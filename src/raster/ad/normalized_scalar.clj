@@ -18,13 +18,18 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-facts :as contraction]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.peephole :as peephole]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.core :as core]))
 
@@ -686,7 +691,8 @@
   primal)
 
 (declare validate! validate-map-proof! validate-indexed-proof!
-         validate-sum-programs! sum-source-map)
+         validate-sum-programs! sum-source-map
+         segmented-description project-segmented-fold construct-segmented-stage)
 
 (defn- validate-scalar-correspondence!
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
@@ -1780,7 +1786,7 @@
                     :interface interface
                     :proof {:authority :normalized-scalar :nodes witnesses}}}))
 
-(defn- reconstructed-map-proof
+(defn- reconstructed-map-proof-map
   [{:keys [map-programs source-ns] :as bundle}]
   (let [{:keys [source interface proof]} map-programs
         submitted (:nodes proof)
@@ -1918,6 +1924,50 @@
         (assoc stage :source source
                :proof (assoc proof :nodes [node]))))))
 
+(defn- reconstructed-segmented-proof
+  [{:keys [map-programs source-ns] :as bundle}]
+  (let [{:keys [source interface proof]} map-programs
+        nodes (:nodes proof)
+        [node] nodes
+        active (first (:active-inputs interface))]
+    (when-not (and (map? proof) (= :normalized-scalar (:authority proof))
+                   (= #{:authority :nodes} (set (keys proof)))
+                   (vector? nodes) (= 1 (count nodes)) (map? node)
+                   (= #{:source-equations :execution-equation :scalar-derivation
+                        :stage-interface :equation-ids}
+                      (set (keys node)))
+                   (= [(:execution-equation node)] (:source-equations node))
+                   (= {:primal 'ad-map-primal :linear 'ad-map-linear
+                       :transpose 'ad-map-transpose}
+                      (:equation-ids node))
+                   (identical? source-ns (get-in node [:scalar-derivation :source-ns])))
+      (fail! :ad-normalized-segmented-proof {:proof proof}))
+    (let [description (segmented-description source {:active-input active})
+          _ (when-not (= (:equation-id description) (:execution-equation node))
+              (fail! :ad-normalized-segmented-proof {:node node}))
+          project (fn [output]
+                    (project-segmented-fold description source-ns output))
+          projected (checked-scalar-proof-replay!
+                     source-ns (:scalar-derivation node) project
+                     {:proof-reason :ad-normalized-segmented-proof
+                      :namespace-reason :ad-normalized-segmented-proof
+                      :correspondence-reason :ad-normalized-segmented-proof
+                      :data {:equation (:equation-id description)}})
+          description (merge description
+                             (select-keys projected
+                                          [:active-formal :passive-formal :accumulator]))
+          expected (construct-segmented-stage description (:scalar-derivation node)
+                                              interface (:equation-ids node))]
+      expected)))
+
+(defn- reconstructed-map-proof [bundle]
+  (let [source (get-in bundle [:map-programs :source])
+        equations (soac/equations (soac/validate! source))
+        kind (when (= 1 (count equations)) (soac/operation-kind (first equations)))]
+    (case kind
+      segmented-reduce (reconstructed-segmented-proof bundle)
+      (reconstructed-map-proof-map bundle))))
+
 (defn- validate-proof-header! [bundle expected-keys]
   (let [source-ns (:source-ns bundle)]
     (when-not (and (= expected-keys (set (keys bundle)))
@@ -1979,6 +2029,422 @@
     (contains? bundle :gather-programs) (validate-indexed-proof! bundle)
     :else (validate-scalar! bundle)))
 
+;; One deliberately small non-map node uses the same scalar proof envelope.  Its array geometry
+;; is a checked contraction fact, never an inference from the derivative programs.
+(defn- static-capacity! [shape reason]
+  (when-not (and (vector? shape) (= 1 (count shape))
+                 (integer? (first shape)) (pos? (first shape))
+                 (<= (first shape) Integer/MAX_VALUE))
+    (fail! reason {:shape shape}))
+  (first shape))
+
+(defn- static-extent! [expression reason]
+  (let [value (try
+                (launch/resolve-expression
+                 (fn [id] (fail! reason {:extent expression :unresolved id})) expression)
+                (catch clojure.lang.ExceptionInfo exception
+                  (if (= :normalized-scalar (:representation (ex-data exception)))
+                    (throw exception)
+                    (fail! reason {:extent expression :cause (ex-data exception)}))))]
+    (when-not (and (integer? value) (pos? value) (<= value Integer/MAX_VALUE))
+      (fail! reason {:extent expression :value value}))
+    value))
+
+(defn- segmented-activity! [operands options]
+  (when-not (and (map? options)
+                 (= #{:active-input} (set (keys options)))
+                 (some #{(:active-input options)} operands))
+    (fail! :ad-normalized-segmented-activity
+           {:operands operands :options options}))
+  (:active-input options))
+
+(defn- segmented-description
+  "Rederive the exact bounded bilinear fold and its physical axis maps."
+  [source options]
+  (soac/validate! source)
+  (let [[equation :as equations] (soac/equations source)
+        facts (soac/facts source)
+        [_ equation-id results] equation
+        {:keys [kind attributes arrays captures lambda]} (when equation
+                                                           (soac/operation-parts equation))
+        operands (vec (concat arrays captures))
+        values (:values facts)
+        equation-facts (get-in facts [:equations equation-id])
+        layout (when equation (soac/parameter-layout equation))
+        params (:parameters (soac/lambda-parts lambda))
+        active (segmented-activity! operands options)
+        passive (first (remove #{active} operands))
+        components (when equation
+                     (projection/segmented-reduce-contract-components source equation))
+        contraction (when components (contraction/from-components components))
+        matrix-view (when contraction (contraction/dense-matrix-view contraction))
+        operand-entries (when contraction (:operands contraction))
+        operand-maps (when contraction
+                       (into {} (map (juxt :sym #(contraction/operand-axis-map contraction %)))
+                             operand-entries))
+        raw-extents (vec (concat (map second (:segment-axes attributes))
+                                 [(:extent attributes)]))
+        raw-extents? (every? #(and (integer? %) (pos? %) (<= % Integer/MAX_VALUE))
+                             raw-extents)
+        result-map (when raw-extents? (soac/segmented-reduce-result-map attributes))
+        reduction (when contraction (contraction/scalar-reduction-view contraction))
+        reads (when equation
+                (projection/segmented-reduce-core-read-requirements source equation))
+        dt (first (:dtypes attributes))
+        expected-arithmetic (when (contains? #{:float :double} dt)
+                              (numerics/blas-source-arithmetic dt))
+        source-attrs (:attributes facts)
+        op-attrs (:attributes attributes)
+        result (first results)
+        all-values (mapv values (conj operands result))]
+    (when-not
+     (and (= 1 (count equations)) (= 'segmented-reduce kind)
+          (= 1 (count results) (count (:accumulators attributes))
+             (count (:identities attributes)) (count (:dtypes attributes))
+             (count (:algebra attributes)))
+          (= results (soac/outputs source)) (= 2 (count operands))
+          (empty? arrays) (= 2 (count captures))
+          (source-envelope? facts equations)
+          (= (set operands) (set (:inputs facts))) (= (count operands) (count (:inputs facts)))
+          (= (set (keys values)) (set (conj operands result)))
+          (empty? (:effects facts)) (empty? (:aliases facts))
+          (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
+          (empty? (:attributes equation-facts))
+          (empty? (soac/result-storage source equation-id))
+          (= #{:source-arithmetic} (set (keys source-attrs)))
+          (= expected-arithmetic (:source-arithmetic source-attrs)
+             (:source-arithmetic attributes))
+          (= #{:segment-axes :index :extent :attributes :accumulators :identities
+               :dtypes :algebra :source-arithmetic :result-map}
+             (set (keys attributes)))
+          (= #{:stable-array-captures :pointwise-storage-inputs} (set (keys op-attrs)))
+          (= operands (:stable-array-captures op-attrs))
+          (empty? (:pointwise-storage-inputs op-attrs))
+          raw-extents?
+          (contains? #{:float :double} dt)
+          (= (count params) 3)
+          (= 1 (count (:accumulators layout)))
+          (empty? (:elements layout)) (= 2 (count (:capture-parameters layout)))
+          (= dt (:dtype reduction))
+          (:ok matrix-view) (false? (:batched? matrix-view)) (nil? (:epilogue matrix-view))
+          (= 2 (count (:bindings matrix-view)))
+          (= (set operands) (set (vals (:bindings matrix-view))))
+          (= (set operands) (set (keys reads)) (set (keys operand-maps)))
+          (every? some? (vals operand-maps))
+          (every? #(= % (av/make %)) all-values)
+          (every? #(and (= :tensor (:kind %)) (= dt (:dtype %))
+                        (= {:kind :plain} (:representation %))
+                        (nil? (:logical-layout %)) (empty? (:effects %))
+                        (empty? (:attributes %)) (nil? (:memory-space %))
+                        (nil? (:placement %)) (nil? (:sharding %))) all-values)
+          (= :owned (:ownership (values result)))
+          (every? #(contains? #{nil :borrowed} (:ownership (values %))) operands)
+          (= 1 (count (:groups result-map)))
+          (= (vec (:segment-axes attributes)) (vec (first (:groups result-map)))))
+      (fail! :ad-normalized-segmented-boundary {:equation equation :options options}))
+    (doseq [extent (concat (map second (:segment-axes attributes)) [(:extent attributes)])]
+      (static-extent! extent :ad-normalized-segmented-space))
+    (doseq [id (conj operands result)] (static-capacity! (:shape (values id))
+                                                         :ad-normalized-segmented-space))
+    (doseq [[id requirement] reads]
+      (let [required (static-extent! requirement :ad-normalized-segmented-space)]
+       (when-not (= (first (:shape (values id))) required)
+        (fail! :ad-normalized-segmented-space
+               {:operand id :shape (:shape (values id)) :required required}))))
+    (when-not (= (first (:shape (values result)))
+                 (reduce *' 1 (axis-map/shape result-map)))
+      (fail! :ad-normalized-segmented-space {:result result :map result-map}))
+    {:source source :equation equation :equation-id equation-id :attributes attributes
+     :operands operands :active active :passive passive :result result :dtype dt
+     :layout layout :parameters params :components components :contraction contraction
+     :operand-maps operand-maps :result-map result-map :reduction reduction
+     :matrix-view matrix-view}))
+
+(defn- project-segmented-fold
+  [description source-ns output-id]
+  (let [{:keys [equation operands active passive dtype layout parameters]} description
+        active-formal (get (zipmap operands (:capture-parameters layout)) active)
+        passive-formal (get (zipmap operands (:capture-parameters layout)) passive)
+        accumulator (first (:accumulators layout))
+        {:keys [locals body-results]} (soac/lambda-parts (:lambda (soac/operation-parts equation)))
+        formal-by-array (zipmap (:capture-parameters layout) (:capture-parameters layout))
+        scalar-body
+        (descriptor/rewrite-aget-reads
+         (first body-results)
+         (fn [read]
+           (get formal-by-array (descriptor/aget-array-sym read))))]
+    (when-not (and (instance? clojure.lang.Namespace source-ns) (empty? locals)
+                   scalar-body (= #{accumulator active-formal passive-formal}
+                                  (set parameters))
+                   (every? #(contains? #{nil (tag dtype)} (types/sym-type-tag %)) parameters))
+      (fail! :ad-normalized-segmented-fold {:equation equation}))
+    (binding [*ns* source-ns]
+      (let [params (mapv #(tagged % dtype) parameters)
+            substitution (zipmap parameters params)
+            expression (util/subst-syms substitution
+                                        (soac/scalar-converts->source scalar-body))
+            output (or output-id ((typed-gensym dtype) "segmented_fold_output"))
+            ordinal (atom 0)
+            normalized (anf/anf-normalize-bindings
+                        [output expression]
+                        (fn [_]
+                          (tagged (symbol (str (name output) "__anf_"
+                                               (swap! ordinal inc))) dtype)))
+            input-values (into (array-map)
+                               (map (fn [id] [id (av/tensor {:dtype dtype :shape []})]))
+                               params)
+            primal (program input-values normalized [output])
+            interface {:params params :tags (vec (repeat 3 (tag dtype)))
+                       :active-inputs [(tagged accumulator dtype)
+                                       (tagged active-formal dtype)]
+                       :source-ns source-ns}]
+        {:primal primal :interface interface :active-formal (tagged active-formal dtype)
+         :passive-formal (tagged passive-formal dtype)
+         :accumulator (tagged accumulator dtype)}))))
+
+(defn- snapshot-equation-id [primal-id]
+  (when-not (and (symbol? primal-id) (nil? (namespace primal-id)))
+    (fail! :ad-normalized-segmented-interface {:primal-id primal-id}))
+  (symbol (str (name primal-id) "__passive_snapshot")))
+
+(defn- allocate-segmented-interface [description scalar]
+  (let [{:keys [active]} description
+        coefficient (first (:residuals scalar))]
+    {:active-inputs [active]
+     :residual-arrays {coefficient (gensym "ad_contraction_residual_")}
+     :scalar-captures {}
+     :tangent-inputs [(gensym "ad_contraction_tangent_")]
+     :cotangent-input (gensym "ad_contraction_cotangent_")
+     :tangent-output (gensym "ad_contraction_push_")
+     :gradient-outputs [(gensym "ad_contraction_pull_")]}))
+
+(defn- lambda-substitute [program parameters outputs substitutions]
+  (let [{:keys [locals body-results]}
+        (soac/lambda-parts (scalar-program-lambda program parameters outputs))]
+    (soac/lambda-form parameters
+                      (mapv (fn [{:keys [id dtype init]}]
+                              (soac/local-value
+                               id dtype (util/subst-syms substitutions init))) locals)
+                      (mapv #(util/subst-syms substitutions %) body-results))))
+
+(defn- materialized-lambda-body [lambda]
+  (let [{:keys [locals body-results]} (soac/lambda-parts lambda)
+        bindings (vec (mapcat (juxt :id :init) locals))]
+    (util/inline-pure-lets (list 'let* bindings (first body-results)))))
+
+(defn- segmented-equation
+  [id output attributes captures lambda]
+  (list '= id [output] (list 'segmented-reduce attributes [] captures lambda)))
+
+(defn- identity-copy-equation [id output input extent dtype]
+  (let [index (symbol (str (name id) "__index"))
+        element (tagged (symbol (str (name id) "__element")) dtype)]
+    (list '= id [output]
+          (list 'map {:index index :extent extent :attributes {}}
+                [input] [] (soac/lambda-form [element] [] [element])))))
+
+(defn- phase-program [values inputs equations outputs]
+  (soac/make
+   (soac/default-program-facts
+    {:values values :inputs inputs :attributes {}
+     :equations (into {} (map (fn [equation]
+                                [(second equation) (soac/default-equation-facts)])) equations)})
+   equations outputs))
+
+(defn- axis-pairs [axis-map]
+  (vec (mapcat identity (:groups axis-map))))
+
+(defn- exact-accumulator-cotangent! [scalar accumulator]
+  (let [transpose (:transpose scalar)
+        gradient (first (soac/outputs transpose))
+        seed (:cotangent-seed scalar)
+        slice (required-bindings (bindings transpose) [gradient])
+        values (:values (soac/facts transpose))
+        dt (:dtype (get values seed))
+        pairs (partition 2 slice)
+        ids (concat [seed gradient] (mapcat identity pairs))
+        expected-tag (tag dt)
+        copied (peephole/copy-propagate-let
+                (list 'let* slice (list 'clojure.core/vector gradient)))
+        expected (list 'let* [] (list 'clojure.core/vector seed))]
+    (when-not
+     (and (= accumulator (first (:active-inputs scalar)))
+          (seq pairs) (every? symbol? (map second pairs))
+          (every? #(and (map? (get values %)) (= dt (:dtype (get values %)))) ids)
+          (every? #(= expected-tag (types/sym-type-tag %)) ids)
+          (= :pure (effects/analyze-effect (list 'let* slice gradient)))
+          (sequential? copied) (= 'let* (first copied))
+          (empty? (second copied)) (= 3 (count copied))
+          (sequential? (nth copied 2)) (= 'clojure.core/vector (first (nth copied 2)))
+          (fingerprint/equivalent? (vec copied) (vec expected)))
+      (fail! :ad-normalized-segmented-fold
+             {:accumulator accumulator :gradient gradient :slice slice}))
+    true))
+
+(defn- contraction-axis-proof! [description]
+  (let [{:keys [attributes operand-maps active passive result-map]} description
+        selected (get operand-maps active)
+        excluded (get operand-maps passive)
+        selected-pairs (axis-pairs selected)
+        excluded-pairs (axis-pairs excluded)
+        selected-set (set selected-pairs)
+        excluded-set (set excluded-pairs)
+        intersection (filterv excluded-set selected-pairs)
+        source-contract [[(:index attributes) (:extent attributes)]]
+        source-free (vec (:segment-axes attributes))
+        union-free (vec (filter #(not (some #{%} intersection))
+                                (distinct (concat selected-pairs excluded-pairs))))
+        fiber (filterv #(not (selected-set %)) source-free)]
+    (when-not (and (= (count selected-pairs) (count (distinct selected-pairs)))
+                   (= (count excluded-pairs) (count (distinct excluded-pairs)))
+                   (= source-contract intersection)
+                   (= (count source-free) (count union-free))
+                   (= (set source-free) (set union-free))
+                   (= source-free (axis-pairs result-map))
+                   (= 1 (count fiber))
+                   (= (set (concat source-free source-contract))
+                      (set (concat selected-pairs excluded-pairs))))
+      (fail! :ad-normalized-segmented-fold
+             {:selected selected :passive excluded :result result-map}))
+    {:selected-map selected :passive-map excluded :fiber (first fiber)}))
+
+(defn- construct-segmented-stage
+  [description scalar interface equation-ids]
+  (let [{:keys [source equation attributes active passive result dtype reduction
+                active-formal passive-formal accumulator]} description
+        source-values (:values (soac/facts source))
+        coefficient (first (:residuals scalar))
+        {:keys [active-inputs residual-arrays scalar-captures tangent-inputs cotangent-input
+                tangent-output gradient-outputs]} interface
+        primal-id (:primal equation-ids)
+        snapshot-id (snapshot-equation-id primal-id)
+        linear-id (:linear equation-ids)
+        transpose-id (:transpose equation-ids)
+        snapshot (get residual-arrays coefficient)
+        tangent (first tangent-inputs)
+        gradient (first gradient-outputs)
+        source-ids (set (concat (keys source-values) (map second (soac/equations source))))
+        allocated [primal-id snapshot-id linear-id transpose-id snapshot tangent cotangent-input
+                   tangent-output gradient]
+        _ (when-not (and (= #{:active-inputs :residual-arrays :scalar-captures
+                              :tangent-inputs :cotangent-input :tangent-output
+                              :gradient-outputs}
+                            (set (keys interface)))
+                         (= [active] active-inputs)
+                         (= {} scalar-captures) (= #{coefficient} (set (keys residual-arrays)))
+                         (= 1 (count tangent-inputs) (count gradient-outputs))
+                         (every? symbol? allocated)
+                         (= (count allocated) (count (distinct allocated)))
+                         (empty? (set/intersection source-ids (set allocated)))
+                         (= [accumulator active-formal] (:active-inputs scalar))
+                         (= [passive-formal] (:residuals scalar)))
+            (fail! :ad-normalized-segmented-interface
+                   {:interface interface :equation-ids equation-ids}))
+        _ (exact-accumulator-cotangent! scalar accumulator)
+        {:keys [selected-map passive-map fiber]} (contraction-axis-proof! description)
+        selected-result-map {:groups [(axis-pairs selected-map)]}
+        selected-index (axis-map/index-expr selected-map)
+        passive-index (axis-map/index-expr passive-map)
+        result-index (axis-map/index-expr (:result-map description))
+        active-value (get source-values active)
+        passive-value (get source-values passive)
+        result-value (get source-values result)
+        snapshot-value (assoc passive-value :ownership :owned)
+        tangent-value (assoc active-value :ownership :borrowed)
+        cotangent-value (assoc result-value :ownership :borrowed)
+        tangent-result-value (assoc result-value :ownership :owned)
+        gradient-value (assoc active-value :ownership :owned)
+        [acc-param selected-param passive-param]
+        (mapv #(tagged % dtype) '[ad_fold_acc ad_fold_selected ad_fold_passive])
+        scalar-linear (:linear scalar)
+        [dacc dselected] (:tangent-inputs scalar)
+        scalar-push (first (soac/outputs scalar-linear))
+        linear-subs {dacc acc-param
+                     dselected (list 'clojure.core/aget selected-param selected-index)
+                     coefficient (list 'clojure.core/aget passive-param passive-index)}
+        linear-lambda0 (lambda-substitute scalar-linear
+                                           [acc-param selected-param passive-param]
+                                           [scalar-push] linear-subs)
+        linear-body (materialized-lambda-body linear-lambda0)
+        linear-lambda (soac/lambda-form [acc-param selected-param passive-param]
+                                        [] [linear-body])
+        linear-algebra (scan/certify-reassociation
+                        {:acc acc-param :init (first (:identities attributes))
+                         :lambda linear-body} dtype)
+        linear-attributes (-> attributes
+                              (assoc :accumulators [acc-param]
+                                     :algebra [linear-algebra]
+                                     :attributes {:stable-array-captures [tangent snapshot]
+                                                  :pointwise-storage-inputs []}))
+        linear-equation (segmented-equation linear-id tangent-output linear-attributes
+                                            [tangent snapshot] linear-lambda)
+        transpose (:transpose scalar)
+        scalar-seed (:cotangent-seed scalar)
+        selected-gradient (second (soac/outputs transpose))
+        contribution-lambda
+        (lambda-substitute transpose [acc-param selected-param passive-param]
+                           [selected-gradient]
+                           {scalar-seed (list 'clojure.core/aget selected-param result-index)
+                            coefficient (list 'clojure.core/aget passive-param passive-index)})
+        contribution (materialized-lambda-body contribution-lambda)
+        transpose-body (tagged (list (:combine reduction) acc-param contribution) dtype)
+        transpose-lambda (soac/lambda-form [acc-param selected-param passive-param]
+                                           [] [transpose-body])
+        transpose-algebra (scan/certify-reassociation
+                           {:acc acc-param :init (first (:identities attributes))
+                            :lambda (materialized-lambda-body transpose-lambda)} dtype)
+        [fiber-axis fiber-extent] fiber
+        transpose-attributes
+        (-> attributes
+            (assoc :segment-axes (axis-pairs selected-map)
+                   :index fiber-axis :extent fiber-extent
+                   ;; The operand's verified atomic order owns the gradient coordinates; the
+                   ;; explicit one-group witness preserves that order in the public flat AV.
+                   :result-map selected-result-map
+                   :accumulators [acc-param] :identities (:identities attributes)
+                   :algebra [transpose-algebra]
+                   :attributes {:stable-array-captures [cotangent-input snapshot]
+                                :pointwise-storage-inputs []}))
+        transpose-equation (segmented-equation transpose-id gradient transpose-attributes
+                                               [cotangent-input snapshot] transpose-lambda)
+        source-operation (nth equation 3)
+        primal-equation (list '= primal-id [result] source-operation)
+        copy-equation (identity-copy-equation snapshot-id snapshot passive
+                                              (first (:shape passive-value)) dtype)
+        primal-values (assoc source-values result result-value snapshot snapshot-value)
+        primal (phase-program primal-values (vec (:inputs (soac/facts source)))
+                              [primal-equation copy-equation] [result snapshot])
+        linear-values {tangent tangent-value snapshot snapshot-value
+                       tangent-output tangent-result-value}
+        linear (phase-program linear-values [tangent snapshot]
+                              [linear-equation] [tangent-output])
+        transpose-values {cotangent-input cotangent-value snapshot snapshot-value
+                          gradient gradient-value}
+        transpose (phase-program transpose-values [cotangent-input snapshot]
+                                 [transpose-equation] [gradient])]
+    {:source source :primal primal :linear linear :transpose transpose
+     :interface interface
+     :proof {:authority :normalized-scalar
+             :nodes [{:source-equations [(:equation-id description)]
+                      :execution-equation (:equation-id description)
+                      :scalar-derivation scalar
+                      :stage-interface interface
+                      :equation-ids equation-ids}]}}))
+
+(defn- build-segmented-programs [source source-ns options]
+  (let [description (segmented-description source options)
+        projected (project-segmented-fold description source-ns nil)
+        scalar (linearize-program (:primal projected) (:interface projected))
+        description (merge description (select-keys projected
+                                                     [:active-formal :passive-formal :accumulator]))
+        equation-ids {:primal 'ad-map-primal :linear 'ad-map-linear
+                      :transpose 'ad-map-transpose}
+        interface (allocate-segmented-interface description scalar)]
+    {:source-ns source-ns
+     :template-revision (templates/registry-revision)
+     :compiler-revision (dispatch/compiler-definition-revision)
+     :map-programs (construct-segmented-stage description scalar interface equation-ids)}))
+
 (defn- build-map-programs
   [source source-ns options]
   (let [region? (< 1 (count (soac/equations source)))
@@ -2023,6 +2489,29 @@
   ([source source-ns options]
    (let [bundle (build-map-programs source source-ns options)]
      (validate! (assoc bundle :certificate (certificate bundle))))))
+
+(defn linearize-equation-program
+  "Linearize one exactly admitted normalized equation through its checked operation owner.
+
+   Maps retain `linearize-map-program` byte semantics. The only additional operation is the
+   bounded pure bilinear segmented product described by its explicit result/operand AxisMaps;
+   it requires singular `:active-input`. No source-AD fallback or operation registry is involved."
+  ([source source-ns] (linearize-equation-program source source-ns {}))
+  ([source source-ns options]
+   (let [source (soac/validate! source)
+         equations (soac/equations source)
+         kind (when (= 1 (count equations)) (soac/operation-kind (first equations)))]
+     (case kind
+       segmented-reduce
+       (let [bundle (build-segmented-programs source source-ns options)]
+         (validate! (assoc bundle :certificate (certificate bundle))))
+
+       map (linearize-map-program source source-ns options)
+
+       (if (every? #(= 'map (soac/operation-kind %)) equations)
+         (linearize-map-program source source-ns options)
+         (fail! :ad-normalized-equation-boundary
+                {:operations (mapv soac/operation-kind equations)}))))))
 
 (defn linearize-map-chain-program
   "Compatibility entry for a multi-equation map composition.
