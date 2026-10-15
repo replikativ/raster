@@ -86,6 +86,34 @@
       (is (= :ad-normalized-gather-proof
              (reason #(normalized/validate! (recertify changed))))))))
 
+(deftest retained-gather-lifecycle-reuses-scalar-output-and-interface-identities
+  (let [bundle (build (indexed-map :double :long 'n 'm))
+        scalar (get-in bundle [:gather-programs :proof :scalar-derivation])
+        retained-output (first (soac/outputs (:primal scalar)))
+        retained-interface (get-in bundle [:gather-programs :interface])
+        project-var #'normalized/project-indexed-element project @project-var
+        lift-var #'normalized/lift-gather-programs lift @lift-var
+        projected-outputs (atom []) interfaces (atom [])]
+    (with-redefs-fn
+      {project-var (fn [source source-ns output]
+                     (swap! projected-outputs conj output)
+                     (project source source-ns output))
+       lift-var (fn [proof source interface]
+                  (swap! interfaces conj interface)
+                  (lift proof source interface))}
+      #(is (identical? bundle (normalized/validate! bundle))))
+    (is (= [retained-output] @projected-outputs))
+    (is (= [retained-interface] @interfaces))
+    (doseq [changed [(assoc-in bundle [:gather-programs :proof :extra] true)
+                     (assoc-in bundle [:gather-programs :extra] true)]]
+      (is (= :ad-normalized-gather-proof
+             (reason #(normalized/validate! (recertify changed))))))
+    (doseq [changed [(update-in bundle [:gather-programs :interface]
+                                dissoc :tangent-input)
+                     (assoc-in bundle [:gather-programs :interface :extra] 'forged-port)]]
+      (is (= :ad-normalized-gather-interface
+             (reason #(normalized/validate! (recertify changed))))))))
+
 (deftest namespace-fingerprint-projection-never-synthesizes-proof-keys
   (let [bundle (build (indexed-map :double :long 'n 'm))
         path [:gather-programs :proof :scalar-derivation]

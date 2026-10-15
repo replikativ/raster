@@ -1475,6 +1475,25 @@
       (checked-primal-map-node-port primal source stage)
       stage)))
 
+(defn- checked-scalar-proof-replay!
+  "Replay one retained active scalar proof through its exact source projector.
+   Callers retain family-specific source, port, storage, and phase obligations."
+  [source-ns scalar project
+   {:keys [proof-reason namespace-reason correspondence-reason data]}]
+  (when-not (map? scalar)
+    (fail! proof-reason data))
+  (when-not (identical? source-ns (:source-ns scalar))
+    (fail! namespace-reason
+           (assoc data :source-ns source-ns :scalar-ns (:source-ns scalar))))
+  (validate-scalar-proof! scalar)
+  (let [projected (project (first (soac/outputs (:primal scalar))))]
+    (when-not (and (fingerprint/equivalent? (:primal projected) (:primal scalar))
+                   (fingerprint/equivalent?
+                    (select-keys (:interface projected) [:params :tags :active-inputs])
+                    (select-keys scalar [:params :tags :active-inputs])))
+      (fail! correspondence-reason data))
+    projected))
+
 (defn- map-node-lifecycle
   "Allocate or replay one checked map node. Submitted witnesses retain every identity;
    newly allocated nodes use the same projection, construction, and port correspondence path."
@@ -1485,26 +1504,34 @@
                                 active-outers)))
         submitted-derivation (when submitted
                                ((if active? :scalar-derivation :primal-derivation) submitted))
-        _ (when (and submitted (not (map? submitted-derivation)))
+        _ (when (and submitted (not active?) (not (map? submitted-derivation)))
             (fail! :ad-normalized-map-node-derivation
                    {:equation (second equation)}))
         _ (when (and submitted
                      (not= (second equation) (:execution-equation submitted)))
             (fail! :ad-normalized-map-node-coverage
                    {:expected (second equation) :actual (:execution-equation submitted)}))
-        _ (when (and submitted
+        _ (when (and submitted (not active?)
                      (not (identical? source-ns (:source-ns submitted-derivation))))
             (fail! :ad-normalized-map-node-namespace
                    {:source-ns source-ns :node-ns (:source-ns submitted-derivation)}))
-        _ (when (and submitted active?) (validate-scalar-proof! submitted-derivation))
         {:keys [arrays]} (soac/operation-parts equation)
         witness-active (if active? active-outers [(first arrays)])
-        output-id (when submitted
+        output-id (when (and submitted (not active?))
                     (first (soac/outputs (:primal submitted-derivation))))
-        projected (or projected
+        project (fn [retained-output]
+                  (or projected
                       (project-map-equation-lane
-                       source subprogram equation source-ns output-id
-                       {:active-inputs (vec witness-active)}))
+                       source subprogram equation source-ns retained-output
+                       {:active-inputs (vec witness-active)})))
+        projected (if (and submitted active?)
+                    (checked-scalar-proof-replay!
+                     source-ns submitted-derivation project
+                     {:proof-reason :ad-normalized-map-node-derivation
+                      :namespace-reason :ad-normalized-map-node-namespace
+                      :correspondence-reason :ad-normalized-map-node-derivation
+                      :data {:equation (second equation)}})
+                    (project output-id))
         scalar-interface (:interface projected)
         derivation (or submitted-derivation
                        (if active?
@@ -1512,19 +1539,15 @@
                          {:source-ns source-ns
                           :primal (:primal projected)
                           :interface scalar-interface}))
-        _ (when (and submitted
+        _ (when (and submitted (not active?)
                      (not
                       (and
                        (fingerprint/equivalent? (:primal projected) (:primal derivation))
-                       (if active?
-                         (fingerprint/equivalent?
-                          (select-keys scalar-interface [:params :tags :active-inputs])
-                          (select-keys derivation [:params :tags :active-inputs]))
-                         (and (= #{:source-ns :primal :interface} (set (keys derivation)))
-                              (identical? source-ns (:source-ns (:interface derivation)))
-                              (fingerprint/equivalent?
-                               (dissoc scalar-interface :source-ns)
-                               (dissoc (:interface derivation) :source-ns)))))))
+                       (= #{:source-ns :primal :interface} (set (keys derivation)))
+                       (identical? source-ns (:source-ns (:interface derivation)))
+                       (fingerprint/equivalent?
+                        (dissoc scalar-interface :source-ns)
+                        (dissoc (:interface derivation) :source-ns)))))
             (fail! :ad-normalized-map-node-derivation
                    {:equation (second equation)}))
         interface (if submitted
@@ -2173,48 +2196,70 @@
                        [tangent-output])
      :transpose (soac/make transpose-facts [transpose-equation] [gradient-output])}))
 
-(defn- indexed-scalar-proof!
-  [{:keys [gather-programs source-ns]}]
-  (let [proof (:proof gather-programs)
-        scalar (:scalar-derivation proof)]
-    (when-not (and (map? gather-programs)
-                   (= #{:source :interface :required-zero-gradient :primal :linear :transpose :proof}
-                      (set (keys gather-programs)))
-                   (map? proof)
-                   (= #{:authority :scalar-derivation} (set (keys proof)))
-                   (= :normalized-scalar (:authority proof))
-                   (map? scalar)
-                   (identical? source-ns (:source-ns scalar)))
-      (fail! :ad-normalized-gather-proof {:proof proof}))
-    scalar))
-
-(defn- validate-gather-programs!
-  [{:keys [gather-programs source-ns] :as bundle} scalar]
-  (let [{:keys [source interface]} gather-programs
-        _ (when-not (map? interface)
-            (fail! :ad-normalized-gather-interface {:interface interface}))
-        projected (project-indexed-element source source-ns
-                                           (first (soac/outputs (:primal scalar))))
-        ids (vals interface)
-        source-equation (first (soac/equations source))
-        source-bound (conj (set (:parameters (soac/lambda-parts
-                                             (:lambda (soac/operation-parts source-equation)))))
-                           (get-in (soac/operation-parts source-equation) [:attributes :index]))]
-    (when-not (and (= #{:index-snapshot :tangent-input :tangent-output :cotangent-input
-                       :zero-gradient :gradient-output} (set (keys interface)))
-                   (every? symbol? ids) (= (count ids) (count (distinct ids)))
-                   (empty? (set/intersection (set ids)
-                                            (set/union source-bound
-                                                       (set (keys (:values (soac/facts source)))))))
-                   (fingerprint/equivalent? (:primal projected) (:primal scalar))
-                   (fingerprint/equivalent? (select-keys (:interface projected) [:params :tags :active-inputs])
-                                            (select-keys scalar [:params :tags :active-inputs])))
-      (fail! :ad-normalized-gather-interface {:interface interface}))
-    (doseq [p (map gather-programs [:primal :linear :transpose])] (soac/validate! p))
-    (when-not (fingerprint/equivalent? (dissoc gather-programs :proof)
-                                       (lift-gather-programs scalar source interface))
-      (fail! :ad-normalized-gather-programs {:interface interface})))
-  bundle)
+(defn- gather-node-lifecycle
+  "Allocate or replay one checked scalar-identity gather node.
+   Index snapshots, scatter storage, aliases, and typed-zero obligations remain gather-specific."
+  ([source source-ns revision]
+   (let [output (gensym "indexed_element_output_")
+         {:keys [primal interface] :as projected}
+         (project-indexed-element source source-ns output)
+         scalar (build-bundle primal interface revision)
+         equation (first (soac/equations source))
+         source-parts (soac/operation-parts equation)
+         used (into (set (keys (:values (soac/facts source))))
+                    (conj (:parameters (soac/lambda-parts (:lambda source-parts)))
+                          (get-in source-parts [:attributes :index])))
+         fresh (fn [key]
+                 (loop [id (gensym (str "ad_gather_" (name key) "_"))]
+                   (if (contains? used id)
+                     (recur (gensym (str "ad_gather_" (name key) "_"))) id)))
+         interface (into {} (map (fn [key] [key (fresh key)]))
+                         [:index-snapshot :tangent-input :tangent-output :cotangent-input
+                          :zero-gradient :gradient-output])
+         programs (lift-gather-programs scalar source interface)
+         gather-programs (assoc programs :proof {:authority :normalized-scalar
+                                                  :scalar-derivation scalar})]
+     {:scalar-derivation scalar :projected projected
+      :programs programs :gather-programs gather-programs}))
+  ([source-ns gather-programs]
+   (let [proof (:proof gather-programs)
+         scalar (:scalar-derivation proof)
+         _ (when-not (and (map? gather-programs)
+                          (= #{:source :interface :required-zero-gradient
+                               :primal :linear :transpose :proof}
+                             (set (keys gather-programs)))
+                          (map? proof)
+                          (= #{:authority :scalar-derivation} (set (keys proof)))
+                          (= :normalized-scalar (:authority proof)))
+             (fail! :ad-normalized-gather-proof {:proof proof}))
+         {:keys [source interface]} gather-programs
+         _ (when-not (map? interface)
+             (fail! :ad-normalized-gather-interface {:interface interface}))
+         projected (checked-scalar-proof-replay!
+                    source-ns scalar
+                    #(project-indexed-element source source-ns %)
+                    {:proof-reason :ad-normalized-gather-proof
+                     :namespace-reason :ad-normalized-gather-proof
+                     :correspondence-reason :ad-normalized-gather-interface
+                     :data {:proof proof :interface interface}})
+         ids (vals interface)
+         source-equation (first (soac/equations source))
+         source-bound (conj (set (:parameters (soac/lambda-parts
+                                              (:lambda (soac/operation-parts source-equation)))))
+                            (get-in (soac/operation-parts source-equation) [:attributes :index]))]
+     (when-not (and (= #{:index-snapshot :tangent-input :tangent-output :cotangent-input
+                        :zero-gradient :gradient-output} (set (keys interface)))
+                    (every? symbol? ids) (= (count ids) (count (distinct ids)))
+                    (empty? (set/intersection (set ids)
+                                             (set/union source-bound
+                                                        (set (keys (:values (soac/facts source))))))))
+       (fail! :ad-normalized-gather-interface {:interface interface}))
+     (doseq [p (map gather-programs [:primal :linear :transpose])] (soac/validate! p))
+     (let [programs (lift-gather-programs scalar source interface)]
+       (when-not (fingerprint/equivalent? (dissoc gather-programs :proof) programs)
+         (fail! :ad-normalized-gather-programs {:interface interface}))
+       {:scalar-derivation scalar :projected projected
+        :programs programs :gather-programs gather-programs}))))
 
 (defn validate-indexed-proof!
   [{:keys [source-ns] :as bundle}]
@@ -2227,14 +2272,12 @@
     (fail! :ad-normalized-stale-rules
            {:expected (select-keys bundle [:template-revision :compiler-revision])
             :actual (revisions)}))
-  (let [scalar (indexed-scalar-proof! bundle)]
-    (binding [*ns* source-ns
-              *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
-      (validate-scalar-proof! scalar)
-      (validate-gather-programs! bundle scalar)
-      (when-not (= (:certificate bundle) (certificate bundle))
-        (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
-      (check-dependencies! *proof-dependencies* source-ns)))
+  (binding [*ns* source-ns
+            *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
+    (gather-node-lifecycle source-ns (:gather-programs bundle))
+    (when-not (= (:certificate bundle) (certificate bundle))
+      (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
+    (check-dependencies! *proof-dependencies* source-ns))
   bundle)
 
 (defn linearize-indexed-map-program
@@ -2244,22 +2287,7 @@
    typed-zero physical gradient binding; the effect equation does not allocate or zero it."
   [source source-ns]
   (let [revision (revisions)
-        output (gensym "indexed_element_output_")
-        {:keys [primal interface]} (project-indexed-element source source-ns output)
-        scalar (build-bundle primal interface revision)
-        equation (first (soac/equations source))
-        source-parts (soac/operation-parts equation)
-        used (into (set (keys (:values (soac/facts source))))
-                   (conj (:parameters (soac/lambda-parts (:lambda source-parts)))
-                         (get-in source-parts [:attributes :index])))
-        fresh (fn [key] (loop [id (gensym (str "ad_gather_" (name key) "_"))]
-                          (if (contains? used id) (recur (gensym (str "ad_gather_" (name key) "_"))) id)))
-        interface (into {} (map (fn [key] [key (fresh key)]))
-                        [:index-snapshot :tangent-input :tangent-output :cotangent-input
-                         :zero-gradient :gradient-output])
-        gather-programs (assoc (lift-gather-programs scalar source interface)
-                               :proof {:authority :normalized-scalar
-                                       :scalar-derivation scalar})
+        {:keys [gather-programs]} (gather-node-lifecycle source source-ns revision)
         bundle (merge revision {:source-ns source-ns :gather-programs gather-programs})]
     (validate! (assoc bundle :certificate (certificate bundle)))))
 
