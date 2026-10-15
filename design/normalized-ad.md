@@ -40,6 +40,17 @@ descriptors, related in order to `:active-inputs`; singleton owners use length-o
 than duplicate singular aliases. This is an internal experimental AD schema migration, not a
 change to surface `deftm` semantics or activation of the normalized engine by default.
 
+Host execution consumes each canonical port's own AbstractValue for source arguments,
+primal/JVP results, cotangent seeds, gradients and owned residuals. Its current shape boundary
+is scalar or rank one, with literal dimensions or direct retained Int/Long dimension values;
+this is not a general dynamic-shape evaluator. Nonindexed execution no longer reconstructs
+tensor roles or a common buffer extent from map operands. Delayed pullbacks retain only
+required immutable residual inputs, direct shape controls and freshly owned residual arrays.
+The indexed adapter separately retains its original-width bounds checks, distinct output
+extent and data capacity, private index snapshot and exclusive typed-zero gradient owner.
+Device adapters share exact canonical port association while keeping their existing family
+capability limits and materialized resident geometry.
+
 Compiler-generated pure TypedSOAC programs can acquire an exact source-free invocation boundary
 without manufacturing a Clojure `let` or re-inferring parameter types. The ordered IR inputs and
 their retained AbstractValues supply a zero-prefix plan; flat public buffers and every retained
@@ -162,6 +173,13 @@ the same canonical ports, residual bindings and physical initialization obligati
 schema-owned namespace projection is reused for normalized and canonical fingerprints only
 after identity checks. It preserves nested certificates and unknown data; it is not a
 validator or permission to normalize arbitrary runtime objects.
+
+Singleton and fused-map proof reconstruction use the same checked node lifecycle as
+nodewise maps, without a second scalar projection and phase reconstruction. The outer
+envelope must still match the rebuilt node interface exactly, including metadata; generated
+ports must remain fresh against both original and fused source values. Scalar-active maps
+still require the independently checked ordered-sum source. Removing duplicate replay does
+not remove these correspondence premises or broaden operation coverage.
 
 Singletons and regions whose fused execution frontier has at most two arrays retain their
 existing one-witness programs and numerical model. Only a previously refused homogeneous
