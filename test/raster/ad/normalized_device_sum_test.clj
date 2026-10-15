@@ -23,6 +23,18 @@
   (canonical/adapt-map-sum
    ((private-fn 'build) ((private-fn 'source) :float) 'xs)))
 
+(defn- reordered-owner []
+  (let [source ((private-fn 'source) :float)
+        reordered (soac/make (assoc (soac/facts source) :inputs '[weights xs size])
+                             (soac/equations source) (soac/outputs source))]
+    (canonical/adapt-map-sum
+     ((private-fn 'build) reordered 'xs))))
+
+(defn- device-private-fn [name]
+  (let [v (ns-resolve 'raster.ad.normalized-device name)]
+    (when-not (var? v) (throw (ex-info "missing normalized-device helper" {:name name})))
+    v))
+
 (defn- zero-residual-owner []
   (let [source ((private-fn 'source) :float)
         equations (vec (soac/equations source))
@@ -64,6 +76,60 @@
     ;; The public API intentionally returns resident leases. This remains a test-only projection.
     (gpu/download-range! (:session payload) resident output {:elements elements})
     output))
+
+(deftest public-array-boundary-is-an-exact-id-bijection
+  (let [boundary (device-private-fn 'public-array-boundary!)
+        descriptors [{:id 'xs} {:id 'weights}]
+        layout {:public-inputs [{:symbol 'weights :value :weight-value}
+                                {:symbol 'xs :value :xs-value}]
+                :buffer-bindings {'xs :xs-value 'weights :weight-value}}]
+    (is (= {:ids '[xs weights] :values [:xs-value :weight-value]}
+           (boundary descriptors layout)))
+    (doseq [[declared malformed]
+            [[descriptors (assoc layout :public-inputs [{:symbol 'xs :value :xs-value}])]
+             [[{:id 'xs} {:id 'xs}] layout]
+             [descriptors (assoc-in layout [:public-inputs 0 :value] :wrong-value)]]]
+      (is (= :normalized-device-array-boundary
+             (reason #(boundary declared malformed)))))))
+
+(deftest reordered-map-sum-source-binds-public-arrays-by-id
+  (let [owner (reordered-owner)
+        xs (float-array [1.0 2.0 3.0])
+        weights (float-array [4.0 5.0 6.0])
+        compilations (atom [])
+        calls (atom [])
+        compile equation-first/compile-typed
+        runtime (reify java.io.Closeable (close [_]))]
+    (with-redefs [hardware/descriptor-for synthetic-descriptor
+                  equation-first/compile-typed
+                  (fn [& args]
+                    (let [compiled (apply compile args)]
+                      (swap! compilations conj compiled)
+                      compiled))
+                  link-module/instantiate! (fn [_ _] runtime)
+                  link-module/run-and-lease!
+                  (fn [_ entry request]
+                    (swap! calls conj [entry request])
+                    (reify java.io.Closeable (close [_])))]
+      (let [prepared (device/prepare-sum-owner
+                      owner (arguments owner xs weights) (float 1.0)
+                      {:target :ocl:normalized-sum :schedule {:precision :f32-scalar}})
+            ports (:ports prepared)
+            canonical-ids (mapv :id (filterv #(seq (get-in % [:value :shape]))
+                                             (get-in owner [:interface :inputs])))
+            primal-parameters
+            (get-in (first @compilations) [:semantic :attributes :invocation-plan :parameters])
+            compiled-array-ids
+            (mapv :symbol (filterv #(seq (get-in % [:value :shape])) primal-parameters))
+            primal ((:primal! prepared) {'xs xs 'weights weights})
+            values-by-id (into {} (map (juxt :id :value)) (:inputs ports))
+            expected {(get values-by-id 'xs) xs (get values-by-id 'weights) weights}]
+        (is (= '[weights xs] canonical-ids))
+        (is (not= canonical-ids compiled-array-ids))
+        (is (= canonical-ids (mapv :id (:inputs ports))))
+        (is (= [:primal {:inputs expected}] (first @calls)))
+        (.close ^java.io.Closeable (:lease primal))
+        ((:close! prepared))))))
 
 (deftest fixed-seed-map-sum-uses-exact-array-and-scalar-boundaries
   (let [owner (owner)

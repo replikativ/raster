@@ -207,6 +207,38 @@
     (invocation-link/project-resident-layout
      materialized (:emitted compilation) (:target compilation) caller-options)))
 
+(defn- public-array-boundary!
+  "Match canonical array descriptors to a projected resident layout by compiler identity.
+
+   Canonical source order and the generated invocation ABI may differ.  This boundary preserves
+   canonical order for the public device API while proving an exact bijection to the layout's
+   ordered public inputs and compiler bindings."
+  [descriptors layout]
+  (let [canonical-ids (mapv :id descriptors)
+        public-inputs (:public-inputs layout)
+        public-ids (mapv :symbol public-inputs)
+        compiler-bindings (:buffer-bindings layout)
+        canonical-values (mapv #(get compiler-bindings %) canonical-ids)]
+    (when-not
+     (and (vector? descriptors)
+          (every? #(and (map? %) (symbol? (:id %))) descriptors)
+          (= (count canonical-ids) (count (distinct canonical-ids)))
+          (vector? public-inputs)
+          (map? compiler-bindings)
+          (every? #(and (map? %) (symbol? (:symbol %)) (some? (:value %))) public-inputs)
+          (= (count public-ids) (count (distinct public-ids)))
+          (= (set canonical-ids) (set public-ids))
+          (= (count canonical-values) (count (distinct canonical-values)))
+          (every? some? canonical-values)
+          (every? (fn [{:keys [symbol value]}]
+                    (= value (get compiler-bindings symbol)))
+                  public-inputs))
+      (fail! :normalized-device-array-boundary
+             "canonical arrays must correspond bijectively to resident public inputs"
+             {:canonical canonical-ids :public-inputs public-inputs
+              :canonical-values canonical-values}))
+    {:ids canonical-ids :values canonical-values}))
+
 (defn- fresh-id [used base]
   (first (remove used (map #(vector ::resident base %) (range)))))
 
@@ -355,11 +387,12 @@
         seed-id (get-in interface [:seed :id])
         gradient-id (get-in interface [:gradient :id])
         compiler-bindings (:buffer-bindings layout)
+        array-boundary (public-array-boundary! [(:active interface)] layout)
         active-value (get compiler-bindings active-id)
         primal-value (get compiler-bindings primal-id)
         _ (when-not (and active-value primal-value
-                         (= [{:symbol active-id :value active-value}]
-                            (:public-inputs layout)))
+                         (= [active-id] (:ids array-boundary))
+                         (= [active-value] (:values array-boundary)))
             (fail! :normalized-device-layout-interface
                    "resident layout must expose exactly the canonical active array input"
                    {:active active-id :active-value active-value
@@ -436,20 +469,17 @@
         compiler-bindings (:buffer-bindings layout)
         active-value (get compiler-bindings active-id)
         primal-value (get compiler-bindings primal-id)
-        canonical-array-ids (mapv :id (:arrays interface))
-        public-inputs (:public-inputs layout)
-        public-array-ids (mapv :symbol public-inputs)
-        public-array-values (mapv :value public-inputs)
+        array-boundary (public-array-boundary! (:arrays interface) layout)
+        canonical-array-ids (:ids array-boundary)
+        public-array-values (:values array-boundary)
         _ (when-not (and active-value primal-value
-                         (= canonical-array-ids public-array-ids)
-                         (= (count public-array-values) (count (set public-array-values)))
                          (= :resident-scalar-buffer
                             (get-in layout [:values primal-value :abstract
                                             :representation :kind]))
                          (= [] (get-in layout [:values primal-value :abstract :shape])))
             (fail! :normalized-device-layout-interface
                    "map-sum resident layout must expose every canonical array and scalar loss"
-                   {:expected-arrays canonical-array-ids :public-inputs public-inputs
+                   {:expected-arrays canonical-array-ids :public-inputs (:public-inputs layout)
                     :active active-id :active-value active-value
                     :primal primal-id :primal-value primal-value
                     :primal-abstract (get-in layout [:values primal-value :abstract])}))
@@ -522,10 +552,9 @@
         zero-compilation (compile-program! checked zero-program compile-options)
         layout (materialize-layout! primal-compilation (:inputs interface) arguments caller-options)
         compiler-bindings (:buffer-bindings layout)
-        canonical-array-ids (mapv :id (:arrays interface))
-        public-inputs (:public-inputs layout)
-        public-array-ids (mapv :symbol public-inputs)
-        public-array-values (mapv compiler-bindings canonical-array-ids)
+        array-boundary (public-array-boundary! (:arrays interface) layout)
+        canonical-array-ids (:ids array-boundary)
+        public-array-values (:values array-boundary)
         index-id (get-in interface [:index :id])
         active-id (get-in interface [:active :id])
         primal-id (get-in interface [:primal :id])
@@ -535,15 +564,11 @@
         index-value (get compiler-bindings index-id)
         active-value (get compiler-bindings active-id)
         primal-value (get compiler-bindings primal-id)
-        _ (when-not (and (= (set canonical-array-ids) (set public-array-ids))
-                         (= (count canonical-array-ids) (count public-array-ids)
-                            (count (distinct canonical-array-ids)))
-                         (= #{index-id active-id} (set canonical-array-ids))
-                         (= (count public-array-values) (count (set public-array-values)))
+        _ (when-not (and (= #{index-id active-id} (set canonical-array-ids))
                          (every? some? [index-value active-value primal-value]))
             (fail! :normalized-device-layout-interface
                    "indexed resident layout must expose exact index and active arrays"
-                   {:expected canonical-array-ids :public-inputs public-inputs
+                   {:expected canonical-array-ids :public-inputs (:public-inputs layout)
                     :primal primal-id :primal-value primal-value}))
         residuals (ordered-residual-frontiers! owner residual-plan compiler-bindings)
         residual-ids (:ids residuals)
