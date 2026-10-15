@@ -2603,24 +2603,27 @@
             initial-values
             (reduce
              (fn [values idx]
-               (let [uniformity
+               (let [computed-info
+                     (when-not (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
+                       (expression-info! (:expression idx) values))
+                     uniformity
                      (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
                        (case (:source idx)
                          (:group :group-count) all-uniform
                          :local lane-varying
                          :subgroup subgroup-uniform
                          :lane lane-varying)
-                       (expression-uniformity (:expression idx) values))]
+                       (:uniformity computed-info))]
                  (assoc values (:id idx)
                         {:type (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
                                  :int
-                                 (:type (expression-info! (:expression idx) values)))
+                                 (:type computed-info))
                          :range (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
                                   ;; Hardware ids have target-dependent launch ranges.  Until a
                                   ;; launch contract proves one, they are ordinary full-width
                                   ;; ints, never implicit no-overflow evidence.
                                   (scalar-range/for-dtype :int)
-                                  (:range (expression-info! (:expression idx) values)))
+                                  (:range computed-info))
                          :nonnegative?
                          (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
                            true
