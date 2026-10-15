@@ -4,7 +4,8 @@
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-map-element-test :as element]
             [raster.ad.normalized-surface-map-test :as surface]
-            [raster.compiler.ir.abstract-value :as av]))
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.soac-dialect :as soac]))
 
 (defn- bundle [program]
   (normalized/linearize-map-program program (the-ns 'raster.ad.normalized-map-runtime-test)))
@@ -82,6 +83,56 @@
       (is (= :ad-map-runtime-array (reason #(pullback (float-array 2)))))
       (is (= :ad-map-runtime-array
              (reason #((:jvp prepared) (args prepared valid) (double-array 1))))))))
+
+(deftest nonindexed-context-preserves-port-order-errors-and-minimal-saves
+  (doseq [[dt array cast] [[:float float-array float] [:double double-array double]]
+          [dimension-dtype dimension-cast wrong-dimension-cast]
+          [[:long long int] [:int int long]]]
+    (let [source (#'element/map-program
+                  dt {:captures '[scale bias]
+                      :body '(raster.numeric/+ (raster.numeric/* element scale) bias)
+                      :values {'n (av/tensor {:dtype dimension-dtype :shape []})}})
+          ;; Public input order is not executable capture/array order. Bias is
+          ;; needed by the primal, but not by the derivative's retained state.
+          source (soac/make (-> (soac/facts source)
+                                (assoc :inputs '[scale x n bias]))
+                            (soac/equations source) (soac/outputs source))
+          prepared (runtime/prepare (bundle source))
+          x (array [1.0 2.0])
+          valid {'scale (cast 3.0) 'x x
+                 'n (dimension-cast 2) 'bias (cast 5.0)}
+          wrong-scalar (if (= dt :float) (double 3.0) (float 3.0))
+          call (fn [environment] ((:vjp prepared) (args prepared environment)))]
+      (is (= '[scale x n bias] (:inputs prepared)))
+      (is (= :ad-map-runtime-arity (reason #((:vjp prepared) []))))
+      (doseq [extent [-1 (inc (long Integer/MAX_VALUE)) 2.0]]
+        (is (= :ad-map-runtime-extent
+               (reason #(call (assoc valid 'n extent 'x nil 'scale wrong-scalar))))))
+      (is (= :ad-map-runtime-extent-type
+             (reason #(call (assoc valid 'n (wrong-dimension-cast 2) 'x nil)))))
+      (is (= :ad-map-runtime-array
+             (reason #(call (assoc valid 'x (array 1) 'scale wrong-scalar)))))
+      (is (= :ad-map-runtime-capture
+             (reason #(call (assoc valid 'scale wrong-scalar)))))
+      (let [[output pullback] (call valid)
+            invoke-var #'runtime/invoke
+            invoke @invoke-var
+            saved (atom nil)
+            seed (array [0.5 -1.0])
+            gradients (with-redefs-fn
+                        {invoke-var (fn [executable environment]
+                                      (reset! saved environment)
+                                      (invoke executable environment))}
+                        #(pullback seed))]
+        (is (= (mapv cast [8.0 11.0]) (vec output)))
+        (is (= [nil (mapv cast [1.5 -3.0]) nil nil]
+               (mapv #(when (some? %) (vec %)) gradients)))
+        (is (= (dimension-cast 2) (get @saved 'n)))
+        (is (= (cast 3.0) (get @saved 'scale)))
+        (is (not-any? #(contains? @saved %) '[bias x]))
+        (is (not-any? #(or (identical? x %) (identical? output %)) (vals @saved)))
+        (is (= #{'n 'scale}
+               (set (filter #(contains? valid %) (keys @saved)))))))))
 
 (deftest direct-port-shapes-use-only-literal-or-typed-integral-dimensions
   (let [long-shape (av/tensor {:dtype :long :shape []})
