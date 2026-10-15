@@ -104,10 +104,12 @@
             forged (assoc forged :certificate (#'normalized/certificate forged))]
         (is (= expected
                (reason #(normalized/validate! forged))))))
-    (doseq [[active-inputs expected] [[(vec (butlast active)) :ad-normalized-map-interface]
+    (doseq [[active-inputs expected] [[(vec (butlast active)) :ad-normalized-map-node-derivation]
                                       ;; Ordered activity uniqueness is now a node-proof premise.
                                       ['[weights weights] :ad-normalized-map-node-proof]
-                                      [(vec (reverse active)) :ad-normalized-map-interface]]]
+                                      ;; Retained scalar activity is replayed before the complete
+                                      ;; generated map interface is compared.
+                                      [(vec (reverse active)) :ad-normalized-map-node-derivation]]]
       (let [forged (assoc-in bundle [:map-programs :interface :active-inputs] active-inputs)
             forged (assoc forged :certificate (#'normalized/certificate forged))]
         (is (= expected
@@ -269,7 +271,8 @@
                     (assoc-in [:map-programs :interface :active-inputs] '[xs weights])
                     (update-in [:map-programs :interface :tangent-inputs] conj 'forged-tangent)
                     (update-in [:map-programs :interface :gradient-outputs] conj 'forged-gradient))]
-      (is (= :ad-normalized-map-interface
+      ;; The retained scalar witness cannot justify the forged outer activity expansion.
+      (is (= :ad-normalized-map-node-derivation
              (reason #(normalized/validate! (recertify multi))))))))
 
 (deftest frontend-bookkeeping-is-checked-before-map-prefix-projection

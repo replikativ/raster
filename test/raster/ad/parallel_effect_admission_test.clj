@@ -1,5 +1,5 @@
 (ns raster.ad.parallel-effect-admission-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.ad.reverse :as rev]
             [raster.ad.jvp :as jvp]
@@ -75,6 +75,65 @@
     (is (= :ad-unsupported-active-parallel-region
            (try (construct source) nil
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftm unsupported-direct-contract [x :- Double] :- Double
+  (let [out (double-array 1)]
+    ;; The linter has no hook for this primitive's axis binders.
+    #_{:clj-kondo/ignore [:unresolved-symbol]}
+    (par/contract out [[s 1]] [[i 2]] (n/* x x))
+    (ra/aget out 0)))
+
+(deftm unsupported-direct-product-reduce [x :- Double] :- Double
+  (let [out (double-array 1)]
+    ;; Component/combine binders are scoped by the compiler primitive.
+    #_{:clj-kondo/ignore [:unresolved-symbol]}
+    (par/product-reduce! [out] [[acc 0.0 :double]] [[s 1]] i 2
+      [] [(n/* x x)] [[left right]] [] [(n/+ left right)] {})
+    (ra/aget out 0)))
+
+(deftm unsupported-direct-segmented-fold-map [x :- Double] :- Double
+  (let [out (double-array 1)]
+    (par/segmented-fold-map! [out] [[s 1]] i 1
+      [[acc 0.0 :double 2 (n/+ acc (n/* x x))]] [acc])
+    (ra/aget out 0)))
+
+(deftm unsupported-direct-exclusive-scan [x :- Double] :- Double
+  (let [out (double-array 3)]
+    (par/scan-exclusive out acc 0.0 _i 2 double (n/+ acc (n/* x x)))
+    (ra/aget out 2)))
+
+(deftm unsupported-direct-scatter-add
+  [x :- Double indices :- (Array long)] :- Double
+  (let [src (par/map [i 2] (n/* x x))
+        out (double-array 1)]
+    (par/scatter! out src indices 2)
+    (ra/aget out 0)))
+
+(deftest direct-combinator-ad-capabilities-refuse-unsupported-active-regions
+  ;; Primal compiler support does not establish an AD capability. Every case is
+  ;; the nonconstant polynomial 2*x*x, so accepting a zero derivative is wrong.
+  ;; When a scoped derivative is implemented, update that case's capability
+  ;; expectation and exercise its analytic derivative (12) / seeded JVP (3),
+  ;; rather than weakening this refusal into acceptance of an arbitrary result.
+  (doseq [[combinator source extra-arguments]
+          [[:contract #'unsupported-direct-contract []]
+           [:product-reduce #'unsupported-direct-product-reduce []]
+           [:segmented-fold-map #'unsupported-direct-segmented-fold-map []]
+           [:exclusive-scan #'unsupported-direct-exclusive-scan []]
+           [:scatter-add #'unsupported-direct-scatter-add [(long-array [0 0])]]]]
+    (testing (name combinator)
+      (let [primal #(apply source % extra-arguments)
+            x 3.0 h 0.125]
+        (is (= 18.0 (primal x)))
+        (is (= 12.0 (/ (- (primal (+ x h)) (primal (- x h))) (* 2.0 h))))))
+    (doseq [[mode construct] [[:reverse rev/value+grad] [:jvp jvp/jvp]]]
+      (testing (str (name combinator) " " (name mode) " construction")
+        ;; Refusal must occur while constructing the derivative: there is no
+        ;; derivative invocation here whose failure could disguise admission.
+        (is (= :ad-unsupported-active-parallel-region
+               (try (construct source :wrt [0]) nil
+                    (catch clojure.lang.ExceptionInfo error
+                      (:reason (ex-data error))))))))))
 
 (deftm fresh-gather-sum
   [src :- (Array double) indices :- (Array long) size :- Long] :- Double

@@ -261,7 +261,9 @@
     (let [bundle (build program 'xs)
           changed (assoc-in bundle [:map-programs :interface :active-inputs] ['weights])
           changed (assoc changed :certificate (#'normalized/certificate changed))]
-      (is (= :ad-normalized-map-interface (reason #(normalized/validate! changed)))))
+      ;; The retained scalar witness is now checked against selected activity
+      ;; before reconstructing the outer map interface.
+      (is (= :ad-normalized-map-node-derivation (reason #(normalized/validate! changed)))))
     (let [one (#'element/map-program :double)]
       (is (= '[element] (:active-inputs (normalized/linearize-map-element one source-ns)))))))
 
@@ -310,7 +312,8 @@
         forged (assoc forged :certificate (#'normalized/certificate forged))]
     (with-redefs-fn {invoke (fn [& _] (swap! executions inc))}
       (fn []
-        (is (= :ad-normalized-map-interface (reason #(runtime/prepare forged))))
+        ;; Reject the inconsistent node witness before any runtime invocation.
+        (is (= :ad-normalized-map-node-derivation (reason #(runtime/prepare forged))))
         (with-redefs-fn {revisions (constantly (update current :template-revision inc))}
           (fn []
             (is (= :ad-normalized-stale-rules (reason #((:vjp prepared) arguments))))

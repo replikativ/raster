@@ -88,6 +88,56 @@
 (defn- fmul [left right] (float (* (float left) (float right))))
 (defn- fadd [left right] (float (+ (float left) (float right))))
 (defn- fbits [x] (Float/floatToRawIntBits (float x)))
+
+(deftest one-node-lifecycle-allocates-once-and-replays-retained-identities
+  (let [source (frontend/form->program
+                '(let* [paired (raster.par/pmap i n float
+                                                (raster.numeric/*
+                                                 (clojure.core/aget x i)
+                                                 (clojure.core/aget q i)))
+                        output (raster.par/pmap j n float
+                                                (raster.numeric/*
+                                                 (clojure.core/aget paired j)
+                                                 (clojure.core/aget r j)))]
+                       output)
+                {:dtype :float :array-types {'x :float 'q :float 'r :float}
+                 :scalar-types {'n :long}})
+        bundle (normalized/linearize-map-chain-program
+                source (the-ns 'raster.ad.normalized-map-chain-test)
+                {:active-input 'r})
+        ordered-bundle (normalized/linearize-map-chain-program
+                        source (the-ns 'raster.ad.normalized-map-chain-test)
+                        {:active-inputs '[r q x]})
+        phases (select-keys (:map-programs bundle) [:primal :linear :transpose])
+        reject-allocation (fn [& _]
+                            (throw (ex-info "retained replay allocated an identity" {})))
+        rebuilt (with-redefs-fn
+                  {#'normalized/allocate-map-stage-interface reject-allocation
+                   #'normalized/node-equation-ids reject-allocation}
+                  #(#'normalized/reconstructed-map-proof bundle))
+        node-path [:map-programs :proof :nodes]]
+    (is (= [false true]
+           (mapv #(contains? % :scalar-derivation) (get-in bundle node-path))))
+    (is (every? (fn [phase]
+                  (fingerprint/equivalent? (get phases phase) (get rebuilt phase)))
+                [:primal :linear :transpose]))
+    (let [nodes (get-in ordered-bundle node-path)
+          residuals (mapv #(vec (vals (get-in % [:stage-interface :residual-arrays]))) nodes)
+          expected-outputs (into [(first (soac/outputs source))] (mapcat identity residuals))]
+      (is (< 1 (count (first residuals))))
+      (is (= expected-outputs
+             (soac/outputs (get-in ordered-bundle [:map-programs :primal])))))
+    (is (= :ad-normalized-map-node-derivation
+           (reason (fn []
+                     (#'normalized/reconstructed-map-proof
+                      (assoc-in bundle (conj node-path 1 :scalar-derivation) nil))))))
+    (doseq [changed [(assoc-in bundle (conj node-path 0 :equation-ids :linear)
+                               'forged-inactive-linear)
+                     (update-in bundle (conj node-path 1 :equation-ids) dissoc :linear)
+                     (assoc-in bundle (conj node-path 1 :equation-ids :extra)
+                               'forged-active-extra)]]
+      (is (= :ad-normalized-map-node-interface
+             (reason (fn [] (#'normalized/reconstructed-map-proof changed))))))))
 (defn- square-push [x dx] (fadd (fmul dx x) (fmul dx x)))
 
 (defn- alter-facts [program f]
