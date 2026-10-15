@@ -953,7 +953,7 @@ fresh interfaces and construction correspondence, including semantic metadata an
 owned residuals. Known frontend binding bookkeeping is projected only after its
 complete two-binding envelope and absent host activity have been checked; unknown
 attributes are not stripped. No derivative rules or numerical interpreter are added.
-The host consumer adapts admitted legacy evidence once at its preparation boundary. All
+The host consumer adapts admitted normalized evidence once at its preparation boundary. All
 three supported families then execute the canonical primal/linear/transpose programs,
 ordered input/value interfaces, owned residual bindings and physical requirements. It
 does not rebuild a separate runtime interface or execute a legacy program facet. Family
