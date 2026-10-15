@@ -97,6 +97,46 @@
             (gp/gpu-capability-skip! "scale-clamp-exp backward Double controls"
                                      :fp64? caps)))))))
 
+(defn- check-dot-rows-dh! [target make-array dtype]
+  (let [rows 17 dim 257
+        cases [[(mapv #(* 0.125 (- % 8)) (range rows))
+                (mapv #(* 0.03125 (- (mod % 17) 8)) (range dim))]
+               [(mapv #(* 0.0625 (- 10 %)) (range rows))
+                (mapv #(* 0.015625 (- (mod % 23) 11)) (range dim))]]
+        [initial-dy initial-w] (mapv make-array (first cases))
+        executable (compiled/instantiate!
+                    (compiled/lower #'ops/dot-rows-dh [initial-dy initial-w rows dim]
+                                    {:compiler :equation-first :target target :dtype dtype}))]
+    (try
+      (doseq [[dy-values w-values] cases]
+        (let [dy (make-array dy-values) w (make-array w-values)
+              before (mapv array-bits [dy w])
+              ;; Exact dyadic products are an independent oracle for both storage types.
+              expected (make-array (for [v (range rows) d (range dim)]
+                                     (* (nth dy-values v) (nth w-values d))))
+              actual (value/->host
+                      (:result (compiled/invoke-compiled executable {:dy dy :W w})))]
+          (is (= (class expected) (class actual)) (str target " " dtype))
+          (is (= (array-bits expected) (array-bits actual)) (str target " " dtype " all 4369 products"))
+          (is (= before (mapv array-bits [dy w])) "changed inputs remain immutable")))
+      (finally (compiled/close! executable)))))
+
+(deftest dot-rows-dh-replays-changed-inputs-on-both-device-routes
+  (doseq [[target available? skip!] [[:ocl:0 ocl/opencl-available? ocl/opencl-skip!]
+                                    [:ze:0 gp/gpu-available? gp/gpu-skip!]]]
+    (if-not @available?
+      (skip! (str "dot-rows-dh on " target))
+      (do
+        (check-dot-rows-dh! target float-array :float)
+        (let [caps (when (= target :ze:0)
+                     ((requiring-resolve 'raster.gpu.ze-runtime/module-capabilities)))
+              fp64? (if (= target :ocl:0) @ocl/opencl-fp64-available? (:fp64? caps))]
+          (if fp64?
+            (check-dot-rows-dh! target double-array :double)
+            (if (= target :ocl:0)
+              (ocl/opencl-skip! "dot-rows-dh Double" :fp64)
+              (gp/gpu-capability-skip! "dot-rows-dh Double" :fp64? caps))))))))
+
 (deftm mixed-norm-tail!
   [dy :- (Array float), x :- (Array float), weight :- (Array float),
    inv :- (Array float), dot :- (Array float), out :- (Array float),

@@ -198,8 +198,12 @@
    is the typed scalar equation's result. Compound arithmetic requires its own retained dtype and
    must already be long; int arithmetic may wrap or trap before widening and therefore declines.
    The only implicit conversion this projection inserts is exact int-to-long leaf widening.
+   Optional authoritative, invocation-specific leaf ranges permit a long-to-int cast ONLY when
+   its source proves to be one representable constant; variable narrowing still declines.
    This is the graph-launch counterpart of scalar KernelBody lowering, not source type inference."
-  [expression scope leaf-dtype expected-dtype decline!]
+  ([expression scope leaf-dtype expected-dtype decline!]
+   (lower-typed expression scope leaf-dtype expected-dtype decline! nil))
+  ([expression scope leaf-dtype expected-dtype decline! leaf-ranges]
   (letfn [(source-dtype [form]
             (or (when (instance? raster.compiler.ir.kernel_body.Literal form) (:type form))
                 (some-> (or (:raster.type/tag (meta form)) (:tag (meta form)))
@@ -214,6 +218,14 @@
                 (= source target) lowered
                 (and (= :int source) (= :long target))
                 (body/index-cast lowered :long :exact)
+                (and leaf-ranges (= :long source) (= :int target))
+                (let [range (scalar-range/typed-index-range lowered leaf-dtype leaf-ranges)]
+                  (if (and range (integer? (:lower range)) (= (:lower range) (:upper range))
+                           (scalar-range/contained-in-dtype? range target))
+                    (body/index-cast (:lower range) target :exact)
+                    (decline! :index-expression-dtype
+                              "typed index narrowing requires one representable constant"
+                              {:expression form :source source :target target})))
                 :else
                 (decline! :index-expression-dtype
                           "typed launch arithmetic permits only exact integral widening"
@@ -256,7 +268,7 @@
                                     "an exact index cast requires its argument's retained dtype"
                                     {:expression form :argument argument :dtype source}))
                       lowered (lower* argument source)]
-                  (coerce lowered source target form))
+                  (coerce (coerce lowered source target form) target expected form))
 
                 (seq? form)
                 (let [operator (get operators (descriptor/semantic-op form))
@@ -292,7 +304,7 @@
         (decline! :index-expression-dtype
                   "typed launch result requires an integral retained dtype"
                   {:expression expression :dtype expected-dtype}))
-      (lower* expression expected))))
+      (lower* expression expected)))))
 
 (defn to-launch-expression
   "Project non-negative KernelBody index arithmetic into resolvable host launch IR.

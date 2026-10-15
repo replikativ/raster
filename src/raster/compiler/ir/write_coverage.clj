@@ -143,7 +143,8 @@
 (defn- expression-range [expression types intervals]
   (let [typed (index-expression/lower-typed
                expression (set (keys types)) types :long
-               (fn [reason message data] (throw (ex-info message (assoc data :reason reason)))))]
+               (fn [reason message data] (throw (ex-info message (assoc data :reason reason))))
+               intervals)]
     (ranges/typed-index-range typed types intervals)))
 
 (defn- unique-scatter-covers?
