@@ -9,19 +9,22 @@
   tangent algebra acts at STAGE time and emits monomorphic code.
 
   Runtime `nil` remains the dynamic ⊕-identity (grad-acc handles it);
-  ⊥ (no tangent space — Long/Boolean/Object slots) remains STATIC:
+  ⊥ (no tangent space — primitive integral/Boolean slots) remains STATIC:
   `differentiable?` is the type-level ⊥ test that activity analysis
   abstracts.
 
   Tag vocabulary is the :raster.type/tag / deftm-tags symbols:
     double float          → scalar tangent spaces
     doubles floats        → array tangent spaces
-    long longs int ints boolean Object … (and nil) → ⊥ (no tangent space)
+    long longs int ints boolean … → ⊥ (no tangent space)
+    Object, reference tags, and nil     → unknown (not evidence of ⊥)
 
-  Dependency-light BY DESIGN: no requires. Both raster.ad.reverse and
+  Dependency-light BY DESIGN: only the compiler's retained JVM tag vocabulary
+  is required. Both raster.ad.reverse and
   raster.compiler.ad.flatten (and compiler passes) may require this ns
   without creating cycles."
-  (:refer-clojure :exclude []))
+  (:refer-clojure :exclude [])
+  (:require [raster.compiler.core.types :as types]))
 
 (def ^:private scalar-tag->dtype {'double :double 'float :float})
 (def ^:private array-tag->dtype  {'doubles :double 'floats :float})
@@ -29,29 +32,33 @@
 (defn tangent-kind
   "Classify a primal type tag into its tangent space.
   Returns {:kind :scalar|:array, :dtype :double|:float} for tags with a
-  tangent space, {:kind :none} for ⊥ tags (integers, booleans, Object,
-  untagged/nil — no tangent space or statically unknown)."
+  tangent space, {:kind :none} for proven ⊥ primitive tags, and
+  {:kind :unknown} when the tag supplies no tangent-space evidence."
   [tag]
   (if-let [dt (scalar-tag->dtype tag)]
     {:kind :scalar :dtype dt}
     (if-let [dt (array-tag->dtype tag)]
       {:kind :array :dtype dt}
-      {:kind :none})))
+      (if (or (and (contains? types/primitive-info tag)
+                   (not (contains? scalar-tag->dtype tag)))
+              (and (contains? types/primitive-array-info tag)
+                   (not (contains? array-tag->dtype tag))))
+        {:kind :none}
+        {:kind :unknown}))))
 
 (defn differentiable?
-  "Type-level ⊥ test: does `tag` denote a tangent space that carries
-  gradient? Reverse AD's shared runtime/compiler preparation delegates
-  to this single type-level source of truth."
+  "Does `tag` positively denote a tangent space that carries gradient?
+  False includes both proven NoTangent and Unknown; admission callers must
+  inspect `tangent-kind` rather than treating false as proof of inactivity."
   [tag]
-  (not= :none (:kind (tangent-kind tag))))
+  (contains? #{:scalar :array} (:kind (tangent-kind tag))))
 
 (defn tangent-tag
   "Π — the tangent-type projection on TAGS (.internal/ad_formal_framework.md
   §5, item #1): maps a PRIMAL's :raster.type/tag to the tag of its
   tangent/cotangent space. Identity on the differentiable tags
   (double/float scalars, doubles/floats arrays — exactly the tags
-  `differentiable?` accepts), nil for everything else — ⊥/no-tangent
-  (integers, booleans, Object) AND unknown (nil in, nil out).
+  `differentiable?` accepts), nil for everything else — proven ⊥ or unknown.
 
   The single seam every AD emission site asks instead of copying the
   primal tag ad hoc or defaulting a dtype: a nil result means the
@@ -83,13 +90,16 @@
 
 (defn seed-expr
   "IR expression for the typed seed cotangent (1̄) of a SCALAR loss with
-  type `tag`. nil/unknown tags fall back to the double 1.0 (the loss of a
-  value+grad is scalar by contract; array tags fail loud)."
+  type `tag`. Untagged/unknown and proven NoTangent tags retain the legacy
+  scalar-loss Double seed; array tags fail loud. Parameter admission is the
+  safety boundary for Unknown in this slice; internal result-tag propagation
+  and seed precision are separate work."
   [tag]
   (let [{:keys [kind dtype]} (tangent-kind tag)]
     (case kind
       :scalar (case dtype :float (list 'float 1.0) :double 1.0)
       :none 1.0
+      :unknown 1.0
       (throw (ex-info (str "Seed requires a scalar loss; got array tag " (pr-str tag))
                       {:tag tag})))))
 

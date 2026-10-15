@@ -663,7 +663,8 @@
     (is (= {:kind :array :dtype :float} (tangent/tangent-kind 'floats)))
     (is (= {:kind :scalar :dtype :double} (tangent/tangent-kind 'double)))
     (is (= {:kind :none} (tangent/tangent-kind 'long)))
-    (is (= {:kind :none} (tangent/tangent-kind nil)) "untagged = statically unknown = ⊥")
+    (is (= {:kind :unknown} (tangent/tangent-kind nil))
+        "untagged is Unknown, never proof of ⊥")
     (is (= (list 'float-array 'n) (tangent/zero-expr 'floats 'n)))
     (is (= 0.0 (tangent/zero-expr 'double 'n)))
     (is (thrown? clojure.lang.ExceptionInfo (tangent/zero-expr nil 'n))
@@ -1678,7 +1679,10 @@
 (deftest normal-log-density-differentiates-through-variadic-arithmetic
   (let [d (dist/->Normal 0.3 1.2)
         x 1.0
-        [value dd dx] ((rev/value+grad #'laws-normal-logpdf) d x)]
+        refusal (try (rev/value+grad #'laws-normal-logpdf) nil
+                     (catch clojure.lang.ExceptionInfo e (ex-data e)))
+        [value dd dx] ((rev/value+grad #'laws-normal-logpdf :wrt [1]) d x)]
+    (is (= :ad-unknown-tangent-space (:reason refusal)))
     (is (close? value (dist/logpdf d x) 1e-12))
     (is (nil? dd) "the distribution record is not an active scalar parameter")
     (is (close? dx (/ (- 0.3 x) (* 1.2 1.2)) 1e-12))

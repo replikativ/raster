@@ -1,5 +1,59 @@
 # Automatic Differentiation in Raster
 
+## Implementation status and consolidation contract (October 15, 2026)
+
+The source-transform AD engine remains the default. The normalized AD path is opt-in:
+it derives checked primal, linear and transpose programs for a bounded subset of pure
+TypedSOAC programs. Shared scalar rules do not yet imply one shared program-composition
+engine. The examples and CPU timings below are historical receipts, not current
+whole-model acceptance or cross-backend performance guarantees.
+
+The consolidation target is one typed program boundary:
+
+```
+linearize(f, x) -> (y, residual, linear-program)
+push(residual, dx) -> dy
+pull(residual, dy) -> dx
+```
+
+Extend the existing normalized program envelope rather than introducing another AD IR,
+rule registry or execution-plan schema. Scalar templates and operation descriptors remain
+the derivative-rule authority; graph activity, topological propagation and ordered fan-out
+accumulation belong to the structural transform. Keep separate obligations separate:
+derivative laws, primal/derivative correspondence, target admissibility, physical storage
+and execution lifetime are not interchangeable certificates.
+
+Type admission must distinguish a known tangent space, a proven absence of one, and
+insufficient type information. Activity is a separate question: an explicit `:wrt`
+exclusion is not evidence that a type has no tangent space. Neither an unknown type nor
+an unsupported derivative may silently become a zero gradient. Retain the actual
+Float/Double computational checkpoints; an interface return annotation alone does not
+authorize changing the precision of an internal derivative.
+
+The first admission slice is deliberately conservative at public parameter boundaries:
+default selection includes all parameters and refuses Unknown; explicit `:wrt` can
+exclude unknown-typed controls. A named `reified-grad` parameter is an explicit selection.
+Source JVP accepts `:wrt` too: its arguments are all original primals followed by tangent
+arguments for selected parameters in source order; it requires a nonempty tangent selection.
+This does not establish inactivity through `stop-gradient` for an unknown-typed public
+parameter: use explicit exclusion. Internal generated locals and legacy scalar-loss seed
+fallbacks are not newly admitted or made more precise by this change. Proving inactivity
+and preserving types throughout those internal programs belongs to the structural work.
+
+External AD is an explicitly opaque block with independently declared push/pull,
+batching and higher-order capabilities. A VJP-only block does not support JVP or HVP
+merely because its pullback is callable. Its residual must retain the exact primal and
+parameter versions and own any foreign resources until completion. Initial qualification
+should use synchronous CPU copies and analytic/finite-difference oracles; device sharing
+additionally needs layout, ownership, mutation and stream/event synchronization proofs.
+Sharing storage does not share an AD graph or establish cross-engine kernel fusion.
+Function inversion and log-Jacobian capabilities remain distinct from transposition.
+
+Implementation order, acceptance gates and the original compiler obligations are retained
+in [the compiler campaign](compiler-unification-campaign.md#ad-consolidation-sequence).
+
+## Surface model
+
 Raster differentiates ordinary `deftm` code. Because every arithmetic op
 (`raster.numeric/+`, `raster.math/sin`, `raster.dl.nn/linear-nb`, …) is a typed
 multiple-dispatch function, the *same* op definition runs with plain numbers, with

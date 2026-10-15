@@ -17,6 +17,22 @@
 (r/deftm quad-loss [x :- Double, y :- Double] :- Double
   (raster.numeric/+ (raster.numeric/* x x) (raster.numeric/* y y)))
 
+(r/deftm unknown-active-loss [x :- Object] :- Double
+  (double x))
+
+(r/deftm unknown-stopped-loss [x :- Object, y :- Double] :- Double
+  (raster.numeric/+ (double (raster.ad.forward/stop-gradient x))
+                    (raster.numeric/* y y)))
+
+(r/deftm unknown-straight-through-loss [f :- Object, x :- Double] :- Double
+  (raster.ad.forward/straight-through f x))
+
+(r/deftm float-stopped-loss [x :- Float] :- Float
+  (raster.ad.forward/stop-gradient x))
+
+(r/deftm double-integral-cast-loss [x :- Double] :- Double
+  (double (long x)))
+
 (r/deftm forward-rounded-primal [x :- Double] :- Double (double (float x)))
 (r/deftm forward-integral-primal [x :- Double] :- Double (double (long x)))
 (r/deftm forward-qualified-rounded-primal [x :- Double] :- Double
@@ -171,6 +187,101 @@
           [val dx] (vg 2.0)]
       (is (= 8.0 val) "f(2) = 8")
       (is (= 12.0 dx) "df/dx = 3x^2 = 12"))))
+
+(deftest source-jvp-explicit-parameter-selection-test
+  (let [select-y ((requiring-resolve 'raster.ad.jvp/jvp) #'quad-loss :wrt [1])
+        reversed ((requiring-resolve 'raster.ad.jvp/jvp) #'quad-loss :wrt [1 0])]
+    (is (= [25.0 8.0] (select-y 3.0 4.0 1.0))
+        "unselected known primals retain their argument but have no tangent slot")
+    (is (= '[x y dy__jt]
+           (mapv #(symbol (name %)) (:raster.core/deftm-params (meta select-y)))))
+    (is (= [25.0 5.0] (reversed 3.0 4.0 0.5 0.25))
+        "selected tangent slots retain source parameter order, not request order"))
+  (doseq [[options expected]
+          [[[:wrt :x] :ad-wrt]
+           [[:wrt []] :ad-no-tangent-parameters]
+           [[:compile? true] :ad-source-jvp-options]]]
+    (is (= expected
+           (:reason (try (apply (requiring-resolve 'raster.ad.jvp/jvp)
+                                #'quad-loss options)
+                         nil
+                         (catch clojure.lang.ExceptionInfo e (ex-data e))))))))
+
+(deftest unknown-tangent-parameter-admission-test
+  (testing "missing type evidence cannot grant inactivity"
+    (doseq [construct [(fn [] (rev/value+grad #'unknown-active-loss))
+                       (fn [] (rev/value+grad #'unknown-active-loss :wrt [0]))]]
+      (let [failure (try (construct) nil
+                         (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= :ad-unknown-tangent-space (:reason failure))))))
+  (testing "explicit :wrt exclusion is authoritative, including across gradient controls"
+    (is (= [2.0 nil]
+           ((rev/value+grad #'unknown-active-loss :wrt []) 2.0)))
+    (is (= [11.0 nil 6.0]
+           ((rev/value+grad #'unknown-stopped-loss :wrt [1]) 2.0 3.0)))
+    (is (= [2.0 nil 1.0]
+           ((rev/value+grad #'unknown-straight-through-loss :wrt [1])
+            #(Math/floor (double %)) 2.75))))
+  (testing "malformed :wrt is rejected by the admission boundary"
+    (let [failure (try (rev/value+grad #'quad-loss :wrt :x) nil
+                       (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= :ad-wrt (:reason failure)))))
+  (testing "forward coverage reports Unknown instead of calling it constant"
+    (let [coverage (rev/forward-coverage #'unknown-active-loss)]
+      (is (false? (:admissible? coverage)))
+      (is (= '[x] (:unknown-params coverage)))
+      (is (empty? (:constant-params coverage)))
+      (is (= :ad-unknown-tangent-space
+             (:reason (try ((requiring-resolve 'raster.ad.jvp/jvp)
+                            #'unknown-active-loss)
+                           nil
+                           (catch clojure.lang.ExceptionInfo e (ex-data e))))))
+      (is (= :ad-unknown-tangent-space
+             (:reason (try ((requiring-resolve 'raster.ad.jvp/jvp)
+                            #'unknown-active-loss :wrt [0])
+                           nil
+                           (catch clojure.lang.ExceptionInfo e (ex-data e))))))))
+  (testing "every public automatic/selected mode refuses Unknown before invocation"
+    (doseq [construct [(fn [] (rev/value+grad #'unknown-active-loss :mode :auto))
+                       (fn [] (rev/value+grad #'unknown-stopped-loss))
+                       (fn [] (rev/value+grad #'unknown-straight-through-loss))
+                       (fn [] ((requiring-resolve 'raster.ad.jvp/hvp)
+                               #'unknown-active-loss))
+                       (fn [] (rev/reified-grad #'unknown-active-loss 'x))]]
+      (is (= :ad-unknown-tangent-space
+             (:reason (try (construct) nil
+                           (catch clojure.lang.ExceptionInfo e (ex-data e)))))))
+    (let [failure (try (rev/value+grad #'unknown-active-loss :mode :forward) nil
+                       (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= '[x] (:unknown-params failure))
+          "forward construction reports the unknown slot without executing a primal")))
+  (testing "a named known parameter may exclude an unrelated Object control"
+    (is (= 6.0 ((rev/reified-grad #'unknown-stopped-loss 'y) 2.0 3.0))))
+  (testing "known Float/Double zero-flow paths retain typed values and gradients"
+    (let [[fv fd] ((rev/value+grad #'float-stopped-loss) (float 2.5))
+          [dv dd] ((rev/value+grad #'double-integral-cast-loss) 2.75)]
+      (is (= [Float Float] (mapv class [fv fd])))
+      (is (= [Double Double] (mapv class [dv dd])))
+      (is (zero? fd))
+      (is (zero? dd)))))
+
+(deftest vjp-cache-includes-parameter-type-evidence-test
+  (let [v (rev/resolve-deftm-var #'quad-loss)
+        original-tags (:raster.core/deftm-tags (meta v))]
+    (try
+      (let [[_ held-pullback] (rev/vjp v 2.0 3.0)]
+        (alter-meta! v assoc :raster.core/deftm-tags [nil 'double])
+        (let [failure (try (rev/vjp v 2.0 3.0) nil
+                           (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+          (is (= :ad-unknown-tangent-space (:reason failure))
+              "an unchanged walked body must not reuse a VJP admitted under older tags"))
+        (is (= [4.0 6.0] (held-pullback 1.0))
+            "an already acquired pullback retains its admitted snapshot"))
+      (finally
+        (alter-meta! v assoc :raster.core/deftm-tags original-tags)))
+    (let [[_ restored-pullback] (rev/vjp v 2.0 3.0)]
+      (is (= [4.0 6.0] (restored-pullback 1.0))
+          "a post-restore acquisition uses the restored type evidence"))))
 
 (deftest vjp-cache-observes-nested-rule-replacement-test
   (testing "fresh VJP acquisition recompiles after merge; acquired pullbacks remain snapshots"

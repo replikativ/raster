@@ -230,11 +230,55 @@
 
 (declare vjp)
 
-(def ^:private differentiable-tag?
-  "Param tags that carry gradient. Floating-point arrays and scalars only —
-  Long/long, longs (indices), Boolean, Object, etc. are never differentiated.
-  Delegates to the tangent-type protocol (Π) — the type-level ⊥ test."
-  tangent/differentiable?)
+(defn ^:no-doc tangent-parameter-plan
+  "Classify an ordered parameter boundary without treating missing type evidence as NoTangent.
+   Default selection includes every parameter, so any Unknown refuses before transformation.
+   Explicit :wrt exclusion is authoritative; explicitly selecting an Unknown or NoTangent slot
+   also refuses before transformation."
+  [params tags wrt]
+  (let [parameter-count (count params)
+        _ (when-not (= parameter-count (count tags))
+            (throw (ex-info "Parameter tags must align exactly with parameters"
+                            {:reason :ad-parameter-tags
+                             :parameter-count parameter-count :tags tags})))
+        _ (when-not (or (nil? wrt) (sequential? wrt))
+            (throw (ex-info ":wrt must be a sequence of distinct zero-based parameter indices"
+                            {:reason :ad-wrt :wrt wrt :parameter-count parameter-count})))
+        requested (when (some? wrt) (set wrt))
+        valid (set (range parameter-count))]
+    (when-not (or (nil? wrt)
+                  (and (= (count wrt) (count requested))
+                       (every? valid requested)))
+      (throw (ex-info ":wrt must be a sequence of distinct zero-based parameter indices"
+                      {:reason :ad-wrt :wrt wrt :parameter-count parameter-count})))
+    (let [spaces (mapv tangent/tangent-kind tags)]
+      (when (nil? requested)
+        (when-let [index (first (keep-indexed #(when (= :unknown (:kind %2)) %1)
+                                              spaces))]
+          (throw (ex-info "A selected parameter's tangent space is unknown"
+                          {:reason :ad-unknown-tangent-space :index index
+                           :tag (nth tags index)}))))
+      (when requested
+        (doseq [index requested]
+          (case (:kind (nth spaces index))
+            :none (throw (ex-info ":wrt selects a parameter with no tangent space"
+                                  {:reason :ad-no-tangent-parameter :index index
+                                   :tag (nth tags index)}))
+            :unknown (throw (ex-info ":wrt selects a parameter whose tangent space is unknown"
+                                     {:reason :ad-unknown-tangent-space :index index
+                                      :tag (nth tags index)}))
+            nil)))
+      (let [selected? #(or (nil? requested) (contains? requested %))
+            candidate-indices
+            (vec (keep-indexed (fn [index {:keys [kind]}]
+                                 (when (and (selected? index)
+                                            (contains? #{:scalar :array :unknown} kind))
+                                   index))
+                               spaces))]
+        {:spaces spaces
+         :candidate-indices candidate-indices
+         :candidate-params (mapv params candidate-indices)
+         :no-tangent-indices (vec (keep-indexed #(when (= :none (:kind %2)) %1) spaces))}))))
 
 (defn- auto-make-deftm-rule
   "Create a transient AD rule for a deftm op that has no explicit template.
@@ -3270,7 +3314,10 @@
                                      {:var resolved})))
           walked-body (or (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body on var" {:var resolved})))
-          cache-key [resolved walked-body]
+          ;; Parameter tags are part of the admission proof. They can change while the
+          ;; retained body remains identical (for example during deftm redefinition), so
+          ;; an old classification must never be reused across that metadata boundary.
+          cache-key [resolved walked-body params (:raster.core/deftm-tags m)]
           cache @vjp-cache
           cached (when (and (= registry-revision (:registry-revision cache))
                             (= definition-revision (:definition-revision cache)))
@@ -3285,13 +3332,17 @@
         cached cached
 
         :else
-        (let [all-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
-              tags (or (:raster.core/deftm-tags m)
-                       (vec (repeat (count params) 'double)))
-              diff-active-params (vec (keep-indexed
-                                       (fn [i p]
-                                         (when (differentiable-tag? (nth tags i nil)) p))
-                                       all-params))
+        (let [tags (or (:raster.core/deftm-tags m)
+                       (vec (repeat (count params) nil)))
+              all-params (vec (map-indexed
+                               (fn [index parameter]
+                                 (let [base (if (symbol? parameter)
+                                              parameter (symbol (name parameter)))
+                                       tag (nth tags index nil)]
+                                   (cond-> base tag (vary-meta assoc :raster.type/tag tag))))
+                               params))
+              parameter-plan (tangent-parameter-plan all-params tags nil)
+              diff-active-params (:candidate-params parameter-plan)
               transformed (with-ad-gensym
                             (transform-body
                              (ad-prepare (first walked-body)
@@ -4084,7 +4135,7 @@
                    (throw (ex-info "reified-grad requires a deftm var" {:var f-var})))
         walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
-        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
         all-params (vec (map-indexed
                          (fn [i p]
                            (let [base (if (symbol? p) p (symbol (name p)))
@@ -4093,14 +4144,15 @@
                                (with-meta base {:raster.type/tag tag})
                                (with-meta base nil))))
                          params))
-        diff-params (vec (filter #(differentiable-tag? (:raster.type/tag (meta %)))
-                                 all-params))
         param-sym (symbol (name param))
-        slot-idx (or (first (keep-indexed
-                             (fn [i p] (when (= p param-sym) i)) diff-params))
-                     (throw (ex-info (str "reified-grad: `" param "` is not a "
-                                          "differentiable param of " f-var)
-                                     {:param param :diff-params diff-params})))
+        source-slot (or (first (keep-indexed
+                                (fn [i p] (when (= p param-sym) i)) all-params))
+                        (throw (ex-info (str "reified-grad: unknown parameter `" param
+                                             "` of " f-var)
+                                        {:param param :params all-params})))
+        parameter-plan (tangent-parameter-plan all-params tags [source-slot])
+        diff-params (:candidate-params parameter-plan)
+        slot-idx 0
         param-tag (:raster.type/tag (meta (nth diff-params slot-idx)))
         array-param? (= :array (:kind (tangent/tangent-kind param-tag)))
         ;; The gradient program, assembled exactly as hvp does. ad-prepare
@@ -4178,7 +4230,7 @@
           walked-body (or (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body" {:var f-var})))
           tags (or (:raster.core/deftm-tags m)
-                   (vec (repeat (count params) 'double)))
+                   (vec (repeat (count params) nil)))
           ;; KEEP each param's :raster.type/tag (§13 A4 fix): the tangent
           ;; protocol reads it to type seeds/zeros — stripping it forced
           ;; untyped zeros downstream.
@@ -4190,12 +4242,9 @@
                                  (with-meta base {:raster.type/tag tag})
                                  (with-meta base nil))))
                            params))
-          ;; Differentiate only w.r.t. params WITH a tangent space (⊥ slots —
-          ;; Long dims etc. — get no v slot and no Hv row). All-double scalar
-          ;; fns are unchanged: every param stays active.
-          active-params (vec (filter #(differentiable-tag?
-                                       (:raster.type/tag (meta %)))
-                                     all-params))
+          parameter-plan (tangent-parameter-plan all-params tags nil)
+          ;; Proven ⊥ slots (Long dimensions, indices, controls) have no v/Hv row.
+          active-params (:candidate-params parameter-plan)
           n (count active-params)
 
         ;; Phase 1: Reify the pullback
@@ -4631,7 +4680,7 @@
                              "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
                              "For 1-param scalar fns, (grad (grad f)) composes directly.")
                         {:var f-var :tail-shape :vector :reason :tuple-valued-output}))))
-          tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+          tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
           all-params (vec (map-indexed
                            (fn [i p]
                              (let [tag (nth tags i nil)
@@ -4640,30 +4689,10 @@
                                  (with-meta base {:raster.type/tag tag})
                                  (with-meta base nil))))
                            params))
-          wrt-indices (when (some? wrt)
-                        (let [requested (set wrt)
-                              valid (set (range (count params)))]
-                          (when-not (and (sequential? wrt)
-                                         (= (count wrt) (count requested))
-                                         (every? valid requested))
-                            (throw (ex-info ":wrt must be a sequence of distinct zero-based parameter indices"
-                                            {:wrt wrt :parameter-count (count params)})))
-                          (doseq [i requested]
-                            (when-not (differentiable-tag? (nth tags i nil))
-                              (throw (ex-info ":wrt selects a non-differentiable parameter"
-                                              {:index i :tag (nth tags i nil)}))))
-                          requested))
-        ;; Only differentiable-tag params seed activity analysis. Non-diff
-        ;; params (Long/longs scalars, indices, etc.) are constants for AD —
-        ;; expressions involving only them stay inactive and don't need AD
-        ;; rules. Their grad slots are still emitted in the output vector
-        ;; (via all-params) so positional consumers don't shift.
-          diff-active-params (vec (keep-indexed
-                                   (fn [i p]
-                                     (when (and (differentiable-tag? (nth tags i nil))
-                                                (or (nil? wrt-indices)
-                                                    (contains? wrt-indices i))) p))
-                                   all-params))
+          parameter-plan (tangent-parameter-plan all-params tags wrt)
+        ;; Unknown parameters refuse above unless explicit :wrt excludes them. Proven ⊥
+        ;; parameters are positional constants and selected known tangent spaces stay ordered.
+          diff-active-params (:candidate-params parameter-plan)
           constant-gradient-arrays (set (remove (set diff-active-params)
                                                 all-params))
           source-ns (or (:ns m) *ns*)
@@ -5120,6 +5149,10 @@
                               (fn [i p]
                                 (when (= :none (:kind (tangent/tangent-kind (nth tags i nil))))
                                   p)) params))
+        unknown-params (vec (keep-indexed
+                             (fn [i p]
+                               (when (= :unknown (:kind (tangent/tangent-kind (nth tags i nil))))
+                                 p)) params))
         uncovered (->> (:call-declines conversion-plan)
                        ;; Unknown operand facts are propagated refusals, not
                        ;; evidence that an otherwise lifted consumer lacks a lift.
@@ -5131,12 +5164,14 @@
     {:resolved resolved :params params :walked-body walked-body
      :conversion-plan conversion-plan
      :coverage {:admissible? (and (empty? (:call-declines conversion-plan))
-                                 (empty? array-params) (empty? (:declines conversion-plan)))
+                                 (empty? array-params) (empty? unknown-params)
+                                 (empty? (:declines conversion-plan)))
                 :conversion-declines (:declines conversion-plan)
                 :call-declines (:call-declines conversion-plan)
                 :uncovered-ops uncovered
                 :active-indices active-indices
                 :constant-params constant-params
+                :unknown-params unknown-params
                 :array-params array-params}}))
 
 (defn forward-coverage
@@ -5295,6 +5330,9 @@
                             (when (seq (:array-params cov))
                               (str "array-typed params (forward mode is scalar-only): "
                                    (str/join ", " (:array-params cov)) ". "))
+                            (when (seq (:unknown-params cov))
+                              (str "params with unknown tangent spaces: "
+                                   (str/join ", " (:unknown-params cov)) ". "))
                             (when (seq (:conversion-declines cov))
                               (str "source conversions without a faithful Dual interpretation: "
                                    (pr-str (:conversion-declines cov)) ". "))
@@ -5308,7 +5346,8 @@
                         :uncovered-ops (:uncovered-ops cov)
                         :conversion-declines (:conversion-declines cov)
                         :call-declines (:call-declines cov)
-                        :array-params (:array-params cov)})))
+                        :array-params (:array-params cov)
+                        :unknown-params (:unknown-params cov)})))
            resolved (:resolved preparation)
            params (deftm-params-or-throw f-var resolved)
            walked-body (:walked-body preparation)
