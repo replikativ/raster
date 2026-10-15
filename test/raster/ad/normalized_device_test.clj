@@ -121,6 +121,27 @@
     (gpu/download-range! (:session payload) resident output {:elements n})
     output))
 
+(deftest singleton-device-association-retains-canonical-port-descriptors
+  (let [owner (canonical-owner '(raster.numeric/* element element))
+        interface (:interface owner)
+        select-ports (ns-resolve 'raster.ad.normalized-device 'singleton-derivative-ports!)
+        selected (select-ports interface :map)
+        projected ((ns-resolve 'raster.ad.normalized-device 'map-interface!) owner)
+        active-id (first (:active-inputs interface))
+        active (first (filter #(= active-id (:id %)) (:inputs interface)))]
+    (is (= active-id (:active-id selected)))
+    (doseq [[key expected] [[:inputs (:inputs interface)]
+                           [:active active]
+                           [:tangent (first (:tangent-inputs interface))]
+                           [:primal (:primal-result interface)]
+                           [:seed (:cotangent-input interface)]
+                           [:gradient (first (:cotangent-results interface))]]]
+      (is (identical? expected (get selected key)))
+      (is (identical? expected (get projected key))))
+    ;; Cardinality is a capability refusal before association or any compilation.
+    (is (= :normalized-device-multi-active
+           (reason #(select-ports (assoc interface :tangent-inputs []) :map))))))
+
 (deftest fresh-resident-layout-cloning-preserves-canonical-value-facets
   (let [target :ocl:layout-clone
         template-av (av/tensor {:dtype :float :shape '[n] :ownership :owned
