@@ -109,6 +109,10 @@
                                     records))]
         (is (= [1 2] (mapv (comp count :instances) entries)))
         (is (= 3 (count (:instances spine))))
+        (is (= [:raster.ad.normalized-device/primal
+                :raster.ad.normalized-device/zero-fill
+                :raster.ad.normalized-device/transpose-effect]
+               (mapv :id (:instances spine))))
         (is (empty? (get-in zero-instance [:call :program :inputs])))
         (is (= :borrowed
                (get-in owner [:interface :cotangent-input :value :ownership])))
