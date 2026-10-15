@@ -1,5 +1,6 @@
 (ns raster.ad.normalized-map-chain-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.walk :as walk]
             [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
@@ -39,6 +40,21 @@
                                                     (clojure.core/aget fourth k)))]
          eighth))
 
+(def ^:private diamond-source
+  '(let* [squared (raster.par/pmap i n float
+                                   (raster.numeric/* (clojure.core/aget x i)
+                                                     (clojure.core/aget x i)))
+          shifted (raster.par/pmap j n float
+                                   (raster.numeric/+ (clojure.core/aget squared j)
+                                                     (clojure.core/float 1.0)))
+          fourth (raster.par/pmap k n float
+                                  (raster.numeric/* (clojure.core/aget squared k)
+                                                    (clojure.core/aget squared k)))
+          joined (raster.par/pmap l n float
+                                  (raster.numeric/+ (clojure.core/aget shifted l)
+                                                    (clojure.core/aget fourth l)))]
+         joined))
+
 (defn- typed-source [source]
   (frontend/form->program source {:dtype :float :array-types {'x :float}
                                   :scalar-types {'n :long}}))
@@ -68,6 +84,11 @@
         [tangent] (evaluate-lane bundle :linear (into [(float dx)] residuals))
         [gradient] (evaluate-lane bundle :transpose (into [(float seed)] residuals))]
     {:primal primal :residuals residuals :tangent tangent :gradient gradient}))
+
+(defn- fmul [left right] (float (* (float left) (float right))))
+(defn- fadd [left right] (float (+ (float left) (float right))))
+(defn- fbits [x] (Float/floatToRawIntBits (float x)))
+(defn- square-push [x dx] (fadd (fmul dx x) (fmul dx x)))
 
 (defn- alter-facts [program f]
   (apply list (assoc (vec program) 1 (f (soac/facts program)))))
@@ -166,6 +187,80 @@
                 (vals (:residual-bindings owner))))
     (is (identical? bundle (normalized/validate! bundle)))
     (is (identical? owner (canonical/validate! owner)))))
+
+(deftest closed-diamond-differentiates-one-exact-fused-execution-map
+  (let [source (typed-source diamond-source)
+        bundle (normalized/linearize-map-program
+                source (the-ns 'raster.ad.normalized-map-chain-test))
+        stage (normalized/execution-map-source bundle)
+        equation (first (soac/equations stage))
+        {:keys [lambda]} (soac/operation-parts equation)
+        {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
+        element (first parameters)
+        fused-body (walk/postwalk-replace
+                    {element 'element}
+                    (soac/scalar-converts->source (first body-results)))
+        expected-body
+        '(clojure.core/float
+          (raster.numeric/+
+           (clojure.core/float
+            (raster.numeric/+ (clojure.core/float
+                               (raster.numeric/* element element))
+                              (clojure.core/float 1.0)))
+           (clojure.core/float
+            (raster.numeric/* (clojure.core/float
+                               (raster.numeric/* element element))
+                              (clojure.core/float
+                               (raster.numeric/* element element))))))
+        source-ids (mapv second (soac/equations source))
+        stage-id (second equation)
+        constituents (get-in (soac/facts stage)
+                             [:equations stage-id :attributes :fusion/constituents])]
+    (is (identical? source (get-in bundle [:map-programs :source])))
+    (is (= 4 (count (soac/equations source))))
+    (is (= '[map] (mapv soac/operation-kind (soac/equations stage))))
+    (is (empty? locals))
+    (is (= expected-body fused-body)
+        "the execution model duplicates the shared square in the exact fused operation order")
+    (is (= (set source-ids) (set (keys constituents))))
+    (is (identical? bundle (normalized/validate! bundle)))
+    (doseq [[x dx seed] [[2.0 0.25 -0.5] [-3.0 0.75 1.25]
+                          [4097.0 0.25 -0.5]]]
+      (let [{:keys [primal tangent gradient]} (lane-run bundle x dx seed)
+            x (float x) dx (float dx) seed (float seed)
+            square-left (fmul x x)
+            shifted (fadd square-left (float 1.0))
+            square-right-left (fmul x x)
+            square-right-right (fmul x x)
+            fourth (fmul square-right-left square-right-right)
+            expected-primal (fadd shifted fourth)
+            shifted-tangent (square-push x dx)
+            right-left-tangent (square-push x dx)
+            right-right-tangent (square-push x dx)
+            fourth-tangent (fadd (fmul right-left-tangent square-right-right)
+                                 (fmul right-right-tangent square-right-left))
+            expected-tangent (fadd shifted-tangent fourth-tangent)
+            ;; Transposition visits the duplicated right branch first. Its four equal
+            ;; contributions precede the two contributions from the shifted branch.
+            t (fmul (fmul seed square-right-left) x)
+            u (fmul seed x)
+            expected-gradient (fadd (fadd (fadd (fadd (fadd t t) t) t) u) u)]
+        (is (= (fbits expected-primal) (fbits primal)))
+        (is (= (fbits expected-tangent) (fbits tangent)))
+        (is (= (fbits expected-gradient) (fbits gradient)))))
+    (let [x (float 0.1)
+          seed (float 0.1)
+          {:keys [gradient]} (lane-run bundle x 0.0 seed)
+          a (fmul x x)
+          t (fmul (fmul seed a) x)
+          u (fmul seed x)
+          fused-gradient (fadd (fadd (fadd (fadd (fadd t t) t) t) u) u)
+          source-a-cotangent (fadd seed (fadd (fmul seed a) (fmul seed a)))
+          source-node-gradient (fadd (fmul source-a-cotangent x)
+                                     (fmul source-a-cotangent x))]
+      (is (= (fbits fused-gradient) (fbits gradient)))
+      (is (not= (fbits fused-gradient) (fbits source-node-gradient))
+          "the admitted contract is the fused model, not rounded source-node transpose"))))
 
 (deftest retained-public-input-order-is-not-a-type-erasing-canonicalization
   (let [source (typed-source square-chain-source)
@@ -352,7 +447,14 @@
     (is (some? (reason #(build wrong-extent))))
     (is (some? (reason #(build public-intermediate))))
     (is (some? (reason #(build public-long-intermediate))))
-    (doseq [[label source] [[:horizontal horizontal] [:dag dag] [:skipped-link skipped]
+    (let [bundle (build dag)]
+      (is (identical? bundle (normalized/validate! bundle))))
+    (let [bundle (normalized/linearize-map-chain-program
+                  skipped (the-ns 'raster.ad.normalized-map-chain-test)
+                  {:active-inputs ['q 'x]})]
+      (is (= ['q 'x] (get-in bundle [:map-programs :interface :active-inputs])))
+      (is (identical? bundle (normalized/validate! bundle))))
+    (doseq [[label source] [[:horizontal horizontal]
                             [:active-conversion conversion]
                             [:three-fused-arrays three-fused-arrays]]]
       (is (some? (reason #(build source))) (name label)))))

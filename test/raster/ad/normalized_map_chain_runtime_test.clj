@@ -29,6 +29,26 @@
    {:dtype :float :array-types {'x :float 'q :float}
     :scalar-types (if (symbol? extent) {extent :long} {})}))
 
+(defn- typed-diamond [extent]
+  (frontend/form->program
+   (walk/postwalk-replace
+    {'diamond-extent extent}
+    '(let* [squared (raster.par/pmap i diamond-extent float
+                                     (raster.numeric/* (clojure.core/aget x i)
+                                                       (clojure.core/aget x i)))
+            shifted (raster.par/pmap j diamond-extent float
+                                     (raster.numeric/+ (clojure.core/aget squared j)
+                                                       (clojure.core/float 1.0)))
+            fourth (raster.par/pmap k diamond-extent float
+                                    (raster.numeric/* (clojure.core/aget squared k)
+                                                      (clojure.core/aget squared k)))
+            joined (raster.par/pmap l diamond-extent float
+                                    (raster.numeric/+ (clojure.core/aget shifted l)
+                                                      (clojure.core/aget fourth l)))]
+           joined))
+   {:dtype :float :array-types {'x :float}
+    :scalar-types (if (symbol? extent) {extent :long} {})}))
+
 (defn- scalar-capture-chain []
   (frontend/form->program
    '(let* [squared (raster.par/pmap i n float
@@ -206,6 +226,52 @@
       (is (= (mapv fbits gq) (mapv fbits (nth slots q-slot))))
       (is (every? nil? (keep-indexed #(when (not (contains? #{x-slot q-slot} %1)) %2) slots))))))
 
+(deftest closed-diamond-runtime-obeys-fused-float-order-and-snapshots
+  (let [prepared (runtime/prepare (evidence (typed-diamond 'n)))
+        xs0 (mapv float [0.1 -3.0 4097.0])
+        dx0 (mapv float [0.25 0.75 -0.5])
+        dy0 (mapv float [0.1 1.25 -0.5])
+        xs (float-array xs0)
+        dx (float-array dx0)
+        dy (float-array dy0)
+        args (arguments prepared {'n (long 3) 'x xs})
+        [output pullback] ((:vjp prepared) args)
+        [jvp-output tangent] ((:jvp prepared) args dx)
+        primal (mapv (fn [x]
+                       (fadd (fadd (fmul x x) (float 1.0))
+                             (fmul (fmul x x) (fmul x x))))
+                     xs0)
+        jvp (mapv (fn [x d]
+                    (let [left-da (fadd (fmul d x) (fmul d x))
+                          right-a (fmul x x)
+                          right-da (fadd (fmul d x) (fmul d x))]
+                      (fadd left-da
+                            (fadd (fmul right-da right-a)
+                                  (fmul right-da right-a)))))
+                  xs0 dx0)
+        gradient (mapv (fn [x seed]
+                         (let [a (fmul x x)
+                               t (fmul (fmul seed a) x)
+                               u (fmul seed x)]
+                           (fadd (fadd (fadd (fadd (fadd t t) t) t) u) u)))
+                       xs0 dy0)]
+    (is (= (mapv fbits primal) (mapv fbits output) (mapv fbits jvp-output)))
+    (is (= (mapv fbits jvp) (mapv fbits tangent)))
+    (dotimes [i 3]
+      (aset xs i (float 99.0))
+      (aset output i (float -77.0)))
+    (let [slots (pullback dy)
+          x-slot (.indexOf ^java.util.List (:inputs prepared) 'x)]
+      (is (= (mapv fbits gradient) (mapv fbits (nth slots x-slot))))
+      (is (every? nil? (keep-indexed #(when (not= x-slot %1) %2) slots)))))
+  (let [prepared (runtime/prepare (evidence (typed-diamond 0)))
+        args (arguments prepared {'x (float-array 0)})
+        [output pullback] ((:vjp prepared) args)
+        [jvp-output tangent] ((:jvp prepared) args (float-array 0))
+        slots (pullback (float-array 0))]
+    (is (= [] (vec output) (vec jvp-output) (vec tangent)))
+    (is (= [] (vec (nth slots (.indexOf ^java.util.List (:inputs prepared) 'x)))))))
+
 (deftest four-stage-runtime-preserves-checkpoints-order-captures-and-snapshots
   (let [source (four-map-spine 'n)
         reordered (soac/make (update (soac/facts source) :inputs #(vec (reverse %)))
@@ -353,8 +419,8 @@
     (is (= [] (vec (nth slots (.indexOf ^java.util.List (:inputs prepared) 'x)))))
     (is (nil? (nth slots (.indexOf ^java.util.List (:inputs prepared) 'q))))))
 
-(deftest canonical-reconstruction-rejects-every-chain-scope-tamper
-  (let [owner (canonical/adapt-map (evidence (typed-chain 'n)))
+(deftest canonical-reconstruction-rejects-every-region-scope-tamper
+  (let [owner (canonical/adapt-map (evidence (typed-diamond 'n)))
         coefficient (first (keys (:residual-bindings owner)))
         changes [#(update % :source alter-facts
                           (fn [facts] (assoc-in facts [:values 'x :dtype] :double)))

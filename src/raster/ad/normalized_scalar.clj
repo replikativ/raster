@@ -873,79 +873,79 @@
                          {} (mapcat :control-references nodes))]
     {:nodes nodes :producers producers :consumers consumers :controls controls}))
 
-(defn- map-spine-description
-  "Audit one exact adjacent, single-use linear map spine without choosing differentiation
-   activity. Every internal value is private and has exactly one consumer equation: the
-   immediately following map. Equation subprograms remain the authority for later composition
-   and lane projection."
+(defn- map-region-description
+  "Audit one closed, pure homogeneous map region without choosing differentiation activity.
+
+   Every source equation is independently admitted through the existing map-lane authority.
+   Intermediate arrays may fan out, but none may escape the region or participate in host,
+   control, effect, alias or physical-storage boundaries. The exact validated source remains
+   the only input to the existing fusion authority."
   [source]
-  (let [{:keys [nodes consumers] :as dataflow} (equation-dataflow source)
-        equations (mapv :equation nodes)]
+  (let [{:keys [nodes consumers controls] :as dataflow} (equation-dataflow source)
+        equations (mapv :equation nodes)
+        facts (soac/facts source)]
     (when-not (<= 2 (count equations))
       (fail! :ad-normalized-map-chain-boundary {:equations (count equations)}))
     (let [subprograms (mapv :subprogram nodes)
           results (mapv :results nodes)
           public-outputs (set (soac/outputs source))
-          edges
-          (mapv (fn [index]
-                  (let [producer (nth equations index)
-                        consumer (nth equations (inc index))
-                        producer-results (nth results index)
-                        value (first producer-results)
-                        consumer-indices (vec (distinct (map :consumer-index
-                                                             (get consumers value))))]
-                    (when-not (and (= 1 (count producer-results))
-                                   (= [(inc index)] consumer-indices)
-                                   (not (contains? public-outputs value)))
-                      (fail! :ad-normalized-map-chain-boundary
-                             {:producer producer :consumer consumer :value value
-                              :consumers consumer-indices :outputs (soac/outputs source)}))
-                    {:value value :producer producer :consumer consumer}))
-                (range (dec (count equations))))]
-      (when-not (and (every? #(= 'map (soac/operation-kind %)) equations)
+          intermediate-results (vec (mapcat identity (butlast results)))
+          equation-ids (mapv second equations)
+          equation-facts (mapv #(get-in facts [:equations %]) equation-ids)
+          parts (mapv soac/operation-parts equations)
+          extents (mapv #(get-in % [:attributes :extent]) parts)
+          result-values (mapv #(get-in facts [:values (first %)]) results)]
+      (when-not (and (every? #(= 'map (:kind %)) parts)
                      (every? #(= 1 (count %)) results)
-                     (fingerprint/equivalent? (last results) (soac/outputs source)))
+                     (= 1 (count public-outputs))
+                     (fingerprint/equivalent? (last results) (soac/outputs source))
+                     (empty? (set/intersection public-outputs (set intermediate-results)))
+                     (every? #(seq (get consumers %)) intermediate-results)
+                     (every? #(empty? (get controls %)) intermediate-results)
+                     (every? #(fingerprint/equivalent? (first extents) %)
+                             (rest extents))
+                     (apply = (map :dtype result-values))
+                     (empty? (:effects facts)) (empty? (:aliases facts))
+                     (empty? (get-in facts [:attributes :host-read-values]))
+                     (empty? (get-in facts [:attributes :host-read-sites]))
+                     (every? #(and (empty? (:effects %)) (empty? (:aliases %)))
+                             equation-facts)
+                     (every? (fn [equation]
+                               (empty? (soac/result-storage source (second equation))))
+                             equations))
         (fail! :ad-normalized-map-chain-boundary
-               {:equations equations :outputs (soac/outputs source)}))
-      (assoc dataflow :equations equations :subprograms subprograms :edges edges))))
+               {:equations equations :outputs (soac/outputs source)
+                :intermediates intermediate-results}))
+      (assoc dataflow :equations equations :subprograms subprograms))))
 
-(defn- exact-map-spine-stage
-  "Rebuild and fuse one exact finite pure linear map spine using shared dialect authorities.
-   The fused stage is transient: callers retain the original multi-equation source."
-  ([source] (exact-map-spine-stage source (map-spine-description source)))
-  ([source {:keys [equations subprograms edges]}]
-   (let [appended
-         (reduce (fn [producer [consumer-program {:keys [value consumer]}]]
-                   (soac/append-pure-spines producer consumer-program {value value}
-                                             (vec (nth consumer 2))))
-                 (first subprograms)
-                 (map vector (rest subprograms) edges))
-          source-inputs (:inputs (soac/facts source))
-          appended-inputs (:inputs (soac/facts appended))
-          _ (when-not (exact-semantic-members? source-inputs appended-inputs)
-              (fail! :ad-normalized-map-chain-correspondence
-                     {:source-inputs source-inputs :appended-inputs appended-inputs}))
-          ;; Projection canonicalizes executable operands ahead of shape-only inputs. Restore
-          ;; only the already-validated public input order after proving exact typed membership;
-          ;; all other appended facts remain subject to the full fingerprint comparison below.
-          rebuilt (soac/make (assoc (soac/facts appended) :inputs source-inputs)
-                             (soac/equations appended) (soac/outputs appended))
-          _ (when-not (fingerprint/equivalent? source rebuilt)
-              (fail! :ad-normalized-map-chain-correspondence {}))
-          [stage stats] (fusion/fusion-fixpoint rebuilt)
+(defn- exact-map-region-stage
+  "Derive one transient execution map directly from an exact validated closed map region.
+   The untouched multi-equation source remains the public semantic/provenance authority."
+  ([source] (exact-map-region-stage source (map-region-description source)))
+  ([source {:keys [equations]}]
+   (let [source-inputs (:inputs (soac/facts source))
+          [stage stats] (fusion/fusion-fixpoint source)
           [stage-equation] (soac/equations stage)
           stage-parts (when stage-equation (soac/operation-parts stage-equation))
           visible-ids (concat (:inputs (soac/facts source)) (soac/outputs source))
-          equation-count (count equations)]
-      (when-not (and (= {:vertical (dec equation-count)
-                         :horizontal 0 :iterations equation-count}
-                        (select-keys stats [:vertical :horizontal :iterations]))
-                     (= 1 (count (soac/equations stage)))
+          source-equation-ids (mapv second equations)
+          stage-equation-id (second stage-equation)
+          constituents (get-in (soac/facts stage)
+                               [:equations stage-equation-id :attributes
+                                :fusion/constituents])]
+      (when-not (and (= 1 (count (soac/equations stage)))
                      (= 'map (:kind stage-parts))
+                     (= 1 (count (nth stage-equation 2)))
+                     (= (set source-equation-ids) (set (keys constituents)))
+                     (every? (fn [equation-id]
+                               (fingerprint/equivalent?
+                                (get-in (soac/facts source) [:equations equation-id])
+                                (get constituents equation-id)))
+                             source-equation-ids)
                      ;; Fusion may canonicalize the transient executable input order. The
                      ;; retained source remains the public ABI; prove that the stage has the
                      ;; exact same typed members without pretending its internal order is ABI.
-                     (exact-semantic-members? (:inputs (soac/facts source))
+                     (exact-semantic-members? source-inputs
                                               (:inputs (soac/facts stage)))
                      (fingerprint/equivalent? (soac/outputs source) (soac/outputs stage))
                      (every? #(fingerprint/equivalent?
@@ -953,23 +953,23 @@
                                (get-in (soac/facts stage) [:values %]))
                              visible-ids))
         (fail! :ad-normalized-map-chain-boundary
-               {:equations equations :edges edges :stats stats}))
+               {:equations equations :stats stats
+                :constituents (keys constituents)}))
       stage)))
 
-(defn- project-map-spine
+(defn- project-map-region
   [source source-ns output-id options]
-  (let [{:keys [equations subprograms edges] :as spine} (map-spine-description source)
-        producer (first equations)
-        producer-parts (soac/operation-parts producer)
-        producer-local-active (first (concat (:arrays producer-parts)
-                                             (:captures producer-parts)))
+  (let [{:keys [equations subprograms] :as region} (map-region-description source)
         ;; These are source-member validity checks, not activity selection. The final fused
         ;; lane applies the caller's option against the complete external operand boundary.
-        local-actives (into [producer-local-active] (map :value edges))
+        local-actives (mapv (fn [equation]
+                              (let [{:keys [arrays captures]} (soac/operation-parts equation)]
+                                (first (concat arrays captures))))
+                            equations)
         _ (doseq [[equation subprogram active] (map vector equations subprograms local-actives)]
             (project-map-equation-lane source subprogram equation source-ns nil
                                        {:active-input active}))
-        stage (exact-map-spine-stage source spine)
+        stage (exact-map-region-stage source region)
         equation (first (soac/equations stage))]
     (assoc (select-keys
             (project-checked-map-lane source stage equation source-ns output-id options)
@@ -1169,9 +1169,9 @@
 
 (defn- validate-map-programs! [{:keys [map-programs source-ns] :as bundle}]
   (let [{:keys [source interface]} map-programs
-        spine? (< 1 (count (soac/equations source)))
+        region? (< 1 (count (soac/equations source)))
         {:keys [primal stage-source] :as projected}
-        ((if spine? project-map-spine
+        ((if region? project-map-region
              (fn [source source-ns output-id options]
                (assoc (project-map-element source source-ns output-id options)
                       :stage-source source)))
@@ -1225,11 +1225,21 @@
 
 (defn- build-map-programs
   [source source-ns options]
-   (let [bundle (linearize-map-element source source-ns options)]
-     (assoc bundle :map-programs (construct-map-stage bundle source))))
+  (let [{:keys [primal interface stage-source]}
+        (if (= 1 (count (soac/equations source)))
+          (assoc (project-map-element source source-ns nil options)
+                 :stage-source source)
+          (project-map-region source source-ns nil options))
+        bundle (linearize-program primal interface)]
+    (assoc bundle :map-programs
+           (assoc (construct-map-stage bundle stage-source) :source source))))
 
 (defn linearize-map-program
-  "Lift a checked homogeneous map with one or more active array operands. :active-inputs is
+  "Lift one checked homogeneous map or a closed map region that exactly fuses to one map.
+   Composition differentiates the exact independently rederived fused execution map; it does
+   not assert rounded node-wise source-transpose equivalence, and retained descriptive numerical
+   facets grant no additional fusion or reassociation permission.
+   :active-inputs is
    an ordered nonempty vector of exact source array IDs. Singular :active-input and compatibility
    :active-array retain their existing one-active behavior. Scalar capture activity needs a sum."
   ([source source-ns] (linearize-map-program source source-ns {}))
@@ -1238,25 +1248,23 @@
      (validate! (assoc bundle :certificate (certificate bundle))))))
 
 (defn linearize-map-chain-program
-  "Build checked scalar and lifted map programs for one finite pure linear map spine.
+  "Compatibility entry for a multi-equation map composition.
 
    The original multi-equation source remains the semantic authority. Existing target-neutral
    fusion derives a transient single-map execution stage which is rebuilt during validation.
    Canonical adaptation separately retains and checks source, execution scope and residual lineage."
   ([source source-ns] (linearize-map-chain-program source source-ns {}))
   ([source source-ns options]
-   (let [{:keys [primal interface stage-source]}
-         (project-map-spine source source-ns nil options)
-         bundle (linearize-program primal interface)
-         programs (assoc (construct-map-stage bundle stage-source) :source source)
-         bundle (assoc bundle :map-programs programs)]
-     (validate! (assoc bundle :certificate (certificate bundle))))))
+   (when-not (< 1 (count (soac/equations source)))
+     (fail! :ad-normalized-map-chain-boundary
+            {:equations (count (soac/equations source))}))
+   (linearize-map-program source source-ns options)))
 
 (defn execution-map-scope
   "Return the exact execution source and certified scalar scope of a validated map bundle.
 
-   A singleton retains its original source identity. An admitted finite linear map spine is rederived
-   through the same checked append and fusion path used by construction; callers cannot supply
+   A singleton retains its original source identity. An admitted closed map region is rederived
+   through the same checked fusion path used by construction; callers cannot supply
    or cache a substitute execution stage. Scalar values are limited to the validated primal's
    parameters and ordered binding results; residual-role validation independently proves which
    of those values are saved coefficients."
@@ -1266,7 +1274,7 @@
         execution-source
         (if (= 1 (count (soac/equations source)))
           source
-          (exact-map-spine-stage source))]
+          (exact-map-region-stage source))]
     {:source execution-source
      :scalar-values (vec (concat (:params bundle)
                                  (map first (partition 2 (bindings (:primal bundle))))))}))
