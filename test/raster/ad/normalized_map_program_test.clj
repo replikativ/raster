@@ -166,6 +166,19 @@
     (is (some? (reason (update-in bundle [:map-programs :linear] alter-facts
                                   #(assoc-in % [:values residual :dtype] :float)))))))
 
+(deftest retained-generated-ports-cannot-collide-with-original-source-values
+  (let [bundle (build (source :double {}))
+        tangent (first (get-in bundle [:map-programs :interface :tangent-inputs]))
+        collision 'x
+        remap {tangent collision}
+        forged (-> bundle
+                   (update-in [:map-programs :linear] soac/remap-values remap)
+                   (assoc-in [:map-programs :interface :tangent-inputs] [collision])
+                   (assoc-in [:map-programs :proof :nodes 0 :stage-interface :tangent-inputs]
+                             [collision]))]
+    (is (contains? (:values (soac/facts (get-in bundle [:map-programs :source]))) collision))
+    (is (= :ad-normalized-map-node-interface (reason forged)))))
+
 (deftest retained-map-stage-reconstruction-preserves-interface-identities
   (let [bundle (build (source :double {}))
         {:keys [source interface] :as retained} (:map-programs bundle)

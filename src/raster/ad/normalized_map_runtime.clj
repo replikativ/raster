@@ -120,16 +120,11 @@
         inputs (mapv :id (:inputs interface))
         values (:values (soac/facts source))
         input-ports (:inputs interface)
-        equations (vec (soac/equations execution-source))
-        parts (mapv soac/operation-parts equations)
+        ;; Only the indexed adapter still needs the checked operation's physical
+        ;; index/output geometry. Nonindexed geometry comes from canonical ports.
+        parts (when indexed? (mapv soac/operation-parts (soac/equations execution-source)))
         operand-arrays (set (mapcat :arrays parts))
-        operand-captures (set (mapcat :captures parts))
         arrays (filterv operand-arrays inputs)
-        extent-ids (mapv #(get-in % [:attributes :extent]) parts)
-        _ (when-not (or indexed? (apply = extent-ids))
-            (fail! :ad-map-runtime-extent {:extents extent-ids}))
-        extent-id (first extent-ids)
-        captures (filterv #(and (operand-captures %) (not= extent-id %)) inputs)
         {:keys [lambda]} (first parts)
         active-inputs (vec (:active-inputs interface))
         active (first active-inputs)
@@ -137,6 +132,18 @@
         capacity-id (when indexed? (first (:shape (get values active))))
         gradient-ids (mapv :id (:cotangent-results interface))
         projections (mapv route/materialize-host-program [primal linear transpose])
+        executable-inputs (set (:inputs (first projections)))
+        executable-ports (filterv #(contains? executable-inputs (:id %)) input-ports)
+        array-ports (filterv #(= 1 (count (get-in % [:value :shape]))) executable-ports)
+        capture-ports (filterv #(and (= [] (get-in % [:value :shape]))
+                                    (contains? #{:float :double} (get-in % [:value :dtype])))
+                               executable-ports)
+        ;; This dimension preserves extent-before-array diagnostics only. It is
+        ;; never a common extent for the independently checked array ports.
+        primary-dimension (when-not indexed? (first (get-in (first array-ports) [:value :shape])))
+        extent-id (if indexed? (get-in (first parts) [:attributes :extent])
+                      (if (integer? primary-dimension) primary-dimension
+                          (direct-dimension-id primary-dimension (:id (first array-ports)))))
         source-dependencies
         (cond-> (normalized/execution-sources (get-in owner [:derivation :bundle]))
           indexed?
@@ -171,7 +178,8 @@
                                  {:role (:id port) :abstract-value (:value port)})))))
               shape-ports)
         retained-source-ids
-        (into shape-value-ids (if indexed? [] captures))
+        (into shape-value-ids
+              (map #(get-in % [:producer :input]) (vals (:immutable-scalars residual-plan))))
         index-snapshot (when indexed? (:id (get owned-residuals (first arrays))))
         required-zero-gradient (when indexed?
                                  (some (fn [[_ binding]]
@@ -226,12 +234,13 @@
                   {:environment environment
                    :extent extent :capacity capacity}))
               (do
-                (doseq [id arrays] (array! (get environment id) dt extent id))
-                (doseq [id captures]
-                  (when-not (case (:dtype (get values id))
+                (doseq [{:keys [id value]} array-ports]
+                  (source-value! (get environment id) value environment values id))
+                (doseq [{:keys [id value]} capture-ports]
+                  (when-not (case (:dtype value)
                               :float (instance? Float (get environment id))
                               :double (instance? Double (get environment id)) false)
-                    (fail! :ad-map-runtime-capture {:input id :dtype (:dtype (get values id))})))
+                    (fail! :ad-map-runtime-capture {:input id :dtype (:dtype value)})))
                 (doseq [{:keys [id value]} input-ports]
                   (source-value! (get environment id) value environment values id))
                 {:environment environment :extent extent}))))

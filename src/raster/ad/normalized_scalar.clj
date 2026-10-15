@@ -685,7 +685,7 @@
       (binding-dtype! values id expression)))
   primal)
 
-(declare validate! validate-map-proof! validate-indexed-proof! validate-map-programs!
+(declare validate! validate-map-proof! validate-indexed-proof!
          validate-sum-programs! sum-source-map)
 
 (defn- validate-scalar-correspondence!
@@ -1780,62 +1780,6 @@
                     :interface interface
                     :proof {:authority :normalized-scalar :nodes witnesses}}}))
 
-(defn- validate-map-programs! [{:keys [map-programs source-ns] :as bundle}]
-  (let [{:keys [source interface]} map-programs
-        region? (< 1 (count (soac/equations source)))
-        {:keys [primal stage-source] :as projected}
-        ((if region? project-map-region
-             (fn [source source-ns output-id options]
-               (assoc (project-map-element source source-ns output-id options)
-                      :stage-source source)))
-         source source-ns (first (soac/outputs (:primal bundle)))
-         (let [source-parts (soac/operation-parts (first (soac/equations source)))
-               active-inputs (:active-inputs interface)]
-           (if (and (= 1 (count active-inputs))
-                    (some #{(first active-inputs)} (:captures source-parts)))
-             {:active-input (first active-inputs)}
-             {:active-inputs active-inputs})))
-        scalar-interface (:interface projected)
-        interface (:interface map-programs)
-        source-parts (soac/operation-parts (first (soac/equations stage-source)))
-        source-operands (concat (:arrays source-parts) (:captures source-parts))
-        source-active (mapv (fn [active] (some #(when (= active %) %) source-operands))
-                            (:active-inputs interface))
-        {:keys [scalars arrays]} (map-residual-roles bundle stage-source)
-        ids (concat (vals (:residual-arrays interface))
-                    (:tangent-inputs interface) [(:cotangent-input interface) (:tangent-output interface)]
-                    (:gradient-outputs interface))]
-    (when-not (and (fingerprint/equivalent? primal (:primal bundle))
-                   (fingerprint/equivalent? source-active (:active-inputs interface))
-                   (fingerprint/equivalent? (select-keys bundle [:params :tags :active-inputs])
-                                            (select-keys scalar-interface [:params :tags :active-inputs]))
-                   (= #{:active-inputs :residual-arrays :scalar-captures :tangent-inputs :cotangent-input
-                        :tangent-output :gradient-outputs} (set (keys interface)))
-                   (seq (:active-inputs interface))
-                   (= (count (:active-inputs interface))
-                      (count (:tangent-inputs interface))
-                      (count (:gradient-outputs interface)))
-                   (fingerprint/equivalent? (set arrays) (set (keys (:residual-arrays interface))))
-                   (fingerprint/equivalent? scalars (:scalar-captures interface))
-                   (every? symbol? ids) (= (count ids) (count (distinct ids)))
-                   (empty? (set/intersection
-                            (set ids)
-                            (set/union (set (keys (:values (soac/facts source))))
-                                       (set (keys (:values (soac/facts stage-source))))))))
-      (fail! :ad-normalized-map-interface {:interface interface :projected projected}))
-    (when (and (= [] (get-in (soac/facts stage-source)
-                             [:values (first (:active-inputs interface)) :shape]))
-               (not (:sum-programs bundle)))
-      (fail! :ad-normalized-map-scalar-requires-sum {:active-inputs (:active-inputs interface)}))
-    (doseq [program (map map-programs [:primal :linear :transpose])] (soac/validate! program))
-    ;; Fixed interface IDs make reconstruction deterministic. Exact semantic equality includes
-    ;; expression metadata and float bits; no fresh AD generation or printed-string comparison.
-    (when-not (fingerprint/equivalent?
-               map-programs
-               (assoc (construct-map-stage bundle stage-source interface) :source source))
-      (fail! :ad-normalized-map-programs {:interface interface})))
-  bundle)
-
 (defn- reconstructed-map-proof
   [{:keys [map-programs source-ns] :as bundle}]
   (let [{:keys [source interface proof]} map-programs
@@ -1943,13 +1887,34 @@
                     :results (vec (nth equation 2))
                     :projected (select-keys projected [:primal :interface])}
                    nil nil node)
-            ;; Preserve the complete established singleton/fused-stage correspondence check.
-            ;; The node wrapper changes evidence ownership, not the one-stage map contract.
-            _ (validate-map-programs!
-               (cond-> (assoc (dissoc scalar :certificate)
-                              :map-programs (dissoc map-programs :proof))
-                 (:sum-programs bundle) (assoc :sum-programs (:sum-programs bundle))))
-            stage (:stage built)]
+            stage (:stage built)
+            ;; The node-local interface has already been checked against all three generated
+            ;; phases. Link the submitted outer interface to that reconstruction explicitly;
+            ;; the later whole-program comparison owns arithmetic, not interface diagnostics.
+            _ (when-not (fingerprint/equivalent? interface (:interface stage))
+                (fail! :ad-normalized-map-interface {:interface interface}))
+            allocated-port-ids
+            (concat (vals (:residual-arrays interface))
+                    (:tangent-inputs interface)
+                    [(:cotangent-input interface) (:tangent-output interface)]
+                    (:gradient-outputs interface))
+            ;; Local port correspondence already proves roles, cardinality and phase facts.
+            ;; This outer guard is intentionally stronger for a fused singleton: generated
+            ;; values must also remain fresh against the untouched original source.
+            _ (when-not
+               (empty? (set/intersection
+                        (set allocated-port-ids)
+                        (set/union (set (keys (:values (soac/facts source))))
+                                   (set (keys (:values (soac/facts stage-source)))))))
+                (fail! :ad-normalized-map-interface {:interface interface}))
+            ;; Scalar map activity is legal only in the independently checked surrounding
+            ;; ordered-sum source. validate-map-sum-proof! establishes that source before
+            ;; entering this correspondence replay.
+            _ (when (and (= [] (get-in (soac/facts stage-source)
+                                       [:values (first requested) :shape]))
+                         (not (:sum-programs bundle)))
+                (fail! :ad-normalized-map-scalar-requires-sum
+                       {:active-inputs requested}))]
         (assoc stage :source source
                :proof (assoc proof :nodes [node]))))))
 
