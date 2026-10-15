@@ -81,13 +81,12 @@
                         (#'normalized/construct-map-stage
                          scalar (get-in b [:map-programs :source]) interface equation-ids))
         changed (recertify changed)
-        legacy (assoc (dissoc scalar :certificate)
-                      :map-programs (dissoc (:map-programs changed) :proof))
         envelope (-> (canonical/adapt-map b)
                      (merge (select-keys (:map-programs changed) [:source :primal :linear :transpose]))
                      (assoc-in [:derivation :bundle] changed))
         envelope (assoc envelope :certificate (#'canonical/certificate envelope))]
-    (is (identical? legacy (#'normalized/validate-map-programs! legacy)))
+    ;; The shared node replay now owns this correspondence directly; there is no parallel
+    ;; proof-less map-program validator that can bless the forged phases first.
     (is (= :ad-normalized-derivation-correspondence (reason #(normalized/validate! changed))))
     ;; Recomputed inner AND outer certificates cannot authorize a matching forged map lift.
     (is (= :ad-normalized-derivation-correspondence (reason #(canonical/validate! envelope)))))))

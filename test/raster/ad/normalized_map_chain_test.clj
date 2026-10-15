@@ -449,6 +449,24 @@
                      source (the-ns 'raster.ad.normalized-map-chain-test)
                      {:active-input 'scale}))))))
 
+(deftest fused-generated-ports-remain-fresh-against-eliminated-source-values
+  (let [source (typed-source square-chain-source)
+        bundle (build source)
+        tangent (first (get-in bundle [:map-programs :interface :tangent-inputs]))
+        collision 'squared
+        remap {tangent collision}
+        forged (-> bundle
+                   (update-in [:map-programs :linear] soac/remap-values remap)
+                   (assoc-in [:map-programs :interface :tangent-inputs] [collision])
+                   (assoc-in [:map-programs :proof :nodes 0 :stage-interface :tangent-inputs]
+                             [collision]))]
+    (is (contains? (:values (soac/facts source)) collision))
+    (is (not (contains? (:values (soac/facts (#'normalized/exact-map-region-stage source)))
+                        collision)))
+    (is (= :ad-normalized-map-interface
+           (reason #(normalized/validate!
+                     (assoc forged :certificate (#'normalized/certificate forged))))))))
+
 (deftest zero-extent-retains-the-same-composition-evidence
   (let [source
         (frontend/form->program
