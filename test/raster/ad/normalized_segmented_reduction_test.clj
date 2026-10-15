@@ -10,6 +10,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
@@ -376,11 +377,27 @@
         owner (canonical/adapt checked)
         coefficient (first (keys (:residual-bindings owner)))
         materializations (atom 0)]
+    (let [reject-allocation (fn [& _] (throw (ex-info "segmented replay allocated an identity" {})))
+          [rebuilt validated]
+          (with-redefs-fn {#'normalized/allocate-map-stage-interface reject-allocation
+                          #'normalized/allocate-segmented-interface reject-allocation
+                          #'normalized/node-equation-ids reject-allocation
+                          #'normalized/linearize-program reject-allocation}
+            #(vector (#'normalized/reconstructed-map-proof checked) (normalized/validate! checked)))]
+      (is (identical? checked validated))
+      (is (= #{:source-equations :execution-equation :scalar-derivation :stage-interface :equation-ids}
+             (set (keys (get-in checked [:map-programs :proof :nodes 0])))))
+      (doseq [phase [:primal :linear :transpose]]
+        (is (fingerprint/equivalent? (get-in checked [:map-programs phase]) (get rebuilt phase)))))
     (with-redefs [route/materialize-host-program
                   (fn [& _] (swap! materializations inc)
                     (throw (ex-info "unexpected materialization" {:reason :test-materialization})))]
       (doseq [[label expected change]
               [[:activity :ad-normalized-segmented-proof #(assoc-in % [:map-programs :interface :active-inputs] '[W])]
+               [:extra-node-key :ad-normalized-segmented-proof #(assoc-in % [:map-programs :proof :nodes 0 :extra-lifecycle-field] true)]
+               [:missing-derivation :ad-normalized-segmented-proof #(assoc-in % [:map-programs :proof :nodes 0 :scalar-derivation] nil)]
+               [:scalar-namespace :ad-normalized-segmented-proof #(assoc-in % [:map-programs :proof :nodes 0 :scalar-derivation :source-ns]
+                                                                          (the-ns 'clojure.core))]
                [:snapshot-body :ad-normalized-map-programs #(update-in % [:map-programs :primal] altered-snapshot-body)]
                [:snapshot-child-id :ad-normalized-map-programs #(update-in % [:map-programs :primal] altered-snapshot-equation-id)]
                [:phase-id-collision :ad-normalized-segmented-proof #(assoc-in % [:map-programs :proof :nodes 0 :equation-ids :linear]
