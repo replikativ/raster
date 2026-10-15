@@ -51,6 +51,20 @@ extent and data capacity, private index snapshot and exclusive typed-zero gradie
 Device adapters share exact canonical port association while keeping their existing family
 capability limits and materialized resident geometry.
 
+`linearize-equation-program` delegates pure maps to the existing map entry and additionally
+admits one bounded bilinear segmented reduction on the host. Its two external operands and
+result are flat plain Float/Double arrays, with positive literal axes and an explicit
+order-preserving result regrouping. Exactly one operand is selected with `:active-input`.
+The existing dense-product authority proves additive zero, product and layout; normalized
+scalar AD differentiates the full accumulator-plus-product step. A checked AxisMap fiber
+then determines the JVP/VJP reductions, without a separate derivative rule table. The passive
+operand is privately copied for delayed pullbacks. Generated derivative phases use existing
+TypedSOAC operations and host materialization. Batched/dynamic/empty contractions, epilogues,
+multiple active operands and resident device execution remain refused; the map-only entry
+and default source AD engine are unchanged. The historical internal `:map-programs` facet
+holds the checked phases; it is not a second contraction runtime. Float tests qualify host
+precision checkpoints, not bitwise agreement with arbitrary BLAS or device schedules.
+
 Compiler-generated pure TypedSOAC programs can acquire an exact source-free invocation boundary
 without manufacturing a Clojure `let` or re-inferring parameter types. The ordered IR inputs and
 their retained AbstractValues supply a zero-prefix plan; flat public buffers and every retained
