@@ -1747,6 +1747,37 @@
      :tangent-output (get-in (last active-nodes) [:ports :tangent-result :id])
      :gradient-outputs (mapv gradient-ports requested)}))
 
+(defn- map-spine-nodes
+  "Allocate or replay source-ordered map nodes through the same activity sweep."
+  [source source-ns source-nodes requested submitted]
+  (let [active-values (atom (set requested))
+        nodes
+        (mapv (fn [source-node node]
+                (let [{:keys [arrays captures]} (soac/operation-parts (:equation source-node))
+                      local-active (filterv @active-values (concat arrays captures))
+                      result (first (:results source-node))
+                      _ (when submitted
+                          (let [expected-source [(second (:equation source-node))]
+                                expected-keys (if (seq local-active)
+                                                #{:source-equations :execution-equation
+                                                  :scalar-derivation :stage-interface :equation-ids}
+                                                #{:source-equations :execution-equation
+                                                  :primal-derivation :stage-interface :equation-ids})]
+                            (when-not (= expected-keys (set (keys node)))
+                              (fail! :ad-normalized-map-node-proof
+                                     {:node (:execution-equation node)
+                                      :keys (set (keys node))}))
+                            (when-not (= expected-source (:source-equations node))
+                              (fail! :ad-normalized-map-node-coverage
+                                     {:expected expected-source
+                                      :actual (:source-equations node)}))))
+                      built (map-node-lifecycle source source-ns source-node local-active
+                                                (when-not submitted (node-equation-ids)) node)]
+                  (when (seq local-active) (swap! active-values conj result))
+                  built))
+              source-nodes (or submitted (repeat nil)))]
+    {:nodes nodes :active-values @active-values}))
+
 (defn- build-nodewise-map-proof [source source-ns options]
   (let [{:keys [nodes consumers]} (graph-spine-description source)
         fused (exact-map-region-stage source)
@@ -1762,18 +1793,8 @@
             (when-not (= 1 (count (get consumers active)))
               (fail! :ad-normalized-map-chain-boundary
                      {:active active :uses (get consumers active)})))
-        active-values (atom (set requested))
-        built
-        (mapv (fn [node]
-                (let [{:keys [arrays captures]} (soac/operation-parts (:equation node))
-                      local-active (filterv @active-values (concat arrays captures))
-                      result (first (:results node))
-                      built (map-node-lifecycle source source-ns node local-active
-                                                (node-equation-ids) nil)]
-                  (when (seq local-active) (swap! active-values conj result))
-                  built))
-              nodes)
-        _ (when-not (contains? @active-values (first (soac/outputs source)))
+        {built :nodes active-values :active-values} (map-spine-nodes source source-ns nodes requested nil)
+        _ (when-not (contains? active-values (first (soac/outputs source)))
             (fail! :ad-normalized-map-chain-boundary {:active-inputs requested}))
         interface (node-proof-interface built requested)
         primal (compose-primal-nodes built)
@@ -1824,33 +1845,10 @@
             _ (doseq [active requested]
                 (when-not (= 1 (count (get consumers active)))
                   (fail! :ad-normalized-map-chain-boundary {:active active})))
-            active-values (atom (set requested))
-            nodes
-            (mapv (fn [source-node node]
-                    (let [{:keys [arrays captures]} (soac/operation-parts (:equation source-node))
-                          local-active (filterv @active-values (concat arrays captures))
-                          expected-source [(second (:equation source-node))]
-                          expected-keys (if (seq local-active)
-                                          #{:source-equations :execution-equation
-                                            :scalar-derivation :stage-interface :equation-ids}
-                                          #{:source-equations :execution-equation
-                                            :primal-derivation :stage-interface :equation-ids})
-                          _ (when-not (= expected-keys (set (keys node)))
-                              (fail! :ad-normalized-map-node-proof
-                                     {:node (:execution-equation node)
-                                      :keys (set (keys node))}))
-                          _ (when-not (= expected-source (:source-equations node))
-                              (fail! :ad-normalized-map-node-coverage
-                                     {:expected expected-source
-                                      :actual (:source-equations node)}))
-                          rebuilt (map-node-lifecycle
-                                   source source-ns source-node local-active nil node)]
-                      (when (seq local-active)
-                        (swap! active-values conj (first (:results source-node))))
-                      rebuilt))
-                  source-nodes submitted)
+            {nodes :nodes active-values :active-values}
+            (map-spine-nodes source source-ns source-nodes requested submitted)
             expected-interface (node-proof-interface nodes requested)]
-        (when-not (contains? @active-values (first (soac/outputs source)))
+        (when-not (contains? active-values (first (soac/outputs source)))
           (fail! :ad-normalized-map-chain-boundary {:active-inputs requested}))
         {:source source
          :primal (compose-primal-nodes nodes)
