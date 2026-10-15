@@ -826,19 +826,65 @@
        (every? #(= 1 (count (filter (partial fingerprint/equivalent? %) right))) left)
        (every? #(= 1 (count (filter (partial fingerprint/equivalent? %) left))) right)))
 
+(defn- equation-dataflow
+  "Project ordered equation dependencies after one whole-program validation.
+
+   Executable operand occurrences retain duplicates and positions. Extent/control references
+   remain separate: they constrain iteration and shape but are not executable data operands.
+   This ephemeral view grants no activity, differentiation, fusion or ownership authority."
+  [source]
+  (let [subprograms (soac/equation-subprograms source)
+        equations (vec (soac/equations source))
+        nodes
+        (mapv (fn [index equation subprogram]
+                (let [equation-id (second equation)
+                      results (vec (nth equation 2))
+                      operands (soac/operation-inputs equation)
+                      controls (soac/operation-extents equation)]
+                  {:index index :id equation-id :equation equation :subprogram subprogram
+                   :results results
+                   :operand-occurrences
+                   (mapv (fn [position value]
+                           {:value value :position position :consumer-index index
+                            :consumer-id equation-id})
+                         (range) operands)
+                   :control-references
+                   (into []
+                         (keep-indexed
+                          (fn [position value]
+                            (when (soac/value-id? value)
+                              {:value value :position position :consumer-index index
+                               :consumer-id equation-id})))
+                         controls)}))
+              (range) equations subprograms)
+        producers
+        (into {}
+              (mapcat (fn [{:keys [index id results]}]
+                        (map-indexed (fn [position value]
+                                       [value {:producer-index index :producer-id id
+                                               :position position}])
+                                     results)))
+              nodes)
+        consumers (reduce (fn [result occurrence]
+                            (update result (:value occurrence) (fnil conj []) occurrence))
+                          {} (mapcat :operand-occurrences nodes))
+        controls (reduce (fn [result reference]
+                           (update result (:value reference) (fnil conj []) reference))
+                         {} (mapcat :control-references nodes))]
+    {:nodes nodes :producers producers :consumers consumers :controls controls}))
+
 (defn- map-spine-description
   "Audit one exact adjacent, single-use linear map spine without choosing differentiation
    activity. Every internal value is private and has exactly one consumer equation: the
    immediately following map. Equation subprograms remain the authority for later composition
    and lane projection."
   [source]
-  (soac/validate! source)
-  (let [equations (soac/equations source)]
+  (let [{:keys [nodes consumers] :as dataflow} (equation-dataflow source)
+        equations (mapv :equation nodes)]
     (when-not (<= 2 (count equations))
       (fail! :ad-normalized-map-chain-boundary {:equations (count equations)}))
-    (let [subprograms (soac/equation-subprograms source)
-          results (mapv (comp vec #(nth % 2)) equations)
-          inputs (mapv (comp set soac/operation-inputs) equations)
+    (let [subprograms (mapv :subprogram nodes)
+          results (mapv :results nodes)
           public-outputs (set (soac/outputs source))
           edges
           (mapv (fn [index]
@@ -846,18 +892,14 @@
                         consumer (nth equations (inc index))
                         producer-results (nth results index)
                         value (first producer-results)
-                        consumers (into []
-                                        (keep-indexed
-                                         (fn [consumer-index consumer-inputs]
-                                           (when (contains? consumer-inputs value)
-                                             consumer-index)))
-                                        inputs)]
+                        consumer-indices (vec (distinct (map :consumer-index
+                                                             (get consumers value))))]
                     (when-not (and (= 1 (count producer-results))
-                                   (= [(inc index)] consumers)
+                                   (= [(inc index)] consumer-indices)
                                    (not (contains? public-outputs value)))
                       (fail! :ad-normalized-map-chain-boundary
                              {:producer producer :consumer consumer :value value
-                              :consumers consumers :outputs (soac/outputs source)}))
+                              :consumers consumer-indices :outputs (soac/outputs source)}))
                     {:value value :producer producer :consumer consumer}))
                 (range (dec (count equations))))]
       (when-not (and (every? #(= 'map (soac/operation-kind %)) equations)
@@ -865,7 +907,7 @@
                      (fingerprint/equivalent? (last results) (soac/outputs source)))
         (fail! :ad-normalized-map-chain-boundary
                {:equations equations :outputs (soac/outputs source)}))
-      {:equations equations :subprograms subprograms :edges edges})))
+      (assoc dataflow :equations equations :subprograms subprograms :edges edges))))
 
 (defn- exact-map-spine-stage
   "Rebuild and fuse one exact finite pure linear map spine using shared dialect authorities.
@@ -1428,24 +1470,25 @@
   "Check the two-equation source before narrowing its known frontend bookkeeping.
    This is a relational projection, not permission to erase arbitrary host activity."
   [source source-ns]
-  (soac/validate! source)
-  (when-not (and (= 2 (count (soac/equations source)))
-                 (instance? clojure.lang.Namespace source-ns))
-    (fail! :ad-normalized-sum-boundary {:source source :source-ns source-ns}))
-  (let [[map-equation reduction :as equations] (soac/equations source)
-        facts (soac/facts source)
-        map-parts (soac/operation-parts map-equation)
-        {:keys [kind attributes arrays captures lambda]} (soac/operation-parts reduction)
-        {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
-        [acc element] parameters
-        [identity] (:identities attributes)
-        [dt] (:dtypes attributes)
-        [result] (nth reduction 2)
-        values (:values facts)
-        body (first body-results)
-        scalar-values {result (get values result)
-                       acc (av/tensor {:dtype dt :shape []})
-                       element (av/tensor {:dtype dt :shape []})}]
+  (let [{:keys [nodes]} (equation-dataflow source)
+        equations (mapv :equation nodes)]
+    (when-not (and (= 2 (count equations))
+                   (instance? clojure.lang.Namespace source-ns))
+      (fail! :ad-normalized-sum-boundary {:source source :source-ns source-ns}))
+    (let [[map-equation reduction] equations
+          facts (soac/facts source)
+          map-parts (soac/operation-parts map-equation)
+          {:keys [kind attributes arrays captures lambda]} (soac/operation-parts reduction)
+          {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
+          [acc element] parameters
+          [identity] (:identities attributes)
+          [dt] (:dtypes attributes)
+          [result] (nth reduction 2)
+          values (:values facts)
+          body (first body-results)
+          scalar-values {result (get values result)
+                         acc (av/tensor {:dtype dt :shape []})
+                         element (av/tensor {:dtype dt :shape []})}]
     (when-not (and (= 2 (count equations)) (= 'map (:kind map-parts)) (= 'reduce kind)
                    (= [result] (soac/outputs source)) (= 1 (count (nth reduction 2)))
                    (empty? (:effects facts)) (empty? (:aliases facts))
@@ -1511,14 +1554,14 @@
         (let [derived (scan/certify-reassociation {:acc acc :init identity :lambda body} dt)]
           (when-not (fingerprint/equivalent? derived (first (:algebra attributes)))
             (fail! :ad-normalized-sum-algebra {:derived derived :retained (:algebra attributes)})))))
-    (let [view (soac/equation-subprogram source map-equation)]
+    (let [view (:subprogram (first nodes))]
       (if (= :closed-clojure (get-in facts [:attributes :source-dialect]))
         ;; All original bindings, provenance and absent host operations were checked above.
         ;; The one-map view's binding list is the exact checked first source prefix.
         (let [view-facts (assoc-in (soac/facts view) [:attributes :source-bindings]
                                   (nth map-equation 2))]
           (soac/make view-facts [map-equation] (nth map-equation 2)))
-        view))))
+        view)))))
 
 (defn- append-ordered-sum [map-program reduction source result]
   (let [[boundary] (:arrays (soac/operation-parts reduction))
