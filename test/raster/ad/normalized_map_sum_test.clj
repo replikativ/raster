@@ -94,7 +94,8 @@
                (reason #(normalized/validate! forged))))))
     (doseq [[tangent-inputs expected]
             [[nil :ad-normalized-map-interface]
-             [(apply list (:tangent-inputs map-interface)) :ad-normalized-sum-interface]
+             ;; The retained node proof owns exact stage-port shape before the sum consumer.
+             [(apply list (:tangent-inputs map-interface)) :ad-normalized-map-programs]
              [(vec (butlast (:tangent-inputs map-interface))) :ad-normalized-map-interface]
              [(vec (repeat 2 (first (:tangent-inputs map-interface)))) :ad-normalized-map-interface]
              [(vec (reverse (:tangent-inputs map-interface))) :ad-normalized-map-programs]]]
@@ -103,7 +104,8 @@
         (is (= expected
                (reason #(normalized/validate! forged))))))
     (doseq [[active-inputs expected] [[(vec (butlast active)) :ad-normalized-map-interface]
-                                      ['[weights weights] :ad-normalized-map-active-array]
+                                      ;; Ordered activity uniqueness is now a node-proof premise.
+                                      ['[weights weights] :ad-normalized-map-node-proof]
                                       [(vec (reverse active)) :ad-normalized-map-interface]]]
       (let [forged (assoc-in bundle [:map-programs :interface :active-inputs] active-inputs)
             forged (assoc forged :certificate (#'normalized/certificate forged))]
@@ -121,9 +123,20 @@
     (is (not-any? #(contains? bundle %)
                   [:primal :linear :transpose :params :active-inputs
                    :tangent-inputs :residuals :cotangent-seed]))
+    ;; A malformed list containing a real namespace-bearing witness is rejected before
+    ;; certification; the certificate projector deliberately handles only valid node vectors.
+    (is (= :ad-normalized-sum-map-boundary
+           (reason #(normalized/validate!
+                     (assoc-in bundle [:map-programs :proof :nodes] (list node))))))
     (doseq [[expected change]
             [[:ad-normalized-sum-map-boundary
               #(update-in % [:map-programs :proof] dissoc :nodes)]
+             [:ad-normalized-sum-map-boundary
+              #(assoc-in % [:map-programs :proof :nodes] 1)]
+             [:ad-normalized-sum-map-boundary
+              #(assoc-in % [:map-programs :proof :nodes] [1])]
+             [:ad-normalized-sum-map-boundary
+              #(assoc-in % [:map-programs :proof :nodes] (list 1))]
              [:ad-normalized-sum-map-boundary
               #(assoc-in % [:map-programs :proof :nodes] [node node])]
              [:ad-normalized-map-node-proof

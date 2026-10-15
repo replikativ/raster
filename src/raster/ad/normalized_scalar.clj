@@ -2192,15 +2192,17 @@
   [bundle]
   (let [proof (get-in bundle [:map-programs :proof])
         nodes (:nodes proof)
-        [node] nodes
+        node (when (vector? nodes) (first nodes))
         scalar (:scalar-derivation node)]
     (when-not (and (= :normalized-scalar (:authority proof))
+                   (vector? nodes)
                    (= 1 (count nodes))
+                   (map? node)
                    (= #{:source-equations :execution-equation :scalar-derivation
                         :stage-interface :equation-ids}
                       (set (keys node)))
                    (map? scalar))
-      (fail! :ad-normalized-sum-map-boundary {:nodes (count nodes)}))
+      (fail! :ad-normalized-sum-map-boundary {:nodes nodes}))
     scalar))
 
 (defn- lift-sum-programs [bundle source interface]
