@@ -1028,6 +1028,15 @@ stable array captures and caller-owned indexed transpose destinations are still 
 their respective operation boundaries. This does not generalize the accepted topology or
 derive AD rules from mere structural source realizability.
 
+One internal prerequisite also admits a single source-free functional `segmented-reduce` under
+the existing Float/Double `:abstract-blas-product` source contract. It allocates a fresh owned
+plain-host result before invoking the unchanged typed contraction projection. Admission requires
+static positive dense geometry, one result and accumulator, exact public operands, and no physical
+result storage, effects, aliases, transforms, stages, mixed storage or unknown facets. The older
+caller-owned projection remains unchanged. This is host realization infrastructure, not an AD
+facet or evidence that its implementation-defined reduction association is bit-identical to a
+particular BLAS library.
+
 ## Opt-in resident normalized-map execution
 
 `raster.ad.normalized-device/prepare-owner` is a bounded lease-oriented device consumer for one

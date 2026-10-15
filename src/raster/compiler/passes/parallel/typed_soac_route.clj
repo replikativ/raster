@@ -7,7 +7,9 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
@@ -179,8 +181,14 @@
                  nil)]
     (when extent (allocation-pair values result extent))))
 
+(defn- segmented-result-extent
+  [attributes]
+  (let [shape (dialect/segmented-reduce-result-shape attributes)]
+    (reduce *' 1 shape)))
+
 (defn- realize-equation
-  [program equation]
+  ([program equation] (realize-equation program equation false))
+  ([program equation fresh-segmented-reduction?]
   (let [[_ equation-id results] equation
         {:keys [kind attributes]} (dialect/operation-parts equation)
         values (:values (dialect/facts program))
@@ -513,11 +521,20 @@
       (let [host-binding (or (get-in placement-facts [:attributes :host-binding])
                              (first results))
             source (projection/segmented-reduce-contract-form program equation)]
-        {:equation-id equation-id
-         :placement placement
-         :pairs [[host-binding source]]
-         :site [:binding host-binding]
-         :source source})
+        (if fresh-segmented-reduction?
+          (let [result (first results)
+                effect (gensym (str "typed_soac_segmented_reduce_" equation-id "__"))]
+            {:equation-id equation-id
+             :placement placement
+             :pairs [(allocation-pair values result (segmented-result-extent attributes))
+                     [effect source]]
+             :site [:binding effect]
+             :source source})
+          {:equation-id equation-id
+           :placement placement
+           :pairs [[host-binding source]]
+           :site [:binding host-binding]
+           :source source}))
 
       product-reduce
       (let [host-binding (or (get-in placement-facts [:attributes :host-binding])
@@ -567,7 +584,7 @@
          :placement placement
          :pairs [[result source]]
          :site [:binding result]
-         :source source}))))
+         :source source})))))
 
 (defn- project-host-scalar-hints
   "Retained scalar dtype is semantic; primitive JVM local hints are not.
@@ -589,7 +606,9 @@
 
 (defn- host-projection
   "Shared source assembly. Physical destinations remain separate from semantic inputs."
-  [program physical-inputs output-values]
+  ([program physical-inputs output-values]
+   (host-projection program physical-inputs output-values #{}))
+  ([program physical-inputs output-values fresh-segmented-reductions]
   (let [facts (dialect/facts program)
         inputs (:inputs facts)
         outputs (dialect/outputs program)
@@ -607,13 +626,17 @@
                              (assoc-in facts [:equations (second equation) :provenance :source-binding-id] index))
                            (dialect/facts projected) (map-indexed vector (dialect/equations projected)))
                    (dialect/equations projected) (dialect/outputs projected))
-        pairs (mapcat #(:pairs (realize-equation projected %)) (dialect/equations projected))]
+        pairs (mapcat #(let [equation-id (second %)]
+                         (:pairs (realize-equation projected %
+                                                   (contains? fresh-segmented-reductions
+                                                              equation-id))))
+                      (dialect/equations projected))]
     (cond-> {:inputs inputs :outputs outputs
              :parameters (mapv symbols (concat inputs physical-inputs))
              :value-symbols symbols
              :body (project-host-scalar-hints
                     (list 'let* (vec (mapcat identity pairs)) (mapv symbols output-values)))}
-      (seq physical-inputs) (assoc :physical-inputs physical-inputs))))
+      (seq physical-inputs) (assoc :physical-inputs physical-inputs)))))
 
 (defn- plain-host-value? [value]
   (and (= :tensor (:kind value)) (= {:kind :plain} (:representation value))
@@ -754,8 +777,11 @@
                        :operations (mapv :kind parts) :outputs outputs})))
     {:physical-inputs [] :output-values outputs}))
 
-(defn- project-admitted-host [program {:keys [physical-inputs output-values]}]
-  (host-projection program physical-inputs output-values))
+(defn- project-admitted-host
+  [program {:keys [physical-inputs output-values fresh-segmented-reductions]}]
+  (if-let [fresh (seq fresh-segmented-reductions)]
+    (host-projection program physical-inputs output-values (set fresh))
+    (host-projection program physical-inputs output-values)))
 
 (defn materialize-host-map
   "Project one pure functional map to fresh host primitive arrays using existing realization.
@@ -859,10 +885,110 @@
   (dialect/validate! program)
   (project-admitted-host program (admit-host-indexed-map-program! program)))
 
+(defn- admit-host-fresh-segmented-reduce-program!
+  [program]
+  (let [facts (dialect/facts program)
+        [equation :as equations] (dialect/equations program)
+        [_ equation-id results] equation
+        {:keys [kind attributes arrays captures lambda]} (when equation
+                                                           (dialect/operation-parts equation))
+        equation-facts (get-in facts [:equations equation-id])
+        outputs (dialect/outputs program)
+        inputs (:inputs facts)
+        values (:values facts)
+        result (first results)
+        result-value (get values result)
+        {:keys [accumulators identities dtypes algebra segment-axes index extent
+                result-transform result-storage-dtype source-arithmetic]} attributes
+        operation-attributes (:attributes attributes)
+        operand-ids (vec (concat arrays captures))
+        operand-values (mapv values operand-ids)
+        extents (vec (concat (map second segment-axes) [extent]))
+        shape (when attributes (dialect/segmented-reduce-result-shape attributes))
+        static-array? (fn [value]
+                        (let [shape (:shape value)
+                              capacity (when (and (vector? shape)
+                                                  (seq shape)
+                                                  (every? #(and (integer? %) (pos? %)) shape))
+                                         (reduce *' 1 shape))]
+                          (and capacity (<= capacity Integer/MAX_VALUE))))
+        capacity (when (every? integer? shape) (reduce *' 1 shape))
+        dt (first dtypes)
+        expected-arithmetic (when (contains? #{:float :double} dt)
+                              (numerics/blas-source-arithmetic dt))
+        read-requirements (when equation
+                            (projection/segmented-reduce-core-read-requirements
+                             program equation))
+        read-minima (when (map? read-requirements)
+                      (try
+                        (into {} (map (fn [[id requirement]]
+                                        [id (launch/resolve-expression
+                                             (fn [_]
+                                               (throw (ex-info "fresh host read extent is not static"
+                                                               {:id id})))
+                                             requirement)]))
+                              read-requirements)
+                        (catch clojure.lang.ExceptionInfo _ nil)))
+        source-free (util/free-syms lambda)
+        stable (get operation-attributes :stable-array-captures)
+        pointwise-storage (get operation-attributes :pointwise-storage-inputs)
+        binders (conj (mapv first segment-axes) index)]
+    (when-not
+     (and (= 1 (count equations)) (= 'segmented-reduce kind)
+          (= 1 (count results) (count accumulators) (count identities)
+             (count dtypes) (count algebra))
+          (= outputs results) (= 1 (count outputs))
+          (not (contains? (:attributes equation-facts) :result-storage))
+          (empty? (:attributes equation-facts))
+          (empty? (:effects facts)) (empty? (:aliases facts))
+          (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
+          (set/subset? (set (keys (:attributes facts))) #{:source-arithmetic})
+          (or (not (contains? (:attributes facts) :source-arithmetic))
+              (= expected-arithmetic (get-in facts [:attributes :source-arithmetic])))
+          (set/subset? (set (keys attributes))
+                       #{:segment-axes :index :extent :attributes :accumulators :identities
+                         :dtypes :algebra :source-arithmetic})
+          (set/subset? (set (keys operation-attributes))
+                       #{:stable-array-captures :pointwise-storage-inputs})
+          (= (set stable) (set (filter #(seq (:shape (get values %))) captures)))
+          (empty? pointwise-storage)
+          (nil? result-transform) (nil? result-storage-dtype)
+          (= expected-arithmetic source-arithmetic)
+          (contains? #{:float :double} dt)
+          (seq segment-axes)
+          (every? #(and (integer? %) (pos? %) (<= % Integer/MAX_VALUE)) extents)
+          (every? #(and (symbol? %) (nil? (namespace %))) binders)
+          (not-any? '#{float double int long}
+                    binders)
+          (every? #(and (integer? %) (pos? %)) shape)
+          (integer? capacity) (pos? capacity) (<= capacity Integer/MAX_VALUE)
+          (= (vec (distinct operand-ids)) operand-ids)
+          (= (set inputs) (set operand-ids))
+          (= (set (keys values)) (set (conj operand-ids result)))
+          (every? #(= % (av/make %)) (vals values))
+          (not (some #{result} operand-ids)) (not (contains? source-free result))
+          (every? #(and (plain-host-value? %) (= dt (:dtype %)) (static-array? %))
+                  operand-values)
+          (map? read-requirements)
+          (= (set operand-ids) (set (keys read-requirements)))
+          (= (set operand-ids) (set (keys read-minima)))
+          (every? (fn [[id minimum]]
+                    (let [operand (get values id)]
+                      (and (integer? minimum) (pos? minimum)
+                           (>= (reduce *' 1 (:shape operand)) minimum))))
+                  read-minima)
+          (plain-host-value? result-value) (= :owned (:ownership result-value))
+          (= dt (:dtype result-value)) (= shape (:shape result-value)))
+      (throw (ex-info "program cannot be materialized as a fresh host segmented reduction"
+                      {:reason :typed-soac-host-fresh-segmented-reduce-boundary
+                       :equation equation :inputs inputs :outputs outputs})))
+    {:physical-inputs [] :output-values outputs
+     :fresh-segmented-reductions [equation-id]}))
+
 (defn materialize-host-program
   "Project the existing bounded primitive host subset by its actual TypedSOAC operations.
    Admits one map, one pure homogeneous common-extent map graph, one map→scalar reduction,
-   or one sequential indexed effect map.
+   one fresh plain-host abstract-BLAS segmented reduction, or one sequential indexed effect map.
    Uses the same strict operation/physical-owner checks as the specialized public APIs;
    graph projection preserves every equation/output in source order and adds no numerical
    semantics. Other equation graphs remain outside this boundary."
@@ -883,6 +1009,7 @@
                      [map] (if indexed? (admit-host-indexed-map-program! program)
                                         (admit-host-map-program! program false))
                      [map reduce] (admit-host-map-program! program true)
+                     [segmented-reduce] (admit-host-fresh-segmented-reduce-program! program)
                      [effect-map] (admit-host-indexed-map-program! program)
                      (throw (ex-info "unsupported primitive host program topology"
                                      {:reason :typed-soac-host-program-topology

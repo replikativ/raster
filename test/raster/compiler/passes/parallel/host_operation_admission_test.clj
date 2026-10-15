@@ -1,12 +1,16 @@
 (ns raster.compiler.passes.parallel.host-operation-admission-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.walk :as walk]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-map-element-test :as maps]
             [raster.ad.normalized-map-sum-test :as sums]
             [raster.ad.normalized-indexed-map-test :as indexed]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.par]
             [raster.numeric]))
 
 (defn- reason [f]
@@ -14,6 +18,31 @@
 
 (defn- changed [program f]
   (soac/make (f (soac/facts program)) (soac/equations program) (soac/outputs program)))
+
+(defn- changed-operation-attributes [program f]
+  (let [[equation] (soac/equations program)
+        operation (nth equation 3)
+        operation (apply list (assoc (vec operation) 1 (f (second operation))))
+        equation (apply list (assoc (vec equation) 3 operation))]
+    (soac/make (soac/facts program) [equation] (soac/outputs program))))
+
+(defn- changed-segmented-body [program f]
+  (let [[equation] (soac/equations program)
+        operation (nth equation 3)
+        attributes (second operation)
+        arrays (nth operation 2)
+        captures (nth operation 3)
+        {:keys [parameters locals body-results]} (soac/lambda-parts (nth operation 4))
+        body (f (first body-results))
+        dtype (first (:dtypes attributes))
+        algebra (scan/certify-reassociation
+                 {:acc (first (:accumulators attributes))
+                  :init (first (:identities attributes)) :lambda body} dtype)
+        attributes (assoc attributes :algebra [algebra])
+        operation (list 'segmented-reduce attributes arrays captures
+                        (soac/lambda-form parameters locals [body]))
+        equation (apply list (assoc (vec equation) 3 operation))]
+    (soac/make (soac/facts program) [equation] (soac/outputs program))))
 
 (defn- map-equation [id results index extent arrays parameters bodies]
   (list '= id (vec results)
@@ -68,6 +97,52 @@
 (defn- run-host [program arguments]
   (let [{:keys [parameters body]} (route/materialize-host-program program)]
     (apply (eval (list 'fn parameters body)) arguments)))
+
+(defn- segmented-program
+  ([dt] (segmented-program dt nil))
+  ([dt destination]
+   (let [init (if (= :float dt) '(clojure.core/float 0.0) 0.0)
+         body '(raster.numeric/+ acc
+                  (raster.numeric/*
+                   (clojure.core/aget lhs (clojure.core/+ (clojure.core/* i 2) l))
+                   (clojure.core/aget rhs (clojure.core/+ (clojure.core/* j 2) l))))
+         algebra (scan/certify-reassociation {:acc 'acc :init init :lambda body} dt)
+         arithmetic (numerics/blas-source-arithmetic dt)
+         equation
+         (list '= 'dense-product '[C]
+               (list 'segmented-reduce
+                     {:segment-axes '[[i 2] [j 3]] :index 'l :extent 2
+                      :accumulators '[acc] :identities [init] :dtypes [dt]
+                      :algebra [algebra] :source-arithmetic arithmetic
+                      :attributes {:stable-array-captures '[A B]
+                                   :pointwise-storage-inputs []}}
+                     [] '[A B] (soac/lambda-form '[acc lhs rhs] [] [body])))
+         value (fn [shape ownership]
+                 (av/tensor {:dtype dt :shape shape :ownership ownership}))
+         equation-facts
+         (cond-> (soac/default-equation-facts)
+           destination
+           (assoc :effects #{:memory/write}
+                  :aliases {'C destination}
+                  :attributes {:result-storage
+                               [{:destination destination :access :write
+                                 :host-return :buffer}]}))
+         facts (soac/default-program-facts
+                {:values (cond-> {'A (value [2 2] nil) 'B (value [3 2] nil)
+                                  'C (value [2 3] :owned)}
+                           destination (assoc destination (value [2 3] :owned)))
+                 :inputs '[A B]
+                 :effects (if destination #{:memory/write} #{})
+                 :aliases (if destination {'C destination} {})
+                 :attributes {:source-arithmetic arithmetic}
+                 :equations {'dense-product equation-facts}})]
+     (soac/make facts [equation] '[C]))))
+
+(defn- run-projection [projection arguments]
+  (apply (eval (list 'fn (:parameters projection) (:body projection))) arguments))
+
+(defn- fbits [^floats values]
+  (mapv #(Float/floatToRawIntBits (aget values %)) (range (alength values))))
 
 (defn- independent-graph [left-dtype right-dtype left-extent right-extent]
   (let [left (graph-program
@@ -128,6 +203,128 @@
         (is (= 1 @validations))
         (route/materialize-host-map program)
         (is (= 2 @validations))))))
+
+(deftest fresh-segmented-reduction-matches-the-existing-stored-host-realization
+  (let [fresh (segmented-program :float)
+        stored (segmented-program :float 'destination)
+        a (float-array [4097.0 -1.25 0.03125 8193.0])
+        b (float-array [0.1 -0.3 1025.0 0.0009765625 -7.0 11.0])
+        a-before (fbits a)
+        b-before (fbits b)
+        fresh-projection (route/materialize-host-program fresh)
+        swapped-projection (route/materialize-host-program
+                            (changed fresh #(assoc % :inputs '[B A])))
+        stored-projection (#'route/host-projection stored '[destination] '[C])
+        [first-result] (run-projection fresh-projection [a b])
+        [second-result] (run-projection fresh-projection [a b])
+        [swapped-result] (run-projection swapped-projection [b a])
+        destination (float-array 6)
+        [stored-result] (run-projection stored-projection [a b destination])
+        [_ bindings returned] (:body fresh-projection)
+        [allocated allocation effect call] bindings]
+    (is (= (fbits stored-result) (fbits first-result) (fbits second-result)
+           (fbits swapped-result)))
+    (is (every? #(Float/isFinite %) first-result))
+    (is (not (identical? first-result second-result)))
+    (is (not (identical? first-result a)))
+    (is (not (identical? first-result b)))
+    (is (identical? destination stored-result))
+    (is (= a-before (fbits a)))
+    (is (= b-before (fbits b)))
+    (is (= 2 (count (:parameters fresh-projection))))
+    (is (= 3 (count (:parameters stored-projection))))
+    ;; Fresh realization allocates before invoking the unchanged contraction form and returns
+    ;; the allocated logical result. Successful execution above checks the generated scope.
+    (is (= 4 (count bindings)))
+    (is (= allocated (get (:value-symbols fresh-projection) 'C)))
+    (is (= allocated (second call)))
+    (is (= [allocated] returned))
+    (is (not= allocated effect))
+    (is (not (some #{allocated effect} (:parameters fresh-projection))))
+    (is (seq allocation))))
+
+(deftest fresh-double-segmented-reduction-has-the-declared-product
+  (let [[result] (run-host (segmented-program :double)
+                           [(double-array [1.0 2.0 3.0 4.0])
+                            (double-array [5.0 6.0 7.0 8.0 9.0 10.0])])]
+    (is (= [17.0 23.0 29.0 39.0 53.0 67.0] (vec result)))))
+
+(deftest fresh-segmented-reduction-boundary-is-closed
+  (let [program (segmented-program :float)
+        arithmetic (numerics/blas-source-arithmetic :float)
+        eq-id (second (first (soac/equations program)))
+        refuse (fn [candidate]
+                 (= :typed-soac-host-fresh-segmented-reduce-boundary
+                    (reason #(route/materialize-host-program candidate))))]
+    (is (refuse (changed program #(assoc-in % [:values 'C :ownership] nil))))
+    ;; Read minima stay small when the summand broadcasts over the reduction axis.
+    ;; The host macro still narrows its loop bound to int, independently of storage.
+    (let [broadcast (changed-segmented-body
+                     program
+                     #(walk/postwalk-replace
+                       {'(clojure.core/+ (clojure.core/* i 2) l) 'i
+                        '(clojure.core/+ (clojure.core/* j 2) l) 'j}
+                       %))]
+      (is (some? (route/materialize-host-program broadcast)))
+      (is (refuse (changed-operation-attributes broadcast #(assoc % :extent 2147483648)))))
+    (is (refuse (changed program #(assoc-in % [:values 'A :memory-space] :device))))
+    (is (refuse (changed program #(assoc-in % [:values 'A :dtype] :double))))
+    (is (refuse (changed program #(assoc-in % [:values 'A :shape] [50000 50000]))))
+    (is (refuse (changed program #(assoc-in % [:values 'A :shape] [1]))))
+    (is (refuse (changed program #(assoc-in % [:values 'B :shape] [1]))))
+    (is (refuse (changed program #(update-in % [:values 'A] assoc :unknown-facet true))))
+    (is (refuse (changed program #(update-in % [:values 'C] assoc :unknown-facet true))))
+    (is (refuse (changed program #(assoc-in % [:attributes :unknown] true))))
+    (is (some? (reason (fn [] (route/materialize-host-program
+                                (changed program #(assoc % :inputs '[A B C])))))))
+    (is (refuse (changed program #(assoc-in % [:values 'unused]
+                                             (av/tensor {:dtype :float :shape [1]})))))
+    (is (refuse (changed program #(assoc-in % [:equations eq-id :attributes]
+                                             {:unexpected true}))))
+    (is (refuse (changed program #(assoc-in % [:attributes :source-arithmetic]
+                                             numerics/retained-source-arithmetic))))
+    (is (refuse
+         (soac/make (soac/facts program)
+                    (walk/postwalk-replace {'i 'float} (soac/equations program))
+                    (soac/outputs program))))
+    (is (refuse
+         (changed-operation-attributes
+          (changed-segmented-body program #(walk/postwalk-replace {'i 0} %))
+          #(assoc % :segment-axes '[[qualified/i 2] [j 3]]))))
+    (is (refuse
+         (changed-segmented-body
+          program
+          #(walk/postwalk-replace
+            {'(clojure.core/+ (clojure.core/* j 2) l)
+             '(clojure.core/rem (clojure.core/+ (clojure.core/* j 2) l) 6)}
+            %))))
+    (is (refuse (changed-operation-attributes program #(dissoc % :source-arithmetic))))
+    (is (= :typed-soac-syntax
+           (reason (fn []
+                     (changed-operation-attributes
+                      program #(assoc % :source-arithmetic
+                                      (numerics/blas-source-arithmetic :double)))))))
+    (is (refuse (changed-operation-attributes program #(assoc % :result-transform nil))))
+    (is (some? (reason (fn [] (route/materialize-host-program
+                                (changed-operation-attributes
+                                 program #(assoc % :stages [])))))))
+    (is (some? (reason (fn [] (route/materialize-host-program
+                                (changed-operation-attributes
+                                 program #(assoc % :decode {})))))))
+    (is (refuse (segmented-program :float 'destination)))
+    (let [[equation] (soac/equations program)
+          operation (nth equation 3)
+          attributes (assoc (second operation) :segment-axes '[[i 50000] [j 50000]])
+          operation (apply list (assoc (vec operation) 1 attributes))
+          equation (apply list (assoc (vec equation) 3 operation))
+          facts (assoc-in (soac/facts program) [:values 'C :shape] [50000 50000])
+          oversized (soac/make facts [equation] (soac/outputs program))]
+      (is (refuse oversized)))
+    (is (= :typed-soac-host-map-boundary
+           (reason #(route/materialize-host-map program))))
+    (is (= arithmetic
+           (get-in (soac/operation-parts (first (soac/equations program)))
+                   [:attributes :source-arithmetic])))))
 
 (deftest map-graph-validates-the-original-through-public-and-batch-boundaries
   (let [program (diamond-graph :float 'n)

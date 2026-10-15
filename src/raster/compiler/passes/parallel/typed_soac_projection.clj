@@ -237,7 +237,7 @@
                          (= 1 (count accumulators))
                          (= 1 (count body-results))
                          (= 1 (count physical-results))
-                         (= 1 (count storage)))
+                         (contains? #{0 1} (count storage)))
             (throw (ex-info "contract projection requires one scalar segmented reduction result"
                             {:reason :typed-soac-contract-projection
                              :equation equation-id :kind kind :results results
