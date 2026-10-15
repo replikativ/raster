@@ -13,6 +13,59 @@
 (def ^:private lhs-layout (layout/dot-operand 0 acc-layout 2 :half))
 (def ^:private rhs-layout (layout/dot-operand 1 acc-layout 2 :half))
 
+(defn- with-counted-index-expression-roots
+  [f]
+  (let [target (ns-resolve 'raster.compiler.ir.kernel-body 'expression-info!)
+        original @target
+        depth (atom 0)
+        roots (atom 0)
+        result (with-redefs-fn
+                 {target (fn [& arguments]
+                           (let [root? (zero? @depth)]
+                             (when root? (swap! roots inc))
+                             (swap! depth inc)
+                             (try
+                               (apply original arguments)
+                               (finally (swap! depth dec)))))}
+                 f)]
+    [result @roots]))
+
+(deftest computed-index-metadata-is-derived-once-per-ssa-root
+  (let [kernel (fn [indices]
+                 (body/make {:id :computed-index-cse
+                             :indices indices
+                             :launch (launch/spec {:workgroup-size [1] :group-count [1]})}))
+        [hardware hardware-roots]
+        (with-counted-index-expression-roots
+          #(kernel [(body/->IndexBinding 'group :group 0)]))
+        [computed computed-roots]
+        (with-counted-index-expression-roots
+          #(kernel [(body/->IndexCompute 'base (body/expression :mul 7 11))
+                    (body/->IndexCompute 'offset (body/expression :add 'base 3))]))]
+    (is (body/kernel-body? hardware))
+    (is (zero? hardware-roots) "hardware metadata remains lazy and independent")
+    (is (body/kernel-body? computed))
+    (is (= 2 computed-roots) "each ordered computed SSA root is analyzed exactly once")
+    (doseq [[expression reason]
+            [[(body/expression :mul Integer/MAX_VALUE 2) :kernel-body-index-prefix]
+             [(apply body/expression :add (repeat 129 0)) :kernel-body-index-prefix]]]
+      (let [actual (try
+                     (with-counted-index-expression-roots
+                       #(kernel [(body/->IndexCompute 'bad expression)]))
+                     :accepted
+                     (catch clojure.lang.ExceptionInfo e
+                       (:reason (ex-data e))))]
+        (is (= reason actual))))
+    (let [index (body/->IndexCompute 'bad (body/expression :add 'missing 1))]
+      (try
+        (kernel [index])
+        (is false "a computed index cannot read an absent prior SSA value")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= "computed kernel index references a value before it is defined"
+                 (ex-message e)))
+          (is (= {:index index :references '[missing] :scope #{}}
+                 (ex-data e))))))))
+
 (deftest closed-scheduling-arithmetic-cannot-hide-overflowing-prefixes
   (let [wide #(body/index-cast % :long :exact)
         kernel #(body/make {:id :prefix-proof :indices [(body/->IndexCompute 'offset %)]
