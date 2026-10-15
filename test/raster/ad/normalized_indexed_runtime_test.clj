@@ -41,6 +41,11 @@
         (is (= [5.0 5.0] (vec output) (vec jy)))
         (is (= [0.0 3.0 0.0] (vec g)))
         (is (= [0.5 0.5] (vec tangent)))
+        (is (= '[m] (get-in @owner [:interface :tangent-inputs 0 :value :shape])
+               (get-in @owner [:interface :cotangent-results 0 :value :shape])))
+        (is (= '[n] (get-in @owner [:interface :primal-result :value :shape])
+               (get-in @owner [:interface :tangent-result :value :shape])
+               (get-in @owner [:interface :cotangent-input :value :shape])))
         (is (= (mapv :id (get-in @owner [:interface :inputs])) (:inputs prepared)))
         (is (= 2 preparation-proofs) "adapter canonical proof and independent post-capture proof")
         (is (= preparation-proofs (count @validated)) "no hot canonical proof replay")
@@ -242,6 +247,8 @@
                 (let [owner (get environment zero)]
                   (is (identical? @snapshot (get environment (get-in b [:gather-programs :interface :index-snapshot]))))
                   (is (not-any? #(or (identical? data %) (identical? indices %) (identical? y %)) (vals environment)))
+                  (is (= (long 1) (get environment 'n)))
+                  (is (= (long 3) (get environment 'm)))
                   (is (= [0.0 0.0 0.0] (vec owner)))
                   (swap! owners conj owner)
                   (let [result (original executable environment)]

@@ -3,7 +3,8 @@
             [raster.ad.normalized-map-runtime :as runtime]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-map-element-test :as element]
-            [raster.ad.normalized-surface-map-test :as surface]))
+            [raster.ad.normalized-surface-map-test :as surface]
+            [raster.compiler.ir.abstract-value :as av]))
 
 (defn- bundle [program]
   (normalized/linearize-map-program program (the-ns 'raster.ad.normalized-map-runtime-test)))
@@ -81,6 +82,104 @@
       (is (= :ad-map-runtime-array (reason #(pullback (float-array 2)))))
       (is (= :ad-map-runtime-array
              (reason #((:jvp prepared) (args prepared valid) (double-array 1))))))))
+
+(deftest direct-port-shapes-use-only-literal-or-typed-integral-dimensions
+  (let [long-shape (av/tensor {:dtype :long :shape []})
+        int-shape (av/tensor {:dtype :int :shape []})
+        float-shape (av/tensor {:dtype :float :shape []})
+        stable-id [:shape :rows]
+        values {'n long-shape 'rows int-shape stable-id long-shape 'bad float-shape}
+        environment {'n (long 2) 'rows (int 2) stable-id (long 2) 'bad (float 2.0)}
+        check (fn [value abstract role]
+                (#'runtime/source-value! value abstract environment values role))]
+    (let [value (double-array 2)]
+      (is (identical? value
+                      (check value (av/tensor {:dtype :double :shape [2]}) :literal))))
+    (is (= 2 (count (check (float-array 2)
+                           (av/tensor {:dtype :float :shape ['n]}) :long-dimension))))
+    (is (= 2 (count (check (double-array 2)
+                           (av/tensor {:dtype :double :shape ['rows]}) :int-dimension))))
+    (is (= 2 (count (check (double-array 2)
+                           (av/tensor {:dtype :double
+                                       :shape [(list 'value stable-id)]})
+                           :wrapped-dimension))))
+    ;; An ordinary integral scalar is type checked, but is not silently treated as a dimension.
+    (is (= (long -3) (#'runtime/source-value! (long -3) long-shape {} values :ordinary-long)))
+    (doseq [abstract [(assoc (av/tensor {:dtype :double :shape []}) :shape 2)
+                      (assoc (av/tensor {:dtype :double :shape []}) :shape '(n))
+                      (av/tensor {:dtype :double :shape ['n 'rows]})
+                      (av/tensor {:dtype :double :shape '[(clojure.core/+ n 1)]})
+                      (av/tensor {:dtype :double :shape ['missing]})
+                      (av/tensor {:dtype :double :shape ['bad]})]]
+      (is (= :ad-map-runtime-shape
+             (reason #(check (double-array 2) abstract :unsupported-shape)))))
+    (is (= :ad-map-runtime-extent-type
+           (reason #(#'runtime/source-value!
+                      (double-array 2) (av/tensor {:dtype :double :shape ['n]})
+                      (assoc environment 'n (int 2)) values :wrong-long-class))))
+    (is (= :ad-map-runtime-shape
+           (reason #(#'runtime/differential-value!
+                      (int 1) int-shape environment values :integral-differential))))))
+
+(deftest generated-results-are-checked-against-their-own-ports
+  (let [prepared (runtime/prepare (bundle (#'element/map-program :double)))
+        arguments (args prepared {'n (long 2) 'x (double-array [1.0 2.0])})
+        invoke-var #'runtime/invoke
+        invoke @invoke-var]
+    (with-redefs-fn {invoke-var (fn [& _] [])}
+      (fn [] (is (= :ad-map-runtime-results
+                     (reason (fn [] ((:vjp prepared) arguments)))))))
+    (with-redefs-fn
+      {invoke-var (fn [executable environment]
+                    (assoc (vec (invoke executable environment)) 0 (double-array 1)))}
+      (fn [] (is (= :ad-map-runtime-array
+                     (reason (fn [] ((:vjp prepared) arguments)))))))
+    (with-redefs-fn
+      {invoke-var (fn [executable environment]
+                    (let [results (vec (invoke executable environment))]
+                      (if (< 1 (count results))
+                        (assoc results 1 (double-array 1))
+                        results)))}
+      (fn [] (is (= :ad-map-runtime-array
+                     (reason (fn [] ((:vjp prepared) arguments)))))))
+    (let [calls (atom 0)]
+      (with-redefs-fn
+        {invoke-var (fn [executable environment]
+                      (let [results (vec (invoke executable environment))]
+                        (if (= 2 (swap! calls inc)) [(double-array 1)] results)))}
+        (fn []
+          (is (= :ad-map-runtime-array
+                 (reason (fn [] ((:jvp prepared) arguments
+                                 (double-array [0.25 0.5])))))))))
+    (let [calls (atom 0)]
+      (with-redefs-fn
+        {invoke-var (fn [executable environment]
+                      (if (= 2 (swap! calls inc)) [] (invoke executable environment)))}
+        (fn []
+          (is (= :ad-map-runtime-results
+                 (reason (fn [] ((:jvp prepared) arguments
+                                 (double-array [0.25 0.5])))))))))))
+
+(deftest delayed-map-pullback-retains-dimensions-and-owned-snapshots-only
+  (let [prepared (runtime/prepare (bundle (#'element/map-program :double)))
+        x (double-array [1.0 2.0])
+        arguments (args prepared {'n (long 2) 'x x})
+        [output pullback] ((:vjp prepared) arguments)
+        invoke-var #'runtime/invoke
+        invoke @invoke-var
+        environments (atom [])]
+    (with-redefs-fn
+      {invoke-var (fn [executable environment]
+                    (swap! environments conj environment)
+                    (invoke executable environment))}
+      #(is (= [1.0 4.0]
+              (vec (nth (pullback (double-array [0.5 1.0]))
+                        (.indexOf ^java.util.List (:inputs prepared) 'x))))))
+    (is (= 1 (count @environments)))
+    (let [environment (first @environments)]
+      (is (= (long 2) (get environment 'n)))
+      (is (not-any? #(or (identical? x %) (identical? output %)) (vals environment)))
+      (is (some #(instance? double/1 %) (vals environment))))))
 
 (deftest runtime-does-not-sidestep-bundle-validation
   (let [checked (bundle (#'element/map-program :double))]

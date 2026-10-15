@@ -32,10 +32,64 @@
     (fail! :ad-map-runtime-scalar {:role role :dtype dt :actual-class (some-> value class .getName)}))
   value)
 
-(defn- differential-value! [value abstract-value extent role]
-  (if (= [] (:shape abstract-value))
-    (scalar! value (:dtype abstract-value) role)
-    (array! value (:dtype abstract-value) extent role)))
+(defn- integral-control! [value dt role]
+  (when-not (case dt :int (instance? Integer value) :long (instance? Long value) false)
+    (fail! :ad-map-runtime-extent-type
+           {:extent value :role role :dtype dt :actual-class (some-> value class .getName)}))
+  value)
+
+(defn- direct-dimension-id
+  "Return the retained value ID for a direct dimension, nil for a literal, or refuse.
+   This deliberately does not interpret general shape/index expressions."
+  [dimension role]
+  (cond
+    (integer? dimension) nil
+    (symbol? dimension) dimension
+    (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension)))
+    (second dimension)
+    :else (fail! :ad-map-runtime-shape {:role role :dimension dimension})))
+
+(defn- direct-dimension!
+  [dimension environment source-values role]
+  (if (integer? dimension)
+    (do
+      (when-not (<= 0 dimension Integer/MAX_VALUE)
+        (fail! :ad-map-runtime-extent {:extent dimension :role role}))
+      dimension)
+    (let [id (direct-dimension-id dimension role)
+          abstract (get source-values id)]
+      (when-not (and (map? abstract) (= [] (:shape abstract))
+                     (contains? #{:int :long} (:dtype abstract))
+                     (contains? environment id))
+        (fail! :ad-map-runtime-shape
+               {:role role :dimension dimension :value-id id :abstract-value abstract}))
+      (let [value (integral-control! (get environment id) (:dtype abstract) id)]
+        (when-not (<= 0 value Integer/MAX_VALUE)
+          (fail! :ad-map-runtime-extent {:extent value :role role}))
+        value))))
+
+(defn- source-value!
+  [value abstract-value environment source-values role]
+  (let [shape (:shape abstract-value) dt (:dtype abstract-value)]
+    (when-not (vector? shape)
+      (fail! :ad-map-runtime-shape {:role role :abstract-value abstract-value}))
+    (cond
+      (= [] shape)
+      (case dt
+        (:float :double) (scalar! value dt role)
+        (:int :long) (integral-control! value dt role)
+        (fail! :ad-map-runtime-shape {:role role :abstract-value abstract-value}))
+
+      (= 1 (count shape))
+      (array! value dt (direct-dimension! (first shape) environment source-values role) role)
+
+      :else (fail! :ad-map-runtime-shape {:role role :abstract-value abstract-value}))))
+
+(defn- differential-value!
+  [value abstract-value environment source-values role]
+  (when-not (contains? #{:float :double} (:dtype abstract-value))
+    (fail! :ad-map-runtime-shape {:role role :abstract-value abstract-value}))
+  (source-value! value abstract-value environment source-values role))
 
 (defn- prepare-validated-owner
   "Compile a freshly validated canonical owner's host projections once.
@@ -60,12 +114,12 @@
   [owner]
   (let [expected (normalized/revisions)
         indexed? (= :checked-scalar-indexed-map (get-in owner [:derivation :kind]))
-        sum? (= :checked-scalar-map-sum (get-in owner [:derivation :kind]))
         {:keys [source execution-source primal linear transpose interface]} owner
         execution-source (or execution-source source)
         seed-id (get-in interface [:cotangent-input :id])
         inputs (mapv :id (:inputs interface))
         values (:values (soac/facts source))
+        input-ports (:inputs interface)
         equations (vec (soac/equations execution-source))
         parts (mapv soac/operation-parts equations)
         operand-arrays (set (mapcat :arrays parts))
@@ -98,6 +152,26 @@
         residual-plan (canonical/execution-residual-plan owner)
         owned-residuals (:owned-arrays residual-plan)
         physical-bindings (:physical-bindings residual-plan)
+        shape-ports (concat input-ports (:tangent-inputs interface)
+                            [(:primal-result interface) (:tangent-result interface)
+                             (:cotangent-input interface)]
+                            (:cotangent-results interface)
+                            (vals owned-residuals))
+        shape-value-ids
+        (into #{}
+              (keep (fn [port]
+                      (let [shape (get-in port [:value :shape])]
+                        (when-not (vector? shape)
+                          (fail! :ad-map-runtime-shape
+                                 {:role (:id port) :abstract-value (:value port)}))
+                        (case (count shape)
+                          0 nil
+                          1 (direct-dimension-id (first shape) (:id port))
+                          (fail! :ad-map-runtime-shape
+                                 {:role (:id port) :abstract-value (:value port)})))))
+              shape-ports)
+        retained-source-ids
+        (into shape-value-ids (if indexed? [] captures))
         index-snapshot (when indexed? (:id (get owned-residuals (first arrays))))
         required-zero-gradient (when indexed?
                                  (some (fn [[_ binding]]
@@ -143,11 +217,14 @@
                   (let [index (if (= :int it) (aget ^ints indices i) (aget ^longs indices i))]
                     (when-not (< -1 index capacity)
                       (fail! :ad-map-runtime-index {:position i :index index :capacity capacity}))))
-                {:environment (if (integer? capacity-id) environment
-                                  (assoc environment capacity-id
-                                         (case (:dtype (get values capacity-id))
-                                           :int (int capacity) :long (long capacity))))
-                 :extent extent :capacity capacity})
+                (let [environment (if (integer? capacity-id) environment
+                                    (assoc environment capacity-id
+                                           (case (:dtype (get values capacity-id))
+                                             :int (int capacity) :long (long capacity))))]
+                  (doseq [{:keys [id value]} input-ports]
+                    (source-value! (get environment id) value environment values id))
+                  {:environment environment
+                   :extent extent :capacity capacity}))
               (do
                 (doseq [id arrays] (array! (get environment id) dt extent id))
                 (doseq [id captures]
@@ -155,15 +232,26 @@
                               :float (instance? Float (get environment id))
                               :double (instance? Double (get environment id)) false)
                     (fail! :ad-map-runtime-capture {:input id :dtype (:dtype (get values id))})))
+                (doseq [{:keys [id value]} input-ports]
+                  (source-value! (get environment id) value environment values id))
                 {:environment environment :extent extent}))))
         acquire
         (fn [environment]
           (let [results (run primal environment)
+                output-ids (:outputs primal)
+                _ (when-not (= (count output-ids) (count results))
+                    (fail! :ad-map-runtime-results
+                           {:phase :primal :outputs output-ids :result-count (count results)}))
+                produced (zipmap output-ids results)
+                _ (source-value! (first results) (get-in interface [:primal-result :value])
+                                 environment values :primal-output)
+                _ (doseq [[_ {:keys [id value]}] owned-residuals]
+                    (source-value! (get produced id) value environment values id))
                 ;; Keep only immutable scalar captures/extent and freshly owned
                 ;; residual outputs. No mutable source array or returned y is a pullback input.
                 residual-ids (map :id (vals owned-residuals))
-                saved (merge (apply dissoc environment (if indexed? (concat arrays captures) arrays))
-                             (select-keys (zipmap (:outputs primal) results) residual-ids))]
+                saved (merge (select-keys environment retained-source-ids)
+                             (select-keys produced residual-ids))]
             (when indexed?
               (let [extent (if (integer? extent-id) extent-id (get environment extent-id))]
                 (array! (first results) dt extent :primal-output)
@@ -173,12 +261,13 @@
     {:inputs inputs
      :vjp
      (fn [arguments]
-       (let [{:keys [environment extent capacity]} (context arguments)
+       (let [{:keys [environment capacity]} (context arguments)
              [output saved] (acquire environment)]
          [output
           (fn [dy]
             (guard!)
-            (if sum? (scalar! dy dt :cotangent) (array! dy dt extent :cotangent))
+            (differential-value! dy (get-in interface [:cotangent-input :value])
+                                 saved values :cotangent)
             (let [seeded (assoc saved seed-id dy)
                   seeded (if indexed?
                            (assoc seeded (:value required-zero-gradient)
@@ -193,8 +282,7 @@
                         :gradient-count (count gradients)}))
               (doseq [[active gradient port] (map vector active-inputs gradients
                                                    (:cotangent-results interface))]
-                (differential-value! gradient (:value port)
-                                     (if indexed? capacity extent) active))
+                (differential-value! gradient (:value port) seeded values active))
               (when indexed?
                 (array! (first gradients) dt capacity :gradient)
                 (when-not (identical? (first gradients) (get seeded (:value required-zero-gradient)))
@@ -204,7 +292,7 @@
                 (mapv by-source inputs))))]))
      :jvp
      (fn [arguments dx]
-       (let [{:keys [environment extent capacity]} (context arguments)
+       (let [{:keys [environment]} (context arguments)
              tangents (if (= 1 (count active-inputs)) [dx] dx)]
          (when-not (and (vector? tangents)
                         (= (count active-inputs) (count (:tangent-inputs interface))
@@ -214,12 +302,19 @@
                                                                  (count tangents))}))
          (doseq [[active tangent port] (map vector active-inputs tangents
                                             (:tangent-inputs interface))]
-           (differential-value! tangent (:value port)
-                                (if indexed? capacity extent) active))
-         (let [[output saved] (acquire environment)]
-           [output (first (run push (into saved (map (fn [port tangent]
-                                                       [(:id port) tangent])
-                                                     (:tangent-inputs interface) tangents))))])))}))
+           (differential-value! tangent (:value port) environment values active))
+         (let [[output saved] (acquire environment)
+               push-environment (into saved (map (fn [port tangent]
+                                                   [(:id port) tangent])
+                                                 (:tangent-inputs interface) tangents))
+               tangent-results (vec (run push push-environment))
+               _ (when-not (= 1 (count tangent-results))
+                   (fail! :ad-map-runtime-results
+                          {:phase :linear :result-count (count tangent-results)}))
+               tangent (first tangent-results)]
+           (differential-value! tangent (get-in interface [:tangent-result :value])
+                                push-environment values :tangent-output)
+           [output tangent])))}))
 
 (defn prepare-owner
   "Validate a canonical owner and prepare CPU execution through the common private consumer.
