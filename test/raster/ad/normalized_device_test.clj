@@ -35,6 +35,32 @@
    (normalized/linearize-map-program
     (map-program body) (the-ns 'raster.ad.normalized-device-test))))
 
+(defn- diamond-owner []
+  (let [base (map-program '(raster.numeric/* element element))
+        tensor (get-in (soac/facts base) [:values 'x])
+        equation (fn [id output input body]
+                   (list '= id [output]
+                         (list 'map {:index 'i :extent 'n} [input] []
+                               (soac/lambda-form '[element] [] [body]))))
+        equations [(equation 'square 'a 'x '(raster.numeric/* element element))
+                   (equation 'twice 'b 'a
+                             '(raster.numeric/* element (clojure.core/float 2.0)))
+                   (equation 'thrice 'c 'a
+                             '(raster.numeric/* element (clojure.core/float 3.0)))
+                   (list '= 'join '[y]
+                         (list 'map {:index 'i :extent 'n} '[b c] []
+                               (soac/lambda-form '[left right] []
+                                                 '[(raster.numeric/+ left right)])))]
+        source (soac/make
+                (-> (soac/facts base)
+                    (update :values merge (zipmap '[a b c] (repeat tensor)))
+                    (assoc :equations (zipmap '[square twice thrice join]
+                                             (repeat (soac/default-equation-facts)))))
+                equations '[y])]
+    (canonical/adapt-map
+     (normalized/linearize-map-program
+      source (the-ns 'raster.ad.normalized-device-test)))))
+
 (defn- multi-active-owner []
   (let [base (map-program '(raster.numeric/* element element))
         tensor (get-in (soac/facts base) [:values 'x])
@@ -310,9 +336,8 @@
         (is (zero? @runs))
         ((:close! prepared))))))
 
-(defn- run-device-case! [target]
-  (let [owner (canonical-owner '(raster.numeric/* element element))
-        xs-values [-2.0 0.5 4.0]
+(defn- run-device-case! [target owner primal-oracle transpose-oracle]
+  (let [xs-values [-2.0 0.5 4.0]
         xs (float-array (map float xs-values))
         xs-before (vec xs)
         captured (atom nil)
@@ -360,12 +385,22 @@
               (finally (.close ^java.io.Closeable (:lease primal)))))
           (finally ((:close! prepared))))))))
 
+(defn- run-device-families! [target]
+  (run-device-case! target (canonical-owner '(raster.numeric/* element element))
+                    primal-oracle transpose-oracle)
+  ;; Exactly representable cases check region provenance, submission and retained lifetimes.
+  ;; The host region tests separately qualify rounded fused-order derivative semantics.
+  (run-device-case!
+   target (diamond-owner)
+   (fn [xs] (mapv #(let [a (fmul % %)] (fadd (fmul a 2.0) (fmul a 3.0))) xs))
+   (fn [xs seeds] (mapv #(fmul (fmul 10.0 %1) %2) xs seeds))))
+
 (deftest normalized-device-owner-runs-on-opencl
   (if @ocl-probe/opencl-available?
-    (run-device-case! :ocl:0)
+    (run-device-families! :ocl:0)
     (ocl-probe/opencl-skip! "normalized device owner acceptance")))
 
 (deftest normalized-device-owner-runs-on-level-zero
   (if @ze-probe/gpu-available?
-    (run-device-case! :ze:0)
+    (run-device-families! :ze:0)
     (ze-probe/gpu-skip! "normalized device owner acceptance")))

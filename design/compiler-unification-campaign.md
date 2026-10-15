@@ -24,6 +24,10 @@ until the shared structural boundary is established.
    to equation graphs: activity, topological JVP, reverse transposition and ordered
    fan-out accumulation. Start with test-only equivalence checks; retire superseded
    family orchestration only as coverage is demonstrated. Do not add another rule table.
+   A bounded consolidation first replaces spine-only composition with the existing
+   fusion authority for closed homogeneous map regions. It differentiates the exact
+   rederived execution map, not the rounded node-wise source graph. This removes a
+   topology special case but does not complete ordered graph cotangent accumulation.
 3. **Composition boundary.** Specify ordered parameter/result ports and owned residuals.
    Qualify an optional synchronous CPU foreign-AD adapter with independent analytic and
    finite-difference checks, changed inputs/seeds, mutation and cleanup tests. Keep
@@ -52,7 +56,7 @@ tolerances or abandoning strict floating-point semantics is not an acceptance sh
 
 | Boundary | Current opt-in implementation | Still open |
 | --- | --- | --- |
-| Normalized host AD | Canonical pure maps/nonbranching map chains, map→ordered-sum and functional indexed-map owners execute generated primal/JVP/VJP programs with exact residual plans. Pure maps, their checked fused chains and a single map→ordered-sum support ordered multiple active array inputs. | Multiple-active map-chain→sum and indexed operations, general equation DAGs, conditional/loop regions and default-source retirement. |
+| Normalized host AD | Canonical pure maps/fully fusible closed homogeneous map regions, map→ordered-sum and functional indexed-map owners execute generated primal/JVP/VJP programs with exact residual plans. Maps, their checked fused execution regions and a single map→ordered-sum support ordered multiple active array inputs. | Ordered node-wise graph transposition, nonfusing graphs, multiple-active map-chain→sum and indexed operations, conditional/loop regions and default-source retirement. |
 | Resident normalized AD | Public lease-oriented `prepare-owner`, `prepare-sum-owner` and `prepare-indexed-owner` reuse the generic resident binder, named-entry owner and LinkPlan/LinkModule validation on OpenCL and Level Zero. | Empty native buffers, general scatter/DAG execution, concurrent mutation, host readback and default-engine activation. |
 | Shape and storage premises | A checked self-`ShapeProjection` derives a private dimension from one public buffer; closed external-storage and external-dimension premises cross separate resident phases without fake parameters or initialization. Program-wide typed shape values remain in `ProgramCall`, while kernels that do not consume them keep an empty scalar ABI. | Automatic source-free projection of compound/shared dimensions, per-call geometry changes and arbitrary dynamic shape programs. |
 | Acceptance | The source AD engine remains the default structural reference; shared scalar rules mean it is not an independent calculus oracle. The unchanged real Gemma gate still fails 12/28 checks and the same-CPU-operand layer control 4/14. | Real-model closure, full GSDM statistical training, Adam/EMA qualification and the other original campaign gates. |

@@ -2,12 +2,13 @@
 
 ## Current implementation boundary
 
-Normalized AD is opt-in. The source AD engine remains the default and the independent oracle.
+Normalized AD is opt-in. The source AD engine remains the default structural reference;
+shared derivative rules mean it is not an independent calculus oracle.
 The current public boundary is deliberately smaller than general program differentiation:
 
 | Canonical family | Host execution | Opt-in resident device execution | Preparation and call contract |
 | --- | --- | --- | --- |
-| Pure map or finite nonbranching map chain | Canonical primal/JVP/VJP with retained residuals and ordered multiple active arrays | `normalized-device/prepare-owner` (one active input) | Concrete array geometry; array cotangent; exact residual dependency leases |
+| Pure map or fully fusible closed homogeneous map region | Canonical primal/JVP/VJP of the rederived execution map, with retained residuals and ordered multiple active arrays | `normalized-device/prepare-owner` (one active input) | Concrete array geometry; array cotangent; exact residual dependency leases |
 | Map followed by one ordered additive sum | Canonical primal/JVP/VJP with a scalar result and ordered multiple active arrays, or one active scalar capture | `normalized-device/prepare-sum-owner` (one active array) | Concrete array geometry; one exactly typed scalar cotangent fixed at preparation |
 | Functional indexed map | Canonical gather primal and sequential ordered transpose | `normalized-device/prepare-indexed-owner` | Static index/cotangent extent; data/gradient extent static or one private `m` fixed from the prepared data array; array cotangent |
 
@@ -24,13 +25,13 @@ source argument order. Host JVP retains the existing primitive-array argument fo
 with multiple active inputs it requires an exact vector of tangent arrays in activity order.
 VJP still returns cotangents in source argument order, with nil slots for inactive inputs. Saved
 coefficients are privately owned snapshots, so delayed pullbacks do not read subsequently mutated
-caller arrays. Chains use the existing exact append/fusion proof to derive their checked
-single-map execution stage; no separate chain derivative rule is added. A sum retains the exact
+caller arrays. Closed map regions use the existing fusion pass to derive their checked
+single-map execution stage; no separate region derivative rule is added. A sum retains the exact
 original ordered reduction for its primal and tangent; its scalar seed feeds the existing
 per-lane transpose, which returns an ordered gradient array for each selected array. Singleton
 scalar-capture differentiation still appends the original ordered reduction to the gradient
 contributions. Multiple-active indexed operations and resident device execution remain explicit refusals; this is not general
-DAG or fan-out differentiation.
+node-wise DAG or fan-out transposition.
 
 The opt-in canonical interface uses only plural `:tangent-inputs` and `:cotangent-results`
 descriptors, related in order to `:active-inputs`; singleton owners use length-one vectors rather
@@ -113,23 +114,24 @@ canonical map owner while retaining the original source as public authority. Exi
 coverage, residual order and numerical policies are unchanged; arbitrary DAGs remain outside the
 boundary, while only the three tabled families have opt-in device consumers.
 
-A checked composition boundary admits a finite linear spine of at least two pure homogeneous maps.
-Every intermediate is private, has exactly one consumer equation (the immediately following map), and is proven
-through its exact equation subprogram. Those subprograms must reconstruct the original source
-through repeated `append-pure-spines`; the existing target-neutral fusion pass must then derive
-exactly one vertical map with N-1 vertical fusions in N iterations. Scalar projection and
-differentiation consume that transient fused stage while the bundle retains the untouched
-multi-equation source, and validation repeats the same append, fusion,
-rule replay and fixed-interface stage construction. Float conversions and typed locals survive as
-explicit checkpoints; no source facts or fusion provenance are scrubbed. Canonical adaptation and
-host execution retain both the untouched source/public interface and the independently rederived
-fused execution source. Composite residual origins name the ordered source-equation scope and the
-exact fused scalar coefficient rather than pretending the coefficient belongs to the first source
-equation. Execution still uses the generated primal/JVP/VJP maps, not a new runtime chain. This
-composition adds no cache, registry, derivative rule or default-engine migration; its bounded
-device consumer is a separate resident boundary.
+A checked composition boundary admits a closed region of pure homogeneous maps with one
+public result. Intermediates remain private and every source member must satisfy the existing
+map-lane and source-envelope premises before fusion. Shared producers and reconverging branches
+are allowed only when existing target-neutral fusion derives exactly one supported map with
+the same typed public interface and exact retained constituent equation facts. Fusion statistics
+and last-merge history are not independent correctness proofs or transitive ancestry.
+Scalar projection and differentiation consume that transient fused stage while the bundle
+retains the untouched multi-equation source; validation repeats fusion, rule replay and
+fixed-interface stage construction. Float conversions and typed locals remain explicit
+checkpoints; no source facts or fusion provenance are scrubbed. Composite residual origins
+name the ordered source-equation scope and exact fused scalar coefficient, rather than
+attributing every coefficient to the first producer. Execution reuses generated primal/JVP/VJP
+maps and the canonical owner, not a region runtime, cache or derivative rule. This is the
+execution-model contract specified under numerical semantics below, not a proof that AD commutes
+with fusion. Graphs that do not fully fuse, escaping intermediates, multiple public results,
+heterogeneous geometry/precision and effects remain outside this boundary.
 
-Normalized AD remains opt-in; the source AD engine remains the default and independent oracle.
+Normalized AD remains opt-in; the source AD engine remains the default structural reference.
 The checked scalar lane supplies derivation evidence to three bounded host families: pure map,
 map followed by ordered additive sum, and functional indexed map. Those families now execute
 through one canonical program/interface/residual owner. Preparation retains full validation;
@@ -641,6 +643,18 @@ FMA contraction or library realization. The existing numerical contract must con
 primal and derivative schedules. Cotangent addition is mathematically associative, but its
 floating implementation is not bitwise associative. Adjoint pairing tests therefore use
 declared tolerances and operation policies, not a universal exact-equality claim.
+
+The opt-in normalized map composition boundary differentiates its exact, independently
+rederived **execution source**. When several source maps legally fuse to one execution map,
+its scalar binding order and precision checkpoints define the primal, JVP and VJP numerical
+model. The untouched source retains the public interface, legality premises and provenance;
+it is not a claim that node-wise source transposition has identical rounded cotangents.
+In particular, substituting a shared producer into several consumers can change derivative
+accumulation order even when primal checkpoints agree bit-for-bit. The descriptive retained
+source-arithmetic facet grants no additional reassociation permission. No default source-AD
+behavior, generic fusion policy or arithmetic permission changes at this opt-in boundary.
+Exact source-node graph transposition, including ordered array cotangent accumulation,
+remains a separate structural-transform obligation; successful map fusion does not discharge it.
 
 Higher-order AD requires closure of the generated programs under the requested transform.
 Residual production must remain differentiable where the outer derivative depends on it;
