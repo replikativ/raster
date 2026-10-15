@@ -613,42 +613,60 @@
 (declare validate! validate-map-proof! validate-map-programs! validate-sum-programs!
          validate-gather-programs!)
 
+(defn- validate-scalar-correspondence!
+  [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
+           cotangent-seed source-ns] :as bundle}]
+  (when-not (= (revisions) (select-keys bundle [:template-revision :compiler-revision]))
+    (fail! :ad-normalized-stale-rules {:expected (select-keys bundle [:template-revision :compiler-revision])
+                                       :actual (revisions)}))
+  (validate-primal! primal params tags)
+  (doseq [p [linear transpose]] (soac/validate! p))
+  (when-not (and (set/subset? (set (:inputs (soac/facts primal))) (set params))
+                 (instance? clojure.lang.Namespace source-ns)
+                 (every? #(contains? (:values (soac/facts primal)) %) params)
+                 (= (count params) (count tags))
+                 (= (count active-inputs) (count tangent-inputs) (count (soac/outputs transpose)))
+                 (= (count active-inputs) (count (distinct active-inputs)))
+                 (set/subset? (set active-inputs) (set params))
+                 (= 1 (count (soac/outputs primal)) (count (soac/outputs linear))))
+    (fail! :ad-normalized-bundle-interface {:params params :active active-inputs}))
+  (validate-linear! linear tangent-inputs residuals)
+  (validate-linear! transpose [cotangent-seed] residuals)
+  (let [primal-values (:values (soac/facts primal))
+        linear-values (:values (soac/facts linear))
+        transpose-values (:values (soac/facts transpose))]
+    (doseq [id residuals]
+      (when-not (and (get primal-values id)
+                     (= (get primal-values id) (get linear-values id) (get transpose-values id)))
+        (fail! :ad-normalized-residual-interface {:value id})))
+    (doseq [[p t g] (map vector active-inputs tangent-inputs (soac/outputs transpose))]
+      (when-not (= (get primal-values p) (get linear-values t) (get transpose-values g))
+        (fail! :ad-normalized-tangent-interface {:primal p :tangent t :cotangent g}))))
+  bundle)
+
+(defn- validate-scalar-proof!
+  [bundle]
+  (when-not (= #{:template-revision :compiler-revision :primal :linear :transpose
+                 :params :tags :active-inputs :tangent-inputs :residuals :cotangent-seed
+                 :generation :source-ns :certificate}
+               (set (keys bundle)))
+    (fail! :ad-normalized-bundle-interface {:keys (set (keys bundle))}))
+  (validate-scalar-correspondence! bundle)
+  (when-not (= (:certificate bundle) (certificate bundle))
+    (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
+  (validate-derivation! bundle)
+  bundle)
+
 (defn- validate-legacy!
   "Validate the bundle's typed interfaces and retained producer certificate before emission.
    Replays registered scalar rules on every call; no validation cache is used. Correspondence
    with those rules is not independent proof of custom derivative mathematics."
-  [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
-           cotangent-seed source-ns] :as bundle}]
+  [{:keys [source-ns] :as bundle}]
   (when-not (instance? clojure.lang.Namespace source-ns)
     (fail! :ad-normalized-bundle-interface {:source-ns source-ns}))
   (binding [*ns* source-ns
             *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
-    (when-not (= (revisions) (select-keys bundle [:template-revision :compiler-revision]))
-      (fail! :ad-normalized-stale-rules {:expected (select-keys bundle [:template-revision :compiler-revision])
-                                         :actual (revisions)}))
-    (validate-primal! primal params tags)
-    (doseq [p [linear transpose]] (soac/validate! p))
-    (when-not (and (set/subset? (set (:inputs (soac/facts primal))) (set params))
-                   (instance? clojure.lang.Namespace source-ns)
-                   (every? #(contains? (:values (soac/facts primal)) %) params)
-                   (= (count params) (count tags))
-                   (= (count active-inputs) (count tangent-inputs) (count (soac/outputs transpose)))
-                   (= (count active-inputs) (count (distinct active-inputs)))
-                   (set/subset? (set active-inputs) (set params))
-                   (= 1 (count (soac/outputs primal)) (count (soac/outputs linear))))
-      (fail! :ad-normalized-bundle-interface {:params params :active active-inputs}))
-    (validate-linear! linear tangent-inputs residuals)
-    (validate-linear! transpose [cotangent-seed] residuals)
-    (let [primal-values (:values (soac/facts primal))
-          linear-values (:values (soac/facts linear))
-          transpose-values (:values (soac/facts transpose))]
-      (doseq [id residuals]
-        (when-not (and (get primal-values id)
-                       (= (get primal-values id) (get linear-values id) (get transpose-values id)))
-          (fail! :ad-normalized-residual-interface {:value id})))
-      (doseq [[p t g] (map vector active-inputs tangent-inputs (soac/outputs transpose))]
-        (when-not (= (get primal-values p) (get linear-values t) (get transpose-values g))
-          (fail! :ad-normalized-tangent-interface {:primal p :tangent t :cotangent g}))))
+    (validate-scalar-correspondence! bundle)
     (when (contains? bundle :map-programs)
       (validate-map-programs! bundle))
     (when (contains? bundle :sum-programs)
@@ -1522,7 +1540,7 @@
         _ (when-not (identical? source-ns (:source-ns derivation))
             (fail! :ad-normalized-map-node-namespace
                    {:source-ns source-ns :node-ns (:source-ns derivation)}))
-        _ (when active? (validate! derivation))
+        _ (when active? (validate-scalar-proof! derivation))
         {:keys [arrays]} (soac/operation-parts equation)
         witness-active (if (seq local-active) local-active [(first arrays)])
         projected (project-map-equation-lane
@@ -1667,7 +1685,7 @@
                              (= (second equation) (:execution-equation node)))
                 (fail! :ad-normalized-map-node-namespace
                        {:source-ns source-ns :node (:execution-equation node)}))
-            _ (validate! scalar)
+            _ (validate-scalar-proof! scalar)
             ;; Preserve the complete established singleton/fused-stage correspondence check.
             ;; The node wrapper changes evidence ownership, not the one-stage map contract.
             _ (validate-map-programs!

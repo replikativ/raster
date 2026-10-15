@@ -80,7 +80,8 @@
    (let [bundle (normalized/linearize-map-program
                 (#'element/map-program dtype)
                 (the-ns 'raster.ad.normalized-scalar-accumulation-test))
-        raw-programs (map bundle [:primal :linear :transpose])
+        scalar (get-in bundle [:map-programs :proof :nodes 0 :scalar-derivation])
+        raw-programs (map scalar [:primal :linear :transpose])
         raw-expressions (mapcat #(take-nth 2 (rest (#'normalized/bindings %))) raw-programs)
         prepared (runtime/prepare bundle)
         arguments (mapv {'n (long 2) 'x (array [2.0 -3.0])} (:inputs prepared))
