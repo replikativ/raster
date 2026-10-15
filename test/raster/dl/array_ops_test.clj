@@ -1,5 +1,6 @@
 (ns raster.dl.array-ops-test
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
+            [raster.arrays :as arrays]
             [raster.dl.array-ops :as ops]
             [raster.dl.gsdm :as gsdm]
             [raster.dl.nn :as nn]
@@ -16,6 +17,32 @@
 (defn- arr-finite?
   [^doubles arr]
   (every? #(Double/isFinite %) arr))
+
+(defn- raw-bits
+  [xs]
+  (if (= Float/TYPE (.getComponentType (class xs)))
+    (mapv #(Float/floatToRawIntBits (float %)) xs)
+    (mapv #(Double/doubleToRawLongBits (double %)) xs)))
+
+(defn- scale-clamp-exp-backward-loop
+  "Independent serial oracle retaining the typed Float product checkpoint."
+  [dy x result scale clamp-bound n]
+  (let [float-storage? (= Float/TYPE (.getComponentType (class dy)))
+        out (if float-storage?
+              (float-array n)
+              (double-array n))]
+    (dotimes [i n]
+      (let [raw (* (arrays/aget x i) scale)
+            clamp-mask (if (and (>= raw (- clamp-bound))
+                                (<= raw clamp-bound))
+                         1.0 0.0)
+            dy-result (* (arrays/aget dy i) (arrays/aget result i))
+            ;; Both operands are Float in the Float specialization, so this product
+            ;; checkpoints before its later multiplication by the Double scale.
+            dy-result (if float-storage? (unchecked-float dy-result) dy-result)]
+        (arrays/aset out i
+                     (* dy-result (* scale clamp-mask)))))
+    out))
 
 (deftest strided-slice-and-scatter-are-padding-duals
   (doseq [src [(double-array (range 10)) (float-array (range 10))]]
@@ -501,6 +528,51 @@
       (dotimes [i n]
         (is (approx= (numerical-grad f-x x i) (aget ^doubles dx i) 1e-4)
             (str "scale-clamp-exp dx mismatch at " i))))))
+
+(deftest scale-clamp-exp-backward-map-void-retains-serial-bits
+  (doseq [[make-array values]
+          [[float-array [0.0 -0.0 2.0 -2.0
+                         2.0000002 -2.0000002 Float/NaN
+                         Float/POSITIVE_INFINITY Float/NEGATIVE_INFINITY]]
+           [double-array [0.0 -0.0 2.0 -2.0
+                          (Math/nextUp 2.0) (Math/nextDown -2.0) Double/NaN
+                          Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]]]
+    (let [n (count values)
+          x (make-array values)
+          dy (make-array [1.0 -1.0 2.0 -3.0 4.0 -5.0 6.0 7.0 -8.0])
+          result (make-array [1.0 -0.0 2.0 3.0 -4.0 5.0 6.0
+                              Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY])
+          before (mapv raw-bits [x dy result])
+          expected (scale-clamp-exp-backward-loop dy x result 2.0 4.0 n)
+          actual (ops/scale-clamp-exp-backward dy x result 2.0 4.0 n)]
+      (is (= (class expected) (class actual)))
+      (is (= (raw-bits expected) (raw-bits actual)))
+      (is (= before (mapv raw-bits [x dy result])) "the parallel intent does not mutate inputs")
+      (let [empty-array (make-array [])
+            empty-result (ops/scale-clamp-exp-backward
+                          empty-array empty-array empty-array 2.0 4.0 0)]
+        (is (= (class empty-array) (class empty-result)))
+        (is (zero? (alength empty-result)))))))
+
+(deftest scale-clamp-exp-template-uses-the-migrated-backward
+  (doseq [make-array [float-array double-array]]
+    (let [x (make-array [0.5 -0.3 2.0 -1.0])
+          dy (make-array [1.0 -2.0 3.0 -4.0])
+          scale 0.7
+          bound 5.0
+          n 4
+          result (ops/scale-clamp-exp x scale bound n)
+          before (mapv raw-bits [x dy result])
+          pullback (tmpl/template-pullback 'raster.dl.array-ops/scale-clamp-exp)
+          gradients ((pullback result x scale bound n) dy)
+          expected (scale-clamp-exp-backward-loop dy x result scale bound n)
+          direct (ops/scale-clamp-exp-backward dy x result scale bound n)]
+      (is (= 4 (count gradients)))
+      (is (= (raw-bits expected) (raw-bits (first gradients))))
+      (is (= (raw-bits direct) (raw-bits (first gradients)))
+          "the registered pullback routes through the migrated helper")
+      (is (= [nil nil nil] (vec (rest gradients))))
+      (is (= before (mapv raw-bits [x dy result]))))))
 
 (deftest reduce-axis-gradient-test
   (testing "reduce-axis gradient via finite differences"

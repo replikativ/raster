@@ -7,6 +7,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.arrays :as ra]
             [raster.core :refer [deftm]]
+            [raster.dl.array-ops :as ops]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
             [raster.gpu.compiled :as compiled]
@@ -27,6 +28,74 @@
                    (ra/aset f i (+ p z)))))
 
 (defn- bits [x] (Float/floatToRawIntBits (float x)))
+
+(defn- array-bits [xs]
+  (if (= Float/TYPE (.getComponentType (class xs)))
+    (mapv #(Float/floatToRawIntBits (float %)) xs)
+    (mapv #(Double/doubleToRawLongBits (double %)) xs)))
+
+(defn- backward-reference [dy x result scale bound]
+  (let [n (alength dy)
+        float-storage? (= Float/TYPE (.getComponentType (class dy)))
+        out (if float-storage?
+              (float-array n)
+              (double-array n))]
+    (dotimes [i n]
+      (let [raw (* (ra/aget x i) scale)
+            mask (if (and (>= raw (- bound)) (<= raw bound)) 1.0 0.0)
+            dy-result (* (ra/aget dy i) (ra/aget result i))
+            dy-result (if float-storage? (unchecked-float dy-result) dy-result)]
+        (ra/aset out i (* dy-result (* scale mask)))))
+    out))
+
+(defn- check-scale-clamp-exp-backward! [target make-array dtype]
+  (let [scale 1.0
+        bound 2.0
+        cases [[[-2.0 -1.0 0.0 1.0 2.0] [1.0 -2.0 3.0 -4.0 5.0]
+                [0.5 1.5 2.5 3.5 4.5]]
+               [[-3.0 -0.5 -0.0 0.5 3.0] [-5.0 4.0 -3.0 2.0 -1.0]
+                [4.5 3.5 2.5 1.5 0.5]]]
+        [initial-x initial-dy initial-result] (mapv make-array (first cases))
+        executable (compiled/instantiate!
+                    (compiled/lower #'ops/scale-clamp-exp-backward
+                                    [initial-dy initial-x initial-result scale bound (long 5)]
+                                    {:compiler :equation-first :target target :dtype dtype}))]
+    (try
+      (doseq [[x-values dy-values result-values] cases]
+        (let [x (make-array x-values)
+              dy (make-array dy-values)
+              result (make-array result-values)
+              before (mapv array-bits [dy x result])
+              expected (backward-reference dy x result scale bound)
+              actual (value/->host
+                      (:result (compiled/invoke-compiled
+                                executable {:dy dy :x x :result result})))]
+          (is (= (class expected) (class actual)) (str target " " dtype))
+          (is (= (array-bits expected) (array-bits actual)) (str target " " dtype))
+          (is (= before (mapv array-bits [dy x result])) (str target " inputs"))))
+      (finally (compiled/close! executable)))))
+
+(deftest scale-clamp-exp-backward-runs-on-both-device-routes
+  (doseq [[target available? skip!]
+          [[:ocl:0 ocl/opencl-available? ocl/opencl-skip!]
+           [:ze:0 gp/gpu-available? gp/gpu-skip!]]]
+    (if-not @available?
+      (skip! (str "scale-clamp-exp backward on " target))
+      (let [caps (when (= target :ze:0)
+                   ((requiring-resolve 'raster.gpu.ze-runtime/module-capabilities)))
+            fp64? (if (= target :ocl:0)
+                    @ocl/opencl-fp64-available?
+                    (:fp64? caps))]
+        ;; Both array specializations retain Double scale/bound controls and arithmetic.
+        (if fp64?
+          (do
+            (check-scale-clamp-exp-backward! target float-array :float)
+            (check-scale-clamp-exp-backward! target double-array :double)
+            nil)
+          (if (= target :ocl:0)
+            (ocl/opencl-skip! "scale-clamp-exp backward Double controls" :fp64)
+            (gp/gpu-capability-skip! "scale-clamp-exp backward Double controls"
+                                     :fp64? caps)))))))
 
 (deftm mixed-norm-tail!
   [dy :- (Array float), x :- (Array float), weight :- (Array float),
