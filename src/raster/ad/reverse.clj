@@ -4105,6 +4105,7 @@
 ;; ================================================================
 
 (declare ^:private make-runtime-value+grad-fn)
+(declare assert-scalar-loss-result-admissible!)
 
 (defonce ^:private ror-rename-counter (atom 0))
 
@@ -4136,6 +4137,8 @@
         walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
+        _ (assert-scalar-loss-result-admissible!
+           f-var resolved walked-body params tags)
         all-params (vec (map-indexed
                          (fn [i p]
                            (let [base (if (symbol? p) p (symbol (name p)))
@@ -4231,6 +4234,8 @@
                           (throw (ex-info "No walked body" {:var f-var})))
           tags (or (:raster.core/deftm-tags m)
                    (vec (repeat (count params) nil)))
+          _ (assert-scalar-loss-result-admissible!
+             f-var resolved walked-body params tags)
           ;; KEEP each param's :raster.type/tag (§13 A4 fix): the tangent
           ;; protocol reads it to type seeds/zeros — stripping it forced
           ;; untyped zeros downstream.
@@ -4592,6 +4597,61 @@
       (when (and (seq? form) (form/binding-form? form) (seq (drop 2 form)))
         (body-tail-tag (last form)))))
 
+(defn ^:no-doc assert-scalar-loss-result-admissible!
+  "Reject positively-known non-scalar results before a public AD constructor
+  synthesizes the unit cotangent of a scalar loss.
+
+  `infer-result-tags` is the existing retained-source authority for reachable
+  result alternatives.  It intentionally returns nil for result shapes whose
+  fixed-point evidence is not retained yet (notably loops), so Unknown remains
+  admitted here for compatibility and is NOT treated as proof of scalarity.
+  The declared return tag contributes negative evidence only; it never selects
+  the seed dtype, which continues to follow the actual walked-body checkpoint."
+  [f-var resolved walked-body params tags]
+  (let [m (meta resolved)
+        body (last walked-body)
+        tail (if (and (seq? body)
+                      (contains? #{'let 'let*} (first body)))
+               (last body)
+               body)]
+    ;; Preserve the established product-output diagnostic.  A literal vector
+    ;; has no JVM primitive tag for infer-result-tags to classify.
+    (when (vector? tail)
+      (throw (ex-info
+              (str "Cannot differentiate the tuple-valued function `" f-var
+                   "` — its output is a vector, which has no canonical "
+                   "cotangent seed (this is what value+grad returns; "
+                   "value+grad of value+grad is ill-typed). Compose "
+                   "transparently instead: call the inner gradient in a "
+                   "scalar deftm and differentiate that, e.g. "
+                   "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
+                   "For 1-param scalar fns, (grad (grad f)) composes directly.")
+              {:var f-var :tail-shape :vector :reason :tuple-valued-output})))
+    (let [source-ns (or (some-> (:raster.core/deftm-source-ns m) find-ns)
+                        (:ns m) *ns*)
+          actual-tags (inf/infer-result-tags body (zipmap params tags) source-ns)
+          declared-tag (:raster.core/return-tag m)
+          evidence (cond-> (mapv (fn [tag] {:source :walked-body :tag tag})
+                                 actual-tags)
+                     declared-tag (conj {:source :declared-interface
+                                         :tag declared-tag}))
+          declined (filterv (fn [{:keys [tag]}]
+                              (contains? #{:array :none}
+                                         (:kind (tangent/tangent-kind tag))))
+                            evidence)]
+      (when (seq declined)
+        (throw (ex-info
+                (str "Scalar-loss AD requires a floating-point scalar result for `" f-var
+                     "`; retained result evidence contains a known result tag "
+                     "without a scalar tangent space.")
+                {:reason :ad-nonscalar-loss-result
+                 :var f-var
+                 :actual-result-tags actual-tags
+                 :declared-return-tag declared-tag
+                 :declined-evidence declined})))
+      {:actual-result-tags actual-tags
+       :declared-return-tag declared-tag})))
+
 (defn- anf-value-temp?
   "True iff `sym` is an ANF *value* temp: a name of the exact form `anf__<N>`
   minted by the ANF normalizer (`(gensym-fn \"anf\")`, reverse/normalize.clj).
@@ -4657,30 +4717,9 @@
           params (deftm-params-or-throw f-var resolved)
           walked-body (or (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body on var" {:var f-var})))
-        ;; TUPLE-VALUED OUTPUT GUARD (#74, framework §14): grad/value+grad is
-        ;; only defined for SCALAR-valued functions — a vector tail (e.g. the
-        ;; [primal grads...] of a value+grad result, or a tuple-returning
-        ;; deftm) has a PRODUCT cotangent space with no canonical seed, and
-        ;; the reverse fold would silently return zero gradients. Fail loud.
-        ;; The transparent-composition idiom is to USE the components in a
-        ;; scalar program: (let [vg ((value+grad #'f) x)] ...scalar of (nth vg i)...).
-          _ (let [wb-form (first walked-body)
-                  tail (if (and (seq? wb-form)
-                                (contains? #{'let 'let*} (first wb-form)))
-                         (last wb-form)
-                         wb-form)]
-              (when (vector? tail)
-                (throw (ex-info
-                        (str "Cannot differentiate the tuple-valued function `" f-var
-                             "` — its output is a vector, which has no canonical "
-                             "cotangent seed (this is what value+grad returns; "
-                             "value+grad of value+grad is ill-typed). Compose "
-                             "transparently instead: call the inner gradient in a "
-                             "scalar deftm and differentiate that, e.g. "
-                             "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
-                             "For 1-param scalar fns, (grad (grad f)) composes directly.")
-                        {:var f-var :tail-shape :vector :reason :tuple-valued-output}))))
           tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
+          _ (assert-scalar-loss-result-admissible!
+             f-var resolved walked-body params tags)
           all-params (vec (map-indexed
                            (fn [i p]
                              (let [tag (nth tags i nil)
@@ -5161,7 +5200,7 @@
                        (filter symbol?) distinct
                        sort
                        vec)]
-    {:resolved resolved :params params :walked-body walked-body
+    {:resolved resolved :params params :tags tags :walked-body walked-body
      :conversion-plan conversion-plan
      :coverage {:admissible? (and (empty? (:call-declines conversion-plan))
                                  (empty? array-params) (empty? unknown-params)
@@ -5319,6 +5358,12 @@
      ;; Admissibility is checked at CONSTRUCTION time (framework §11): fail
      ;; with the uncovered ops named, never a No-matching-method at call time.
      (let [preparation (forward-preparation f-var)
+           {resolved-for-result :resolved
+            result-params :params
+            result-body :walked-body
+            result-tags :tags} preparation
+           _ (assert-scalar-loss-result-admissible!
+              f-var resolved-for-result result-body result-params result-tags)
            cov (:coverage preparation)
            _ (when-not (:admissible? cov)
                (throw (ex-info
