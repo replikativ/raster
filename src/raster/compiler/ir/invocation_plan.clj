@@ -15,6 +15,7 @@
             [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.scalar.effects :as effects]))
 
@@ -53,6 +54,111 @@
   (and (map? binding)
        (= #{:program-value :external} (set (keys binding)))
        (true? (:external binding))))
+
+(def ^:private source-free-shape-projection-key :source-free-shape-projections)
+
+(declare fail! scalar-value?)
+
+(defn source-free-shape-projections
+  "Derive the bounded public-buffer shape projections required by a source-free program.
+
+   A projected dimension is a retained private integral scalar used as the sole dimension of
+   exactly one public rank-one buffer. It may be reused by other AbstractValue shapes, but it must
+   not occur at the executable value boundary. The returned order follows public input order."
+  [parallel-program]
+  (let [inputs (vec (:inputs parallel-program))
+        input-set (set inputs)
+        values (:values parallel-program)
+        inner-executable-values
+        (into #{}
+              (mapcat
+               (fn [equation]
+                 (let [algorithm (:algorithm equation)]
+                   (when (soac/program-form? algorithm)
+                     (mapcat
+                      (fn [inner]
+                        (concat (soac/operation-inputs inner)
+                                (nth inner 2)
+                                (mapcat util/free-syms (soac/operation-extents inner))))
+                      (soac/equations algorithm)))))
+              (:equations parallel-program)))
+        executable-values
+        (into (into (set (:outputs parallel-program)) inner-executable-values)
+              (mapcat #(concat (:operands %) (:results %)))
+              (:equations parallel-program))
+        candidates
+        (into []
+              (keep (fn [source]
+                      (let [source-value (get values source)
+                            shape (:shape source-value)
+                            dimension (when (= 1 (count shape)) (first shape))]
+                        (when (and (= :tensor (:kind source-value))
+                                   (symbol? dimension)
+                                   (not (contains? input-set dimension)))
+                          {:dimension dimension :source source :axis 0}))))
+              inputs)
+        by-dimension (group-by :dimension candidates)]
+    (doseq [[dimension projections] by-dimension]
+      (when-not (= 1 (count projections))
+        (fail! :invocation-source-free-shape-projection
+               "one private shape dimension requires exactly one public buffer source"
+               {:dimension dimension :sources (mapv :source projections)}))
+      (let [value (get values dimension)
+            declared (:dtype value)
+            canonical (when (and (keyword? declared) (dtype/known? declared))
+                        (dtype/canon declared))]
+        (when-not (and (scalar-value? value) (contains? #{:int :long} canonical))
+          (fail! :invocation-source-free-shape-projection
+                 "a projected shape dimension requires one retained integral scalar"
+                 {:dimension dimension :value value})))
+      (when (contains? executable-values dimension)
+        (fail! :invocation-source-free-shape-projection
+               "a projected shape dimension cannot also be an executable value"
+               {:dimension dimension :executable-values executable-values})))
+    candidates))
+
+(defn- validate-source-free-shape-projection-marker!
+  [plan]
+  (let [attributes (:attributes plan)
+        present? (contains? attributes source-free-shape-projection-key)
+        projections (get attributes source-free-shape-projection-key)]
+    (when present?
+      (when-not (and (vector? projections) (seq projections)
+                     (every? #(and (= #{:dimension :source :axis} (set (keys %)))
+                                    (symbol? (:dimension %)) (symbol? (:source %))
+                                    (= 0 (:axis %)))
+                             projections)
+                     (= (count projections) (count (distinct (map :dimension projections))))
+                     (= (count projections) (count (distinct (map :source projections)))))
+        (fail! :invocation-source-free-shape-projection
+               "source-free shape projections require a closed ordered marker"
+               {:projections projections}))
+      (let [parameters (into {} (map (juxt :symbol identity)) (:parameters plan))
+            steps (into {} (map (juxt :symbol identity)) (:steps plan))]
+        (when-not (= (count projections) (count (:steps plan)))
+          (fail! :invocation-source-free-shape-projection
+                 "source-free shape projection steps must exactly match their marker"
+                 {:projections projections :steps (mapv :id (:steps plan))}))
+        (doseq [{:keys [dimension source axis]} projections
+                :let [parameter (get parameters source)
+                      step (get steps dimension)
+                      dimension-value (get-in plan [:values dimension])]]
+          (when-not (and parameter (shape-projection? step)
+                         (= [(list 'extent source)] (get-in parameter [:value :shape]))
+                         (= axis (:axis step))
+                         (= (:id parameter) (:source step))
+                         (= [{:symbol source :value (:id parameter)}] (:operands step))
+                         (= dimension-value (:value step))
+                         (scalar-value? dimension-value)
+                         (keyword? (:dtype dimension-value))
+                         (dtype/known? (:dtype dimension-value))
+                         (contains? #{:int :long}
+                                    (dtype/canon (:dtype dimension-value))))
+            (fail! :invocation-source-free-shape-projection
+                   "source-free shape marker differs from its parameter and ShapeProjection"
+                   {:projection {:dimension dimension :source source :axis axis}
+                    :parameter parameter :step step :dimension-value dimension-value}))))))
+  plan)
 
 (defn invocation-step?
   [x]
@@ -280,6 +386,7 @@
                {:parameter parameter :table (get values id)}))
       (av/validate! value))
     (validate-parameter-projection! plan)
+    (validate-source-free-shape-projection-marker! plan)
     (let [available (binding [util/*shadowing-locals*
                              (into util/*shadowing-locals*
                                    (map :symbol (concat parameters steps)))]
@@ -520,13 +627,71 @@
                            (soac/equations algorithm))))))
         (:equations parallel-program)))
 
+(def ^:private source-free-program-origins
+  #{[:explicit-typed-algorithm :source-free-typed-invocation]
+    [:explicit-typed-effect-algorithm :source-free-typed-effect-invocation]})
+
+(defn- source-free-program?
+  "Recognize the source-free boundary from the validated program, never from plan attributes."
+  [program]
+  (let [origin [(:front-end (:provenance program)) (:pass (:provenance program))]
+        source-free-candidate? (and (= :typed-parallel (:dialect program))
+                                    (nil? (:source program))
+                                    (every? #(soac/program-form? (:algorithm %))
+                                            (:equations program)))
+        source-free? (and source-free-candidate?
+                          (= :typed-invocation (get-in program [:attributes :host-control]))
+                          (contains? source-free-program-origins origin))]
+    (parallel-program/validate!
+     program (constantly true)
+     (if source-free-candidate?
+       (fn [equation algorithm]
+         (and (= :typed-soac (get-in equation [:attributes :algorithm-dialect]))
+              (soac/program-form? algorithm)
+              (= algorithm (soac/validate! algorithm))
+              (= (:operands equation) (:inputs (soac/facts algorithm)))
+              (= (:results equation) (soac/outputs algorithm))))
+       (fn [_ _] true)))
+    (when (and source-free-candidate? (not source-free?))
+      (fail! :invocation-program-mismatch
+             "source-free typed programs require their exact validated origin"
+             {:origin origin :host-control (get-in program [:attributes :host-control])}))
+    source-free?))
+
 (defn validate-against!
   "Validate that `plan` still matches a program's explicit value/input/output boundary."
   [plan parallel-program]
   (let [plan (validate! plan)
+        source-free? (source-free-program? parallel-program)
+        expected-projections (when source-free?
+                               (source-free-shape-projections parallel-program))
+        declared-projections (get-in plan [:attributes source-free-shape-projection-key])
         external (mapv :program-value
                        (filter external-storage-binding? (:storage-bindings plan)))]
-    (when-not (and (= (:program-inputs plan) (:inputs parallel-program))
+    (when-not (and (or (not source-free?)
+                       (= {:source-dialect :typed-soac
+                           :algorithm-dialect :typed-soac
+                           :target-dialect :typed-invocation}
+                          (select-keys (:attributes plan)
+                                       [:source-dialect :algorithm-dialect :target-dialect])))
+                   (= (vec expected-projections) (vec (or declared-projections [])))
+                   (every?
+                    (fn [{:keys [dimension source]}]
+                      (let [parameter (some #(when (= source (:symbol %)) %) (:parameters plan))
+                            source-bindings (filterv #(= source (:program-value %))
+                                                     (:bindings plan))
+                            original (get-in parallel-program [:values source])
+                            dimension-value (get-in parallel-program [:values dimension])]
+                        (and (= 1 (count source-bindings))
+                             (= (:id parameter) (:invocation-value (first source-bindings)))
+                             (= (:value parameter)
+                                (assoc original :shape [(list 'extent source)]))
+                             (= dimension-value (get-in plan [:values dimension]))
+                             (= dimension-value
+                                (:value (some #(when (= dimension (:symbol %)) %)
+                                              (:steps plan)))))))
+                    expected-projections)
+                   (= (:program-inputs plan) (:inputs parallel-program))
                    (= (:program-outputs plan) (:outputs parallel-program))
                    (or (empty? external)
                        (= external (program-external-storage parallel-program)))
@@ -538,5 +703,7 @@
       (fail! :invocation-program-mismatch
              "invocation plan no longer matches its internal ParallelProgram boundary"
              {:plan-inputs (:program-inputs plan) :program-inputs (:inputs parallel-program)
-              :plan-outputs (:program-outputs plan) :program-outputs (:outputs parallel-program)}))
+              :plan-outputs (:program-outputs plan) :program-outputs (:outputs parallel-program)
+              :shape-projections declared-projections
+              :expected-shape-projections expected-projections}))
     plan))
