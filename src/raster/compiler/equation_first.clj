@@ -644,7 +644,7 @@
          ;; public representation demand adds stricter roots to this same transaction.
          [compiled-program _resident-stats]
          (resident/realize-source-free-reductions typed-program resident-outputs)
-         promoted (structured-route/promote-typed-algorithm compiled-program)
+         promoted (structured-route/promote-source-free-algorithm compiled-program)
          carrier (typed-compilation-dtype typed-program)
          source-fingerprint (semantic/fingerprint typed-program)
          function-id [::typed-algorithm source-fingerprint]

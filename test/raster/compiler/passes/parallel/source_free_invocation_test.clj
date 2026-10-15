@@ -1,12 +1,14 @@
 (ns raster.compiler.passes.parallel.source-free-invocation-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.ad.normalized-map-element-test :as map-fixture]
+            [raster.ad.normalized-indexed-map-test :as indexed-fixture]
             [raster.ad.normalized-map-sum-test :as sum-fixture]
             [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.kernel-body]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.structured-control-route :as route]))
 
@@ -38,6 +40,159 @@
         :inputs '[x n]
         :equations {'map-0 (soac/default-equation-facts)}})
       [equation] '[y]))))
+
+(defn- ordered-effect-program
+  ([] (ordered-effect-program 3 4))
+  ([gradient-extent] (ordered-effect-program 3 gradient-extent))
+  ([extent gradient-extent]
+   (let [source (#'indexed-fixture/indexed-map :float :long extent gradient-extent)
+         bundle (#'indexed-fixture/build source)]
+     (get-in bundle [:gather-programs :transpose]))))
+
+(defn- nested-records
+  [value]
+  (lazy-seq
+   (cons value
+         (cond
+           (map? value) (mapcat nested-records (vals value))
+           (coll? value) (mapcat nested-records value)
+           :else []))))
+
+(deftest source-free-ordered-effect-promotion-retains-unresolved-storage-only
+  (let [typed (ordered-effect-program)
+        promoted (route/promote-typed-effect-algorithm typed)
+        plan (get-in promoted [:attributes :invocation-plan])
+        [storage] (:storage-bindings plan)
+        destination (:program-value storage)
+        [equation] (soac/equations typed)
+        result (first (soac/outputs typed))
+        touched (atom [])
+        hostile-arguments (reify clojure.lang.Seqable
+                            (seq [_] (swap! touched conj :arguments) nil))]
+    (is (= {:program-value destination :external true} storage))
+    (is (not (some #{destination} (:program-inputs plan))))
+    (is (not= destination result))
+    (is (= destination (get-in (soac/facts typed)
+                               [:equations (second equation) :aliases result])))
+    (is (= plan (invocation/validate-against! plan promoted)))
+    (is (= :resident-premise (get-in plan [:attributes :external-storage])))
+    (is (= :invocation-materialization-external-storage
+           (reason #(materialization/materialize
+                     plan hostile-arguments
+                     (fn [& _] (swap! touched conj :evaluate))))))
+    (is (empty? @touched)
+        "external storage refuses before argument projection or scalar evaluation")
+    (testing "the unchanged pure entry never accepts the external effect boundary"
+      (is (= :structured-control-source-free-effects
+             (reason #(route/promote-typed-algorithm typed)))))
+    (testing "dynamic private destination extents remain outside this first slice"
+      (is (= :structured-control-source-free-dimension
+             (reason #(route/promote-typed-effect-algorithm
+                       (ordered-effect-program 'm))))))
+    (testing "external premise maps and their rederived destination are exact"
+      (is (= :invocation-storage-binding-form
+             (reason #(invocation/validate!
+                       (assoc-in plan [:storage-bindings 0 :forged] true)))))
+      (is (= :invocation-external-storage-mode
+             (reason #(invocation/validate!
+                       (update plan :attributes dissoc :external-storage)))))
+      (is (= :invocation-external-storage-mode
+             (reason #(invocation/validate!
+                       (update plan :storage-bindings conj
+                               {:program-value (first (:program-inputs plan))
+                                :invocation-value (get-in plan [:bindings 0 :invocation-value])})))))
+      (is (= :invocation-storage-bindings
+             (reason #(invocation/validate-against!
+                       (assoc-in plan [:storage-bindings 0 :program-value]
+                                 (first (:program-inputs plan)))
+                       promoted))))
+      (is (= :invocation-external-storage-boundary
+             (reason #(invocation/validate!
+                       (assoc-in plan [:storage-bindings 0 :program-value] result)))))
+      (is (= :invocation-external-storage-mode
+             (reason #(invocation/validate-against!
+                       (assoc plan :storage-bindings []) promoted))))
+      (let [rogue 'unowned-external-candidate
+            abstract (get-in plan [:values destination])
+            changed-plan (-> plan
+                             (assoc-in [:values rogue] abstract)
+                             (assoc-in [:storage-bindings 0 :program-value] rogue))
+            changed-program (assoc-in promoted [:values rogue] abstract)]
+        (is (= changed-plan (invocation/validate! changed-plan)))
+        (is (= changed-program (route/validate-typed-program! changed-program)))
+        (is (= :invocation-program-mismatch
+               (reason #(invocation/validate-against! changed-plan changed-program)))))
+      (let [algorithm (get-in promoted [:equations 0 :algorithm])
+            equation-id (second (first (soac/equations algorithm)))
+            result (first (soac/outputs algorithm))
+            rogue 'forged-alias-destination
+            facts (-> (soac/facts algorithm)
+                      (assoc-in [:values rogue] (get-in plan [:values destination]))
+                      (assoc-in [:equations equation-id :aliases result] rogue))
+            malformed (apply list (assoc (vec algorithm) 1 facts))
+            changed-program (assoc-in promoted [:equations 0 :algorithm] malformed)]
+        (is (= :typed-soac-result-storage-alias
+               (reason #(invocation/validate-against! plan changed-program)))))
+      (let [pure-plan (get-in (route/promote-typed-algorithm (pure-map))
+                              [:attributes :invocation-plan])]
+        (is (= :invocation-external-storage-mode
+               (reason #(invocation/validate!
+                         (assoc-in pure-plan [:attributes :external-storage]
+                                   :resident-premise)))))
+        (is (= :invocation-external-storage-mode
+               (reason #(invocation/validate!
+                         (assoc-in pure-plan [:attributes :external-storage]
+                                   :forged)))))))))
+
+(deftest source-free-ordered-effect-refuses-native-initialization-and-retains-zero-extent
+  (let [base (ordered-effect-program)
+        native (change-facts
+                base #(assoc-in % [:attributes :native-initialization-providers]
+                                [(-> base soac/equations first soac/operation-parts
+                                     :destinations first)]))]
+    (is (identical? base (soac/validate! base)))
+    (is (= :structured-control-source-free-effects
+           (reason #(route/promote-source-free-algorithm native))))
+    (let [zero (ordered-effect-program 0 4)
+          promoted (route/promote-source-free-algorithm zero)
+          scheduled (route/schedule-program promoted {:target-device :ocl:zero-effect
+                                                       :dtype :float})
+          storage (get-in promoted [:attributes :invocation-plan :storage-bindings])]
+      (is (= 1 (count storage)))
+      (is (true? (get-in storage [0 :external])))
+      (is (= 0 (get-in (-> zero soac/equations first soac/operation-parts)
+                       [:attributes :extent])))
+      (doseq [target [:opencl-intel :opencl-portable :cuda :hip]]
+        (let [failure (try (c-family/emit-program
+                            scheduled {:target-dialect target :dtype :float}) nil
+                           (catch clojure.lang.ExceptionInfo error error))]
+          (is (instance? clojure.lang.ExceptionInfo failure))
+          (is (some #(and (map? %) (= [0] (:shape %)))
+                    (nested-records (ex-data failure)))
+              (str target " retains exact zero capacity and refuses the current nonempty KernelBody boundary")))))))
+
+(deftest source-free-ordered-effect-schedules-one-ordered-loop-without-atomics
+  (let [promoted (route/promote-typed-effect-algorithm (ordered-effect-program))
+        scheduled (route/schedule-program promoted {:target-device :ocl:source-free-effect
+                                                     :dtype :float})
+        emitted (c-family/emit-program scheduled {:target-dialect :opencl-portable
+                                                  :dtype :float})
+        body (get-in emitted [:kernels 0 :attributes :kernel-body])
+        records (nested-records body)
+        loops (distinct (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %) records))
+        atomics (distinct (filter #(instance? raster.compiler.ir.kernel_body.AtomicRMW %) records))]
+    (is (= :scheduled-parallel (:dialect scheduled)))
+    (is (= :one-work-item-ordered-loop (get-in body [:schedule :strategy])))
+    (is (= [[1] [1]] [(:workgroup-size (:launch body))
+                      (:group-count (:launch body))]))
+    (is (= 1 (count loops)))
+    (is (empty? atomics))
+    (is (= :ordered (get-in (first loops) [:attributes :association])))
+    (doseq [target [:opencl-intel :opencl-portable :cuda :hip]]
+      (let [{:keys [program kernels]}
+            (c-family/emit-program scheduled {:target-dialect target :dtype :float})]
+        (is (some? program) (str target))
+        (is (= 1 (count kernels)) (str target))))))
 
 (deftest source-free-promotion-retains-the-exact-zero-prefix-interface
   (let [typed (pure-map)

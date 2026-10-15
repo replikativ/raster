@@ -2,7 +2,8 @@
   "Pure specialization of a typed InvocationPlan against ordered public arguments.
 
    The result contains typed scalars and logical buffer initializers for the exact internal
-   ParallelProgram inputs plus explicitly bound caller-owned result storage. It allocates no driver
+   ParallelProgram inputs plus explicitly resolved caller-owned result storage. Unresolved resident
+   storage refuses before argument projection. It allocates no driver
    objects and does not evaluate Clojure source: scalar regions are delegated as closed TypedSOAC
    regions to an injected compiler or interpreter. A later lowering realizes MaterializedBuffers
    as LinkValues/BufferViews."
@@ -29,6 +30,14 @@
 (defn- fail!
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :ir :invocation-materialization))))
+
+(defn- refuse-external-storage!
+  [plan]
+  (when-let [storage (seq (filter invocation/external-storage-binding?
+                                  (:storage-bindings plan)))]
+    (fail! :invocation-materialization-external-storage
+           "unresolved resident storage cannot be materialized from host arguments"
+           {:storage (mapv :program-value storage)})))
 
 (defn- typed-scalar? [value]
   (and (map? value) (keyword? (:type value)) (contains? value :value)))
@@ -218,6 +227,7 @@
            {:actual (type materialization)}))
   (let [{:keys [plan values program-buffers program-scalars attributes]} materialization
         plan (invocation/validate! plan)
+        _ (refuse-external-storage! plan)
         invocation-ids (set (concat (map :id (:parameters plan)) (map :id (:steps plan))))
         lexical (into {} (map (juxt :symbol :id))
                       (concat (:parameters plan) (:steps plan)))]
@@ -330,6 +340,7 @@
    aliases are interpreted from structured invocation records."
   [plan arguments evaluate-scalar]
   (let [plan (invocation/validate! plan)
+        _ (refuse-external-storage! plan)
         arguments (project-parameter-arguments plan arguments)]
     (let [parameter-pairs (mapv vector (:parameters plan) arguments)
           scalar-values

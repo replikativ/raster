@@ -70,7 +70,7 @@
     (into {}
           (keep (fn [{:keys [id elements]}]
                   (when (and (not= id elements)
-                             (or (and (integer? elements) (pos? elements))
+                             (or (and (integer? elements) (not (neg? elements)))
                                  (symbol? elements) (klaunch/dimension-expression? elements)
                                  (= id (klaunch/backing-extent-id elements))))
                     [id [(if (klaunch/backing-extent-id elements)

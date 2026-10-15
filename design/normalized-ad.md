@@ -6,8 +6,20 @@ Compiler-generated pure TypedSOAC programs can acquire an exact source-free invo
 without manufacturing a Clojure `let` or re-inferring parameter types. The ordered IR inputs and
 their retained AbstractValues supply a zero-prefix plan; flat public buffers and every retained
 shape must resolve directly from public integral inputs or supported public-buffer extents.
-Effects, aliases, physical result storage and native initialization providers refuse. The existing
-analyzed-source promotion still independently proves the complete source return.
+The unchanged pure promotion refuses effects, aliases, physical result storage and native
+initialization providers. A separate bounded promotion accepts exactly one already validated
+sequential ordered effect map and derives its sole read-write destination from retained
+result-storage/alias facts. That destination is an unresolved external storage premise, not a
+parameter, initializer, allocation, or complete-write claim. Ordinary host materialization refuses
+the plan before reading arguments; resident binding and final LinkPlan initialization remain
+independent obligations. This first slice requires statically materializable destination geometry;
+a private dynamic gradient extent still refuses. The existing analyzed-source promotion still
+independently proves the complete source return.
+
+Zero-extent ordered effects preserve their exact zero GraphBuffer capacities through scheduling.
+Current KernelBody storage parameters require positive extents, so target emission then refuses
+explicitly instead of substituting capacity one. Empty-buffer/liveness support is a separate
+compiler capability; this prerequisite does not claim it.
 
 This is a compiler-frontier prerequisite, not normalized device execution. Canonical map/sum
 primal, linear and transpose programs promote, schedule and emit through all four C-family
