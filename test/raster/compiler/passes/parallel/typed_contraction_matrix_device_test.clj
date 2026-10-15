@@ -10,6 +10,7 @@
             [raster.compiler.fixtures.attention-projection :as attention-projection]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gpu-probe]
@@ -326,6 +327,37 @@
      :desc (hardware/descriptor-for device-id)
      :precision :mixed-f16-f32))))
 
+(defn- regrouped-typed-dispatch
+  [device-id]
+  (let [{:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device device-id
+                 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :int 'n :int 'k :int}})
+        equation (first (:equations form))
+        algorithm (:algorithm equation)
+        [algorithm-equation] (soac/equations algorithm)
+        result-ids (nth algorithm-equation 2)
+        result-id (do (assert (= 1 (count result-ids)))
+                      (first result-ids))
+        operation-form (nth algorithm-equation 3)
+        result-map {:groups '[[[i m] [j n]]]}
+        operation-form (apply list
+                              (assoc (vec operation-form) 1
+                                     (assoc (second operation-form)
+                                            :result-map result-map)))
+        algorithm-equation (apply list (assoc (vec algorithm-equation) 3 operation-form))
+        algorithm (soac/make
+                   (assoc-in (soac/facts algorithm) [:values result-id :shape]
+                             '[(clojure.core/* m n)])
+                   [algorithm-equation] (soac/outputs algorithm))
+        operation (assoc (first (:operations equation)) :result-map result-map)]
+    (contract-route/route-typed-contraction-dispatch
+     algorithm operation :dtype :float
+     :desc (hardware/descriptor-for device-id)
+     :precision :mixed-f16-f32)))
+
 (defn- typed-batched-dispatch
   [device-id scalar-dtype both-batched?]
   (let [{:keys [form]}
@@ -437,8 +469,10 @@
   ([device-id scheduled m n k scalar-dtype]
    (run-contraction device-id scheduled m n k scalar-dtype :nn))
   ([device-id scheduled m n k scalar-dtype variant]
-  (let [a (input-array (* m k) 17)
-        b (input-array (* k n) 29)
+   (run-contraction device-id scheduled m n k scalar-dtype variant 0))
+  ([device-id scheduled m n k scalar-dtype variant seed-offset]
+  (let [a (input-array (* m k) (+ 17 seed-offset))
+        b (input-array (* k n) (+ 29 seed-offset))
         transpose (fn [^floats values rows columns]
                     (float-array (for [column (range columns) row (range rows)]
                                    (aget values (+ (* row columns) column)))))
@@ -546,6 +580,18 @@
         (let [{:keys [strategy actual expected]}
               (run-contraction :ze:0 scheduled 13 32 8192)]
           (is (= :xmx-split-k strategy))
+          (is (< (relative-l1 actual expected) 1.0e-3)))))))
+
+(deftest regrouped-result-executes-through-a-schedule-local-matrix-view
+  (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "regrouped typed contraction result on " device))
+      (let [scheduled (regrouped-typed-dispatch device)]
+        (doseq [seed-offset [0 101]
+                :let [{:keys [actual expected]}
+                      (run-contraction device scheduled 16 32 32 :int :nn seed-offset)]]
+          (is (= (* 16 32) (alength ^floats actual)))
           (is (< (relative-l1 actual expected) 1.0e-3)))))))
 
 (deftest public-long-contraction-executes-guarded-matrix-schedules

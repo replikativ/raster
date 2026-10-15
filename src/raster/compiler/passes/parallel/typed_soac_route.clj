@@ -947,7 +947,7 @@
               (= expected-arithmetic (get-in facts [:attributes :source-arithmetic])))
           (set/subset? (set (keys attributes))
                        #{:segment-axes :index :extent :attributes :accumulators :identities
-                         :dtypes :algebra :source-arithmetic})
+                         :dtypes :algebra :source-arithmetic :result-map})
           (set/subset? (set (keys operation-attributes))
                        #{:stable-array-captures :pointwise-storage-inputs})
           (= (set stable) (set (filter #(seq (:shape (get values %))) captures)))

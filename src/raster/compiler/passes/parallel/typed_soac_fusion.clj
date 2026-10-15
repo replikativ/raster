@@ -1004,6 +1004,7 @@
                               (mapcat (comp util/free-syms :init) (:locals consumer))))
                  transform (when (and (= :map (:kind producer))
                                       (= :segmented-reduce (:kind consumer))
+                                      (not (contains? (:attributes consumer) :result-map))
                                       destination (= destination consumer-destination))
                              (compose-initializer-transform
                               program (subvec infos 0 producer-index)
@@ -1096,6 +1097,7 @@
                  consumer (nth infos consumer-index)]
            :when (= :segmented-reduce (:kind producer))
            :when (= :map (:kind consumer))
+           :when (not (contains? (:attributes producer) :result-map))
            :let [produced (first (:results producer))
                  consumed-destination
                  (get-in facts [:equations (:id producer)

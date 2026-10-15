@@ -147,15 +147,69 @@
          (list 'clojure.core/inc (first (extent-shape extent))))
      (first (extent-shape extent)))])
 
+(defn- ordered-segment-axes?
+  [axes]
+  (and (vector? axes)
+       (every? #(and (vector? %) (= 2 (count %))
+                     (symbol? (first %)) (extent? (second %)))
+               axes)
+       (= (count axes) (count (distinct (map first axes))))))
+
+(defn- regroup-only-result-map?
+  [axes result-map]
+  (let [groups (:groups result-map)
+        canonical-map (axis-map/of-axes axes)]
+    (and (map? result-map) (= #{:groups} (set (keys result-map)))
+         (vector? groups) (seq groups)
+         (every? #(and (vector? %) (seq %)
+                       (every? (fn [pair]
+                                 (and (vector? pair) (= 2 (count pair)))) %))
+                 groups)
+         (= axes (vec (mapcat identity groups)))
+         (let [canonical-index (axis-map/index-expr canonical-map)
+               result-index (axis-map/index-expr result-map)]
+           (or (= canonical-index result-index)
+               (axis-map/index= canonical-index result-index (mapv first axes)))))))
+
+(defn segmented-reduce-result-map
+  "Physical grouping of a segmented reduction's ordered parallel axes.
+
+   Absence denotes the historical one-axis-per-dimension layout.  An explicit map is validated
+   as a regrouping only: it cannot reorder, repeat, omit or pad the segment space."
+  [attributes]
+  (let [axes (:segment-axes attributes)
+        explicit? (contains? attributes :result-map)
+        result-map (:result-map attributes)]
+    (when-not (and (ordered-segment-axes? axes)
+                   (or (not explicit?) (regroup-only-result-map? axes result-map)))
+      (throw (ex-info "segmented reduction result map must only regroup its ordered segment axes"
+                      {:reason :typed-soac-segmented-reduce-result-map
+                       :segment-axes axes :result-map result-map})))
+    (update (if explicit? result-map (axis-map/of-axes axes))
+            :groups
+            #(mapv (fn [group]
+                     (mapv (fn [[axis extent]]
+                             [axis (first (extent-shape extent))])
+                           group)) %))))
+
+(defn segmented-reduce-result-index
+  "Flat result coordinate derived from the segmented reduction's checked result grouping."
+  [attributes]
+  (axis-map/index-expr (segmented-reduce-result-map attributes)))
+
 (defn segmented-reduce-result-shape
-  "Canonical tensor shape of a segmented reduction's ordered parallel axes."
+  "Physical tensor shape of a segmented reduction's checked result grouping."
+  [attributes]
+  (axis-map/shape (segmented-reduce-result-map attributes)))
+
+(defn- canonical-segment-result-shape
   [attributes]
   (mapv (comp first extent-shape second) (:segment-axes attributes)))
 
 (defn segmented-fold-map-result-shape
   "Canonical dense output shape of an ordered segmented fold-map."
   [attributes]
-  (conj (segmented-reduce-result-shape attributes)
+  (conj (canonical-segment-result-shape attributes)
         (first (extent-shape (:extent attributes)))))
 
 (defn map-attributes?
@@ -425,14 +479,14 @@
    space; `:index/:extent` remain the innermost reduced axis shared with ordinary reduce."
   [value]
   (let [axes (:segment-axes value)
-        indices (mapv first axes)]
-    (and (reduce-attributes? (dissoc value :segment-axes))
-         (vector? axes)
-         (every? #(and (vector? %) (= 2 (count %))
-                       (symbol? (first %)) (extent? (second %)))
-                 axes)
-         (= (count indices) (count (distinct indices)))
+        indices (mapv first axes)
+        explicit-result-map? (contains? value :result-map)
+        result-map (:result-map value)]
+    (and (reduce-attributes? (dissoc value :segment-axes :result-map))
+         (ordered-segment-axes? axes)
          (not (contains? (set indices) (:index value)))
+         (or (not explicit-result-map?)
+             (regroup-only-result-map? axes result-map))
          (or (nil? (:result-transform value))
              (and (= 1 (count (:accumulators value)))
                   (result-transform? (:result-transform value)))))))
@@ -450,6 +504,7 @@
         result-components (:result-components value)
         indices (mapv first axes)]
     (and (map-attributes? value)
+         (not (contains? value :result-map))
          (vector? axes) (seq axes)
          (every? #(and (vector? %) (= 2 (count %))
                        (symbol? (first %)) (extent? (second %)))
@@ -547,6 +602,7 @@
   (let [axes (:segment-axes value)
         indices (mapv first axes)]
     (and (map-attributes? value)
+         (not (contains? value :result-map))
          (vector? axes) (seq axes)
          (every? #(and (vector? %) (= 2 (count %))
                        (symbol? (first %)) (extent? (second %)))
@@ -2396,7 +2452,7 @@
                       :segment-axes (:segment-axes attributes) :dtype dtype})))))
 
       product-reduce
-      (let [result-shape (segmented-reduce-result-shape attributes)
+      (let [result-shape (canonical-segment-result-shape attributes)
             result-dtypes (mapv #((:dtypes attributes) %)
                                 (:result-components attributes))]
         (doseq [[id dtype] (map vector results result-dtypes)]
@@ -2794,6 +2850,15 @@
                                            #(mapv (fn [[index extent]]
                                                     [index (if (value-id? extent)
                                                              (rename extent) extent)]) %))
+                                   attributes)
+                      attributes (if (and (= 'segmented-reduce kind)
+                                          (contains? attributes :result-map))
+                                   (update-in attributes [:result-map :groups]
+                                              #(mapv (fn [group]
+                                                       (mapv (fn [[index extent]]
+                                                               [index (if (value-id? extent)
+                                                                        (rename extent) extent)])
+                                                             group)) %))
                                    attributes)
                       attributes (cond-> attributes
                                    (:result-transform attributes)
