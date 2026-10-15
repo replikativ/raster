@@ -12,6 +12,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.link-module-plan :as module-plan]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -139,7 +140,24 @@
         zero-requirement (:requirement physical)
         zero-value (:value physical)
         consumer (:consumer physical)
-        gradient-id (:id gradient)]
+        gradient-id (:id gradient)
+        index-values (map :value [index primal seed])
+        dynamic-values (map :value [active gradient])
+        dynamic-values (conj (vec dynamic-values) zero-value)
+        dynamic-shape (:shape (first dynamic-values))
+        dimension (when (and (= 1 (count dynamic-shape))
+                             (symbol? (first dynamic-shape)))
+                    (first dynamic-shape))
+        dimension-value (when dimension
+                          (get-in (soac/facts (:transpose owner)) [:values dimension]))
+        dynamic-geometry?
+        (and dimension
+             (every? #(= [dimension] (:shape %)) dynamic-values)
+             (= :tensor (:kind dimension-value))
+             (empty? (:shape dimension-value))
+             (contains? #{:int :long} (dtype/canon (:dtype dimension-value)))
+             (not (some #{dimension} (map :id inputs))))
+        static-geometry? (every? static-positive-vector? dynamic-values)]
     (when-not
      (and (= 2 (count inputs)) (= 2 (count arrays)) (empty? (remove #(seq (get-in % [:value :shape])) inputs))
           (= 1 (count residuals)) (= 1 (count physicals)) active index (not= active index)
@@ -148,7 +166,8 @@
           (contains? #{:float :double} (get-in active [:value :dtype]))
           (contains? #{nil :owned} (get-in index [:value :ownership]))
           (contains? #{nil :owned} (get-in active [:value :ownership]))
-          (every? static-positive-vector? (map :value [index active primal seed gradient]))
+          (every? static-positive-vector? index-values)
+          (or static-geometry? dynamic-geometry?)
           (= (:shape (get-in index [:value])) (:shape (get-in primal [:value])))
           (= (:shape (get-in primal [:value])) (:shape (get-in seed [:value])))
           (= (:shape (get-in active [:value])) (:shape (get-in gradient [:value])))
@@ -172,14 +191,16 @@
           (= (:shape zero-value) (get-in active [:value :shape])
              (get-in gradient [:value :shape])))
       (fail! :normalized-device-indexed-interface
-             "indexed preparation requires two static arrays and one exact typed-zero gradient"
+             "indexed preparation requires a static index space and one exact gradient geometry"
              {:inputs (mapv :id inputs) :active active-id :index index-id
               :residuals (mapv :id residuals) :physical-bindings (set (keys physicals))}))
     {:inputs inputs :arrays arrays :active active :index index
      :index-snapshot index-snapshot :primal primal :seed seed :gradient gradient
-     :zero-id physical-id :zero-value zero-value :zero-requirement zero-requirement}))
+     :zero-id physical-id :zero-value zero-value :zero-requirement zero-requirement
+     :external-dimension (when dynamic-geometry?
+                           {:id dimension :dtype (dtype/canon (:dtype dimension-value))})}))
 
-(defn- materialize-layout! [compilation input-descriptors arguments caller-options]
+(defn- materialize-layout-with! [compilation input-descriptors arguments caller-options admit-steps!]
   (let [invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
         arguments (vec arguments)
         semantic-ids (mapv :id input-descriptors)
@@ -194,10 +215,7 @@
                     :arguments (count arguments)}))
         argument-by-id (zipmap semantic-ids arguments)
         invocation-arguments (mapv argument-by-id invocation-ids)
-        _ (when (seq (:steps invocation-plan))
-            (fail! :normalized-device-specialization
-                   "the first device consumer accepts only direct array/scalar specialization"
-                   {:steps (mapv :id (:steps invocation-plan))}))
+        _ (admit-steps! invocation-plan)
         materialized
         (materialization/materialize
          invocation-plan invocation-arguments
@@ -206,6 +224,34 @@
                   "device preparation cannot evaluate a host scalar prefix" {})))]
     (invocation-link/project-resident-layout
      materialized (:emitted compilation) (:target compilation) caller-options)))
+
+(defn- materialize-layout! [compilation input-descriptors arguments caller-options]
+  (materialize-layout-with!
+   compilation input-descriptors arguments caller-options
+   (fn [plan]
+     (when (seq (:steps plan))
+       (fail! :normalized-device-specialization
+              "the first device consumer accepts only direct array/scalar specialization"
+              {:steps (mapv :id (:steps plan))})))))
+
+(defn- materialize-indexed-layout!
+  [compilation input-descriptors arguments caller-options {:keys [external-dimension active]}]
+  (materialize-layout-with!
+   compilation input-descriptors arguments caller-options
+   (fn [plan]
+     (let [steps (:steps plan)
+           marker (get-in plan [:attributes :source-free-shape-projections])
+           expected (when external-dimension
+                      [{:dimension (:id external-dimension) :source (:id active) :axis 0}])]
+       (when-not (if external-dimension
+                   (and (= expected marker) (= 1 (count steps))
+                        (invocation/shape-projection? (first steps))
+                        (= (:id external-dimension) (:symbol (first steps))))
+                   (and (empty? steps) (nil? marker)))
+         (fail! :normalized-device-indexed-shape-projection
+                "indexed preparation requires exactly its canonical self-shape projection"
+                {:expected expected :marker marker
+                 :steps (mapv :id steps)}))))))
 
 (defn- public-array-boundary!
   "Match canonical array descriptors to a projected resident layout by compiler identity.
@@ -299,7 +345,8 @@
                {:residual residual-id :binding binding})))
     {:ids residual-ids :values (mapv compiler-bindings residual-ids)}))
 
-(defn- typed-zero-program [owner {:keys [zero-id zero-value zero-requirement]}]
+(defn- typed-zero-program
+  [owner {:keys [zero-id zero-value zero-requirement]} concrete-shape]
   (let [used (into (set (keys (:values (soac/facts (:transpose owner)))))
                    (map second (soac/equations (:transpose owner))))
         fresh (fn [prefix]
@@ -307,7 +354,8 @@
         equation-id (fresh "normalized-device-zero-fill-")
         index (fresh "normalized-device-zero-index-")
         dtype (:dtype zero-value)
-        extent (first (:shape zero-value))
+        realized-zero (assoc zero-value :shape concrete-shape)
+        extent (first concrete-shape)
         cast (dtype/scalar-tag-for-dtype dtype)
         equation (list '= equation-id [zero-id]
                        (list 'map {:index index :extent extent} [] []
@@ -315,19 +363,38 @@
         program
         (soac/make
          (soac/default-program-facts
-          {:values {zero-id zero-value}
+          {:values {zero-id realized-zero}
            :inputs [] :equations {equation-id (soac/default-equation-facts)}})
          [equation] [zero-id])]
     (when-not (and (= :typed-zero (:initialization zero-requirement))
                    (= :owned (:ownership zero-requirement))
                    (true? (:exclusive zero-requirement))
                    (= zero-id (:value zero-requirement))
-                   (= zero-value (get-in (soac/facts program) [:values zero-id]))
+                   (= (dissoc zero-value :shape) (dissoc realized-zero :shape))
+                   (= concrete-shape (:shape realized-zero))
+                   (= realized-zero (get-in (soac/facts program) [:values zero-id]))
+                   (= 1 (count concrete-shape))
+                   (integer? extent) (pos? extent) (<= extent Integer/MAX_VALUE)
                    (empty? (:inputs (soac/facts program))))
       (fail! :normalized-device-zero-fill
              "zero fill must derive exactly from the canonical physical obligation"
              {:zero zero-id :requirement zero-requirement}))
     program))
+
+(defn- resident-value-shape!
+  [nodes values value-id]
+  (let [value (get values value-id)
+        leaves (:leaves value)
+        node-id (get-in leaves [0 :node])
+        node (get nodes node-id)
+        shape (get-in node [:view :shape])]
+    (when-not (and value (= 1 (count leaves)) node
+                   (= 1 (count shape)) (integer? (first shape))
+                   (pos? (first shape)) (<= (first shape) Integer/MAX_VALUE))
+      (fail! :normalized-device-indexed-geometry
+             "indexed execution requires one positive concrete resident vector"
+             {:value value-id :leaves leaves :node node-id :shape shape}))
+    shape))
 
 (defn- bind-module!
   [check! target caller-options nodes values primal-phase transpose-phases residual-values]
@@ -548,9 +615,8 @@
         caller-options (caller-options options)
         primal-compilation (compile-phase! checked :primal compile-options)
         transpose-compilation (compile-phase! checked :transpose compile-options)
-        zero-program (typed-zero-program owner interface)
-        zero-compilation (compile-program! checked zero-program compile-options)
-        layout (materialize-layout! primal-compilation (:inputs interface) arguments caller-options)
+        layout (materialize-indexed-layout!
+                primal-compilation (:inputs interface) arguments caller-options interface)
         compiler-bindings (:buffer-bindings layout)
         array-boundary (public-array-boundary! (:arrays interface) layout)
         canonical-array-ids (:ids array-boundary)
@@ -603,6 +669,48 @@
         values (assoc (:values layout)
                       seed-value (:value seed-layout)
                       gradient-value (:value gradient-layout))
+        index-shape (resident-value-shape! nodes values index-value)
+        active-shape (resident-value-shape! nodes values active-value)
+        primal-shape (resident-value-shape! nodes values primal-value)
+        seed-shape (resident-value-shape! nodes values seed-value)
+        gradient-shape (resident-value-shape! nodes values gradient-value)
+        external-dimension (:external-dimension interface)
+        transpose-plan (get-in transpose-compilation
+                               [:semantic :attributes :invocation-plan])
+        declared-dimensions (get-in transpose-plan
+                                    [:attributes :external-dimension-values])
+        typed-dimension (when external-dimension
+                          (get (:scalar-values layout) (:id external-dimension)))
+        transpose-scalars
+        (if external-dimension {(:id external-dimension) typed-dimension} {})
+        _ (when-not
+           (and (= index-shape primal-shape seed-shape)
+                (= active-shape gradient-shape)
+                (if external-dimension
+                  (and (= [external-dimension] declared-dimensions)
+                       (= #{(:id external-dimension)}
+                          (set (keys (:scalar-values layout))))
+                       (= {:type (:dtype external-dimension)
+                           :value (first gradient-shape)}
+                          typed-dimension)
+                       (= [(:id external-dimension)] (:shape (:zero-value interface)))
+                       (= [(:id external-dimension)]
+                          (get-in interface [:gradient :value :shape]))
+                       (= [(:id external-dimension)]
+                          (get-in interface [:active :value :shape])))
+                  (and (nil? declared-dimensions)
+                       (empty? (:scalar-values layout))
+                       (= active-shape (:shape (:zero-value interface))))))
+          (fail! :normalized-device-indexed-geometry
+                 "indexed symbolic and resident geometry must correspond exactly"
+                 {:external-dimension external-dimension
+                  :declared-dimensions declared-dimensions
+                  :typed-dimension typed-dimension
+                  :index-shape index-shape :primal-shape primal-shape
+                  :seed-shape seed-shape :active-shape active-shape
+                  :gradient-shape gradient-shape}))
+        zero-program (typed-zero-program owner interface gradient-shape)
+        zero-compilation (compile-program! checked zero-program compile-options)
         zero-bindings {zero-id gradient-value}
         transpose-bindings
         (into {seed-id seed-value zero-id gradient-value gradient-id gradient-value}
@@ -617,24 +725,24 @@
            :buffer-bindings zero-bindings :scalar-values {}
            :interface {:inputs [] :state [] :outputs [gradient-value]}}
           {:instance-id ::transpose-effect :compilation transpose-compilation
-           :buffer-bindings transpose-bindings :scalar-values (:scalar-values layout)
+           :buffer-bindings transpose-bindings :scalar-values transpose-scalars
            :interface {:inputs [seed-value] :state [] :outputs [gradient-value]}}]
          residual-values)
-        index-count (first (get-in interface [:index :value :shape]))
-        gradient-count (first (get-in interface [:active :value :shape]))]
+        index-count (first index-shape)
+        gradient-count (first gradient-shape)]
     {:module (:module bound) :frontier-values (:frontier-values bound)
      :ports {:inputs (mapv (fn [id value]
                              {:id id :value value
                               :dtype (get-in (soac/facts (:primal owner)) [:values id :dtype])
-                              :elements (first (get-in (soac/facts (:primal owner))
-                                                       [:values id :shape]))})
+                              :elements (first (resident-value-shape!
+                                                nodes values value))})
                            canonical-array-ids public-array-values)
              :index-input index-value :index-id index-id
              :index-dtype (get-in interface [:index :value :dtype])
              :index-count index-count :gradient-count gradient-count
              :primal-output primal-value :seed-input seed-value
              :seed-dtype (get-in interface [:seed :value :dtype])
-             :seed-elements (first (get-in interface [:seed :value :shape]))
+             :seed-elements (first seed-shape)
              :gradient-output gradient-value :residuals residual-values
              :zero-destination zero-id :logical-gradient gradient-id}}))
 
@@ -816,15 +924,17 @@
     (instantiate-prepared! checked assembled options :map-sum)))
 
 (defn prepare-indexed-owner
-  "Prepare one canonical static indexed map for explicit resident gather/transpose execution.
+  "Prepare one canonical fixed-geometry indexed map for resident gather/transpose execution.
 
    `arguments` fix two positive one-dimensional arrays in canonical interface order: excluded
-   Int/Long indices and active Float/Double data. `:primal!` accepts an exact ID-to-array map, snapshots a
-   checked clone of the indices on device, and returns its dependency lease. `:transpose!` accepts
-   a cotangent array plus that exact dependency map; one private complete zero-fill precedes the
-   canonical sequential ordered update in the same named entry.
+   Int/Long indices and active Float/Double data. The index/cotangent extent is static; the data
+   extent may also be one exact private dimension projected from the prepared data array and then
+   remains fixed. `:primal!` accepts an exact ID-to-array map, snapshots a checked clone of the
+   indices on device, and returns its dependency lease. `:transpose!` accepts a cotangent array plus
+   that exact dependency map; one private complete zero-fill precedes the canonical sequential
+   ordered update in the same named entry.
 
-   This opt-in lease boundary supports neither dynamic/empty geometry nor general scatter,
+   This opt-in lease boundary supports neither empty or per-call dynamic geometry nor general scatter,
    mutable state, caching, host readback, or default AD activation. Every issued lease must close
    before replaying an overlapping entry or calling `:close!`."
   [owner arguments {:keys [target] :as options}]

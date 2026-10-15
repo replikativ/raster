@@ -3,8 +3,10 @@
             [raster.ad.normalized-device :as device]
             [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.normalized-scalar :as normalized]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.kernel-body]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -154,11 +156,11 @@
                  (reason #((:transpose! prepared) seed {})))))
         (is (zero? @calls))
         ((:close! prepared)))))
-  (testing "dynamic and empty geometry refuse before runtime instantiation"
+  (testing "empty, dynamic-index-space and oversized geometry refuse before runtime instantiation"
     (doseq [[make-owner expected]
             [[#(indexed-owner :long 0 2) :normalized-device-indexed-interface]
              [#(indexed-owner :long 3 0) :normalized-device-indexed-interface]
-             [#(indexed-owner :long 3 'm) :normalized-device-indexed-interface]
+             [#(indexed-owner :long 'n 'm) :normalized-device-indexed-interface]
              [#(indexed-owner :long 3 (inc (bigint Integer/MAX_VALUE)))
               :ad-normalized-indexed-map-boundary]]]
       (let [instantiations (atom 0)]
@@ -172,6 +174,106 @@
                              owner [(long-array 0) (float-array 2)]
                              {:target :ocl:indexed-refusal})))))
           (is (zero? @instantiations)))))))
+
+(deftest indexed-private-data-geometry-is-fixed-by-the-primal-shape-projection
+  (let [owner (indexed-owner :long 3 'm)
+        captures (atom [])
+        calls (atom [])
+        runtime (reify java.io.Closeable (close [_]))]
+    (with-redefs [hardware/descriptor-for synthetic-descriptor
+                  link-module/instantiate!
+                  (fn [module _] (swap! captures conj module) runtime)
+                  link-module/run-and-lease!
+                  (fn [_ entry request]
+                    (swap! calls conj [entry request])
+                    (reify java.io.Closeable (close [_])))]
+      (doseq [m [2 4]]
+        (let [indices (long-array [0 0 0])
+              data (float-array m)
+              prepared (device/prepare-indexed-owner
+                        owner (arguments owner indices data)
+                        {:target :ocl:indexed-dynamic-structure
+                         :schedule {:precision :f32-scalar}})
+              module (peek @captures)
+              ports (:ports prepared)
+              [primal zero effect] (get-in module [:spine :instances])
+              calls-before (count @calls)
+              _ (is (= :normalized-device-array
+                       (reason #((:primal! prepared)
+                                  {'indices indices 'data (float-array (inc m))}))))
+              _ (is (= calls-before (count @calls)))
+              primal-result ((:primal! prepared) {'indices indices 'data data})]
+          (is (= {:type :long :value m} (get-in primal [:call :scalar-values 'm])))
+          (is (seq (get-in primal [:call :steps])))
+          (is (every? empty? (map :scalar-values (get-in primal [:call :steps])))
+              "program-wide shape evidence does not become a kernel scalar argument")
+          (is (empty? (get-in zero [:call :scalar-values])))
+          (is (= {:type :long :value m} (get-in effect [:call :scalar-values 'm])))
+          (is (= [{:dimension 'm :source 'data :axis 0}]
+                 (get-in primal [:call :program :attributes :invocation-plan :attributes
+                                 :source-free-shape-projections])))
+          (is (= [{:id 'm :dtype :long}]
+                 (get-in effect [:call :program :attributes :invocation-plan :attributes
+                                 :external-dimension-values])))
+          (is (= [m] (get-in zero [:call :program :values
+                                   (:zero-destination ports) :shape])))
+          (is (= '[m] (get-in effect [:call :program :values
+                                      (:zero-destination ports) :shape])))
+          (is (= m (:gradient-count ports)))
+          (is (= m (:elements (some #(when (= 'data (:id %)) %) (:inputs ports)))))
+          (.close ^java.io.Closeable (:lease primal-result))
+          ((:close! prepared))))
+    (let [instantiations (atom 0)]
+      (with-redefs [hardware/descriptor-for synthetic-descriptor
+                    link-module/instantiate!
+                    (fn [& _] (swap! instantiations inc) runtime)]
+        (is (some? (reason #(device/prepare-indexed-owner
+                             owner (arguments owner (long-array [0 0 0]) (float-array 0))
+                             {:target :ocl:indexed-dynamic-empty}))))
+        (is (zero? @instantiations)))))))
+
+(deftest indexed-private-data-geometry-refuses-an-expanded-primal-prefix
+  (let [owner (indexed-owner :long 3 'm)
+        compile-typed equation-first/compile-typed
+        instantiations (atom 0)]
+    (with-redefs [hardware/descriptor-for synthetic-descriptor
+                  equation-first/compile-typed
+                  (fn [program options]
+                    (let [compiled (compile-typed program options)]
+                      (if (identical? program (:primal owner))
+                        (update-in compiled
+                                   [:semantic :attributes :invocation-plan :steps]
+                                   #(conj % (first %)))
+                        compiled)))
+                  link-module/instantiate!
+                  (fn [& _] (swap! instantiations inc)
+                    (throw (AssertionError. "runtime observed")))]
+      (is (= :normalized-device-indexed-shape-projection
+             (reason #(device/prepare-indexed-owner
+                       owner (arguments owner (long-array [0 0 0]) (float-array 4))
+                       {:target :ocl:indexed-expanded-prefix
+                        :schedule {:precision :f32-scalar}}))))
+      (is (zero? @instantiations)))))
+
+(deftest indexed-private-data-geometry-refuses-an-extra-layout-scalar
+  (let [owner (indexed-owner :long 3 'm)
+        project-layout invocation-link/project-resident-layout
+        instantiations (atom 0)]
+    (with-redefs [hardware/descriptor-for synthetic-descriptor
+                  invocation-link/project-resident-layout
+                  (fn [& arguments]
+                    (assoc-in (apply project-layout arguments)
+                              [:scalar-values 'extra]
+                              {:type :long :value 4}))
+                  link-module/instantiate!
+                  (fn [& _] (swap! instantiations inc)
+                    (throw (AssertionError. "runtime observed")))]
+      (is (= :normalized-device-indexed-geometry
+             (reason #(device/prepare-indexed-owner
+                       owner (arguments owner (long-array [0 0 0]) (float-array 4))
+                       {:target :ocl:indexed-extra-layout-scalar
+                        :schedule {:precision :f32-scalar}}))))
+      (is (zero? @instantiations)))))
 
 (deftest indexed-public-order-is-canonical-and-buffer-transport-is-id-based
   (let [owner (reordered-indexed-owner)
@@ -220,10 +322,16 @@
 (defn- index-array [index-dtype values]
   (case index-dtype :int (int-array values) :long (long-array values)))
 
-(defn- run-indexed-device-case! [target index-dtype]
-  (let [owner (indexed-owner index-dtype 3 2)
+(defn- run-indexed-device-case!
+  ([target index-dtype] (run-indexed-device-case! target index-dtype 2))
+  ([target index-dtype data-extent]
+  (let [data-count (if (symbol? data-extent) 4 data-extent)
+        owner (indexed-owner index-dtype 3 data-extent)
         indices (index-array index-dtype [0 0 0])
-        data (float-array [7.0 11.0])
+        data (float-array (take data-count [7.0 11.0 13.0 17.0]))
+        zero-gradient (vec (repeat data-count 0.0))
+        first-gradient (assoc zero-gradient 0 6.0)
+        second-gradient (assoc zero-gradient 1 6.0)
         captured (atom nil)
         instantiate link-module/instantiate!]
     (with-redefs [link-module/instantiate!
@@ -237,14 +345,14 @@
         (try
           (is (= :normalized-device-index-bounds
                  (reason #((:primal! prepared)
-                           {'indices (index-array index-dtype [0 2 0])
-                            'data (float-array [7.0 11.0])}))))
+                           {'indices (index-array index-dtype [0 data-count 0])
+                            'data (float-array data)}))))
           (let [primal ((:primal! prepared) {'indices indices 'data data})]
             (try
               (is (= (bits [7.0 7.0 7.0])
                      (bits (download @captured (:lease primal) (:output-id primal) 3))))
               (is (= [0 0 0] (vec indices)))
-              (is (= (bits [7.0 11.0]) (bits data)))
+              (is (= (bits (take data-count [7.0 11.0 13.0 17.0])) (bits data)))
               (dotimes [position 3]
                 (case index-dtype
                   :int (aset-int ^ints indices position 1)
@@ -256,48 +364,52 @@
                     ordered ((:transpose! prepared) seed
                              (:dependencies primal))]
                 (try
-                  (is (= (bits [0.0 0.0])
+                  (is (= (bits zero-gradient)
                          (bits (download @captured (:lease ordered)
-                                         (:output-id ordered) 2))))
+                                         (:output-id ordered) data-count))))
                   (is (= seed-before (bits seed)))
                   (finally (.close ^java.io.Closeable (:lease ordered)))))
               (let [changed ((:transpose! prepared)
                              (float-array [1.0 2.0 3.0]) (:dependencies primal))]
                 (try
-                  (is (= (bits [6.0 0.0])
+                  (is (= (bits first-gradient)
                          (bits (download @captured (:lease changed)
-                                         (:output-id changed) 2))))
+                                         (:output-id changed) data-count))))
                   (finally (.close ^java.io.Closeable (:lease changed)))))
               (is (= :link-module-runtime-lease-active
                      (reason #((:primal! prepared)
                                {'indices (index-array index-dtype [1 1 1])
-                                'data (float-array [7.0 11.0])}))))
+                                'data (float-array data)}))))
               (finally (.close ^java.io.Closeable (:lease primal))))
             (is (= :link-module-runtime-lease-released
                    (reason #((:transpose! prepared)
                              (float-array [1.0 2.0 3.0]) (:dependencies primal))))))
           (let [next ((:primal! prepared)
                       {'indices (index-array index-dtype [1 1 1])
-                       'data (float-array [7.0 11.0])})]
+                       'data (float-array data)})]
             (try
               (let [gradient ((:transpose! prepared)
                               (float-array [1.0 2.0 3.0]) (:dependencies next))]
                 (try
-                  (is (= (bits [0.0 6.0])
+                  (is (= (bits second-gradient)
                          (bits (download @captured (:lease gradient)
-                                         (:output-id gradient) 2))))
+                                         (:output-id gradient) data-count))))
                   (finally (.close ^java.io.Closeable (:lease gradient)))))
               (finally (.close ^java.io.Closeable (:lease next)))))
-          (finally ((:close! prepared))))))))
+          (finally ((:close! prepared)))))))))
 
 (deftest normalized-indexed-device-owner-runs-on-opencl
   (if @ocl-probe/opencl-available?
-    (doseq [index-dtype [:int :long]]
-      (run-indexed-device-case! :ocl:0 index-dtype))
+    (do
+      (doseq [index-dtype [:int :long]]
+        (run-indexed-device-case! :ocl:0 index-dtype))
+      (run-indexed-device-case! :ocl:0 :long 'm))
     (ocl-probe/opencl-skip! "normalized indexed device owner acceptance")))
 
 (deftest normalized-indexed-device-owner-runs-on-level-zero
   (if @ze-probe/gpu-available?
-    (doseq [index-dtype [:int :long]]
-      (run-indexed-device-case! :ze:0 index-dtype))
+    (do
+      (doseq [index-dtype [:int :long]]
+        (run-indexed-device-case! :ze:0 index-dtype))
+      (run-indexed-device-case! :ze:0 :long 'm))
     (ze-probe/gpu-skip! "normalized indexed device owner acceptance")))

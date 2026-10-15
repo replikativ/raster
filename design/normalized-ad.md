@@ -12,9 +12,10 @@ sequential ordered effect map and derives its sole read-write destination from r
 result-storage/alias facts. That destination is an unresolved external storage premise, not a
 parameter, initializer, allocation, or complete-write claim. Ordinary host materialization refuses
 the plan before reading arguments; resident binding and final LinkPlan initialization remain
-independent obligations. This first slice requires statically materializable destination geometry;
-a private dynamic gradient extent still refuses. The existing analyzed-source promotion still
-independently proves the complete source return.
+independent obligations. A separate closed external-dimension premise retains direct private
+Int/Long shape symbols for later resident binding without making them logical parameters or
+executable values. The existing analyzed-source promotion still independently proves the complete
+source return.
 
 Zero-extent ordered effects preserve their exact zero GraphBuffer capacities through scheduling.
 Current KernelBody storage parameters require positive extents, so target emission then refuses
@@ -28,8 +29,9 @@ Fresh validation proves the exact source parameter, all non-shape facets, the si
 projection source, and the dimension's shape-only uses. Materialization derives typed `m` from
 the actual array geometry rather than asking callers for an internal scalar. Shared competing
 sources, compound shapes, executable uses, and forged or removed projection markers refuse.
-This does not yet provide dimensions to a separate phase with no public source buffer, admit
-empty device storage, or enable dynamic indexed device AD.
+The external-dimension premise can carry the same exact typed value into a separate resident phase
+with no public source buffer. This still does not admit empty device storage or arbitrary dynamic
+shape programs.
 
 This is a compiler-frontier prerequisite, not normalized device execution. Canonical map/sum
 primal, linear and transpose programs promote, schedule and emit through all four C-family
@@ -911,8 +913,10 @@ private dependency frontiers. Transpose takes only that exact dependency map and
 gradient lease. The same binder, LinkPlan/LinkModule validation, named-entry owner, epoch fences and
 cleanup path are used by both families.
 
-`prepare-indexed-owner` adds one static positive-geometry indexed-map family. Its public primal
+`prepare-indexed-owner` adds one positive fixed-preparation-geometry indexed-map family. Its public primal
 boundary is the canonical ordered pair of excluded Int/Long indices and active Float/Double data.
+The index/cotangent extent remains static. The data/gradient extent may be static or one private
+direct integral symbol projected exactly once from the prepared data array; calls cannot change it.
 Each call clones the indices, validates their exact dtype, length and bounds against the active
 extent, then uploads that same checked clone; the canonical primal owns the resulting device index
 snapshot as its sole dependency frontier. The cotangent is an ordinary array input whose borrowed
@@ -924,9 +928,8 @@ Transpose is one named entry containing a genuine input-free complete zero map i
 the canonical sequential ordered effect. The zero map is derived from the freshly validated single
 typed-zero/exclusive physical obligation. Final LinkPlan/LinkModule analysis—not the effect—proves
 initialization and complete production; the ordered effect retains its read-write partial-update
-contract. No atomic or reassociation permission is introduced. Dynamic or empty index/gradient
-geometry remains outside this slice because current external-storage and native buffer boundaries
-do not yet establish that capability.
+contract. No atomic or reassociation permission is introduced. Empty geometry, dynamic index space,
+compound/shared dimensions and per-call geometry changes remain outside this slice.
 
 The source-free compiler can nevertheless retain one closed external-dimension premise for this
 later boundary: a private Int/Long symbol used directly in resident array shape slots, but absent
@@ -935,7 +938,8 @@ The InvocationPlan records the freshly rederived ordered symbol/dtype set withou
 parameter, binding, initializer or allocation. Ordinary host materialization refuses such a plan;
 only resident binding with the exact typed scalar value can discharge it while rechecking the
 concrete buffer ABI. This is compiler infrastructure only and does not make dynamic indexed
-geometry part of the public device adapter.
+geometry generally available; the indexed adapter consumes only the single fixed-preparation case
+above.
 
 These opt-in slices still accept exactly one active public array and immutable scalar specialization.
 It retains no caller array after preparation and does not add a cache, session owner, lease registry,
