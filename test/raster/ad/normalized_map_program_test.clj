@@ -96,6 +96,37 @@
       (is (every? #(= [0] (:shape (get-in (soac/facts program) [:values %])))
                   (soac/outputs program))))))
 
+(deftest node-port-geometry-is-rederived-from-source-and-scalar-roles
+  (let [bundle (build (source :double {}))
+        interface (get-in bundle [:map-programs :interface])
+        active (first (:active-inputs interface))
+        tangent (first (:tangent-inputs interface))
+        gradient (first (:gradient-outputs interface))
+        residual (first (vals (:residual-arrays interface)))
+        source-value (get-in (soac/facts (get-in bundle [:map-programs :source]))
+                             [:values active])
+        result-value (get-in (soac/facts (get-in bundle [:map-programs :primal]))
+                             [:values 'y])
+        tangent-value (get-in (soac/facts (get-in bundle [:map-programs :linear]))
+                              [:values tangent])
+        gradient-value (get-in (soac/facts (get-in bundle [:map-programs :transpose]))
+                               [:values gradient])]
+    (is (fingerprint/equivalent? (assoc source-value :ownership :borrowed) tangent-value))
+    (is (fingerprint/equivalent? result-value gradient-value))
+    (is (fingerprint/equivalent?
+         result-value
+         (get-in (soac/facts (get-in bundle [:map-programs :primal]))
+                 [:values residual])))
+    (doseq [[phase id facet value]
+            [[:linear tangent :shape '[forged]]
+             [:linear tangent :dtype :float]
+             [:transpose gradient :ownership :borrowed]
+             [:transpose gradient :placement {:device :forged}]
+             [:primal residual :ownership :borrowed]]]
+      (is (some? (reason (update-in bundle [:map-programs phase] alter-facts
+                                    #(assoc-in % [:values id facet] value))))
+          (str phase " " id " " facet)))))
+
 (deftest lifted-map-validation-checks-relations-not-just-a-producer-hash
   (let [bundle (build (source :double {}))
         residual (first (vals (get-in bundle [:map-programs :interface :residual-arrays])))

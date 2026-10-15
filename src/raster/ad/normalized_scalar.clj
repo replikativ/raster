@@ -1173,6 +1173,128 @@
      :tangent-output (gensym "ad_push_")
      :gradient-outputs (mapv (fn [_] (gensym "ad_pull_")) active-inputs)}))
 
+(defn- mapped-lane-value
+  [result-value scalar-value ownership]
+  (assoc result-value :dtype (:dtype scalar-value) :ownership ownership))
+
+(defn- checked-map-node-ports
+  "Rederive one scalar-map node's exact fixed-ID port geometry.
+
+   The submitted interface owns identities only. Scalar proof values own derivative dtypes,
+   while the checked source map owns outer geometry and storage placement. Optional `stage`
+   facts are correspondence evidence; they never supply missing port metadata."
+  ([bundle source interface]
+   (checked-map-node-ports bundle source interface nil))
+  ([bundle source interface stage]
+   (let [source-values (:values (soac/facts source))
+         equation (first (soac/equations source))
+         layout (soac/parameter-layout equation)
+         parts (soac/operation-parts equation)
+         element->outer (zipmap (concat (:elements layout) (:capture-parameters layout))
+                                (concat (:arrays parts) (:captures parts)))
+         outputs (soac/outputs source)
+         result (first outputs)
+         result-value (owned-functional-result! (get source-values result))
+         {:keys [active-inputs residual-arrays scalar-captures tangent-inputs cotangent-input
+                 tangent-output gradient-outputs]} interface
+         {:keys [arrays scalars]} (map-residual-roles bundle source)
+         scalar-primal-values (:values (soac/facts (:primal bundle)))
+         scalar-linear-values (:values (soac/facts (:linear bundle)))
+         scalar-transpose-values (:values (soac/facts (:transpose bundle)))
+         scalar-actives (:active-inputs bundle)
+         scalar-tangents (:tangent-inputs bundle)
+         scalar-gradients (soac/outputs (:transpose bundle))
+         scalar-push (first (soac/outputs (:linear bundle)))
+         scalar-seed (:cotangent-seed bundle)
+         expected-active-inputs (mapv element->outer scalar-actives)
+         scalar-port-values
+         (concat (map scalar-primal-values scalar-actives)
+                 (map scalar-linear-values scalar-tangents)
+                 (map scalar-transpose-values scalar-gradients)
+                 [(get scalar-linear-values scalar-push)
+                  (get scalar-transpose-values scalar-seed)]
+                 (map scalar-primal-values arrays))
+         ids (concat (vals residual-arrays) tangent-inputs [cotangent-input tangent-output]
+                     gradient-outputs)
+         _ (when-not (and (= #{:active-inputs :residual-arrays :scalar-captures
+                               :tangent-inputs :cotangent-input :tangent-output
+                               :gradient-outputs}
+                             (set (keys interface)))
+                          (vector? active-inputs) (seq active-inputs)
+                          (vector? tangent-inputs) (vector? gradient-outputs)
+                          (= (count active-inputs) (count scalar-actives)
+                             (count scalar-tangents) (count scalar-gradients)
+                             (count tangent-inputs) (count gradient-outputs))
+                          (fingerprint/equivalent? active-inputs expected-active-inputs)
+                          (= (set arrays) (set (keys residual-arrays)))
+                          (fingerprint/equivalent? scalars scalar-captures)
+                          (every? #(contains? source-values %) active-inputs)
+                          (every? map? scalar-port-values)
+                          (every? symbol? ids)
+                          (= (count ids) (count (distinct ids)))
+                          (empty? (set/intersection (set ids) (set (keys source-values)))))
+             (fail! :ad-normalized-map-node-interface {:interface interface}))
+         active-ports
+         (mapv (fn [outer scalar-active scalar-tangent scalar-gradient tangent gradient]
+                 (let [outer-value (get source-values outer)
+                       tangent-scalar (get scalar-linear-values scalar-tangent)
+                       gradient-scalar (get scalar-transpose-values scalar-gradient)]
+                   {:source outer
+                    :source-value outer-value
+                    :scalar-source scalar-active
+                    :tangent {:id tangent :source outer
+                              :value (cond-> (assoc outer-value :dtype (:dtype tangent-scalar))
+                                       (seq (:shape outer-value))
+                                       (assoc :ownership :borrowed))}
+                    ;; A scalar-active map->sum lane still produces one mapped gradient element;
+                    ;; the enclosing ordered reduction alone changes it back to scalar geometry.
+                    :gradient {:id gradient :source outer
+                               :value (mapped-lane-value result-value gradient-scalar :owned)}}))
+               active-inputs scalar-actives scalar-tangents scalar-gradients
+               tangent-inputs gradient-outputs)
+         residual-ports
+         (into (array-map)
+               (map (fn [coefficient]
+                      (let [scalar-value (get scalar-primal-values coefficient)]
+                        [coefficient
+                         {:id (get residual-arrays coefficient) :coefficient coefficient
+                          :value (mapped-lane-value result-value scalar-value :owned)}])))
+               arrays)
+         scalar-ports
+         (into (array-map)
+               (map (fn [[coefficient outer]]
+                      [coefficient {:id outer :source outer :coefficient coefficient
+                                    :value (get source-values outer)}]))
+               scalars)
+         ports
+         {:result {:id result :source result :value result-value}
+          :active active-ports
+          :residual-arrays residual-ports
+          :scalar-captures scalar-ports
+          :tangent-result
+          {:id tangent-output :source result
+           :value (mapped-lane-value result-value (get scalar-linear-values scalar-push) :owned)}
+          :cotangent-input
+          {:id cotangent-input :source result
+           :value (mapped-lane-value result-value (get scalar-transpose-values scalar-seed)
+                                     :borrowed)}}]
+     (when stage
+       (let [expected
+             (concat
+              [[:primal (:result ports)]
+               [:linear (:tangent-result ports)]
+               [:transpose (:cotangent-input ports)]]
+              (map (fn [[_ port]] [:primal port]) residual-ports)
+              (map (fn [port] [:linear (:tangent port)]) active-ports)
+              (map (fn [port] [:transpose (:gradient port)]) active-ports))]
+         (doseq [[phase {:keys [id value]}] expected]
+           (when-not (fingerprint/equivalent?
+                      value (get-in (soac/facts (get stage phase)) [:values id]))
+             (fail! :ad-normalized-map-node-interface
+                    {:phase phase :port id :expected value
+                     :actual (get-in (soac/facts (get stage phase)) [:values id])})))))
+     ports)))
+
 (defn- construct-map-stage
   "Construct the exact executable map stage owned by a scalar AD bundle.
 
@@ -1188,9 +1310,10 @@
   ([bundle source interface equation-ids]
    (let [equation (first (soac/equations source))
         {:keys [attributes arrays captures]} (soac/operation-parts equation)
-        {:keys [active-inputs residual-arrays scalar-captures tangent-inputs cotangent-input
+        {:keys [residual-arrays scalar-captures tangent-inputs cotangent-input
                 tangent-output gradient-outputs]} interface
         outputs (soac/outputs source)
+        result (first outputs)
         input-values (mapv #(get-in (soac/facts source) [:values %]) arrays)
         output-value (get-in (soac/facts source) [:values (first outputs)])
         _ (when-not (and (contains? #{nil :owned} (:ownership output-value))
@@ -1199,21 +1322,25 @@
                           (vec (repeat (count arrays)
                                        (select-keys output-value [:memory-space :placement :sharding])))))
             (fail! :ad-normalized-map-storage {:inputs input-values :output output-value}))
-        coefficients (vec (filter #(contains? residual-arrays %) (:residuals bundle)))
-        scalar-coefficients (vec (filter #(contains? scalar-captures %) (:residuals bundle)))
-        tensor (owned-functional-result! output-value)
+        ports (checked-map-node-ports bundle source interface)
+        coefficients (vec (filter #(contains? (:residual-arrays ports) %) (:residuals bundle)))
+        scalar-coefficients (vec (filter #(contains? (:scalar-captures ports) %)
+                                         (:residuals bundle)))
         residual-outputs (mapv residual-arrays coefficients)
-        active-values (mapv #(get-in (soac/facts source) [:values %]) active-inputs)
         values (merge (:values (soac/facts source))
-                      (zipmap (concat outputs residual-outputs [tangent-output]) (repeat tensor))
-                      (zipmap tangent-inputs
-                              (map #(if (= [] (:shape %)) % (assoc % :ownership :borrowed))
-                                   active-values))
-                      ;; Every derivative map result has the original map-result geometry.
-                      ;; Scalar-active lanes acquire their scalar cotangent only in the enclosing
-                      ;; ordered sum; source-array ownership is not transferred to fresh outputs.
-                      (zipmap gradient-outputs (repeat tensor))
-                      {cotangent-input (assoc tensor :ownership :borrowed)})
+                      {result (get-in ports [:result :value])
+                       tangent-output (get-in ports [:tangent-result :value])
+                       cotangent-input (get-in ports [:cotangent-input :value])}
+                      (into {} (map (fn [[_ port]] [(:id port) (:value port)]))
+                            (:residual-arrays ports))
+                      (into {} (map (fn [port]
+                                     [(get-in port [:tangent :id])
+                                      (get-in port [:tangent :value])]))
+                            (:active ports))
+                      (into {} (map (fn [port]
+                                     [(get-in port [:gradient :id])
+                                      (get-in port [:gradient :value])]))
+                            (:active ports)))
         make-map
         (fn [id arrays captures lambda outputs]
           (generated-map-program values id attributes arrays captures lambda outputs []))
@@ -1228,14 +1355,17 @@
                                       (:linear bundle))
         pull (derivative-map-operands values (derivative-pairs [(:cotangent-seed bundle)] [cotangent-input])
                                       (:transpose bundle))]
-    {:source source :interface interface
-     :primal (make-map (:primal equation-ids) arrays captures
-                       (scalar-program-lambda (:primal bundle) (:params bundle) primal-yields)
-                       primal-results)
-     :linear (make-map (:linear equation-ids) (:arrays push) (:captures push) (:lambda push)
-                       [tangent-output])
-     :transpose (make-map (:transpose equation-ids) (:arrays pull) (:captures pull) (:lambda pull)
-                          gradient-outputs)})))
+    (let [stage
+          {:source source :interface interface
+           :primal (make-map (:primal equation-ids) arrays captures
+                             (scalar-program-lambda (:primal bundle) (:params bundle) primal-yields)
+                             primal-results)
+           :linear (make-map (:linear equation-ids) (:arrays push) (:captures push) (:lambda push)
+                             [tangent-output])
+           :transpose (make-map (:transpose equation-ids) (:arrays pull) (:captures pull) (:lambda pull)
+                                gradient-outputs)}]
+      (checked-map-node-ports bundle source interface stage)
+      stage))))
 
 (defn- edge-readable-value?
   [producer consumer]
@@ -1300,6 +1430,24 @@
             (when-let [id (:tangent-output interface)] [id])
             (:gradient-outputs interface))))
 
+(defn- checked-primal-map-node-port
+  ([primal source]
+   (checked-primal-map-node-port primal source nil))
+  ([primal source stage]
+   (let [result (first (soac/outputs source))
+         scalar-result (first (soac/outputs primal))
+         value (mapped-lane-value
+                (owned-functional-result! (get-in (soac/facts source) [:values result]))
+                (get-in (soac/facts primal) [:values scalar-result]) :owned)
+         port {:id result :source result :value value}]
+     (when (and stage
+                (not (fingerprint/equivalent?
+                      value (get-in (soac/facts stage) [:values result]))))
+       (fail! :ad-normalized-map-node-interface
+              {:phase :primal :port result :expected value
+               :actual (get-in (soac/facts stage) [:values result])}))
+     port)))
+
 (defn- construct-primal-map-node
   "Construct one checked primal-only map node.  Unlike `construct-map-stage`, this does not
    allocate or manufacture tangent/cotangent identities for a globally inactive node."
@@ -1309,9 +1457,9 @@
         outputs (soac/outputs source)
         input-values (mapv #(get-in (soac/facts source) [:values %]) arrays)
         output-value (get-in (soac/facts source) [:values (first outputs)])
-        tensor (owned-functional-result! output-value)
+        result-port (checked-primal-map-node-port primal source)
         values (merge (:values (soac/facts source))
-                      (zipmap outputs (repeat tensor)))]
+                      {(first outputs) (:value result-port)})]
     (when-not (and (contains? #{nil :owned} (:ownership output-value))
                    (fingerprint/equivalent?
                     (mapv #(select-keys % [:memory-space :placement :sharding]) input-values)
@@ -1319,10 +1467,13 @@
                                  (select-keys output-value
                                               [:memory-space :placement :sharding])))))
       (fail! :ad-normalized-map-storage {:inputs input-values :output output-value}))
-    (generated-map-program
-     values equation-id attributes arrays captures
-     (scalar-program-lambda primal (:params scalar-interface) (soac/outputs primal))
-     outputs [])))
+    (let [stage
+          (generated-map-program
+           values equation-id attributes arrays captures
+           (scalar-program-lambda primal (:params scalar-interface) (soac/outputs primal))
+           outputs [])]
+      (checked-primal-map-node-port primal source stage)
+      stage)))
 
 (defn- build-map-node
   [source source-ns {:keys [equation subprogram results]} active-outers equation-ids]
@@ -1571,28 +1722,7 @@
       (fail! :ad-normalized-map-node-derivation
              {:equation (second equation)}))
     (if active?
-      (let [interface (:stage-interface node)
-            roles (map-residual-roles derivation subprogram)
-            ids (concat (vals (:residual-arrays interface))
-                        (:tangent-inputs interface)
-                        [(:cotangent-input interface) (:tangent-output interface)]
-                        (:gradient-outputs interface))]
-        (when-not (and (= #{:active-inputs :residual-arrays :scalar-captures
-                            :tangent-inputs :cotangent-input :tangent-output
-                            :gradient-outputs}
-                          (set (keys interface)))
-                       (fingerprint/equivalent? (vec local-active)
-                                                (:active-inputs interface))
-                       (= (count local-active) (count (:tangent-inputs interface))
-                          (count (:gradient-outputs interface)))
-                       (= (set (:arrays roles)) (set (keys (:residual-arrays interface))))
-                       (fingerprint/equivalent? (:scalars roles) (:scalar-captures interface))
-                       (every? symbol? ids)
-                       (= (count ids) (count (distinct ids)))
-                       (empty? (set/intersection
-                                (set ids)
-                                (set (keys (:values (soac/facts subprogram)))))))
-          (fail! :ad-normalized-map-node-interface {:interface interface}))
+      (let [interface (:stage-interface node)]
         (assoc node :result (first (nth equation 2)) :active? true
                :stage (construct-map-stage derivation subprogram interface
                                            (:equation-ids node))))
