@@ -868,7 +868,7 @@
    scale :- Double clamp-bound :- Double n :- Long]
   :- (Array T)
   (let [out (alloc-like dy n)]
-    (dotimes [i n]
+    (par/map-void! i n
       (let [raw (* (aget x i) scale)
             clamp-mask (if (and (>= raw (- clamp-bound)) (<= raw clamp-bound)) 1.0 0.0)]
         (aset out i

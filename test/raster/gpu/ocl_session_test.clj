@@ -159,6 +159,14 @@
     (is (= {:kernel-body 1} (get-in report [:emission :routes])))
     (is (empty? (get-in report [:emission :declines])))))
 
+(deftest scale-clamp-exp-backward-is-one-typed-write-map
+  (doseq [dtype [:float :double]]
+    (let [descriptor (pl/compile-gpu-program
+                      #'ops/scale-clamp-exp-backward :ocl:0 :dtype dtype)]
+      (is (= [:map-void] (mapv :convention (:steps descriptor))))
+      (is (= 1 (count (filter #(= :map-void (:convention %)) (:steps descriptor)))))
+      (is (= (:sym (first (:allocs descriptor))) (:result-sym descriptor))))))
+
 (deftest sum-kv-heads-keeps-an-ordered-nonzero-origin-body
   (let [report (pl/compile-report #'ops/sum-kv-heads :target-device :ocl:0 :dtype :float)]
     (is (= {:kernel-body 1} (get-in report [:emission :routes])))
