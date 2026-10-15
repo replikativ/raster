@@ -5,6 +5,7 @@
             [raster.ad.normalized-scalar-public-test :as public]
             [raster.ad.normalized-map-element-test :as element]
             [raster.ad.normalized-map-sum-test :as map-sum]
+            [raster.ad.normalized-indexed-map-test :as indexed]
             [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.reverse :as reverse]
             [raster.ad.templates :as templates]
@@ -103,6 +104,19 @@
                          scalar (get-in changed [:map-programs :source])
                          (get-in changed [:map-programs :interface])
                          (get-in changed [:map-programs :proof :nodes 0 :equation-ids])))
+        changed (recertify changed)]
+    (is (= :ad-normalized-derivation-correspondence
+           (reason #(normalized/validate! changed))))))
+
+(deftest recertified-inner-scalar-arithmetic-is-not-indexed-authority
+  (let [bundle (normalized/linearize-indexed-map-program
+                (#'indexed/indexed-map :double :long 'n 'm)
+                (the-ns 'raster.ad.normalized-derivation-test))
+        scalar-path [:gather-programs :proof :scalar-derivation]
+        changed (update-in bundle (conj scalar-path :linear) scale-result)
+        scalar (get-in changed scalar-path)
+        changed (assoc-in changed scalar-path
+                          (assoc scalar :certificate (#'normalized/certificate scalar)))
         changed (recertify changed)]
     (is (= :ad-normalized-derivation-correspondence
            (reason #(normalized/validate! changed))))))

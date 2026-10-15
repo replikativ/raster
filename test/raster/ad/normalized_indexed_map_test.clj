@@ -34,12 +34,24 @@
     (let [source (indexed-map dt it extent 'm)
           bundle (build source)
           {:keys [primal linear transpose interface required-zero-gradient]} (:gather-programs bundle)
+          proof (get-in bundle [:gather-programs :proof])
+          scalar (:scalar-derivation proof)
           snapshot (:index-snapshot interface)
           result (:gradient-output interface)
           [effect] (soac/equations transpose)
           {:keys [attributes lambda]} (soac/operation-parts effect)]
       (is (identical? source (get-in bundle [:gather-programs :source])))
       (is (identical? bundle (normalized/validate! bundle)))
+      (is (= #{:source-ns :template-revision :compiler-revision
+               :gather-programs :certificate}
+             (set (keys bundle))))
+      (is (= #{:authority :scalar-derivation} (set (keys proof))))
+      (is (= :normalized-scalar (:authority proof)))
+      (is (map? scalar))
+      (is (= 3 (count (normalized/execution-sources bundle))))
+      (is (not-any? #(contains? bundle %)
+                    [:primal :linear :transpose :params :tags :active-inputs
+                     :tangent-inputs :residuals :cotangent-seed :generation]))
       (doseq [program [primal linear transpose]] (is (identical? program (soac/validate! program))))
       (doseq [program [primal linear transpose]]
         (is (not (some #{'m} (:inputs (soac/facts program)))))
@@ -59,6 +71,34 @@
         (is (= (:zero-gradient interface) (:destination parts))))
       (is (= (:zero-gradient interface)
              (get-in (soac/facts transpose) [:equations (second effect) :aliases result]))))))
+
+(deftest indexed-scalar-proof-shape-and-namespace-fail-closed
+  (let [bundle (build (indexed-map :double :long 'n 'm))
+        scalar (get-in bundle [:gather-programs :proof :scalar-derivation])
+        other-ns (the-ns 'raster.ad.normalized-scalar)]
+    (doseq [changed [(update bundle :gather-programs dissoc :proof)
+                     (assoc-in bundle [:gather-programs :proof] 1)
+                     (assoc-in bundle [:gather-programs :proof] (list 1))
+                     (assoc-in bundle [:gather-programs :proof :scalar-derivation] 1)
+                     (assoc bundle :primal (:primal scalar))
+                     (assoc-in bundle [:gather-programs :proof :scalar-derivation :source-ns]
+                               other-ns)]]
+      (is (= :ad-normalized-gather-proof
+             (reason #(normalized/validate! (recertify changed))))))))
+
+(deftest namespace-fingerprint-projection-never-synthesizes-proof-keys
+  (let [bundle (build (indexed-map :double :long 'n 'm))
+        path [:gather-programs :proof :scalar-derivation]
+        without-ns (update-in bundle path dissoc :source-ns)
+        malformed (assoc-in bundle path 1)]
+    (is (not (contains? (get-in (#'normalized/pure-proof-namespaces without-ns) path)
+                        :source-ns)))
+    (is (= :ad-normalized-gather-proof
+           (reason #(normalized/validate! (recertify without-ns)))))
+    (is (= 1 (get-in (#'normalized/pure-proof-namespaces malformed) path)))
+    (let [changed (assoc-in bundle [:gather-programs :interface] 1)]
+      (is (= :ad-normalized-gather-interface
+             (reason #(normalized/validate! (recertify changed))))))))
 
 (deftest functional-frontend-indexed-map-uses-existing-layout-without-destination-erasure
   (doseq [dt [:float :double] it [:int :long]]

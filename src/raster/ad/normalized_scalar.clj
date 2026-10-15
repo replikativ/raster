@@ -480,6 +480,11 @@
   {:parameters parameters
    :body (list 'let* (bindings program) (soac/outputs program))})
 
+(defn- scalar-execution-sources [scalar]
+  [(scalar-program-source (:primal scalar) (:params scalar))
+   (scalar-program-source (:linear scalar) (:inputs (soac/facts (:linear scalar))))
+   (scalar-program-source (:transpose scalar) (:inputs (soac/facts (:transpose scalar))))])
+
 (defn ^:no-doc execution-sources
   "Project the raw primal, linear and transpose scalar programs for executable dependency capture.
 
@@ -487,25 +492,22 @@
    projections keep every original helper Var and rule-produced call in the execution guard. This
    is not source importing, host materialization, or an independent validator."
   [bundle]
-  (if-let [nodes (get-in bundle [:map-programs :proof :nodes])]
+  (cond
+    (get-in bundle [:map-programs :proof :nodes])
     (vec
      (mapcat
       (fn [node]
         (if-let [scalar (:scalar-derivation node)]
-          [(scalar-program-source (:primal scalar) (:params scalar))
-           (scalar-program-source (:linear scalar) (:inputs (soac/facts (:linear scalar))))
-           (scalar-program-source (:transpose scalar) (:inputs (soac/facts (:transpose scalar))))]
+          (scalar-execution-sources scalar)
           (let [{:keys [primal interface]} (:primal-derivation node)]
             [(scalar-program-source primal (:params interface))])))
-      nodes))
-    [(scalar-program-source (:primal bundle) (:params bundle))
-     (scalar-program-source (:linear bundle) (:inputs (soac/facts (:linear bundle))))
-     (scalar-program-source (:transpose bundle) (:inputs (soac/facts (:transpose bundle))))]))
+      (get-in bundle [:map-programs :proof :nodes])))
 
-(defn ^:no-doc execution-source
-  "Project the validated raw scalar primal for compatibility with existing guard callers."
-  [bundle]
-  (scalar-program-source (:primal bundle) (:params bundle)))
+    (get-in bundle [:gather-programs :proof :scalar-derivation])
+    (scalar-execution-sources
+     (get-in bundle [:gather-programs :proof :scalar-derivation]))
+
+    :else (scalar-execution-sources bundle)))
 
 (defn ^:no-doc execution-guard
   "Capture effective executable Var identities in already checked source projections.
@@ -562,34 +564,48 @@
       (check-dependencies! dependencies source-ns)
       true)))
 
-(defn- pure-map-proof-namespaces [map-programs]
-  (let [nodes (get-in map-programs [:proof :nodes])]
-    (if-not (vector? nodes)
-      map-programs
-      (assoc-in map-programs [:proof :nodes]
-                (mapv (fn [node]
-                        (if-let [derivation (or (:scalar-derivation node)
-                                               (:primal-derivation node))]
-                          (let [key (if (:scalar-derivation node)
-                                      :scalar-derivation :primal-derivation)
-                                derivation (assoc derivation :source-ns
-                                                  (ns-name (:source-ns derivation)))
-                                derivation (if (= key :primal-derivation)
-                                             (update derivation :interface
-                                                     #(assoc % :source-ns
-                                                             (ns-name (:source-ns %))))
-                                             derivation)]
-                            (assoc node key derivation))
-                          node))
-                      nodes)))))
+(defn- namespace-name [value]
+  (if (instance? clojure.lang.Namespace value) (ns-name value) value))
+
+(defn ^:no-doc pure-proof-namespaces
+  "Replace only schema-owned Namespace values for semantic fingerprinting.
+   This pure projection preserves certificates and unknown keys and grants no proof authority."
+  [bundle]
+  (let [bundle (if (contains? bundle :source-ns)
+                 (update bundle :source-ns namespace-name)
+                 bundle)
+        nodes (get-in bundle [:map-programs :proof :nodes])
+        bundle
+        (if-not (vector? nodes)
+          bundle
+          (assoc-in
+           bundle [:map-programs :proof :nodes]
+           (mapv (fn [node]
+                   (if-let [derivation (let [candidate (or (:scalar-derivation node)
+                                                           (:primal-derivation node))]
+                                        (when (and (map? candidate)
+                                                   (contains? candidate :source-ns))
+                                          candidate))]
+                     (let [key (if (:scalar-derivation node)
+                                 :scalar-derivation :primal-derivation)
+                           derivation (update derivation :source-ns namespace-name)
+                           derivation (if (and (= key :primal-derivation)
+                                               (map? (:interface derivation))
+                                               (contains? (:interface derivation) :source-ns))
+                                        (update-in derivation [:interface :source-ns]
+                                                   namespace-name)
+                                        derivation)]
+                       (assoc node key derivation))
+                     node))
+                 nodes)))
+        scalar-path [:gather-programs :proof :scalar-derivation]
+        scalar (get-in bundle scalar-path)]
+    (if (and (map? scalar) (contains? scalar :source-ns))
+      (update-in bundle (conj scalar-path :source-ns) namespace-name)
+      bundle)))
 
 (defn- certificate [bundle]
-  (let [bundle (assoc (dissoc bundle :certificate)
-                      :source-ns (ns-name (:source-ns bundle)))
-        bundle (cond-> bundle
-                 (contains? bundle :map-programs)
-                 (update :map-programs pure-map-proof-namespaces))]
-    (fingerprint/fingerprint bundle)))
+  (fingerprint/fingerprint (dissoc (pure-proof-namespaces bundle) :certificate)))
 
 (defn- validate-primal! [primal params tags]
   (soac/validate! primal)
@@ -610,8 +626,8 @@
       (binding-dtype! values id expression)))
   primal)
 
-(declare validate! validate-map-proof! validate-map-programs! validate-sum-programs!
-         validate-gather-programs! sum-source-map sole-map-scalar!)
+(declare validate! validate-map-proof! validate-indexed-proof! validate-map-programs!
+         validate-sum-programs! sum-source-map sole-map-scalar!)
 
 (defn- validate-scalar-correspondence!
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
@@ -657,7 +673,7 @@
   (validate-derivation! bundle)
   bundle)
 
-(defn- validate-legacy!
+(defn- validate-scalar!
   "Validate the bundle's typed interfaces and retained producer certificate before emission.
    Replays registered scalar rules on every call; no validation cache is used. Correspondence
    with those rules is not independent proof of custom derivative mathematics."
@@ -667,8 +683,6 @@
   (binding [*ns* source-ns
             *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
     (validate-scalar-correspondence! bundle)
-    (when (contains? bundle :gather-programs)
-      (validate-gather-programs! bundle))
     ;; Preserve all existing family/certificate refusal ordering. Matching a certificate
     ;; never grants derivation authority: current-rule replay remains mandatory afterward.
     (when-not (= (:certificate bundle) (certificate bundle))
@@ -1725,8 +1739,13 @@
   (doseq [program (map map-programs [:primal :linear :transpose])]
     (soac/validate! program))
   (let [expected (reconstructed-map-proof bundle)]
-    (when-not (fingerprint/equivalent? (pure-map-proof-namespaces map-programs)
-                                       (pure-map-proof-namespaces expected))
+    (when-not (fingerprint/equivalent?
+               (:map-programs (pure-proof-namespaces
+                               {:source-ns (:source-ns bundle)
+                                :map-programs map-programs}))
+               (:map-programs (pure-proof-namespaces
+                               {:source-ns (:source-ns bundle)
+                                :map-programs expected})))
       (fail! :ad-normalized-map-programs {:interface (:interface map-programs)})))
   bundle)
 
@@ -1764,7 +1783,8 @@
   (cond
     (contains? bundle :sum-programs) (validate-map-sum-proof! bundle)
     (contains? bundle :map-programs) (validate-map-proof! bundle)
-    :else (validate-legacy! bundle)))
+    (contains? bundle :gather-programs) (validate-indexed-proof! bundle)
+    :else (validate-scalar! bundle)))
 
 (defn- build-map-programs
   [source source-ns options]
@@ -1945,7 +1965,7 @@
       {:primal scalar
        :interface {:params [element] :tags [(tag dt)] :active-inputs [element] :source-ns source-ns}})))
 
-(defn- lift-gather-programs [bundle source interface]
+(defn- lift-gather-programs [scalar source interface]
   (let [facts (soac/facts source) [equation] (soac/equations source)
         {:keys [attributes arrays captures lambda]} (soac/operation-parts equation)
         [indices] arrays [data] captures [result] (soac/outputs source)
@@ -1995,7 +2015,7 @@
                                              :attributes {:result-storage
                                                           [{:destination zero-gradient :access :read-write
                                                             :host-return :effect}]})}})
-        _ (binding [*ns* (:source-ns bundle)]
+        _ (binding [*ns* (:source-ns scalar)]
             (selected-call-contract! (call! {} addition) [dt dt] dt))]
     {:source source :interface interface
      :required-zero-gradient {:value zero-gradient :dtype dt :shape (:shape data-value)
@@ -2008,9 +2028,28 @@
                        [tangent-output])
      :transpose (soac/make transpose-facts [transpose-equation] [gradient-output])}))
 
-(defn- validate-gather-programs! [{:keys [gather-programs source-ns] :as bundle}]
+(defn- indexed-scalar-proof!
+  [{:keys [gather-programs source-ns]}]
+  (let [proof (:proof gather-programs)
+        scalar (:scalar-derivation proof)]
+    (when-not (and (map? gather-programs)
+                   (= #{:source :interface :required-zero-gradient :primal :linear :transpose :proof}
+                      (set (keys gather-programs)))
+                   (map? proof)
+                   (= #{:authority :scalar-derivation} (set (keys proof)))
+                   (= :normalized-scalar (:authority proof))
+                   (map? scalar)
+                   (identical? source-ns (:source-ns scalar)))
+      (fail! :ad-normalized-gather-proof {:proof proof}))
+    scalar))
+
+(defn- validate-gather-programs!
+  [{:keys [gather-programs source-ns] :as bundle} scalar]
   (let [{:keys [source interface]} gather-programs
-        projected (project-indexed-element source source-ns (first (soac/outputs (:primal bundle))))
+        _ (when-not (map? interface)
+            (fail! :ad-normalized-gather-interface {:interface interface}))
+        projected (project-indexed-element source source-ns
+                                           (first (soac/outputs (:primal scalar))))
         ids (vals interface)
         source-equation (first (soac/equations source))
         source-bound (conj (set (:parameters (soac/lambda-parts
@@ -2022,13 +2061,35 @@
                    (empty? (set/intersection (set ids)
                                             (set/union source-bound
                                                        (set (keys (:values (soac/facts source)))))))
-                   (fingerprint/equivalent? (:primal projected) (:primal bundle))
+                   (fingerprint/equivalent? (:primal projected) (:primal scalar))
                    (fingerprint/equivalent? (select-keys (:interface projected) [:params :tags :active-inputs])
-                                            (select-keys bundle [:params :tags :active-inputs])))
+                                            (select-keys scalar [:params :tags :active-inputs])))
       (fail! :ad-normalized-gather-interface {:interface interface}))
     (doseq [p (map gather-programs [:primal :linear :transpose])] (soac/validate! p))
-    (when-not (fingerprint/equivalent? gather-programs (lift-gather-programs bundle source interface))
+    (when-not (fingerprint/equivalent? (dissoc gather-programs :proof)
+                                       (lift-gather-programs scalar source interface))
       (fail! :ad-normalized-gather-programs {:interface interface})))
+  bundle)
+
+(defn validate-indexed-proof!
+  [{:keys [source-ns] :as bundle}]
+  (when-not (and (= #{:source-ns :template-revision :compiler-revision
+                      :gather-programs :certificate}
+                    (set (keys bundle)))
+                 (instance? clojure.lang.Namespace source-ns))
+    (fail! :ad-normalized-gather-proof {:source-ns source-ns}))
+  (when-not (= (revisions) (select-keys bundle [:template-revision :compiler-revision]))
+    (fail! :ad-normalized-stale-rules
+           {:expected (select-keys bundle [:template-revision :compiler-revision])
+            :actual (revisions)}))
+  (let [scalar (indexed-scalar-proof! bundle)]
+    (binding [*ns* source-ns
+              *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
+      (validate-scalar-proof! scalar)
+      (validate-gather-programs! bundle scalar)
+      (when-not (= (:certificate bundle) (certificate bundle))
+        (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
+      (check-dependencies! *proof-dependencies* source-ns)))
   bundle)
 
 (defn linearize-indexed-map-program
@@ -2040,7 +2101,7 @@
   (let [revision (revisions)
         output (gensym "indexed_element_output_")
         {:keys [primal interface]} (project-indexed-element source source-ns output)
-        bundle (build-bundle primal interface revision)
+        scalar (build-bundle primal interface revision)
         equation (first (soac/equations source))
         source-parts (soac/operation-parts equation)
         used (into (set (keys (:values (soac/facts source))))
@@ -2051,7 +2112,10 @@
         interface (into {} (map (fn [key] [key (fresh key)]))
                         [:index-snapshot :tangent-input :tangent-output :cotangent-input
                          :zero-gradient :gradient-output])
-        bundle (assoc bundle :gather-programs (lift-gather-programs bundle source interface))]
+        gather-programs (assoc (lift-gather-programs scalar source interface)
+                               :proof {:authority :normalized-scalar
+                                       :scalar-derivation scalar})
+        bundle (merge revision {:source-ns source-ns :gather-programs gather-programs})]
     (validate! (assoc bundle :certificate (certificate bundle)))))
 
 (defn- sum-source-map

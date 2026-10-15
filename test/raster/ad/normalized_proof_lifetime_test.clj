@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.normalized-map-element-test :as element]
             [raster.ad.normalized-map-sum-test :as map-sum]
+            [raster.ad.normalized-indexed-map-test :as indexed]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-prepared-owner-test :as owner]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -73,6 +74,26 @@
                           ;; derivative-only multiplication. Mutate only after sum replay.
                           (alter-var-root v (constantly (fn [& _] 99.0)))
                           result))}
+        #(is (= :ad-normalized-execution-callee
+                (reason (fn [] (normalized/validate! bundle))))))
+      (is (= revision (normalized/revisions)))
+      (finally (alter-var-root v (constantly original)) (reset-meta! v original-meta)))))
+
+(deftest indexed-scalar-and-gather-proof-share-one-dependency-fence
+  (let [bundle (normalized/linearize-indexed-map-program
+                (#'indexed/indexed-map :double :long 'n 'm)
+                (the-ns 'raster.ad.normalized-proof-lifetime-test))
+        revision (normalized/revisions)
+        v #'n/+ original @v original-meta (meta v)
+        validate-gather #'normalized/validate-gather-programs! check-gather @validate-gather]
+    (try
+      (with-redefs-fn
+        {validate-gather (fn [b scalar]
+                           (let [result (check-gather b scalar)]
+                             ;; Indexed correspondence has observed the generated ordered
+                             ;; scatter addition; mutate it before the one outer fence.
+                             (alter-var-root v (constantly (fn [& _] 99.0)))
+                             result))}
         #(is (= :ad-normalized-execution-callee
                 (reason (fn [] (normalized/validate! bundle))))))
       (is (= revision (normalized/revisions)))
