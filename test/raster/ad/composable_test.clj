@@ -118,6 +118,22 @@
 (r/deftm discrete-only-value [flag :- Boolean count :- Long] :- Long
   (if flag count (unchecked-inc count)))
 
+(def array-result-effects (atom 0))
+
+(r/deftm double-array-identity [x :- (Array double)] :- (Array double)
+  x)
+
+(r/deftm float-array-alias [x :- (Array float)] :- (Array float)
+  (let [alias x] alias))
+
+(r/deftm effectful-double-array-identity
+  [x :- (Array double)] :- (Array double)
+  (do (swap! array-result-effects inc) x))
+
+(r/deftm mixed-scalar-array-result
+  [x :- Double xs :- (Array double) array-result? :- Boolean] :- Object
+  (if array-result? xs x))
+
 (r/deftm quadratic-with-array-control [x :- Double values :- (Array double)] :- Double
   (raster.numeric/* x x))
 
@@ -134,15 +150,80 @@
   (doseq [mode [:forward :auto]]
     (let [unused (rev/value+grad #'quadratic-with-unused-control :mode mode)
           flagged (rev/value+grad #'flagged-quadratic :mode mode)
-          scaled (rev/value+grad #'integer-scaled-quadratic :mode mode)
-          discrete (rev/value+grad #'discrete-only-value :mode mode)]
+          scaled (rev/value+grad #'integer-scaled-quadratic :mode mode)]
       (doseq [x [3.0 -2.0] flag [true false]]
         (is (= [(* x x) (* 2.0 x) nil nil] (unused x flag Long/MAX_VALUE)))
         (is (= (if flag [(* x x) (* 2.0 x) nil] [(+ x x) 2.0 nil])
                (flagged x flag)))
-        (is (= [(* 3.0 x x) (* 6.0 x) nil] (scaled x 3))))
-      (is (= [Long/MAX_VALUE nil nil] (discrete true Long/MAX_VALUE)))
-      (is (= [9007199254740994 nil nil] (discrete false 9007199254740993))))))
+        (is (= [(* 3.0 x x) (* 6.0 x) nil] (scaled x 3)))))
+    (is (= :ad-nonscalar-loss-result
+           (:reason (try (rev/value+grad #'discrete-only-value :mode mode) nil
+                         (catch clojure.lang.ExceptionInfo e (ex-data e)))))
+        "A proven integral result has no scalar cotangent seed")))
+
+(deftest explicit-vjp-retains-discrete-result-precision
+  (doseq [[flag count expected]
+          [[true Long/MAX_VALUE Long/MAX_VALUE]
+           [false 9007199254740993 9007199254740994]]]
+    (let [[value pullback] (rev/vjp #'discrete-only-value flag count)]
+      (is (= expected value)
+          "general VJP preserves the exact Long primal beyond Double precision")
+      (is (= [nil nil] (pullback nil))
+          "an explicit NoCotangent seed returns positional nil adjoints"))))
+
+(deftest scalar-loss-result-admission-test
+  (testing "known array results refuse every scalar-unit-seeded public constructor"
+    (reset! array-result-effects 0)
+    (doseq [construct [(fn [] (rev/value+grad #'effectful-double-array-identity))
+                       (fn [] (rev/value+grad #'effectful-double-array-identity
+                                              :mode :forward))
+                       (fn [] (rev/value+grad #'effectful-double-array-identity
+                                              :mode :auto))
+                       (fn [] (rev/grad #'effectful-double-array-identity))
+                       (fn [] (rev/reified-grad #'effectful-double-array-identity 'x))
+                       (fn [] (rev/compile-hvp-fn #'effectful-double-array-identity))
+                       (fn [] ((requiring-resolve 'raster.ad.jvp/hvp)
+                               #'effectful-double-array-identity))]]
+      (let [failure (try (construct) nil
+                         (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= :ad-nonscalar-loss-result (:reason failure)))
+        (is (some #(= 'doubles (:tag %)) (:declined-evidence failure)))))
+    (is (zero? @array-result-effects)
+        "result admission inspects retained evidence without invoking the primal"))
+  (testing "Float array aliases are classified through retained let evidence"
+    (let [failure (try (rev/value+grad #'float-array-alias) nil
+                       (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= :ad-nonscalar-loss-result (:reason failure)))
+      (is (= ['floats] (:actual-result-tags failure)))))
+  (testing "one known array alternative refuses even with a selected scalar parameter"
+    (let [failure (try (rev/value+grad #'mixed-scalar-array-result :wrt [0]) nil
+                       (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= :ad-nonscalar-loss-result (:reason failure)))
+      (is (= #{'double 'doubles} (set (:actual-result-tags failure))))))
+  (testing "unknown loop result evidence remains compatible and is not scalar proof"
+    (let [v (rev/resolve-deftm-var #'forward-carried-rounded-primal)
+          m (meta v)
+          body (r/ensure-walked-body! v)
+          params (:raster.core/deftm-params m)
+          tags (:raster.core/deftm-tags m)
+          contract (rev/assert-scalar-loss-result-admissible!
+                    v v body params tags)]
+      (is (= [nil] (:actual-result-tags contract)))
+      (is (= [16777216.0 1.0]
+             ((rev/value+grad #'forward-carried-rounded-primal)
+              16777217.0)))))
+  (testing "ordinary array JVP and explicit-cotangent VJP remain lawful"
+    (let [x (double-array [1.0 -2.0])
+          dx (double-array [0.25 0.5])
+          directional ((requiring-resolve 'raster.ad.jvp/jvp)
+                       #'double-array-identity)
+          [primal tangent] (directional x dx)
+          [v pullback] (rev/vjp #'double-array-identity x)
+          [gradient] (pullback dx)]
+      (is (= (vec x) (vec primal)))
+      (is (= (vec dx) (vec tangent)))
+      (is (= (vec x) (vec v)))
+      (is (= (vec dx) (vec gradient))))))
 
 ;; Function with nested let in call args (tests let-hoisting)
 (r/deftm nested-let-fn [x :- Double, y :- Double] :- Double

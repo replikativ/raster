@@ -40,6 +40,12 @@ parameter: use explicit exclusion. Internal generated locals and legacy scalar-l
 fallbacks are not newly admitted or made more precise by this change. Proving inactivity
 and preserving types throughout those internal programs belongs to the structural work.
 
+Scalar-unit-seeded APIs also reject positively known array or primitive NoTangent result
+evidence. General JVP and VJP with an explicit output-shaped cotangent remain available
+for array results. This is a one-way safety check, not a full result-type proof: unknown
+loop results retain the legacy scalar-loss assumption until fixed-point/type evidence is
+retained. Declared return metadata never overrides the actual Float/Double seed checkpoint.
+
 External AD is an explicitly opaque block with independently declared push/pull,
 batching and higher-order capabilities. A VJP-only block does not support JVP or HVP
 merely because its pullback is callable. Its residual must retain the exact primal and

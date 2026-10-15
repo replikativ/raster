@@ -700,6 +700,8 @@
         walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
+        _ (rev/assert-scalar-loss-result-admissible!
+           f-var resolved walked-body params tags)
         all-params (vec (map-indexed
                          (fn [i p]
                            (let [tag (nth tags i nil)
