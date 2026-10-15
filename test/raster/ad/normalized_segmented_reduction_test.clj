@@ -108,6 +108,60 @@
 (def ^:private w0 [0.25 -1.0 2.0 0.75 3.0 -0.5 1.5 -2.0 -1.25 4.0 0.125 2.5])
 (def ^:private dy0 [0.5 -1.5 2.0 0.25 -2.5 0.75 1.25 -0.125])
 
+(deftest retained-segmented-node-ports-keep-independent-operand-and-result-spaces
+  (doseq [dt [:float :double] active '[A W]]
+    (let [program (source dt 2 3 4 '[W A])
+          checked (evidence program active)
+          node (get-in checked [:map-programs :proof :nodes 0])
+          description (#'normalized/segmented-description program {:active-input active})
+          reject-allocation (fn [& _] (throw (ex-info "checked port replay allocated an identity" {})))
+          built (with-redefs-fn {#'normalized/allocate-map-stage-interface reject-allocation
+                                #'normalized/allocate-segmented-interface reject-allocation
+                                #'normalized/node-equation-ids reject-allocation
+                                #'normalized/linearize-program reject-allocation}
+                  #(#'normalized/segmented-node-lifecycle description (:source-ns checked) nil node))
+          ports (:ports built) stage (:stage built)
+          selected (first (:active ports))
+          passive (if (= active 'A) 'W 'A)
+          active-value (get-in (soac/facts program) [:values active])
+          passive-value (get-in (soac/facts program) [:values passive])
+          scalar (:scalar-derivation node)
+          coefficient (first (:residuals scalar))
+          snapshot (get-in ports [:residual-arrays coefficient])
+          ids (:equation-ids node)
+          [primal-copy] (rest (soac/equations (:primal stage)))]
+      (is (= node (dissoc built :result :active? :ports :stage)))
+      (is (= [8] (get-in ports [:result :value :shape])
+                 (get-in ports [:tangent-result :value :shape])
+                 (get-in ports [:cotangent-input :value :shape])))
+      (is (= (if (= active 'A) [6] [12]) (:shape active-value)))
+      (is (= active (:source selected) (get-in selected [:tangent :source])
+                    (get-in selected [:gradient :source])))
+      (is (= active-value (:source-value selected)))
+      (is (fingerprint/equivalent? (second (:active-inputs scalar)) (:scalar-source selected)))
+      (is (= (assoc active-value :ownership :borrowed) (get-in selected [:tangent :value])))
+      (is (= (assoc active-value :ownership :owned) (get-in selected [:gradient :value])))
+      (is (= dt (get-in selected [:tangent :value :dtype]) (get-in selected [:gradient :value :dtype])))
+      (is (= (if (= active 'A) [12] [6]) (get-in snapshot [:value :shape])))
+      (is (= (assoc passive-value :ownership :owned) (:value snapshot)))
+      (is (fingerprint/equivalent? coefficient (:coefficient snapshot)))
+      (is (= [passive] (:arrays (soac/operation-parts primal-copy))))
+      (is (= [(:id snapshot)] (nth primal-copy 2)))
+      (is (= {} (:scalar-captures ports)))
+      (doseq [phase [:linear :transpose]]
+        (let [program (get stage phase)
+              ;; Fault only submitted correspondence metadata: the checker must
+              ;; retain the passive operand's space, never borrow result extent 8.
+              facts (assoc-in (soac/facts program) [:values (:id snapshot) :shape] [8])
+              changed (apply list (assoc (vec program) 1 facts))]
+          (is (= :ad-normalized-segmented-interface
+                 (reason #(#'normalized/checked-segmented-node-ports
+                            description scalar (:stage-interface node) (assoc stage phase changed)))))))
+      (is (= [(:primal ids) (symbol (str (name (:primal ids)) "__passive_snapshot"))]
+             (mapv second (soac/equations (:primal stage)))))
+      (doseq [phase [:linear :transpose]]
+        (is (= [(get ids phase)] (mapv second (soac/equations (get stage phase)))))))))
+
 (deftest nonsquare-double-products-have-independent-jvp-vjp-and-finite-differences
   (doseq [active '[A W] inputs ['[A W] '[W A]]]
     (testing (str active " with public order " inputs)

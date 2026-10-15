@@ -692,7 +692,7 @@
 
 (declare validate! validate-map-proof! validate-indexed-proof!
          validate-sum-programs! sum-source-map
-         segmented-description project-segmented-fold construct-segmented-stage)
+         segmented-description project-segmented-fold segmented-node-lifecycle)
 
 (defn- validate-scalar-correspondence!
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
@@ -1925,7 +1925,7 @@
                :proof (assoc proof :nodes [node]))))))
 
 (defn- reconstructed-segmented-proof
-  [{:keys [map-programs source-ns] :as bundle}]
+  [{:keys [map-programs source-ns]}]
   (let [{:keys [source interface proof]} map-programs
         nodes (:nodes proof)
         [node] nodes
@@ -1943,22 +1943,14 @@
                    (identical? source-ns (get-in node [:scalar-derivation :source-ns])))
       (fail! :ad-normalized-segmented-proof {:proof proof}))
     (let [description (segmented-description source {:active-input active})
-          _ (when-not (= (:equation-id description) (:execution-equation node))
-              (fail! :ad-normalized-segmented-proof {:node node}))
-          project (fn [output]
-                    (project-segmented-fold description source-ns output))
-          projected (checked-scalar-proof-replay!
-                     source-ns (:scalar-derivation node) project
-                     {:proof-reason :ad-normalized-segmented-proof
-                      :namespace-reason :ad-normalized-segmented-proof
-                      :correspondence-reason :ad-normalized-segmented-proof
-                      :data {:equation (:equation-id description)}})
-          description (merge description
-                             (select-keys projected
-                                          [:active-formal :passive-formal :accumulator]))
-          expected (construct-segmented-stage description (:scalar-derivation node)
-                                              interface (:equation-ids node))]
-      expected)))
+          built (segmented-node-lifecycle description source-ns nil node)]
+      ;; Replay scalar/source correspondence before linking the outer interface, preserving
+      ;; the established proof diagnostic for forged activity while still checking the exact
+      ;; envelope-to-node association before accepting the reconstructed stage.
+      (when-not (fingerprint/equivalent? interface (:stage-interface node))
+        (fail! :ad-normalized-segmented-interface
+               {:interface interface :node-interface (:stage-interface node)}))
+      (assoc (:stage built) :proof proof))))
 
 (defn- reconstructed-map-proof [bundle]
   (let [source (get-in bundle [:map-programs :source])
@@ -2308,6 +2300,58 @@
              {:selected selected :passive excluded :result result-map}))
     {:selected-map selected :passive-map excluded :fiber (first fiber)}))
 
+(defn- checked-segmented-node-ports
+  "Project one segmented node's fixed identities onto its independently checked source geometry.
+   Optional stage facts are correspondence evidence and never supply missing metadata."
+  [description scalar interface stage]
+  (let [{:keys [source active passive result]} description
+        source-values (:values (soac/facts source))
+        coefficient (first (:residuals scalar))
+        {:keys [active-inputs residual-arrays scalar-captures tangent-inputs cotangent-input
+                tangent-output gradient-outputs]} interface
+        active-value (get source-values active)
+        passive-value (get source-values passive)
+        result-value (get source-values result)
+        tangent (first tangent-inputs)
+        gradient (first gradient-outputs)
+        snapshot (get residual-arrays coefficient)
+        ports
+        {:result {:id result :source result :value result-value}
+         :active [{:source active :source-value active-value
+                   :scalar-source (second (:active-inputs scalar))
+                   :tangent {:id tangent :source active
+                             :value (assoc active-value :ownership :borrowed)}
+                   :gradient {:id gradient :source active
+                              :value (assoc active-value :ownership :owned)}}]
+         :residual-arrays
+         {coefficient {:id snapshot :coefficient coefficient
+                       :value (assoc passive-value :ownership :owned)}}
+         :scalar-captures {}
+         :tangent-result {:id tangent-output :source result
+                          :value (assoc result-value :ownership :owned)}
+         :cotangent-input {:id cotangent-input :source result
+                           :value (assoc result-value :ownership :borrowed)}}
+        expected [[:primal (:result ports)]
+                  [:primal (get-in ports [:residual-arrays coefficient])]
+                  [:linear (get-in ports [:active 0 :tangent])]
+                  [:linear (get-in ports [:residual-arrays coefficient])]
+                  [:linear (:tangent-result ports)]
+                  [:transpose (:cotangent-input ports)]
+                  [:transpose (get-in ports [:residual-arrays coefficient])]
+                  [:transpose (get-in ports [:active 0 :gradient])]]]
+    (when-not (and (= [active] active-inputs)
+                   (= {} scalar-captures)
+                   (= 1 (count tangent-inputs) (count gradient-outputs))
+                   (= #{coefficient} (set (keys residual-arrays))))
+      (fail! :ad-normalized-segmented-interface {:interface interface}))
+    (doseq [[phase {:keys [id value]}] expected]
+      (when-not (fingerprint/equivalent?
+                 value (get-in (soac/facts (get stage phase)) [:values id]))
+        (fail! :ad-normalized-segmented-interface
+               {:phase phase :port id :expected value
+                :actual (get-in (soac/facts (get stage phase)) [:values id])})))
+    ports))
+
 (defn- construct-segmented-stage
   [description scalar interface equation-ids]
   (let [{:keys [source equation attributes active passive result dtype reduction
@@ -2423,27 +2467,56 @@
         transpose (phase-program transpose-values [cotangent-input snapshot]
                                  [transpose-equation] [gradient])]
     {:source source :primal primal :linear linear :transpose transpose
-     :interface interface
-     :proof {:authority :normalized-scalar
-             :nodes [{:source-equations [(:equation-id description)]
-                      :execution-equation (:equation-id description)
-                      :scalar-derivation scalar
-                      :stage-interface interface
-                      :equation-ids equation-ids}]}}))
+     :interface interface}))
+
+(defn- segmented-node-lifecycle
+  "Allocate or replay one checked segmented node while retaining operation-specific fold proof."
+  [description source-ns equation-ids submitted]
+  (let [equation-id (:equation-id description)
+        _ (when (and submitted (not= equation-id (:execution-equation submitted)))
+            (fail! :ad-normalized-segmented-proof {:node submitted}))
+        project #(project-segmented-fold description source-ns %)
+        submitted-scalar (when submitted (:scalar-derivation submitted))
+        projected (if submitted
+                    (checked-scalar-proof-replay!
+                     source-ns submitted-scalar project
+                     {:proof-reason :ad-normalized-segmented-proof
+                      :namespace-reason :ad-normalized-segmented-proof
+                      :correspondence-reason :ad-normalized-segmented-proof
+                      :data {:equation equation-id}})
+                    (project nil))
+        scalar (or submitted-scalar
+                   (linearize-program (:primal projected) (:interface projected)))
+        description (merge description
+                           (select-keys projected
+                                        [:active-formal :passive-formal :accumulator]))
+        interface (if submitted (:stage-interface submitted)
+                      (allocate-segmented-interface description scalar))
+        equation-ids (if submitted (:equation-ids submitted) equation-ids)
+        _ (when-not (and (= #{:primal :linear :transpose} (set (keys equation-ids)))
+                         (every? symbol? (vals equation-ids)))
+            (fail! :ad-normalized-segmented-interface {:equation-ids equation-ids}))
+        stage (construct-segmented-stage description scalar interface equation-ids)
+        ports (checked-segmented-node-ports description scalar interface stage)
+        witness (or submitted
+                    {:source-equations [equation-id]
+                     :execution-equation equation-id
+                     :scalar-derivation scalar
+                     :stage-interface interface
+                     :equation-ids equation-ids})]
+    (assoc witness :result (:result description) :active? true :ports ports :stage stage)))
 
 (defn- build-segmented-programs [source source-ns options]
   (let [description (segmented-description source options)
-        projected (project-segmented-fold description source-ns nil)
-        scalar (linearize-program (:primal projected) (:interface projected))
-        description (merge description (select-keys projected
-                                                     [:active-formal :passive-formal :accumulator]))
         equation-ids {:primal 'ad-map-primal :linear 'ad-map-linear
                       :transpose 'ad-map-transpose}
-        interface (allocate-segmented-interface description scalar)]
+        built (segmented-node-lifecycle description source-ns equation-ids nil)
+        node (dissoc built :result :active? :ports :stage)]
     {:source-ns source-ns
      :template-revision (templates/registry-revision)
      :compiler-revision (dispatch/compiler-definition-revision)
-     :map-programs (construct-segmented-stage description scalar interface equation-ids)}))
+     :map-programs (assoc (:stage built)
+                          :proof {:authority :normalized-scalar :nodes [node]})}))
 
 (defn- build-map-programs
   [source source-ns options]
