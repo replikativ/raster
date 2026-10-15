@@ -633,6 +633,8 @@
                                    operator nil inputs (set physical-results) scalars nil
                                    (if contraction? :contraction :segmented)
                                    nil output-dtype)
+                      (contains? attributes :result-map)
+                      (assoc :result-map (:result-map attributes))
                       contraction?
                       (assoc :source-arithmetic (get attributes :source-arithmetic
                                                    numerics/retained-source-arithmetic))))}))))

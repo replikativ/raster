@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.typed-segmented-reduction-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.reduction :as reduction]
@@ -10,6 +11,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-pass]
             [raster.compiler.passes.parallel.soac-lower :as lower]
+            [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.util :as util]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]))
@@ -46,6 +48,106 @@
                :equations {'contract-equation (dialect/default-equation-facts
                                                 {:source :test})})]
     (dialect/make facts [equation] '[C])))
+
+(defn- with-result-map [source result-map]
+  (let [[equation] (dialect/equations source)
+        operation (nth equation 3)
+        attributes (assoc (second operation) :result-map result-map)
+        operation (apply list (assoc (vec operation) 1 attributes))
+        equation (apply list (assoc (vec equation) 3 operation))
+        result-shape (axis-map/shape result-map)
+        facts (assoc-in (dialect/facts source) [:values 'C :shape] result-shape)]
+    (dialect/make facts [equation] '[C])))
+
+(defn- reason [f]
+  (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest segmented-result-map-is-an-explicit-regrouping-witness
+  (let [result-map {:groups '[[[i m] [j n]]]}
+        source (with-result-map (program) result-map)
+        attributes (:attributes (dialect/operation-parts
+                                 (first (dialect/equations source))))
+        projected (:operation (lower/project-typed-segmented-reduce source))]
+    (is (= result-map (:result-map attributes)))
+    (is (= result-map (:result-map projected)))
+    (is (= '[(clojure.core/* m n)]
+           (dialect/segmented-reduce-result-shape attributes)))
+    (is (= '(clojure.core/+ (clojure.core/* i n) j)
+           (dialect/segmented-reduce-result-index attributes)))
+    (is (= result-map
+           (:result-map (:operation
+                         (lower/project-typed-segmented-reduce source)))))
+    (let [rank-three (assoc attributes
+                            :segment-axes '[[i 2] [j 3] [k 4]]
+                            :result-map {:groups '[[[i 2]] [[j 3] [k 4]]]})]
+      (is (= [2 12] (dialect/segmented-reduce-result-shape rank-three)))
+      (is (= '(clojure.core/+ (clojure.core/* i 12)
+                              (clojure.core/* j 4) k)
+             (dialect/segmented-reduce-result-index rank-three))))))
+
+(deftest segmented-result-map-is-part-of-the-scheduled-semantic-certificate
+  (let [result-map {:groups '[[[i m] [j n]]]}
+        grouped (with-result-map (program) result-map)
+        [equation] (dialect/equations grouped)
+        operation-form (nth equation 3)
+        attributes (assoc-in (second operation-form) [:attributes :source-operation]
+                             :raster.par/contract)
+        operation-form (apply list (assoc (vec operation-form) 1 attributes))
+        equation (apply list (assoc (vec equation) 3 operation-form))
+        source (dialect/make (dialect/facts grouped) [equation] (dialect/outputs grouped))
+        operation (first (lower/lower-typed-segmented-reduce source :ze:0 :dtype :float))]
+    (is (some? (:schedule operation)))
+    (is (= source (:program (contraction-context/validate-semantic! source operation))))
+    (doseq [tampered [(dissoc operation :result-map)
+                      (assoc operation :result-map {:groups '[[[i m]] [[j n]]]})]]
+      (is (= :typed-contraction-semantic-operation
+             (reason #(contraction-context/validate-semantic! source tampered)))))))
+
+(deftest segmented-result-map-refuses-non-regrouping-layouts
+  (let [attributes (:attributes (dialect/operation-parts
+                                 (first (dialect/equations (program)))))
+        rejected [{:groups '[[[j n] [i m]]]}
+                  {:groups '[[[i m] [i m] [j n]]]}
+                  {:groups '[[[i m]]]}
+                  {:groups '[[[i m]] [] [[j n]]]}
+                  {:groups '[[[i m] [j (+ n 1)]]]}
+                  {:groups '[[[i m] [j n]]] :padding 1}]]
+    (doseq [result-map rejected]
+      (is (= :typed-soac-segmented-reduce-result-map
+             (reason #(dialect/segmented-reduce-result-map
+                       (assoc attributes :result-map result-map))))))
+    (is (= [] (dialect/segmented-reduce-result-shape {:segment-axes []})))
+    (is (= :typed-soac-segmented-reduce-result-map
+           (reason #(dialect/segmented-reduce-result-shape
+                     {:segment-axes [] :result-map {:groups [[]]}}))))
+    (let [product-attributes
+          {:segment-axes '[[i 2]] :index 'l :extent 3 :attributes {}
+           :component-ids [:sum] :result-components [0]
+           :accumulators '[acc] :identities [0.0] :dtypes [:double]
+           :algebra {:associative? true}
+           :result-map {:groups '[[[i 2]]]}}
+          fold-map-attributes
+          {:segment-axes '[[i 2]] :index 'l :extent 3 :attributes {}
+           :association :ordered :dtypes [:double]
+           :result-map {:groups '[[[i 2]]]}}]
+      (is (true? (dialect/product-reduce-attributes?
+                  (dissoc product-attributes :result-map))))
+      (is (false? (dialect/product-reduce-attributes? product-attributes)))
+      (is (true? (dialect/segmented-fold-map-attributes?
+                  (dissoc fold-map-attributes :result-map))))
+      (is (false? (dialect/segmented-fold-map-attributes? fold-map-attributes))))))
+
+(deftest segmented-result-map-remaps-only-extent-identities
+  (let [source (with-result-map (program) {:groups '[[[i m] [j n]]]})
+        remapped (dialect/remap-values source {'i 'renamed-value
+                                               'm [:extent :m]
+                                               'n [:extent :n]})
+        attributes (:attributes (dialect/operation-parts
+                                 (first (dialect/equations remapped))))]
+    (is (= '[[i [:extent :m]] [j [:extent :n]]]
+           (:segment-axes attributes)))
+    (is (= {:groups '[[[i [:extent :m]] [j [:extent :n]]]]}
+           (:result-map attributes)))))
 
 (deftest segmented-semantic-projection-is-device-free-and-exact
   (let [source (program)
@@ -91,6 +193,16 @@
     (is (= 0 (:vertical stats)))
     (is (= 0 (:horizontal stats)))))
 
+(deftest generic-fusion-does-not-drop-an-explicit-result-layout
+  (let [source (with-result-map (program) {:groups '[[[i m] [j n]]]})
+        [result stats] (fusion/fusion-fixpoint source)]
+    (is (= source result))
+    (is (= {:groups '[[[i m] [j n]]]}
+           (get-in (dialect/operation-parts (first (dialect/equations result)))
+                   [:attributes :result-map])))
+    (is (= 0 (:vertical stats)))
+    (is (= 0 (:horizontal stats)))))
+
 (deftest segmented-reduction-lowers-directly-to-canonical-segred
   (with-redefs [legacy/->SoacContract
                 (fn [& _]
@@ -126,7 +238,8 @@
     (is (= [[:binding 'C]] (dialect/outputs remapped)))))
 
 (deftest typed-parallel-program-schedules-the-equation-without-compatibility-relowering
-  (let [algorithm (program)
+  (let [result-map {:groups '[[[i m] [j n]]]}
+        algorithm (with-result-map (program) result-map)
         values (:values (dialect/facts algorithm))
         source '(raster.par/contract C [[i m] [j n]] [[l k]] body)
         equation
@@ -150,5 +263,6 @@
     (is (= 1 (get-in lowered [:stats :typed-soac-reused])))
     (is (= 1 (get-in lowered [:stats :segops-lowered])))
     (is (instance? raster.compiler.ir.segop.SegRed operation))
+    (is (= result-map (:result-map operation)))
     (is (= :typed-soac (get-in scheduled-equation [:provenance :source-dialect])))
     (is (empty? (:diagnostics (:form lowered))))))

@@ -5112,7 +5112,7 @@
 
 (defn- segmented-reduce-equation
   [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results
-           result-transform output-dtype source-arithmetic]}]
+           result-map result-transform output-dtype source-arithmetic] :as description}]
   (let [component (first (:components product))
         expressions (:results (reduction/fold-region product))
         arrays (if (empty? segment-axes)
@@ -5132,17 +5132,19 @@
                  (:dtype component))]
     (list '= id results
           (list 'segmented-reduce
-                {:segment-axes segment-axes
-                 :index reduce-index :extent reduce-extent
-                 :attributes {:stable-array-captures stable
-                              :source-operation :raster.par/contract}
-                 :accumulators [(:accumulator component)]
-                 :identities [(:neutral component)]
-                 :dtypes [(:dtype component)]
-                 :result-storage-dtype output-dtype
-                 :source-arithmetic (or source-arithmetic numerics/retained-source-arithmetic)
-                 :algebra [algebra]
-                 :result-transform result-transform}
+                (cond-> {:segment-axes segment-axes
+                         :index reduce-index :extent reduce-extent
+                         :attributes {:stable-array-captures stable
+                                      :source-operation :raster.par/contract}
+                         :accumulators [(:accumulator component)]
+                         :identities [(:neutral component)]
+                         :dtypes [(:dtype component)]
+                         :result-storage-dtype output-dtype
+                         :source-arithmetic (or source-arithmetic
+                                                numerics/retained-source-arithmetic)
+                         :algebra [algebra]
+                         :result-transform result-transform}
+                  (contains? description :result-map) (assoc :result-map result-map))
                 arrays captures
                 (dialect/lambda-form
                  (vec (concat [(:accumulator component)] elements capture-parameters))

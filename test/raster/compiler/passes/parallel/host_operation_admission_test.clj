@@ -138,6 +138,17 @@
                  :equations {'dense-product equation-facts}})]
      (soac/make facts [equation] '[C]))))
 
+(defn- regrouped-segmented-program [dt]
+  (let [source (segmented-program dt)
+        [equation] (soac/equations source)
+        operation (nth equation 3)
+        attributes (assoc (second operation)
+                          :result-map {:groups '[[[i 2] [j 3]]]})
+        operation (apply list (assoc (vec operation) 1 attributes))
+        equation (apply list (assoc (vec equation) 3 operation))
+        facts (assoc-in (soac/facts source) [:values 'C :shape] [6])]
+    (soac/make facts [equation] '[C])))
+
 (defn- segmented-snapshot-program
   ([dt] (segmented-snapshot-program dt 'B '[A B]))
   ([dt copied inputs]
@@ -429,6 +440,32 @@
     (is (= arithmetic
            (get-in (soac/operation-parts (first (soac/equations program)))
                    [:attributes :source-arithmetic])))))
+
+(deftest fresh-segmented-reduction-consumes-a-regrouped-result-layout
+  (doseq [dt [:float :double]]
+    (let [canonical (segmented-program dt)
+          regrouped (regrouped-segmented-program dt)
+          array (if (= :float dt) float-array double-array)
+          bits (if (= :float dt) fbits dbits)
+          a (array [0.1 -0.3 1025.0 0.0009765625])
+          b (array [0.1 -0.3 1025.0 0.0009765625 -7.0 11.0])
+          a-before (bits a)
+          b-before (bits b)
+          [expected] (run-host canonical [a b])
+          [actual] (run-host regrouped [a b])
+          [again] (run-host regrouped [a b])]
+      (is (= (bits expected) (bits actual) (bits again)))
+      (is (= a-before (bits a)))
+      (is (= b-before (bits b)))
+      (is (not (identical? actual again)))
+      (is (= 6 (java.lang.reflect.Array/getLength actual)))))
+  (let [source (segmented-program :float)
+        regrouped (regrouped-segmented-program :float)]
+    (is (nil? (get-in (soac/operation-parts (first (soac/equations source)))
+                      [:attributes :result-map])))
+    (is (= {:groups '[[[i 2] [j 3]]]}
+           (get-in (soac/operation-parts (first (soac/equations regrouped)))
+                   [:attributes :result-map])))))
 
 (deftest map-graph-validates-the-original-through-public-and-batch-boundaries
   (let [program (diamond-graph :float 'n)
