@@ -74,12 +74,13 @@
   :- (Array double)
   (let [n (* batch dim)
         out (double-array n)]
-    (dotimes [b batch]
-      (dotimes [d dim]
-        (let [idx (+ (* b (int dim)) d)]
-          (aset out idx
-                (+ (aget h idx)
-                   (aget t d))))))
+    (par/map! out idx n nil
+              ;; A nonpositive dimension never enters the original nested loops.
+              ;; Retain its zero-filled result even when two negative extents
+              ;; multiply to a positive allocation; guard the remainder too.
+              (if (> dim 0)
+                (+ (aget h idx) (aget t (rem idx dim)))
+                0.0))
     out))
 
 (deftm broadcast-add-dh

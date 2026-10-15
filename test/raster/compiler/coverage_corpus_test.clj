@@ -35,10 +35,14 @@
                 (println "  coverage regression:" (pr-str v))))))
       (testing "the corpus compiled for a real device"
         (is (pos? (:total (:summary report)))))
-      (testing "migrated graph and strided-norm workloads remain entirely KernelBody-emitted"
+      (testing "migrated array, graph and strided-norm workloads remain entirely KernelBody-emitted"
         (let [rows (into {} (map (juxt :var identity)) (:vars report))]
           (doseq [[workload expected-kernels]
-                  {'raster.dl.array-ops/masked-mse-loss-into! 2
+                  {;; broadcast-add intentionally refines an independent effect-map into a
+                   ;; functional map. Its baseline no longer pins a source store, but its
+                   ;; single checked KernelBody must not disappear into compatibility code.
+                   'raster.dl.array-ops/broadcast-add 1
+                   'raster.dl.array-ops/masked-mse-loss-into! 2
                    'raster.dl.array-ops/masked-mse-loss-backward 2
                    'raster.dl.loss/cross-entropy-loss-into! 4
                    'raster.dl.loss/cross-entropy-loss-backward 3
@@ -137,7 +141,13 @@
             (first (coverage/ratchet-violations
                     {:vars [(assoc row :effect-orders {:independent 1})]}
                     (report {:sequential 1})))))
-        "an established independent effect remains a protected performance fact")))
+        "an established independent effect remains a protected performance fact")
+    (is (= :effect-map-serialized
+           (:violation
+            (first (coverage/ratchet-violations
+                    {:vars [(assoc row :effect-orders {:independent 1})]}
+                    (report nil)))))
+        "an unrelated established effect still cannot disappear from its report")))
 
 (deftest host-only-is-honest-without-erasing-established-device-coverage
   (let [host-row {:var 'orchestrator :route :host-only :host-contract :explicit}
