@@ -4,11 +4,25 @@
             [raster.ad.normalized-scalar-public-test :as public]
             [raster.ad.reverse :as reverse]
             [raster.ad.jvp :as jvp]
+            [raster.ad.templates :as templates]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.numeric :as n]))
+
+(deftest revision-snapshots-follow-semantic-dependency-initialization
+  (let [calls (atom [])
+        initialized? (atom false)]
+    (with-redefs [effects/init-raster-context!
+                  (fn [] (swap! calls conj :initialize) (reset! initialized? true))
+                  templates/registry-revision
+                  (fn [] (is @initialized?) (swap! calls conj :templates) 42)
+                  dispatch/compiler-definition-revision
+                  (fn [] (is @initialized?) (swap! calls conj :compiler) 73)]
+      (is (= {:template-revision 42 :compiler-revision 73} (normalized/revisions)))
+      (is (= [:initialize :templates :compiler] @calls)))))
 
 (def ^:dynamic receiver nil)
 (defn- reason [f]
