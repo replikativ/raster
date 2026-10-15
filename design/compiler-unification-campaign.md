@@ -28,6 +28,11 @@ until the shared structural boundary is established.
    fusion authority for closed homogeneous map regions. It differentiates the exact
    rederived execution map, not the rounded node-wise source graph. This removes a
    topology special case but does not complete ordered graph cotangent accumulation.
+   The next shared host-materialization prerequisite admits ordered homogeneous pure-map
+   graphs with tuple/multiple declared outputs through existing per-map admission and
+   equation realization. It preserves source order/checkpoints and adds no AD rules or
+   runtime. Node-wise graph derivatives and precise residual-producer/borrowed-use
+   relationships remain separate, consumed obligations in the existing envelope.
 3. **Composition boundary.** Specify ordered parameter/result ports and owned residuals.
    Qualify an optional synchronous CPU foreign-AD adapter with independent analytic and
    finite-difference checks, changed inputs/seeds, mutation and cleanup tests. Keep

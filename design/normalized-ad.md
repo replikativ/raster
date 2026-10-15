@@ -131,6 +131,17 @@ execution-model contract specified under numerical semantics below, not a proof 
 with fusion. Graphs that do not fully fuse, escaping intermediates, multiple public results,
 heterogeneous geometry/precision and effects remain outside this boundary.
 
+The shared host compiler materializer separately admits ordered pure homogeneous map graphs,
+including tuple results and multiple declared outputs. An intermediate may be consumed by a
+later map and also returned as a fresh owned value; this is needed to export saved coefficients.
+Equation order, typed checkpoints and declared output order remain unchanged, with no fusion,
+pruning or reassociation. Each map still passes the existing host admission checks; the graph
+adds closed SSA liveness, exact external-input correspondence and common extent/dtype premises.
+Effects, aliases, physical storage, host reads, unknown layout/placement and intermediate
+control values refuse. This is a compiler projection capability, not graph differentiation or
+authority to classify outputs as primal results, residuals or gradients. Canonical AD must
+independently derive those roles, ownership relationships and derivative programs.
+
 Normalized AD remains opt-in; the source AD engine remains the default structural reference.
 The checked scalar lane supplies derivation evidence to three bounded host families: pure map,
 map followed by ordered additive sum, and functional indexed map. Those families now execute
