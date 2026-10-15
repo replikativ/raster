@@ -27,8 +27,9 @@ VJP still returns cotangents in source argument order, with nil slots for inacti
 coefficients are privately owned snapshots, so delayed pullbacks do not read subsequently mutated
 caller arrays. Supported closed map regions use the existing fusion pass to derive their checked
 single-map execution stage; a previously unsupported spine with more than two boundary arrays
-instead composes checked equation-local scalar derivatives. No separate region derivative rule
-is added. A sum retains the exact
+instead composes checked equation-local scalar derivatives. Repeated selected external arrays
+share one public tangent port and receive explicitly ordered cotangent contributions. No separate
+region derivative rule is added. A sum retains the exact
 original ordered reduction for its primal and tangent; its scalar seed feeds the existing
 per-lane transpose, which returns an ordered gradient array for each selected array. Singleton
 scalar-capture differentiation still appends the original ordered reduction to the gradient
@@ -203,9 +204,18 @@ not remove these correspondence premises or broaden operation coverage.
 Singletons and regions whose fused execution frontier has at most two arrays retain their
 existing one-witness programs and numerical model. Only a previously refused homogeneous
 single-use spine with more boundary arrays acquires source-ordered primal/JVP equations and
-reverse-ordered transpose equations. Internal active results and selected external arrays
-must not require cotangent accumulation across consumers. This is not arbitrary DAG AD or
+reverse-ordered transpose equations. Internal active results remain immediate single-use edges;
+selected external arrays may occur in several nodes. This is not arbitrary DAG AD or
 a claim that these spines cannot be fused by the ordinary compiler.
+
+External tangents share exact identities only in derived execution views; retained node ports
+remain fresh and distinct. Reverse contributions accumulate in reverse node order, with each
+separate Float/Double addition stored before the next addition. No zero identity or reassociation
+is inserted. Each addition retains checked primal-only `grad-acc` evidence, exact contributor
+order, fresh equation/result identities and the library helper dependency. Reconstruction derives
+the required contributions from source topology and consumes retained identities without
+allocation. The first contributor initializes the accumulator. Existing unique-use programs,
+small fused-region numerical models and proof schemas remain unchanged.
 
 Activity is derived across nodes. A node outside the selected derivative path retains only
 its checked primal, not synthetic tangent ports. Downstream derivatives save required values
@@ -213,8 +223,8 @@ as fresh owned residuals, including values produced by such inactive nodes. Resi
 are qualified by execution equation, and each saved array names its actual producer.
 Generated ports are globally fresh. An internal read edge preserves every AbstractValue
 facet while relating a fresh owned producer to its checked read-use; composition then uses
-the ordinary pure-spine appender. No new evaluator, derivative registry or accumulation
-semantics is introduced. Public `deftm` semantics and the default source AD engine are unchanged.
+the ordinary pure-spine appender. No new evaluator or derivative registry is introduced.
+Public `deftm` semantics and the default source AD engine are unchanged.
 
 The shared host compiler materializer separately admits ordered pure homogeneous map graphs,
 including tuple results and multiple declared outputs. An intermediate may be consumed by a

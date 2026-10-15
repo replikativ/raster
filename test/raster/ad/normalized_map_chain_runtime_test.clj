@@ -485,6 +485,48 @@
     (is (not= (fbits ordered) (fbits reassociated)) "the oracle distinguishes reassociation")
     (is (= (fbits ordered) (fbits gradient)) "each reverse-source addition is a Float checkpoint")))
 
+(deftest two-repeated-sources-accumulate-at-the-same-reverse-boundary
+  (doseq [[dtype make-array] [[:float float-array] [:double double-array]]
+          active ['[x q] '[q x]]]
+    (let [source
+          (frontend/form->program
+           (walk/postwalk-replace
+            {'lane-dtype (if (= dtype :float) 'float 'double)}
+            '(let* [paired (raster.par/pmap i n lane-dtype
+                                            (raster.numeric/* (clojure.core/aget x i)
+                                                              (clojure.core/aget q i)))
+                    shifted (raster.par/pmap j n lane-dtype
+                                             (raster.numeric/+ (clojure.core/aget paired j)
+                                                               (clojure.core/aget x j)))
+                    scaled (raster.par/pmap k n lane-dtype
+                                            (raster.numeric/* (clojure.core/aget shifted k)
+                                                              (clojure.core/aget q k)))
+                    result (raster.par/pmap l n lane-dtype
+                                            (raster.numeric/* (clojure.core/aget scaled l)
+                                                              (clojure.core/aget r l)))] result))
+           {:dtype dtype :array-types {'x dtype 'q dtype 'r dtype} :scalar-types {'n :long}})
+          checked (normalized/linearize-map-chain-program
+                   source (the-ns 'raster.ad.normalized-map-chain-runtime-test) {:active-inputs active})
+          prepared (runtime/prepare checked)
+          xs [0.25 -2.0 3.0] qs [-0.5 4.0 0.125] rs [2.0 -0.75 1.5]
+          dx [0.5 -1.0 2.0] dq [-0.25 0.5 1.0] seed [1.0 -0.5 2.0]
+          gx (mapv #(* (+ %1 1.0) %1 %2) qs rs)
+          gq (mapv #(* %1 (+ (* 2.0 %2) 1.0) %3) xs qs rs)
+          args (arguments prepared {'n (long 3) 'x (make-array xs) 'q (make-array qs) 'r (make-array rs)})
+          [output pullback] ((:vjp prepared) args)
+          [_ tangent] ((:jvp prepared) args (mapv #(make-array (case % x dx q dq)) active))
+          slots (pullback (make-array seed))
+          positions (zipmap (:inputs prepared) (range))]
+      (is (= (filterv (set active)
+                      (:arrays (soac/operation-parts (first (soac/equations source)))))
+             (mapv :source (get-in checked [:map-programs :proof :accumulations])))
+          "independent arrays accumulate in retained operand order, not public activity order")
+      (is (= (vec (make-array (mapv #(* %1 (+ %2 1.0) %2 %3) xs qs rs))) (vec output)))
+      (is (= (vec (make-array (mapv #(+ (* %1 %2) (* %3 %4)) dx gx dq gq))) (vec tangent)))
+      (is (= (vec (make-array (mapv * seed gx))) (vec (nth slots (positions 'x)))))
+      (is (= (vec (make-array (mapv * seed gq))) (vec (nth slots (positions 'q)))))
+      (is (nil? (nth slots (positions 'r)))))))
+
 (deftest ordered-cotangent-evidence-replays-with-fixed-identities-and-refuses-tampering
   (let [checked (normalized/linearize-map-chain-program
                  (typed-three-occurrence-spine 1 :double)
