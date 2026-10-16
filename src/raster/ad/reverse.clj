@@ -1220,24 +1220,32 @@
         {:keys [fwd-bindings rev-ctx param-adj-syms replays writes]}
         (process-bindings norm-bindings active-params
                           {:seed-adj-env {body-sym [dy-sym]}})]
-    {:body-sym body-sym
+    {:body-sym body-sym :dy dy-sym
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
      :replays replays :writes writes
      :param-adj-syms param-adj-syms}))
 
+(defn- reverse-program-forms
+  "Project shared reverse pieces into existing primal/closure forms. Memory
+   facts belong to the pieces, not to free-symbol inspection of emitted code."
+  [{:keys [body-sym dy fwd-bindings rev-bindings param-adj-syms]}]
+  (let [pullback-body (list 'let* rev-bindings (vec param-adj-syms))
+        result-sym (ad-gensym "result")
+        augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
+    {:primal-form (list 'let* augmented-bindings result-sym)
+     :pullback-form pullback-body
+     :result-sym result-sym
+     :standard-form (list 'let* augmented-bindings
+                          (vector result-sym (list 'fn* [dy] pullback-body)))}))
+
 (defn- gen-reverse-let-core
   "Generate reverse-mode AD code for a let* form: normalize → process-bindings →
   assemble [primal, pullback-fn]."
   [bindings body-exprs active-params]
-  (let [dy-sym 'dy__rad
-        {:keys [body-sym fwd-bindings rev-bindings param-adj-syms]}
-        (let-gradient-pieces bindings body-exprs active-params dy-sym)
-        pullback-body (list 'let* rev-bindings (vec param-adj-syms))
-        pullback-fn   (list 'fn* [dy-sym] pullback-body)
-        result-sym    (ad-gensym "result")
-        augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
-    (list 'let* augmented-bindings (vector result-sym pullback-fn))))
+  (:standard-form
+   (reverse-program-forms
+    (let-gradient-pieces bindings body-exprs active-params 'dy__rad))))
 
 (defn- gen-inline-step-gradients
   "Emit a closure-free scalar-step pullback inside an enclosing ordered loop.
@@ -4014,17 +4022,12 @@
   [form active-params]
   (with-ad-gensym
     (let [[bindings body-exprs] (extract-let-parts form)
-          [norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-
-          ;; === Phases 1-3: the shared pure engine (no atoms) ===
           dy-sym 'dy__rad
-          {:keys [fwd-bindings rev-ctx param-adj-syms]}
-          (process-bindings norm-bindings active-params {:seed-adj-env {body-sym [dy-sym]}})
+          {:keys [fwd-bindings] :as pieces}
+          (let-gradient-pieces bindings body-exprs active-params dy-sym)
+          {:keys [pullback-form] :as forms} (reverse-program-forms pieces)
 
           ;; === Phase 4: Reify pullback ===
-          rev-bindings (vec (:bindings rev-ctx))
-          pullback-body (list 'let* rev-bindings (vec param-adj-syms))
-
           ;; Determine captured variables:
           ;; Free symbols in the reverse bindings that are NOT:
           ;; - defined within the reverse bindings themselves
@@ -4032,32 +4035,21 @@
           ;; - the active params (these flow separately)
           fwd-bound (collect-bound-syms (vec fwd-bindings))
           rev-free  (binding [util/*shadowing-locals* (into util/*shadowing-locals* fwd-bound)]
-                      (util/free-syms pullback-body #{dy-sym}))
+                      (util/free-syms pullback-form #{dy-sym}))
           ;; Captured = free in reverse bindings ∩ bound in forward bindings
           captured  (clojure.set/intersection rev-free fwd-bound)
           ;; Maintain deterministic order: use forward binding order
           captured-ordered (filterv captured (take-nth 2 fwd-bindings))
 
           ;; Pullback params: [dy, captured1, captured2, ...]
-          pullback-params (vec (cons dy-sym captured-ordered))
+          pullback-params (vec (cons dy-sym captured-ordered))]
 
-          ;; Standard output for backward compatibility
-          result-sym (ad-gensym "result")
-          augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
-
-      {:primal-form     (list 'let* augmented-bindings result-sym)
-       :pullback-form   pullback-body
-       :pullback-params pullback-params
-       :active-params   (vec active-params)
-       :captured-syms   captured-ordered
-       :fwd-bindings    (vec fwd-bindings)
-       :result-sym      result-sym
-       :body-sym        body-sym
-       ;; Standard [primal, pullback] for backward compat
-       :standard-form
-       (list 'let* augmented-bindings
-             (vector result-sym
-                     (list 'fn* [dy-sym] pullback-body)))})))
+      (merge forms
+             {:pullback-params pullback-params
+              :active-params   (vec active-params)
+              :captured-syms   captured-ordered
+              :fwd-bindings    (vec fwd-bindings)
+              :body-sym        (:body-sym pieces)}))))
 
 (defn- transform-pullback
   "Apply AD to a reified pullback form, producing second-order derivatives.

@@ -1314,3 +1314,11 @@ fast path; a free parameter is differentiated as a terminal expression.
 Retaining this pullback does not make arbitrary captured mutable buffers safe:
 operations whose pullbacks replay buffer contents still need their existing
 memory contracts. Unsupported lexical regions continue to fail explicitly.
+
+Scalar reverse regions expose one compile-time description of forward bindings,
+result, reverse bindings, cotangent binder and gradient slots, together with their
+existing write/replay facts. Closure and reified pullbacks project the same primal
+and pullback forms from it; inline steps consume the same underlying pieces.
+Lexical capture order is derived separately and does not certify memory safety.
+This shared assembly does not yet replace the generic loop builder or admit new
+effectful loop regions.
