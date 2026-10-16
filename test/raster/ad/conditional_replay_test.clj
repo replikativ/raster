@@ -72,6 +72,34 @@
   (try (rev/value+grad v :wrt [0]) nil
        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(deftm selected-buffer-overwrite
+  [x :- Double, ys :- (Array double), zs :- (Array double), flag :- Long] :- Double
+  (let [view (if (= flag 1) ys zs)
+        prior (par/reduce s 0.0 j 1 (n/+ s (n/* x (aget ys j))))
+        ignored (aset view 0 7.0)]
+    (n/+ prior (n/* 2.0 x))))
+
+(deftm selected-buffer-earlier-write
+  [x :- Double, ys :- (Array double), zs :- (Array double), flag :- Long] :- Double
+  (let [view (if (= flag 1) ys zs) ignored (aset view 0 7.0)
+        prior (par/reduce s 0.0 j 1 (n/+ s (n/* x (aget ys j))))]
+    (n/+ prior (n/* 2.0 x))))
+
+(deftest selected-results-contribute-all-known-may-alias-edges
+  ;; Before this change flag=1 returned [10,9,...], instead of derivative 5.
+  (is (= 10.0 (selected-buffer-overwrite 2.0 (double-array [3.0])
+                                       (double-array [4.0]) 1)))
+  (is (= :replayed-array-overwritten (refusal #'selected-buffer-overwrite)))
+  (let [{:keys [aliases]}
+        (#'rev/forward-pass '[view (if flag ys zs) later view] [])]
+    (doseq [s '[ys zs view later]]
+      (is (= '#{ys zs view later} (memory/transitive-closure #{s} aliases)))))
+  ;; Writes BEFORE the residual is captured remain valid in both cases.
+  (let [gradient (rev/value+grad #'selected-buffer-earlier-write :wrt [0])]
+    (doseq [[flag expected] [[1 [18.0 9.0 nil nil nil]]
+                           [0 [10.0 5.0 nil nil nil]]]]
+      (is (= expected (gradient 2.0 (double-array [3.0]) (double-array [4.0]) flag))))))
+
 (deftest conditional-residual-replay-is-protected-across-scope-boundaries
   ;; Previously each overwrite variant returned [6,101,nil,nil] rather than
   ;; derivative 3: the conditional dropped the reduction's replay obligation.

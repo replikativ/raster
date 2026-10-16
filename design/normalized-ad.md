@@ -1330,3 +1330,10 @@ sides. This is a conservative safety relation: multiple names may refer to the
 same storage, and missing edges do not certify freshness or distinctness.
 It does not establish carried-array aliases or admit new loop regions. Diagnostic
 array lists are sorted and may include additional names from an alias component.
+
+Known selected results contribute every alternative from the shared form
+analysis's `normal-exit-symbols`; exact copy propagation uses only its singleton
+`tail-symbol` projection. Thus `(if flag ys zs)` may alias either buffer without
+making them interchangeable. A nil result means unknown, not fresh; an empty set
+means no normal exit. Arbitrary array-returning calls and unknown branch results
+remain an open alias boundary, not a new non-aliasing guarantee.

@@ -6,6 +6,19 @@
 ;; form-info classification
 ;; ================================================================
 
+(deftest normal-exit-alternatives-are-not-exact-identity
+  (is (= '#{xs ys} (form/normal-exit-symbols '(if flag xs ys))))
+  (is (nil? (form/tail-symbol '(if flag xs ys))))
+  (is (= '#{xs} (form/normal-exit-symbols '(if flag xs xs))))
+  (is (= 'xs (form/tail-symbol '(if flag xs xs))))
+  (is (= '#{xs} (form/normal-exit-symbols '(if flag (throw error) xs))))
+  (is (= #{} (form/normal-exit-symbols '(if flag (throw error) (recur xs)))))
+  (doseq [expression '[nil (do) (if flag xs nil) (if flag xs 1)
+                      (if flag xs (opaque ys)) (let* [xs ys] xs)
+                      (if flag xs (let* [xs ys] xs))]]
+    (is (nil? (form/normal-exit-symbols expression)) (pr-str expression)))
+  (is (= '#{out} (form/normal-exit-symbols '(raster.par/map! out i n nil x)))))
+
 (deftest form-info-leaf-test
   (testing "symbols are leaves"
     (let [info (form/form-info 'x)]
