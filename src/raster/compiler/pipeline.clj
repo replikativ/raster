@@ -1386,6 +1386,9 @@
     :target          - :c routes to the native CPU-C backend (one fused C function
                        per deftm via Panama FFM, no per-op JVM dispatch). Bypasses
                        the bytecode/GPU path.
+    :no-alias?       - native C only, default true. False admits verified single
+                       same-index pointwise maps with identical or disjoint
+                       pointer regions; shifted writable overlaps are refused.
     :reuse-buffers?  - keep intermediate and result buffers across calls instead
                        of allocating them in each call. The returned fn then
                        serves one caller at a time with the shapes of its first
@@ -1394,13 +1397,13 @@
                        compiled fn may be called concurrently, with any shapes,
                        and returns arrays no later call writes."
   [f-var & {:keys [inline? simd? dtype target-device target preserve-declared-array-storage?
-                   reuse-buffers?]
-            :or {inline? true simd? true}}]
+                   reuse-buffers? no-alias?]
+            :or {inline? true simd? true no-alias? true}}]
   (if (= target :c)
     ;; Native CPU-C backend: emit the whole fused body as one C function (no
     ;; per-op JVM dispatch) + Panama FFM. Bypasses the bytecode/hoist path.
     ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
-     f-var (or dtype :double) :reuse-buffers? reuse-buffers?)
+     f-var (or dtype :double) :reuse-buffers? reuse-buffers? :no-alias? no-alias?)
     (compile-aot-jvm f-var :inline? inline? :simd? simd? :dtype dtype
                      :target-device target-device
                      :preserve-declared-array-storage? preserve-declared-array-storage?

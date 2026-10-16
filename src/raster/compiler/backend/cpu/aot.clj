@@ -97,11 +97,84 @@
 ;; Fused-IR access — reuse compile-aot's forward pipeline at the scalar backend.
 ;; ---------------------------------------------------------------------------
 
+(declare array-tags)
+
+(defn- verify-pointwise-alias-scope!
+  "Prove a closed single-map scope BEFORE disjoint-storage rewrites. Every memory
+   access must address the map's own ordinal. This permits exact-region aliases,
+   not shifted overlaps, copies, reductions, allocations or opaque helpers."
+  [source params param-env]
+  (let [arrays (set (filter #(contains? array-tags (get param-env %)) params))
+        scalars (set (remove arrays params))
+        fail! (fn [expression]
+                (throw (ex-info "Native alias-capable compilation requires a closed same-index pointwise map"
+                                {:reason :unsupported-native-alias-scope :form expression})))
+        ;; Lowering wraps a bare map in an empty let*. Do not discard an actual prefix.
+        source (loop [source source]
+                 (if (and (seq? source) (#{'let 'let*} (first source))
+                          (empty? (second source)) (= 3 (count source)))
+                   (recur (nth source 2)) source))]
+    ;; One ordinal denotes the same byte lane only for one proven storage type.
+    ;; Equal byte ranges alone do not justify aliasing float and double views.
+    (when-not (= 1 (count (set (map param-env arrays)))) (fail! source))
+    (when-not (and (= 'raster.par/map-void! (descriptor/semantic-op source))
+                   (= 3 (count (descriptor/call-args source))))
+      (fail! source))
+    (let [[ordinal bound body] (descriptor/call-args source)]
+      (when-not (and (symbol? ordinal) (not (contains? (set params) ordinal))
+                     (or (integer? bound) (contains? scalars bound)))
+        (fail! source))
+      (letfn [(check! [expression locals tail?]
+                (cond
+                  (or (nil? expression) (number? expression) (boolean? expression)) true
+                  (symbol? expression) (when-not (contains? locals expression) (fail! expression))
+                  (not (seq? expression)) (fail! expression)
+                  (#{'let 'let*} (first expression))
+                  (let [[_ bindings & body] expression
+                        _ (when-not (and (vector? bindings) (even? (count bindings))
+                                         (= 1 (count body))) (fail! expression))
+                        scope (reduce (fn [scope [id init]]
+                                        (when (or (not (symbol? id)) (arrays id) (= ordinal id))
+                                          (fail! expression))
+                                        (check! init scope false)
+                                        (conj scope id)) locals (partition 2 bindings))]
+                    (check! (first body) scope tail?))
+                  (= 'if (first expression))
+                  (do (when-not (#{3 4} (count expression)) (fail! expression))
+                      (check! (second expression) locals false)
+                      (doseq [value (nnext expression)] (check! value locals tail?)))
+                  :else
+                  (let [op (descriptor/semantic-op expression)
+                        arguments (descriptor/call-args expression)
+                        intrinsic (some-> (descriptor/resolve-op-descriptor op)
+                                          first :intrinsic :key intrinsics/descriptor)]
+                    (cond
+                      (#{'clojure.core/aget 'clojure.core/aset} op)
+                      (let [[array index & values] arguments]
+                        (when-not (and (arrays array) (= ordinal index)
+                                       (or (= op 'clojure.core/aget) tail?)
+                                       (= (if (= op 'clojure.core/aget) 2 3) (count arguments)))
+                          (fail! expression))
+                        (doseq [value values] (check! value locals false)))
+                      (and (not (contains? locals op))
+                           (or (descriptor/cast-op? op)
+                               intrinsic))
+                      (do
+                        (when (and (descriptor/cast-op? op) (not= 1 (count arguments)))
+                          (fail! expression))
+                        (doseq [value arguments] (check! value locals false)))
+                      :else (fail! expression)))))]
+        (check! body (conj scalars ordinal) true))))
+  source)
+
 (defn fused-scalar-form
   "Run compile-aot's forward passes with the SCALAR backend (no SIMD lowering)
   to get the inlined, buffer-fused body as plain loops/lets — the dialect the C
   emitter consumes."
-  [f-var dtype & {:keys [simd?] :or {simd? false}}]
+  [f-var dtype & {:keys [simd? no-alias?] :or {simd? false no-alias? true}}]
+  (when-not (boolean? no-alias?)
+    (throw (ex-info "Native :no-alias? must be Boolean"
+                    {:reason :invalid-native-alias-policy :no-alias? no-alias?})))
   (let [wb     (pl/get-walked-body f-var dtype)
         params (pl/get-params f-var dtype)
         raw    (if (= 1 (count wb)) (first wb) (list* 'do wb))
@@ -113,7 +186,11 @@
         ;; backend can emit __m256 intrinsics via csimd (vs clang auto-vec only).
         opts  {:inline? true :simd? false :keep-par-forms? simd? :dtype dtype
                :active-params active :param-env penv :source-ns source-ns}]
-    (let [lowered (pl/run-passes raw pl/forward-passes opts)
+    (let [lowered (if no-alias?
+                    (pl/run-passes raw pl/forward-passes opts)
+                    (let [source (pl/run-passes raw [:lower] opts)]
+                      (verify-pointwise-alias-scope! source active penv)
+                      (pl/run-passes source (vec (rest pl/forward-passes)) opts :lowered)))
           program (when (parallel-program/parallel-program? lowered)
                     (parallel-program/validate! lowered segop/segop-node?))]
       {:form (if program (:source program) lowered)
@@ -618,7 +695,7 @@
    - stripped     : the let* body (buffer-allocs already removed) to emit
    Returns the C source string."
   [kernel-name dtype array-params scalar-params buffers local-buffers length-syms stripped
-   & {:keys [return-type written-pointers] :or {return-type :void}}]
+   & {:keys [return-type written-pointers no-alias?] :or {return-type :void no-alias? true}}]
   (let [ct (ctype dtype "double")  ; default scalar type for the body (the dominant dtype)
         array-syms (set (concat (map first array-params) (map first buffers) (map first local-buffers)))
         ;; SROA: small, compile-time-fixed-size, non-escaping scratch buffers are emitted
@@ -637,7 +714,7 @@
         ;; param order: input arrays, output buffers, scalar params, array lengths —
         ;; each array gets ITS OWN element type (e.g. float in, int8_t out for quant).
         param-strs (concat
-                    (map (fn [[s c]] (str (when-not (written s) "const ") c "* restrict " (ce/c-symbol s))) array-params)
+                    (map (fn [[s c]] (str (when-not (written s) "const ") c "* " (when no-alias? "restrict ") (ce/c-symbol s))) array-params)
                     (map (fn [[s _ elem]] (str (elem->ctype elem "double") "* restrict " (ce/c-symbol s))) buffers)
                     (map (fn [[s t]] (str t " " (ce/c-symbol s))) scalar-params)
                     (map (fn [[_ ls]] (str "int " (ce/c-symbol ls))) (sort-by (comp str val) length-syms)))
@@ -805,9 +882,13 @@
   are not copied back. Writable argument aliases violate the emitted restrict
   ABI and are rejected before invocation.
 
+  :no-alias? false admits a closed same-index pointwise map, verified before
+  disjoint-storage optimizations. External pointers then omit restrict and may
+  name exactly the same region. Partial/shifted writable overlaps remain errors.
+
   With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
   __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
-  [f-var dtype & {:keys [simd? reuse-buffers?] :or {simd? false}}]
+  [f-var dtype & {:keys [simd? reuse-buffers? no-alias?] :or {simd? false no-alias? true}}]
   (let [return-tag (:return-tag (pl/deftm-frontend-facts f-var dtype))
         return-type (some-> return-tag dtype/dtype-for-scalar-tag)
         return-class (get types/tag->java-class return-tag)
@@ -817,7 +898,7 @@
             (throw (ex-info "Unsupported native scalar return ABI"
                             {:reason :unsupported-native-return :return-tag return-tag})))
         {:keys [form parallel-program params param-env]}
-        (fused-scalar-form f-var dtype :simd? simd?)
+        (fused-scalar-form f-var dtype :simd? simd? :no-alias? no-alias?)
         form (recover-rectangular-maps form)
         {nform :form length-syms :length-syms} (normalize-for-c form)
         ;; The lowering pipeline uses hygienic gensyms. Canonicalize the final
@@ -871,7 +952,7 @@
                       *host-value-remap* host-value-remap]
               (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers
                          length-syms stripped :return-type (or return-type :void)
-                         :written-pointers written))
+                         :written-pointers written :no-alias? no-alias?))
         so  (cpu/compile-source! src)
         pointer-access (into (mapv (fn [[sym _]] (if (written sym) :read-write :read))
                                    array-params)
@@ -879,7 +960,7 @@
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count heap-buffers))
                                 scalar-ffm (or return-type :void)
-                                {:pointer-access pointer-access :no-alias? true
+                                {:pointer-access pointer-access :no-alias? (if no-alias? true :same-region)
                                  :object-distinct-pairs object-pairs})
         wrapper (native-call-wrapper native params array-params scalar-params len-order
                                      heap-buffers scalar-bindings result-shape result-syms
@@ -887,5 +968,6 @@
     (with-meta
       wrapper
       {:c-source src :kernel-name kernel-name :native-call-policy :ordinary
+       :native-alias-policy (if no-alias? :disjoint :same-region-pointwise)
        :entry-preconditions (:preconditions entry-contract)
        :native-pointer-access pointer-access})))

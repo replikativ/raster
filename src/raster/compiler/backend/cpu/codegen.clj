@@ -182,7 +182,9 @@
   requires exactly the declared argument count; extra arguments are rejected.
   Ordinary calls stage heap arrays and accept caller-owned native segments.
   :pointer-access defaults to :read-write for every pointer. :no-alias? enforces
-  an emitted restrict ABI. Optional :object-distinct-pairs names pairs of leading
+  an emitted restrict ABI. Its internal :same-region policy permits writable
+  overlap only for identical complete regions; the compiler must prove the
+  corresponding pointwise scope and omit restrict. Optional :object-distinct-pairs names pairs of leading
   pointer argument indices whose ORIGINAL objects must differ, including empty
   storage. This entry precondition is checked before marshalling, separately from
   physical range overlap. :call-policy :critical requires explicit caller

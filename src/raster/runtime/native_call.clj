@@ -116,9 +116,16 @@
         (when no-alias?
           (doseq [[^MemorySegment previous _ previous-write?] ranges]
             (when (and (or writable? previous-write?)
-                       (.isPresent (.asOverlappingSlice segment previous)))
-              (throw (ex-info "Writable pointer overlap violates the emitted no-alias ABI"
-                              {:reason :native-pointer-alias :index argument-index})))))
+                       (.isPresent (.asOverlappingSlice segment previous))
+                       (not (and (= :same-region no-alias?)
+                                 (= (.byteSize segment) (.byteSize previous))
+                                 ;; Equality of bytes is not identity of storage. The overlap
+                                 ;; has to cover both complete views, including their origins.
+                                 (= (.byteSize segment)
+                                    (.byteSize ^MemorySegment (.get (.asOverlappingSlice segment previous)))))))
+              (throw (ex-info "Writable pointer overlap violates the compiled alias policy"
+                              {:reason :native-pointer-alias :index argument-index
+                               :alias-policy no-alias?})))))
         (.add ranges [segment heap writable? offset backing])))
     (if (every? #(nil? (second %)) ranges)
       (if operation (operation arguments) (.invokeWithArguments mh arguments))
