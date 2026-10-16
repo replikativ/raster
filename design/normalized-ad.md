@@ -78,6 +78,16 @@ and default source AD engine are unchanged. The historical internal `:map-progra
 holds the checked phases; it is not a second contraction runtime. Float tests qualify host
 precision checkpoints, not bitwise agreement with arbitrary BLAS or device schedules.
 
+Canonical fresh contractions may retain the existing `:raster.par/contract` source intent.
+For these sources, AD preserves that intent in all three phases and independently reprojects
+each phase's operand AxisMaps, reduction fiber, numerical scope, read capacities and physical
+self-result. A dense regrouping of cotangent axes must preserve flat addresses. Intent is not
+a geometry certificate: ordinary scheduled contraction validation still checks the emitted
+body and schedule, and canonical validation reconstructs the complete derivative phases.
+Unmarked host sources retain their existing behavior. This enables ordinary compilation of
+the marked phases, not resident AD execution, general frontend physical destinations or
+activation of the default AD engine.
+
 Compiler-generated pure TypedSOAC programs can acquire an exact source-free invocation boundary
 without manufacturing a Clojure `let` or re-inferring parameter types. The ordered IR inputs and
 their retained AbstractValues supply a zero-prefix plan; flat public buffers and every retained
@@ -1122,6 +1132,9 @@ result storage, effects, aliases, transforms, stages, mixed storage or unknown f
 caller-owned projection remains unchanged. This is host realization infrastructure, not an AD
 facet or evidence that its implementation-defined reduction association is bit-identical to a
 particular BLAS library.
+
+This host projection also accepts the exact retained `:raster.par/contract` source intent;
+unknown intent remains refused, and all existing storage, geometry and arithmetic guards apply.
 
 ## Opt-in resident normalized-map execution
 

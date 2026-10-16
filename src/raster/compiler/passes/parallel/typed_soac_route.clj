@@ -940,7 +940,9 @@
                        #{:segment-axes :index :extent :attributes :accumulators :identities
                          :dtypes :algebra :source-arithmetic :result-map})
           (set/subset? (set (keys operation-attributes))
-                       #{:stable-array-captures :pointwise-storage-inputs})
+                       #{:stable-array-captures :pointwise-storage-inputs :source-operation})
+          (or (not (contains? operation-attributes :source-operation))
+              (= :raster.par/contract (:source-operation operation-attributes)))
           (= (set stable) (set (filter #(seq (:shape (get values %))) captures)))
           (empty? pointwise-storage)
           (nil? result-transform) (nil? result-storage-dtype)
