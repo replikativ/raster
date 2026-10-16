@@ -14,6 +14,14 @@
   [x]
   (or (symbol? x) (number? x) (nil? x) (boolean? x) (string? x) (keyword? x)))
 
+(defn- lifted-value-symbol
+  "A lifted argument denotes the already-typed expression's value. Preserve
+   that declaration and source position, not its callee/effect/ownership facts.
+   Missing declarations remain missing; normalization does not infer types."
+  [gensym-fn prefix expression]
+  (vary-meta (gensym-fn prefix) merge
+             (select-keys (meta expression) [:raster.type/tag :line :column :file])))
+
 (defn anf-normalize-expr
   "Flatten nested sub-expressions in a call into separate let bindings.
   Returns [extra-bindings-vec, normalized-expr] where all call arguments
@@ -46,7 +54,7 @@
         (let [sub-exprs (rest expr)]
           (doseq [se (butlast sub-exprs)]
             (let [[sub-extras normalized] (anf-normalize-expr se gensym-fn)
-                  s (gensym-fn "_side")]
+                  s (lifted-value-symbol gensym-fn "_side" normalized)]
               (swap! extras into (concat sub-extras [s normalized]))))
           (let [last-expr (last sub-exprs)
                 [le ln] (anf-normalize-expr last-expr gensym-fn)]
@@ -68,7 +76,7 @@
                       (if (trivial-expr? arg)
                         arg
                         (let [[sub-extras normalized] (anf-normalize-expr arg gensym-fn)
-                              s (gensym-fn "anf")]
+                              s (lifted-value-symbol gensym-fn "anf" normalized)]
                           (swap! extras into (concat sub-extras [s normalized]))
                           s)))
                     args)]
