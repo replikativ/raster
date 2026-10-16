@@ -319,7 +319,8 @@ links, NVLink branding or a forecast never grant ownership, numerical permission
 3. **Continue normalized AD consolidation (item 5, with item 3).** Follow `normalized-ad.md`: checked
    source/primal/residual/linear/transpose programs, common equation composition, then the existing
    map/gather/reduce/contraction rules and ordered recurrence contracts. Keep source AD as the
-   independent default oracle until each migrated family passes its gates. Gate: analytic/finite
+   default structural reference until each migrated family passes its gates; shared derivative
+   rules do not make it an independent calculus oracle. Gate: analytic/finite
    differences, JVP–VJP pairing, `:wrt`, mixed storage, zero domains, overwrite/tape lifetime and
    higher-order refusal/correctness checks. Arbitrary loops need not be accepted to finish the
    supported-language campaign, but must never silently differentiate to zero.
