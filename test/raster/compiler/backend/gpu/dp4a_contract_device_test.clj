@@ -5,15 +5,8 @@
    orientation). Device output == reference int8 matmul. Gated on a real GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
-            [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.passes.parallel.contract-route :as route]
-            [raster.compiler.backend.gpu.segop-opencl :as sco])
-  (:import [java.lang.foreign MemorySegment]))
-
-(def ^:private gpu?
-  (delay (try (require 'raster.gpu.ze-runtime)
-              (boolean (seq ((resolve 'raster.gpu.ze-runtime/query-devices))))
-              (catch Throwable _ false))))
+            [raster.dl.gpu-grad-parity :as gpu-probe]))
 
 ;; B is [N,K] TRANSPOSED: element = A[i,l]·B[j,l] (both operands K-contiguous for dp4a packing)
 (defn- dp4a-form [m n k]
@@ -92,12 +85,12 @@
       (is (= :quant-naive (:strategy (route/route-contraction bad :dtype :byte)))))))
 
 (deftest dp4a-contraction-matches-ref-on-device
-  (if-not @gpu?
-    (println "[skip] dp4a-contract-device: no GPU device available")
+  (if @gpu-probe/gpu-available?
     (do
       (testing "int8 dp4a matmul (128×64×256) == reference"
         (let [{:keys [gpu cpu]} (run-dp4a 128 64 256 0.01)]
           (is (rel-close? gpu cpu 1.0e-6) (str "gpu " (take 3 gpu) " vs cpu " (take 3 cpu)))))
       (testing "non-square, K multiple of 4 (100×32×70)"
         (let [{:keys [gpu cpu]} (run-dp4a 100 32 70 0.005)]
-          (is (rel-close? gpu cpu 1.0e-6) "non-square"))))))
+          (is (rel-close? gpu cpu 1.0e-6) "non-square"))))
+    (gpu-probe/gpu-skip! "dp4a-contract-device")))

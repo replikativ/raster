@@ -6,8 +6,6 @@
   {:count 3 :class :device-test :reason "Level Zero device gate predates the shared probe"}
   "test/raster/compiler/backend/gpu/cuda_mma_compile_test.clj"
   {:count 1 :class :toolchain :reason "Optional nvcc execution gate"}
-  "test/raster/compiler/backend/gpu/dp4a_contract_device_test.clj"
-  {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
   "test/raster/compiler/backend/gpu/dpas_contract_device_test.clj"
   {:count 2 :class :device-test :reason "Level Zero device gates predate the shared probe"}
   "test/raster/compiler/backend/gpu/gpu_correctness_test.clj"
