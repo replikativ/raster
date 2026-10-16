@@ -67,6 +67,14 @@
 
 (def ^:private ^:dynamic *constant-gradient-arrays* #{})
 
+(def ^:private ^:dynamic *source-memory-context*
+  "Ordered whole primitive-array inputs at the current public AD boundary.
+   These are retained parameter facts, not a freshness or disjointness proof."
+  {:inputs [] :replayed {} :aliases {}})
+
+(defn- source-array-inputs [params]
+  (filterv #(contains? types/primitive-array-info (:raster.type/tag (meta %))) params))
+
 (defn- gradient-bearing-array-read?
   "Only reads from differentiated arrays need scatter cotangents. Reads from
   explicitly constant parameter arrays stay ordinary scalar expressions."
@@ -729,6 +737,55 @@
     (let [writes (written-syms expression)]
       {:writes writes :local-writes writes :replays (set (:replays record))})))
 
+(defn- join-input-replay-conditions [left right]
+  (merge-with (fn [a b]
+                (cond (or (true? a) (true? b)) true
+                      (= a b) a
+                      :else (list 'if a true b)))
+              left right))
+
+(defn- record-input-replay-conditions
+  "Project known input replay obligations using the existing choice selector.
+   Child summaries remain conservative: no private child selector escapes."
+  [record memory-effects may-aliases]
+  (into {}
+        (keep (fn [input]
+                (if (= :if-region (:type record))
+                  (let [[a b] (:pieces record)
+                        then? (contains? (may-aliases (:replays a)) input)
+                        else? (contains? (may-aliases (:replays b)) input)]
+                    (cond
+                      (and then? else?) [input true]
+                      then? [input (:branch record)]
+                      else? [input (list 'clojure.core/not (:branch record))]))
+                  (when (contains? (may-aliases (:replays memory-effects)) input)
+                    [input true]))))
+        (:inputs *source-memory-context*)))
+
+(defn- replay-input-guard-bindings
+  "Retain a semantic check for external input pairs that could alias at runtime.
+   Only original whole primitive-array inputs are admitted here; this is not
+   an alias proof for unknown results, private child IDs or foreign views."
+  [conditions writes]
+  (vec
+   (mapcat
+    (fn [[read write condition]]
+      [(vary-meta (ad-gensym "_replay_alias_guard") assoc :raster.effect/effectful true)
+       (let [guard (list 'if (list 'clojure.core/identical? read write)
+                         (list 'throw
+                               (list 'clojure.core/ex-info
+                                     "Reverse AD replay input aliases a later write"
+                                     {:reason :ad-replayed-array-alias
+                                      :input (list 'quote read) :write (list 'quote write)}))
+                         nil)]
+         (if (true? condition) guard (list 'if condition guard nil)))])
+    (for [read (:inputs *source-memory-context*) :when (contains? conditions read)
+          write (:inputs *source-memory-context*)
+          :when (and (contains? writes write) (not= read write)
+                     (= (get types/primitive-array-info (:raster.type/tag (meta read)))
+                        (get types/primitive-array-info (:raster.type/tag (meta write)))))]
+      [read write (get conditions read)]))))
+
 (defn- forward-pass
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
   An array a pullback replays must keep its forward contents until the
@@ -737,12 +794,25 @@
   the shared memory analysis; an absent edge is not a freshness proof."
   [norm-bindings active-params]
   (reduce
-   (fn [{:keys [activity fwd-bindings records replayed writes aliases]} [sym init-expr]]
+   (fn [{:keys [activity fwd-bindings records replayed writes aliases input-replay-conditions]}
+        [sym init-expr]]
      (let [active?  (init-active? init-expr activity)
            activity (assoc activity sym active?)
-           fwd      (conj fwd-bindings sym (qualify-fwd-expr init-expr))
-           {:keys [record fwd-patch]} (ad-record (ad-form-kind init-expr active? sym)
-                                                 sym init-expr activity)
+           may-aliases #(memory/transitive-closure (set %) aliases)
+           ambient (join-input-replay-conditions (:replayed *source-memory-context*)
+                                                 input-replay-conditions)
+           ;; Gradient-inactive choices can still invalidate earlier residuals.
+           ;; Use the existing scoped choice adapter, not a unioned parent guard,
+           ;; when an external replay obligation reaches a possible input write.
+           kind (if (and (seq ambient) (seq? init-expr) (= 'if (first init-expr))
+                         (seq (set/intersection (set (:inputs *source-memory-context*))
+                                                (may-aliases (written-syms init-expr)))))
+                  :if
+                  (ad-form-kind init-expr active? sym))
+           {:keys [record fwd-patch]}
+           (binding [*source-memory-context* (assoc *source-memory-context*
+                                                   :replayed ambient :aliases aliases)]
+             (ad-record kind sym init-expr activity))
            ;; A SOAC whose body carries gradient makes its WRITTEN buffers
            ;; gradient-carrying too: a downstream DIRECT read (aget out k)
            ;; must scatter into adj-env[out] (emit-backward already sums the
@@ -752,7 +822,6 @@
            activity (if (and active? (seq (:written-arrs record)))
                       (reduce #(assoc %1 %2 true) activity (:written-arrs record))
                       activity)
-           may-aliases #(memory/transitive-closure (set %) aliases)
            memory-effects (record-memory-effects record init-expr)
            current-replays (may-aliases (:replays memory-effects))
            source-writes (:writes memory-effects)
@@ -775,7 +844,15 @@
                                           ;; Partial positive evidence survives
                                           ;; unknown arms; completeness/freshness
                                           ;; are NOT inferred from missing edges.
-                                          sym (or result-aliases #{}) #{}))]
+                                          sym (or result-aliases #{}) #{}))
+           guard-bindings (replay-input-guard-bindings
+                           ambient
+                           ;; Place checks at the actual primitive write, not
+                           ;; before a choice/loop from its unioned footprint.
+                           (if-let [destination (op/aset-array-sym init-expr)]
+                             (may-aliases #{destination}) #{}))
+           fwd (into (into fwd-bindings guard-bindings)
+                     [sym (qualify-fwd-expr init-expr)])]
        (when overwritten
          (throw (ex-info
                  (str "Reverse-mode AD: `" sym "` writes " (vec overwritten) ", which an "
@@ -786,11 +863,16 @@
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
         :records (if record (conj records record) records)
         :aliases aliases
+        :input-replay-conditions (join-input-replay-conditions
+                                  input-replay-conditions
+                                  (record-input-replay-conditions record memory-effects may-aliases))
         :replayed (into replayed
                         (memory/transitive-closure (set (:replays memory-effects)) aliases))
         :writes (into writes (may-aliases (into source-writes (:written-arrs record))))}))
    {:activity (into {} (map (fn [p] [p true]) active-params))
-    :fwd-bindings [] :records [] :replayed #{} :writes #{} :aliases {}}
+    :fwd-bindings [] :records [] :replayed #{} :writes #{}
+    :aliases (:aliases *source-memory-context* {})
+    :input-replay-conditions {}}
    (partition 2 norm-bindings)))
 
 (defn- array-zero-of-shape
@@ -3371,11 +3453,14 @@
                                params))
               parameter-plan (tangent-parameter-plan all-params tags nil)
               diff-active-params (:candidate-params parameter-plan)
-              transformed (with-ad-gensym
-                            (transform-body
-                             (ad-prepare (first walked-body)
-                                         (zipmap all-params tags))
-                             diff-active-params))
+              transformed (binding [*source-memory-context* {:inputs (source-array-inputs all-params)
+                                                            :replayed {} :aliases {}}
+                                    util/*shadowing-locals* (into util/*shadowing-locals* all-params)]
+                            (with-ad-gensym
+                              (transform-body
+                               (ad-prepare (first walked-body)
+                                           (zipmap all-params tags))
+                               diff-active-params)))
               ;; transformed is (let* bindings [primal pullback-fn])
               ;; The pullback returns gradients for diff-active-params only;
               ;; wrap it so it returns gradients aligned with all-params (nil
@@ -4773,6 +4858,8 @@
         ;; transform-body delegates binding-position loops to gen-reverse-let's
         ;; activity-aware routing; inactive loops remain in the primal prefix.
           ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays
+                            *source-memory-context* {:inputs (source-array-inputs all-params)
+                                                     :replayed {} :aliases {}}
                             util/*shadowing-locals* (into util/*shadowing-locals* all-params)]
                     (transform-body hoisted diff-active-params))
           flat (binding [ad-flatten/*flatten-dtype* dtype]
