@@ -1338,3 +1338,27 @@ either buffer, and an unknown arm in `(if flag ys nil)` cannot erase `ys`.
 only its singleton `tail-symbol` projection. Neither unknown nor no normal exit
 proves freshness. Arbitrary array-returning calls still have an open alias boundary;
 partial positive evidence is not a complete non-aliasing guarantee.
+
+For original whole primitive-array parameters, source reverse AD also retains
+runtime identity checks before direct writes that would invalidate an earlier
+input replay. Distinct formal names are not a disjointness proof. These checks
+live in the generated forward program, including the walked body used by compiler
+inlining, rather than only in an invocation wrapper. An offending call throws
+`:ad-replayed-array-alias` before that write; earlier unrelated effects are not
+rolled back. Valid writes preceding replay remain admitted.
+
+Checks follow the retained selected choice and its enclosing positive aliases.
+Gradient-inactive choices with relevant writes use the same scoped choice adapter;
+they do not acquire numerical activity. Sequential replay choices combine lazily
+without re-running predicates. Nested child summaries can conservatively require
+a check even when a deeper branch does not replay. Different primitive-array
+classes cannot be identical and need no such check.
+
+This is bounded source-engine protection, not general memory-safe AD: opaque
+array results, implicit SOAC output writes, other inactive control regions,
+resident views/ranges and caller mutation between primal and delayed pullback
+still require their own existing or future contracts. Native compilation must
+refuse retained guards it cannot execute; this does not introduce a device
+preflight executor. The actual guarded reduction gradient currently also meets
+an earlier GPU backward-loop/tuple typedness refusal. No loop adapter, normalized
+default migration or higher-order memory differentiation is activated here.
