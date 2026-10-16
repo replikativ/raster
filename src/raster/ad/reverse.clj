@@ -548,14 +548,22 @@
                             :raster.ad/residual
                             {:kind :conditional :representation :persistent-vector
                              :source-form init-expr})
-            paired (mapv (fn [{:keys [fwd-bindings body-sym]}]
+            replay-roots (vec (sort-by str (into #{} (mapcat (comp keys :pullback-replay-conditions)) pieces)))
+            paired (mapv (fn [{:keys [fwd-bindings body-sym pullback-replay-conditions]}]
                            (let [saved (ad-gensym "branch_saved")]
                              (list 'let* (vec (concat fwd-bindings
                                                      [saved (vec (take-nth 2 fwd-bindings))]))
-                                   [body-sym saved])))
+                                   ;; Export evaluated obligations through the existing
+                                   ;; residual, never leak a child's private selector.
+                                   [body-sym saved
+                                    (mapv #(get pullback-replay-conditions % false) replay-roots)])))
                          pieces)]
         {:record {:type :if-region :sym sym :branch branch :params params
                   :dy dy :tape tape :pieces pieces
+                  :replay-conditions
+                  (into {} (map-indexed (fn [index root]
+                                         [root (list 'clojure.core/nth
+                                                     (list 'clojure.core/nth tape 2) index)]) replay-roots))
                   :effects {:kind :choice :regions pieces}}
          :fwd-patch (fn [bindings]
                       (into (vec (drop-last 2 bindings))
@@ -788,13 +796,11 @@
                                   root))))
                       ids))]
     (if (= :if-region (:type record))
-      (let [[a b] (:pieces record)
-            then (roots (:replays a)) else (roots (:replays b))]
-        (into {} (map (fn [root]
-                        [root (cond (and (contains? then root) (contains? else root)) true
-                                    (contains? then root) (:branch record)
-                                    :else (list 'clojure.core/not (:branch record)))]))
-              (set/union then else)))
+      (let [conditions (:replay-conditions record)]
+        (when-not (map? conditions)
+          (throw (ex-info "Conditional reverse region lacks its residual replay projection"
+                          {:reason :ad-region-replay-projection :sym (:sym record)})))
+        conditions)
       (zipmap (roots (:replays memory-effects)) (repeat true)))))
 
 (defn- replay-write-compatible? [value-facts read write]
@@ -1382,9 +1388,11 @@
   "Phase 2 (pure): thread {:adj-env :rev-ctx} backward across records, seeded by
   `seed-adj-env` (gen-reverse-let seeds {body-sym [dy]}; loop-with-let seeds the
   loop pullback's grads)."
-  [records activity seed-adj-env]
+  ([records activity seed-adj-env]
+   (reverse-pass records activity seed-adj-env (:value-facts *source-memory-context*)))
+  ([records activity seed-adj-env value-facts]
   (reduce
-   (fn [{:keys [adj-env rev-ctx pullback-replays]} {:keys [type sym] :as record}]
+   (fn [{:keys [adj-env rev-ctx pullback-replays pullback-replay-conditions]} {:keys [type sym] :as record}]
      (let [;; Array writers can receive cotangents through either their result
            ;; or any declared output buffer. No incoming edge means no reverse
            ;; execution; an explicit nil/zero-valued seed is still an edge.
@@ -1403,12 +1411,18 @@
                      (sum-contribs-into rev-ctx adj-sym adj-contribs nil sym-tag)
                      rev-ctx)]
        (if (or output-demand? adj-contribs)
-         (assoc (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
-                :pullback-replays (into pullback-replays
-                                         (:replays (record-memory-effects record nil))))
-         {:adj-env adj-env :rev-ctx rev-ctx :pullback-replays pullback-replays})))
-   {:adj-env seed-adj-env :rev-ctx (bind-ctx/make-ctx ad-gensym) :pullback-replays #{}}
-   (reverse records)))
+         (let [memory-effects (record-memory-effects record nil)]
+           (assoc (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
+                  :pullback-replays (into pullback-replays (:replays memory-effects))
+                  :pullback-replay-conditions
+                  (join-input-replay-conditions
+                   pullback-replay-conditions
+                   (record-replay-conditions record memory-effects value-facts))))
+         {:adj-env adj-env :rev-ctx rev-ctx :pullback-replays pullback-replays
+          :pullback-replay-conditions pullback-replay-conditions})))
+   {:adj-env seed-adj-env :rev-ctx (bind-ctx/make-ctx ad-gensym)
+    :pullback-replays #{} :pullback-replay-conditions {}}
+   (reverse records))))
 
 (defn- param-zero-expr
   "Typed zero default for a param's adjoint slot (Π): array params get a
@@ -1465,13 +1479,14 @@
   "Project one output seed environment through an already checked forward
    program. Does not normalize or execute another forward pass. Replay facts
    remain raw here; the owning composition closes them over its alias graph."
-  [{:keys [records activity]} active-params seed-adj-env]
-  (let [{:keys [adj-env rev-ctx pullback-replays]}
-        (reverse-pass records activity seed-adj-env)
+  [{:keys [records activity value-facts]} active-params seed-adj-env]
+  (let [{:keys [adj-env rev-ctx pullback-replays pullback-replay-conditions]}
+        (reverse-pass records activity seed-adj-env value-facts)
         {:keys [rev-ctx param-adj-syms]}
         (collect-param-adjoints active-params adj-env rev-ctx)]
     {:adj-env adj-env :rev-ctx rev-ctx :param-adj-syms param-adj-syms
-     :pullback-replays pullback-replays}))
+     :pullback-replays pullback-replays
+     :pullback-replay-conditions pullback-replay-conditions}))
 
 (defn- process-bindings
   "The shared engine: run Phases 1-3 over a NORMALIZED binding vector and return
@@ -1482,11 +1497,12 @@
                                        (take-nth 2 norm-bindings))]
     (let [{:keys [activity fwd-bindings records replayed writes value-facts] :as forward-state}
           (forward-pass norm-bindings active-params)
-          {:keys [adj-env rev-ctx pullback-replays param-adj-syms]}
+          {:keys [adj-env rev-ctx pullback-replays pullback-replay-conditions param-adj-syms]}
           (reverse-program-projection forward-state active-params seed-adj-env)]
       {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
        :rev-ctx rev-ctx :param-adj-syms param-adj-syms :replays replayed :writes writes
        :value-facts value-facts :forward-scope (source-memory-scope forward-state)
+       :pullback-replay-conditions pullback-replay-conditions
        :pullback-replays (memory/transitive-closure pullback-replays (:aliases forward-state))})))
 
 (declare gen-reverse-loop-with-let gen-reverse-loop-with-let-program lift-loop-to-tail)
@@ -1500,7 +1516,8 @@
   representation; the latter must not allocate a closure per iteration."
   [bindings body-exprs active-params dy-sym]
   (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope pullback-replays]}
+        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope
+                pullback-replays pullback-replay-conditions]}
         (process-bindings norm-bindings active-params
                           {:seed-adj-env {body-sym [dy-sym]}})]
     {:body-sym body-sym :dy dy-sym
@@ -1508,6 +1525,7 @@
      :rev-bindings (vec (:bindings rev-ctx))
      :replays replays :writes writes :value-facts value-facts :forward-scope forward-scope
      :pullback-replays pullback-replays
+     :pullback-replay-conditions pullback-replay-conditions
      :param-adj-syms param-adj-syms}))
 
 (defn- reverse-program-forms
