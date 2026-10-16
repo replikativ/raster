@@ -2633,6 +2633,31 @@
                       {:reason :ad-map-store-callee :cast cast :resolved-callee callee
                        :form map-form})))))
 
+(defn- gen-reverse-read-region
+  "Lifted reads execute before this scalar child. Their scatter indices must
+   survive its effects, unlike a child-owned replay established after a write."
+  [bindings body active-params prior-replays]
+  (let [prior-replays (set prior-replays)
+        conditions (record-replay-conditions nil {:replays prior-replays}
+                                             (:value-facts *source-memory-context*))
+        visible (set (:values *source-memory-context*))
+        program (binding [*source-memory-context*
+                          (-> *source-memory-context*
+                              (update :replayed join-input-replay-conditions
+                                      (select-keys conditions visible))
+                              (update :unprojectable join-input-replay-conditions
+                                      (apply dissoc conditions visible)))]
+                  (gen-reverse-let-program bindings body active-params))
+        aliases (:aliases program)
+        overwritten (set/intersection
+                     (memory/transitive-closure (into prior-replays (keys conditions)) aliases)
+                     (memory/transitive-closure (:writes program) aliases))]
+    (when (seq overwritten)
+      (throw (ex-info "Scalar child overwrites an index needed by its parent's pullback"
+                      {:reason :replayed-array-overwritten
+                       :arrays (vec (sort-by str overwritten))})))
+    program))
+
 (defn- gen-reverse-par-map
   "Generate reverse-mode AD code for a raster.par/map! form.
 
@@ -2696,7 +2721,8 @@
           (let [binds (if (seq pure-scalar-bindings)
                         (vec (concat pure-scalar-bindings [val-result-sym body-result]))
                         [val-result-sym body-result])]
-            (gen-reverse-let-program binds [val-result-sym] iter-active)))
+            (gen-reverse-read-region binds [val-result-sym] iter-active
+                                     (index-replays agets idx-sym))))
         scalar-transform (:form scalar-program)
 
         ;; === Forward code ===
@@ -3122,7 +3148,8 @@
                         (vec (concat pure-scalar-bindings [val-result-sym body-result]))
                         [val-result-sym body-result])
         scalar-program (when (and (seq iter-active) (not typed-double?))
-                         (gen-reverse-let-program step-bindings [val-result-sym] iter-active))
+                         (gen-reverse-read-region step-bindings [val-result-sym] iter-active
+                                                  (index-replays agets idx-sym)))
         scalar-transform (when (seq iter-active)
                            (if typed-double?
                              (gen-inline-step-gradients step-bindings [val-result-sym]

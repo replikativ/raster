@@ -41,6 +41,68 @@
   (loop [observed (aget ys 0) i (quot 3 divisor) acc x]
     (if (< i 3) (recur observed (inc i) (n/* acc x)) acc)))
 
+(deftm map-step-changes-index
+  [xs :- (Array double) indices :- (Array int)] :- Double
+  (let [out (double-array 1)
+        ignored (par/map! out i 1 nil
+                  (let [value (aget xs (aget indices i))
+                        changed (aset indices i 1)] value))]
+    (aget out 0)))
+
+(deftm float-step-writes-other-index-port
+  [xs :- (Array float) indices :- (Array int) destination :- (Array int)] :- Float
+  (par/reduce acc (float 1.0) i 1
+    (let [value (aget xs (aget indices i))
+          changed (aset destination i 1)]
+      (n/* acc value))))
+
+(deftm child-write-before-own-replay
+  [x :- Double ys :- (Array double)] :- Double
+  (let [out (double-array 1)
+        ignored (par/map! out i 1 nil
+                  (let [changed (aset ys 0 3.0)]
+                    (par/reduce acc 0.0 k 1 (n/+ acc (n/* x (aget ys k))))))]
+    (aget out 0)))
+
+(deftest parent-scatter-indices-precede-child-effects
+  (is (= :replayed-array-overwritten
+         (try (rev/value+grad #'map-step-changes-index :wrt [0]) nil
+              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+  (let [gradient (rev/value+grad #'float-step-writes-other-index-port :wrt [0])
+        indices (int-array [0]) destination (int-array [0])
+        [value dx] (gradient (float-array [2.0 7.0]) indices destination)]
+    (is (= (float 2.0) value))
+    (is (= [1.0 0.0] (vec dx)))
+    (is (= [1] (vec destination)))
+    (is (= :ad-replayed-array-alias
+           (try (gradient (float-array [2.0 7.0]) indices indices) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= [0] (vec indices)))))
+
+(deftest child-owned-replays-may-follow-lawful-earlier-writes
+  (let [ys (double-array [17.0])]
+    (is (= [6.0 3.0 nil] ((rev/value+grad #'child-write-before-own-replay :wrt [0]) 2.0 ys)))
+    (is (= [3.0] (vec ys)))))
+
+(deftest prior-index-obligations-use-retained-root-and-visibility-authority
+  (let [root (with-meta 'root {:raster.type/tag 'ints})
+        alias (with-meta 'alias {:raster.type/tag 'ints})
+        hidden (with-meta 'hidden {:raster.type/tag 'ints})
+        offset (with-meta 'offset {:raster.type/tag 'long})
+        seen (atom nil)]
+    (with-bindings {#'rev/*source-memory-context*
+                    {:values [root] :replayed {'earlier true}
+                     :unprojectable {'earlier-private true}
+                     :value-facts {root {:value root} alias {:value alias :alias root}
+                                   hidden {:value hidden} offset {:value offset}}}}
+      (with-redefs-fn {#'rev/gen-reverse-let-program
+                      (fn [& _] (reset! seen @#'rev/*source-memory-context*)
+                        {:writes #{} :aliases {}})}
+        #(#'rev/gen-reverse-read-region [] [1.0] [] #{alias hidden offset})))
+    (is (= #{'root 'earlier} (set (keys (:replayed @seen)))))
+    (is (= #{'hidden 'earlier-private} (set (keys (:unprojectable @seen)))))
+    (is (= [root] (:values @seen)))))
+
 (deftest inactive-compound-initializers-keep-source-order
   (doseq [[source expected] [[#'inactive-initializer-order ArithmeticException]
                              [#'inactive-initializer-before-origin ArrayIndexOutOfBoundsException]]]

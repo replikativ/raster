@@ -1543,6 +1543,14 @@ order. Absence of known writes is not a general purity proof.
 This construction-time restriction may also reject zero-trip loops containing
 such fragments; it is not a runtime test of whether their effects execute.
 
+An owning map/reduction's lifted reads precede its scalar child. Index storage
+that its scatter pullback will reread is therefore a prior replay obligation
+when that child is constructed, not a dependency appended only afterward. The
+same ordered child checks enforce runtime alias guards; positive alias closure
+also preserves the existing static overwrite refusal. This prior frontier is
+distinct from the child's own replays, which may lawfully be established after
+an earlier child write. A checked region summary must not erase that distinction.
+
 This is not the shared whole-step forward spine: per-port transforms, their
 arithmetic checkpoints and existing tape ownership remain unchanged. Nor does
 it activate the held raw-loop record adapter or add mutable-state AD support.
