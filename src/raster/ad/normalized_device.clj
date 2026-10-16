@@ -493,64 +493,114 @@
     (check!)
     {:module module :frontier-values frontier-values}))
 
-(defn- assemble-map!
-  [{:keys [owner check!] :as checked} arguments options]
-  (let [interface (map-interface! owner)
-        residual-plan (canonical/execution-residual-plan owner)
-        _ (when (or (seq (:immutable-scalars residual-plan))
-                    (seq (:physical-bindings residual-plan)))
-            (fail! :normalized-device-residuals
-                   "device preparation currently requires array-only residual storage"
-                   {:immutable-scalars (set (keys (:immutable-scalars residual-plan)))
-                    :physical-bindings (set (keys (:physical-bindings residual-plan)))}))
-        {:keys [target caller-options primal-compilation transpose-compilation]}
-        (compile-device-phases! checked options nil)
-        layout (materialize-layout! primal-compilation (:inputs interface) arguments caller-options)
+(defn- functional-seed-binding!
+  "Project the admitted seed transport without reconstructing derivative associations.
+   Array seeds own fresh storage; fixed scalar seeds close from the canonical phase inputs."
+  [owner interface layout primal-value {:keys [transport value]}]
+  (let [seed-id (get-in interface [:seed :id])]
+    (case transport
+      :array
+      (let [cloned (clone-seed-layout! layout interface primal-value)
+            seed-value (:value cloned)]
+        {:layout (:layout cloned) :buffers {seed-id seed-value}
+         :scalars (:scalar-values layout) :inputs [seed-value]
+         :ports {:seed-input seed-value}})
+
+      :scalar
+      (let [typed-seed (materialization/checked-scalar-value seed-id (get-in interface [:seed :value]) value)
+            facts (soac/facts (:transpose owner))
+            scalar-ids (filterv #(empty? (get-in facts [:values % :shape])) (:inputs facts))
+            scalars (into {} (map (fn [id]
+                                   [id (if (= id seed-id) typed-seed (get (:scalar-values layout) id))]))
+                          scalar-ids)]
+        (when-not (and (some #{seed-id} scalar-ids) (every? some? (vals scalars)))
+          (fail! :normalized-device-specialization
+                 "map-sum transpose scalars must close from fixed primal specialization and seed"
+                 {:seed seed-id :inputs (:inputs facts)
+                  :scalars (set (keys scalars)) :available (set (keys (:scalar-values layout)))}))
+        {:layout layout :buffers {} :scalars scalars :inputs []
+         :ports {:fixed-seed {:id seed-id :value typed-seed}}}))))
+
+(defn- assemble-functional!
+  "Bind admitted pure canonical phases through one layout/frontier/module construction.
+   Callers retain admission and public compatibility projections. Seed transport determines
+   only physical scalar/array binding, never derivative rules or operation admission."
+  [{:keys [owner check!] :as checked} interface residual-plan arguments options seed-request]
+  (let [scalar-seed? (case (:transport seed-request) :array false :scalar true)
         active-id (get-in interface [:active :id])
         primal-id (get-in interface [:primal :id])
-        seed-id (get-in interface [:seed :id])
         gradient-id (get-in interface [:gradient :id])
+        {:keys [target caller-options primal-compilation transpose-compilation]}
+        (compile-device-phases! checked options (when scalar-seed? [primal-id]))
+        layout (materialize-layout! primal-compilation (:inputs interface) arguments caller-options)
         compiler-bindings (:buffer-bindings layout)
-        array-boundary (public-array-boundary! [(:active interface)] layout)
+        array-boundary (public-array-boundary! (:arrays interface) layout)
         active-value (get compiler-bindings active-id)
         primal-value (get compiler-bindings primal-id)
-        _ (when-not (and active-value primal-value
-                         (= [active-id] (:ids array-boundary))
-                         (= [active-value] (:values array-boundary)))
-            (fail! :normalized-device-layout-interface
-                   "resident layout must expose exactly the canonical active array input"
-                   {:active active-id :active-value active-value
-                    :primal primal-id :primal-value primal-value
-                    :public-inputs (:public-inputs layout)}))
+        _ (if scalar-seed?
+            (when-not (and active-value primal-value
+                           (= :resident-scalar-buffer
+                              (get-in layout [:values primal-value :abstract :representation :kind]))
+                           (= [] (get-in layout [:values primal-value :abstract :shape])))
+              (fail! :normalized-device-layout-interface
+                     "map-sum resident layout must expose every canonical array and scalar loss"
+                     {:expected-arrays (:ids array-boundary) :public-inputs (:public-inputs layout)
+                      :active active-id :active-value active-value :primal primal-id :primal-value primal-value
+                      :primal-abstract (get-in layout [:values primal-value :abstract])}))
+            (when-not (and active-value primal-value
+                           (= [active-id] (:ids array-boundary))
+                           (= [active-value] (:values array-boundary)))
+              (fail! :normalized-device-layout-interface
+                     "resident layout must expose exactly the canonical active array input"
+                     {:active active-id :active-value active-value
+                      :primal primal-id :primal-value primal-value
+                      :public-inputs (:public-inputs layout)})))
         residuals (ordered-residual-frontiers! owner residual-plan compiler-bindings)
         residual-ids (:ids residuals)
-        seed-clone (clone-seed-layout! layout interface primal-value)
-        seed-value (:value seed-clone)
-        gradient-clone (clone-gradient-layout! (:layout seed-clone) interface active-value)
+        seed (functional-seed-binding! owner interface layout primal-value seed-request)
+        gradient-clone (clone-gradient-layout! (:layout seed) interface active-value)
         gradient-value (:value gradient-clone)
         nodes (get-in gradient-clone [:layout :nodes])
         values (get-in gradient-clone [:layout :values])
         residual-values (:values residuals)
         transpose-bindings
-        (into {seed-id seed-value gradient-id gradient-value}
+        (into (assoc (:buffers seed) gradient-id gradient-value)
               (map (fn [id] [id (get compiler-bindings id)])) residual-ids)
         bound (bind-module!
                check! target caller-options nodes values
                {:compilation primal-compilation :buffer-bindings compiler-bindings
                 :scalar-values (:scalar-values layout)
-                :interface {:inputs [active-value] :state [] :outputs [primal-value]}}
+                :interface {:inputs (:values array-boundary) :state [] :outputs [primal-value]}}
                [{:instance-id ::transpose
                  :compilation transpose-compilation :buffer-bindings transpose-bindings
-                 :scalar-values (:scalar-values layout)
-                 :interface {:inputs [seed-value] :state [] :outputs [gradient-value]}}]
+                 :scalar-values (:scalars seed)
+                 :interface {:inputs (:inputs seed) :state [] :outputs [gradient-value]}}]
                residual-values)]
     {:module (:module bound) :frontier-values (:frontier-values bound)
-     :ports {:input active-value :primal-output primal-value
-             :seed-input seed-value :gradient-output gradient-value
-             :residuals (:frontier-values bound)}}))
+     :ports (merge {:inputs (mapv (fn [id value] {:id id :value value})
+                                 (:ids array-boundary) (:values array-boundary))
+                    :primal-output primal-value :gradient-output gradient-value
+                    :residuals (:frontier-values bound)}
+                   (:ports seed))}))
+
+(defn- assemble-map!
+  [{:keys [owner] :as checked} arguments options]
+  (let [interface (map-interface! owner)
+        residual-plan (canonical/execution-residual-plan owner)]
+    (when (or (seq (:immutable-scalars residual-plan)) (seq (:physical-bindings residual-plan)))
+      (fail! :normalized-device-residuals
+             "device preparation currently requires array-only residual storage"
+             {:immutable-scalars (set (keys (:immutable-scalars residual-plan)))
+              :physical-bindings (set (keys (:physical-bindings residual-plan)))}))
+    (let [bound (assemble-functional! checked (assoc interface :arrays [(:active interface)])
+                                      residual-plan arguments options {:transport :array})]
+      ;; Preserve the existing singleton map API; the shared binder uses ordered canonical ports.
+      (update bound :ports (fn [ports]
+                             (-> ports (dissoc :inputs)
+                                 (assoc :input (get-in ports [:inputs 0 :value]))))))))
 
 (defn- assemble-sum!
-  [{:keys [owner check!] :as checked} arguments fixed-seed options]
+  [{:keys [owner] :as checked} arguments fixed-seed options]
   (let [interface (sum-interface! owner)
         residual-plan (canonical/execution-residual-plan owner)
         _ (when (or (seq (:immutable-scalars residual-plan))
@@ -558,77 +608,9 @@
             (fail! :normalized-device-residuals
                    "the first map-sum device slice requires array-only residual storage"
                    {:immutable-scalars (set (keys (:immutable-scalars residual-plan)))
-                    :physical-bindings (set (keys (:physical-bindings residual-plan)))}))
-        active-id (get-in interface [:active :id])
-        primal-id (get-in interface [:primal :id])
-        seed-id (get-in interface [:seed :id])
-        gradient-id (get-in interface [:gradient :id])
-        {:keys [target caller-options primal-compilation transpose-compilation]}
-        (compile-device-phases! checked options [primal-id])
-        layout (materialize-layout! primal-compilation (:inputs interface) arguments caller-options)
-        compiler-bindings (:buffer-bindings layout)
-        array-boundary (public-array-boundary! (:arrays interface) layout)
-        active-value (get compiler-bindings active-id)
-        primal-value (get compiler-bindings primal-id)
-        canonical-array-ids (:ids array-boundary)
-        public-array-values (:values array-boundary)
-        _ (when-not (and active-value primal-value
-                         (= :resident-scalar-buffer
-                            (get-in layout [:values primal-value :abstract
-                                            :representation :kind]))
-                         (= [] (get-in layout [:values primal-value :abstract :shape])))
-            (fail! :normalized-device-layout-interface
-                   "map-sum resident layout must expose every canonical array and scalar loss"
-                   {:expected-arrays canonical-array-ids :public-inputs (:public-inputs layout)
-                    :active active-id :active-value active-value
-                    :primal primal-id :primal-value primal-value
-                    :primal-abstract (get-in layout [:values primal-value :abstract])}))
-        residuals (ordered-residual-frontiers! owner residual-plan compiler-bindings)
-        residual-ids (:ids residuals)
-        residual-values (:values residuals)
-        typed-seed (materialization/checked-scalar-value
-                    seed-id (get-in interface [:seed :value]) fixed-seed)
-        transpose-facts (soac/facts (:transpose owner))
-        transpose-inputs (:inputs transpose-facts)
-        transpose-values (:values transpose-facts)
-        transpose-scalar-ids
-        (filterv #(empty? (get-in transpose-values [% :shape])) transpose-inputs)
-        transpose-scalars
-        (into {}
-              (map (fn [id]
-                     [id (if (= id seed-id) typed-seed (get (:scalar-values layout) id))]))
-              transpose-scalar-ids)
-        _ (when-not (and (some #{seed-id} transpose-scalar-ids)
-                         (every? some? (vals transpose-scalars)))
-            (fail! :normalized-device-specialization
-                   "map-sum transpose scalars must close from fixed primal specialization and seed"
-                   {:seed seed-id :inputs transpose-inputs
-                    :scalars (set (keys transpose-scalars))
-                    :available (set (keys (:scalar-values layout)))}))
-        gradient-clone (clone-gradient-layout! layout interface active-value)
-        gradient-value (:value gradient-clone)
-        nodes (get-in gradient-clone [:layout :nodes])
-        values (get-in gradient-clone [:layout :values])
-        transpose-bindings
-        (into {gradient-id gradient-value}
-              (map (fn [id] [id (get compiler-bindings id)])) residual-ids)
-        bound
-        (bind-module!
-         check! target caller-options nodes values
-         {:compilation primal-compilation :buffer-bindings compiler-bindings
-          :scalar-values (:scalar-values layout)
-          :interface {:inputs public-array-values :state [] :outputs [primal-value]}}
-         [{:instance-id ::transpose
-           :compilation transpose-compilation :buffer-bindings transpose-bindings
-           :scalar-values transpose-scalars
-           :interface {:inputs [] :state [] :outputs [gradient-value]}}]
-         residual-values)]
-    {:module (:module bound) :frontier-values (:frontier-values bound)
-     :ports {:inputs (mapv (fn [id value] {:id id :value value})
-                           canonical-array-ids public-array-values)
-             :primal-output primal-value :gradient-output gradient-value
-             :residuals (:frontier-values bound)
-             :fixed-seed {:id seed-id :value typed-seed}}}))
+                    :physical-bindings (set (keys (:physical-bindings residual-plan)))}))]
+    (assemble-functional! checked interface residual-plan arguments options
+                          {:transport :scalar :value fixed-seed})))
 
 (defn- assemble-indexed!
   [{:keys [owner check!] :as checked} arguments options]
