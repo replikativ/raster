@@ -94,18 +94,28 @@
       {:inputs inputs :active-id active-id :active active :tangent tangent
        :primal primal :seed seed :gradient gradient})))
 
+(defn- static-positive-vector? [value]
+  (and (= 1 (count (:shape value)))
+       (integer? (first (:shape value)))
+       (pos? (first (:shape value)))
+       (<= (first (:shape value)) Integer/MAX_VALUE)))
+
 (defn- map-interface! [owner]
   (let [interface (:interface owner)
         {:keys [inputs active-id active tangent primal seed gradient]}
         (singleton-derivative-ports! interface :map)
         arrays (filterv #(seq (get-in % [:value :shape])) inputs)]
-    (when-not (and (= 1 (count arrays)) (= active (first arrays)))
+    (when-not (and (seq arrays) (some #{active} arrays)
+                   (every? #{'map} (map soac/operation-kind (soac/equations (:source owner))))
+                   (or (= 1 (count arrays))
+                       (every? (comp static-positive-vector? :value)
+                               (concat arrays [primal seed gradient]))))
       (fail! :normalized-device-interface
-             "device preparation requires one active array and exact canonical derivative ports"
+             "device preparation requires pure maps, one active array and static multi-input geometry"
              {:inputs (mapv :id inputs) :active active-id
               :primal (:id primal) :seed-source (:source seed)
               :gradient-source (:source gradient)}))
-    {:inputs inputs :active active :tangent tangent
+    {:inputs inputs :arrays arrays :active active :tangent tangent
      :primal primal :seed seed :gradient gradient}))
 
 (defn- sum-interface! [owner]
@@ -132,12 +142,6 @@
               :gradient-source (:source gradient)}))
     {:inputs inputs :arrays arrays :scalars scalars :active active :tangent tangent
      :primal primal :seed seed :gradient gradient}))
-
-(defn- static-positive-vector? [value]
-  (and (= 1 (count (:shape value)))
-       (integer? (first (:shape value)))
-       (pos? (first (:shape value)))
-       (<= (first (:shape value)) Integer/MAX_VALUE)))
 
 (defn- indexed-interface! [owner residual-plan]
   (let [interface (:interface owner)
@@ -486,12 +490,18 @@
                  (module-plan/make module-request))
         frontier-values (mapv :value (filterv #(= :transpose (:consumer %))
                                               (:frontiers module)))]
-    (when-not (= residual-values frontier-values)
+    ;; The module orders frontiers by first use, independently of canonical primal outputs.
+    ;; Dependencies are value-ID keyed: prove a bijection, then preserve canonical publication
+    ;; order without rewriting the module's independently checked producer/lifetime evidence.
+    (when-not (and (= (count residual-values) (count (distinct residual-values)))
+                   (= (count frontier-values) (count (distinct frontier-values)))
+                   (= (count residual-values) (count frontier-values))
+                   (= (set residual-values) (set frontier-values)))
       (fail! :normalized-device-frontiers
-             "module frontiers must exactly preserve canonical residual order"
+             "module frontiers must correspond bijectively to canonical residual values"
              {:expected residual-values :actual frontier-values}))
     (check!)
-    {:module module :frontier-values frontier-values}))
+    {:module module :frontier-values residual-values}))
 
 (defn- functional-seed-binding!
   "Project the admitted seed transport without reconstructing derivative associations.
@@ -548,10 +558,10 @@
                       :active active-id :active-value active-value :primal primal-id :primal-value primal-value
                       :primal-abstract (get-in layout [:values primal-value :abstract])}))
             (when-not (and active-value primal-value
-                           (= [active-id] (:ids array-boundary))
-                           (= [active-value] (:values array-boundary)))
+                           (some #{active-id} (:ids array-boundary))
+                           (some #{active-value} (:values array-boundary)))
               (fail! :normalized-device-layout-interface
-                     "resident layout must expose exactly the canonical active array input"
+                     "resident layout must expose the canonical arrays and selected active input"
                      {:active active-id :active-value active-value
                       :primal primal-id :primal-value primal-value
                       :public-inputs (:public-inputs layout)})))
@@ -566,13 +576,21 @@
         transpose-bindings
         (into (assoc (:buffers seed) gradient-id gradient-value)
               (map (fn [id] [id (get compiler-bindings id)])) residual-ids)
+        transpose-request {:id ::transpose :target target :nodes nodes :values values
+                           :buffer-bindings transpose-bindings :scalar-values (:scalars seed)}
+        transpose-layout
+        (if caller-options
+          (invocation-link/complete-resident-buffer-layout
+           (:emitted transpose-compilation) transpose-request caller-options)
+          (invocation-link/complete-resident-buffer-layout
+           (:emitted transpose-compilation) transpose-request))
         bound (bind-module!
-               check! target caller-options nodes values
+               check! target caller-options (:nodes transpose-layout) (:values transpose-layout)
                {:compilation primal-compilation :buffer-bindings compiler-bindings
                 :scalar-values (:scalar-values layout)
                 :interface {:inputs (:values array-boundary) :state [] :outputs [primal-value]}}
                [{:instance-id ::transpose
-                 :compilation transpose-compilation :buffer-bindings transpose-bindings
+                 :compilation transpose-compilation :buffer-bindings (:buffer-bindings transpose-layout)
                  :scalar-values (:scalars seed)
                  :interface {:inputs (:inputs seed) :state [] :outputs [gradient-value]}}]
                residual-values)]
@@ -592,12 +610,7 @@
              "device preparation currently requires array-only residual storage"
              {:immutable-scalars (set (keys (:immutable-scalars residual-plan)))
               :physical-bindings (set (keys (:physical-bindings residual-plan)))}))
-    (let [bound (assemble-functional! checked (assoc interface :arrays [(:active interface)])
-                                      residual-plan arguments options {:transport :array})]
-      ;; Preserve the existing singleton map API; the shared binder uses ordered canonical ports.
-      (update bound :ports (fn [ports]
-                             (-> ports (dissoc :inputs)
-                                 (assoc :input (get-in ports [:inputs 0 :value]))))))))
+    (assemble-functional! checked interface residual-plan arguments options {:transport :array})))
 
 (defn- assemble-sum!
   [{:keys [owner] :as checked} arguments fixed-seed options]
@@ -796,19 +809,32 @@
                     :index index :extent limit}))))
       checked)))
 
+(defn- canonical-array-request!
+  "Project only canonical public array IDs. Prepared scalar arguments cannot be overridden."
+  [ports inputs]
+  (let [input-ports (:inputs ports)
+        expected (mapv :id input-ports)]
+    (when-not (and (map? inputs) (= (set expected) (set (keys inputs)))
+                   (= (count expected) (count inputs)))
+      (fail! :normalized-device-inputs
+             "primal inputs must exactly cover canonical array IDs"
+             {:expected expected :actual (when (map? inputs) (set (keys inputs)))}))
+    {:inputs (into {} (map (fn [{:keys [id value]}] [value (get inputs id)])) input-ports)}))
+
 (defn- instantiate-prepared!
   [{:keys [check! guard!]} {:keys [module frontier-values ports]} options family]
   (let [runtime-options (select-keys options [:scalar-math :profile?])
         runtime (link-module/instantiate! module runtime-options)]
     (try
       (check!)
-      (let [[primal! transpose!]
+      (let [pure-primal! (fn [inputs]
+                          (run-result! guard! runtime :primal
+                                       (canonical-array-request! ports inputs)
+                                       (:primal-output ports) frontier-values true))
+            [primal! transpose!]
             (case family
               :map
-              [(fn [input]
-                 (run-result! guard! runtime :primal
-                              {:inputs {(:input ports) input}}
-                              (:primal-output ports) frontier-values true))
+              [pure-primal!
                (fn [seed dependencies]
                  (run-result! guard! runtime :transpose
                               {:inputs {(:seed-input ports) seed}
@@ -816,20 +842,7 @@
                               (:gradient-output ports) frontier-values false))]
 
               :map-sum
-              [(fn [inputs]
-                 (let [input-ports (:inputs ports)
-                       expected (mapv :id input-ports)]
-                   (when-not (and (map? inputs) (= (set expected) (set (keys inputs)))
-                                  (= (count expected) (count inputs)))
-                     (fail! :normalized-device-inputs
-                            "map-sum primal inputs must exactly cover canonical array IDs"
-                            {:expected expected
-                             :actual (when (map? inputs) (set (keys inputs)))}))
-                   (run-result!
-                    guard! runtime :primal
-                    {:inputs (into {} (map (fn [{:keys [id value]}]
-                                             [value (get inputs id)])) input-ports)}
-                    (:primal-output ports) frontier-values true)))
+              [pure-primal!
                (fn [dependencies]
                  (run-result! guard! runtime :transpose {:dependencies dependencies}
                               (:gradient-output ports) frontier-values false))]
@@ -866,8 +879,11 @@
 
    This is an opt-in lease API, not a CPU-compatible function. `arguments` fix the canonical
    public scalar values and array geometry for the lifetime of the returned owner. `:primal!`
-   and `:transpose!` accept new exact primitive buffers, returning opaque leases whose outputs
-   remain device-resident. Callers must close every lease before invoking `:close!`.
+   takes an exact map from canonical array IDs to primitive buffers; :ports exposes ordered
+   :inputs descriptors. `:transpose!` takes an array seed and the primal dependency map.
+   One derivative input is active; multiple public arrays require positive static vector
+   geometry and an admitted pure-map source. Outputs remain resident behind opaque leases.
+   Callers must close every lease before invoking `:close!`.
 
    No default AD engine, cache, host readback, mutable state, map-sum or indexed-map path is
    activated by this boundary."

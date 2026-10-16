@@ -1133,6 +1133,13 @@ named-entry owner. It is deliberately not a CPU-compatible AD function: calls up
 input buffers and return opaque resident leases plus logical output IDs, with no host readback.
 The target is mandatory; this surface has no hardware-specific default.
 
+Pure-map primal calls use an exact map from canonical array IDs to primitive host buffers,
+including excluded coefficient arrays. The ordered `:ports :inputs` descriptors replace the old
+singleton `:input` port. Scalar arguments remain fixed at preparation. A finite multi-input map
+spine is admitted only with positive static vector geometry and one active array; dynamic
+multi-input geometry, contractions and multiple active derivative ports still refuse before
+device compilation. Repeated use of the active array retains canonical reverse accumulation.
+
 Canonical proof reconstruction is preparation-only, including the post-instantiation check.
 Resident replay retains the same pre/post compiler-epoch and effective-callee execution fences
 as the host normalized runtime. Hot closures capture only those fences, immutable port IDs and
@@ -1158,6 +1165,13 @@ returned nodes and values are allocation-request data, not initialized buffers o
 evidence: strict resident binding and the final LinkPlan/LinkModule still prove the complete
 storage boundary and ordered readiness. This generic facility alone does not widen any AD
 adapter's admitted programs.
+
+Private transpose map intermediates use the compiler's ordinary resident-layout completion;
+they have no initializer and must be completely produced before use. Cross-entry residuals
+retain an exact identity bijection between canonical producer outputs and module-owned
+frontiers. Canonical publication order need not equal the module's first-use traversal order;
+dependency leases are keyed by value identity, not position. Module producer, only-writer and
+ownership proofs remain authoritative.
 
 `prepare-sum-owner` adds one separately admitted canonical map→ordered-sum family. Preparation
 fixes the exactly typed scalar cotangent seed; transpose has no fake rank-zero input buffer and no
