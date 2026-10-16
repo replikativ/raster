@@ -754,6 +754,22 @@
     (let [{:keys [value alias]} (get value-facts id)]
       (if alias (recur alias (conj seen id)) (or value id)))))
 
+(defn- source-memory-scope
+  "Project actual forward state into a child construction scope. Visibility is
+   not the fact catalog; conditional replay obligations are not the replay set."
+  [{:keys [values value-facts aliases activity input-replay-conditions unprojectable]}]
+  (when-not (and (vector? values)
+                 (every? map? [value-facts aliases activity input-replay-conditions unprojectable]))
+    (throw (ex-info "Reverse AD child scope requires complete forward state"
+                    {:reason :ad-forward-scope})))
+  (assoc *source-memory-context*
+         :values values :value-facts value-facts :aliases aliases
+         :activity (merge-with #(or %1 %2) (:activity *source-memory-context*) activity)
+         :replayed (join-input-replay-conditions (:replayed *source-memory-context*)
+                                                input-replay-conditions)
+         :unprojectable (join-input-replay-conditions (:unprojectable *source-memory-context*)
+                                                      unprojectable)))
+
 (defn- record-replay-conditions
   "Project actual replay roots through exact aliases and retained declarations.
    Choice selectors are already evaluated; private child selectors never escape."
@@ -790,8 +806,9 @@
   ([conditions writes]
    (replay-input-guard-bindings conditions writes
                                 {:reason :ad-replayed-array-alias
-                                 :message "Reverse AD replay input aliases a later write"}))
-  ([conditions writes {:keys [reason message]}]
+                                 :message "Reverse AD replay input aliases a later write"
+                                 :include-same-value? true}))
+  ([conditions writes {:keys [reason message include-same-value?]}]
   (if (or (empty? conditions) (empty? writes))
     []
     (do
@@ -802,7 +819,7 @@
             value-facts (:value-facts *source-memory-context*)
             pairs (vec (for [read values :when (contains? conditions read)
                              write (sort-by str writes)
-                             :when (and (not= read write)
+                             :when (and (or include-same-value? (not= read write))
                                         (replay-write-compatible? value-facts read write))]
                          [read write (get conditions read)]))
             private-writes (set/difference (set (map second pairs)) (set values))]
@@ -852,6 +869,7 @@
       (replay-input-guard-bindings
        conditions writes
        {:reason :ad-unversioned-storage-alias
+        :include-same-value? false
         :message "Source reverse AD requires disjoint independently named writable storage"}))))
 
 (defn- assert-source-write-contract!
@@ -897,16 +915,11 @@
      (let [active?  (init-active? init-expr activity)
            activity (assoc activity sym active?)
            may-aliases #(memory/transitive-closure (set %) aliases)
-           ambient (join-input-replay-conditions (:replayed *source-memory-context*)
-                                                 input-replay-conditions)
-           unknown (join-input-replay-conditions (:unprojectable *source-memory-context*)
-                                                 unprojectable)
-           scope (assoc *source-memory-context* :values values :value-facts value-facts
-                                                :replayed ambient :unprojectable unknown
-                                                :aliases aliases
-                                                :activity (merge-with #(or %1 %2)
-                                                                      (:activity *source-memory-context*)
-                                                                      activity))
+           scope (source-memory-scope
+                  {:values values :value-facts value-facts :aliases aliases :activity activity
+                   :input-replay-conditions input-replay-conditions :unprojectable unprojectable})
+           ambient (:replayed scope)
+           unknown (:unprojectable scope)
            ;; Inactive choices can still change storage dependencies. Shared
            ;; effect analysis selects the existing scoped adapter conservatively;
            ;; it is not a freshness or derivative certificate.
@@ -1443,12 +1456,13 @@
   [norm-bindings active-params {:keys [seed-adj-env]}]
   (binding [util/*shadowing-locals* (into (into util/*shadowing-locals* active-params)
                                        (take-nth 2 norm-bindings))]
-    (let [{:keys [activity fwd-bindings records replayed writes value-facts]} (forward-pass norm-bindings active-params)
+    (let [{:keys [activity fwd-bindings records replayed writes value-facts] :as forward-state}
+          (forward-pass norm-bindings active-params)
           {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
           {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
       {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
        :rev-ctx rev-ctx :param-adj-syms param-adj-syms :replays replayed :writes writes
-       :value-facts value-facts})))
+       :value-facts value-facts :forward-scope (source-memory-scope forward-state)})))
 
 (declare gen-reverse-loop-with-let lift-loop-to-tail)
 
@@ -1461,13 +1475,13 @@
   representation; the latter must not allocate a closure per iteration."
   [bindings body-exprs active-params dy-sym]
   (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts]}
+        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope]}
         (process-bindings norm-bindings active-params
                           {:seed-adj-env {body-sym [dy-sym]}})]
     {:body-sym body-sym :dy dy-sym
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
-     :replays replays :writes writes :value-facts value-facts
+     :replays replays :writes writes :value-facts value-facts :forward-scope forward-scope
      :param-adj-syms param-adj-syms}))
 
 (defn- reverse-program-forms
@@ -2016,11 +2030,13 @@
         ;; hand-rolled copy lacked). This is what lets an array-valued INTERMEDIATE
         ;; produced in the let-prefix (e.g. a broadcast) and consumed by the loop
         ;; differentiate: its par/map! backward is now generated here.
-        {:keys [activity fwd-bindings records]} (forward-pass anf-bindings active-params)
+        {:keys [activity fwd-bindings records] :as forward-state}
+        (forward-pass anf-bindings active-params)
         let-active-syms (filterv #(get activity % false) (map first (partition 2 anf-bindings)))
         ;; Extended active set the loop sees: original params + active let-syms.
         loop-active (vec (distinct (concat active-params let-active-syms)))
-        loop-transform (gen-reverse-loop loop-form loop-active)
+        loop-transform (binding [*source-memory-context* (source-memory-scope forward-state)]
+                         (gen-reverse-loop loop-form loop-active))
         dy-sym 'dy__rad
         loop-vpb-sym (ad-gensym "lvpb")
         loop-val-sym (ad-gensym "lval")
