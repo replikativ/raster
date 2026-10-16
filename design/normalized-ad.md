@@ -1303,3 +1303,14 @@ recovery or AD's older scan materializer. Those must be consolidated together wh
 qualifying the existing reverse tape, stored-carry loops and compiler consumers.
 Explicit parallel combinators keep their separately certified algebra. General
 loop HVPs and normalized/default-engine activation remain independent gates.
+
+The source reverse loop tape also retains the terminal expression's pullback at
+the actual forward exit. A compound exit is linearized once in its lexical scope;
+backward seeding invokes that saved pullback rather than re-evaluating the primal.
+This preserves inactive scalar effects, saved observation reads, lazy exit branches,
+and nested binder identities. All terminal statements remain in source order through
+the shared ordered normalization. Only a returned loop carry takes the direct-seed
+fast path; a free parameter is differentiated as a terminal expression.
+Retaining this pullback does not make arbitrary captured mutable buffers safe:
+operations whose pullbacks replay buffer contents still need their existing
+memory contracts. Unsupported lexical regions continue to fail explicitly.
