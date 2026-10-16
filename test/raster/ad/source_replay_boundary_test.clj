@@ -95,11 +95,15 @@
       (is (= [6.0 3.0 nil nil]
              (gradient 2.0 (double-array [1.0 2.0]) (double-array [7.0 8.0]))))
       (check-refusal-before-write gradient)))
-  (check-refusal-before-write #(rev/vjp #'replay-then-external-write %1 %2 %3))
-  (let [[value pb] (rev/vjp #'replay-then-external-write 2.0
-                           (double-array [1.0 2.0]) (double-array [7.0 8.0]))]
-    (is (= 6.0 value))
-    (is (= 3.0 (first (pb 1.0))))))
+  ;; vjp differentiates every floating-array argument, including zs. Its write
+  ;; now requires a memory-version derivative even when the inputs are disjoint.
+  ;; value+grad's explicit :wrt [0] controls above retain the replay coverage.
+  (let [ys (double-array [1.0 2.0]) zs (double-array [7.0 8.0])]
+    (is (= :ad-active-storage-write
+           (try (rev/vjp #'replay-then-external-write 2.0 ys zs) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= [1.0 2.0] (vec ys)))
+    (is (= [7.0 8.0] (vec zs)))))
 
 (deftest legitimate-earlier-writes-remain-valid-for-identical-inputs
   (let [shared (double-array [1.0 2.0])]
