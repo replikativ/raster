@@ -763,11 +763,19 @@
         (:inputs *source-memory-context*)))
 
 (defn- replay-input-guard-bindings
-  "Retain a semantic check for external input pairs that could alias at runtime.
-   Only original whole primitive-array inputs are admitted here; this is not
-   an alias proof for unknown results, private child IDs or foreign views."
+  "Retain identity checks between replayed inputs and actual write destinations.
+   An unknown destination is not fresh. Only replay roots from original whole
+   primitive-array inputs are admitted; private replay IDs and foreign views
+   require separate ownership contracts."
   [conditions writes]
-  (vec
+  (when (and (seq conditions) (some (complement symbol?) writes))
+    (throw (ex-info "Reverse AD replay guard requires a normalized write destination"
+                    {:reason :ad-unclosed-write-target :destinations writes})))
+  (let [inputs (:inputs *source-memory-context*)
+        ;; Mutation analysis returns IDs without metadata. Recover an original
+        ;; parameter's declaration by exact ID, not by re-inferring its type.
+        input-facts (zipmap inputs inputs)]
+   (vec
    (mapcat
     (fn [[read write condition]]
       [(vary-meta (ad-gensym "_replay_alias_guard") assoc :raster.effect/effectful true)
@@ -779,12 +787,15 @@
                                       :input (list 'quote read) :write (list 'quote write)}))
                          nil)]
          (if (true? condition) guard (list 'if condition guard nil)))])
-    (for [read (:inputs *source-memory-context*) :when (contains? conditions read)
-          write (:inputs *source-memory-context*)
-          :when (and (contains? writes write) (not= read write)
-                     (= (get types/primitive-array-info (:raster.type/tag (meta read)))
-                        (get types/primitive-array-info (:raster.type/tag (meta write)))))]
-      [read write (get conditions read)]))))
+    (for [read inputs :when (contains? conditions read)
+          write (sort-by str writes)
+          :let [read-class (get types/primitive-array-info (:raster.type/tag (meta read)))
+                write-class (get types/primitive-array-info
+                                 (:raster.type/tag (meta (get input-facts write write))))]
+          :when (and (not= read write)
+                     ;; Missing retained evidence cannot prove incompatibility.
+                     (or (nil? read-class) (nil? write-class) (= read-class write-class)))]
+      [read write (get conditions read)])))))
 
 (defn- forward-pass
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
@@ -803,10 +814,9 @@
                                                  input-replay-conditions)
            ;; Gradient-inactive choices can still invalidate earlier residuals.
            ;; Use the existing scoped choice adapter, not a unioned parent guard,
-           ;; when an external replay obligation reaches a possible input write.
+           ;; when an external replay obligation reaches a possible write.
            kind (if (and (seq ambient) (seq? init-expr) (= 'if (first init-expr))
-                         (seq (set/intersection (set (:inputs *source-memory-context*))
-                                                (may-aliases (written-syms init-expr)))))
+                         (seq (written-syms init-expr)))
                   :if
                   (ad-form-kind init-expr active? sym))
            {:keys [record fwd-patch]}
@@ -850,7 +860,7 @@
                            ;; Place checks at the actual primitive write, not
                            ;; before a choice/loop from its unioned footprint.
                            (if-let [destination (op/aset-array-sym init-expr)]
-                             (may-aliases #{destination}) #{}))
+                             #{destination} #{}))
            fwd (into (into fwd-bindings guard-bindings)
                      [sym (qualify-fwd-expr init-expr)])]
        (when overwritten
