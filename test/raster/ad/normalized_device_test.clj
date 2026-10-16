@@ -35,27 +35,32 @@
    (normalized/linearize-map-program
     (map-program body) (the-ns 'raster.ad.normalized-device-test))))
 
-(defn- three-boundary-owner []
-  (let [tensor (av/tensor {:dtype :float :shape '[n]})
+(defn- three-boundary-owner
+  ([] (three-boundary-owner 'n false))
+  ([extent repeated?]
+  (let [tensor (av/tensor {:dtype :float :shape [extent]})
         n (av/tensor {:dtype :long :shape []})
         equation (fn [id output arrays parameters body]
                    (list '= id [output]
-                         (list 'map {:index 'i :extent 'n} arrays []
+                         (list 'map {:index 'i :extent extent} arrays []
                                (soac/lambda-form parameters [] [body]))))
-        equations [(equation 'pair 'a '[x q] '[left right]
-                             '(raster.numeric/* left right))
-                   (equation 'finish 'y '[a r] '[left right]
-                             '(raster.numeric/* left right))]
+        equations (if repeated?
+                    [(equation 'pair 'a '[x q] '[left right] '(raster.numeric/- left right))
+                     (equation 'reuse 'b '[a x] '[left right] '(raster.numeric/* left right))
+                     (equation 'finish 'y '[b r] '[left right] '(raster.numeric/* left right))]
+                    [(equation 'pair 'a '[x q] '[left right] '(raster.numeric/* left right))
+                     (equation 'finish 'y '[a r] '[left right] '(raster.numeric/* left right))])
         source (soac/make
                 (soac/default-program-facts
-                 {:values {'n n 'x tensor 'q tensor 'r tensor 'a tensor 'y tensor}
-                  :inputs '[n x q r]
-                  :equations {'pair (soac/default-equation-facts)
-                              'finish (soac/default-equation-facts)}})
+                 {:values (cond-> {'x tensor 'q tensor 'r tensor 'a tensor 'y tensor}
+                            (symbol? extent) (assoc extent n)
+                            repeated? (assoc 'b tensor))
+                  :inputs (if (symbol? extent) [extent 'x 'q 'r] '[r q x])
+                  :equations (into {} (map #(vector (second %) (soac/default-equation-facts)) equations))})
                 equations '[y])]
     (canonical/adapt-map
      (normalized/linearize-map-chain-program
-      source (the-ns 'raster.ad.normalized-device-test) {:active-input 'r}))))
+      source (the-ns 'raster.ad.normalized-device-test) {:active-input (if repeated? 'x 'r)})))))
 
 (defn- diamond-owner []
   (let [base (map-program '(raster.numeric/* element element))
@@ -226,7 +231,7 @@
             seed-abstract (get-in @captured-module [:spine :values (:seed-input ports) :abstract])
             gradient-abstract
             (get-in @captured-module [:spine :values (:gradient-output ports) :abstract])
-            primal ((:primal! prepared) (float-array [2.0 3.0 4.0]))
+            primal ((:primal! prepared) {'x (float-array [2.0 3.0 4.0])})
             transpose ((:transpose! prepared) (float-array [1.0 1.0 1.0]) {})
             extra-dependencies {::extra (:lease primal)}
             extra ((:transpose! prepared) (float-array [2.0 2.0 2.0])
@@ -273,8 +278,13 @@
             preparation-validations @validations]
         (try
           (is (pos? preparation-validations))
+          (doseq [invalid [(float-array [2.0 3.0 4.0]) {}
+                           {'x (float-array [2.0 3.0 4.0]) 'n 3}
+                           {'x (float-array [2.0 3.0 4.0]) 'extra (float-array 3)}]]
+            (is (= :normalized-device-inputs (reason #((:primal! prepared) invalid)))))
+          (is (zero? @runs))
           (dotimes [_ 2]
-            (let [primal ((:primal! prepared) (float-array [2.0 3.0 4.0]))
+            (let [primal ((:primal! prepared) {'x (float-array [2.0 3.0 4.0])})
                   transpose ((:transpose! prepared) (float-array [1.0 2.0 3.0])
                              (:dependencies primal))]
               (.close ^java.io.Closeable (:lease transpose))
@@ -339,7 +349,7 @@
       (is (zero? @compiles))
       (is (zero? @instantiations)))))
 
-(deftest multi-array-nodewise-map-refuses-before-device-compilation-or-instantiation
+(deftest dynamic-multi-array-map-refuses-before-device-compilation-or-instantiation
   (let [owner (three-boundary-owner)
         compiles (atom 0)
         instantiations (atom 0)
@@ -374,7 +384,7 @@
                       owner (arguments owner (float-array [1.0 2.0 3.0]))
                       {:target :ocl:normalized-device :schedule {:precision :f32-scalar}})]
         (is (= :ad-normalized-stale-rules
-               (reason #((:primal! prepared) (float-array [2.0 3.0 4.0])))))
+               (reason #((:primal! prepared) {'x (float-array [2.0 3.0 4.0])}))))
         (is (= 1 @runs))
         (is (= 1 @closes))
         ((:close! prepared))))))
@@ -392,7 +402,7 @@
                       {:target :ocl:normalized-device :schedule {:precision :f32-scalar}})]
         (with-redefs [numeric/* (fn [& _] (float 999.0))]
           (is (= :ad-normalized-execution-callee
-                 (reason #((:primal! prepared) (float-array [2.0 3.0 4.0]))))))
+                 (reason #((:primal! prepared) {'x (float-array [2.0 3.0 4.0])})))))
         (is (zero? @runs))
         ((:close! prepared))))))
 
@@ -411,7 +421,7 @@
                       owner (arguments owner xs)
                       {:target target :schedule {:precision :f32-scalar}})]
         (try
-          (let [primal ((:primal! prepared) xs)
+          (let [primal ((:primal! prepared) {'x xs})
                 primal-lease (:lease primal)]
             (try
               (is (= (bits (primal-oracle xs-values))
@@ -438,11 +448,70 @@
                              (:dependencies primal))))))
           (let [changed-values [1.0 2.0 -4.0]
                 changed (float-array (map float changed-values))
-                primal ((:primal! prepared) changed)]
+                primal ((:primal! prepared) {'x changed})]
             (try
               (is (= (bits (primal-oracle changed-values))
                      (bits (download @captured (:lease primal) (:output-id primal) 3))))
               (finally (.close ^java.io.Closeable (:lease primal)))))
+          (finally ((:close! prepared))))))))
+
+(defn- run-static-multi-array-case! [target]
+  (let [owner (three-boundary-owner 3 true)
+        captured (atom nil)
+        instantiate link-module/instantiate!
+        initial {'r (float-array [2.0 -0.5 1.0]) 'q (float-array [0.5 -1.0 2.0])
+                 'x (float-array [-2.0 0.5 3.0])}]
+    (is (= 3 (count (get-in owner [:derivation :bundle :map-programs :proof :nodes]))))
+    (with-redefs [link-module/instantiate!
+                  (fn [module options]
+                    (let [runtime (instantiate module options)]
+                      (reset! captured runtime) runtime))]
+      (let [prepared (device/prepare-owner
+                      owner (mapv #(get initial (:id %)) (get-in owner [:interface :inputs]))
+                      {:target target :schedule {:precision :f32-scalar}})]
+        (try
+          (is (= '[r q x] (mapv :id (get-in prepared [:ports :inputs]))))
+          (is (not (contains? (:ports prepared) :input)))
+          (doseq [xs [[-2.0 0.5 3.0] [1.25 -1.0 2.0]]]
+            (let [rs [2.0 -0.5 1.0] qs [0.5 -1.0 2.0]
+                  inputs {'r (float-array rs) 'q (float-array qs) 'x (float-array xs)}
+                  primal ((:primal! prepared) inputs)
+                  base (mapv #(float (- (float %1) (float %2))) xs qs)
+                  expected (mapv #(fmul (fmul %1 %2) %3) base xs rs)]
+              (try
+                ;; Blocking download observes completion before host input mutation.
+                (is (= (bits expected) (bits (download @captured (:lease primal) (:output-id primal) 3))))
+                (doseq [array (vals inputs)] (java.util.Arrays/fill ^floats array (float 99.0)))
+                (is (= :link-module-runtime-lease-active
+                       (reason #((:primal! prepared) inputs))))
+                (doseq [seeds [[0.5 -0.25 2.0] [-1.0 1.0 0.125]]]
+                  (let [seed (float-array seeds)
+                        ;; Reverse source order: direct x use, then the path through x-q.
+                        oracle (mapv (fn [s r x p]
+                                       (let [cotangent (fmul s r)]
+                                         (fadd (fmul cotangent p) (fmul cotangent x)))) seeds rs xs base)
+                        transpose ((:transpose! prepared) seed (:dependencies primal))]
+                    (try
+                      (let [actual (vec (download @captured (:lease transpose) (:output-id transpose) 3))
+                            loss (fn [xvalues]
+                                   (reduce + (map (fn [s r x q] (* s r (- x q) x))
+                                                  seeds rs xvalues qs)))
+                            epsilon 1.0e-5
+                            differences
+                            (mapv (fn [i]
+                                    (/ (- (loss (update xs i + epsilon))
+                                          (loss (update xs i - epsilon)))
+                                       (* 2.0 epsilon))) (range 3))]
+                        (is (= (bits oracle) (bits actual)))
+                        (is (every? (fn [[a b]] (< (abs (- (double a) (double b))) 1.0e-5))
+                                    (map vector actual differences))))
+                      (is (= seeds (mapv double seed)))
+                      (finally (.close ^java.io.Closeable (:lease transpose))))))
+                (is (= :link-module-runtime-dependencies
+                       (reason #((:transpose! prepared) (float-array [1.0 1.0 1.0]) {}))))
+                (finally (.close ^java.io.Closeable (:lease primal))))
+              (is (= :link-module-runtime-lease-released
+                     (reason #((:transpose! prepared) (float-array [1.0 1.0 1.0]) (:dependencies primal)))))))
           (finally ((:close! prepared))))))))
 
 (defn- run-device-families! [target]
@@ -453,7 +522,8 @@
   (run-device-case!
    target (diamond-owner)
    (fn [xs] (mapv #(let [a (fmul % %)] (fadd (fmul a 2.0) (fmul a 3.0))) xs))
-   (fn [xs seeds] (mapv #(fmul (fmul 10.0 %1) %2) xs seeds))))
+   (fn [xs seeds] (mapv #(fmul (fmul 10.0 %1) %2) xs seeds)))
+  (run-static-multi-array-case! target))
 
 (deftest normalized-device-owner-runs-on-opencl
   (if @ocl-probe/opencl-available?
