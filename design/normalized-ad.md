@@ -1493,3 +1493,27 @@ interpret a type declaration as an alias/lifetime proof. For a flattened `do`,
 the selected result supplies the value declaration, not the enclosing region's
 stamp. This closes two declaration-loss seams, not all normalization metadata
 paths or the opaque memory/version boundaries above.
+
+### Source prefix-to-loop scope
+
+The current tape-based loop builder inherits the completed prefix's checked
+forward scope, not just its list of differentiated arguments. A shared scope
+projection is used both for per-binding recursion and for completed prefixes.
+It keeps lexical `:values` distinct from the larger `:value-facts` catalog,
+preserves positive aliases and inherited activity, and joins conditional
+`:input-replay-conditions` into the child's ambient replay map. The forward
+`:replayed` set is a separate static summary, never a replacement for those
+conditions. Process/binding pieces expose the completed scope for composition.
+
+Replay fences also include a write to the very same SSA object: a child scope
+must not assume an enclosing static fence already checked it. Such runtime
+checks remain conditional and execute at the child write. A zero-trip loop
+executes no check or write; an unselected prefix replay arm imposes no false
+obligation. Existing static overwrite diagnostics retain their precedence.
+Activity/disjointness checks still exclude self-pairs explicitly: a new output
+is not required to be distinct from itself.
+
+This closes a measured prefix-reduction/loop-write error that returned gradient
+9 instead of 3 by replaying overwritten contents. The hazard now refuses before
+the write; it is not newly supported mutation AD. No joint loop-step builder,
+new raw-loop admission, tape representation or held loop adapter is activated.
