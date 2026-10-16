@@ -1474,7 +1474,9 @@
 
         ;; Determine which loop var is the result
         ;; (result-expr should be a loop var symbol)
-        result-var (when (symbol? result-expr) result-expr)
+        result-var (when (and (symbol? result-expr)
+                              (some #{result-expr} loop-syms))
+                     result-expr)
 
         ;; === Per active-loop-var transform data ===
         ;; For each active loop var, gen-reverse-let transforms its update expr.
@@ -1483,6 +1485,14 @@
         ;; in recur-bindings (e.g. aget W i) can reference loop counters like i.
         ;; Non-active loop vars get nil gradients which are harmlessly discarded.
         iter-active (vec (distinct (concat active-loop-vars active-params)))
+
+        ;; Linearize the exit where it actually executes. Re-running its primal
+        ;; in the pullback would repeat inactive effects and reread mutable data.
+        terminal-pair-sym (ad-gensym "terminal_vpb")
+        terminal-transform
+        (when-not result-var
+          (let [[bindings body] (extract-let-parts (hoist-nested-lets result-expr))]
+            (gen-reverse-let bindings body iter-active)))
 
         per-var-data
         (mapv (fn [lv]
@@ -1545,11 +1555,14 @@
 
               body (list 'let* transform-bindings
                          (list 'do store-expr (cons 'recur new-recur-args)))
-              ;; For compound result expressions, return all loop vars + result
-              ;; so the pullback can differentiate through the result expression.
+              ;; Keep the exit pullback beside its primal on the existing tape.
               terminal-expr (if result-var
                               result-expr
-                              (cons 'vector (concat loop-syms [result-expr])))]
+                              (list 'let* [terminal-pair-sym terminal-transform]
+                                    (cons 'vector
+                                          (concat loop-syms
+                                                  [(list 'nth terminal-pair-sym 0)
+                                                   (list 'nth terminal-pair-sym 1)]))))]
           (if recur-in-then?
             (list 'if test-expr body terminal-expr)
             (list 'if test-expr terminal-expr body)))
@@ -1634,69 +1647,21 @@
                                  (concat new-d-lv-exprs new-d-param-exprs))]
             (list 'let* all-bindings (cons 'recur recur-args))))
 
-        ;; === Compound result expression differentiation ===
-        ;; When result-expr is not a simple loop var, the forward loop returns
-        ;; [lv0 lv1 ... result-value]. The pullback must:
-        ;; 1. Bind final loop var values from the forward return vector
-        ;; 2. Differentiate result-expr (with final loop vars substituted)
-        ;; 3. Use the resulting adjoints to seed the backward loop
+        ;; Seed the backward recurrence with the saved exit pullback. Its
+        ;; closure captures final carry values without substituting source forms.
         n-loop-syms (count loop-syms)
 
         result-seed
         (when-not result-var
-          (let [;; Gensyms for the final loop var values (accessible in pullback)
-                final-lv-syms (mapv (fn [lv] (ad-gensym (str "final_" (name lv))))
-                                    loop-syms)
-                ;; Substitute loop-var names in result-expr with final-lv gensyms.
-                ;; CAPTURE-AVOIDING (util/subst-syms, not walk/postwalk-replace):
-                ;; the result branch may contain a NESTED loop that rebinds the
-                ;; same loop-var names (two inlined copies of the same deftm — e.g.
-                ;; two attention blocks — share `[hq acc]`). A blind postwalk would
-                ;; rewrite the inner loop's own binders/refs → variable capture →
-                ;; corrupt backward (IndexOutOfBounds / wrong grads). subst-syms
-                ;; respects shadowing: the inner rebinding stops the substitution.
-                lv-subst (zipmap loop-syms final-lv-syms)
-                subst-result (util/subst-syms lv-subst result-expr)
-                ;; Differentiate the substituted result-expr w.r.t. iter-active
-                ;; (active loop vars + active params), using final-lv names
-                subst-iter-active (mapv #(get lv-subst % %) iter-active)
-                res-sym (ad-gensym "res")
-                ;; Lift any nested let* bindings out of subst-result so AD can
-                ;; process each binding as a separate record. If we leave the
-                ;; let* opaque, gen-reverse-let's Phase 1 doesn't know how to
-                ;; record it (the call dispatch falls through with no template
-                ;; for `let*`), Phase 2 has no records, no contributions flow,
-                ;; and Phase 3 fires every param adjoint with the no-contribs
-                ;; default — the gradient w.r.t. the loop's final value never
-                ;; gets computed. Recurse through nested lets to handle deeply
-                ;; nested cases produced by inlining.
-                [lifted-bindings final-result]
-                (loop [expr subst-result acc []]
-                  (if (and (seq? expr) (#{'let 'let*} (first expr)))
-                    (let [[_ binds & body] expr
-                          last-body (last body)]
-                      (recur last-body (into acc binds)))
-                    [acc expr]))
-                res-bindings (vec (concat lifted-bindings [res-sym final-result]))
-                res-transform (gen-reverse-let res-bindings [res-sym] subst-iter-active)
-                ;; At pullback time: call the result pullback with dy__rad
-                rvpb-sym (ad-gensym "rvpb")
-                rpb-sym (ad-gensym "rpb")
+          (let [rpb-sym (ad-gensym "rpb")
                 rg-sym (ad-gensym "rgrads")
-                ;; Per-symbol seed gensyms for the backward loop init
                 lv-seed-syms (mapv (fn [lv] (ad-gensym (str "seed_" (name lv))))
                                    active-loop-vars)
                 param-seed-syms (mapv (fn [p] (ad-gensym (str "seed_" (name p))))
                                       active-params)]
-            {:final-lv-syms final-lv-syms
-             :pullback-bindings
+            {:pullback-bindings
              (vec (concat
-                   ;; Bind final loop var values from the forward return vector
-                   (mapcat (fn [i s] [s (list 'nth loop-result-sym i)])
-                           (range) final-lv-syms)
-                   ;; Differentiate result expr and call pullback
-                   [rvpb-sym res-transform
-                    rpb-sym (list 'nth rvpb-sym 1)
+                   [rpb-sym (list 'nth loop-result-sym (inc n-loop-syms))
                     rg-sym (list rpb-sym 'dy__rad)]
                    ;; Extract per-symbol seeds
                    (mapcat (fn [i s] [s (list 'nth rg-sym i)])
@@ -1775,7 +1740,7 @@
         ;; both forward (which .add's to it) and backward (which .get/.size's it).
         ;; No shadowing, no destructuring — alpha-rename sees one binding.
         ;; For compound result expressions, the forward loop returns a vector
-        ;; [lv0 lv1 ... result-value]; extract the result as the last element.
+        ;; [lv0 lv1 ... result-value result-pullback]; expose only the primal.
         result-value-expr (if result-var
                             loop-result-sym
                             (list 'nth loop-result-sym n-loop-syms))]
