@@ -75,7 +75,7 @@
                    (raster.numeric/+ a x))]]
     (let [[bindings body] (#'reverse/extract-let-parts form)
           closure (reverse/call-with-shared-ad-gensym
-                   #(#'reverse/gen-reverse-let-core bindings body ['x 'y]))
+                   #(:form (#'reverse/gen-reverse-let-program-core bindings body ['x 'y])))
           reified (reverse/reify-pullback form ['x 'y])]
       (is (= closure (:standard-form reified)) (str form))
       (is (= '[x y] (:active-params reified)))

@@ -1458,6 +1458,18 @@
      {:rev-ctx rev-ctx :param-adj-syms []}
      active-params)))
 
+(defn- reverse-program-projection
+  "Project one output seed environment through an already checked forward
+   program. Does not normalize or execute another forward pass. Replay facts
+   remain raw here; the owning composition closes them over its alias graph."
+  [{:keys [records activity]} active-params seed-adj-env]
+  (let [{:keys [adj-env rev-ctx pullback-replays]}
+        (reverse-pass records activity seed-adj-env)
+        {:keys [rev-ctx param-adj-syms]}
+        (collect-param-adjoints active-params adj-env rev-ctx)]
+    {:adj-env adj-env :rev-ctx rev-ctx :param-adj-syms param-adj-syms
+     :pullback-replays pullback-replays}))
+
 (defn- process-bindings
   "The shared engine: run Phases 1-3 over a NORMALIZED binding vector and return
   the raw pieces. Pure — no atoms. Wrappers assemble their own output shape.
@@ -1467,8 +1479,8 @@
                                        (take-nth 2 norm-bindings))]
     (let [{:keys [activity fwd-bindings records replayed writes value-facts] :as forward-state}
           (forward-pass norm-bindings active-params)
-          {:keys [adj-env rev-ctx pullback-replays]} (reverse-pass records activity seed-adj-env)
-          {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
+          {:keys [adj-env rev-ctx pullback-replays param-adj-syms]}
+          (reverse-program-projection forward-state active-params seed-adj-env)]
       {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
        :rev-ctx rev-ctx :param-adj-syms param-adj-syms :replays replayed :writes writes
        :value-facts value-facts :forward-scope (source-memory-scope forward-state)
@@ -1520,9 +1532,6 @@
      ;; Positive MAY identity, including private IDs, never exact :alias evidence.
      :result-aliases (memory/transitive-closure #{(:body-sym pieces)} aliases)}))
 
-(defn- gen-reverse-let-core [bindings body-exprs active-params]
-  (:form (gen-reverse-let-program-core bindings body-exprs active-params)))
-
 (defn- gen-inline-step-gradients
   "Emit a closure-free scalar-step pullback inside an enclosing ordered loop.
   The caller has already bound `adjoint`; every primal and reverse binding is
@@ -1542,7 +1551,7 @@
   engine (`ad-record :loop` fails loud): only a loop in TAIL position is
   differentiable (via `lift-loop-to-tail` → `gen-reverse-loop-with-let`).
   A SECOND raw loop composed in series lands as a mid-let binding inside the FIRST loop's
-  result-branch continuation (gen-reverse-loop*'s compound-result path funnels
+  result-branch continuation (gen-reverse-loop-program*'s compound-result path funnels
   that continuation here) — where the tail-lift was never re-applied.
 
   So when a binding init is an ACTIVE raw loop, lift the first such loop to
@@ -1684,7 +1693,6 @@
     (filterv @active-set loop-syms)))
 
 (declare gen-reverse-loop-with-let)
-(declare gen-reverse-loop*)
 (declare gen-reverse-loop-program*)
 (declare hoist-nested-lets)
 
@@ -2090,9 +2098,6 @@
                  loop-result-sym forward-loop-form]
           (vector result-value-expr pullback-code))}))
 
-(defn- gen-reverse-loop* [loop-form active-params]
-  (:form (gen-reverse-loop-program* loop-form active-params)))
-
 (defn- gen-reverse-loop-with-let-program
   "Handle (let* [bindings...] (loop ...)) by wrapping the let bindings
   around the loop and composing pullbacks.
@@ -2109,7 +2114,7 @@
         ;; hand-rolled copy lacked). This is what lets an array-valued INTERMEDIATE
         ;; produced in the let-prefix (e.g. a broadcast) and consumed by the loop
         ;; differentiate: its par/map! backward is now generated here.
-        {:keys [activity fwd-bindings records] :as forward-state}
+        {:keys [activity fwd-bindings] :as forward-state}
         (forward-pass anf-bindings active-params)
         let-active-syms (filterv #(get activity % false) (map first (partition 2 anf-bindings)))
         ;; Extended active set the loop sees: original params + active let-syms.
@@ -2126,8 +2131,8 @@
         ;; (bound at pullback-call time as `loop-grads-sym`).
         seed-adj-env (into {} (map-indexed (fn [i s] [s [(list 'nth loop-grads-sym i)]])
                                            loop-active))
-        {:keys [adj-env rev-ctx pullback-replays]} (reverse-pass records activity seed-adj-env)
-        {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)
+        {:keys [rev-ctx pullback-replays param-adj-syms]}
+        (reverse-program-projection forward-state active-params seed-adj-env)
         aliases (merge-with into (:aliases forward-state) (:aliases loop-program))]
     ;; Assemble: forward let-prefix + loop + composed pullback.
     {:writes (into (:writes forward-state) (:writes loop-program))
