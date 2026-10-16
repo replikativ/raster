@@ -10,7 +10,7 @@ cross-cutting parts of this campaign, not competing replacements for it.
 
 ### October 16 continuation
 
-The next bounded normalized host AD composition attaches an exact terminal ordered sum
+The bounded normalized host AD composition now attaches an exact terminal additive sum
 to an already-admitted canonical multi-equation pure producer. It reuses producer JVP/VJP,
 owned residuals and the existing sum checks; a retained typed seed-broadcast equation joins
 the transpose through the ordinary pure-spine composer. Independent controls cover both
@@ -18,6 +18,21 @@ contraction operands, nonsquare cotangent geometry, finite differences, repeated
 map-node accumulation, changed inputs/seeds, mutation and replay/refusal. Direct map→sum
 semantics remain unchanged. This is not general graph AD, device activation or default-engine
 migration; product→sum without a map and scalar-active longer producers remain held.
+
+The next resident slice composes canonical static producers with that scalar loss through the
+existing sum adapter. Maps and explicitly marked fresh bilinear contractions share the phase
+assembler, ordinary storage projection, strict binder, residual frontiers and lease owner.
+Each marked primal/JVP/transpose independently reprojects its own axes, body, storage and
+numerical contract. Unmarked contractions refuse before compilation; host-owned scalar losses
+still fail ordinary resident promotion. Both selected contraction operands, both ABI orders and
+a repeated-input three-node map producer are checked without allocation. OpenCL and Level Zero
+exercise changed inputs, post-completion mutation, gradient checkpoints and lease failures.
+No default-engine migration or model acceptance follows from this bounded composition.
+
+Numerical evidence distinguishes source-expression order from target reduction association:
+the retained checked commutative monoid permits a terminal Float tree, but does not authorize
+factoring scalar/map or reverse-contribution checkpoints. A non-exact three-term fixture checks
+every legal permutation and binary addition tree without tolerance or schedule assumptions.
 
 The Gemma gate remains open. Same-device-input controls now narrow two GELU leaves:
 the selected fused add→GELU forward is bit-identical on all 4096 elements, while the

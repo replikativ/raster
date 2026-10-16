@@ -73,7 +73,7 @@ The original mixed source has an empty program arithmetic scope with an explicit
 contract. Shared composition preserves every operation's effective policy rather than rewriting
 the scope to force admission. Generated derivative phases use existing TypedSOAC operations and
 host materialization. Batched/dynamic/empty contractions, maps before the product, fan-out,
-multiple products, multiple active operands and resident device execution remain refused; the map-only entry
+multiple products, multiple active operands and standalone resident contraction AD remain refused; the map-only entry
 and default source AD engine are unchanged. The historical internal `:map-programs` facet
 holds the checked phases; it is not a second contraction runtime. Float tests qualify host
 precision checkpoints, not bitwise agreement with arbitrary BLAS or device schedules.
@@ -84,8 +84,8 @@ each phase's operand AxisMaps, reduction fiber, numerical scope, read capacities
 self-result. A dense regrouping of cotangent axes must preserve flat addresses. Intent is not
 a geometry certificate: ordinary scheduled contraction validation still checks the emitted
 body and schedule, and canonical validation reconstructs the complete derivative phases.
-Unmarked host sources retain their existing behavior. This enables ordinary compilation of
-the marked phases, not resident AD execution, general frontend physical destinations or
+Unmarked host sources retain their existing behavior. By itself this enables ordinary phase
+compilation, not resident AD execution, general frontend physical destinations or
 activation of the default AD engine.
 
 Compiler-generated pure TypedSOAC programs can acquire an exact source-free invocation boundary
@@ -404,7 +404,11 @@ The original two-equation source and generated programs stay exact. Tangent inpu
 array, while primal/tangent results and the explicit cotangent seed have the retained scalar
 Float/Double space. Residual producer bindings still name the original tuple-map outputs;
 physical obligations remain empty. The existing sum authority retains the initializer, actual
-step, dtype and operand/iteration order; algebra metadata grants no reassociation permission.
+step, dtype and operand/iteration order in the generated IR. AD adds no reassociation itself;
+the retained, independently revalidated commutative reduction certificate separately permits
+the backend's Float/Double tree schedule. This does not authorize rewrites within map/scalar
+steps or change reverse contribution checkpoints. A certified device sum is not a promise of
+bitwise equality with the sequential host fallback.
 No sum runtime selector, broadcast seed array, fusion or new derivative rule is added. Indexed
 canonical migration, further equation composition, exact SFT and the unchanged FAILED Gemma
 gate (11/28) remain open.
@@ -1194,6 +1198,17 @@ shared certified resident-reduction representation, while ordered owned-array re
 private dependency frontiers. Transpose takes only that exact dependency map and publishes a fresh
 gradient lease. The same binder, LinkPlan/LinkModule validation, named-entry owner, epoch fences and
 cleanup path are used by both families.
+
+The same sum adapter also accepts an already canonical longer producer with positive static
+vector array/gradient geometry and one active array. Producer operations must be maps or fresh
+contractions carrying the exact retained contract intent in both source and derivative phases.
+The scalar loss must independently qualify for ordinary resident promotion: an explicitly
+host-owned scalar still refuses. Unmarked contractions refuse before compilation; no source
+facets are stripped or inferred from numerical policy. These producers use the same phase
+assembler, pure-map intermediate storage completion, residual frontiers and lease runtime.
+There is no new contraction allocator, derivative rule, evaluator or general-DAG capability;
+unsupported storage refinements remain ordinary compiler refusals. A single map→sum retains
+its existing dynamic geometry behavior.
 
 `prepare-indexed-owner` adds one positive fixed-preparation-geometry indexed-map family. Its public primal
 boundary is the canonical ordered pair of excluded Int/Long indices and active Float/Double data.

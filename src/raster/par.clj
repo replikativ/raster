@@ -150,7 +150,10 @@
 (defmacro reduce
   "Parallel reduction. When compiled (eval'd), expands to a plain
   sequential loop. The compiler pipeline's backend pass uses
-  int-counted loop* for optimization.
+  int-counted loop* for optimization. A checked commutative-monoid certificate permits
+  compiled parallel schedules to regroup and interleave operands; floating addition and
+  multiplication therefore need not match the sequential fallback bitwise. This does not
+  authorize changing the arithmetic within an element computation.
 
   Form: (raster.par/reduce acc init idx bound body-expr)
   Semantics: acc = init; for idx in 0..bound: acc = body; return acc"

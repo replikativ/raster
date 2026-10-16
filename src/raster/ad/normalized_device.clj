@@ -119,10 +119,28 @@
      :primal primal :seed seed :gradient gradient}))
 
 (defn- sum-interface! [owner]
-  (let [kinds (mapv soac/operation-kind (soac/equations (:source owner)))
-        _ (when-not (= '[map reduce] kinds)
+  (let [equations (vec (soac/equations (:source owner)))
+        kinds (mapv soac/operation-kind equations)
+        legacy? (= '[map reduce] kinds)
+        ;; Canonical validation owns topology, derivatives and storage correspondence. This
+        ;; only restricts the resident execution slice; intent is never inferred from math.
+        supported-producer?
+        (fn [equation]
+          (case (soac/operation-kind equation)
+            map true
+            segmented-reduce (= :raster.par/contract
+                                (get-in (soac/operation-parts equation)
+                                        [:attributes :attributes :source-operation]))
+            false))
+        producer-sum? (and (< 2 (count equations)) (= 'reduce (peek kinds))
+                           (every? supported-producer? (pop equations))
+                           (every? supported-producer?
+                                   (filter #(= 'segmented-reduce (soac/operation-kind %))
+                                           (mapcat #(soac/equations (get owner %))
+                                                   [:primal :linear :transpose]))))
+        _ (when-not (or legacy? producer-sum?)
             (fail! :normalized-device-interface
-                   "resident sum preparation currently requires the verified single-map reduction slice"
+                   "resident sum preparation requires verified maps or marked contractions and a certified additive loss"
                    {:operations kinds}))
         interface (:interface owner)
         {:keys [inputs active-id active tangent primal seed gradient]}
@@ -132,6 +150,8 @@
         scalars (filterv #(empty? (get-in % [:value :shape])) inputs)]
     (when-not (and (= 1 (count active-ids)) active
                    (some #(= active-id (:id %)) arrays)
+                   (or legacy?
+                       (every? (comp static-positive-vector? :value) (conj arrays gradient)))
                    (= (count inputs) (+ (count arrays) (count scalars)))
                    (empty? (get-in primal [:value :shape]))
                    (empty? (get-in seed [:value :shape])))
@@ -901,7 +921,10 @@
      (instantiate-prepared! checked assembled options :map)))
 
 (defn prepare-sum-owner
-  "Prepare one canonical map→ordered-sum owner with a fixed typed cotangent seed.
+  "Prepare a canonical producer→certified-sum owner with a fixed typed cotangent seed.
+
+   A single map retains its existing geometry support. Longer producers require positive
+   static vector arrays and may contain maps or explicitly marked canonical contractions.
 
    `arguments` specialize all canonical arrays/scalars and are discarded after resident layout
    projection. `:primal!` accepts an exact map from every canonical array ID to a primitive host
