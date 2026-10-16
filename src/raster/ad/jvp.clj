@@ -15,8 +15,9 @@
   decomposition; jvp only consumes reverse's shared pieces (ad-prepare,
   resolve-deftm-var, grad-acc as the ⊕ kernel).
 
-  Double-carry par/scan and par/reduce and pure maps into fresh buffers have
-  forward rules. Other loop/SOAC forms still fail loud when active."
+  Double-carry par/scan and par/reduce, pure typed ordered counted recurrences,
+  and pure maps into fresh buffers have forward rules. Other active loop/SOAC
+  forms still fail loud."
   (:require [raster.ad.reverse :as rev]
             [raster.ad.templates :as tmpl]
             [raster.ad.tangent :as tangent]
@@ -26,6 +27,7 @@
             [raster.compiler.core.op-descriptor :as opdesc]
             [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.core :as rcore]
             [clojure.string :as string]
             [clojure.walk :as walk]
@@ -310,6 +312,72 @@
                sym (list 'nth pair 0)
                result (list 'nth pair 1)]])))
 
+(defn- fold-double-ordered-loop
+  "Linearize a pure, typed counted recurrence without turning it into a parallel fold.
+   Keep the original induction domain, comparison, step and carry checkpoints.
+   Return nil outside the existing ordered-loop grammar; unsupported loops stay fail-loud."
+  [tenv sym loop-form tag]
+  (when-let [{:keys [acc-sym acc-init index-sym index-init bound-expr test-expr
+                     then-branch idx-update-expr update-expr scoped-update-expr else-expr]}
+             (patterns/match-ordered-reduce-loop loop-form)]
+    (when (and (= 'double tag)
+               (= 'double (:raster.type/tag (meta acc-sym)))
+               (= 'double (:raster.type/tag (meta update-expr)))
+               (patterns/acc-ref? else-expr acc-sym)
+               (not (any-active? tenv index-init))
+               (not (patterns/contains-sym? index-init acc-sym))
+               (not (patterns/contains-sym? acc-init index-sym))
+               (not (patterns/contains-sym? bound-expr index-sym))
+               (not (patterns/contains-sym? bound-expr acc-sym))
+               (not (any-active? tenv bound-expr))
+               (= :pure (effects/analyze-effect index-init))
+               (= :pure (effects/analyze-effect acc-init))
+               (= :pure (effects/analyze-effect scoped-update-expr)))
+      (let [dacc (jvp-gensym "ordered_carry_tangent" 'double)
+            init-pair (jvp-gensym "ordered_init_pair")
+            step-pair (jvp-gensym "ordered_step_pair")
+            origin (jvp-gensym "ordered_origin")
+            index-next (jvp-gensym "ordered_index_next")
+            pair (jvp-gensym "ordered_result_pair")
+            result (jvp-gensym (str "d_" (name sym)) tag)
+            original-bindings (partition 2 (second loop-form))
+            init-bindings (vec (mapcat (fn [[id init]]
+                                        (if (= id index-sym) [origin init]
+                                            [init-pair (linearize-region init tenv)]))
+                                      original-bindings))
+            loop-bindings (vec (concat
+                                (mapcat (fn [[id init]]
+                                          [id (if (= id acc-sym)
+                                                (list 'clojure.core/nth init-pair 0)
+                                                origin)])
+                                        original-bindings)
+                                [dacc (list 'clojure.core/nth init-pair 1)]))
+            recur-args (mapv (fn [[id _]]
+                              (if (= id index-sym) index-next
+                                  (list 'clojure.core/nth step-pair 0)))
+                            original-bindings)
+            ;; The source prelude executes before either recur argument.
+            ;; Keep its scope, then evaluate those arguments in their original order.
+            prelude (if (form/binding-form? then-branch) (second then-branch) [])
+            [normalized-prelude _] (anf/normalize-for-ad prelude [acc-sym] jvp-gensym)
+            {prelude-bindings :bindings step-tenv :tenv}
+            (jvp-fold normalized-prelude (assoc tenv acc-sym dacc))
+            step (linearize-region update-expr step-tenv)
+            step-bindings (into (vec prelude-bindings)
+                                (mapcat (fn [[id _]]
+                                          (if (= id index-sym) [index-next idx-update-expr]
+                                              [step-pair step])) original-bindings))
+            paired-loop (list 'loop* loop-bindings
+                              (list 'if test-expr
+                                    (list 'let* step-bindings
+                                          (list* 'recur (conj recur-args
+                                                             (list 'clojure.core/nth step-pair 1))))
+                                    [acc-sym dacc]))]
+        [result (into init-bindings
+                      [pair paired-loop
+                       sym (list 'clojure.core/nth pair 0)
+                       result (list 'clojure.core/nth pair 1)])]))))
+
 (defn- jvp-fold
   "A2: ONE pure reduce over the normalized ANF bindings threading
   {:tenv (tangent env, sym → tangent-sym), :bindings (flat primal+tangent)}.
@@ -317,7 +385,7 @@
   → paired tangent bindings via the op's (derived) :jvp-fn; templated-but-no-
   jvp-fn or un-templated-active → FAIL LOUD; `if` → branch-selected tangent
   with a typed zero for the inactive branch; double scans → a tangent scan;
-  double reductions → paired primal/tangent carries;
+  double reductions and pure typed ordered loops → paired primal/tangent carries;
   pure fresh-buffer maps → an independent tangent map;
   other loops/par forms → FAIL LOUD."
   [norm-bindings param-tangents]
@@ -461,6 +529,17 @@
                          [dt (list 'clojure.core/nth dcoll index)]))
 
                  :else (done tenv [])))
+
+             ;; An ordered recurrence is not evidence of reassociation consent.
+             ;; Pair its primal and tangent in the same source-order loop.
+             (contains? '#{loop loop*} head)
+             (if (any-active? tenv init)
+               (if-let [[dloop extra] (fold-double-ordered-loop tenv sym init tag)]
+                 {:tenv (assoc tenv sym dloop)
+                  :bindings (into prior-bindings extra)}
+                 (throw (ex-info "jvp: active loop is outside the pure typed ordered-carry grammar"
+                                 {:reason :jvp-ordered-loop-unsupported :form-head head :sym sym})))
+               (done tenv []))
 
              ;; Remaining control flow has no forward rule yet.
              (or (contains? unsupported-forward-heads head)
