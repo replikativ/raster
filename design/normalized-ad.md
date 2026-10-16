@@ -1331,9 +1331,10 @@ same storage, and missing edges do not certify freshness or distinctness.
 It does not establish carried-array aliases or admit new loop regions. Diagnostic
 array lists are sorted and may include additional names from an alias component.
 
-Known selected results contribute every alternative from the shared form
-analysis's `normal-exit-symbols`; exact copy propagation uses only its singleton
-`tail-symbol` projection. Thus `(if flag ys zs)` may alias either buffer without
-making them interchangeable. A nil result means unknown, not fresh; an empty set
-means no normal exit. Arbitrary array-returning calls and unknown branch results
-remain an open alias boundary, not a new non-aliasing guarantee.
+Selected results retain positive enclosing symbols separately from completeness
+in the shared form analysis's `normal-exit-facts`. Thus `(if flag ys zs)` may alias
+either buffer, and an unknown arm in `(if flag ys nil)` cannot erase `ys`.
+`normal-exit-symbols` projects a complete set or nil; exact copy propagation uses
+only its singleton `tail-symbol` projection. Neither unknown nor no normal exit
+proves freshness. Arbitrary array-returning calls still have an open alias boundary;
+partial positive evidence is not a complete non-aliasing guarantee.

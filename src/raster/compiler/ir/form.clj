@@ -695,17 +695,18 @@
   [form]
   (contains? #{:invk :call} (:kind (form-info form))))
 
-(defn normal-exit-symbols
-  "All enclosing symbols returned on normal exits, or nil when unknown.
-   A multi-symbol set describes alternatives, NOT a single exact identity.
-   The empty set means no normal exit; nil does not mean fresh storage.
-   Local binders cannot establish enclosing identity. Unknown calls and literal
-   values have normal exits and must not disappear from a join."
+(defn normal-exit-facts
+  "Positive enclosing return symbols and whether other exits are unknown.
+   Keep partial evidence through joins: an unknown arm cannot erase a known
+   returned symbol. :unknown? false only means this symbol analysis is complete,
+   never that storage is fresh. Local-bound identities remain unknown."
   [expr]
   (letfn [(exits [e bound]
             (cond
-              (symbol? e) (when-not (contains? bound e) #{e})
-              (not (seq? e)) nil
+              (symbol? e) (if (contains? bound e)
+                            {:symbols #{} :unknown? true}
+                            {:symbols #{e} :unknown? false})
+              (not (seq? e)) {:symbols #{} :unknown? true}
               (or (let-head? (first e)) (loop-head? (first e)))
               (let [{:keys [binders body]} (first (:scopes (scope-info e)))]
                 (exits (last body) (into bound binders)))
@@ -713,13 +714,23 @@
               (= 'if (first e))
               (let [a (exits (nth e 2 nil) bound)
                     b (exits (nth e 3 nil) bound)]
-                (when (and (some? a) (some? b)) (into a b)))
-              (contains? #{'recur 'throw} (first e)) #{}
+                {:symbols (into (:symbols a) (:symbols b))
+                 :unknown? (or (:unknown? a) (:unknown? b))})
+              (contains? #{'recur 'throw} (first e)) {:symbols #{} :unknown? false}
               ;; Retain the existing destination identity contract, not a
               ;; name-suffix heuristic or the return TYPE of a reduction.
               (= 'raster.par/map! (first e)) (exits (second e) bound)
-              :else nil))]
+              :else {:symbols #{} :unknown? true}))]
     (exits expr #{})))
+
+(defn normal-exit-symbols
+  "All enclosing symbols returned on normal exits, or nil when unknown.
+   A multi-symbol set describes alternatives, NOT a single exact identity.
+   The empty set means no normal exit; nil does not mean fresh storage.
+   Use normal-exit-facts for positive evidence from an incomplete join."
+  [expr]
+  (let [{:keys [symbols unknown?]} (normal-exit-facts expr)]
+    (when-not unknown? symbols)))
 
 (defn tail-symbol
   "An enclosing symbol returned on EVERY normal exit, or nil when unknown.

@@ -19,6 +19,19 @@
     (is (nil? (form/normal-exit-symbols expression)) (pr-str expression)))
   (is (= '#{out} (form/normal-exit-symbols '(raster.par/map! out i n nil x)))))
 
+(deftest partial-normal-exit-evidence-is-not-lost-or-promoted-to-identity
+  (doseq [expression '[(if flag xs nil) (if flag nil xs)
+                      (if flag xs (opaque ys)) (if flag (opaque ys) xs)
+                      (if flag xs (let* [xs ys] xs))]]
+    (is (= {:symbols '#{xs} :unknown? true} (form/normal-exit-facts expression)))
+    (is (nil? (form/normal-exit-symbols expression)))
+    (is (nil? (form/tail-symbol expression))))
+  (is (= {:symbols '#{xs ys} :unknown? true}
+         (form/normal-exit-facts '(if p xs (if q ys (opaque zs))))))
+  (is (= {:symbols #{} :unknown? false}
+         (form/normal-exit-facts '(if flag (throw error) (recur xs)))))
+  (is (= {:symbols #{} :unknown? true} (form/normal-exit-facts '(opaque xs)))))
+
 (deftest form-info-leaf-test
   (testing "symbols are leaves"
     (let [info (form/form-info 'x)]
