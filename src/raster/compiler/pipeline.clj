@@ -41,6 +41,7 @@
             [raster.compiler.backend.intrinsics :as ix]
             [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
+            [raster.compiler.passes.scalar.local-products :as local-products]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-soac-frontend]
@@ -489,6 +490,10 @@
               expanded (soa-lower/lower-local-constructors
                         expanded {:source-ns (:source-ns opts)
                                   :locals (keys (:param-env opts))})
+              ;; Literal presence and nonescaping local products are physical
+              ;; representation facts, shared by JVM/C/GPU. Do not invoke broad
+              ;; arithmetic PE or rewalk merely to remove a known presence arm.
+              expanded (local-products/lower-local-products expanded)
               ;; Step 2: Normalize + Rewalk only if expand introduced NEW
               ;; undevirtualized calls (e.g. from composable AD body inlining).
               ;; Regular expand (compound deftm inlining) produces pre-walked code
