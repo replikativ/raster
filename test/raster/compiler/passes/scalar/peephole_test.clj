@@ -55,6 +55,18 @@
           (is (= (original flag 2.0 7.0 before) (compiled flag 2.0 7.0 after)))
           (is (= (vec before) (vec after))))))))
 
+(deftest alias-substitution-preserves-results-quoted-data-and-lexical-binding
+  (doseq [source ['(let* [alias x] alias)
+                  '(let* [alias x] (quote alias))
+                  '(let* [alias x] (let* [alias y] (clojure.core/+ alias x)))
+                  '(let* [alias x] (let* [x y] (clojure.core/+ alias x)))
+                  '(let* [alias x] ((fn* [alias] (clojure.core/+ alias x)) y))]]
+    (let [lowered (peep/copy-propagate-let source)
+          original (eval (list 'fn* '[x y] source))
+          compiled (eval (list 'fn* '[x y] lowered))]
+      (doseq [[x y] [[2.0 7.0] [-3.0 0.5]]]
+        (is (= (original x y) (compiled x y)) (str source " -> " lowered))))))
+
 ;; ================================================================
 ;; Non-let forms pass through
 ;; ================================================================

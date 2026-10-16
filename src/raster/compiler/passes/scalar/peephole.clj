@@ -31,12 +31,9 @@
   (vec (remove (fn [[_s e]] (nil? e)) pairs)))
 
 (defn- subst-aliases
-  "Substitute known aliases (alias-map sym -> target) throughout an expression."
+  "Substitute known aliases through the shared capture-safe scope grammar."
   [alias-map e]
-  (if (and (seq? e) (seq alias-map))
-    (clojure.walk/postwalk
-     (fn [x] (if (and (symbol? x) (contains? alias-map x)) (get alias-map x) x)) e)
-    e))
+  (if (seq alias-map) (util/subst-syms alias-map e) e))
 
 (defn- inline-aliases
   "Copy-propagation over flat let* bindings. Resolves two alias shapes by recording
