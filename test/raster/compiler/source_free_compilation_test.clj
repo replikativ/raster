@@ -466,6 +466,107 @@
      :buffer-bindings {'x :input-value 'y :output-value}
      :scalar-values {'n {:type :long :value 2}}})))
 
+(defn- private-map-buffer-compilation
+  ([] (private-map-buffer-compilation :owned))
+  ([ownership] (private-map-buffer-compilation ownership {}))
+  ([ownership {:keys [program-attributes equation-attributes result-facets]}]
+   (let [array (av/tensor {:dtype :double :shape [2]})
+         intermediate (merge array {:ownership ownership} result-facets)
+         equation (fn [id output input body]
+                    (list '= id [output]
+                          (list 'map {:index 'i :extent 2} [input] []
+                                (soac/lambda-form '[element] [] [body]))))
+         source (soac/make
+                 (soac/default-program-facts
+                  {:values {'x array 'z intermediate 'y array} :inputs '[x]
+                   :attributes (or program-attributes {})
+                   :equations {'square (assoc (soac/default-equation-facts)
+                                             :attributes (or equation-attributes {}))
+                               'twice (soac/default-equation-facts)}})
+                 [(equation 'square 'z 'x '(raster.numeric/* element element))
+                  (equation 'twice 'y 'z '(raster.numeric/+ element element))] '[y])]
+     (with-redefs [hardware/descriptor-for synthetic-descriptor]
+       (equation-first/compile-typed source {:target :ocl:private-buffer
+                                             :schedule {:precision :f32-scalar}})))))
+
+(deftest resident-completion-adds-only-private-map-buffer-data
+  (let [compilation (private-map-buffer-compilation)
+        program (:emitted compilation)
+        request (assoc (resident-map-request compilation) :scalar-values {})
+        complete (invocation-link/complete-resident-buffer-layout program request)
+        token (get-in complete [:buffer-bindings 'z])
+        instance (invocation-link/bind-resident-program program complete)
+        plan-request {:id :completed-private-map :target (:target complete)
+                      :nodes (:nodes complete) :values (:values complete)
+                      :instances [instance] :outputs [:output-node]}
+        plan (link-plan/make plan-request)]
+    (is (= :resident-binding-buffers
+           (reason #(invocation-link/bind-resident-program program request))))
+    (is (= (set (keys request)) (set (keys complete))))
+    (is (= (count (:nodes request)) (dec (count (:nodes complete)))))
+    (is (= (count (:values request)) (dec (count (:values complete)))))
+    (is (= request (-> complete (update :nodes dissoc token)
+                               (update :values dissoc token)
+                               (update :buffer-bindings dissoc 'z))))
+    (is (= :internal (get-in complete [:nodes token :role])))
+    (is (nil? (get-in complete [:nodes token :source])))
+    (is (= [2] (get-in complete [:nodes token :view :shape])))
+    (is (= :double (get-in complete [:nodes token :view :dtype])))
+    (is (= :owned (get-in complete [:nodes token :view :allocation :ownership])))
+    (is (= (get-in program [:values 'z]) (get-in complete [:values token :abstract])))
+    (is (identical? complete (invocation-link/complete-resident-buffer-layout program complete)))
+    (is (= plan (link-plan/validate! plan)))
+    (is (not (link-plan/link-plan? complete)))
+    (testing "completion never manufactures readiness for the supplied input"
+      (let [uninitialized (-> complete (assoc-in [:nodes :input-node :role] :internal)
+                                      (assoc-in [:nodes :input-node :source] nil))
+            bound (invocation-link/bind-resident-program program uninitialized)]
+        (is (= :link-read-before-write
+               (reason #(link-plan/make (assoc plan-request :nodes (:nodes uninitialized)
+                                                           :instances [bound])))))))))
+
+(deftest resident-completion-refuses-public-gaps-and-identity-collisions
+  (let [compilation (private-map-buffer-compilation)
+        program (:emitted compilation)
+        request (assoc (resident-map-request compilation) :scalar-values {})
+        token [:raster.compiler.ir.invocation-link/storage (:id request) :result 'z]]
+    (doseq [id '[x y]]
+      (is (= :resident-layout-completion-boundary
+             (reason #(invocation-link/complete-resident-buffer-layout
+                       program (update request :buffer-bindings dissoc id))))))
+    (is (= :resident-layout-completion-boundary
+           (reason #(invocation-link/complete-resident-buffer-layout
+                     program (assoc-in request [:buffer-bindings 'unknown] :input-value)))))
+    (is (= :resident-binding-scalars
+           (reason #(invocation-link/complete-resident-buffer-layout
+                     program (assoc request :scalar-values {'n {:type :long :value 2}})))))
+    (doseq [changed [(assoc-in request [:nodes token] (get-in request [:nodes :input-node]))
+                     (assoc-in request [:values token] (get-in request [:values :input-value]))
+                     (assoc-in request [:nodes :input-node :view :allocation :id] token)]]
+      (is (= :resident-layout-completion-identity
+             (reason #(invocation-link/complete-resident-buffer-layout program changed)))))
+    (is (= :resident-layout-completion-producer
+           (reason #(let [borrowed (private-map-buffer-compilation :borrowed)]
+                      (invocation-link/complete-resident-buffer-layout
+                       (:emitted borrowed) (assoc (resident-map-request borrowed) :scalar-values {}))))))
+    (doseq [facets [{:program-attributes {:unknown-storage-contract true}}
+                    {:equation-attributes {:unknown-storage-contract true}}
+                    {:result-facets {:logical-layout {:order :row-major}}}
+                    {:result-facets {:attributes {:opaque true}}}]]
+      (let [changed (private-map-buffer-compilation :owned facets)]
+        (is (= :resident-layout-completion-producer
+               (reason #(invocation-link/complete-resident-buffer-layout
+                         (:emitted changed)
+                         (assoc (resident-map-request changed) :scalar-values {})))))))
+    (testing "a validated private reduction is not a private map result"
+      (let [compiled (with-redefs [hardware/descriptor-for synthetic-descriptor]
+                       (equation-first/compile-typed
+                        (captured-weighted-sum :float)
+                        {:target :ocl:private-reduction :schedule {:precision :f32-scalar}}))
+            validated (emitted-program/validate-with-physical-results! (:emitted compiled))]
+        (is (not (#'invocation-link/completable-map-result?
+                  (:program validated) (:projections validated) 'loss)))))))
+
 (defn- contains-identical?
   [value target]
   (cond

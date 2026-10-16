@@ -1150,6 +1150,15 @@ one boundary; every other AbstractValue facet remains exact, and the emitted con
 borrowed. Fresh resident binding and the final LinkPlan/LinkModule revalidate all storage and
 ordered-effect obligations.
 
+For consumers that already supply public buffers, the source-free compiler also exposes
+`invocation-link/complete-resident-buffer-layout`. It derives missing private storage only for
+uniquely produced, positive-static, owned plain pure-map results, through ordinary storage
+lowering. Unknown source contracts, views, aliases and other producer kinds are refused. The
+returned nodes and values are allocation-request data, not initialized buffers or validation
+evidence: strict resident binding and the final LinkPlan/LinkModule still prove the complete
+storage boundary and ordered readiness. This generic facility alone does not widen any AD
+adapter's admitted programs.
+
 `prepare-sum-owner` adds one separately admitted canonical map→ordered-sum family. Preparation
 fixes the exactly typed scalar cotangent seed; transpose has no fake rank-zero input buffer and no
 per-run scalar override. Primal calls instead upload an exact ID-keyed map covering every canonical

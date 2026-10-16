@@ -19,6 +19,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.write-coverage :as coverage]
@@ -457,6 +458,32 @@
                    (update-in [:storage token :compiler-values] conj result))))))
        state (:results equation)))))
 
+(defn- storage-link-layout
+  "Project selected derived storage through the ordinary node/value constructors. No allocation
+   or initialization is performed; callers retain the final plan's memory obligations."
+  [{:keys [storage buffers]} scalars target output-tokens tokens]
+  {:nodes
+   (mapv (fn [token]
+           (let [{:keys [shape source abstract backing]} (get storage token)]
+             (link/node {:id token :dtype (:dtype abstract) :shape shape :device target
+                         :allocation-id (or backing token)
+                         :byte-size (when backing
+                                      (let [base-shape (get-in storage [backing :shape])]
+                                        (bview/required-byte-span (:dtype abstract) base-shape
+                                                                  (bview/dense-strides base-shape))))
+                         :role (cond
+                                 (and source (contains? output-tokens token)) :state
+                                 source :state
+                                 (contains? output-tokens token) :output
+                                 :else :internal)
+                         :source source}))) tokens)
+   :values
+   (mapv (fn [token]
+           (let [abstract (get-in storage [token :abstract])]
+             (link/value {:id token :abstract (assoc abstract :shape
+                                                    (concrete-shape token abstract scalars buffers storage))
+                          :leaves [{:name :value :node token}]}))) tokens)})
+
 (defn- lower-in-context
   "Lower one specialized invocation and matching emitted program into a validated LinkPlan.
 
@@ -551,31 +578,9 @@
                                    (contains? output-tokens token)) :state
                                :else :input)]))
               public-buffer-bindings)
-        nodes
-        (mapv (fn [[token {:keys [shape source abstract backing]}]]
-                (link/node {:id token :dtype (:dtype abstract) :shape shape :device target
-                            :allocation-id (or backing token)
-                            :byte-size (when backing
-                                         (let [base-shape (get-in storage [backing :shape])]
-                                           (bview/required-byte-span (:dtype abstract) base-shape
-                                                                     (bview/dense-strides base-shape))))
-                            :role (cond
-                                    (and source (contains? output-tokens token)) :state
-                                    source :state
-                                    (contains? output-tokens token) :output
-                                    :else :internal)
-                            :source source}))
-              storage)
-        values
-        (mapv (fn [[token {:keys [abstract]}]]
-                ;; The invocation already carries all shape scalars and extent bindings.
-                ;; Retain their resolved logical shape at the public LinkPlan boundary,
-                ;; rather than forcing composition to rediscover symbolic dimensions.
-                (link/value {:id token :abstract (assoc abstract :shape
-                                                       (concrete-shape token abstract shape-scalars
-                                                                       (:buffers realized) storage))
-                             :leaves [{:name :value :node token}]}))
-              storage)
+        ;; Preserve resolved logical shapes; composition must not rediscover dimensions.
+        {:keys [nodes values]}
+        (storage-link-layout realized shape-scalars target output-tokens (keys storage))
         ;; Roles and escaped outputs are projected before the final LinkPlan proof.
         ;; Keep this exact checked call inside an unescaped instance candidate;
         ;; validating its pre-projection role map would recheck the same program
@@ -648,7 +653,7 @@
    {:buffers buffer-bindings :loop-scratch {} :storage {}}
    buffer-bindings))
 
-(defn- bind-resident-program-in-context
+(defn- resident-program-context!
   [parallel-program request caller-options]
   (when-not (and (map? request) (= resident-binding-keys (set (keys request))))
     (fail! :resident-binding-request
@@ -695,7 +700,16 @@
         _ (when-not (= expected-scalars (set (keys scalar-values)))
             (fail! :resident-binding-scalars
                    "resident scalar bindings must exactly match scalar program inputs"
-                   {:expected expected-scalars :actual (set (keys scalar-values))}))
+                   {:expected expected-scalars :actual (set (keys scalar-values))}))]
+    {:program parallel-program :retained-validation retained-validation
+     :expected-buffers expected-buffers}))
+
+(defn- bind-resident-program-in-context
+  [parallel-program request caller-options]
+  (let [{:keys [program retained-validation expected-buffers]}
+        (resident-program-context! parallel-program request caller-options)
+        parallel-program program
+        {:keys [id target nodes values buffer-bindings scalar-values]} request
         _ (when-not (= expected-buffers (set (keys buffer-bindings)))
             (fail! :resident-binding-buffers
                    "resident buffer bindings must exactly cover the emitted program boundary"
@@ -747,6 +761,100 @@
   ([parallel-program request caller-options]
    (link/without-validation-context
     #(bind-resident-program-in-context parallel-program request caller-options))))
+
+(defn- completable-map-result?
+  [parallel-program projections value-id]
+  (let [producers (filterv #(some #{value-id} (:results %)) (:equations parallel-program))
+        equation (first producers)
+        operation (first (:operations equation))
+        projection (when operation (emitted-program/operation-projection projections operation))
+        algorithm (get-in projection [:boundary :algorithm])
+        source-equations (when (soac/program-form? algorithm) (soac/equations algorithm))
+        source-facts (when (soac/program-form? algorithm) (soac/facts algorithm))
+        value (get-in parallel-program [:values value-id])]
+    (and (= 1 (count producers) (count source-equations))
+         (= value-id (get-in projection [:physical-results value-id]))
+         (= 'map (soac/operation-kind (first source-equations)))
+         (some #{value-id} (nth (first source-equations) 2))
+         (empty? (dissoc (:attributes source-facts) :source-arithmetic))
+         (contains? #{nil numerics/retained-source-arithmetic}
+                    (get-in source-facts [:attributes :source-arithmetic]))
+         (empty? (:effects source-facts)) (empty? (:aliases source-facts))
+         (every? (fn [eq]
+                   (let [ef (get-in source-facts [:equations (second eq)])]
+                     (and (empty? (:effects ef)) (empty? (:aliases ef))
+                          (empty? (:attributes ef))
+                          (empty? (soac/result-storage algorithm (second eq)))))) source-equations)
+         (= :tensor (:kind value)) (= {:kind :plain} (:representation value))
+         (= :owned (:ownership value)) (nil? (:logical-layout value))
+         (contains? #{nil :device} (:memory-space value))
+         (nil? (:placement value)) (nil? (:sharding value))
+         (empty? (:effects value)) (empty? (:attributes value))
+         (vector? (:shape value)) (seq (:shape value))
+         (every? #(and (integer? %) (pos? %)) (:shape value)))))
+
+(defn- complete-resident-buffer-layout-in-context
+  [parallel-program request caller-options]
+  (let [{:keys [program retained-validation expected-buffers]}
+        (resident-program-context! parallel-program request caller-options)
+        {:keys [id target nodes values buffer-bindings scalar-values]} request
+        supplied (set (keys buffer-bindings))
+        missing (set/difference expected-buffers supplied)
+        public (set/intersection expected-buffers (set (concat (:inputs program) (:outputs program))))]
+    (when-not (and (set/subset? supplied expected-buffers) (set/subset? public supplied))
+      (fail! :resident-layout-completion-boundary
+             "resident completion requires all public buffers and no unknown bindings"
+             {:expected expected-buffers :supplied supplied :public public}))
+    (if (empty? missing)
+      request
+      (let [_ (when-not (every? #(completable-map-result? program (:projections retained-validation) %) missing)
+                (fail! :resident-layout-completion-producer
+                       "only private owned positive-static pure-map self-results may be completed"
+                       {:missing missing}))
+            tokens (into {} (map #(vector % (storage-id id :result %))) missing)
+            existing-ids (into (set (keys nodes))
+                               (concat (keys values) (map #(get-in % [:view :allocation :id]) (vals nodes))))
+            new-ids (set (vals tokens))
+            _ (when-not (and (= (count missing) (count new-ids))
+                             (empty? (set/intersection existing-ids new-ids)))
+                (fail! :resident-layout-completion-identity
+                       "internal resident storage identities must be fresh across nodes, values and allocations"
+                       {:identities new-ids :existing existing-ids}))
+            initial (resident-single-leaf-storage nodes values (:values program) buffer-bindings)
+            realized (reduce #(lower-equation-storage %1 id %2 (:values program) scalar-values
+                                                      (:projections retained-validation))
+                             initial (:equations program))
+            new-storage (select-keys (:storage realized) new-ids)
+            _ (when-not (and (= (:buffers realized) (merge buffer-bindings tokens))
+                             (= (:storage initial) (apply dissoc (:storage realized) new-ids))
+                             (= new-ids (set (keys new-storage)))
+                             (empty? (:loop-scratch realized))
+                             (every? #(and (nil? (:source %)) (= :unspecified (:initialization %))
+                                           (nil? (:backing %)) (nil? (:result-view %)))
+                                     (vals new-storage)))
+                (fail! :resident-layout-completion-storage
+                       "resident completion cannot rewrite supplied storage or introduce views or initializers"
+                       {:missing missing :buffers (:buffers realized)}))
+            derived (storage-link-layout realized scalar-values target #{} (vals tokens))]
+        (-> request
+            (update :nodes into (map (juxt :id identity) (:nodes derived)))
+            (update :values into (map (juxt :id identity) (:values derived)))
+            (assoc :buffer-bindings (:buffers realized)))))))
+
+(defn complete-resident-buffer-layout
+  "Complete only missing private, uniquely defined owned positive-static pure-map results.
+
+   Takes the same closed storage request as bind-resident-program. All public buffer inputs and
+   outputs and exact typed scalars must already be supplied. Reuses ordinary storage lowering;
+   adds only fresh internal whole-buffer node/value DATA, never host content, initialization,
+   driver allocations or a validation receipt. An already complete request is returned unchanged.
+   The strict binder and a final LinkPlan/LinkModule must still prove storage and readiness."
+  ([parallel-program request]
+   (link/without-validation-context
+    #(complete-resident-buffer-layout-in-context parallel-program request nil)))
+  ([parallel-program request caller-options]
+   (link/without-validation-context
+    #(complete-resident-buffer-layout-in-context parallel-program request caller-options))))
 
 (defn lower
   "Lower a specialized invocation under independent caller math intent, without driver allocation."
