@@ -28,7 +28,7 @@
   ;; The public scope entry validates before deriving its reprojected execution view. Carry that
   ;; exact request-local result into envelope construction instead of validating the same evidence
   ;; again there. Other families retain their existing direct validation.
-  (if (= :checked-scalar-map kind)
+  (if (contains? #{:checked-scalar-map :checked-scalar-map-sum} kind)
     {:bundle bundle :execution-scope (scalar/execution-map-scope bundle)}
     {:bundle (scalar/validate! bundle) :execution-scope nil}))
 
@@ -94,7 +94,7 @@
         execution-scalars (:scalar-values execution-scope)
         execution-nodes (:nodes execution-scope)
         coefficients (concat (keys residual-arrays) (keys scalar-captures))
-        _ (when (and plain-map?
+        _ (when (and (or plain-map? sum?)
                      (not
                       (every?
                        (fn [coefficient]

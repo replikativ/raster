@@ -705,7 +705,8 @@
   primal)
 
 (declare validate! validate-map-proof! validate-indexed-proof!
-         validate-sum-programs! sum-source-map
+         validate-sum-programs! sum-source-map sum-source-producer
+         linearize-map-sum-program build-producer-sum-programs
          segmented-description project-segmented-fold segmented-node-lifecycle
          reconstructed-segmented-activation-proof)
 
@@ -2147,7 +2148,7 @@
             *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
     ;; Establish the exact surrounding map→sum source before that context permits the
     ;; existing scalar-active map stage during correspondence reconstruction.
-    (sum-source-map (:source sum-programs) source-ns)
+    (sum-source-producer (:source sum-programs) source-ns)
     (validate-map-proof-correspondence! bundle)
     (validate-sum-programs! bundle)
     (when-not (= (:certificate bundle) (certificate bundle))
@@ -2854,8 +2855,11 @@
    Maps retain `linearize-map-program` byte semantics. The only additional operation is the
    bounded pure bilinear segmented product described by its explicit result/operand AxisMaps;
    it requires singular `:active-input`. That product may feed a unary, single-use map spine;
-   each operation retains its own checked scalar model and arithmetic contract. No source-AD
-   fallback or operation registry is involved."
+   each operation retains its own checked scalar model and arithmetic contract. An already
+   admitted multi-equation pure producer may end in an exact ordered additive scalar sum;
+   array activity composes its existing derivatives with a typed, freshly owned seed broadcast.
+   The original direct map→sum entry retains its scalar-capture behavior. No source-AD fallback,
+   new derivative registry, device owner or default-engine migration is involved."
   ([source source-ns] (linearize-equation-program source source-ns {}))
   ([source source-ns options]
    (let [source (soac/validate! source)
@@ -2872,6 +2876,12 @@
          (validate! (assoc bundle :certificate (certificate bundle))))
 
        (every? #{'map} kinds) (linearize-map-program source source-ns options)
+
+       (= '[map reduce] kinds) (linearize-map-sum-program source source-ns options)
+
+       (and (< 2 (count kinds)) (= 'reduce (peek kinds)))
+       (let [bundle (build-producer-sum-programs source source-ns options)]
+         (validate! (assoc bundle :certificate (certificate bundle))))
 
        :else
        (fail! :ad-normalized-equation-boundary {:operations kinds})))))
@@ -3168,18 +3178,12 @@
         bundle (merge revision {:source-ns source-ns :gather-programs gather-programs})]
     (validate! (assoc bundle :certificate (certificate bundle)))))
 
-(defn- sum-source-map
-  "Check the two-equation source before narrowing its known frontend bookkeeping.
-   This is a relational projection, not permission to erase arbitrary host activity."
-  [source source-ns]
-  (let [{:keys [nodes]} (equation-dataflow source)
-        equations (mapv :equation nodes)]
-    (when-not (and (= 2 (count equations))
-                   (instance? clojure.lang.Namespace source-ns))
-      (fail! :ad-normalized-sum-boundary {:source source :source-ns source-ns}))
-    (let [[map-equation reduction] equations
+(defn- checked-sum-reduction!
+  "Check the exact terminal fold after the caller has validated whole-source dataflow.
+   The producer owns the boundary/extent relation; this checks its unchanged reduction."
+  [source source-ns equations expected-arrays expected-extent]
+  (let [reduction (peek equations)
           facts (soac/facts source)
-          map-parts (soac/operation-parts map-equation)
           {:keys [kind attributes arrays captures lambda]} (soac/operation-parts reduction)
           {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
           [acc element] parameters
@@ -3191,7 +3195,7 @@
           scalar-values {result (get values result)
                          acc (av/tensor {:dtype dt :shape []})
                          element (av/tensor {:dtype dt :shape []})}]
-    (when-not (and (= 2 (count equations)) (= 'map (:kind map-parts)) (= 'reduce kind)
+    (when-not (and (<= 2 (count equations)) (= 'reduce kind)
                    (= [result] (soac/outputs source)) (= 1 (count (nth reduction 2)))
                    (empty? (:effects facts)) (empty? (:aliases facts))
                    (source-envelope? facts equations)
@@ -3200,8 +3204,8 @@
                           (get-in facts [:attributes :source-arithmetic])))
                    (every? #(and (empty? (:effects %)) (empty? (:aliases %)))
                            (map #(get-in facts [:equations (second %)]) equations))
-                   (= arrays (nth map-equation 2)) (= 1 (count arrays)) (empty? captures)
-                   (fingerprint/equivalent? (:extent attributes) (get-in map-parts [:attributes :extent]))
+                   (= arrays expected-arrays) (= 1 (count arrays)) (empty? captures)
+                   (fingerprint/equivalent? (:extent attributes) expected-extent)
                    (= 2 (count parameters)) (empty? locals) (= 1 (count body-results))
                    (every? #(or (nil? (types/sym-type-tag %))
                                 (= dt (dtype/dtype-for-scalar-tag (types/sym-type-tag %)))) parameters)
@@ -3256,14 +3260,60 @@
         (let [derived (scan/certify-reassociation {:acc acc :init identity :lambda body} dt)]
           (when-not (fingerprint/equivalent? derived (first (:algebra attributes)))
             (fail! :ad-normalized-sum-algebra {:derived derived :retained (:algebra attributes)})))))
-    (let [view (:subprogram (first nodes))]
-      (if (= :closed-clojure (get-in facts [:attributes :source-dialect]))
-        ;; All original bindings, provenance and absent host operations were checked above.
-        ;; The one-map view's binding list is the exact checked first source prefix.
-        (let [view-facts (assoc-in (soac/facts view) [:attributes :source-bindings]
-                                  (nth map-equation 2))]
-          (soac/make view-facts [map-equation] (nth map-equation 2)))
-        view)))))
+    reduction))
+
+(defn- sum-source-map
+  "Check the two-equation source before narrowing its known frontend bookkeeping.
+   This is a relational projection, not permission to erase arbitrary host activity."
+  [source source-ns]
+  (let [{:keys [nodes]} (equation-dataflow source)
+        equations (mapv :equation nodes)]
+    (when-not (and (= 2 (count equations))
+                   (instance? clojure.lang.Namespace source-ns))
+      (fail! :ad-normalized-sum-boundary {:source source :source-ns source-ns}))
+    (let [[map-equation] equations
+          facts (soac/facts source)
+          map-parts (soac/operation-parts map-equation)]
+      (when-not (= 'map (:kind map-parts))
+        (fail! :ad-normalized-sum-boundary {:source source}))
+      (checked-sum-reduction! source source-ns equations (nth map-equation 2)
+                              (get-in map-parts [:attributes :extent]))
+      (let [view (:subprogram (first nodes))]
+        (if (= :closed-clojure (get-in facts [:attributes :source-dialect]))
+          ;; All original bindings, provenance and absent host operations were checked above.
+          ;; The one-map view's binding list is the exact checked first source prefix.
+          (let [view-facts (assoc-in (soac/facts view) [:attributes :source-bindings]
+                                    (nth map-equation 2))]
+            (soac/make view-facts [map-equation] (nth map-equation 2)))
+          view)))))
+
+(defn- sum-source-producer
+  "Project only an exact terminal reduction away from an admitted pure prefix.
+   The old singleton map projection retains its complete frontend envelope checks."
+  [source source-ns]
+  (if (= 2 (count (soac/equations source)))
+    (sum-source-map source source-ns)
+    (let [{:keys [nodes]} (equation-dataflow source)
+          equations (mapv :equation nodes)
+          _ (when-not (< 2 (count equations))
+              (fail! :ad-normalized-sum-boundary {:source source :source-ns source-ns}))
+          prefix (pop equations)
+          reduction (peek equations)
+          boundary (vec (nth (peek prefix) 2))
+          facts (soac/facts source)
+          value (get-in facts [:values (first boundary)])]
+      (when-not (and (instance? clojure.lang.Namespace source-ns)
+                     (empty? (dissoc (:attributes facts) :source-arithmetic))
+                     (= 1 (count boundary) (count (:shape value)))
+                     (contains? #{:float :double} (:dtype value)))
+        (fail! :ad-normalized-sum-boundary {:source source :source-ns source-ns}))
+      (checked-sum-reduction! source source-ns equations boundary (first (:shape value)))
+      ;; Whole-source bookkeeping and effects have been checked. Only the final
+      ;; defining equation/result are removed; all producer facts remain exact.
+      (soac/make (-> facts
+                     (update :values #(apply dissoc % (nth reduction 2)))
+                     (update :equations dissoc (second reduction)))
+                 prefix boundary))))
 
 (defn- append-ordered-sum [map-program reduction source result]
   (let [[boundary] (:arrays (soac/operation-parts reduction))
@@ -3302,8 +3352,58 @@
               :gradient-outputs gradient-outputs}))
     active-inputs))
 
+(defn- producer-sum-transpose [map-programs source interface]
+  (let [{:keys [seed seed-array seed-equation seed-index]} interface
+        producer-interface (:interface map-programs)
+        transpose (:transpose map-programs)
+        cotangent (:cotangent-input producer-interface)
+        cotangent-value (get-in (soac/facts transpose) [:values cotangent])
+        [extent] (:shape cotangent-value)
+        result (first (soac/outputs source))
+        scalar-value (get-in (soac/facts source) [:values result])
+        dt (:dtype cotangent-value)
+        _ (when-not (and (= 1 (count (:shape cotangent-value)))
+                         (= dt (:dtype scalar-value))
+                         (= [] (:shape scalar-value)))
+            (fail! :ad-normalized-sum-interface {:cotangent cotangent-value :seed scalar-value}))
+        ;; This is a newly allocated result with the cotangent's exact geometry,
+        ;; not ownership relabeling of the producer's borrowed input buffer.
+        values (assoc (:values (soac/facts transpose))
+                      seed scalar-value seed-array (assoc cotangent-value :ownership :owned))
+        region (soac/lambda-form [(tagged seed dt)] [] [(tagged seed dt)])
+        initial (generated-map-program
+                 values seed-equation {:index seed-index :extent extent}
+                 [] [seed] region [seed-array] (filter soac/value-id? [extent]))
+        rebound (soac/remap-values transpose {cotangent seed-array})
+        program
+        (reduce
+         (fn [program node]
+           (let [defined (set (mapcat #(nth % 2) (soac/equations program)))
+                 boundary (into {} (for [id (:inputs (soac/facts node)) :when (contains? defined id)]
+                                     [id id]))
+                 outputs (vec (distinct (concat (soac/outputs program) (soac/outputs node))))]
+             (append-map-node program node boundary outputs)))
+         initial (soac/equation-subprograms rebound))]
+    (soac/make (soac/facts program) (soac/equations program) (soac/outputs transpose))))
+
+(defn- lift-producer-sum-programs [bundle source interface]
+  (let [map-programs (:map-programs bundle)
+        boundary (first (soac/outputs (:source map-programs)))
+        result (first (soac/outputs source))
+        tangent-result (:tangent-result interface)
+        tangent-source (soac/remap-values source
+                                         {boundary (get-in map-programs [:interface :tangent-output])
+                                          result tangent-result})]
+    {:source source :interface interface
+     :primal (append-ordered-sum (:primal map-programs) (peek (soac/equations source)) source result)
+     :linear (append-ordered-sum (:linear map-programs) (peek (soac/equations tangent-source))
+                                 tangent-source tangent-result)
+     :transpose (producer-sum-transpose map-programs source interface)}))
+
 (defn- lift-sum-programs [bundle source interface]
-  (let [[_ reduction] (soac/equations source)
+  (if (contains? interface :seed-array)
+    (lift-producer-sum-programs bundle source interface)
+    (let [[_ reduction] (soac/equations source)
         map-programs (:map-programs bundle)
         map-interface (:interface map-programs)
         active-inputs (sum-map-activity! map-interface)
@@ -3352,20 +3452,26 @@
        :transpose (if scalar-active?
                     (append-ordered-sum transpose (second (soac/equations gradient-source))
                                         gradient-source (first gradient-results))
-                    transpose)})))
+                    transpose)}))))
 
 (defn- validate-sum-programs! [{:keys [sum-programs source-ns] :as bundle}]
   (let [{:keys [source interface]} sum-programs
-        projected (sum-source-map source source-ns)
+        projected (sum-source-producer source source-ns)
+        producer? (< 2 (count (soac/equations source)))
         active-inputs (sum-map-activity! (get-in bundle [:map-programs :interface]))
         gradient-results (:gradient-results interface)
-        fixed-ids ((juxt :seed :tangent-result) interface)
+        fixed-ids (mapv interface (if producer?
+                                   [:seed :tangent-result :seed-array :seed-equation :seed-index]
+                                   [:seed :tangent-result]))
         ids (into fixed-ids gradient-results)
         map-value-ids (set (mapcat #(keys (:values (soac/facts %)))
                                   (vals (select-keys (:map-programs bundle) [:primal :linear :transpose]))))
         scalar-active? (= [] (get-in (soac/facts source) [:values (first active-inputs) :shape]))]
     (when-not (and (fingerprint/equivalent? projected (get-in bundle [:map-programs :source]))
-                   (= #{:seed :tangent-result :gradient-results} (set (keys interface)))
+                   (= (if producer?
+                        #{:seed :tangent-result :gradient-results :seed-array :seed-equation :seed-index}
+                        #{:seed :tangent-result :gradient-results}) (set (keys interface)))
+                   (or (not producer?) (not scalar-active?))
                    (vector? gradient-results)
                    (= (count active-inputs) (count gradient-results))
                    (= (count gradient-results) (count (distinct gradient-results)))
@@ -3379,7 +3485,12 @@
                         (get-in bundle [:map-programs :interface :gradient-outputs])))
                    (every? symbol? ids) (= (count ids) (count (distinct ids)))
                    (empty? (set/intersection (set fixed-ids)
-                                            (set (concat (keys (:values (soac/facts source)))
+                                            (set (concat (when producer? (map second (soac/equations source)))
+                                                         (keys (:values (soac/facts source)))
+                                                         (when producer?
+                                                           (mapcat #(map second (soac/equations %))
+                                                                   (vals (select-keys (:map-programs bundle)
+                                                                                      [:primal :linear :transpose]))))
                                                          (mapcat #(keys (:values (soac/facts %)))
                                                                  (vals (select-keys (:map-programs bundle)
                                                                                     [:primal :linear :transpose]))))))))
@@ -3388,6 +3499,20 @@
     (when-not (fingerprint/equivalent? sum-programs (lift-sum-programs bundle source interface))
       (fail! :ad-normalized-sum-programs {:interface interface})))
   bundle)
+
+(defn- build-producer-sum-programs [source source-ns options]
+  (let [prefix (sum-source-producer source source-ns)
+        bundle (linearize-equation-program prefix source-ns options)
+        producer-interface (get-in bundle [:map-programs :interface])
+        active (sum-map-activity! producer-interface)
+        _ (when-not (every? #(= 1 (count (get-in (soac/facts prefix) [:values % :shape]))) active)
+            (fail! :ad-normalized-sum-interface {:active-inputs active}))
+        interface {:seed (gensym "ad_sum_seed_") :tangent-result (gensym "ad_sum_tangent_")
+                   :gradient-results (:gradient-outputs producer-interface)
+                   :seed-array (gensym "ad_sum_seed_array_")
+                   :seed-equation (gensym "ad_sum_seed_equation_")
+                   :seed-index (with-meta (gensym "ad_sum_seed_lane_") {:raster.type/tag 'long})}]
+    (assoc bundle :sum-programs (lift-sum-programs bundle source interface))))
 
 (defn linearize-map-sum-program
   "Build checked map→ordered additive sum programs in the existing normalized bundle.

@@ -8,7 +8,30 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
-### October 15 current checkpoint
+### October 16 continuation
+
+The next bounded normalized host AD composition attaches an exact terminal ordered sum
+to an already-admitted canonical multi-equation pure producer. It reuses producer JVP/VJP,
+owned residuals and the existing sum checks; a retained typed seed-broadcast equation joins
+the transpose through the ordinary pure-spine composer. Independent controls cover both
+contraction operands, nonsquare cotangent geometry, finite differences, repeated-input
+map-node accumulation, changed inputs/seeds, mutation and replay/refusal. Direct map→sum
+semantics remain unchanged. This is not general graph AD, device activation or default-engine
+migration; product→sum without a map and scalar-active longer producers remain held.
+
+The Gemma gate remains open. Same-device-input controls now narrow two GELU leaves:
+the selected fused add→GELU forward is bit-identical on all 4096 elements, while the
+selected backward has relative L2 error 2.67e-11 on identical operands. Saved activation
+and incoming cotangent drift are approximately 6.53e-7 and 9.78e-7 respectively; changing
+only the incoming cotangent explains more of that backward discrepancy than changing only
+the saved activation. These are local attribution controls, not model acceptance. The
+historical full-model 12/28 failure receipt has not been rerun after the derivative correction;
+the fresh layer gate still fails 4/14. No tolerance or acceptance threshold has changed.
+
+Continue with upstream same-operand attribution, representative normalized training graphs,
+then workload closure and retirement. All eight original obligations below remain open.
+
+### October 15 historical checkpoint
 
 Normalized host AD now also admits one bounded bilinear segmented product, optionally
 followed by a unary single-use map spine, through `linearize-equation-program`. The

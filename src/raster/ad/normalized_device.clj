@@ -109,7 +109,12 @@
      :primal primal :seed seed :gradient gradient}))
 
 (defn- sum-interface! [owner]
-  (let [interface (:interface owner)
+  (let [kinds (mapv soac/operation-kind (soac/equations (:source owner)))
+        _ (when-not (= '[map reduce] kinds)
+            (fail! :normalized-device-interface
+                   "resident sum preparation currently requires the verified single-map reduction slice"
+                   {:operations kinds}))
+        interface (:interface owner)
         {:keys [inputs active-id active tangent primal seed gradient]}
         (singleton-derivative-ports! interface :map-sum)
         active-ids (vec (:active-inputs interface))

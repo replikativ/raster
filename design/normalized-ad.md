@@ -232,6 +232,23 @@ facet while relating a fresh owned producer to its checked read-use; composition
 the ordinary pure-spine appender. No new evaluator or derivative registry is introduced.
 Public `deftm` semantics and the default source AD engine are unchanged.
 
+`linearize-equation-program` can also attach an exact terminal ordered additive scalar sum
+to an already-admitted canonical pure producer with at least two equations. This composes
+the existing producer JVP with the unchanged fold. Its transpose broadcasts the typed scalar
+seed into a fresh owned array with the producer cotangent's geometry, then composes the
+existing transpose one equation at a time. Seed/value/equation/index identities are retained
+and replayed; validation does not call an allocating producer constructor. Residual origins
+remain qualified by the checked producer execution scope, distinct from the scalar loss.
+
+The bounded host cases include contraction→unary map spine→sum and larger map spines with
+ordered repeated-input cotangent accumulation. Array activity preserves explicit input and
+gradient-slot order, including inactive slots. The existing direct map→sum path and its
+scalar-capture behavior remain unchanged. Unknown frontend bookkeeping, product→sum without
+a map, and scalar-active longer producers remain refused. Host execution of the new mixed
+graphs requires positive static owned cross-operation arrays; device preparation refuses
+before native compilation/allocation. No new derivative rule, evaluator, cache or default
+AD engine is introduced.
+
 The shared host compiler materializer separately admits ordered pure homogeneous map graphs,
 including tuple results and multiple declared outputs. An intermediate may be consumed by a
 later map and also returned as a fresh owned value; this is needed to export saved coefficients.
