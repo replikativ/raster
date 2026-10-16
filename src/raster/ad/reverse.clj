@@ -817,6 +817,28 @@
                (if (true? condition) guard (list 'if condition guard nil)))])
           pairs))))))
 
+(defn- assert-source-write-contract!
+  "Source records do not version an active array's previous contents. Refuse
+   overwrites of that version, and active scalar stores without a store rule.
+   Positive alias evidence is sufficient to refuse, never to establish freshness."
+  [sym expression writes activity]
+  (let [{:keys [aliases value-facts]} *source-memory-context*
+        activity (merge-with #(or %1 %2) (:activity *source-memory-context*) activity)
+        destination (op/aset-array-sym expression)
+        active-storage
+        (filterv (fn [write]
+                   (some #(or (get activity % false)
+                              (get activity (exact-replay-root % value-facts) false))
+                         (memory/transitive-closure #{write} aliases)))
+                 (sort-by str writes))]
+    (when (seq active-storage)
+      (throw (ex-info "Source reverse AD requires a versioned derivative for active storage writes"
+                      {:reason :ad-active-storage-write :sym sym :writes active-storage})))
+    (when (and destination
+               (init-active? (last (op/call-args expression)) activity))
+      (throw (ex-info "Source reverse AD has no versioned derivative for an active scalar store"
+                      {:reason :ad-unversioned-store :sym sym :write destination})))))
+
 (defn- forward-pass
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
   An array a pullback replays must keep its forward contents until the
@@ -837,7 +859,10 @@
                                                  unprojectable)
            scope (assoc *source-memory-context* :values values :value-facts value-facts
                                                 :replayed ambient :unprojectable unknown
-                                                :aliases aliases)
+                                                :aliases aliases
+                                                :activity (merge-with #(or %1 %2)
+                                                                      (:activity *source-memory-context*)
+                                                                      activity))
            ;; Gradient-inactive choices can still invalidate earlier residuals.
            ;; Use the existing scoped choice adapter, not a unioned parent guard,
            ;; when an external replay obligation reaches a possible write.
@@ -855,6 +880,7 @@
            ;; buffer's contributions into d_out alongside the result sym's).
            ;; Without this, statement-position map!/scan followed by a direct
            ;; buffer read silently drops the adjoint (zero gradients).
+           prior-activity activity
            activity (if (and active? (seq (:written-arrs record)))
                       (reduce #(assoc %1 %2 true) activity (:written-arrs record))
                       activity)
@@ -896,15 +922,12 @@
                                           ;; unknown arms; completeness/freshness
                                           ;; are NOT inferred from missing edges.
                                           sym (or result-aliases #{}) #{}))
+           ;; Choice children check their own writes on the selected path.
+           declared-writes (into (if-let [destination (op/aset-array-sym init-expr)]
+                                   #{destination} #{})
+                                 (:written-arrs record))
            guard-bindings (binding [*source-memory-context* scope]
-                            (replay-input-guard-bindings
-                             ambient
-                             ;; A SOAC's declared output writes are as real as
-                             ;; explicit stores. Choice records own no unioned
-                             ;; output list; their selected children check here.
-                             (into (if-let [destination (op/aset-array-sym init-expr)]
-                                     #{destination} #{})
-                                   (:written-arrs record))))
+                            (replay-input-guard-bindings ambient declared-writes))
            fwd (into (into fwd-bindings guard-bindings)
                      [sym (qualify-fwd-expr init-expr)])]
        (when overwritten
@@ -917,6 +940,10 @@
          (throw (ex-info "Reverse AD cannot project a private replay object across this write"
                          {:reason :ad-unprojectable-replay-root :sym sym
                           :replays (vec unprojectable-overwrite)})))
+       (binding [*source-memory-context* scope]
+         (assert-source-write-contract! sym init-expr
+                                        (into source-writes (:written-arrs record))
+                                        prior-activity))
        {:activity activity
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
         :records (if record (conj records record) records)

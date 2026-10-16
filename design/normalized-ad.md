@@ -1404,3 +1404,41 @@ refuse retained guards it cannot execute; this does not introduce a device
 preflight executor. The actual guarded reduction gradient currently also meets
 an earlier GPU backward-loop/tuple typedness refusal. No loop adapter, normalized
 default migration or higher-order memory differentiation is activated here.
+
+### Source writes require a differentiated memory version
+
+Replay validity and activity are different obligations. A constant overwrite of
+an active array followed by a read must not differentiate the overwritten value
+as if it were the input contents. Likewise, a scalar store of an active value
+needs a store derivative; executing it in the primal is not such a derivative.
+The common source binding engine now refuses declared writes to previously active
+storage with `:ad-active-storage-write`, and active primitive stores without a
+versioned derivative with `:ad-unversioned-store`. These are construction-time
+refusals, before primal effects, including when the unsupported write occurs in
+only one conditional arm. Enclosing activity is retained as compile-time memory
+facts through child scopes, independently of their derivative parameter lists.
+Existing exact roots and positive may-alias closure supply refusal evidence;
+missing edges do not prove disjointness or freshness.
+
+This intentionally tightens source AD admission. `vjp`, which selects all
+floating inputs, can now refuse a function that writes an output-array argument.
+An explicit `value+grad :wrt` excluding that storage can retain the supported
+SOAC-into-inactive-output path, but is not permission to alias that output with
+another logical input. Read-only differentiation and excluded integer counters
+are unchanged by this gate. No new derivative or evaluator is introduced.
+
+Distinct formal arrays that alias at runtime remain a separate **open activity
+gap**, even without any saved replay. For example, an active map into `zs` followed
+by a read through an independent `ys` port can miss the dependency if `ys` and `zs`
+are the same object. Exact views created before a write can likewise carry stale
+activity. The replay guards above do not close those cases. A broader checked
+disjointness contract is being qualified separately; it must account for selected
+paths, scope, native admission and owned outputs before activation.
+
+The consolidation target is functional/versioned array SSA before AD, using the
+existing checked structured-control functionalization and normalized AD ownership
+contracts. Each logical write must distinguish old and new contents; complete
+writes, partial stores, aliases and residual lifetimes require explicit proofs.
+The bounded complete-write/fresh-scratch frontend is precedent, not evidence that
+arbitrary source mutation is already functionalized. The held whole-loop adapter
+must not activate until its children preserve these same memory obligations.
