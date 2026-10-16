@@ -1,10 +1,14 @@
 (ns raster.compiler.passes.scalar.local-products
   "Closed lexical presence refinement and nonescaping local vector replacement.
-   No calls are evaluated and no arithmetic or dtype facts are inferred. Fields
+   No calls are evaluated and no arithmetic is rewritten. Primitive result
+   presence is proved only by the existing checked scalar lowerer. Fields
    are snapshotted in source order; escaping products retain their source form."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.numeric-constant :as numeric-constant]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.inference :as inference]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.core.util :as util]))
 
 (defn- literal? [x]
@@ -14,7 +18,10 @@
   (with-meta (apply list children) (meta original)))
 
 (defn- fact [env expression]
-  (cond (literal? expression) {:literal expression}
+  (cond (literal? expression) (cond-> {:literal expression}
+                               (number? expression)
+                               (assoc :scalar-type (some-> (inference/infer-arg-tag expression {})
+                                                          dtype/dtype-for-scalar-tag)))
         (symbol? expression) (get env expression)
         :else nil))
 
@@ -50,6 +57,19 @@
 
 (declare lower)
 
+(defn- binding-fact [scope id init]
+  (let [known (or (fact scope init)
+                  (when-let [proof (and (seq? init)
+                                       (descriptor/scalar-op? (descriptor/semantic-op init))
+                                       (scalar-body/checked-primitive-result
+                                        init (into {} (keep (fn [argument]
+                                                             (when-let [type (:scalar-type (get scope argument))]
+                                                               [argument type])))
+                                                   (descriptor/call-args init))))]
+                    {:present? true :scalar-type (:type proof)}))
+        retained (some-> (:raster.type/tag (meta id)) dtype/dtype-for-scalar-tag)]
+    (cond-> known (and (:scalar-type known) retained) (assoc :scalar-type retained))))
+
 (defn- lower-let [env expression products?]
   (let [[head bindings & body] expression]
     (when-not (and (vector? bindings) (even? (count bindings))
@@ -71,12 +91,16 @@
                        snapshots (mapv (fn [value]
                                          [(with-meta (gensym "product_field__")
                                             (select-keys (meta value) [:raster.type/tag])) value])
-                                       fields)]
+                                       fields)
+                       lifted (vec (concat prefix (mapcat identity snapshots)))
+                       scope (reduce (fn [local [id init]]
+                                       (assoc local id (binding-fact local id init)))
+                                     scope (partition 2 lifted))]
                    [(assoc scope id {:fields (mapv first snapshots)})
-                    (into output (concat prefix (mapcat identity snapshots)))])
+                    (into output lifted)])
 
                  :else
-                 [(assoc scope id (fact scope init)) (conj output id init)])))
+                 [(assoc scope id (binding-fact scope id init)) (conj output id init)])))
            [env []] (partition 2 bindings))]
       (relist expression (concat [head (with-meta (vec output) (meta bindings))]
                                  (map #(lower local % products?) body))))))
@@ -122,6 +146,7 @@
     (and (seq? expression) (= 'clojure.core/nil? (descriptor/semantic-op expression)) (= 2 (count expression)))
     (let [argument (second expression) known (fact env argument)]
       (cond (:fields known) false
+            (:present? known) false
             (contains? known :literal) (nil? (:literal known))
             ;; A primitive cast cannot return nil, but can throw. Retain its
             ;; evaluation once, at the original test position, before false.
