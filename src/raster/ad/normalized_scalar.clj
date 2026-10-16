@@ -3601,7 +3601,9 @@
 (defn linearize-map-sum-program
   "Build checked map→ordered additive sum programs in the existing normalized bundle.
    One homogeneous Float/Double accumulator, exact typed zero, and the original selected
-   addition step are required. Algebra evidence grants no reassociation permission.
+   addition step are required. AD adds no reassociation: the retained commutative reduction
+   certificate separately permits the backend's Float/Double tree schedule, while scalar
+   checkpoints and reverse contribution order remain explicit.
    Transpose consumes an explicit scalar seed. This entry constructs programs, not execution."
   ([source source-ns] (linearize-map-sum-program source source-ns {}))
   ([source source-ns options]
