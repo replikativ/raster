@@ -1446,13 +1446,37 @@ SOAC-into-inactive-output path, but is not permission to alias that output with
 another logical input. Read-only differentiation and excluded integer counters
 are unchanged by this gate. No new derivative or evaluator is introduced.
 
-Distinct formal arrays that alias at runtime remain a separate **open activity
-gap**, even without any saved replay. For example, an active map into `zs` followed
-by a read through an independent `ys` port can miss the dependency if `ys` and `zs`
-are the same object. Exact views created before a write can likewise carry stale
-activity. The replay guards above do not close those cases. A broader checked
-disjointness contract is being qualified separately; it must account for selected
-paths, scope, native admission and owned outputs before activation.
+Runtime alias-dependent activity is separate from replay validity. An active map
+into `zs` followed by a read through an independently named `ys` can otherwise
+miss the dependency when they are the same object. A view created before a write
+can likewise retain stale activity. The common source engine therefore guards
+active differentiated outputs against every prior visible reference value,
+using original object identity and retained primitive declarations for compatible
+storage. Distinct SSA names or missing alias edges are not disjointness evidence.
+Violations fail with `:ad-unversioned-storage-alias` before the write.
+
+Passive writes cannot introduce a tangent: they require separation only from
+**prior active storage**, in addition to the independent replay fences. The same
+exact-root, positive-alias and inherited activity query supplies both this check
+and the construction-time active-storage refusal. This preserves lawful passive
+writes through inactive aliases before later reads. Scoped choices execute only
+the selected child's runtime checks; no unioned parent guard invalidates the
+unselected path. A pure binding does not scan all previously visible values.
+
+An active SOAC's declared output must also be stable with respect to its own
+source reads, including excluded observation arrays. Positive input/output
+storage overlap fails with `:ad-unversioned-storage-read-write`. No same-index
+exception is assumed: a cross-lane read can observe earlier source writes, and
+even same-index writes need an explicit differentiated version or stability proof.
+This does not blanket-reject passive ordered tape effects such as scratch counters.
+
+These checks cover visible source objects and retained declared operations, not
+general memory-safe mutation AD. Opaque reads hidden inside a writing operation,
+aliases introduced by opaque results after a write, undeclared foreign effects,
+resident views and caller mutation of delayed residuals remain open boundaries.
+An identity check is neither a physical range proof nor a substitute for versioned
+array semantics. Native coverage remains bounded by which guards and backward
+programs its existing adapter can actually lower.
 
 The consolidation target is functional/versioned array SSA before AD, using the
 existing checked structured-control functionalization and normalized AD ownership
@@ -1468,4 +1492,4 @@ not infer missing types, copy callee/effect/ownership facts onto a value, or
 interpret a type declaration as an alias/lifetime proof. For a flattened `do`,
 the selected result supplies the value declaration, not the enclosing region's
 stamp. This closes two declaration-loss seams, not all normalization metadata
-paths or the independent-port alias gap above.
+paths or the opaque memory/version boundaries above.
