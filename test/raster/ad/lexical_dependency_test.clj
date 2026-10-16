@@ -65,3 +65,19 @@
       (let [pullback (reverse/reify-pullback 'x ['x])]
         (is (= '[needed count] (:captured-syms pullback)))
         (is (= '[dy__rad needed count] (:pullback-params pullback)))))))
+
+(deftest closure-and-reified-pullbacks-project-the-same-reverse-program
+  (doseq [form ['x
+                '(raster.numeric/* x x)
+                '(let* [a (raster.numeric/* x y) b (raster.numeric/+ a x)] b)
+                '(let* [a (raster.numeric/* x x)] (if flag a x))
+                '(let* [a (if flag (raster.numeric/* x x) (raster.numeric/* y y))]
+                   (raster.numeric/+ a x))]]
+    (let [[bindings body] (#'reverse/extract-let-parts form)
+          closure (reverse/call-with-shared-ad-gensym
+                   #(#'reverse/gen-reverse-let-core bindings body ['x 'y]))
+          reified (reverse/reify-pullback form ['x 'y])]
+      (is (= closure (:standard-form reified)) (str form))
+      (is (= '[x y] (:active-params reified)))
+      (is (= (vec (cons 'dy__rad (:captured-syms reified)))
+             (:pullback-params reified))))))
