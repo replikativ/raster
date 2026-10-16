@@ -121,7 +121,9 @@
                 typed-accumulators))))
 
 (defn scalar-folds->source
-  "Project explicit scalar Fold/conversion terms to Raster's interpreted host vocabulary."
+  "Project explicit scalar Fold/conversion terms to Raster's interpreted host vocabulary.
+   Ordered Folds remain raw loops even when their bounds fit par/reduce: that spelling carries
+   parallel consent when it re-enters the frontend, not merely a sequential host implementation."
   [expression]
   (walk/postwalk
    (fn [form]
@@ -135,7 +137,8 @@
              [accumulator index] parameters
              update (materialize-region locals (first body-results))
              projected
-             (if (or (= :inclusive (:upper-bound attributes))
+             (if (or (= :ordered (:association attributes))
+                     (= :inclusive (:upper-bound attributes))
                      (not= 0 (:lower attributes 0)))
                (let [typed-index (with-meta index {:raster.type/tag 'long})
                      typed-accumulator
