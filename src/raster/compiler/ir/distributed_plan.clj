@@ -1009,8 +1009,10 @@
                 (fail! "compute step device must belong to the mesh and topology"
                        :distributed-compute-device
                        {:step (:id step) :device (:device step)}))
-              (when-not (positive-number? (:duration-ns step))
-                (fail! "compute step duration must be positive and finite"
+              (when-not (and (positive-number? (:duration-ns step))
+                             (or (not (integer? (:duration-ns step)))
+                                 (<= (:duration-ns step) Long/MAX_VALUE)))
+                (fail! "compute step duration must be positive and finite, with integer nanoseconds representable as a long"
                        :distributed-compute-duration
                        {:step (:id step) :duration-ns (:duration-ns step)}))
               (when-not (and (integer? (:peak-memory-bytes step))
@@ -1720,7 +1722,12 @@
                                                    resources))
                  start (max dependency-ready resource-ready)
                  duration (case (:kind step)
-                            :compute (long (Math/ceil (double (:duration-ns step))))
+                            :compute (let [duration (:duration-ns step)]
+                                       ;; An explicit integer nanosecond estimate
+                                       ;; is already rounded. Routing it through
+                                       ;; double loses ticks above 2^53.
+                                       (if (integer? duration) (long duration)
+                                           (long (Math/ceil (double duration)))))
                             :transfer (if costs (get-in costs [(:id step) :duration-ns])
                                           (transfer-duration-ns topology step)))
                  finish (+ start duration)
