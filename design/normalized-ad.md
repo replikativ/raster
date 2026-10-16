@@ -1268,3 +1268,20 @@ and changed-input device replay. A real Gemma Double diagnostic preserved all si
 finite-difference forward outputs and reduced the two inspected coordinate discrepancies
 from roughly 2.4e-8/1.6e-8 to 1.2e-10/1.3e-10. Those two coordinates do not establish
 full-model Float/GPU numerical acceptance; that gate and its tolerances remain unchanged.
+
+### Ordered source recurrences do not imply parallel consent
+
+The source JVP engine can pair the primal and tangent of a pure, retained-typed
+Double counted recurrence directly in one ordered loop. It reuses the existing
+ordered-loop grammar and scalar region linearization, preserves the source
+comparison, induction origin/step and binding order, and differentiates the
+initializer once, including zero-trip loops. Bounds are not narrowed to Int.
+Only pure origins and loop-invariant bounds independent of the active tangent inputs are admitted;
+effectful steps, unknown/other carry types and unsupported loop shapes fail loudly.
+This is not a new arithmetic rule registry or reassociation permission.
+
+This bounded source-engine prerequisite does not yet retire raw loop-to-parallel
+recovery or AD's older scan materializer. Those must be consolidated together while
+qualifying the existing reverse tape, stored-carry loops and compiler consumers.
+Explicit parallel combinators keep their separately certified algebra. General
+loop HVPs and normalized/default-engine activation remain independent gates.
