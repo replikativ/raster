@@ -13,6 +13,23 @@
                         (MethodType/methodType Object (into-array Class (repeat arity Object))))
            callback))
 
+(deftest original-object-contract-is-not-a-range-or-owner-contract
+  (let [plan (native/object-distinct-pairs! 2 [[1 0]])
+        empty (double-array 0)
+        args [empty (double-array 0)]]
+    (is (= [[0 1]] plan))
+    (is (identical? args (native/validate-object-distinct-arguments! plan args)))
+    (is (= :native-object-alias
+           (reason #(native/validate-object-distinct-arguments! plan [empty empty]))))
+    (let [backing (MemorySegment/ofArray (double-array [1.0 2.0]))]
+      (is (vector? (native/validate-object-distinct-arguments!
+                    plan [(.asSlice backing 0 8) (.asSlice backing 8 8)])))))
+  (doseq [pairs [false '([0 1]) [[0]] [[0 0]] [[-1 1]] [[0 2]]
+                 [[0 1.0]] [[0 1] [1 0]]]]
+    (is (= :invalid-native-object-contract
+           (reason #(native/object-distinct-pairs! 2 pairs)))))
+  (is (= [] (native/object-distinct-pairs! 0 nil))))
+
 (deftest overlapping-views-share-one-staged-backing
   (let [library (cpu/compile-source!
                  "void range_alias(double*x,double*y){x[0]+=1;y[0]+=x[1];x[1]+=y[0];}")
