@@ -695,11 +695,12 @@
   [form]
   (contains? #{:invk :call} (:kind (form-info form))))
 
-(defn tail-symbol
-  "An enclosing symbol returned on EVERY normal exit, or nil when unknown.
-   This is an exact alias query, not a may-alias/else-first result guess. Local
-   binders cannot establish enclosing identity. Recur/throw have no normal exit;
-   unknown calls and literal values do, and must not disappear from a join."
+(defn normal-exit-symbols
+  "All enclosing symbols returned on normal exits, or nil when unknown.
+   A multi-symbol set describes alternatives, NOT a single exact identity.
+   The empty set means no normal exit; nil does not mean fresh storage.
+   Local binders cannot establish enclosing identity. Unknown calls and literal
+   values have normal exits and must not disappear from a join."
   [expr]
   (letfn [(exits [e bound]
             (cond
@@ -718,8 +719,14 @@
               ;; name-suffix heuristic or the return TYPE of a reduction.
               (= 'raster.par/map! (first e)) (exits (second e) bound)
               :else nil))]
-    (let [aliases (exits expr #{})]
-      (when (= 1 (count aliases)) (first aliases)))))
+    (exits expr #{})))
+
+(defn tail-symbol
+  "An enclosing symbol returned on EVERY normal exit, or nil when unknown.
+   Singleton projection of normal-exit-symbols: never choose a may-alias arm."
+  [expr]
+  (let [aliases (normal-exit-symbols expr)]
+    (when (= 1 (count aliases)) (first aliases))))
 
 (defn terminal-value-expr
   "The terminal VALUE expression a body evaluates to at exit — walks through
@@ -739,7 +746,7 @@
    is deliberately NOT handled.
 
    Distinct from tail-symbol above: tail-symbol answers ALIASING (which symbol
-   does this expression pass through, else-first, par/map! out-array aware);
+   does this expression pass through on every normal exit, par/map! out-array aware);
    this answers TYPING (which expression's type is the body's result)."
   [expr]
   (cond

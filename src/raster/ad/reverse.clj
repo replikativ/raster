@@ -767,10 +767,15 @@
                                     (may-aliases (:local-writes memory-effects))))))
            ;; Even an inactive alias can write an earlier residual. Records
            ;; describe result/output identity without another operation registry.
-           result-alias (or (:result-alias record) (when (symbol? init-expr) init-expr))
+           result-aliases (if-let [result-alias (:result-alias record)]
+                            #{result-alias}
+                            (form/normal-exit-symbols init-expr))
            aliases (:aliases
                     (memory/track-aliases {:aliases aliases :consumed #{}}
-                                          sym (if result-alias #{result-alias} #{}) #{}))]
+                                          ;; Positive edges only: unknown nil
+                                          ;; and no-exit #{} are NOT freshness
+                                          ;; or non-aliasing certificates.
+                                          sym (or result-aliases #{}) #{}))]
        (when overwritten
          (throw (ex-info
                  (str "Reverse-mode AD: `" sym "` writes " (vec overwritten) ", which an "
