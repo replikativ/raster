@@ -187,8 +187,13 @@
     (is (zero? @allocations))))
 
 (deftest higher-order-memory-regions-remain-explicit-refusals
-  (doseq [[construct reason] [[#(jvp/hvp #'replay-then-external-write) :hvp-unlinearized-scope]
-                              [#(rev/compile-hvp-fn #'replay-then-external-write)
-                               :ad-active-unlinearized-region]]]
-    (is (= reason (try (construct) nil
-                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+  ;; These builders do not establish a public replay-object scope. The memory
+  ;; proof now refuses before their older unlinearized-loop refusal; neither
+  ;; path may admit this region or silently produce a higher derivative.
+  (doseq [construct [#(jvp/hvp #'replay-then-external-write)
+                     #(rev/compile-hvp-fn #'replay-then-external-write)]]
+    (let [data (try (construct) nil
+                    (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= :ad-unprojectable-replay-root (:reason data)))
+      (is (some #(= "ys" (first (clojure.string/split (name %) #"_α_")))
+                (:replays data))))))
