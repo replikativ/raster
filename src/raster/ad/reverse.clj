@@ -550,20 +550,25 @@
                              :source-form init-expr})
             replay-roots (vec (sort-by str (into #{} (mapcat (comp keys :pullback-replay-conditions)) pieces)))
             paired (mapv (fn [{:keys [fwd-bindings body-sym pullback-replay-conditions]}]
-                           (let [saved (ad-gensym "branch_saved")]
+                           (let [saved (ad-gensym "branch_saved")
+                                 conditions (mapv (fn [root]
+                                                    [(ad-gensym "branch_replay")
+                                                     (get pullback-replay-conditions root false)])
+                                                  replay-roots)]
                              (list 'let* (vec (concat fwd-bindings
-                                                     [saved (vec (take-nth 2 fwd-bindings))]))
+                                                     [saved (vec (take-nth 2 fwd-bindings))]
+                                                     (mapcat identity conditions)))
                                    ;; Export evaluated obligations through the existing
                                    ;; residual, never leak a child's private selector.
-                                   [body-sym saved
-                                    (mapv #(get pullback-replay-conditions % false) replay-roots)])))
+                                   ;; Keep every residual element in ANF so that a
+                                   ;; subsequent linearization can traverse this tape.
+                                   (into [body-sym saved] (map first conditions)))))
                          pieces)]
         {:record {:type :if-region :sym sym :branch branch :params params
                   :dy dy :tape tape :pieces pieces
                   :replay-conditions
                   (into {} (map-indexed (fn [index root]
-                                         [root (list 'clojure.core/nth
-                                                     (list 'clojure.core/nth tape 2) index)]) replay-roots))
+                                         [root (list 'clojure.core/nth tape (clojure.core/+ 2 index))]) replay-roots))
                   :effects {:kind :choice :regions pieces}}
          :fwd-patch (fn [bindings]
                       (into (vec (drop-last 2 bindings))

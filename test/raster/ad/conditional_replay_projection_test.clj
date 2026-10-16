@@ -3,7 +3,43 @@
             [raster.core :refer [deftm]]
             [raster.numeric :as n]
             [raster.par :as par]
+            [raster.ad.jvp :as jvp]
+            [raster.ad.reverse.normalize :as anf]
             [raster.ad.reverse :as reverse]))
+
+(deftm scalar-branches [x :- Double] :- Double
+  (if (n/> x 0.0)
+    (n/* x x)
+    (n/* 5.0 (n/* x x))))
+
+(deftest conditional-residual-ports-compose-with-linearization
+  ;; Replay bookkeeping must not introduce non-ANF structured values into
+  ;; the reverse program subsequently differentiated by HVP.
+  (doseq [[x derivative curvature] [[4.0 8.0 2.0] [1.0 2.0 2.0] [-2.0 -20.0 10.0]]]
+    (let [[gradient product] ((jvp/hvp #'scalar-branches) x 1.0)]
+      (is (= [derivative] (vec gradient)))
+      (is (= [curvature] (vec product))))))
+
+(deftest nonempty-replay-ports-are-flat-anf-values
+  (with-bindings {#'reverse/*gensym-counter* (atom 0)}
+    (with-redefs-fn
+      {#'reverse/let-gradient-pieces
+       (fn [& _] {:fwd-bindings '[value (* x x)] :body-sym 'value
+                  :pullback-replay-conditions {'observations '(= selector 1)}})}
+      (fn []
+        (let [{:keys [record fwd-patch]}
+              ((get-method @#'reverse/ad-record :if) :if 'result
+               '(if branch (* x x) (* x 2.0)) {'x true})
+              [_ conditional] (fwd-patch '[result ignored])
+              tape (:tape record)]
+          (is (= (list 'clojure.core/nth tape 2)
+                 (get (:replay-conditions record) 'observations)))
+          (doseq [arm (drop 2 conditional)]
+            (let [ports (last arm) bindings (second arm)]
+              (is (= 3 (count ports)))
+              (is (every? anf/trivial-expr? ports))
+              (is (= '(= selector 1)
+                     (get (into {} (map vec (partition 2 bindings))) (last ports)))))))))))
 
 (deftm nested-selected-replay
   [x :- Double observations :- (Array double) destination :- (Array double)
