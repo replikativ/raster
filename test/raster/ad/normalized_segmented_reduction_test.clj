@@ -8,6 +8,7 @@
             [raster.ad.normalized-map-element-test :as element]
             [raster.ad.normalized-device :as device]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -16,6 +17,7 @@
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
+            [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.gpu.link-module :as link-module]))
 
@@ -102,6 +104,17 @@
 (defn- evidence [program active]
   (normalized/linearize-equation-program
    program (the-ns 'raster.ad.normalized-segmented-reduction-test) {:active-input active}))
+
+(defn- with-contract-intent [program]
+  ;; Canonical fresh marked IR, not a claim that physical frontend destinations are admitted.
+  (let [equations (vec (soac/equations program))
+        equation (first equations) operation (nth equation 3)
+        operation (apply list (assoc (vec operation) 1
+                                    (assoc-in (second operation) [:attributes :source-operation]
+                                              :raster.par/contract)))]
+    (soac/make (soac/facts program)
+               (assoc equations 0 (apply list (assoc (vec equation) 3 operation)))
+               (soac/outputs program))))
 
 (defn- arguments [prepared a w] (mapv {'A a 'W w} (:inputs prepared)))
 (defn- active-slot [prepared active gradients]
@@ -466,9 +479,9 @@
         (is (= [(get ids phase)] (mapv second (soac/equations (get stage phase)))))))))
 
 (deftest nonsquare-double-products-have-independent-jvp-vjp-and-finite-differences
-  (doseq [active '[A W] inputs ['[A W] '[W A]]]
+  (doseq [active '[A W] inputs ['[A W] '[W A]] marked? [false true]]
     (testing (str active " with public order " inputs)
-      (let [program (source :double 2 3 4 inputs)
+      (let [program (cond-> (source :double 2 3 4 inputs) marked? with-contract-intent)
             checked (evidence program active)
             owner (canonical/adapt checked)
             prepared (runtime/prepare checked)
@@ -511,8 +524,9 @@
                    2.0e-8))))))))
 
 (deftest float-phases-obey-explicit-typed-host-checkpoints
-  (doseq [active '[A W]]
-    (let [prepared (runtime/prepare (evidence (source :float 2 3 4 '[W A]) active))
+  (doseq [active '[A W] marked? [false true]]
+    (let [prepared (runtime/prepare (evidence (cond-> (source :float 2 3 4 '[W A])
+                                              marked? with-contract-intent) active))
           ;; Non-exact products and cancellation expose missing Float checkpoints.
           a (mapv float float-a0)
           w (mapv float float-w0)
@@ -531,8 +545,9 @@
       (is (every? #(instance? float/1 %) [output jvp-output tangent gradient])))))
 
 (deftest delayed-pullback-owns-passive-copy-and-returns-fresh-flat-gradients
-  (doseq [active '[A W]]
-    (let [prepared (runtime/prepare (evidence (source :double 2 3 4 '[W A]) active))
+  (doseq [active '[A W] marked? [false true]]
+    (let [prepared (runtime/prepare (evidence (cond-> (source :double 2 3 4 '[W A])
+                                              marked? with-contract-intent) active))
           a (double-array a0) w (double-array w0)
           [output pb] ((:vjp prepared) (arguments prepared a w))
           expected (pull active 2 3 4 a0 w0 dy0)
@@ -561,11 +576,12 @@
                       (active-slot prepared active (new-pb (double-array dy0))) 1.0e-12)))))))
 
 (defn- source-attributes [program f]
-  (let [[equation] (soac/equations program)
+  (let [equations (vec (soac/equations program))
+        equation (first equations)
         operation (nth equation 3)
         changed (apply list (assoc (vec operation) 1 (f (second operation))))]
     (soac/make (soac/facts program)
-               [(apply list (assoc (vec equation) 3 changed))] (soac/outputs program))))
+               (assoc equations 0 (apply list (assoc (vec equation) 3 changed))) (soac/outputs program))))
 
 (defn- source-fold-body
   ([program f] (source-fold-body program f false))
@@ -688,6 +704,57 @@
 
 (defn- recertify [checked]
   (assoc checked :certificate (#'normalized/certificate checked)))
+
+(deftest canonical-marked-contractions-retain-intent-through-all-compiled-phases
+  (let [native-calls (atom 0)]
+    (with-redefs [hardware/descriptor-for (fn [target] {:device-id target})
+                  link-module/instantiate!
+                  (fn [& _] (swap! native-calls inc)
+                    (throw (ex-info "unexpected native allocation" {})))]
+      (doseq [dt [:float :double] active '[A W]]
+        (let [program (cond-> (with-contract-intent (source dt))
+                        (= active 'A)
+                        (source-attributes #(update % :attributes dissoc :pointwise-storage-inputs)))
+              owner (canonical/adapt (evidence program active))]
+          (doseq [phase [:primal :linear :transpose]]
+            (let [compiled (equation-first/compile-typed
+                            (get owner phase) {:target :ocl:canonical-contraction-intent
+                                               :schedule {:precision :f32-scalar}})
+                  equations (get-in compiled [:scheduled :equations])
+                  contractions (for [eq equations op (:operations eq)
+                                     :when (= :contraction (:phase op))] [eq op])]
+              (is (= 1 (count contractions)))
+              (is (= (soac/outputs (get owner phase)) (get-in compiled [:emitted :outputs])))
+              (doseq [[eq op] contractions]
+                (is (= op (:operation (contraction-context/validate-semantic! (:algorithm eq) op))))))))))
+    (is (zero? @native-calls))))
+
+(deftest contraction-intent-is-closed-and-is-reconstructed-not-trusted
+  (let [program (with-contract-intent (source :double))]
+    (doseq [intent [nil :unknown :raster.par/reduce]]
+      (let [changed (source-attributes program #(assoc-in % [:attributes :source-operation] intent))]
+        (is (= :ad-normalized-segmented-boundary (reason #(evidence changed 'A))))
+        (is (= :typed-soac-host-fresh-segmented-reduce-boundary
+               (reason #(route/materialize-host-program changed))))))
+    (doseq [change [#(assoc-in % [:attributes :unknown-contract] true)
+                    #(assoc % :result-storage-dtype :double)
+                    #(assoc-in % [:attributes :pointwise-storage-inputs] '[A])]]
+      (let [changed (source-attributes program change)]
+        (is (= :ad-normalized-segmented-boundary (reason #(evidence changed 'A))))
+        (is (= :typed-soac-host-fresh-segmented-reduce-boundary
+               (reason #(route/materialize-host-program changed))))))
+    (let [nonlinear (source-fold-body program
+                                     (fn [body]
+                                       (let [product (nth body 2) lhs (second product)]
+                                         (list (first body) (second body) (list (first product) lhs lhs))))
+                                     true)]
+      (is (= :ad-normalized-segmented-boundary (reason #(evidence nonlinear 'A)))))
+    (let [checked (evidence program 'A)]
+      (doseq [phase [:primal :linear :transpose]]
+        (let [changed (update-in checked [:map-programs phase]
+                                 #(source-attributes % (fn [attributes]
+                                                         (update attributes :attributes dissoc :source-operation))))]
+          (is (= :ad-normalized-map-programs (reason #(normalized/validate! (recertify changed))))))))))
 
 (deftest producer-loss-replays-retained-identities-and-refuses-before-backend-contact
   (let [program (summed-activation-source :double '[W A])

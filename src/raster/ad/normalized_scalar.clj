@@ -2265,7 +2265,12 @@
           (= #{:segment-axes :index :extent :attributes :accumulators :identities
                :dtypes :algebra :source-arithmetic :result-map}
              (set (keys attributes)))
-          (= #{:stable-array-captures :pointwise-storage-inputs} (set (keys op-attrs)))
+          (if (contains? op-attrs :source-operation)
+            (and (= :raster.par/contract (:source-operation op-attrs))
+                 (contains? op-attrs :stable-array-captures)
+                 (set/subset? (set (keys op-attrs))
+                              #{:stable-array-captures :pointwise-storage-inputs :source-operation}))
+            (= #{:stable-array-captures :pointwise-storage-inputs} (set (keys op-attrs))))
           (= operands (:stable-array-captures op-attrs))
           (empty? (:pointwise-storage-inputs op-attrs))
           raw-extents?
@@ -2508,6 +2513,57 @@
                 :actual (get-in (soac/facts (get stage phase)) [:values id])})))
     ports))
 
+(defn- check-segmented-phase-intent!
+  "Reproject one derived contraction under its own coordinates and physical ports.
+   Source intent alone is not a geometry proof; the ordinary scheduled checker remains the
+   downstream body/schedule oracle. Complete phase reconstruction remains replay authority."
+  [program equation {:keys [dtype output operand-maps result-map free-axes contract-axes arithmetic]}]
+  (let [{:keys [components facts physical-results source-operation]}
+        (projection/segmented-reduce-contraction-context program equation)
+        {:keys [attributes]} (soac/operation-parts equation)
+        program-facts (soac/facts program)
+        equation-facts (get-in program-facts [:equations (second equation)])
+        values (:values program-facts)
+        matrix (contraction/dense-matrix-view facts)
+        actual-maps (into {} (map (fn [operand]
+                                   [(:sym operand) (contraction/operand-axis-map facts operand)]))
+                          (:operands facts))
+        reads (projection/contraction-core-read-requirements program facts)]
+    (when-not
+     (and (= :raster.par/contract source-operation)
+          (= dtype (:dtype components) (:dtype facts))
+          (= arithmetic (:source-arithmetic components) (:source-arithmetic facts))
+          (= [output] (nth equation 2) physical-results)
+          (= output (:out facts))
+          (= free-axes (:free-axes facts)) (= contract-axes (:contract-axes facts))
+          (fingerprint/equivalent? result-map (soac/segmented-reduce-result-map attributes))
+          (= (set (keys operand-maps)) (set (keys actual-maps)) (set (keys reads)))
+          (every? (fn [[id expected]] (fingerprint/equivalent? expected (get actual-maps id))) operand-maps)
+          (:ok matrix) (false? (:batched? matrix)) (nil? (:epilogue matrix))
+          (empty? (:effects program-facts)) (empty? (:aliases program-facts))
+          (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
+          (empty? (soac/result-storage program (second equation)))
+          (not (contains? attributes :result-transform))
+          (not (contains? attributes :result-storage-dtype))
+          (every? (fn [id]
+                    (let [value (get values id)]
+                      (and (= :tensor (:kind value)) (= dtype (:dtype value))
+                           (= {:kind :plain} (:representation value))
+                           (nil? (:logical-layout value)) (nil? (:memory-space value))
+                           (nil? (:placement value)) (nil? (:sharding value))
+                           (empty? (:effects value)) (empty? (:attributes value)))))
+                  (conj (vec (keys operand-maps)) output)))
+      (fail! :ad-normalized-segmented-phase-intent
+             {:equation (second equation) :output output :expected-operands (keys operand-maps)}))
+    (doseq [[id requirement] reads]
+      (when-not (= (static-capacity! (:shape (get values id)) :ad-normalized-segmented-phase-intent)
+                   (static-extent! requirement :ad-normalized-segmented-phase-intent))
+        (fail! :ad-normalized-segmented-phase-intent {:equation (second equation) :operand id})))
+    (when-not (= (static-capacity! (:shape (get values output)) :ad-normalized-segmented-phase-intent)
+                 (reduce *' 1 (axis-map/shape result-map)))
+      (fail! :ad-normalized-segmented-phase-intent {:equation (second equation) :output output}))
+    true))
+
 (defn- construct-segmented-stage
   [description scalar interface equation-ids]
   (let [{:keys [source equation attributes active passive result dtype reduction
@@ -2542,10 +2598,16 @@
                    {:interface interface :equation-ids equation-ids}))
         _ (exact-accumulator-cotangent! scalar accumulator)
         {:keys [selected-map passive-map fiber]} (contraction-axis-proof! description)
+        intent? (= :raster.par/contract (get-in attributes [:attributes :source-operation]))
         selected-result-map {:groups [(axis-pairs selected-map)]}
         selected-index (axis-map/index-expr selected-map)
         passive-index (axis-map/index-expr passive-map)
         result-index (axis-map/index-expr (:result-map description))
+        ;; Operand inference exposes atomic dense axes, whereas the output may group those
+        ;; axes into a flat AV. Prove the regrouping preserves the actual flat address first.
+        cotangent-map (when intent? (axis-map/of-axes (axis-pairs (:result-map description))))
+        _ (when (and intent? (not (axis-map/index-matches? cotangent-map result-index)))
+            (fail! :ad-normalized-segmented-fold {:result-map (:result-map description)}))
         active-value (get source-values active)
         passive-value (get source-values passive)
         result-value (get source-values result)
@@ -2571,11 +2633,12 @@
         linear-algebra (scan/certify-reassociation
                         {:acc acc-param :init (first (:identities attributes))
                          :lambda linear-body} dtype)
-        linear-attributes (-> attributes
+        linear-attributes (cond-> (-> attributes
                               (assoc :accumulators [acc-param]
                                      :algebra [linear-algebra]
                                      :attributes {:stable-array-captures [tangent snapshot]
                                                   :pointwise-storage-inputs []}))
+                            intent? (assoc-in [:attributes :source-operation] :raster.par/contract))
         linear-equation (segmented-equation linear-id tangent-output linear-attributes
                                             [tangent snapshot] linear-lambda)
         transpose (:transpose scalar)
@@ -2595,7 +2658,7 @@
                             :lambda (materialized-lambda-body transpose-lambda)} dtype)
         [fiber-axis fiber-extent] fiber
         transpose-attributes
-        (-> attributes
+        (cond-> (-> attributes
             (assoc :segment-axes (axis-pairs selected-map)
                    :index fiber-axis :extent fiber-extent
                    ;; The operand's verified atomic order owns the gradient coordinates; the
@@ -2605,6 +2668,7 @@
                    :algebra [transpose-algebra]
                    :attributes {:stable-array-captures [cotangent-input snapshot]
                                 :pointwise-storage-inputs []}))
+          intent? (assoc-in [:attributes :source-operation] :raster.par/contract))
         transpose-equation (segmented-equation transpose-id gradient transpose-attributes
                                                [cotangent-input snapshot] transpose-lambda)
         source-operation (nth equation 3)
@@ -2622,6 +2686,26 @@
                           gradient gradient-value}
         transpose (phase-program transpose-values [cotangent-input snapshot]
                                  [transpose-equation] [gradient])]
+    (when intent?
+      (let [base {:dtype dtype :arithmetic (:source-arithmetic (:contraction description))}
+            original-free (vec (:segment-axes attributes))
+            original-contract [[(:index attributes) (:extent attributes)]]]
+        (check-segmented-phase-intent!
+         (soac/equation-subprogram primal primal-equation) primal-equation
+         (merge base {:output result :operand-maps (:operand-maps description)
+                      :result-map (:result-map description)
+                      :free-axes original-free :contract-axes original-contract}))
+        (check-segmented-phase-intent!
+         linear linear-equation
+         (merge base {:output tangent-output :operand-maps {tangent selected-map snapshot passive-map}
+                      :result-map (:result-map description)
+                      :free-axes original-free :contract-axes original-contract}))
+        (check-segmented-phase-intent!
+         transpose transpose-equation
+         (merge base {:output gradient
+                      :operand-maps {cotangent-input cotangent-map snapshot passive-map}
+                      :result-map selected-result-map
+                      :free-axes (axis-pairs selected-map) :contract-axes [fiber]}))))
     {:source source :primal primal :linear linear :transpose transpose
      :interface interface}))
 
