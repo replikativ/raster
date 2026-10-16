@@ -1399,7 +1399,8 @@
   ;; that reference active params), lift them into let bindings and delegate
   ;; to gen-reverse-loop-with-let so adjoints propagate through the init.
   ;; E.g. (loop [a (* x 2.0) ...] ...) → (let* [a_init (* x 2.0)] (loop [a a_init ...] ...))
-  ;; Only lift inits that reference active params — (long 0) etc. stay in place.
+  ;; Once lifting is needed, preserve the entire sequential initializer region;
+  ;; inactive origins can trap or be referenced by later active initializers.
   (let [raw-bindings (vec (partition 2 (second loop-form)))
         active-set (set active-params)
         references-active? (fn [expr]
@@ -1410,20 +1411,25 @@
                                      (and (seq? init) (references-active? init)))
                                    raw-bindings)]
     (if (seq active-nontrivial)
-      (let [lifted (mapv (fn [[sym init]]
-                           (let [init-sym (ad-gensym (str "init_" (name sym)))]
-                             {:sym sym :init init :init-sym init-sym}))
-                         active-nontrivial)
-            lifted-set (set (map :sym lifted))
+      ;; Loop initializers are sequential bindings, not independent arguments.
+      ;; If an active expression needs lifting, retain *all* initializers in
+      ;; source order and substitute earlier bindings capture-avoidantly.
+      ;; Lifting only active expressions could move a read before an earlier
+      ;; trapping origin, or leave its reference to that origin out of scope.
+      (let [lifted (:lifted
+                    (reduce (fn [{:keys [lifted substitution]} [sym init]]
+                              (let [init-sym (ad-gensym (str "init_" (name sym))
+                                                        (:raster.type/tag (meta sym)))]
+                                {:lifted (conj lifted
+                                               {:sym sym :init (util/subst-syms substitution init)
+                                                :init-sym init-sym})
+                                 :substitution (assoc substitution sym init-sym)}))
+                            {:lifted [] :substitution {}} raw-bindings))
             let-bindings (vec (mapcat (fn [{:keys [init-sym init]}]
                                         [init-sym init])
                                       lifted))
-            new-loop-bindings (vec (mapcat (fn [[sym init]]
-                                             (if (contains? lifted-set sym)
-                                               (let [entry (first (filter #(= sym (:sym %)) lifted))]
-                                                 [sym (:init-sym entry)])
-                                               [sym init]))
-                                           raw-bindings))
+            new-loop-bindings (vec (mapcat (fn [{:keys [sym init-sym]}] [sym init-sym])
+                                           lifted))
             new-loop-form (with-meta (list* 'loop* new-loop-bindings (drop 2 loop-form))
                             (meta loop-form))]
         (gen-reverse-loop-with-let let-bindings new-loop-form active-params))
