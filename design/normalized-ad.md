@@ -1556,3 +1556,13 @@ arithmetic checkpoints and existing tape ownership remain unchanged. Nor does
 it activate the held raw-loop record adapter or add mutable-state AD support.
 The next consolidation must normalize one source-ordered forward step and
 derive separate reverse projections without reassociating their accumulation.
+
+Ordinary binding programs and loop prefixes now use one
+`reverse-program-projection` operation over the completed forward records and
+activity, with an explicit output-seed environment. It shares reverse traversal
+and parameter-cotangent collection; it does not rerun the primal or its
+normalization. Owning compositions still close the raw replay dependencies over
+their own alias graph. This is the reusable projection boundary needed by a
+future shared loop step, not activation of that step. The unused expression-only
+core wrappers are removed; closure/reified equivalence remains tested against
+the structured program's form directly.
