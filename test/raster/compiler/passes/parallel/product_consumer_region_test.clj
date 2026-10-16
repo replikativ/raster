@@ -126,3 +126,21 @@
                  (:intermediate-loads plan))))
     (is (= 2 (count (:subgroup-collectives plan))))
     (is (= [:int :int] (mapv :dtype (:subgroup-collectives plan))))))
+
+(deftest scalar-compatibility-schedule-declines-but-malformed-schedules-still-error
+  (let [program (scheduled-product-consumer)
+        producer-id (:id (first (numerical-equations program)))]
+    (doseq [schedule [nil {}]]
+      (let [changed (update program :equations
+                            (fn [equations]
+                              (mapv #(if (= producer-id (:id %))
+                                       (assoc-in % [:operations 0 :schedule] schedule) %)
+                                    equations)))
+            error (try (region/analyze changed (numerical-equations changed)) nil
+                       (catch clojure.lang.ExceptionInfo e e))]
+        (is (some? error))
+        (if (nil? schedule)
+          (do (is (region/declined? error))
+              (is (= :producer-schedule (:missing-rule (ex-data error)))))
+          (do (is (not (region/declined? error)))
+              (is (= :reduction-schedule-type (:reason (ex-data error))))))))))
