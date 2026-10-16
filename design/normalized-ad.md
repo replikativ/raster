@@ -1339,10 +1339,10 @@ only its singleton `tail-symbol` projection. Neither unknown nor no normal exit
 proves freshness. Arbitrary array-returning calls still have an open alias boundary;
 partial positive evidence is not a complete non-aliasing guarantee.
 
-For original whole primitive-array parameters, source reverse AD also retains
+For lexically visible replay objects, source reverse AD also retains
 runtime identity checks before direct writes that would invalidate an earlier
-input replay. Checks compare the actual destination, including a local returned
-by an opaque helper, rather than requiring it to be another original parameter.
+buffer replay. Both the replayed object and the destination can be locals
+returned by opaque helpers, rather than only original parameters.
 Distinct formal names are not a disjointness proof. These checks
 live in the generated forward program, including the walked body used by compiler
 inlining, rather than only in an invocation wrapper. An offending call throws
@@ -1355,10 +1355,30 @@ they do not acquire numerical activity. Sequential replay choices combine lazily
 without re-running predicates. Nested child summaries can conservatively require
 a check even when a deeper branch does not replay. Different primitive-array
 classes cannot be identical and need no such check. Mutation analysis strips
-destination metadata, so exact original-input IDs recover their retained
-declarations. Unknown local destination types remain possibly compatible.
+destination metadata, so exact IDs recover retained declarations. Known primitive
+scalar coefficients are not mutable array replays. Unknown reference/value types
+remain possibly compatible; missing declarations never prove disjointness.
 Destinations must be normalized symbols; unclosed expressions refuse rather
 than being evaluated twice by a guard and a write.
+
+Program pieces also retain a catalog of value declarations and exact result
+aliases, independently of activity or `:wrt`. The existing record identity and
+shared singleton `tail-symbol` authority supply exact edges; positive may-alias
+alternatives never become exact edges. Alias projection is cycle-checked.
+Only actual enclosing parameters and previously executed binding values are
+lexically visible. Joining a child catalog does not expose its private values.
+An exact child alias can project to a visible object and keep the selected
+branch condition. A private array/reference replay that cannot be projected
+instead causes `:ad-unprojectable-replay-root` before primal execution when a
+later potentially compatible write appears. This conservatively refuses even
+private clones, or calls selecting a non-replay arm, until ownership or residual
+object projection proves that boundary. Incompatible primitive-array writes,
+read-only regions and zero-trip read-only reductions remain valid.
+
+Internal/higher-order builders without a retained public value scope conservatively
+treat missing declarations as unknown. Already-unsupported effectful higher-order
+fixtures can therefore refuse at this memory boundary before an older loop/region
+diagnostic. This is not additional higher-order differentiation support.
 
 Even a genuinely private destination receives a harmless JVM identity check
 unless stronger freshness evidence eliminates it. Allocator basenames are not
@@ -1367,8 +1387,8 @@ guarded programs; the private-write regression fixture was already unsupported
 there because of its backward tuple. No general native-coverage preservation
 or guard-elimination performance claim is made.
 
-This is bounded source-engine protection, not general memory-safe AD: opaque
-replay roots from opaque array results, implicit SOAC output writes, other inactive control regions,
+This is bounded source-engine protection, not general memory-safe AD:
+implicit SOAC output writes, other inactive control regions,
 resident views/ranges and caller mutation between primal and delayed pullback
 still require their own existing or future contracts. Native compilation must
 refuse retained guards it cannot execute; this does not introduce a device

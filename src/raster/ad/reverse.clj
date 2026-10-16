@@ -68,12 +68,9 @@
 (def ^:private ^:dynamic *constant-gradient-arrays* #{})
 
 (def ^:private ^:dynamic *source-memory-context*
-  "Ordered whole primitive-array inputs at the current public AD boundary.
-   These are retained parameter facts, not a freshness or disjointness proof."
-  {:inputs [] :replayed {} :aliases {}})
-
-(defn- source-array-inputs [params]
-  (filterv #(contains? types/primitive-array-info (:raster.type/tag (meta %))) params))
+  "Lexically visible values and retained declarations at the current AD scope.
+   Child fact catalogs do not extend visibility or prove freshness."
+  {:values [] :value-facts {} :replayed {} :unprojectable {} :aliases {}})
 
 (defn- gradient-bearing-array-read?
   "Only reads from differentiated arrays need scatter cotangents. Reads from
@@ -731,11 +728,13 @@
                         {:reason :ad-region-effects :effects (:effects record)})))
       {:writes (reduce into #{} (map :writes regions))
        :replays (reduce into #{} (map :replays regions))
+       :value-facts (reduce merge {} (map :value-facts regions))
        ;; Child scopes were checked independently by the same forward pass.
        ;; The choice itself has no additional source write outside those scopes.
        :local-writes #{}})
     (let [writes (written-syms expression)]
-      {:writes writes :local-writes writes :replays (set (:replays record))})))
+      {:writes writes :local-writes writes :replays (set (:replays record))
+       :value-facts (:value-facts record)})))
 
 (defn- join-input-replay-conditions [left right]
   (merge-with (fn [a b]
@@ -744,58 +743,73 @@
                       :else (list 'if a true b)))
               left right))
 
-(defn- record-input-replay-conditions
-  "Project known input replay obligations using the existing choice selector.
-   Child summaries remain conservative: no private child selector escapes."
-  [record memory-effects may-aliases]
-  (into {}
-        (keep (fn [input]
-                (if (= :if-region (:type record))
-                  (let [[a b] (:pieces record)
-                        then? (contains? (may-aliases (:replays a)) input)
-                        else? (contains? (may-aliases (:replays b)) input)]
-                    (cond
-                      (and then? else?) [input true]
-                      then? [input (:branch record)]
-                      else? [input (list 'clojure.core/not (:branch record))]))
-                  (when (contains? (may-aliases (:replays memory-effects)) input)
-                    [input true]))))
-        (:inputs *source-memory-context*)))
+(defn- exact-replay-root [id value-facts]
+  (loop [id id seen #{}]
+    (when (contains? seen id)
+      (throw (ex-info "Reverse AD replay has a cyclic exact alias proof"
+                      {:reason :ad-replay-alias-cycle :value id})))
+    (let [{:keys [value alias]} (get value-facts id)]
+      (if alias (recur alias (conj seen id)) (or value id)))))
+
+(defn- record-replay-conditions
+  "Project actual replay roots through exact aliases and retained declarations.
+   Choice selectors are already evaluated; private child selectors never escape."
+  [record memory-effects value-facts]
+  (let [roots (fn [ids]
+                (into #{}
+                      (keep (fn [id]
+                              (let [root (exact-replay-root id value-facts)]
+                                (when-not (contains? types/primitive-info
+                                                     (:raster.type/tag (meta root)))
+                                  root))))
+                      ids))]
+    (if (= :if-region (:type record))
+      (let [[a b] (:pieces record)
+            then (roots (:replays a)) else (roots (:replays b))]
+        (into {} (map (fn [root]
+                        [root (cond (and (contains? then root) (contains? else root)) true
+                                    (contains? then root) (:branch record)
+                                    :else (list 'clojure.core/not (:branch record)))]))
+              (set/union then else)))
+      (zipmap (roots (:replays memory-effects)) (repeat true)))))
+
+(defn- replay-write-compatible? [value-facts read write]
+  (let [array-class (fn [id]
+                      (get types/primitive-array-info
+                           (:raster.type/tag (meta (get-in value-facts [id :value] id)))))
+        read-class (array-class read) write-class (array-class write)]
+    ;; An absent retained declaration is not proof of incompatibility.
+    (or (nil? read-class) (nil? write-class) (= read-class write-class))))
 
 (defn- replay-input-guard-bindings
-  "Retain identity checks between replayed inputs and actual write destinations.
-   An unknown destination is not fresh. Only replay roots from original whole
-   primitive-array inputs are admitted; private replay IDs and foreign views
-   require separate ownership contracts."
+  "Retain identity checks between visible replay objects and write destinations.
+   An unknown destination is not fresh; child facts do not grant visibility."
   [conditions writes]
-  (when (and (seq conditions) (some (complement symbol?) writes))
-    (throw (ex-info "Reverse AD replay guard requires a normalized write destination"
-                    {:reason :ad-unclosed-write-target :destinations writes})))
-  (let [inputs (:inputs *source-memory-context*)
-        ;; Mutation analysis returns IDs without metadata. Recover an original
-        ;; parameter's declaration by exact ID, not by re-inferring its type.
-        input-facts (zipmap inputs inputs)]
-   (vec
-   (mapcat
-    (fn [[read write condition]]
-      [(vary-meta (ad-gensym "_replay_alias_guard") assoc :raster.effect/effectful true)
-       (let [guard (list 'if (list 'clojure.core/identical? read write)
-                         (list 'throw
-                               (list 'clojure.core/ex-info
-                                     "Reverse AD replay input aliases a later write"
-                                     {:reason :ad-replayed-array-alias
-                                      :input (list 'quote read) :write (list 'quote write)}))
-                         nil)]
-         (if (true? condition) guard (list 'if condition guard nil)))])
-    (for [read inputs :when (contains? conditions read)
-          write (sort-by str writes)
-          :let [read-class (get types/primitive-array-info (:raster.type/tag (meta read)))
-                write-class (get types/primitive-array-info
-                                 (:raster.type/tag (meta (get input-facts write write))))]
-          :when (and (not= read write)
-                     ;; Missing retained evidence cannot prove incompatibility.
-                     (or (nil? read-class) (nil? write-class) (= read-class write-class)))]
-      [read write (get conditions read)])))))
+  (if (or (empty? conditions) (empty? writes))
+    []
+    (do
+      (when (some (complement symbol?) writes)
+        (throw (ex-info "Reverse AD replay guard requires a normalized write destination"
+                        {:reason :ad-unclosed-write-target :destinations writes})))
+      (let [values (:values *source-memory-context*)
+            value-facts (:value-facts *source-memory-context*)]
+        (vec
+         (mapcat
+          (fn [[read write condition]]
+            [(vary-meta (ad-gensym "_replay_alias_guard") assoc :raster.effect/effectful true)
+             (let [guard (list 'if (list 'clojure.core/identical? read write)
+                               (list 'throw
+                                     (list 'clojure.core/ex-info
+                                           "Reverse AD replay input aliases a later write"
+                                           {:reason :ad-replayed-array-alias
+                                            :input (list 'quote read) :write (list 'quote write)}))
+                               nil)]
+               (if (true? condition) guard (list 'if condition guard nil)))])
+          (for [read values :when (contains? conditions read)
+                write (sort-by str writes)
+                :when (and (not= read write)
+                           (replay-write-compatible? value-facts read write))]
+            [read write (get conditions read)])))))))
 
 (defn- forward-pass
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
@@ -805,23 +819,29 @@
   the shared memory analysis; an absent edge is not a freshness proof."
   [norm-bindings active-params]
   (reduce
-   (fn [{:keys [activity fwd-bindings records replayed writes aliases input-replay-conditions]}
+   (fn [{:keys [activity fwd-bindings records replayed writes aliases input-replay-conditions
+                values value-facts unprojectable]}
         [sym init-expr]]
      (let [active?  (init-active? init-expr activity)
            activity (assoc activity sym active?)
            may-aliases #(memory/transitive-closure (set %) aliases)
            ambient (join-input-replay-conditions (:replayed *source-memory-context*)
                                                  input-replay-conditions)
+           unknown (join-input-replay-conditions (:unprojectable *source-memory-context*)
+                                                 unprojectable)
+           scope (assoc *source-memory-context* :values values :value-facts value-facts
+                                                :replayed ambient :unprojectable unknown
+                                                :aliases aliases)
            ;; Gradient-inactive choices can still invalidate earlier residuals.
            ;; Use the existing scoped choice adapter, not a unioned parent guard,
            ;; when an external replay obligation reaches a possible write.
-           kind (if (and (seq ambient) (seq? init-expr) (= 'if (first init-expr))
+           kind (if (and (or (seq ambient) (seq unknown))
+                         (seq? init-expr) (= 'if (first init-expr))
                          (seq (written-syms init-expr)))
                   :if
                   (ad-form-kind init-expr active? sym))
            {:keys [record fwd-patch]}
-           (binding [*source-memory-context* (assoc *source-memory-context*
-                                                   :replayed ambient :aliases aliases)]
+           (binding [*source-memory-context* scope]
              (ad-record kind sym init-expr activity))
            ;; A SOAC whose body carries gradient makes its WRITTEN buffers
            ;; gradient-carrying too: a downstream DIRECT read (aget out k)
@@ -833,8 +853,23 @@
                       (reduce #(assoc %1 %2 true) activity (:written-arrs record))
                       activity)
            memory-effects (record-memory-effects record init-expr)
+           value-facts (merge value-facts (:value-facts memory-effects))
+           conditions (record-replay-conditions record memory-effects value-facts)
+           visible-ids (set values)
+           visible-conditions (select-keys conditions visible-ids)
+           private-conditions (apply dissoc conditions visible-ids)
            current-replays (may-aliases (:replays memory-effects))
            source-writes (:writes memory-effects)
+           unprojectable-overwrite
+           (seq (sort-by str
+                         (into #{}
+                               (for [[roots targets] [[(keys unknown)
+                                                      (into source-writes (:written-arrs record))]
+                                                     [(keys private-conditions)
+                                                      (:local-writes memory-effects)]]
+                                     root roots write targets
+                                     :when (replay-write-compatible? value-facts root write)]
+                                 root))))
            overwritten
            (seq (sort-by str (set/union
                   (set/intersection replayed
@@ -855,12 +890,12 @@
                                           ;; unknown arms; completeness/freshness
                                           ;; are NOT inferred from missing edges.
                                           sym (or result-aliases #{}) #{}))
-           guard-bindings (replay-input-guard-bindings
-                           ambient
-                           ;; Place checks at the actual primitive write, not
-                           ;; before a choice/loop from its unioned footprint.
-                           (if-let [destination (op/aset-array-sym init-expr)]
-                             #{destination} #{}))
+           guard-bindings (binding [*source-memory-context* scope]
+                            (replay-input-guard-bindings
+                             ambient
+                             ;; Actual selected writes, never unioned choice footprints.
+                             (if-let [destination (op/aset-array-sym init-expr)]
+                               #{destination} #{})))
            fwd (into (into fwd-bindings guard-bindings)
                      [sym (qualify-fwd-expr init-expr)])]
        (when overwritten
@@ -869,18 +904,34 @@
                       "operation re-reads in its pullback. Write a fresh "
                       "array instead.")
                  {:reason :replayed-array-overwritten :sym sym :arrays (vec overwritten)})))
+       (when unprojectable-overwrite
+         (throw (ex-info "Reverse AD cannot project a private replay object across this write"
+                         {:reason :ad-unprojectable-replay-root :sym sym
+                          :replays (vec unprojectable-overwrite)})))
        {:activity activity
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
         :records (if record (conj records record) records)
         :aliases aliases
+        ;; A binding enters visibility only after its initializer. Exact result
+        ;; identity comes from the existing record or shared exact-tail authority.
+        :values (conj values sym)
+        :value-facts (assoc value-facts sym
+                            {:value sym :alias (or (:result-alias record)
+                                                   (form/tail-symbol init-expr))})
+        :unprojectable (join-input-replay-conditions unprojectable private-conditions)
         :input-replay-conditions (join-input-replay-conditions
                                   input-replay-conditions
-                                  (record-input-replay-conditions record memory-effects may-aliases))
+                                  visible-conditions)
         :replayed (into replayed
                         (memory/transitive-closure (set (:replays memory-effects)) aliases))
         :writes (into writes (may-aliases (into source-writes (:written-arrs record))))}))
    {:activity (into {} (map (fn [p] [p true]) active-params))
     :fwd-bindings [] :records [] :replayed #{} :writes #{}
+    :values (:values *source-memory-context*)
+    :value-facts (merge (into {} (map (fn [value] [value {:value value}]))
+                              (:values *source-memory-context*))
+                        (:value-facts *source-memory-context*))
+    :unprojectable {}
     :aliases (:aliases *source-memory-context* {})
     :input-replay-conditions {}}
    (partition 2 norm-bindings)))
@@ -1301,11 +1352,12 @@
   [norm-bindings active-params {:keys [seed-adj-env]}]
   (binding [util/*shadowing-locals* (into (into util/*shadowing-locals* active-params)
                                        (take-nth 2 norm-bindings))]
-    (let [{:keys [activity fwd-bindings records replayed writes]} (forward-pass norm-bindings active-params)
+    (let [{:keys [activity fwd-bindings records replayed writes value-facts]} (forward-pass norm-bindings active-params)
           {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
           {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
       {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
-       :rev-ctx rev-ctx :param-adj-syms param-adj-syms :replays replayed :writes writes})))
+       :rev-ctx rev-ctx :param-adj-syms param-adj-syms :replays replayed :writes writes
+       :value-facts value-facts})))
 
 (declare gen-reverse-loop-with-let lift-loop-to-tail)
 
@@ -1318,13 +1370,13 @@
   representation; the latter must not allocate a closure per iteration."
   [bindings body-exprs active-params dy-sym]
   (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes]}
+        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts]}
         (process-bindings norm-bindings active-params
                           {:seed-adj-env {body-sym [dy-sym]}})]
     {:body-sym body-sym :dy dy-sym
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
-     :replays replays :writes writes
+     :replays replays :writes writes :value-facts value-facts
      :param-adj-syms param-adj-syms}))
 
 (defn- reverse-program-forms
@@ -3463,7 +3515,8 @@
                                params))
               parameter-plan (tangent-parameter-plan all-params tags nil)
               diff-active-params (:candidate-params parameter-plan)
-              transformed (binding [*source-memory-context* {:inputs (source-array-inputs all-params)
+              transformed (binding [*source-memory-context* {:values all-params
+                                                            :value-facts {} :unprojectable {}
                                                             :replayed {} :aliases {}}
                                     util/*shadowing-locals* (into util/*shadowing-locals* all-params)]
                             (with-ad-gensym
@@ -4868,7 +4921,8 @@
         ;; transform-body delegates binding-position loops to gen-reverse-let's
         ;; activity-aware routing; inactive loops remain in the primal prefix.
           ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays
-                            *source-memory-context* {:inputs (source-array-inputs all-params)
+                            *source-memory-context* {:values all-params
+                                                     :value-facts {} :unprojectable {}
                                                      :replayed {} :aliases {}}
                             util/*shadowing-locals* (into util/*shadowing-locals* all-params)]
                     (transform-body hoisted diff-active-params))
