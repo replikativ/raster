@@ -347,10 +347,48 @@
                     (lambda [acc i]
                       (region [] [(+ acc (clojure.core/aget x (+ base i)))])))]
     (is (= '#{n x base} (util/free-syms fold)))
-    (is (= '(raster.par/reduce acc 0.0 i n
-                               (+ acc (clojure.core/aget replacement (+ base i))))
+    (is (= '(loop* [i 0 acc 0.0]
+              (if (clojure.core/< (clojure.core/long i) (clojure.core/long n))
+                (recur (clojure.core/inc (clojure.core/long i))
+                       (+ acc (clojure.core/aget replacement (+ base i))))
+                acc))
            (projection/scalar-folds->source
             (util/subst-syms {'x 'replacement 'i 'must-not-capture} fold))))))
+
+(deftest ordered-fold-source-roundtrip-does-not-introduce-parallel-consent
+  (doseq [[dt identity values]
+          [[:float (float 0.0) [16777216.0 1.0 -16777216.0]]
+           [:double 0.0 [9007199254740992.0 1.0 -9007199254740992.0]]]]
+    (let [body '(raster.numeric/+ acc (clojure.core/aget x i))
+          fold (list 'fold {:accumulator 'acc :index 'i :identity identity :dtype dt
+                            :lower 0 :extent 3 :association :ordered}
+                     (dialect/lambda-form '[acc i] [] [body]))
+          projected (projection/scalar-folds->source fold)
+          rebuilt (#'frontend/canonicalize-scalar-folds projected dt)
+          run (eval (list 'fn '[x] projected))
+          input ((if (= :float dt) float-array double-array) values)]
+      (is (= 'loop* (first projected)))
+      (is (not-any? #(and (seq? %) (= 'raster.par/reduce (first %))) (tree-seq coll? seq projected)))
+      (is (dialect/scalar-fold-form? rebuilt))
+      (is (= :ordered (get-in (dialect/scalar-fold-parts rebuilt) [:attributes :association])))
+      (is (nil? (get-in (dialect/scalar-fold-parts rebuilt) [:attributes :algebra])))
+      (is (= 0.0 (double (run input))))
+      ;; A different legal parallel tree gives 1, so matching values alone is not consent proof.
+      (is (= 1.0 (+ (+ (first values) (last values)) (second values)))))))
+
+(deftest explicitly-reassociated-fold-keeps-its-checked-parallel-contract
+  (doseq [dt [:float :double]]
+    (let [identity (if (= dt :float) (float 0.0) 0.0)
+          body '(raster.numeric/+ acc (clojure.core/aget x i))
+          certificate (scan/certify-reassociation {:acc 'acc :init identity :lambda body} dt)
+          fold (list 'fold {:accumulator 'acc :index 'i :identity identity :dtype dt
+                            :lower 0 :extent 3 :association :implementation-defined :algebra certificate}
+                     (dialect/lambda-form '[acc i] [] [body]))
+          projected (projection/scalar-folds->source fold)
+          rebuilt (#'frontend/canonicalize-scalar-folds projected dt)]
+      (is (= 'raster.par/reduce (first projected)))
+      (is (= :implementation-defined (get-in (dialect/scalar-fold-parts rebuilt) [:attributes :association])))
+      (is (= certificate (get-in (dialect/scalar-fold-parts rebuilt) [:attributes :algebra]))))))
 
 (deftest associative-nested-reduce-carries-a-checked-reassociation-certificate
   (let [program (frontend/form->program dot-map options)
