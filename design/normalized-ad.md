@@ -1166,7 +1166,10 @@ At the raw tanh argument ±9 the clamp uses the saturated-side convention: its d
 is zero. Outside the clamp, GELU's derivative is the actual constant rational tail slope
 (not an assumed exact zero or one), and its second derivative is zero. NaNs propagate.
 As elsewhere, AD differentiates the arithmetic structure, not the discontinuous rounding
-of a floating-point implementation. The separate `gelu!` and `gelu-mul!` operations still
+of a floating-point implementation. Derivatives use dtype-specific base coefficients
+(narrowed before differentiation), evaluate the polynomial jets in Double, and narrow at
+the derivative array store. This is a smooth extension, not exact differentiation of
+every rounded Float intermediate. The separate `gelu!` and `gelu-mul!` operations still
 use libm tanh and are not bitwise-interchangeable with this allocating rational primal.
 
 Validation includes frozen forward bits, a structural polynomial-coefficient check,

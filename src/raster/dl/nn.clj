@@ -254,13 +254,17 @@
 ;; It expands to ordinary scalar arithmetic before type checking: no runtime
 ;; coefficient arrays, helper calls, or new AD dispatch rules are involved.
 (defmacro ^:private with-gelu-rational
-  [[u value & derivatives] & body]
-  (let [p [4.89352455891786e-3 6.37261928875436e-4
+  [[witness u value & derivatives] & body]
+  (let [typed (fn [coefficients] (mapv (fn [v] `(n/oftype ~witness ~v)) coefficients))
+        p (typed [4.89352455891786e-3 6.37261928875436e-4
            1.48572235717979e-5 5.12229709037114e-8
-           -8.60467152213735e-11 2.00018790482477e-13 -2.76076847742355e-16]
-        q [4.89352518554385e-3 2.268434632439e-3
-           1.18534705686654e-4 1.19825839466702e-6]
-        differentiate (fn [cs] (mapv clojure.core/* (rest cs) (range 1 (count cs))))
+           -8.60467152213735e-11 2.00018790482477e-13 -2.76076847742355e-16])
+        q (typed [4.89352518554385e-3 2.268434632439e-3
+           1.18534705686654e-4 1.19825839466702e-6])
+        ;; Differentiate AFTER narrowing the base constants. Narrowing an
+        ;; already multiplied Double coefficient denotes a different Float polynomial.
+        differentiate (fn [cs] (mapv (fn [v degree] `(* ~(double degree) ~v))
+                                    (rest cs) (range 1 (count cs))))
         z (gensym "u2")
         horner (fn [cs] (reduce (fn [tail coefficient]
                                  `(+ ~coefficient (* ~z ~tail)))
@@ -268,7 +272,9 @@
         pn (gensym "np") qn (gensym "dp")
         ps (gensym "ps") qs (gensym "qs") dq (gensym "dq")
         [first-derivative second-derivative] derivatives]
-    `(let [~z (* ~u ~u)
+    ;; Evaluate derivative polynomials in Double, retaining dtype-specific base
+    ;; constants; only the derivative array stores narrow back to Float.
+    `(let [~z (* (double ~u) (double ~u))
            ~pn ~(horner p)
            ~qn ~(horner q)
            ~value (/ (* ~u ~pn) ~qn)
@@ -318,13 +324,14 @@
                                 c (n/oftype x (n/sqrt (/ 2.0 n/pi)))]
                             (dotimes [i n]
                               (let [xi (aget x i)
-                                    inner (* c (+ xi (* 0.044715 xi xi xi)))
+                                    a (n/oftype x 0.044715)
+                                    inner (* c (+ xi (* a xi xi xi)))
                                     u (n/min 9.0 (n/max -9.0 inner))]
-                                (with-gelu-rational [u t tp]
+                                (with-gelu-rational [x u t tp]
                                   (let [grad (if (or (<= inner -9.0) (>= inner 9.0))
                                                (* 0.5 (+ 1.0 t))
                                                (+ (* 0.5 (+ 1.0 t))
-                                                  (* 0.5 xi tp c (+ 1.0 (* 3.0 0.044715 xi xi)))))]
+                                                  (* 0.5 xi tp c (+ 1.0 (* 3.0 a xi xi)))))]
                                     (aset dx i (* (aget dy i) grad))))))
                             dx)))
 
@@ -337,15 +344,16 @@
                                     c (n/oftype x (n/sqrt (/ 2.0 n/pi)))]
                                 (dotimes [i n]
                                   (let [xi (aget x i)
-                                        u (* c (+ xi (* 0.044715 xi xi xi)))]
+                                        a (n/oftype x 0.044715)
+                                        u (* c (+ xi (* a xi xi xi)))]
                                     (aset dd i
                                           (if (not= u u)
                                             u
                                             (if (or (<= u -9.0) (>= u 9.0))
                                               0.0
-                                              (with-gelu-rational [u t tp tpp]
-                                                (let [up (* c (+ 1.0 (* 3.0 0.044715 xi xi)))
-                                                      upp (* 6.0 0.044715 c xi)]
+                                              (with-gelu-rational [x u t tp tpp]
+                                                (let [up (* c (+ 1.0 (* 3.0 a xi xi)))
+                                                      upp (* 6.0 a c xi)]
                                                   (+ (* tp up)
                                                      (* 0.5 xi (+ (* tpp up up) (* tp upp)))))))))))
                                 dd)))

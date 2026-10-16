@@ -262,14 +262,20 @@
                                       (tree-seq coll? seq forward)))
         primal (into {} (map vec (partition 2 (second polynomial-let))))
         expanded (binding [*ns* (the-ns 'raster.dl.nn)]
-                   (macroexpand-1 '(with-gelu-rational [u t tp tpp] tpp)))
+                   (macroexpand-1 '(with-gelu-rational [x u t tp tpp] tpp)))
         bindings (second expanded)
         z (first bindings)
         normalize (fn [form]
-                    (walk/postwalk #(if (symbol? %)
-                                      (if (= z %) 'u2 (symbol (name %))) %) form))]
+                    (walk/postwalk #(cond
+                                      (and (seq? %) (= 'oftype (first %))) (nth % 2)
+                                      (symbol? %) (if (= z %) 'u2 (symbol (name %)))
+                                      :else %) form))]
     (is (= (primal 'np) (normalize (nth bindings 3))))
-    (is (= (primal 'dp) (normalize (nth bindings 5))))))
+    (is (= (primal 'dp) (normalize (nth bindings 5))))
+    (is (= 11 (count (filter #(and (seq? %) (= 'raster.numeric/oftype (first %))
+                                               (= 'x (second %)))
+                                      (tree-seq coll? seq (subvec bindings 0 6)))))
+        "all base coefficients are narrowed before derivative multipliers")))
 
 (deftest gelu-forward-preserves-frozen-float-and-double-bits
   ;; Captured before the derivative correction. Not regenerated from AD.
@@ -321,6 +327,38 @@
     (is (Double/isNaN (double (first (f (double-array [Double/NaN])))))))
   (is (zero? (alength (nn/gelu-backward (double-array 0) (double-array 0) 0))))
   (is (zero? (alength (nn/gelu-second-deriv (double-array 0) 0)))))
+
+(deftest gelu-float-derivatives-use-float-rounded-base-coefficients
+  ;; Independent monomial evaluation, rather than the production Horner jet.
+  ;; The smooth extension uses Float base constants and the rounded raw cubic,
+  ;; then Double derivative arithmetic before the final Float store.
+  (let [p (mapv #(double (float %)) [4.89352455891786e-3 6.37261928875436e-4
+                                    1.48572235717979e-5 5.12229709037114e-8
+                                    -8.60467152213735e-11 2.00018790482477e-13 -2.76076847742355e-16])
+        q (mapv #(double (float %)) [4.89352518554385e-3 2.268434632439e-3
+                                    1.18534705686654e-4 1.19825839466702e-6])
+        polynomial (fn [coefficients odd? u order]
+                     (reduce + (map-indexed
+                                (fn [i coefficient]
+                                  (let [power (+ (* 2 i) (if odd? 1 0))]
+                                    (if (< power order) 0.0
+                                        (* coefficient (reduce * 1.0 (range (inc (- power order)) (inc power)))
+                                           (Math/pow u (- power order)))))) coefficients)))
+        a (float 0.044715) c (float (Math/sqrt (/ 2.0 Math/PI)))]
+    (doseq [v [-5.0 -3.0 -1.0 0.5 1.0 3.0 5.0]]
+      (let [x (float v)
+            cubic (float (* (float (* (float (* a x)) x)) x))
+            u (double (float (* c (float (+ x cubic)))))
+            [f fp fpp] (mapv #(polynomial p true u %) [0 1 2])
+            [q0 qp qpp] (mapv #(polynomial q false u %) [0 1 2])
+            r (/ f q0) rp (/ (- fp (* r qp)) q0)
+            rpp (/ (- fpp (* 2.0 rp qp) (* r qpp)) q0)
+            up (* c (+ 1.0 (* 3.0 (double a) x x)))
+            upp (* 6.0 (double a) c x)
+            d (+ (* 0.5 (+ 1.0 r)) (* 0.5 x rp up))
+            dd (+ (* rp up) (* 0.5 x (+ (* rpp up up) (* rp upp))))]
+        (is (approx= d (first (nn/gelu-backward (float-array [1.0]) (float-array [x]) 1)) 6e-8))
+        (is (approx= dd (first (nn/gelu-second-deriv (float-array [x]) 1)) 6e-8))))))
 
 (deftest gelu-derivatives-on-either-side-of-the-clamp
   ;; The knot is not differentiable. Locate it using the primal's cubic and
