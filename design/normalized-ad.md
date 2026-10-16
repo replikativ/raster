@@ -1442,3 +1442,11 @@ writes, partial stores, aliases and residual lifetimes require explicit proofs.
 The bounded complete-write/fresh-scratch frontend is precedent, not evidence that
 arbitrary source mutation is already functionalized. The held whole-loop adapter
 must not activate until its children preserve these same memory obligations.
+
+ANF argument and discarded-statement lifting preserves a normalized value's
+existing `:raster.type/tag` and source position on its generated binder. It does
+not infer missing types, copy callee/effect/ownership facts onto a value, or
+interpret a type declaration as an alias/lifetime proof. For a flattened `do`,
+the selected result supplies the value declaration, not the enclosing region's
+stamp. This closes two declaration-loss seams, not all normalization metadata
+paths or the independent-port alias gap above.
