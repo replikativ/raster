@@ -731,9 +731,12 @@
        :value-facts (reduce merge {} (map :value-facts regions))
        ;; Child scopes were checked independently by the same forward pass.
        ;; The choice itself has no additional source write outside those scopes.
-       :local-writes #{}})
+       :local-writes #{} :local-reads #{}})
     (let [writes (written-syms expression)]
       {:writes writes :local-writes writes :replays (set (:replays record))
+       ;; Stable input storage includes excluded observation arrays too. The
+       ;; shared retained-call collector is independent of tangent activity.
+       :local-reads (set (map :sym (op/aget-reads expression)))
        :value-facts (:value-facts record)})))
 
 (defn- join-input-replay-conditions [left right]
@@ -784,7 +787,11 @@
 (defn- replay-input-guard-bindings
   "Retain identity checks between visible replay objects and write destinations.
    An unknown destination is not fresh; child facts do not grant visibility."
-  [conditions writes]
+  ([conditions writes]
+   (replay-input-guard-bindings conditions writes
+                                {:reason :ad-replayed-array-alias
+                                 :message "Reverse AD replay input aliases a later write"}))
+  ([conditions writes {:keys [reason message]}]
   (if (or (empty? conditions) (empty? writes))
     []
     (do
@@ -810,26 +817,53 @@
              (let [guard (list 'if (list 'clojure.core/identical? read write)
                                (list 'throw
                                      (list 'clojure.core/ex-info
-                                           "Reverse AD replay input aliases a later write"
-                                           {:reason :ad-replayed-array-alias
+                                           message
+                                           {:reason reason
                                             :input (list 'quote read) :write (list 'quote write)}))
                                nil)]
                (if (true? condition) guard (list 'if condition guard nil)))])
-          pairs))))))
+          pairs)))))))
+
+(defn- active-source-storage?
+  "Positive prior activity through the same memory alias/root authority."
+  [value activity aliases value-facts]
+  (some #(or (get activity % false)
+             (get activity (exact-replay-root % value-facts) false))
+        (memory/transitive-closure #{value} aliases)))
+
+(defn- source-write-disjoint-bindings
+  "Independent visible reference values are not differentiated memory versions.
+   Differentiated outputs must be separate from every prior visible reference;
+   passive writes need separation only from prior active storage. Replay fences
+   remain independent. Identity alone cannot synchronize stale activity facts."
+  [writes differentiated-writes prior-activity]
+  (if (empty? writes)
+    []
+    (let [{:keys [aliases value-facts activity]} *source-memory-context*
+          activity (merge-with #(or %1 %2) activity prior-activity)
+          conditions (into {}
+                           (keep (fn [value]
+                                   (when (and (not (contains? types/primitive-info
+                                                             (:raster.type/tag (meta value))))
+                                              (or (seq differentiated-writes)
+                                                  (active-source-storage? value activity aliases value-facts)))
+                                     [value true])))
+                           (:values *source-memory-context*))]
+      (replay-input-guard-bindings
+       conditions writes
+       {:reason :ad-unversioned-storage-alias
+        :message "Source reverse AD requires disjoint independently named writable storage"}))))
 
 (defn- assert-source-write-contract!
   "Source records do not version an active array's previous contents. Refuse
    overwrites of that version, and active scalar stores without a store rule.
    Positive alias evidence is sufficient to refuse, never to establish freshness."
-  [sym expression writes activity]
+  [sym expression writes output-writes local-reads activity]
   (let [{:keys [aliases value-facts]} *source-memory-context*
         activity (merge-with #(or %1 %2) (:activity *source-memory-context*) activity)
         destination (op/aset-array-sym expression)
         active-storage
-        (filterv (fn [write]
-                   (some #(or (get activity % false)
-                              (get activity (exact-replay-root % value-facts) false))
-                         (memory/transitive-closure #{write} aliases)))
+        (filterv #(active-source-storage? % activity aliases value-facts)
                  (sort-by str writes))]
     (when (seq active-storage)
       (throw (ex-info "Source reverse AD requires a versioned derivative for active storage writes"
@@ -837,7 +871,17 @@
     (when (and destination
                (init-active? (last (op/call-args expression)) activity))
       (throw (ex-info "Source reverse AD has no versioned derivative for an active scalar store"
-                      {:reason :ad-unversioned-store :sym sym :write destination})))))
+                      {:reason :ad-unversioned-store :sym sym :write destination})))
+    ;; A declared output is differentiated as an independent result, not an
+    ;; inter-lane mutable state. Explicit stores inside ordered child programs
+    ;; retain their own checked tape/activity contracts; do not conflate those
+    ;; effects with an implicit differentiated output version.
+    (let [read-write (set/intersection (memory/transitive-closure (set output-writes) aliases)
+                                       (memory/transitive-closure local-reads aliases))]
+      (when (seq read-write)
+        (throw (ex-info "Source reverse AD requires stable input storage during a writing operation"
+                        {:reason :ad-unversioned-storage-read-write :sym sym
+                         :arrays (vec (sort-by str read-write))}))))))
 
 (defn- forward-pass
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
@@ -863,12 +907,14 @@
                                                 :activity (merge-with #(or %1 %2)
                                                                       (:activity *source-memory-context*)
                                                                       activity))
-           ;; Gradient-inactive choices can still invalidate earlier residuals.
-           ;; Use the existing scoped choice adapter, not a unioned parent guard,
-           ;; when an external replay obligation reaches a possible write.
-           kind (if (and (or (seq ambient) (seq unknown))
-                         (seq? init-expr) (= 'if (first init-expr))
-                         (seq (written-syms init-expr)))
+           ;; Inactive choices can still change storage dependencies. Shared
+           ;; effect analysis selects the existing scoped adapter conservatively;
+           ;; it is not a freshness or derivative certificate.
+           kind (if (and (seq? init-expr) (= 'if (first init-expr))
+                         (or (and (or (seq ambient) (seq unknown))
+                                  (seq (written-syms init-expr)))
+                             (and (not active?)
+                                  (not= :pure (effects/analyze-effect init-expr)))))
                   :if
                   (ad-form-kind init-expr active? sym))
            {:keys [record fwd-patch]}
@@ -928,7 +974,14 @@
                                  (:written-arrs record))
            guard-bindings (binding [*source-memory-context* scope]
                             (replay-input-guard-bindings ambient declared-writes))
-           fwd (into (into fwd-bindings guard-bindings)
+           disjoint-bindings
+           (binding [*source-memory-context* scope]
+             (source-write-disjoint-bindings
+              ;; A scoped choice exports no local writes: only the selected
+              ;; child's checks execute. An unclosed non-choice target refuses.
+              (into (:local-writes memory-effects) (:written-arrs record))
+              (when active? (:written-arrs record)) prior-activity))
+           fwd (into (into (into fwd-bindings guard-bindings) disjoint-bindings)
                      [sym (qualify-fwd-expr init-expr)])]
        (when overwritten
          (throw (ex-info
@@ -943,6 +996,8 @@
        (binding [*source-memory-context* scope]
          (assert-source-write-contract! sym init-expr
                                         (into source-writes (:written-arrs record))
+                                        (when active? (:written-arrs record))
+                                        (:local-reads memory-effects)
                                         prior-activity))
        {:activity activity
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
