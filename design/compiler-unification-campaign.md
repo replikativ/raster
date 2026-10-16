@@ -10,6 +10,14 @@ cross-cutting parts of this campaign, not competing replacements for it.
 
 ### October 16 continuation
 
+Fresh hardware-free planning qualification found that an explicit integer compute
+estimate above 2^53 lost nanoseconds through a `double` conversion. The simulator
+now preserves already-integral estimates exactly, and refuses integer durations
+outside the long range. Controls cover timeline, aggregate busy time, makespan,
+certificate costs and serial dependencies; fractional estimates keep their existing
+rounding. This is an item-6 correctness increment, not measured fabric evidence or
+closure of the remaining distributed, halo and durable-state acceptance gates.
+
 The bounded normalized host AD composition now attaches an exact terminal additive sum
 to an already-admitted canonical multi-equation pure producer. It reuses producer JVP/VJP,
 owned residuals and the existing sum checks; a retained typed seed-broadcast equation joins

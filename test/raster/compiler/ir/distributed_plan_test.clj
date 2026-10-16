@@ -65,6 +65,32 @@
               :dependencies [:independent-gradient-1 :send-gradient]})]
     :outputs [:apply-gradient]}))
 
+(deftest explicit-integer-durations-retain-their-exact-nanoseconds
+  (let [single-step (fn [duration]
+                      (assoc (training-plan)
+                             :steps [(distributed/compute-step
+                                       {:id :only :device :gpu-0 :duration-ns duration})]
+                             :outputs [:only]))]
+    (doseq [duration [9007199254740993 9007199254740995N Long/MAX_VALUE]]
+      (let [simulation (distributed/simulate (single-step duration))]
+        (is (= duration (:makespan-ns simulation)))
+        (is (= duration (get-in simulation [:timeline :only :duration-ns])))
+        (is (= duration (get-in simulation [:device-compute-ns :gpu-0])))
+        (is (= duration (get-in (distributed/certify (single-step duration))
+                                [:certificate :cost-vector :latency-ns])))))
+    (let [duration 9007199254740993
+          serial (update (single-step duration) :steps conj
+                         (distributed/compute-step {:id :after :device :gpu-0 :duration-ns 3
+                                                    :dependencies [:only]}))
+          serial (assoc serial :outputs [:after])]
+      (is (= (+ duration 3) (:makespan-ns (distributed/simulate serial)))))
+    ;; Preserve the existing upward rounding of fractional estimates.
+    (doseq [[duration expected] [[0.25 1] [1.25 2] [2.0 2]]]
+      (is (= expected (:makespan-ns (distributed/simulate (single-step duration))))))
+    (is (= :distributed-compute-duration
+           (try (distributed/simulate (single-step (inc' Long/MAX_VALUE))) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest public-witness-boundaries-validate-once-and-reject-drift
   (let [plan (training-plan)
         certified (distributed/certify plan)
