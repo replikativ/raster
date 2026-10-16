@@ -98,6 +98,73 @@
   (let [{:keys [parameters body]} (route/materialize-host-program program)]
     (apply (eval (list 'fn parameters body)) arguments)))
 
+(defn- append-ordered-sum [program dt input extent]
+  (let [zero (if (= dt :float) (float 0.0) 0.0)
+        step '(raster.numeric/+ total element)
+        equation (list '= 'ordered-loss '[loss]
+                       (list 'reduce
+                             {:index 'sum-index :extent extent :accumulators '[total]
+                              :identities [zero] :dtypes [dt]
+                              :algebra [(scan/certify-reassociation
+                                         {:acc 'total :init zero :lambda step} dt)]}
+                             [input] [] (soac/lambda-form '[total element] [step])))
+        facts (-> (soac/facts program)
+                  (assoc-in [:values 'loss] (av/tensor {:dtype dt :shape [] :ownership :owned}))
+                  (assoc-in [:equations 'ordered-loss] (soac/default-equation-facts)))]
+    (soac/make facts (conj (soac/equations program) equation) '[loss])))
+
+(defn- owned-chain-sum [dt extent]
+  (append-ordered-sum
+   (changed (chain-graph dt extent)
+            #(-> % (assoc-in [:values 'a :ownership] :owned)
+                   (assoc-in [:values 'b :ownership] :owned))) dt 'b extent))
+
+(deftest ordered-scalar-reductions-use-existing-host-realization
+  (doseq [dt [:float :double]]
+    (let [array (if (= dt :float) float-array double-array)
+          cast (if (= dt :float) float double)
+          sum #(reduce (fn [acc x] (cast (+ acc x))) (cast 0.0) %)
+          chain (owned-chain-sum dt 3)
+          ;; Project the actual reduction, retaining its own ordered input boundary.
+          standalone (last (soac/equation-subprograms chain))
+          x (array [1.0e20 -1.0e20 3.0])
+          q (array [1.0 1.0 1.0]) r (array [0.0 0.0 0.0])]
+      (is (= [(sum (vec x))] (run-host standalone [x])))
+      (is (= [3.0] (run-host standalone [x])))
+      (is (= [3.0] (run-host chain [x q r])))
+      (is (= [3.0] (run-host (changed chain #(assoc-in % [:attributes :source-arithmetic]
+                                                       numerics/retained-source-arithmetic))
+                             [x q r])))
+      (is (= [12.0] (run-host chain [(array [1.0 2.0 3.0]) q (array [2.0 2.0 2.0])]))))
+    ;; The older two-equation boundary still accepts dynamic and zero extents.
+    (let [source (#'sums/source dt)
+          standalone (second (soac/equation-subprograms source))
+          array (if (= dt :float) float-array double-array)]
+      (is (= [0.0] (run-host standalone [(array []) 0])))
+      (is (= [14.0] (run-host source [(array [1.0 2.0 3.0]) (array [1.0 1.0 1.0]) 3]))))))
+
+(deftest ordered-scalar-reduction-graph-boundary-remains-closed
+  (let [program (owned-chain-sum :double 3)
+        standalone (last (soac/equation-subprograms program))]
+    (is (= :typed-soac-host-map-boundary
+           (reason #(route/materialize-host-program
+                     (changed program (fn [f] (assoc-in f [:values 'b :ownership] :borrowed)))))))
+    (doseq [bad [(owned-chain-sum :double 'n)
+                 (owned-chain-sum :double 0)
+                 ;; All operations must contribute to an explicitly requested output.
+                 (soac/make (soac/facts program) (soac/equations program) '[a])]]
+      (is (= :typed-soac-host-pure-graph-boundary
+             (reason #(route/materialize-host-program bad)))))
+    (doseq [bad [(changed standalone #(assoc-in % [:attributes :unknown-policy] true))
+                 (changed-operation-attributes standalone
+                                               #(assoc % :source-arithmetic
+                                                       (numerics/blas-source-arithmetic :double)))]]
+      (is (= :typed-soac-host-reduce-boundary
+             (reason #(route/materialize-host-program bad)))))
+    (is (= :typed-soac-host-map-binder-collision
+           (reason #(route/materialize-host-program
+                     (changed-operation-attributes standalone (fn [a] (assoc a :index 'double)))))))))
+
 (defn- segmented-program
   ([dt] (segmented-program dt nil))
   ([dt destination]
@@ -200,6 +267,38 @@
                            (cast (+ acc (cast (* (nth a (+ (* i 2) l))
                                                 (nth b (+ (* j 2) l)))))))
                          (cast 0.0) (range 2)))))))
+
+(deftest product-map-ordered-loss-retains-independent-arithmetic
+  (doseq [dt [:float :double]]
+    (let [product (regrouped-segmented-program dt)
+          activation (map-equation 'activation '[squared] 'p 6 '[C] '[c]
+                                   '[(raster.numeric/* c c)])
+          facts (-> (soac/facts product)
+                    (assoc :attributes {})
+                    (assoc-in [:values 'squared]
+                              (av/tensor {:dtype dt :shape [6] :ownership :owned}))
+                    (assoc-in [:equations 'activation] (soac/default-equation-facts)))
+          program (append-ordered-sum
+                   (soac/make facts (conj (soac/equations product) activation) '[squared])
+                   dt 'squared 6)
+          array (if (= dt :float) float-array double-array)
+          cast (if (= dt :float) float double)]
+      (doseq [[as bs] [[[-2.0 0.5 3.0 -4.0] [1.25 -0.5 -3.0 2.0 0.125 4.5]]
+                      [[1.0 2.0 3.0 4.0] [-1.0 2.0 0.5 3.0 -2.0 1.0]]]]
+        (let [a (array as) b (array bs)
+              cs (product-reference dt (vec a) (vec b))
+              expected (reduce (fn [acc c] (cast (+ acc (cast (* c c)))))
+                               (cast 0.0) cs)]
+          (is (= [expected] (run-host program [a b])))
+          (is (= (mapv cast as) (vec a)))
+          (is (= (mapv cast bs) (vec b))))))))
+
+(deftest product-without-map-does-not-widen-the-mixed-graph-boundary
+  (let [product (regrouped-segmented-program :double)
+        program (append-ordered-sum
+                 (changed product #(assoc % :attributes {})) :double 'C 6)]
+    (is (= :typed-soac-host-pure-graph-boundary
+           (reason #(route/materialize-host-program program))))))
 
 (deftest ordered-map-product-graphs-retain-independent-host-results-and-owned-edges
   (let [base (map-product-graph :double '[B X])
@@ -332,10 +431,8 @@
 
 (deftest specialization-boundaries-and-topology-remain-closed
   (let [pure (#'maps/map-program :double)
-        gather (#'indexed/indexed-map :double :long 'n 'm)
-        reduction (second (soac/equation-subprograms (#'sums/source :double)))]
+        gather (#'indexed/indexed-map :double :long 'n 'm)]
     (is (= :typed-soac-host-map-boundary (reason #(route/materialize-host-map gather))))
-    (is (= :typed-soac-host-program-topology (reason #(route/materialize-host-program reduction))))
     (doseq [program [(changed pure #(assoc-in % [:attributes :unknown-host-contract] true))
                      (changed pure #(assoc-in % [:values 'x :memory-space] :device))]]
       (is (= :typed-soac-host-map-boundary (reason #(route/materialize-host-program program))))
