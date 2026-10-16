@@ -33,6 +33,7 @@
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.ad.reverse.normalize :as anf]
             [raster.ad.tangent :as tangent]
+            [raster.analysis.memory :as memory]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par-ir]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -732,7 +733,8 @@
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
   An array a pullback replays must keep its forward contents until the
   backward runs: a later write to it is rejected rather than differentiated at
-  the overwritten values."
+  the overwritten values. Alias state retains positive may-alias edges through
+  the shared memory analysis; an absent edge is not a freshness proof."
   [norm-bindings active-params]
   (reduce
    (fn [{:keys [activity fwd-bindings records replayed writes aliases]} [sym init-expr]]
@@ -750,24 +752,25 @@
            activity (if (and active? (seq (:written-arrs record)))
                       (reduce #(assoc %1 %2 true) activity (:written-arrs record))
                       activity)
-           representative #(get aliases % %)
+           may-aliases #(memory/transitive-closure (set %) aliases)
            memory-effects (record-memory-effects record init-expr)
-           current-replays (set (map representative (:replays memory-effects)))
+           current-replays (may-aliases (:replays memory-effects))
            source-writes (:writes memory-effects)
            overwritten
-           (seq (distinct
-                 (concat
-                  (filter #(contains? replayed (representative %))
-                          (into source-writes (:written-arrs record)))
+           (seq (sort-by str (set/union
+                  (set/intersection replayed
+                                    (may-aliases (into source-writes (:written-arrs record))))
                   ;; A step may overwrite its own scatter index before the
                   ;; pullback. Check explicit source writes, not the normal
                   ;; output writes declared by scan/map/gather records.
-                  (filter #(contains? current-replays (representative %))
-                          (:local-writes memory-effects)))))
+                  (set/intersection current-replays
+                                    (may-aliases (:local-writes memory-effects))))))
            ;; Even an inactive alias can write an earlier residual. Records
            ;; describe result/output identity without another operation registry.
            result-alias (or (:result-alias record) (when (symbol? init-expr) init-expr))
-           aliases (assoc aliases sym (if result-alias (representative result-alias) sym))]
+           aliases (:aliases
+                    (memory/track-aliases {:aliases aliases :consumed #{}}
+                                          sym (if result-alias #{result-alias} #{}) #{}))]
        (when overwritten
          (throw (ex-info
                  (str "Reverse-mode AD: `" sym "` writes " (vec overwritten) ", which an "
@@ -778,8 +781,9 @@
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
         :records (if record (conj records record) records)
         :aliases aliases
-        :replayed (into replayed (map #(get aliases % %) (:replays memory-effects)))
-        :writes (into writes (map representative (into source-writes (:written-arrs record))))}))
+        :replayed (into replayed
+                        (memory/transitive-closure (set (:replays memory-effects)) aliases))
+        :writes (into writes (may-aliases (into source-writes (:written-arrs record))))}))
    {:activity (into {} (map (fn [p] [p true]) active-params))
     :fwd-bindings [] :records [] :replayed #{} :writes #{} :aliases {}}
    (partition 2 norm-bindings)))

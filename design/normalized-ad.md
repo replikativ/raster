@@ -1322,3 +1322,11 @@ and pullback forms from it; inline steps consume the same underlying pieces.
 Lexical capture order is derived separately and does not certify memory safety.
 This shared assembly does not yet replace the generic loop builder or admit new
 effectful loop regions.
+
+Source reverse-region memory checks use the shared memory analysis's transitive
+may-alias relation for existing positive alias evidence, rather than choosing one
+canonical identity per binding. Write/replay checks expand that relation on both
+sides. This is a conservative safety relation: multiple names may refer to the
+same storage, and missing edges do not certify freshness or distinctness.
+It does not establish carried-array aliases or admit new loop regions. Diagnostic
+array lists are sorted and may include additional names from an alias component.
