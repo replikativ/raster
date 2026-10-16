@@ -722,7 +722,8 @@
   [record expression]
   (if-let [{:keys [kind regions]} (:effects record)]
     (do
-      (when-not (and (= :choice kind) (seq regions)
+      (when-not (and (or (= :choice kind) (and (= :region kind) (= 1 (count regions))))
+                     (seq regions)
                      (every? #(and (set? (:writes %)) (set? (:replays %))) regions))
         (throw (ex-info "Malformed reverse AD region effect summary"
                         {:reason :ad-region-effects :effects (:effects record)})))
@@ -731,7 +732,11 @@
        :value-facts (reduce merge {} (map :value-facts regions))
        ;; Child scopes were checked independently by the same forward pass.
        ;; The choice itself has no additional source write outside those scopes.
-       :local-writes #{} :local-reads #{}})
+       :local-writes #{}
+       ;; A map still owns its implicit output store AFTER the checked child.
+       ;; Child replay facts do not replace source input/output stability.
+       :local-reads (if (seq (:written-arrs record))
+                      (set (map :sym (op/aget-reads expression))) #{})})
     (let [writes (written-syms expression)]
       {:writes writes :local-writes writes :replays (set (:replays record))
        ;; Stable input storage includes excluded observation arrays too. The
@@ -969,7 +974,9 @@
                   ;; pullback. Check explicit source writes, not the normal
                   ;; output writes declared by scan/map/gather records.
                   (set/intersection current-replays
-                                    (may-aliases (:local-writes memory-effects))))))
+                                    (may-aliases (:local-writes memory-effects)))
+                  (set/intersection (may-aliases (:input-replays record))
+                                    (may-aliases (:written-arrs record))))))
            ;; Even an inactive alias can write an earlier residual. Records
            ;; describe result/output identity without another operation registry.
            result-aliases (if-let [result-alias (:result-alias record)]
@@ -1377,7 +1384,7 @@
   loop pullback's grads)."
   [records activity seed-adj-env]
   (reduce
-   (fn [{:keys [adj-env rev-ctx]} {:keys [type sym] :as record}]
+   (fn [{:keys [adj-env rev-ctx pullback-replays]} {:keys [type sym] :as record}]
      (let [;; A record that writes arrays can receive cotangent through those
            ;; buffers as well as through its result symbol, so its backward
            ;; always runs; others run only when their result has a cotangent.
@@ -1393,9 +1400,11 @@
                      (sum-contribs-into rev-ctx adj-sym adj-contribs nil sym-tag)
                      rev-ctx)]
        (if (or array-type? adj-contribs)
-         (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
-         {:adj-env adj-env :rev-ctx rev-ctx})))
-   {:adj-env seed-adj-env :rev-ctx (bind-ctx/make-ctx ad-gensym)}
+         (assoc (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
+                :pullback-replays (into pullback-replays
+                                         (:replays (record-memory-effects record nil))))
+         {:adj-env adj-env :rev-ctx rev-ctx :pullback-replays pullback-replays})))
+   {:adj-env seed-adj-env :rev-ctx (bind-ctx/make-ctx ad-gensym) :pullback-replays #{}}
    (reverse records)))
 
 (defn- param-zero-expr
@@ -1458,13 +1467,14 @@
                                        (take-nth 2 norm-bindings))]
     (let [{:keys [activity fwd-bindings records replayed writes value-facts] :as forward-state}
           (forward-pass norm-bindings active-params)
-          {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
+          {:keys [adj-env rev-ctx pullback-replays]} (reverse-pass records activity seed-adj-env)
           {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
       {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
        :rev-ctx rev-ctx :param-adj-syms param-adj-syms :replays replayed :writes writes
-       :value-facts value-facts :forward-scope (source-memory-scope forward-state)})))
+       :value-facts value-facts :forward-scope (source-memory-scope forward-state)
+       :pullback-replays (memory/transitive-closure pullback-replays (:aliases forward-state))})))
 
-(declare gen-reverse-loop-with-let lift-loop-to-tail)
+(declare gen-reverse-loop-with-let gen-reverse-loop-with-let-program lift-loop-to-tail)
 
 (defn- loop-init? [init]
   (and (seq? init) (contains? #{'loop 'loop*} (first init))))
@@ -1475,13 +1485,14 @@
   representation; the latter must not allocate a closure per iteration."
   [bindings body-exprs active-params dy-sym]
   (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope]}
+        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope pullback-replays]}
         (process-bindings norm-bindings active-params
                           {:seed-adj-env {body-sym [dy-sym]}})]
     {:body-sym body-sym :dy dy-sym
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
      :replays replays :writes writes :value-facts value-facts :forward-scope forward-scope
+     :pullback-replays pullback-replays
      :param-adj-syms param-adj-syms}))
 
 (defn- reverse-program-forms
@@ -1497,13 +1508,20 @@
      :standard-form (list 'let* augmented-bindings
                           (vector result-sym (list 'fn* [dy] pullback-body)))}))
 
-(defn- gen-reverse-let-core
+(defn- gen-reverse-let-program-core
   "Generate reverse-mode AD code for a let* form: normalize → process-bindings →
   assemble [primal, pullback-fn]."
   [bindings body-exprs active-params]
-  (:standard-form
-   (reverse-program-forms
-    (let-gradient-pieces bindings body-exprs active-params 'dy__rad))))
+  (let [pieces (let-gradient-pieces bindings body-exprs active-params 'dy__rad)
+        aliases (get-in pieces [:forward-scope :aliases])]
+    {:form (:standard-form (reverse-program-forms pieces))
+     :writes (:writes pieces) :replays (:pullback-replays pieces)
+     :value-facts (:value-facts pieces) :aliases aliases
+     ;; Positive MAY identity, including private IDs, never exact :alias evidence.
+     :result-aliases (memory/transitive-closure #{(:body-sym pieces)} aliases)}))
+
+(defn- gen-reverse-let-core [bindings body-exprs active-params]
+  (:form (gen-reverse-let-program-core bindings body-exprs active-params)))
 
 (defn- gen-inline-step-gradients
   "Emit a closure-free scalar-step pullback inside an enclosing ordered loop.
@@ -1517,7 +1535,7 @@
     (list 'let* (vec (concat fwd-bindings [dy-sym adjoint] rev-bindings))
           (vec param-adj-syms))))
 
-(defn- gen-reverse-let
+(defn- gen-reverse-let-program
   "Generate reverse-mode AD code for a let* form.
 
   A raw `loop` bound to a let* binding is not recordable by the per-binding
@@ -1536,7 +1554,7 @@
   [bindings body-exprs active-params]
   (let [pairs (vec (partition 2 bindings))]
     (if-not (some (fn [[_ init]] (loop-init? init)) pairs)
-      (gen-reverse-let-core bindings body-exprs active-params)
+      (gen-reverse-let-program-core bindings body-exprs active-params)
       ;; Thread activity across the bindings (init-active?, same rule the engine
       ;; uses) WITHOUT running ad-record (which would throw on the active loop).
       ;; Select the first ACTIVE loop with this activity authority. Earlier
@@ -1547,7 +1565,7 @@
             first-loop-sym (ffirst (filter (fn [[sym init]]
                                             (and (loop-init? init) (get activity sym))) pairs))]
         (if-not first-loop-sym
-          (gen-reverse-let-core bindings body-exprs active-params)
+          (gen-reverse-let-program-core bindings body-exprs active-params)
           (let [_ (assert-source-scan-checkpoint!
                    (second (first (filter #(= first-loop-sym (first %)) pairs))) true)
                 lifted (lift-loop-to-tail (apply list 'let* (vec bindings) body-exprs)
@@ -1555,17 +1573,20 @@
             (cond
               ;; lift-loop-to-tail → bare tail loop (no bindings preceded it)
               (and (seq? lifted) (contains? #{'loop 'loop*} (first lifted)))
-              (gen-reverse-loop-with-let [] lifted active-params)
+              (gen-reverse-loop-with-let-program [] lifted active-params)
 
               ;; lift-loop-to-tail → (let* [pre...] (loop ...))
               (and (seq? lifted) (contains? #{'let 'let*} (first lifted))
                    (let [tail (drop 2 lifted)]
                      (and (= 1 (count tail)) (loop-init? (first tail)))))
               (let [[_ pre-bindings loop-form] lifted]
-                (gen-reverse-loop-with-let (vec pre-bindings) loop-form active-params))
+                (gen-reverse-loop-with-let-program (vec pre-bindings) loop-form active-params))
 
               ;; lift declined (non-canonical loop body) — preserve fail-loud.
-              :else (gen-reverse-let-core bindings body-exprs active-params))))))))
+              :else (gen-reverse-let-program-core bindings body-exprs active-params))))))))
+
+(defn- gen-reverse-let [bindings body-exprs active-params]
+  (:form (gen-reverse-let-program bindings body-exprs active-params)))
 
 ;; ================================================================
 ;; Loop/recur reverse-mode AD
@@ -1664,9 +1685,10 @@
 
 (declare gen-reverse-loop-with-let)
 (declare gen-reverse-loop*)
+(declare gen-reverse-loop-program*)
 (declare hoist-nested-lets)
 
-(defn- gen-reverse-loop
+(defn- gen-reverse-loop-program
   "Generate reverse-mode AD code for a loop* form.
 
   Strategy (Myia's closures-as-tape):
@@ -1685,24 +1707,16 @@
       (when-let [{:keys [acc-sym bound-expr]} (patterns/match-reduce-loop loop-form)]
         (when (patterns/contains-sym? bound-expr acc-sym)
           (ad-record :loop '_loop loop-form {})))))
-  ;; CC2 fix: if any init expressions are non-trivial (compound expressions
-  ;; that reference active params), lift them into let bindings and delegate
-  ;; to gen-reverse-loop-with-let so adjoints propagate through the init.
+  ;; Initializers execute once, in source order, including on zero-trip loops.
+  ;; Lift compound inactive initializers too: their effects and aliases must
+  ;; pass through the same checked prefix as differentiated initializers.
   ;; E.g. (loop [a (* x 2.0) ...] ...) → (let* [a_init (* x 2.0)] (loop [a a_init ...] ...))
   ;; Once lifting is needed, preserve the entire sequential initializer region;
   ;; inactive origins can trap or be referenced by later active initializers.
-  (let [raw-bindings (vec (partition 2 (second loop-form)))
-        active-set (set active-params)
-        references-active? (fn [expr]
-                             (binding [util/*shadowing-locals*
-                                       (into util/*shadowing-locals* active-params)]
-                               (some active-set (util/free-syms expr))))
-        active-nontrivial (filterv (fn [[_ init]]
-                                     (and (seq? init) (references-active? init)))
-                                   raw-bindings)]
-    (if (seq active-nontrivial)
+  (let [raw-bindings (vec (partition 2 (second loop-form)))]
+    (if (some (comp seq? second) raw-bindings)
       ;; Loop initializers are sequential bindings, not independent arguments.
-      ;; If an active expression needs lifting, retain *all* initializers in
+      ;; If any compound initializer needs lifting, retain *all* initializers in
       ;; source order and substitute earlier bindings capture-avoidantly.
       ;; Lifting only active expressions could move a read before an earlier
       ;; trapping origin, or leave its reference to that origin out of scope.
@@ -1722,10 +1736,13 @@
                                            lifted))
             new-loop-form (with-meta (list* 'loop* new-loop-bindings (drop 2 loop-form))
                             (meta loop-form))]
-        (gen-reverse-loop-with-let let-bindings new-loop-form active-params))
-      (gen-reverse-loop* loop-form active-params))))
+        (gen-reverse-loop-with-let-program let-bindings new-loop-form active-params))
+      (gen-reverse-loop-program* loop-form active-params))))
 
-(defn- gen-reverse-loop*
+(defn- gen-reverse-loop [loop-form active-params]
+  (:form (gen-reverse-loop-program loop-form active-params)))
+
+(defn- gen-reverse-loop-program*
   "Core reverse-mode loop transform (all init expressions are trivial)."
   [loop-form active-params]
   (let [{:keys [bindings loop-syms test-expr recur-args
@@ -1734,6 +1751,27 @@
 
         ;; Determine active loop vars (include recur-binding dependencies)
         active-loop-vars (loop-var-activity bindings recur-args active-params recur-bindings)
+
+        ;; These fragments are not visited by the existing per-active-port
+        ;; forward programs. A write summary alone cannot close their lexical
+        ;; aliases or establish source-order replay safety. Refuse rather than
+        ;; exporting private write IDs as if a child program had checked them.
+        test-writes (written-syms test-expr)
+        unchecked-recur-writes
+        (into #{} (mapcat written-syms)
+              (keep-indexed (fn [index expression]
+                              (when-not (some #{(nth loop-syms index)} active-loop-vars)
+                                expression)) recur-args))
+        unchecked-prelude-writes
+        (when (empty? active-loop-vars)
+          (written-syms (cons 'do (map second recur-bindings))))
+        _ (doseq [[phase writes] [[:test test-writes]
+                                 [:inactive-recur unchecked-recur-writes]
+                                 [:inactive-prelude unchecked-prelude-writes]]
+                  :when (seq writes)]
+            (throw (ex-info "Reverse loop has a writing fragment outside its checked forward programs"
+                            {:reason :unclosed-loop-effect :region :ordered-loop
+                             :phase phase :arrays (vec (sort-by str writes))})))
 
         ;; All active symbols: active params + active loop vars
         all-active (vec (distinct (concat active-params active-loop-vars)))
@@ -1755,16 +1793,20 @@
         ;; Linearize the exit where it actually executes. Re-running its primal
         ;; in the pullback would repeat inactive effects and reread mutable data.
         terminal-pair-sym (ad-gensym "terminal_vpb")
-        terminal-transform
+        terminal-program
         (when-not result-var
           (let [[bindings body] (extract-let-parts (hoist-nested-lets result-expr))]
-            (gen-reverse-let bindings body iter-active)))
+            (gen-reverse-let-program bindings body iter-active)))
+        terminal-transform (:form terminal-program)
 
         per-var-data
         (mapv (fn [lv]
                 (let [idx (.indexOf loop-syms lv)
                       update-expr (nth recur-args idx)
-                      nv-sym (ad-gensym (str "nv_" (name lv)))
+                      ;; Preserve the update value's retained declaration. The
+                      ;; carry name is not an independent type inference rule.
+                      nv-sym (ad-gensym (str "nv_" (name lv))
+                                       (:raster.type/tag (meta update-expr)))
                       vpb-sym (ad-gensym (str "vpb_" (name lv)))
                       val-sym (ad-gensym (str "val_" (name lv)))
                       pb-sym (ad-gensym (str "pb_" (name lv)))
@@ -1772,17 +1814,47 @@
                       ;; differentiates through aget/math inside the loop body.
                       all-bindings (vec (concat (mapcat identity recur-bindings)
                                                 [nv-sym update-expr]))]
+                  (let [program (gen-reverse-let-program all-bindings [nv-sym] iter-active)]
                   {:lv lv
                    :idx idx
                    :nv-sym nv-sym
                    :vpb-sym vpb-sym
                    :val-sym val-sym
                    :pb-sym pb-sym
-                   :transform (gen-reverse-let
-                               all-bindings
-                               [nv-sym]
-                               iter-active)}))
+                   :program program :transform (:form program)})))
               active-loop-vars)
+
+        ;; These summaries describe the existing emitted transforms. Raw known
+        ;; writes add denial evidence only; absence is not an effect certificate.
+        step-programs (mapv :program per-var-data)
+        programs (cond-> step-programs terminal-program (conj terminal-program))
+        child-aliases (reduce #(merge-with into %1 (:aliases %2))
+                              (:aliases *source-memory-context*) programs)
+        loop-aliases
+        (:aliases
+         (reduce (fn [state [index [sym init]]]
+                   (let [program (:program (some #(when (= sym (:lv %)) %) per-var-data))
+                         alternatives (into (:symbols (form/normal-exit-facts init))
+                                            (into (:symbols (form/normal-exit-facts (nth recur-args index)))
+                                                  (:result-aliases program)))]
+                     (memory/track-aliases state sym alternatives #{})))
+                 {:aliases child-aliases :consumed #{}} (map-indexed vector bindings)))
+        step-writes (memory/transitive-closure
+                     (into (written-syms (cons 'do (concat (map second recur-bindings) recur-args)))
+                           (mapcat :writes step-programs)) loop-aliases)
+        terminal-writes (memory/transitive-closure (set (:writes terminal-program)) loop-aliases)
+        step-replays (memory/transitive-closure (into #{} (mapcat :replays step-programs)) loop-aliases)
+        terminal-replays (memory/transitive-closure (set (:replays terminal-program)) loop-aliases)
+        invalidated (set/intersection step-replays (into step-writes terminal-writes))
+        _ (when (seq invalidated)
+            (throw (ex-info "Reverse loop iterations invalidate outstanding pullback replay contents"
+                            {:reason :replayed-array-overwritten :region :ordered-loop
+                             :arrays (vec (sort-by str invalidated))})))
+        program-writes (memory/transitive-closure
+                        (into (written-syms loop-form) (mapcat :writes programs)) loop-aliases)
+        program-facts (reduce #(merge %1 (:value-facts %2))
+                              (into (:value-facts *source-memory-context*)
+                                    (map (fn [sym] [sym {:value sym}]) loop-syms)) programs)
 
         n-alv (count active-loop-vars)
 
@@ -2010,11 +2082,18 @@
         result-value-expr (if result-var
                             loop-result-sym
                             (list 'nth loop-result-sym n-loop-syms))]
-    (list 'let* [pullbacks-sym (list 'java.util.ArrayList.)
+    {:writes program-writes :replays (into step-replays terminal-replays)
+     :aliases loop-aliases :value-facts program-facts
+     :result-aliases (memory/transitive-closure
+                      (if result-var #{result-var} (set (:result-aliases terminal-program))) loop-aliases)
+     :form (list 'let* [pullbacks-sym (list 'java.util.ArrayList.)
                  loop-result-sym forward-loop-form]
-          (vector result-value-expr pullback-code))))
+          (vector result-value-expr pullback-code))}))
 
-(defn- gen-reverse-loop-with-let
+(defn- gen-reverse-loop* [loop-form active-params]
+  (:form (gen-reverse-loop-program* loop-form active-params)))
+
+(defn- gen-reverse-loop-with-let-program
   "Handle (let* [bindings...] (loop ...)) by wrapping the let bindings
   around the loop and composing pullbacks.
   The let bindings compute values used by the loop, and the loop
@@ -2035,8 +2114,9 @@
         let-active-syms (filterv #(get activity % false) (map first (partition 2 anf-bindings)))
         ;; Extended active set the loop sees: original params + active let-syms.
         loop-active (vec (distinct (concat active-params let-active-syms)))
-        loop-transform (binding [*source-memory-context* (source-memory-scope forward-state)]
-                         (gen-reverse-loop loop-form loop-active))
+        loop-program (binding [*source-memory-context* (source-memory-scope forward-state)]
+                       (gen-reverse-loop-program loop-form loop-active))
+        loop-transform (:form loop-program)
         dy-sym 'dy__rad
         loop-vpb-sym (ad-gensym "lvpb")
         loop-val-sym (ad-gensym "lval")
@@ -2046,10 +2126,15 @@
         ;; (bound at pullback-call time as `loop-grads-sym`).
         seed-adj-env (into {} (map-indexed (fn [i s] [s [(list 'nth loop-grads-sym i)]])
                                            loop-active))
-        {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
-        {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
+        {:keys [adj-env rev-ctx pullback-replays]} (reverse-pass records activity seed-adj-env)
+        {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)
+        aliases (merge-with into (:aliases forward-state) (:aliases loop-program))]
     ;; Assemble: forward let-prefix + loop + composed pullback.
-    (list 'let* (vec (concat fwd-bindings
+    {:writes (into (:writes forward-state) (:writes loop-program))
+     :replays (memory/transitive-closure (into pullback-replays (:replays loop-program)) aliases)
+     :aliases aliases :value-facts (merge (:value-facts forward-state) (:value-facts loop-program))
+     :result-aliases (memory/transitive-closure (:result-aliases loop-program) aliases)
+     :form (list 'let* (vec (concat fwd-bindings
                              [loop-vpb-sym loop-transform
                               loop-val-sym (list 'nth loop-vpb-sym 0)
                               loop-pb-sym  (list 'nth loop-vpb-sym 1)]))
@@ -2057,7 +2142,10 @@
                   (list 'fn* [dy-sym]
                         (list 'let* (vec (concat [loop-grads-sym (list loop-pb-sym dy-sym)]
                                                  (:bindings rev-ctx)))
-                              (vec param-adj-syms)))))))
+                              (vec param-adj-syms)))))}))
+
+(defn- gen-reverse-loop-with-let [let-bindings loop-form active-params]
+  (:form (gen-reverse-loop-with-let-program let-bindings loop-form active-params)))
 
 ;; ================================================================
 ;; Dotimes reverse-mode AD (array mutation patterns)
@@ -2545,6 +2633,31 @@
                       {:reason :ad-map-store-callee :cast cast :resolved-callee callee
                        :form map-form})))))
 
+(defn- gen-reverse-read-region
+  "Lifted reads execute before this scalar child. Their scatter indices must
+   survive its effects, unlike a child-owned replay established after a write."
+  [bindings body active-params prior-replays]
+  (let [prior-replays (set prior-replays)
+        conditions (record-replay-conditions nil {:replays prior-replays}
+                                             (:value-facts *source-memory-context*))
+        visible (set (:values *source-memory-context*))
+        program (binding [*source-memory-context*
+                          (-> *source-memory-context*
+                              (update :replayed join-input-replay-conditions
+                                      (select-keys conditions visible))
+                              (update :unprojectable join-input-replay-conditions
+                                      (apply dissoc conditions visible)))]
+                  (gen-reverse-let-program bindings body active-params))
+        aliases (:aliases program)
+        overwritten (set/intersection
+                     (memory/transitive-closure (into prior-replays (keys conditions)) aliases)
+                     (memory/transitive-closure (:writes program) aliases))]
+    (when (seq overwritten)
+      (throw (ex-info "Scalar child overwrites an index needed by its parent's pullback"
+                      {:reason :replayed-array-overwritten
+                       :arrays (vec (sort-by str overwritten))})))
+    program))
+
 (defn- gen-reverse-par-map
   "Generate reverse-mode AD code for a raster.par/map! form.
 
@@ -2603,12 +2716,14 @@
         pb-sym (ad-gensym "pb")
 
         ;; Per-iteration scalar transform (gen-reverse-let on the scalar body)
-        scalar-transform
+        scalar-program
         (when (seq iter-active)
           (let [binds (if (seq pure-scalar-bindings)
                         (vec (concat pure-scalar-bindings [val-result-sym body-result]))
                         [val-result-sym body-result])]
-            (gen-reverse-let binds [val-result-sym] iter-active)))
+            (gen-reverse-read-region binds [val-result-sym] iter-active
+                                     (index-replays agets idx-sym))))
+        scalar-transform (:form scalar-program)
 
         ;; === Forward code ===
         ;; Run original par/map! AND build tape of pullbacks
@@ -2733,7 +2848,13 @@
               d-scalar-syms))]
 
     {:type :par-map
-     :replays (when forward-code (index-replays agets idx-sym))
+     :replays (when forward-code (into (index-replays agets idx-sym) (:replays scalar-program)))
+     :input-replays (when forward-code (into (index-replays agets idx-sym) (:replays scalar-program)))
+     :effects (when scalar-program
+                {:kind :region
+                 :regions [(assoc (select-keys scalar-program [:writes :replays :value-facts])
+                                  :writes (into (set written-arrs) (:writes scalar-program))
+                                  :replays (into (index-replays agets idx-sym) (:replays scalar-program)))]})
      :forward-code forward-code
      :tape-sym tape-sym
      :d-out-sym d-out-sym
@@ -3023,15 +3144,20 @@
         d-acc-chain-sym (ad-gensym "d_acc_chain")
 
         ;; Per-iteration scalar transform
-        scalar-transform
-        (when (seq iter-active)
-          (let [binds (if (seq pure-scalar-bindings)
+        step-bindings (if (seq pure-scalar-bindings)
                         (vec (concat pure-scalar-bindings [val-result-sym body-result]))
-                        [val-result-sym body-result])]
-            (if typed-double?
-              (gen-inline-step-gradients binds [val-result-sym]
-                                         iter-active d-acc-chain-sym)
-              (gen-reverse-let binds [val-result-sym] iter-active))))
+                        [val-result-sym body-result])
+        scalar-program (when (and (seq iter-active) (not typed-double?))
+                         (gen-reverse-read-region step-bindings [val-result-sym] iter-active
+                                                  (index-replays agets idx-sym)))
+        scalar-transform (when (seq iter-active)
+                           (if typed-double?
+                             (gen-inline-step-gradients step-bindings [val-result-sym]
+                                                        iter-active d-acc-chain-sym)
+                             (:form scalar-program)))
+        step-replays (into (index-replays agets idx-sym)
+                           (if typed-double? (util/free-syms par-reduce-form)
+                               (:replays scalar-program)))
 
         ;; === Forward code ===
         ;; Run the reduce sequentially, storing pullbacks in tape
@@ -3188,8 +3314,12 @@
      :residual-kind (if typed-double? :double-carry :closure-tape)
      ;; Closures save the read values, but the scatter still reconstructs
      ;; destinations. Primitive carry replay additionally rereads the step.
-     :replays (into (index-replays agets idx-sym)
-                    (when typed-double? (util/free-syms par-reduce-form)))
+     :replays step-replays
+     :input-replays step-replays
+     :effects (when scalar-program
+                {:kind :region
+                 :regions [(assoc (select-keys scalar-program [:writes :replays :value-facts])
+                                  :replays step-replays)]})
      :forward-bindings forward-bindings
      :tape-sym tape-sym
      :d-acc-sym d-acc-sym

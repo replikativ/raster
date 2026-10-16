@@ -1517,3 +1517,42 @@ This closes a measured prefix-reduction/loop-write error that returned gradient
 9 instead of 3 by replaying overwritten contents. The hazard now refuses before
 the write; it is not newly supported mutation AD. No joint loop-step builder,
 new raw-loop admission, tape representation or held loop adapter is activated.
+
+### Source loop program summaries
+
+The existing tape transform now returns compile-time program data alongside its
+emitted form. Parent maps and closure-based reductions retain the child's
+checked writes, actual emitted-pullback replay dependencies, and value catalog.
+The catalog does not make private values visible to an enclosing scope. Carry
+result alternatives are conservative may-alias edges, not exact identities.
+Scalar captures are still saved values, not automatically external replays.
+
+These summaries prevent a parent write from invalidating an outstanding child
+pullback, including a reduction nested in a loop terminal. Repeated step writes
+and terminal writes cannot invalidate step replay contents. An initializer's
+earlier write is not globally treated as a later overwrite. Compound
+initializers use the existing checked prefix in source order, even when inactive
+or when the loop takes zero iterations.
+
+The current per-active-carry engine does not check every possible forward
+fragment. Known-writing loop tests (including the final failed test), inactive
+recur arguments, and preludes with no active carry therefore explicitly refuse
+with `:unclosed-loop-effect`. A raw write summary is denial evidence, not a
+certificate that private alias targets were projected or effects executed in
+order. Absence of known writes is not a general purity proof.
+This construction-time restriction may also reject zero-trip loops containing
+such fragments; it is not a runtime test of whether their effects execute.
+
+An owning map/reduction's lifted reads precede its scalar child. Index storage
+that its scatter pullback will reread is therefore a prior replay obligation
+when that child is constructed, not a dependency appended only afterward. The
+same ordered child checks enforce runtime alias guards; positive alias closure
+also preserves the existing static overwrite refusal. This prior frontier is
+distinct from the child's own replays, which may lawfully be established after
+an earlier child write. A checked region summary must not erase that distinction.
+
+This is not the shared whole-step forward spine: per-port transforms, their
+arithmetic checkpoints and existing tape ownership remain unchanged. Nor does
+it activate the held raw-loop record adapter or add mutable-state AD support.
+The next consolidation must normalize one source-ordered forward step and
+derive separate reverse projections without reassociating their accumulation.
