@@ -1269,6 +1269,24 @@ finite-difference forward outputs and reduced the two inspected coordinate discr
 from roughly 2.4e-8/1.6e-8 to 1.2e-10/1.3e-10. Those two coordinates do not establish
 full-model Float/GPU numerical acceptance; that gate and its tolerances remain unchanged.
 
+### Conditional residuals compose their memory obligations
+
+The shared source reverse engine exports alias-resolved writes and replay
+dependencies with each region's forward/reverse pieces. A conditional composes
+these as a choice: either arm may invalidate an earlier residual, and either
+arm's residual must survive later writes. Each arm is checked independently;
+reads in one arm are not compared with mutually exclusive writes in the other.
+The normalized predicate executes before the child scopes and retains its own
+source-order effect checks. Bare and devirtualized writes use the same canonical
+call descriptor.
+
+This closes a silent wrong-gradient case where a reduction inside a branch lost
+its replay dependency, allowing its observation array to be overwritten before
+the pullback. Unsafe programs now receive the existing overwrite refusal, not a
+gradient computed from changed data. Legitimate earlier writes, exclusive-arm
+writes and alias-resolved capture remain supported. No arithmetic rule, cache,
+tape owner, default AD engine or numerical acceptance criterion changes.
+
 ### Ordered source recurrences do not imply parallel consent
 
 The source JVP engine can pair the primal and tangent of a pure, retained-typed

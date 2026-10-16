@@ -525,6 +525,9 @@
 
 (defmethod ad-record :if [_ sym init-expr activity]
   (let [[_ branch then else] init-expr]
+    (when-not (trivial-expr? branch)
+      (throw (ex-info "Reverse AD conditional test survived predicate normalization"
+                      {:reason :ad-region-unclosed-test :sym sym :test branch})))
     (if (every? trivial-expr? [then else])
       {:record {:type :if :sym sym :branch branch :then then :else else}}
       (let [free (set/union (util/free-syms then) (util/free-syms else))
@@ -546,7 +549,8 @@
                                    [body-sym saved])))
                          pieces)]
         {:record {:type :if-region :sym sym :branch branch :params params
-                  :dy dy :tape tape :pieces pieces}
+                  :dy dy :tape tape :pieces pieces
+                  :effects {:kind :choice :regions pieces}}
          :fwd-patch (fn [bindings]
                       (into (vec (drop-last 2 bindings))
                             [tape (list 'if branch (first paired) (second paired))
@@ -693,12 +697,10 @@
 
 
 (defn- written-syms
-  "Explicit aset targets anywhere in a binding's initializer."
+  "Array-write targets, using the retained call identity for bare and typed calls."
   [init-expr]
   (into #{}
-        (keep (fn [form]
-                (when (and (seq? form) (op/aset-op? (first form)) (symbol? (second form)))
-                  (second form))))
+        (keep op/aset-array-sym)
         (tree-seq coll? seq init-expr)))
 
 (defn- index-replays
@@ -707,6 +709,25 @@
   [reads counter]
   (reduce into #{} (map #(util/free-syms (:idx %) #{counter}) reads)))
 
+(defn- record-memory-effects
+  "Compose already-checked child regions without flattening exclusive paths.
+   Choice-arm writes can invalidate an earlier residual; either arm's residual
+   must survive later writes. Writes in one arm do not execute in the other."
+  [record expression]
+  (if-let [{:keys [kind regions]} (:effects record)]
+    (do
+      (when-not (and (= :choice kind) (seq regions)
+                     (every? #(and (set? (:writes %)) (set? (:replays %))) regions))
+        (throw (ex-info "Malformed reverse AD region effect summary"
+                        {:reason :ad-region-effects :effects (:effects record)})))
+      {:writes (reduce into #{} (map :writes regions))
+       :replays (reduce into #{} (map :replays regions))
+       ;; Child scopes were checked independently by the same forward pass.
+       ;; The choice itself has no additional source write outside those scopes.
+       :local-writes #{}})
+    (let [writes (written-syms expression)]
+      {:writes writes :local-writes writes :replays (set (:replays record))})))
+
 (defn- forward-pass
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
   An array a pullback replays must keep its forward contents until the
@@ -714,7 +735,7 @@
   the overwritten values."
   [norm-bindings active-params]
   (reduce
-   (fn [{:keys [activity fwd-bindings records replayed aliases]} [sym init-expr]]
+   (fn [{:keys [activity fwd-bindings records replayed writes aliases]} [sym init-expr]]
      (let [active?  (init-active? init-expr activity)
            activity (assoc activity sym active?)
            fwd      (conj fwd-bindings sym (qualify-fwd-expr init-expr))
@@ -730,8 +751,9 @@
                       (reduce #(assoc %1 %2 true) activity (:written-arrs record))
                       activity)
            representative #(get aliases % %)
-           current-replays (set (map representative (:replays record)))
-           source-writes (written-syms init-expr)
+           memory-effects (record-memory-effects record init-expr)
+           current-replays (set (map representative (:replays memory-effects)))
+           source-writes (:writes memory-effects)
            overwritten
            (seq (distinct
                  (concat
@@ -741,7 +763,7 @@
                   ;; pullback. Check explicit source writes, not the normal
                   ;; output writes declared by scan/map/gather records.
                   (filter #(contains? current-replays (representative %))
-                          source-writes))))
+                          (:local-writes memory-effects)))))
            ;; Even an inactive alias can write an earlier residual. Records
            ;; describe result/output identity without another operation registry.
            result-alias (or (:result-alias record) (when (symbol? init-expr) init-expr))
@@ -756,9 +778,10 @@
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
         :records (if record (conj records record) records)
         :aliases aliases
-        :replayed (into replayed (map #(get aliases % %) (:replays record)))}))
+        :replayed (into replayed (map #(get aliases % %) (:replays memory-effects)))
+        :writes (into writes (map representative (into source-writes (:written-arrs record))))}))
    {:activity (into {} (map (fn [p] [p true]) active-params))
-    :fwd-bindings [] :records [] :replayed #{} :aliases {}}
+    :fwd-bindings [] :records [] :replayed #{} :writes #{} :aliases {}}
    (partition 2 norm-bindings)))
 
 (defn- array-zero-of-shape
@@ -1177,11 +1200,11 @@
   [norm-bindings active-params {:keys [seed-adj-env]}]
   (binding [util/*shadowing-locals* (into (into util/*shadowing-locals* active-params)
                                        (take-nth 2 norm-bindings))]
-    (let [{:keys [activity fwd-bindings records]} (forward-pass norm-bindings active-params)
+    (let [{:keys [activity fwd-bindings records replayed writes]} (forward-pass norm-bindings active-params)
           {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
           {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
       {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
-       :rev-ctx rev-ctx :param-adj-syms param-adj-syms})))
+       :rev-ctx rev-ctx :param-adj-syms param-adj-syms :replays replayed :writes writes})))
 
 (declare gen-reverse-loop-with-let lift-loop-to-tail)
 
@@ -1194,12 +1217,13 @@
   representation; the latter must not allocate a closure per iteration."
   [bindings body-exprs active-params dy-sym]
   (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-        {:keys [fwd-bindings rev-ctx param-adj-syms]}
+        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes]}
         (process-bindings norm-bindings active-params
                           {:seed-adj-env {body-sym [dy-sym]}})]
     {:body-sym body-sym
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
+     :replays replays :writes writes
      :param-adj-syms param-adj-syms}))
 
 (defn- gen-reverse-let-core
