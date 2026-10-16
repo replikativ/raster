@@ -43,10 +43,12 @@
    {:dtype dt :array-types {'x dt 'q dt 'r dt}
     :scalar-types (if (symbol? extent) {extent :long} {})}))
 
-(defn- typed-three-node-reuse [extent]
+(defn- typed-three-node-reuse
+  ([extent] (typed-three-node-reuse extent :float))
+  ([extent dtype]
   (frontend/form->program
    (walk/postwalk-replace
-    {'chain-extent extent}
+    {'chain-extent extent 'float (if (= dtype :float) 'float 'double)}
     '(let* [paired (raster.par/pmap i chain-extent float
                                     (raster.numeric/- (clojure.core/aget x i)
                                                       (clojure.core/aget q i)))
@@ -57,7 +59,27 @@
                                     (raster.numeric/* (clojure.core/aget reused k)
                                                       (clojure.core/aget r k)))]
            result))
-   {:dtype :float :array-types {'x :float 'q :float 'r :float}
+   {:dtype dtype :array-types {'x dtype 'q dtype 'r dtype}
+    :scalar-types (if (symbol? extent) {extent :long} {})})))
+
+(defn- typed-three-occurrence-spine [extent dtype]
+  (frontend/form->program
+   (walk/postwalk-replace
+    {'chain-extent extent 'lane-dtype (if (= dtype :float) 'float 'double)}
+    '(let* [paired (raster.par/pmap i chain-extent lane-dtype
+                                    (raster.numeric/* (clojure.core/aget x i)
+                                                      (clojure.core/aget q i)))
+            squared (raster.par/pmap j chain-extent lane-dtype
+                                     (raster.numeric/* (clojure.core/aget paired j)
+                                                       (clojure.core/aget x j)))
+            shifted (raster.par/pmap k chain-extent lane-dtype
+                                     (raster.numeric/+ (clojure.core/aget squared k)
+                                                       (clojure.core/aget x k)))
+            result (raster.par/pmap l chain-extent lane-dtype
+                                    (raster.numeric/* (clojure.core/aget shifted l)
+                                                      (clojure.core/aget r l)))]
+           result))
+   {:dtype dtype :array-types {'x dtype 'q dtype 'r dtype}
     :scalar-types (if (symbol? extent) {extent :long} {})}))
 
 (defn- typed-diamond [extent]
@@ -354,7 +376,7 @@
     (is (= 2 (count (filter some? slots))))
     (is (every? zero? (map alength (filter some? slots))))))
 
-(deftest passive-external-reuse-allows-three-primal-nodes-but-active-reuse-refuses
+(deftest passive-external-reuse-keeps-its-primal-only-nodes
   (let [source (typed-three-node-reuse 'n)
         checked (normalized/linearize-map-chain-program
                  source (the-ns 'raster.ad.normalized-map-chain-runtime-test)
@@ -365,10 +387,7 @@
         primal (get-in checked [:map-programs :primal])]
     (is (= 3 (count nodes)))
     (is (= [false false true] (mapv #(contains? % :scalar-derivation) nodes)))
-    (is (= :ad-normalized-map-chain-boundary
-           (reason #(normalized/linearize-map-chain-program
-                     source (the-ns 'raster.ad.normalized-map-chain-runtime-test)
-                     {:active-input 'x}))))
+    (is (identical? checked (normalized/validate! checked)))
     (doseq [[[node-id _] binding] bindings]
       (is (= node-id (get-in binding [:origin :execution-equation])))
       (is (= [node-id] (get-in binding [:origin :source-equations])))
@@ -377,6 +396,201 @@
       (is (= (get-in binding [:producer :equation])
              (second (first (filter #(some #{(:id binding)} (nth % 2))
                                     (soac/equations primal)))))))))
+
+(deftest repeated-active-inputs-retain-source-slots-and-owned-pullbacks
+  (doseq [[dtype make-array extent occurrences active]
+          [[:float float-array 'n 2 '[x]]
+           [:double double-array 3 2 '[r x]]
+           [:float float-array 'n 3 '[r x]]
+           [:double double-array 3 3 '[x]]
+           [:float float-array 0 3 '[x]]
+           [:double double-array 0 2 '[r x]]]]
+    (let [size (if (= 0 extent) 0 3)
+          source ((if (= 2 occurrences) typed-three-node-reuse typed-three-occurrence-spine)
+                  extent dtype)
+          checked (normalized/linearize-map-chain-program
+                   source (the-ns 'raster.ad.normalized-map-chain-runtime-test)
+                   {:active-inputs active})
+          prepared (runtime/prepare checked)
+          positions (zipmap (:inputs prepared) (range))]
+      (is (= active (get-in checked [:map-programs :interface :active-inputs])))
+      (doseq [scale [1.0 -0.5]]
+        (let [xs0 (mapv #(* scale %) (take size [0.25 -2.0 3.0]))
+              qs0 (vec (take size [-0.5 4.0 0.125]))
+              rs0 (mapv #(* scale %) (take size [2.0 -0.75 1.5]))
+              dx0 (vec (take size [0.5 -1.0 2.0]))
+              dr0 (vec (take size [-0.25 0.5 1.0]))
+              seed0 (vec (take size [1.0 -0.5 2.0]))
+              xs (make-array xs0) qs (make-array qs0) rs (make-array rs0)
+              args (arguments prepared {'n (long size) 'x xs 'q qs 'r rs})
+              [output pullback] ((:vjp prepared) args)
+              tangents (mapv #(make-array (case % x dx0 r dr0)) active)
+              [jvp-output tangent] ((:jvp prepared) args
+                                    (if (= 1 (count active)) (first tangents) tangents))
+              ;; Independent polynomial calculus, with dyadic data whose results are exact
+              ;; in both storage types. No derivative helper is used by this oracle.
+              bases (mapv (fn [x q] (if (= 2 occurrences) (* (- x q) x) (+ (* x x q) x)))
+                          xs0 qs0)
+              gx (mapv (fn [x q r] (* (if (= 2 occurrences) (- (* 2.0 x) q)
+                                         (+ (* 2.0 x q) 1.0)) r)) xs0 qs0 rs0)
+              primal (make-array (mapv * bases rs0))
+              tangent-oracle (make-array
+                              (mapv (fn [dx gx dr base]
+                                      (+ (* dx gx) (if (some #{'r} active) (* dr base) 0.0)))
+                                    dx0 gx dr0 bases))]
+          (is (= (vec primal) (vec output) (vec jvp-output)))
+          (is (= (vec tangent-oracle) (vec tangent)))
+          (doseq [array [xs qs rs output]]
+            (System/arraycopy (make-array (repeat size 91.0)) 0 array 0 size))
+          (let [slots (pullback (make-array seed0))]
+            (is (= (vec (make-array (mapv * seed0 gx))) (vec (nth slots (positions 'x)))))
+            (when (some #{'r} active)
+              (is (= (vec (make-array (mapv * seed0 bases)))
+                     (vec (nth slots (positions 'r))))))
+            (is (every? nil? (keep-indexed #(when-not (contains? (set (map positions active)) %1) %2)
+                                           slots)))))))))
+
+(deftest repeated-input-double-pullback-matches-central-primal-differences
+  (let [prepared (runtime/prepare
+                  (normalized/linearize-map-chain-program
+                   (typed-three-occurrence-spine 1 :double)
+                   (the-ns 'raster.ad.normalized-map-chain-runtime-test) {:active-input 'x}))
+        environment {'x (double-array [0.4]) 'q (double-array [-0.2]) 'r (double-array [1.1])}
+        evaluate (fn [x]
+                   (double (aget ^doubles
+                            (first ((:vjp prepared)
+                                    (arguments prepared (assoc environment 'x (double-array [x]))))) 0)))
+        [_ pullback] ((:vjp prepared) (arguments prepared environment))
+        gradient (aget ^doubles (nth (pullback (double-array [0.7]))
+                                    (.indexOf ^java.util.List (:inputs prepared) 'x)) 0)
+        h 1.0e-5
+        finite-difference (* 0.7 (/ (- (evaluate (+ 0.4 h)) (evaluate (- 0.4 h))) (* 2.0 h)))]
+    (is (< (Math/abs (- gradient (* 0.7 1.1 (+ (* 2.0 0.4 -0.2) 1.0)))) 1.0e-12))
+    (is (< (Math/abs (- gradient finite-difference)) 1.0e-9))))
+
+(deftest repeated-input-float-accumulation-retains-reverse-source-order
+  (let [prepared (runtime/prepare
+                  (normalized/linearize-map-chain-program
+                   (typed-three-occurrence-spine 1 :float)
+                   (the-ns 'raster.ad.normalized-map-chain-runtime-test) {:active-input 'x}))
+        x (float 0.1) q (float -2.5) r (float 1.0e10)
+        [_ pullback] ((:vjp prepared) (arguments prepared {'x (float-array [x])
+                                                          'q (float-array [q]) 'r (float-array [r])}))
+        gradient (aget ^floats (nth (pullback (float-array [1.0]))
+                                   (.indexOf ^java.util.List (:inputs prepared) 'x)) 0)
+        contributions [r (fmul r (fmul x q)) (fmul (fmul r x) q)]
+        [last-use middle-use first-use] contributions
+        ordered (fadd (fadd last-use middle-use) first-use)
+        reassociated (fadd last-use (fadd middle-use first-use))]
+    (is (not= (fbits ordered) (fbits reassociated)) "the oracle distinguishes reassociation")
+    (is (= (fbits ordered) (fbits gradient)) "each reverse-source addition is a Float checkpoint")))
+
+(deftest two-repeated-sources-accumulate-at-the-same-reverse-boundary
+  (doseq [[dtype make-array] [[:float float-array] [:double double-array]]
+          active ['[x q] '[q x]]]
+    (let [source
+          (frontend/form->program
+           (walk/postwalk-replace
+            {'lane-dtype (if (= dtype :float) 'float 'double)}
+            '(let* [paired (raster.par/pmap i n lane-dtype
+                                            (raster.numeric/* (clojure.core/aget x i)
+                                                              (clojure.core/aget q i)))
+                    shifted (raster.par/pmap j n lane-dtype
+                                             (raster.numeric/+ (clojure.core/aget paired j)
+                                                               (clojure.core/aget x j)))
+                    scaled (raster.par/pmap k n lane-dtype
+                                            (raster.numeric/* (clojure.core/aget shifted k)
+                                                              (clojure.core/aget q k)))
+                    result (raster.par/pmap l n lane-dtype
+                                            (raster.numeric/* (clojure.core/aget scaled l)
+                                                              (clojure.core/aget r l)))] result))
+           {:dtype dtype :array-types {'x dtype 'q dtype 'r dtype} :scalar-types {'n :long}})
+          checked (normalized/linearize-map-chain-program
+                   source (the-ns 'raster.ad.normalized-map-chain-runtime-test) {:active-inputs active})
+          prepared (runtime/prepare checked)
+          xs [0.25 -2.0 3.0] qs [-0.5 4.0 0.125] rs [2.0 -0.75 1.5]
+          dx [0.5 -1.0 2.0] dq [-0.25 0.5 1.0] seed [1.0 -0.5 2.0]
+          gx (mapv #(* (+ %1 1.0) %1 %2) qs rs)
+          gq (mapv #(* %1 (+ (* 2.0 %2) 1.0) %3) xs qs rs)
+          args (arguments prepared {'n (long 3) 'x (make-array xs) 'q (make-array qs) 'r (make-array rs)})
+          [output pullback] ((:vjp prepared) args)
+          [_ tangent] ((:jvp prepared) args (mapv #(make-array (case % x dx q dq)) active))
+          slots (pullback (make-array seed))
+          positions (zipmap (:inputs prepared) (range))]
+      (is (= (filterv (set active)
+                      (:arrays (soac/operation-parts (first (soac/equations source)))))
+             (mapv :source (get-in checked [:map-programs :proof :accumulations])))
+          "independent arrays accumulate in retained operand order, not public activity order")
+      (is (= (vec (make-array (mapv #(* %1 (+ %2 1.0) %2 %3) xs qs rs))) (vec output)))
+      (is (= (vec (make-array (mapv #(+ (* %1 %2) (* %3 %4)) dx gx dq gq))) (vec tangent)))
+      (is (= (vec (make-array (mapv * seed gx))) (vec (nth slots (positions 'x)))))
+      (is (= (vec (make-array (mapv * seed gq))) (vec (nth slots (positions 'q)))))
+      (is (nil? (nth slots (positions 'r)))))))
+
+(deftest ordered-cotangent-evidence-replays-with-fixed-identities-and-refuses-tampering
+  (let [checked (normalized/linearize-map-chain-program
+                 (typed-three-occurrence-spine 1 :double)
+                 (the-ns 'raster.ad.normalized-map-chain-runtime-test) {:active-input 'x})
+        path [:map-programs :proof :accumulations]
+        additions (get-in checked path)
+        reject (fn [& _] (throw (ex-info "proof replay allocated an identity" {})))
+        original-gensym @#'clojure.core/gensym
+        replay (fn [bundle] (#'normalized/reconstructed-map-proof bundle))
+        rebuilt
+        (with-redefs-fn
+          {#'normalized/node-equation-ids reject
+           #'normalized/allocate-map-stage-interface reject
+           #'normalized/linearize-program reject
+           #'clojure.core/gensym
+           (fn [& args]
+             (when (and (string? (first args)) (.startsWith ^String (first args) "ad_accumulation_"))
+               (reject))
+             (apply original-gensym args))}
+          #(replay checked))
+        raw (get-in additions [0 :primal-derivation :primal])
+        stripped-policy (soac/make (update (soac/facts raw) :attributes dissoc :source-arithmetic)
+                                   (soac/equations raw) (soac/outputs raw))]
+    (is (= 2 (count additions)))
+    (is (raster.compiler.ir.semantic-fingerprint/equivalent?
+         (get-in checked [:map-programs :transpose]) (:transpose rebuilt)))
+    (is (identical? checked (normalized/validate! checked)))
+    (is (map? (canonical/adapt checked)))
+    (doseq [[changed expected]
+            [[(update-in checked [:map-programs :proof] dissoc :accumulations)
+              :ad-normalized-map-node-proof]
+             [(update-in checked path pop) :ad-normalized-map-node-proof]
+             [(update-in checked path #(vec (reverse %))) :ad-normalized-map-accumulation]
+             [(update-in checked (conj path 0 :contributors) #(vec (reverse %)))
+              :ad-normalized-map-accumulation]
+             [(assoc-in checked (conj path 0 :result)
+                        (get-in checked [:map-programs :proof :nodes 0 :stage-interface :tangent-output]))
+              :ad-normalized-map-node-interface]
+             [(assoc-in checked (conj path 0 :primal-derivation :source-ns) (the-ns 'clojure.core))
+              :ad-normalized-map-accumulation]
+             [(assoc-in checked (conj path 0 :primal-derivation :primal) stripped-policy)
+              :ad-normalized-map-accumulation]]]
+      (is (= expected (reason #(replay changed)))))))
+
+(deftest ordered-cotangent-raw-helper-remains-in-the-execution-fence
+  (let [build #(normalized/linearize-map-chain-program
+                (typed-three-occurrence-spine 1 :double)
+                (the-ns 'raster.ad.normalized-map-chain-runtime-test) {:active-input 'x})
+        checked (build)
+        prepared (runtime/prepare checked)
+        args (arguments prepared {'x (double-array [0.5]) 'q (double-array [2.0])
+                                  'r (double-array [3.0])})
+        [_ pullback] ((:vjp prepared) args)
+        calls (atom 0)]
+    ;; No source node needs scalar grad-acc here: its new composition evidence must
+    ;; retain this dependency even though the emitted addition uses numeric/+.
+    (with-redefs [raster.ad.reverse/grad-acc
+                  (fn [& _] (swap! calls inc) (throw (ex-info "must not execute" {})))]
+      (is (= :ad-normalized-scalar-accumulation (reason build)))
+      (is (= :ad-normalized-execution-callee (reason #((:vjp prepared) args))))
+      (is (= :ad-normalized-execution-callee (reason #(pullback (double-array [1.0])))))
+      (is (zero? @calls)))
+    (is (= [9.0] (vec (nth (pullback (double-array [1.0]))
+                           (.indexOf ^java.util.List (:inputs prepared) 'x)))))))
 
 (deftest inactive-node-raw-call-remains-in-the-execution-staleness-fence
   (let [checked (normalized/linearize-map-chain-program
