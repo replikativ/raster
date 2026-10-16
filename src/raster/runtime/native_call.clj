@@ -45,6 +45,37 @@
         (.asSlice backing (.address ^MemorySegment segment) (.byteSize ^MemorySegment segment))))
     segment))
 
+(defn object-distinct-pairs!
+  "Validate an optional original-object contract over leading pointer slots.
+   This relation is separate from physical range overlap: empty storage can
+   have object identity, and distinct views can share one backing owner."
+  [n-ptrs pairs]
+  (let [pairs (if (nil? pairs) [] pairs)]
+    (when-not (and (integer? n-ptrs) (<= 0 n-ptrs Integer/MAX_VALUE)
+                   (vector? pairs)
+                   (every? (fn [pair]
+                             (and (vector? pair) (= 2 (count pair))
+                                  (every? #(and (integer? %) (<= 0 % (dec n-ptrs))) pair)
+                                  (not= (first pair) (second pair)))) pairs))
+      (throw (ex-info "Native object-distinct contract requires pairs of distinct pointer slots"
+                      {:reason :invalid-native-object-contract :pointers n-ptrs :pairs pairs})))
+    (let [canonical (mapv #(vec (sort %)) pairs)]
+      (when-not (= (count canonical) (count (distinct canonical)))
+        (throw (ex-info "Native object-distinct contract contains duplicate pairs"
+                        {:reason :invalid-native-object-contract :pointers n-ptrs :pairs pairs})))
+      canonical)))
+
+(defn validate-object-distinct-arguments!
+  "Check a validated pair plan against ORIGINAL arguments, before marshalling.
+   The adapter owns arity validation. This is an explicit call-entry condition,
+   not a claim about backing owners, byte ranges, or in-program effect order."
+  [pairs arguments]
+  (doseq [[left right :as pair] pairs]
+    (when (identical? (nth arguments left) (nth arguments right))
+      (throw (ex-info "Native arguments violate an object-distinct call contract"
+                      {:reason :native-object-alias :indices pair}))))
+  arguments)
+
 (defn- pointer-access! [n access]
   (when-not (and (= n (count access))
                  (every? #{:read :write :read-write} access))

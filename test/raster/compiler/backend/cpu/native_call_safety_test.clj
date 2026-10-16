@@ -54,6 +54,40 @@
       (.close arena)
       (is (= :inaccessible-native-pointer (reason #(native closed y)))))))
 
+(deftest object-distinct-preconditions-run-before-marshalling-or-native-effects
+  (let [library (cpu/compile-source!
+                 "void object_probe(const double *x, double *y, int *calls, int n) { calls[0]++; if(n>0) y[0]=x[0]+1; }")
+        marshalled (atom 0)
+        marshal native-call/pointer-segment
+        native (with-redefs [native-call/pointer-segment
+                            (fn [x] (swap! marshalled inc) (marshal x))]
+                 (cpu/load-kernel library "object_probe" 3 [:int] :void
+                                  {:pointer-access [:read :write :read-write]
+                                   :no-alias? true :object-distinct-pairs [[0 1]]}))
+        empty (double-array 0)
+        calls (int-array 1)]
+    (is (= :native-object-alias (reason #(native empty empty calls 0))))
+    (is (zero? @marshalled))
+    (is (= [0] (vec calls)))
+    (is (= :native-call-arity (reason #(native empty))))
+    (is (zero? @marshalled))
+    (native empty (double-array 0) calls 0)
+    (is (= [1] (vec calls)))
+    (is (= 3 @marshalled))
+    (let [a (double-array [2.0 5.0]) backing (MemorySegment/ofArray a)
+          left (.asSlice backing 0 8) right (.asSlice backing 8 8)]
+      (native left right calls 1)
+      (is (= [2.0 3.0] (vec a)))
+      (is (= [2] (vec calls)))
+      ;; Distinct objects do not discharge the independent range contract.
+      (is (= :native-pointer-alias
+             (reason #(native left (.asSlice backing 0 16) calls 1))))
+      (is (= [2.0 3.0] (vec a)))
+      (is (= [2] (vec calls)))))
+  (is (= :invalid-native-object-contract
+         (reason #(cpu/load-kernel "nonexistent.so" "probe" 2 [] :void
+                                  {:object-distinct-pairs [[0 2]]})))))
+
 (deftest readonly-repeated-storage-and-explicit-short-critical-call
   (let [library (cpu/compile-source! "double read_pair(const double *x, const double *y) { return x[0]+y[0]; }")
         x (double-array [2.0])

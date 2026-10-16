@@ -182,7 +182,10 @@
   requires exactly the declared argument count; extra arguments are rejected.
   Ordinary calls stage heap arrays and accept caller-owned native segments.
   :pointer-access defaults to :read-write for every pointer. :no-alias? enforces
-  an emitted restrict ABI. :call-policy :critical requires explicit caller
+  an emitted restrict ABI. Optional :object-distinct-pairs names pairs of leading
+  pointer argument indices whose ORIGINAL objects must differ, including empty
+  storage. This entry precondition is checked before marshalling, separately from
+  physical range overlap. :call-policy :critical requires explicit caller
   guarantees {:extremely-short? true :no-upcalls? true} in :critical-contract;
   duration must be bounded in ALL cases, not just expected to be fast."
   ([so name n-ptrs] (load-kernel so name n-ptrs 1))
@@ -191,7 +194,7 @@
   ([so name n-ptrs scalars return-type]
    (load-kernel so name n-ptrs scalars return-type {}))
   ([so name n-ptrs scalars return-type
-    {:keys [call-policy critical-contract pointer-access no-alias?]
+    {:keys [call-policy critical-contract pointer-access no-alias? object-distinct-pairs]
      :or {call-policy :ordinary}}]
    (when-not (or (= :void return-type) (contains? scalar-layout return-type))
      (throw (ex-info "Unsupported native scalar return ABI"
@@ -205,7 +208,8 @@
    (when (and (= call-policy :critical) no-alias?)
      (throw (ex-info "Critical calls with a restrict ABI are not yet admitted"
                      {:reason :unsupported-critical-no-alias})))
-   (let [access (or pointer-access (vec (repeat n-ptrs :read-write)))
+   (let [object-pairs (native-call/object-distinct-pairs! n-ptrs object-distinct-pairs)
+         access (or pointer-access (vec (repeat n-ptrs :read-write)))
          _ (when-not (and (= n-ptrs (count access))
                           (every? #{:read :write :read-write} access))
              (throw (ex-info "Native pointer access must match the pointer ABI"
@@ -229,6 +233,11 @@
        ;; The ABI-directed conversion plan is compiled once. In particular,
        ;; overloaded ofArray must not invoke Reflector on every pointer argument.
        (let [arguments (object-array arity)]
+         (when (seq object-pairs)
+           (when-not (= arity (count args))
+             (throw (ex-info "Native kernel argument count does not match its ABI"
+                             {:reason :native-call-arity :expected arity :actual (count args)})))
+           (native-call/validate-object-distinct-arguments! object-pairs args))
          (loop [index 0 remaining (seq args)]
            (if (< index arity)
              (if remaining
