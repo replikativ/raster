@@ -1308,3 +1308,35 @@
            {:operations (into operations (mapcat :operations lowered-results))
             :results (mapv :result lowered-results)
             :types (mapv :type lowered-results)}))})))
+
+(defn checked-primitive-result
+  "Prove primitive presence on normal return of one canonical scalar call using
+   this same strict source-lowering authority. `present-types` contains ONLY
+   independently proved-present lexical scalar values. No source code executes;
+   this is neither purity nor nonthrowing evidence. The caller must retain the
+   original initializer, its position, and its conversions/traps."
+  [expression present-types]
+  (let [operation (descriptor/semantic-op expression)
+        intrinsic (some-> operation intrinsics/canonical intrinsics/descriptor)
+        arguments (vec (descriptor/call-args expression))
+        known? (fn [argument]
+                 (or (and (symbol? argument) (contains? present-types argument))
+                     (and (number? argument) (inference/infer-arg-tag argument {}))))]
+    (when (and (symbol? operation) (namespace operation) (descriptor/scalar-op? operation)
+               intrinsic
+               (every? known? arguments))
+      (let [decline! (fn [rule message data]
+                       (throw (ex-info message (assoc data :reason :primitive-presence-decline :rule rule))))
+            lowerer (make-lowerer {:scalar-types present-types :array-types {} :arrays #{}
+                                  :index-scope #{} :source-region expression
+                                  :lower-index (fn [& _]
+                                                 (decline! :presence-index "Presence proof has no index owner" {}))
+                                  :require-source-types? true :decline! decline!})]
+        (try
+          (when-let [source-type ((:source-type lowerer) expression present-types)]
+            (let [result ((:lower lowerer) expression source-type present-types)]
+              (when (and (= source-type (:type result))
+                         (or (= :predicate source-type) (dtype/info source-type)))
+                {:type source-type})))
+          (catch clojure.lang.ExceptionInfo e
+            (if (= :primitive-presence-decline (:reason (ex-data e))) nil (throw e))))))))
