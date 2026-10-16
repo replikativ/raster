@@ -1784,8 +1784,7 @@
                             :result result :primal-derivation derivation})}))
 
 (defn- compose-transpose-nodes
-  ([nodes requested] (:program (compose-transpose-nodes nodes requested nil nil)))
-  ([nodes requested source-ns submitted]
+  [nodes requested source-ns submitted]
   (let [active-nodes (filterv :active? nodes)
         downstream (last active-nodes)
         initial-pairs (vec (node-derivative-port-map downstream :gradient))]
@@ -1839,7 +1838,7 @@
           (when (and submitted (not= (count submitted) (count additions)))
             (fail! :ad-normalized-map-accumulation {:expected (count additions) :submitted (count submitted)}))
           {:program (soac/make (soac/facts program) (soac/equations program) outputs)
-           :accumulations additions}))))))
+           :accumulations additions})))))
 
 (defn- node-proof-interface [nodes requested]
   (let [active-nodes (filterv :active? nodes)
@@ -1868,6 +1867,22 @@
      :cotangent-input (get-in (last active-nodes) [:ports :cotangent-input :id])
      :tangent-output (get-in (last active-nodes) [:ports :tangent-result :id])
      :gradient-outputs (mapv gradient-ports requested)}))
+
+(defn- compose-node-phases
+  "Assemble already checked stages without deciding family admission. Keep interface
+   derivation at each caller's original validation boundary. A nil accumulation
+   witness permits construction of accumulation identities; [] replays none."
+  [nodes requested interface source-ns submitted proof]
+  (let [primal (compose-primal-nodes nodes)
+        linear (compose-linear-nodes nodes)
+        transposed (compose-transpose-nodes nodes requested source-ns submitted)
+        transpose (:program transposed)
+        additions (:accumulations transposed)]
+    {:primal primal :linear linear :transpose transpose
+     :interface (cond-> interface
+                  (seq additions) (assoc :gradient-outputs (soac/outputs transpose)))
+     :proof (cond-> (assoc proof :nodes (mapv #(dissoc % :stage :ports :result :active?) nodes))
+              (seq additions) (assoc :accumulations additions))}))
 
 (defn- map-spine-nodes
   "Allocate or replay source-ordered map nodes through the same activity sweep."
@@ -1920,20 +1935,12 @@
         _ (when-not (contains? active-values (first (soac/outputs source)))
             (fail! :ad-normalized-map-chain-boundary {:active-inputs requested}))
         interface (node-proof-interface built requested)
-        primal (compose-primal-nodes built)
-        linear (compose-linear-nodes built)
-        transposed (compose-transpose-nodes built requested source-ns nil)
-        transpose (:program transposed)
-        additions (:accumulations transposed)
-        interface (cond-> interface (seq additions) (assoc :gradient-outputs (soac/outputs transpose)))
-        witnesses (mapv #(dissoc % :stage :ports :result :active?) built)]
+        phases (compose-node-phases built requested interface source-ns nil
+                                    {:authority :normalized-scalar})]
     {:source-ns source-ns
      :template-revision (templates/registry-revision)
      :compiler-revision (dispatch/compiler-definition-revision)
-     :map-programs {:source source :primal primal :linear linear :transpose transpose
-                    :interface interface
-                    :proof (cond-> {:authority :normalized-scalar :nodes witnesses}
-                             (seq additions) (assoc :accumulations additions))}}))
+     :map-programs (assoc phases :source source)}))
 
 (defn- reconstructed-map-proof-map
   [{:keys [map-programs source-ns] :as bundle}]
@@ -1988,14 +1995,8 @@
             expected-interface (node-proof-interface nodes requested)]
         (when-not (contains? active-values (first (soac/outputs source)))
           (fail! :ad-normalized-map-chain-boundary {:active-inputs requested}))
-        (let [primal (compose-primal-nodes nodes)
-              linear (compose-linear-nodes nodes)
-              transposed (compose-transpose-nodes nodes requested source-ns (or additions []))]
-          {:source source :primal primal :linear linear :transpose (:program transposed)
-           :interface (cond-> expected-interface
-                        (seq additions) (assoc :gradient-outputs (soac/outputs (:program transposed))))
-           :proof (cond-> (assoc proof :nodes (mapv #(dissoc % :stage :ports :result :active?) nodes))
-                    (seq additions) (assoc :accumulations (:accumulations transposed)))}))
+        (assoc (compose-node-phases nodes requested expected-interface source-ns (or additions []) proof)
+               :source source))
       (let [stage-source (or fused source)
             equation (first (soac/equations stage-source))
             [node] submitted
@@ -2766,13 +2767,9 @@
         nodes (segmented-activation-nodes source source-ns description submitted)
         requested [(get-in description [:segmented :active])]
         interface (node-proof-interface nodes requested)]
-    {:source source
-     :primal (compose-primal-nodes nodes)
-     :linear (compose-linear-nodes nodes)
-     :transpose (compose-transpose-nodes nodes requested)
-     :interface interface
-     :proof {:authority :normalized-scalar
-             :nodes (mapv #(dissoc % :stage :ports :result :active?) nodes)}}))
+    (assoc (compose-node-phases nodes requested interface nil nil
+                                {:authority :normalized-scalar})
+           :source source)))
 
 (defn- reconstructed-segmented-activation-proof
   [{:keys [map-programs source-ns]}]
