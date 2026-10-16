@@ -164,9 +164,9 @@
         #(do
            (is (= #{} (:pullback-replays (#'rev/reverse-pass [record] {sym true} {}))))
            (is (= '#{input} (:pullback-replays (#'rev/reverse-pass [record] {sym true} {sym ['dy]}))))
-           ;; This slice intentionally preserves the existing unconditional
-           ;; array-writing backward. Joint per-port reversal must qualify it.
-           (is (= '#{input} (:pullback-replays
+           ;; Unused output writers still execute in the primal, but have no
+           ;; backward demand merely because they declare a buffer write.
+           (is (= #{} (:pullback-replays
                               (#'rev/reverse-pass [(assoc record :written-arrs '[out])]
                                                  {sym true} {})))))))))
 

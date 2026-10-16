@@ -1566,3 +1566,12 @@ their own alias graph. This is the reusable projection boundary needed by a
 future shared loop step, not activation of that step. The unused expression-only
 core wrappers are removed; closure/reified equivalence remains tested against
 the structured program's form directly.
+
+Source reverse traversal demands an array writer's pullback only when an
+adjoint contribution reaches its result or a declared output buffer. Merely
+writing an array is not a backward dependency. Its forward operation and effects
+still execute. This avoids evaluating a singular, irrelevant derivative (for
+example an unused `sqrt` map at zero) and contaminating an independent result.
+An explicit seed contribution containing nil or numeric zero is still an edge;
+this is structural demand, not value-based zero elimination or reassociation.
+Existing record-specific rules continue to own result/output alias accumulation.

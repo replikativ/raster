@@ -1385,10 +1385,13 @@
   [records activity seed-adj-env]
   (reduce
    (fn [{:keys [adj-env rev-ctx pullback-replays]} {:keys [type sym] :as record}]
-     (let [;; A record that writes arrays can receive cotangent through those
-           ;; buffers as well as through its result symbol, so its backward
-           ;; always runs; others run only when their result has a cotangent.
+     (let [;; Array writers can receive cotangents through either their result
+           ;; or any declared output buffer. No incoming edge means no reverse
+           ;; execution; an explicit nil/zero-valued seed is still an edge.
            array-type? (boolean (seq (:written-arrs record)))
+           output-demand? (when array-type?
+                            (some #(seq (get adj-env %))
+                                  (cons sym (:written-arrs record))))
            adj-contribs (when-not array-type? (get adj-env sym))
            sym-tag (:raster.type/tag (meta sym))
            adj-sym (when-not array-type?
@@ -1399,7 +1402,7 @@
                      ;; grad-acc fold. See sum-contribs-into.
                      (sum-contribs-into rev-ctx adj-sym adj-contribs nil sym-tag)
                      rev-ctx)]
-       (if (or array-type? adj-contribs)
+       (if (or output-demand? adj-contribs)
          (assoc (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
                 :pullback-replays (into pullback-replays
                                          (:replays (record-memory-effects record nil))))
