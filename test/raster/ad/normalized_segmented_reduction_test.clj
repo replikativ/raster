@@ -123,6 +123,162 @@
                   (assoc-in [:equations 'activation] (soac/default-equation-facts)))]
     (soac/make facts (conj (vec (soac/equations product)) activation) '[Y])))
 
+(defn- summed-source [producer dt]
+  (let [boundary (first (soac/outputs producer))
+        extent (first (get-in (soac/facts producer) [:values boundary :shape]))
+        zero (if (= dt :float) (float 0.0) 0.0)
+        body '(raster.numeric/+ total element)
+        reduction (list '= 'ordered-loss '[loss]
+                        (list 'reduce {:index 'p :extent extent :accumulators '[total]
+                                       :identities [zero] :dtypes [dt]
+                                       :algebra [(scan/certify-reassociation
+                                                  {:acc 'total :init zero :lambda body} dt)]}
+                              [boundary] [] (soac/lambda-form '[total element] [body])))
+        facts (-> (soac/facts producer)
+                  (assoc-in [:values 'loss] (av/tensor {:dtype dt :shape [] :ownership :owned}))
+                  (assoc-in [:equations 'ordered-loss] (soac/default-equation-facts)))]
+    (soac/make facts (conj (vec (soac/equations producer)) reduction) '[loss])))
+
+(defn- summed-activation-source [dt inputs]
+  (summed-source (activated-source dt inputs) dt))
+
+(deftest map-spine-ordered-loss-uses-the-same-composition
+  (doseq [dt [:float :double]]
+    (let [array (if (= dt :float) float-array double-array)
+          cast (if (= dt :float) float double)
+          equation (fn [id output input body]
+                     (list '= id [output]
+                           (list 'map {:index 'i :extent 3} [input] []
+                                 (soac/lambda-form '[x] [] [body]))))
+          producer (soac/make
+                    (soac/default-program-facts
+                     {:inputs '[X]
+                      :values (into {} (for [id '[X squared Y]]
+                                         [id (av/tensor {:dtype dt :shape [3]
+                                                        :ownership (when (not= id 'X) :owned)})]))
+                      :equations (into {} (for [id '[square twice]]
+                                            [id (soac/default-equation-facts)]))})
+                    [(equation 'square 'squared 'X '(raster.numeric/* x x))
+                     (equation 'twice 'Y 'squared '(raster.numeric/+ x x))] '[Y])
+          checked (evidence (summed-source producer dt) 'X)
+          prepared (runtime/prepare checked)]
+      (doseq [xs [[-2.0 0.5 3.0] [1.25 -1.0 2.0]]]
+        (let [input (array xs)
+              [value pb] ((:vjp prepared) [input])
+              [jvalue tangent] ((:jvp prepared) [input] (array [1.0 1.0 1.0]))
+              expected (reduce (fn [a x] (cast (+ a (cast (+ (cast (* x x)) (cast (* x x)))))))
+                               (cast 0.0) xs)]
+          (is (= expected value jvalue))
+          (is (= (reduce + 0.0 (map #(* 4.0 %) xs)) tangent))
+          (java.util.Arrays/fill input (cast 99.0))
+          (doseq [seed [1.0 -0.5]]
+            (is (= (mapv #(cast (* 4.0 seed %)) xs)
+                   (vec (first (pb (cast seed))))))))))))
+
+(deftest repeated-input-map-spine-loss-retains-ordered-gradient-ports
+  (doseq [dt [:float :double]]
+    (let [equations
+          (mapv (fn [[id output arrays parameters body]]
+                  (list '= id [output]
+                        (list 'map {:index 'i :extent 3} arrays []
+                              (soac/lambda-form parameters [] [body]))))
+                '[[subtract paired [X Q] [x q] (raster.numeric/- x q)]
+                  [reuse reused [paired X] [p x] (raster.numeric/* p x)]
+                  [scale Y [reused R] [p r] (raster.numeric/* p r)]])
+          producer (soac/make
+                    (soac/default-program-facts
+                     {:inputs '[R Q X]
+                      :values (into {} (for [id '[R Q X paired reused Y]]
+                                         [id (av/tensor {:dtype dt :shape [3]
+                                                        :ownership (when (contains? '#{paired reused Y} id)
+                                                                     :owned)})]))
+                      :equations (into {} (map #(vector (second %) (soac/default-equation-facts)) equations))})
+                    equations '[Y])
+          checked (normalized/linearize-equation-program
+                   (summed-source producer dt) *ns* {:active-inputs '[R X]})
+          owner (canonical/adapt checked)
+          prepared (runtime/prepare checked)
+          array (if (= dt :float) float-array double-array)
+          cast (if (= dt :float) float double)]
+      (is (= 3 (count (get-in checked [:map-programs :proof :nodes]))))
+      (is (= '[R X] (get-in owner [:interface :active-inputs])))
+      (is (every? (fn [[[equation _] binding]]
+                    (= equation (get-in binding [:origin :execution-equation])))
+                  (:residual-bindings owner)))
+      (doseq [xs [[-2.0 0.5 3.0] [1.25 -1.0 2.0]]]
+        (let [qs [0.5 -1.0 2.0] rs [2.0 -0.5 1.0]
+              args [(array rs) (array qs) (array xs)]
+              [value pb] ((:vjp prepared) args)
+              [jvalue tangent] ((:jvp prepared) args [(array [0.25 0.25 0.25]) (array [0.5 0.5 0.5])])
+              dr (mapv #(* (- %1 %2) %1) xs qs)
+              dx (mapv #(* (- (* 2.0 %1) %2) %3) xs qs rs)]
+          (is (= (reduce + 0.0 (map * dr rs)) value jvalue))
+          (is (= (reduce + 0.0 (map #(+ (* 0.25 %1) (* 0.5 %2)) dr dx)) tangent))
+          (doseq [input args] (java.util.Arrays/fill input (cast 99.0)))
+          (doseq [seed [1.0 -0.5]]
+            (let [[gr inactive gx] (pb (cast seed))]
+              (is (= (mapv #(cast (* seed %)) dr) (vec gr)))
+              (is (nil? inactive))
+              (is (= (mapv #(cast (* seed %)) dx) (vec gx))))))))))
+
+(deftest contraction-activation-ordered-loss-composes-existing-derivatives
+  (doseq [dt [:float :double] active '[A W] inputs ['[A W] '[W A]]]
+    (let [program (summed-activation-source dt inputs)
+          checked (normalized/linearize-equation-program program *ns* {:active-input active})
+          owner (canonical/adapt checked)
+          prepared (runtime/prepare checked)
+          make-array (if (= dt :float) float-array double-array)
+          cast (if (= dt :float) float double)
+          mul (fn [x y] (cast (* x y)))
+          add (fn [x y] (cast (+ x y)))
+          a (make-array a0) w (make-array w0)
+          c (if (= dt :float) (float-product 2 3 4 a0 w0) (product 2 3 4 a0 w0))
+          expected (reduce add (cast 0.0) (map #(mul % %) c))
+          args (arguments prepared a w)
+          [value pb] ((:vjp prepared) args)
+          tangent (make-array (repeat (if (= active 'A) 6 12) 0.25))
+          dc (product 2 3 4 (if (= active 'A) tangent a0) (if (= active 'W) tangent w0))
+          [jvalue jvp] ((:jvp prepared) args tangent)
+          tolerance (if (= dt :float) 1e-4 1e-10)
+          seed-array (get-in checked [:sum-programs :interface :seed-array])
+          transpose (:transpose owner)]
+      (is (= inputs (:inputs prepared)))
+      (is (< (Math/abs (- expected value)) tolerance))
+      (is (= value jvalue))
+      (is (< (Math/abs (- jvp (reduce + 0.0 (map #(* 2.0 %1 %2) c dc)))) tolerance))
+      (is (= [8] (get-in (soac/facts transpose) [:values seed-array :shape])))
+      (is (= :owned (get-in (soac/facts transpose) [:values seed-array :ownership])))
+      (is (every? (fn [[[equation _] binding]]
+                    (and (= equation (get-in binding [:origin :execution-equation]))
+                         (seq (get-in binding [:origin :source-equations]))
+                         (get-in binding [:producer :equation])))
+                  (:residual-bindings owner)))
+      ;; Delayed pullback owns passive inputs and nonlinear producer residuals.
+      (java.util.Arrays/fill a (cast 77.0))
+      (java.util.Arrays/fill w (cast -88.0))
+      (doseq [seed [1.0 -0.5]]
+        (let [seed (cast seed)
+              dy (mapv #(add (mul seed %) (mul seed %)) c)
+              oracle ((if (= dt :float) float-pull pull) active 2 3 4 a0 w0 dy)
+              gradients (pb seed)
+              actual (active-slot prepared active gradients)]
+          (is (close? oracle actual tolerance))
+          (when (= dt :double)
+            (let [point (if (= active 'A) a0 w0)
+                  loss (fn [values]
+                         (reduce + 0.0
+                                 (map #(* % %)
+                                      (product 2 3 4 (if (= active 'A) values a0)
+                                               (if (= active 'W) values w0)))))
+                  h 1e-5
+                  finite-difference
+                  (mapv (fn [i]
+                          (* seed (/ (- (loss (update point i + h))
+                                         (loss (update point i - h))) (* 2.0 h))))
+                        (range (count point)))]
+              (is (close? finite-difference actual 1e-6))))
+          (is (nil? (nth gradients (.indexOf ^java.util.List inputs (if (= active 'A) 'W 'A))))))))))
+
 (defn- square-push [cast values tangent]
   ;; The existing elementwise template emits two rounded dx*x contributions,
   ;; then their rounded sum. This is deliberately not the expression 2*x*dx.
@@ -507,6 +663,42 @@
 
 (defn- recertify [checked]
   (assoc checked :certificate (#'normalized/certificate checked)))
+
+(deftest producer-loss-replays-retained-identities-and-refuses-before-backend-contact
+  (let [program (summed-activation-source :double '[W A])
+        checked (evidence program 'A)
+        owner (canonical/adapt checked)
+        reject-allocation (fn [& _] (throw (ex-info "sum replay allocated an identity" {})))
+        [rebuilt validated]
+        (with-redefs-fn {#'normalized/allocate-map-stage-interface reject-allocation
+                        #'normalized/allocate-segmented-interface reject-allocation
+                        #'normalized/node-equation-ids reject-allocation
+                        #'normalized/linearize-program reject-allocation
+                        #'normalized/linearize-equation-program reject-allocation
+                        #'normalized/build-producer-sum-programs reject-allocation}
+          #(vector (#'normalized/lift-sum-programs checked program (:interface (:sum-programs checked)))
+                   (normalized/validate! checked)))]
+    (is (identical? checked validated))
+    (doseq [phase [:primal :linear :transpose]]
+      (is (fingerprint/equivalent? (get-in checked [:sum-programs phase]) (get rebuilt phase))))
+    (doseq [[field value] [[:seed-array 'A] [:seed-equation 'activation]
+                          [:seed-index 'W] [:seed nil]]]
+      (is (= :ad-normalized-sum-interface
+             (reason #(normalized/validate!
+                       (recertify (assoc-in checked [:sum-programs :interface field] value)))))))
+    (let [coefficient (first (keys (:residual-bindings owner)))
+          changed (assoc-in owner [:residual-bindings coefficient :origin :execution-equation] 'wrong)
+          changed (assoc changed :certificate (#'canonical/certificate changed))]
+      (is (= :ad-program-bundle-correspondence (reason #(canonical/validate! changed)))))
+    (let [contacts (atom 0)
+          reject-contact (fn [& _] (swap! contacts inc) (throw (Exception. "unexpected backend contact")))]
+      (with-redefs-fn {#'equation-first/compile-typed reject-contact
+                      #'link-module/instantiate! reject-contact
+                      #'route/materialize-host-program reject-contact}
+        #(is (= :normalized-device-interface
+                (reason (fn [] (device/prepare-sum-owner owner [(double-array w0) (double-array a0)]
+                                                        1.0 {:target :ocl:normalized-sum}))))))
+      (is (zero? @contacts)))))
 
 (deftest segmented-activation-keeps-node-replay-and-topology-boundaries
   (let [program (activated-source :double '[W A])
