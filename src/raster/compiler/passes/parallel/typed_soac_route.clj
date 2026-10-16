@@ -649,6 +649,68 @@
        (every? #(and (integer? %) (pos? %)) (:shape value))
        (<= (reduce *' 1 (:shape value)) Integer/MAX_VALUE)))
 
+(defn- host-scalar-reduction?
+  "Operation-local structural boundary; realization and certified fold order stay unchanged.
+   Returns a predicate so callers retain their existing diagnostic ordering and context."
+  [program equation]
+  (let [facts (dialect/facts program)
+        {:keys [kind attributes arrays captures]} (when equation
+                                                   (dialect/operation-parts equation))
+        results (when equation (nth equation 2))
+        ef (get-in facts [:equations (second equation)])
+        extent (:extent attributes)
+        extent-value (get-in facts [:values extent])
+        value #(get-in facts [:values %])]
+    (and (= 'reduce kind) (= 1 (count arrays) (count results)
+                             (count (:accumulators attributes)))
+         (empty? captures)
+         (empty? (:effects ef)) (empty? (:aliases ef)) (empty? (:attributes ef))
+         (empty? (dialect/result-storage program (second equation)))
+         (set/subset? (set (keys attributes))
+                      #{:index :extent :attributes :accumulators :identities
+                        :dtypes :algebra :source-arithmetic})
+         (set/subset? (set (keys (:attributes attributes)))
+                      #{:stable-array-captures :pointwise-storage-inputs})
+         (every? empty? (vals (:attributes attributes)))
+         (or (nil? (:source-arithmetic attributes))
+             (= numerics/retained-source-arithmetic (:source-arithmetic attributes)))
+         (or (integer? extent)
+             (and (plain-host-value? extent-value) (= [] (:shape extent-value))
+                  (dtype/known? (:dtype extent-value))
+                  (dtype/integral? (:dtype extent-value))))
+         (every? #(and (plain-host-value? (value %))
+                        (contains? #{:float :double} (:dtype (value %))))
+                 (concat arrays results))
+         (= (:dtypes attributes) (mapv (comp :dtype value) arrays)
+            (mapv (comp :dtype value) results))
+         (= (dialect/extent-shape extent) (:shape (value (first arrays))))
+         (= [] (:shape (value (first results))))
+         (contains? #{nil :owned} (:ownership (value (first results)))))))
+
+(defn- admit-host-reduce-program! [program]
+  (let [facts (dialect/facts program)
+        [equation] (dialect/equations program)
+        {:keys [arrays attributes]} (when equation (dialect/operation-parts equation))
+        outputs (dialect/outputs program)]
+    (when-not (and (= 1 (count (dialect/equations program)))
+                   (host-scalar-reduction? program equation)
+                   (= outputs (nth equation 2))
+                   (empty? (:effects facts)) (empty? (:aliases facts))
+                   (set/subset? (set (keys (:attributes facts))) #{:source-arithmetic})
+                   (or (nil? (get-in facts [:attributes :source-arithmetic]))
+                       (= numerics/retained-source-arithmetic
+                          (get-in facts [:attributes :source-arithmetic])))
+                   (= (set (:inputs facts))
+                      (set (concat arrays (when (dialect/value-id? (:extent attributes))
+                                            [(:extent attributes)])))))
+      (throw (ex-info "program cannot be materialized as an ordered host scalar reduction"
+                      {:reason :typed-soac-host-reduce-boundary :equation equation})))
+    (when (contains? '#{float double} (:index attributes))
+      (throw (ex-info "reduction host projection requires capture-safe internal binders"
+                      {:reason :typed-soac-host-map-binder-collision
+                       :index (:index attributes)})))
+    {:physical-inputs [] :output-values outputs}))
+
 (defn- admit-host-map-program!
   [program reduce?]
   (let [facts (dialect/facts program)
@@ -659,7 +721,6 @@
         map-results (when equation (nth equation 2))
         reduction (second equations)
         reduction-parts (when reduction (dialect/operation-parts reduction))
-        reduction-facts (get-in facts [:equations (second reduction)])
         reduction-results (when reduction (nth reduction 2))
         reduction-attributes (:attributes reduction-parts)
         equation-facts (get-in facts [:equations (second equation)])
@@ -683,27 +744,9 @@
                    (every? empty? (vals (:attributes attributes)))
                    (empty? (dialect/result-storage program (second equation)))
                    (or (not reduce?)
-                       (and (= 'reduce (:kind reduction-parts))
+                       (and (host-scalar-reduction? program reduction)
                             (= [(first map-results)] (:arrays reduction-parts))
-                            (empty? (:captures reduction-parts))
-                            (= 1 (count reduction-results)
-                               (count (:accumulators reduction-attributes)))
-                            (semantic/equivalent? extent (:extent reduction-attributes))
-                            (empty? (:effects reduction-facts)) (empty? (:aliases reduction-facts))
-                            (empty? (:attributes reduction-facts))
-                            (empty? (dialect/result-storage program (second reduction)))
-                            (set/subset? (set (keys reduction-attributes))
-                                         #{:index :extent :attributes :accumulators :identities
-                                           :dtypes :algebra :source-arithmetic})
-                            (set/subset? (set (keys (:attributes reduction-attributes)))
-                                         #{:stable-array-captures :pointwise-storage-inputs})
-                            (every? empty? (vals (:attributes reduction-attributes)))
-                            (or (nil? (:source-arithmetic reduction-attributes))
-                                (= numerics/retained-source-arithmetic (:source-arithmetic reduction-attributes)))
-                            (= (:dtypes reduction-attributes)
-                               [(get-in facts [:values (first map-results) :dtype])]
-                               (mapv #(get-in facts [:values % :dtype]) reduction-results))
-                            (= [] (get-in facts [:values (first reduction-results) :shape]))))
+                            (semantic/equivalent? extent (:extent reduction-attributes))))
                    (or (integer? extent)
                        (and (plain-host-value? extent-value) (= [] (:shape extent-value))
                             (dtype/known? (:dtype extent-value))
@@ -936,7 +979,7 @@
 (defn- admit-host-ordered-pure-program!
   "Admit an ordered pure graph through the existing operation-local host boundaries.
    All-map graphs retain their homogeneous contract. Mixed graphs contain only maps and fresh
-   segmented reductions, with exact owned static storage at every cross-kind edge. This function
+   segmented/scalar reductions, with exact owned static storage at every cross-kind edge. This function
    adds no fusion, pruning, arithmetic policy or execution semantics."
   [program]
   (let [facts (dialect/facts program)
@@ -964,6 +1007,7 @@
         (mapv (fn [kind subprogram]
                 (case kind
                   map (admit-host-map-program! subprogram false)
+                  reduce (admit-host-reduce-program! subprogram)
                   segmented-reduce (admit-host-fresh-segmented-reduce-program! subprogram)
                   nil))
               kinds subprograms)
@@ -980,7 +1024,9 @@
                         node-references))
                 (range) references)]
     (when-not (and (< 1 (count equations))
-                   (or all-map? (= #{'map 'segmented-reduce} (set kinds)))
+                   (or all-map?
+                       (and (contains? (set kinds) 'map)
+                            (set/subset? (set kinds) '#{map segmented-reduce reduce})))
                    (every? some? admissions)
                    (every? empty? (map :physical-inputs admissions))
                    (every? true? (map = (map :output-values admissions) results))
@@ -1006,7 +1052,12 @@
                             (every? #(= common-shape (:shape %)) array-values)
                             (every? #(semantic/equivalent? (first extents) %) (rest extents))
                             (every? plain-host-value? (vals values))))
-                     (and (empty? (:attributes facts))
+                     (and (if (some #{'segmented-reduce} kinds)
+                            (empty? (:attributes facts))
+                            (and (set/subset? (set (keys (:attributes facts))) #{:source-arithmetic})
+                                 (or (nil? (get-in facts [:attributes :source-arithmetic]))
+                                     (= numerics/retained-source-arithmetic
+                                        (get-in facts [:attributes :source-arithmetic])))))
                           (= (set (keys values))
                              (into #{} (mapcat #(keys (:values (dialect/facts %)))) subprograms))
                           (every?
@@ -1031,7 +1082,8 @@
 
 (defn materialize-host-program
   "Project the existing bounded primitive host subset by its actual TypedSOAC operations.
-   Admits one map, ordered pure map graphs, ordered pure map/segmented-reduction graphs,
+   Admits one map, ordered pure map graphs, ordered pure map/segmented/scalar-reduction graphs,
+   one ordered scalar reduction,
    one map→scalar reduction, one fresh plain-host abstract-BLAS segmented reduction, or one
    sequential indexed effect map.
    Uses the same strict operation/physical-owner checks as the specialized public APIs;
@@ -1060,6 +1112,7 @@
                      [map] (if indexed? (admit-host-indexed-map-program! program)
                                         (admit-host-map-program! program false))
                      [segmented-reduce] (admit-host-fresh-segmented-reduce-program! program)
+                     [reduce] (admit-host-reduce-program! program)
                      [effect-map] (admit-host-indexed-map-program! program)
                      (throw (ex-info "unsupported primitive host program topology"
                                      {:reason :typed-soac-host-program-topology

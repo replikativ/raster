@@ -243,6 +243,15 @@ control values refuse. This is a compiler projection capability, not graph diffe
 authority to classify outputs as primal results, residuals or gradients. Canonical AD must
 independently derive those roles, ownership relationships and derivative programs.
 
+The same compiler boundary admits one ordered scalar reduction and pure map graphs ending
+in reductions, optionally with fresh segmented products. Each reduction retains its actual
+array input, scalar dtype, certified fold and source order through the existing realization;
+this grants no reassociation. Mixed graphs require exact live inputs/outputs, no effects,
+aliases or physical storage, and owned positive static arrays at cross-operation edges.
+Dynamic/empty longer producer graphs, product→sum without a map, and scalar-reduction-to-map edges remain refused;
+the existing direct map→reduce path retains its dynamic/empty extent support. This is a
+shared host projection capability, not admission of a new AD family or device schedule.
+
 Normalized AD remains opt-in; the source AD engine remains the default structural reference.
 The checked scalar lane supplies derivation evidence to three bounded host families: pure map,
 map followed by ordered additive sum, and functional indexed map. Those families now execute
