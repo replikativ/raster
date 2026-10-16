@@ -147,6 +147,12 @@ canonical map owner while retaining the original source as public authority. Exi
 coverage, residual order and numerical policies are unchanged; arbitrary DAGs remain outside the
 boundary, while only the three tabled families have opt-in device consumers.
 
+Checked node-wise map construction, proof replay and segmented-product→activation
+composition share one primal/linear/transpose phase assembler. Family admission and
+interface validation remain outside it. Constructor accumulation identities and retained
+replay identities remain distinct; no node ports, residual copies or arithmetic contracts
+are inferred again during assembly.
+
 A checked composition boundary admits a closed region of pure homogeneous maps with one
 public result. Intermediates remain private and every source member must satisfy the existing
 map-lane and source-envelope premises before fusion. Shared producers and reconverging branches
