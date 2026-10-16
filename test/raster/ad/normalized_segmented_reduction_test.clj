@@ -9,10 +9,13 @@
             [raster.ad.normalized-device :as device]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.contraction-facts :as contraction]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.gpu.link-module :as link-module]))
 
@@ -103,6 +106,28 @@
 (defn- arguments [prepared a w] (mapv {'A a 'W w} (:inputs prepared)))
 (defn- active-slot [prepared active gradients]
   (nth gradients (.indexOf ^java.util.List (:inputs prepared) active)))
+
+(deftest segmented-ad-reuses-one-contraction-projection-for-read-minima
+  (doseq [dtype [:float :double] active '[A W]]
+    (let [calls (atom 0) captured (atom nil) reads (atom nil) read-facts (atom nil)
+          original contraction/from-components
+          original-reads projection/contraction-core-read-requirements
+          description
+          (with-redefs [contraction/from-components
+                        (fn [components]
+                          (swap! calls inc)
+                          (let [facts (original components)] (reset! captured facts) facts))
+                        projection/contraction-core-read-requirements
+                        (fn [program facts]
+                          (reset! read-facts facts)
+                          (let [requirements (original-reads program facts)]
+                            (reset! reads requirements) requirements))]
+            (#'normalized/segmented-description (source dtype) {:active-input active}))]
+      (is (= 1 @calls))
+      (is (identical? @captured (:contraction description)))
+      (is (identical? @captured @read-facts))
+      (is (= {'A 6 'W 12}
+             (update-vals @reads #(launch/resolve-expression (constantly nil) %)))))))
 
 (def ^:private a0 [-2.0 0.5 3.0 1.25 -4.0 2.0])
 (def ^:private w0 [0.25 -1.0 2.0 0.75 3.0 -0.5 1.5 -2.0 -1.25 4.0 0.125 2.5])

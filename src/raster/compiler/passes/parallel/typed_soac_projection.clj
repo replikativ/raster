@@ -280,15 +280,28 @@
   (contraction-facts/surface-form
    (segmented-reduce-contract-components program equation)))
 
-(defn segmented-reduce-core-read-requirements
-  "Logical core-read minima from verified dense operand maps of a retained scalar fold.
+(defn segmented-reduce-contraction-context
+  "Project existing unscheduled contraction components and their sole verified facts once.
+
+   The context is ephemeral data, not a new IR or membership/scheduling certificate. Callers
+   retain their existing equation-membership and source-intent checks; raw source-operation is
+   retained for correspondence, never inferred from numerical policy or treated as proof."
+  [program equation]
+  (let [components (segmented-reduce-contract-components program equation)]
+    {:equation equation :components components
+     :facts (contraction-facts/from-components components)
+     :physical-results (dialect/physical-results (dialect/facts program) equation)
+     :source-operation (get-in (dialect/operation-parts equation)
+                               [:attributes :attributes :source-operation])}))
+
+(defn contraction-core-read-requirements
+  "Logical core-read minima from already verified contraction facts and program values.
 
    Unsupported maps decline the whole optional projection. This does not certify physical
-   addresses, neutral/result-transform reads, allocation capacity or reassociation."
-  [program equation]
-  (let [facts (contraction-facts/from-components
-               (segmented-reduce-contract-components program equation))
-        reads (contraction-facts/dense-operand-read-maps facts)
+   addresses, neutral/result-transform reads, allocation capacity or reassociation. It neither
+   reprojects an equation nor constructs another ContractionFacts value."
+  [program facts]
+  (let [reads (contraction-facts/dense-operand-read-maps facts)
         values (:values (dialect/facts program))]
     (when (and reads
                (every? (fn [{:keys [sym]}]
@@ -304,6 +317,12 @@
                                   (= prior minimum) prior
                                   :else (launch/maximum prior minimum))))))
               {} reads))))
+
+(defn segmented-reduce-core-read-requirements
+  "Logical core-read minima from a retained scalar fold, using the shared contraction projection."
+  [program equation]
+  (contraction-core-read-requirements
+   program (:facts (segmented-reduce-contraction-context program equation))))
 
 (defn segmented-reduce-core-write-requirements
   "Dense output-prefix minima from a canonical scalar segmented reduction.
