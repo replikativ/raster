@@ -12,6 +12,13 @@ The current public boundary is deliberately smaller than general program differe
 | Map followed by one ordered additive sum | Canonical primal/JVP/VJP with a scalar result and ordered multiple active arrays, or one active scalar capture | `normalized-device/prepare-sum-owner` (one active array) | Concrete array geometry; one exactly typed scalar cotangent fixed at preparation |
 | Functional indexed map | Canonical gather primal and sequential ordered transpose | `normalized-device/prepare-indexed-owner` | Static index/cotangent extent; data/gradient extent static or one private `m` fixed from the prepared data array; array cotangent |
 
+Pure map and ordered-sum device preparation now share one canonical phase-binding projection:
+compilation, exact public-array correspondence, owned residual frontiers, fresh gradient
+storage and module wiring. Array cotangents use fresh seed storage; fixed scalar cotangents
+close from the retained transpose input ports. Existing admission/refusal boundaries, public
+interfaces, cleanup and lease behavior remain unchanged. Indexed zero-fill/scatter obligations
+remain separate. This consolidation does not activate multi-node device AD or a device JVP.
+
 All three device surfaces reuse the generic named-entry owner, resident binder, LinkPlan/LinkModule
 validation, epoch/callee guards and leases. They do not enable arbitrary equation DAGs,
 conditional/loop AD, empty native buffers, per-call geometry changes, concurrent mutation,
