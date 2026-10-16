@@ -3,6 +3,7 @@
             [raster.core :refer [deftm]]
             [raster.numeric :as n]
             [raster.par :as par]
+            [raster.analysis.memory :as memory]
             [raster.ad.reverse :as rev]))
 
 (deftm overwritten [x :- Double, ys :- (Array double), flag :- Long] :- Double
@@ -51,6 +52,22 @@
   (if (do (aset ys 0 3.0) (= flag 1))
     (par/reduce acc 0.0 i 2 (n/+ acc (n/* x (aget ys i)))) x))
 
+(deftm chained-alias-write [x :- Double, ys :- (Array double)] :- Double
+  (let [a ys b a
+        value (par/reduce acc 0.0 i 2 (n/+ acc (n/* x (aget ys i))))
+        c b ignored (aset c 0 99.0)]
+    value))
+
+(deftm chained-earlier-write [x :- Double, ys :- (Array double)] :- Double
+  (let [a ys b a ignored (aset b 0 3.0)]
+    (par/reduce acc 0.0 i 2 (n/+ acc (n/* x (aget ys i))))))
+
+(deftm unrelated-write [x :- Double, ys :- (Array double), zs :- (Array double)] :- Double
+  (let [a ys b zs
+        value (par/reduce acc 0.0 i 2 (n/+ acc (n/* x (aget a i))))
+        ignored (aset b 0 99.0)]
+    value))
+
 (defn- refusal [v]
   (try (rev/value+grad v :wrt [0]) nil
        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
@@ -90,3 +107,18 @@
   (is (= :ad-region-unclosed-test
          (try (#'rev/ad-record :if 'result '(if (predicate x) x x) {'x true}) nil
               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+
+(deftest alias-edges-are-shared-may-alias-relations-not-single-identities
+  (let [{:keys [aliases]} (#'rev/forward-pass '[a xs b a c b other ys] [])]
+    (doseq [s '[xs a b c]]
+      (is (= '#{xs a b c} (memory/transitive-closure #{s} aliases))))
+    (is (= '#{ys other} (memory/transitive-closure '#{ys} aliases))))
+  (is (= :replayed-array-overwritten (refusal #'chained-alias-write)))
+  (is (= [10.0 5.0 nil]
+         ((rev/value+grad #'chained-earlier-write :wrt [0])
+          2.0 (double-array [1.0 2.0]))))
+  (let [ys (double-array [1.0 2.0]) zs (double-array [7.0 8.0])]
+    (is (= [6.0 3.0 nil nil]
+           ((rev/value+grad #'unrelated-write :wrt [0]) 2.0 ys zs)))
+    (is (= [1.0 2.0] (vec ys)))
+    (is (= [99.0 8.0] (vec zs)))))
