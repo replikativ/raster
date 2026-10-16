@@ -769,12 +769,12 @@
            ;; describe result/output identity without another operation registry.
            result-aliases (if-let [result-alias (:result-alias record)]
                             #{result-alias}
-                            (form/normal-exit-symbols init-expr))
+                            (:symbols (form/normal-exit-facts init-expr)))
            aliases (:aliases
                     (memory/track-aliases {:aliases aliases :consumed #{}}
-                                          ;; Positive edges only: unknown nil
-                                          ;; and no-exit #{} are NOT freshness
-                                          ;; or non-aliasing certificates.
+                                          ;; Partial positive evidence survives
+                                          ;; unknown arms; completeness/freshness
+                                          ;; are NOT inferred from missing edges.
                                           sym (or result-aliases #{}) #{}))]
        (when overwritten
          (throw (ex-info

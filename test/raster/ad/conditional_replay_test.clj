@@ -85,15 +85,26 @@
         prior (par/reduce s 0.0 j 1 (n/+ s (n/* x (aget ys j))))]
     (n/+ prior (n/* 2.0 x))))
 
+(deftm partially-known-selected-buffer-overwrite
+  [x :- Double, ys :- (Array double), flag :- Long] :- Double
+  (let [view (if (= flag 1) ys nil)
+        prior (par/reduce s 0.0 j 1 (n/+ s (n/* x (aget ys j))))
+        ignored (aset view 0 7.0)]
+    (n/+ prior (n/* 2.0 x))))
+
 (deftest selected-results-contribute-all-known-may-alias-edges
   ;; Before this change flag=1 returned [10,9,...], instead of derivative 5.
   (is (= 10.0 (selected-buffer-overwrite 2.0 (double-array [3.0])
                                        (double-array [4.0]) 1)))
   (is (= :replayed-array-overwritten (refusal #'selected-buffer-overwrite)))
+  (is (= 10.0 (partially-known-selected-buffer-overwrite 2.0 (double-array [3.0]) 1)))
+  (is (= :replayed-array-overwritten (refusal #'partially-known-selected-buffer-overwrite)))
   (let [{:keys [aliases]}
         (#'rev/forward-pass '[view (if flag ys zs) later view] [])]
     (doseq [s '[ys zs view later]]
       (is (= '#{ys zs view later} (memory/transitive-closure #{s} aliases)))))
+  (let [{:keys [aliases]} (#'rev/forward-pass '[view (if flag ys nil) later view] [])]
+    (is (= '#{ys view later} (memory/transitive-closure '#{ys} aliases))))
   ;; Writes BEFORE the residual is captured remain valid in both cases.
   (let [gradient (rev/value+grad #'selected-buffer-earlier-write :wrt [0])]
     (doseq [[flag expected] [[1 [18.0 9.0 nil nil nil]]
