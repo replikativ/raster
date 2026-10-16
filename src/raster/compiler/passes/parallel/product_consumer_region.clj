@@ -325,6 +325,10 @@
                       {:operations (mapv record-name operations)}))
         operator (reduction/validate! (:reduction producer))
         components (:components operator)
+        _ (when (nil? (:schedule producer))
+            (decline! :producer-schedule
+                      "scalar compatibility reductions do not carry a product-tree schedule"
+                      {:strategy nil}))
         _ (try
             (reduction/validate-product-tree! operator (:schedule producer))
             (catch clojure.lang.ExceptionInfo exception
