@@ -792,7 +792,17 @@
         (throw (ex-info "Reverse AD replay guard requires a normalized write destination"
                         {:reason :ad-unclosed-write-target :destinations writes})))
       (let [values (:values *source-memory-context*)
-            value-facts (:value-facts *source-memory-context*)]
+            value-facts (:value-facts *source-memory-context*)
+            pairs (vec (for [read values :when (contains? conditions read)
+                             write (sort-by str writes)
+                             :when (and (not= read write)
+                                        (replay-write-compatible? value-facts read write))]
+                         [read write (get conditions read)]))
+            private-writes (set/difference (set (map second pairs)) (set values))]
+        (when (seq private-writes)
+          (throw (ex-info "Reverse AD cannot project a write destination into this scope"
+                          {:reason :ad-unprojectable-write-root
+                           :writes (vec (sort-by str private-writes))})))
         (vec
          (mapcat
           (fn [[read write condition]]
@@ -805,11 +815,7 @@
                                             :input (list 'quote read) :write (list 'quote write)}))
                                nil)]
                (if (true? condition) guard (list 'if condition guard nil)))])
-          (for [read values :when (contains? conditions read)
-                write (sort-by str writes)
-                :when (and (not= read write)
-                           (replay-write-compatible? value-facts read write))]
-            [read write (get conditions read)])))))))
+          pairs))))))
 
 (defn- forward-pass
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
@@ -893,9 +899,12 @@
            guard-bindings (binding [*source-memory-context* scope]
                             (replay-input-guard-bindings
                              ambient
-                             ;; Actual selected writes, never unioned choice footprints.
-                             (if-let [destination (op/aset-array-sym init-expr)]
-                               #{destination} #{})))
+                             ;; A SOAC's declared output writes are as real as
+                             ;; explicit stores. Choice records own no unioned
+                             ;; output list; their selected children check here.
+                             (into (if-let [destination (op/aset-array-sym init-expr)]
+                                     #{destination} #{})
+                                   (:written-arrs record))))
            fwd (into (into fwd-bindings guard-bindings)
                      [sym (qualify-fwd-expr init-expr)])]
        (when overwritten

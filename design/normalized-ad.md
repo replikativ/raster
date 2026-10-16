@@ -1340,7 +1340,7 @@ proves freshness. Arbitrary array-returning calls still have an open alias bound
 partial positive evidence is not a complete non-aliasing guarantee.
 
 For lexically visible replay objects, source reverse AD also retains
-runtime identity checks before direct writes that would invalidate an earlier
+runtime identity checks before primitive or declared SOAC output writes that invalidate an earlier
 buffer replay. Both the replayed object and the destination can be locals
 returned by opaque helpers, rather than only original parameters.
 Distinct formal names are not a disjointness proof. These checks
@@ -1360,6 +1360,15 @@ scalar coefficients are not mutable array replays. Unknown reference/value types
 remain possibly compatible; missing declarations never prove disjointness.
 Destinations must be normalized symbols; unclosed expressions refuse rather
 than being evaluated twice by a guard and a write.
+Declared output objects must also be visible at the invocation: a child fact
+catalog alone cannot grant access to a private output. A needed comparison with
+such an output refuses `:ad-unprojectable-write-root` rather than emitting an
+unbound symbol. No check is needed when retained classes prove incompatibility.
+The guard uses prior replay obligations, not a SOAC's own later reads: a scan's
+new output tape must not be mistaken for an old input version. Declared potential
+writes can conservatively require guards even for empty domains; their exact
+conditional footprints and within-operation input/output alias contracts remain
+separate obligations.
 
 Program pieces also retain a catalog of value declarations and exact result
 aliases, independently of activity or `:wrt`. The existing record identity and
@@ -1388,7 +1397,7 @@ there because of its backward tuple. No general native-coverage preservation
 or guard-elimination performance claim is made.
 
 This is bounded source-engine protection, not general memory-safe AD:
-implicit SOAC output writes, other inactive control regions,
+within-operation SOAC input/output aliasing, other inactive control regions,
 resident views/ranges and caller mutation between primal and delayed pullback
 still require their own existing or future contracts. Native compilation must
 refuse retained guards it cannot execute; this does not introduce a device
