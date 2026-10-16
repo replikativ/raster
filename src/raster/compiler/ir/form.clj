@@ -696,24 +696,30 @@
   (contains? #{:invk :call} (:kind (form-info form))))
 
 (defn tail-symbol
-  "The symbol an expression ultimately evaluates to via its tail position — follows
-   let*/loop*/do/if (else-first) to the value leaf. nil if the tail isn't a symbol.
-   Used by copy-propagation to recognise a binding that aliases another value even
-   through an effectful let*/loop* (e.g. r = (let* [..writes b..] b))."
+  "An enclosing symbol returned on EVERY normal exit, or nil when unknown.
+   This is an exact alias query, not a may-alias/else-first result guess. Local
+   binders cannot establish enclosing identity. Recur/throw have no normal exit;
+   unknown calls and literal values do, and must not disappear from a join."
   [expr]
-  (cond
-    (symbol? expr) expr
-    (not (seq? expr)) nil
-    (contains? let-heads (first expr)) (tail-symbol (last expr))
-    (contains? loop-heads (first expr)) (tail-symbol (nth expr 2 nil)) ; loop body
-    ;; raster.par/map! writes AND returns its out array (arg 1) → that IS its tail value,
-    ;; so a binding r = (par/map! out ..) aliases out (buffer-loop classification +
-    ;; copy-prop + result-buffer resolution), same as the expanded (let* ..out) form.
-    (= 'raster.par/map! (first expr)) (tail-symbol (second expr))
-    (= 'do (first expr)) (tail-symbol (last expr))
-    (= 'if (first expr)) (or (tail-symbol (nth expr 3 nil))   ; base/else first
-                             (tail-symbol (nth expr 2 nil)))
-    :else nil))
+  (letfn [(exits [e bound]
+            (cond
+              (symbol? e) (when-not (contains? bound e) #{e})
+              (not (seq? e)) nil
+              (or (let-head? (first e)) (loop-head? (first e)))
+              (let [{:keys [binders body]} (first (:scopes (scope-info e)))]
+                (exits (last body) (into bound binders)))
+              (= 'do (first e)) (exits (last (rest e)) bound)
+              (= 'if (first e))
+              (let [a (exits (nth e 2 nil) bound)
+                    b (exits (nth e 3 nil) bound)]
+                (when (and (some? a) (some? b)) (into a b)))
+              (contains? #{'recur 'throw} (first e)) #{}
+              ;; Retain the existing destination identity contract, not a
+              ;; name-suffix heuristic or the return TYPE of a reduction.
+              (= 'raster.par/map! (first e)) (exits (second e) bound)
+              :else nil))]
+    (let [aliases (exits expr #{})]
+      (when (= 1 (count aliases)) (first aliases)))))
 
 (defn terminal-value-expr
   "The terminal VALUE expression a body evaluates to at exit — walks through
