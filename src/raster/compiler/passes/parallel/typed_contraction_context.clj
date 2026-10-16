@@ -1,7 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-contraction-context
   "Shared typed equation/scheduled contraction boundary, independent of target emission."
-  (:require [raster.compiler.ir.contraction-facts :as cf]
-            [raster.compiler.ir.reduction :as reduction]
+  (:require [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
@@ -27,8 +26,8 @@
                      (throw (ex-info "typed contraction program lacks its scheduled equation"
                                      {:reason :typed-contraction-equation
                                       :operation operation-id})))
-        components (typed-projection/segmented-reduce-contract-components program equation)
-        facts (cf/from-components components)
+        {components :components facts :facts}
+        (typed-projection/segmented-reduce-contraction-context program equation)
         equation-dtype (:dtype components)
         expected-space (conj (:free-axes facts) (:flat-contract-axis facts))
         actual-space (mapv (juxt :name :bound) (get-in operation [:space :dims]))

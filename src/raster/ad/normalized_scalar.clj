@@ -2217,9 +2217,9 @@
         params (:parameters (soac/lambda-parts lambda))
         active (segmented-activity! operands options)
         passive (first (remove #{active} operands))
-        components (when equation
-                     (projection/segmented-reduce-contract-components source equation))
-        contraction (when components (contraction/from-components components))
+        context (when equation (projection/segmented-reduce-contraction-context source equation))
+        components (:components context)
+        contraction (:facts context)
         matrix-view (when contraction (contraction/dense-matrix-view contraction))
         operand-entries (when contraction (:operands contraction))
         operand-maps (when contraction
@@ -2231,8 +2231,8 @@
                              raw-extents)
         result-map (when raw-extents? (soac/segmented-reduce-result-map attributes))
         reduction (when contraction (contraction/scalar-reduction-view contraction))
-        reads (when equation
-                (projection/segmented-reduce-core-read-requirements source equation))
+        reads (when context
+                (projection/contraction-core-read-requirements source contraction))
         dt (first (:dtypes attributes))
         expected-arithmetic (when (contains? #{:float :double} dt)
                               (numerics/blas-source-arithmetic dt))
