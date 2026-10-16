@@ -1,5 +1,7 @@
 (ns raster.dl.nn-test
   (:require [clojure.test :refer [deftest testing is]]
+            [clojure.java.io :as io]
+            [clojure.walk :as walk]
             [raster.dl.nn :as nn]
             [raster.dl.tensor :as t]
             [raster.ad.templates :as tmpl]
@@ -248,6 +250,100 @@
                      (+ (aget y 0) (aget y 1) (aget y 2)))
                   x 1e-5)]
       (is (arr-approx= dx num-dx 1e-4)))))
+
+(deftest gelu-rational-derivative-coefficients-follow-the-primal
+  ;; Do not hide the primal's polynomial behind a late-expanded macro:
+  ;; broadcast must see its arithmetic to retain Float lane semantics.
+  (let [forms (with-open [r (java.io.PushbackReader. (io/reader (io/resource "raster/dl/nn.clj")))]
+                (doall (take-while #(not= ::eof %) (repeatedly #(read r false ::eof)))))
+        forward (first (filter #(= 'gelu (second %)) forms))
+        polynomial-let (first (filter #(and (seq? %) (= 'let (first %))
+                                            (some #{'np} (second %)))
+                                      (tree-seq coll? seq forward)))
+        primal (into {} (map vec (partition 2 (second polynomial-let))))
+        expanded (binding [*ns* (the-ns 'raster.dl.nn)]
+                   (macroexpand-1 '(with-gelu-rational [u t tp tpp] tpp)))
+        bindings (second expanded)
+        z (first bindings)
+        normalize (fn [form]
+                    (walk/postwalk #(if (symbol? %)
+                                      (if (= z %) 'u2 (symbol (name %))) %) form))]
+    (is (= (primal 'np) (normalize (nth bindings 3))))
+    (is (= (primal 'dp) (normalize (nth bindings 5))))))
+
+(deftest gelu-forward-preserves-frozen-float-and-double-bits
+  ;; Captured before the derivative correction. Not regenerated from AD.
+  (let [xs [-100.0 -10.0 -5.0 -3.0 -1.0 -0.5 -0.0 0.0 0.5 1.0 3.0 5.0 10.0 100.0]]
+    (is (= [-4704968438753263616 -4719638591930630144 -4715221409567080448
+            -4652838370507711872 -4628482355361988890 -4628645277730142248
+            -9223372036854775808 0 4599899449755597844 4605752003499454534
+            4613929627573279449 4617315517690340290 4621819117519868619 4636737291268257661]
+           (mapv #(Double/doubleToRawLongBits (double %)) (nn/gelu (double-array xs) (count xs)))))
+    (is (= [-2147483648 -2147483648 -2147483648 -1150393472 -1105027442 -1105330906
+            -2147483648 0 1051787629 1062688860 1077920872 1084227584 1092616192 1120403456]
+           (mapv #(Float/floatToRawIntBits (float %)) (nn/gelu (float-array xs) (count xs)))))))
+
+(deftest gelu-derivatives-match-the-rational-primal
+  (let [xs [-5.0 -3.0 -1.0 -0.5 0.0 0.5 1.0 3.0 5.0]
+        n (count xs)
+        forward (fn [x] (double (first (nn/gelu (double-array [x]) 1))))
+        first-derivative (vec (nn/gelu-backward (double-array (repeat n 1.0)) (double-array xs) n))
+        second-derivative (vec (nn/gelu-second-deriv (double-array xs) n))]
+    (doseq [[x d dd] (map vector xs first-derivative second-derivative)]
+      ;; Independent central differences of the primal, not of another AD rule.
+      (let [h 1e-4
+            fd (/ (- (forward (+ x h)) (forward (- x h))) (* 2.0 h))
+            h2 1e-3
+            fd2 (/ (+ (forward (+ x h2)) (forward (- x h2)) (* -2.0 (forward x))) (* h2 h2))]
+        (is (approx= d fd 3e-9) (str "primal first derivative at " x))
+        (is (approx= dd fd2 3e-7) (str "primal second derivative at " x))))
+    (let [seeds (double-array (map #(- (double %) 4.0) (range n)))
+          actual (nn/gelu-backward seeds (double-array xs) n)]
+      (is (arr-approx= actual (double-array (map * seeds first-derivative)) 1e-14)))
+    ;; AD differentiates arithmetic, not the rounded Float step function.
+    (let [float-d (nn/gelu-backward (float-array (repeat n 1.0)) (float-array xs) n)
+          float-dd (nn/gelu-second-deriv (float-array xs) n)]
+      (is (every? true? (map #(approx= %1 %2 1e-6) float-d first-derivative)))
+      (is (every? true? (map #(approx= %1 %2 1e-6) float-dd second-derivative))))))
+
+(deftest gelu-clamped-derivatives-retain-tail-slopes-and-nan
+  (let [xs [-1e200 -100.0 -6.0 6.0 100.0 1e200]
+        n (count xs)
+        d (nn/gelu-backward (double-array (repeat n 1.0)) (double-array xs) n)
+        dd (nn/gelu-second-deriv (double-array xs) n)
+        f (nn/gelu (double-array xs) n)]
+    (doseq [i (range n)]
+      (is (approx= (aget d i) (/ (aget f i) (nth xs i)) 1e-15))
+      (is (zero? (aget dd i))))
+    (is (not (zero? (aget d 0))) "the rational negative tail is not exactly zero"))
+  (doseq [f [#(nn/gelu-backward (double-array [1.0]) % 1)
+             #(nn/gelu-second-deriv % 1)]]
+    (is (Double/isNaN (double (first (f (double-array [Double/NaN])))))))
+  (is (zero? (alength (nn/gelu-backward (double-array 0) (double-array 0) 0))))
+  (is (zero? (alength (nn/gelu-second-deriv (double-array 0) 0)))))
+
+(deftest gelu-derivatives-on-either-side-of-the-clamp
+  ;; The knot is not differentiable. Locate it using the primal's cubic and
+  ;; check each smooth side independently; never central-difference across it.
+  (let [c (Math/sqrt (/ 2.0 Math/PI))
+        raw (fn [x] (* c (+ x (* 0.044715 x x x))))
+        knot (loop [lo 5.0 hi 6.0 steps 0]
+               (if (= steps 50) hi
+                   (let [mid (* 0.5 (+ lo hi))]
+                     (if (< (raw mid) 9.0)
+                       (recur mid hi (inc steps))
+                       (recur lo mid (inc steps))))))
+        forward (fn [x] (double (first (nn/gelu (double-array [x]) 1))))]
+    (doseq [sign [-1.0 1.0] offset [-1e-4 1e-4]]
+      (let [x (* sign (+ knot offset))
+            h 1e-6
+            d (first (nn/gelu-backward (double-array [1.0]) (double-array [x]) 1))
+            dd (first (nn/gelu-second-deriv (double-array [x]) 1))
+            fd (/ (- (forward (+ x h)) (forward (- x h))) (* 2.0 h))]
+        (is (approx= d fd 2e-9))
+        (when (pos? offset)
+          (is (zero? dd))
+          (is (approx= d (/ (forward x) x) 1e-15)))))))
 
 (deftest gelu-erf-test
   ;; erf-exact GELU (A&S 7.1.26) — the HF-checkpoint activation (moonshine,

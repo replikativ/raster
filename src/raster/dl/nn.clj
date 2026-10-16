@@ -248,6 +248,46 @@
          out)))
 
 ;; --- GELU: x * Phi(x) (tanh approximation) ---
+;; The derivative kernels share this compile-time polynomial jet. Its literal
+;; coefficients must match the forward polynomial below (checked by tests).
+;; Keep the forward polynomial visible to broadcast's scalar dtype rewriting.
+;; It expands to ordinary scalar arithmetic before type checking: no runtime
+;; coefficient arrays, helper calls, or new AD dispatch rules are involved.
+(defmacro ^:private with-gelu-rational
+  [[u value & derivatives] & body]
+  (let [p [4.89352455891786e-3 6.37261928875436e-4
+           1.48572235717979e-5 5.12229709037114e-8
+           -8.60467152213735e-11 2.00018790482477e-13 -2.76076847742355e-16]
+        q [4.89352518554385e-3 2.268434632439e-3
+           1.18534705686654e-4 1.19825839466702e-6]
+        differentiate (fn [cs] (mapv clojure.core/* (rest cs) (range 1 (count cs))))
+        z (gensym "u2")
+        horner (fn [cs] (reduce (fn [tail coefficient]
+                                 `(+ ~coefficient (* ~z ~tail)))
+                               (peek cs) (reverse (pop cs))))
+        pn (gensym "np") qn (gensym "dp")
+        ps (gensym "ps") qs (gensym "qs") dq (gensym "dq")
+        [first-derivative second-derivative] derivatives]
+    `(let [~z (* ~u ~u)
+           ~pn ~(horner p)
+           ~qn ~(horner q)
+           ~value (/ (* ~u ~pn) ~qn)
+           ~@(when first-derivative
+               [ps (horner (differentiate p))
+                qs (horner (differentiate q))
+                dq `(* 2.0 ~u ~qs)
+                first-derivative `(/ (- (+ ~pn (* 2.0 ~z ~ps))
+                                        (* ~value ~dq)) ~qn)])
+           ~@(when second-derivative
+               [second-derivative
+                `(/ (- (* ~u (+ (* 6.0 ~ps)
+                                (* 4.0 ~z ~(horner (differentiate (differentiate p))))))
+                       (* 2.0 ~first-derivative ~dq)
+                       (* ~value (+ (* 2.0 ~qs)
+                                    (* 4.0 ~z ~(horner (differentiate (differentiate q)))))))
+                    ~qn)])]
+       ~@body)))
+
 ;; The tanh is inlined as a vectorizable odd-rational approximation (Eigen ptanh:
 ;; clamp + polynomial in u², only +/*//min/max → a pure SIMD lane chain). A libm
 ;; m/tanh call stays scalar inside the broadcast (dtanh_stub) and blocks the map.
@@ -270,7 +310,8 @@
                                     th (/ (* u np) dp)]
                                 (* 0.5 x (+ 1.0 th)))))))
 
-;; gelu': 0.5*(1+tanh(inner)) + 0.5*x*sech^2(inner)*c*(1+3*0.044715*x^2)
+;; Differentiate the actual rational primal, not the libm tanh it approximates.
+;; The clamp uses the saturated-side derivative (zero) at either endpoint.
 (deftm gelu-backward (All [T] [dy :- (Array T) x :- (Array T) n :- Long]
                           :- (Array T)
                           (let [dx (alloc-like dy n)
@@ -278,33 +319,35 @@
                             (dotimes [i n]
                               (let [xi (aget x i)
                                     inner (* c (+ xi (* 0.044715 xi xi xi)))
-                                    t (raster.math/tanh inner)
-                                    sech2 (- 1.0 (* t t))
-                                    grad (+ (* 0.5 (+ 1.0 t))
-                                            (* 0.5 xi sech2 c (+ 1.0 (* 3.0 0.044715 xi xi))))]
-                                (aset dx i (* (aget dy i) grad))))
+                                    u (n/min 9.0 (n/max -9.0 inner))]
+                                (with-gelu-rational [u t tp]
+                                  (let [grad (if (or (<= inner -9.0) (>= inner 9.0))
+                                               (* 0.5 (+ 1.0 t))
+                                               (+ (* 0.5 (+ 1.0 t))
+                                                  (* 0.5 xi tp c (+ 1.0 (* 3.0 0.044715 xi xi)))))]
+                                    (aset dx i (* (aget dy i) grad))))))
                             dx)))
 
-;; GELU second derivative (act″) — the RoR-closure kernel (#72).
-;; With u = c(x + a·x³), a = 0.044715, c = √(2/π), t = tanh u,
-;; s2 = 1 − t² (= sech²u), u′ = c(1 + 3a·x²), u″ = 6·a·c·x:
-;;   gelu′(x) = 0.5(1+t) + 0.5·x·s2·u′            (= gelu-backward's grad)
-;;   gelu″(x) = 0.5·s2·u′ + 0.5·[s2·u′ + x·(ds2/dx·u′ + s2·u″)]
-;;            = s2·u′ + 0.5·x·s2·(u″ − 2·t·(u′)²)  (ds2/dx = −2·t·s2·u′)
-;; Same exact-tanh spelling as gelu-backward, so FD of that kernel validates
-;; this one directly (o4c double-backward law).
+;; For the interior, f″ = r′u′ + x/2 (r″u′² + r′u″).
+;; Outside (and at) the clamp endpoints the primal is linear: f″ = 0.
+;; Branch before evaluating u′/u″ so even overflowed cubic inputs do not
+;; introduce spurious 0*Inf NaNs in the saturated derivative.
 (deftm gelu-second-deriv (All [T] [x :- (Array T) n :- Long] :- (Array T)
                               (let [dd (alloc-like x n)
                                     c (n/oftype x (n/sqrt (/ 2.0 n/pi)))]
                                 (dotimes [i n]
                                   (let [xi (aget x i)
-                                        u (* c (+ xi (* 0.044715 xi xi xi)))
-                                        up (* c (+ 1.0 (* 3.0 0.044715 xi xi)))
-                                        upp (* 6.0 0.044715 c xi)
-                                        t (raster.math/tanh u)
-                                        s2 (- 1.0 (* t t))]
-                                    (aset dd i (+ (* s2 up)
-                                                  (* 0.5 xi s2 (- upp (* 2.0 t up up)))))))
+                                        u (* c (+ xi (* 0.044715 xi xi xi)))]
+                                    (aset dd i
+                                          (if (not= u u)
+                                            u
+                                            (if (or (<= u -9.0) (>= u 9.0))
+                                              0.0
+                                              (with-gelu-rational [u t tp tpp]
+                                                (let [up (* c (+ 1.0 (* 3.0 0.044715 xi xi)))
+                                                      upp (* 6.0 0.044715 c xi)]
+                                                  (+ (* tp up)
+                                                     (* 0.5 xi (+ (* tpp up up) (* tp upp)))))))))))
                                 dd)))
 
 (tmpl/merge-into-template! 'raster.dl.nn/gelu
@@ -501,7 +544,8 @@
     (layer-norm-reassociated! x gamma beta out rows features eps)
     out))
 
-;; !-variant elementwise GELU (tanh approximation, matches `gelu`/gelu-mul!).
+;; !-variant elementwise GELU (libm tanh approximation, like gelu-mul!).
+;; Unlike allocating `gelu`, this does not use the clamped rational tanh.
 (deftm gelu! (All [T] [x :- (Array T) out :- (Array T) n :- Long] :- Void
                   (raster.par/map-void! i n
                                         (let [v (aget x i)]

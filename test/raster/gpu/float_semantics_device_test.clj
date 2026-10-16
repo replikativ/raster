@@ -8,6 +8,7 @@
             [raster.arrays :as ra]
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as ops]
+            [raster.dl.nn :as nn]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
             [raster.gpu.compiled :as compiled]
@@ -136,6 +137,46 @@
             (if (= target :ocl:0)
               (ocl/opencl-skip! "dot-rows-dh Double" :fp64)
               (gp/gpu-capability-skip! "dot-rows-dh Double" :fp64? caps))))))))
+
+(defn- check-gelu-rational-derivatives! [target make-array dtype]
+  (doseq [[v with-seed?] [[#'nn/gelu-backward true] [#'nn/gelu-second-deriv false]]]
+    (let [cases [[-6.0 -5.0 -3.0 -1.0 -0.0 0.5 3.0 6.0]
+                 [6.0 5.0 1.0 0.5 0.0 -0.5 -3.0 -6.0]]
+          n (count (first cases))
+          seed (make-array [1.0 -2.0 0.0 0.5 -1.0 2.0 -0.5 1.0])
+          args (fn [x] (if with-seed? [seed x n] [x n]))
+          executable (compiled/instantiate!
+                       (compiled/lower v (args (make-array (first cases)))
+                                       {:compiler :equation-first :target target :dtype dtype}))]
+      (try
+        (doseq [xs cases]
+          (let [x (make-array xs)
+                before (mapv array-bits [seed x])
+                expected (apply @v (args x))
+                actual (value/->host
+                        (:result (compiled/invoke-compiled executable
+                                                          (cond-> {:x x} with-seed? (assoc :dy seed)))))]
+            (is (= (class expected) (class actual)) (str target " " dtype " " (:name (meta v))))
+            (is (every? true? (map #(< (Math/abs (- (double %1) (double %2)))
+                                       (if (= dtype :float) 1e-6 1e-12)) expected actual))
+                (str target " " dtype " " (:name (meta v))))
+            (is (= before (mapv array-bits [seed x])) "replayed inputs remain immutable")))
+        (finally (compiled/close! executable))))))
+
+(deftest gelu-rational-derivatives-replay-on-both-device-routes
+  (doseq [[target available? skip!] [[:ocl:0 ocl/opencl-available? ocl/opencl-skip!]
+                                    [:ze:0 gp/gpu-available? gp/gpu-skip!]]]
+    (if-not @available?
+      (skip! (str "rational GELU derivatives on " target))
+      (let [caps (when (= target :ze:0)
+                   ((requiring-resolve 'raster.gpu.ze-runtime/module-capabilities)))
+            fp64? (if (= target :ocl:0) @ocl/opencl-fp64-available? (:fp64? caps))]
+        (check-gelu-rational-derivatives! target float-array :float)
+        (if fp64?
+          (check-gelu-rational-derivatives! target double-array :double)
+          (if (= target :ocl:0)
+            (ocl/opencl-skip! "rational GELU Double" :fp64)
+            (gp/gpu-capability-skip! "rational GELU Double" :fp64? caps)))))))
 
 (deftm mixed-norm-tail!
   [dy :- (Array float), x :- (Array float), weight :- (Array float),
