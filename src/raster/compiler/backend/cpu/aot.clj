@@ -32,6 +32,7 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
+            [raster.compiler.passes.scalar.host-entry-contract :as host-entry]
             [raster.compiler.passes.scalar.peephole :as peephole]))
 
 (def ^:dynamic *simd-preamble*
@@ -617,7 +618,7 @@
    - stripped     : the let* body (buffer-allocs already removed) to emit
    Returns the C source string."
   [kernel-name dtype array-params scalar-params buffers local-buffers length-syms stripped
-   & {:keys [return-type] :or {return-type :void}}]
+   & {:keys [return-type written-pointers] :or {return-type :void}}]
   (let [ct (ctype dtype "double")  ; default scalar type for the body (the dominant dtype)
         array-syms (set (concat (map first array-params) (map first buffers) (map first local-buffers)))
         ;; SROA: small, compile-time-fixed-size, non-escaping scratch buffers are emitted
@@ -631,7 +632,8 @@
         ;; Scheduled stores are authoritative even when the host projection retains par/map!
         ;; rather than an aset spelling. Explicit host writes still count outside those regions.
         ;; Use the same physical-output projection as graph consumers, not a C-only op registry.
-        written (written-pointer-syms stripped *scheduled-program* array-syms)
+        written (into (written-pointer-syms stripped *scheduled-program* array-syms)
+                      written-pointers)
         ;; param order: input arrays, output buffers, scalar params, array lengths —
         ;; each array gets ITS OWN element type (e.g. float in, int8_t out for quant).
         param-strs (concat
@@ -824,17 +826,28 @@
         ;; artifacts across calls and JVM processes.
         {nform :form host-value-remap :host-value-remap}
         (canonical-host-projection nform parallel-program params)
-        {:keys [buffers scalar-bindings stripped]} (split-let nform)
-        ;; canonical copy-propagation: resolve aliases read downstream (e.g. a binding
-        ;; r = (let* [..writes buf..] buf) from inlining residual-add, where r feeds a
-        ;; later norm's reduction). Shared with the AD peephole — no bespoke aliasing.
-        stripped (peephole/copy-propagate-let stripped)
+        {buffers :buffers unsimplified :stripped} (split-let nform)
         ;; input array params as [sym ctype] (per-element type), scalars as [sym ctype]
         array-params  (vec (for [p params :when (contains? array-tags (get param-env p))]
                              [p (elem->ctype (tag->elem (get param-env p)) "double")]))
         ;; scalar params typed from their tag (double eps, long n, ...), not all int.
         scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
                              [p (elem->ctype (tag->elem (get param-env p)) "int")]))
+        ;; Retain access authority BEFORE discharging source assertions. Removing
+        ;; an entry guard cannot turn an originally writable argument into const.
+        written (written-pointer-syms unsimplified parallel-program
+                                      (concat (map first array-params) (map first buffers)))
+        ;; Inspect before buffer extraction: an allocation/read cannot disappear
+        ;; from the prefix and accidentally make a later assertion look like entry.
+        entry-contract (host-entry/project-entry-assertions nform param-env
+                                                            (mapv first array-params))
+        {:keys [scalar-bindings stripped]} (split-let (:form entry-contract))
+        ;; Shared canonical copy propagation, after the checked entry projection.
+        stripped (peephole/copy-propagate-let stripped)
+        pointer-indices (zipmap (map first array-params) (range))
+        object-pairs (mapv (fn [{:keys [left right]}]
+                             [(get pointer-indices left) (get pointer-indices right)])
+                           (:preconditions entry-contract))
         ;; stable length-sym order shared by signature + call site
         len-order (vec (sort-by (comp str val) length-syms))
         ;; FFM marshalling types for the trailing scalars: scalar-param types then
@@ -857,21 +870,22 @@
         src (binding [*scheduled-program* parallel-program
                       *host-value-remap* host-value-remap]
               (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers
-                         length-syms stripped :return-type (or return-type :void)))
+                         length-syms stripped :return-type (or return-type :void)
+                         :written-pointers written))
         so  (cpu/compile-source! src)
-        written (written-pointer-syms stripped parallel-program
-                                      (concat (map first array-params) (map first heap-buffers)))
         pointer-access (into (mapv (fn [[sym _]] (if (written sym) :read-write :read))
                                    array-params)
                              (repeat (count heap-buffers) :read-write))
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count heap-buffers))
                                 scalar-ffm (or return-type :void)
-                                {:pointer-access pointer-access :no-alias? true})
+                                {:pointer-access pointer-access :no-alias? true
+                                 :object-distinct-pairs object-pairs})
         wrapper (native-call-wrapper native params array-params scalar-params len-order
                                      heap-buffers scalar-bindings result-shape result-syms
                                      reuse-buffers?)]
     (with-meta
       wrapper
       {:c-source src :kernel-name kernel-name :native-call-policy :ordinary
+       :entry-preconditions (:preconditions entry-contract)
        :native-pointer-access pointer-access})))

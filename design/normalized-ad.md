@@ -1396,6 +1396,25 @@ guarded programs; the private-write regression fixture was already unsupported
 there because of its backward tuple. No general native-coverage preservation
 or guard-elimination performance claim is made.
 
+The monolithic native-C adapter can project one bounded class of source guards
+onto the existing executable precondition contract: unused, unconditional entry
+assertions that two declared public primitive-array arguments are not the same
+original host object. Only a direct canonical identity predicate, closed
+`ex-info` failure and nil success qualify. The prefix cannot cross reads,
+allocations, arithmetic, effects or unknown calls. Conditional guards, private
+values, used assertion results and split boolean dependencies remain source;
+they are not silently discarded to make native emission succeed.
+
+The same validated identities determine both source-check removal and native
+pointer argument indices. The native adapter checks original objects before
+marshalling, including empty arrays, independently of physical range checks.
+Distinct objects do not prove disjoint storage, and range disjointness does not
+prove object inequality. Original write authority is retained in both the C
+signature and native access plan. Invalid aliases now fail as an ABI entry
+precondition, without promising the original source exception payload or its
+relative ordering on invalid calls. This is not a new AD evaluator or a GPU
+preflight path; it does not establish general mutation/version support.
+
 This is bounded source-engine protection, not general memory-safe AD:
 within-operation SOAC input/output aliasing, other inactive control regions,
 resident views/ranges and caller mutation between primal and delayed pullback
