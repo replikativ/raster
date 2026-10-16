@@ -1153,3 +1153,28 @@ specialization. They retain no caller array after preparation and do not add a c
 device readback, dynamic scalar seed, mutable state, general scatter, arbitrary DAG execution, or
 default-engine activation. The original campaign gates, real Gemma numerical acceptance and long
 GSDM qualification remain independent.
+
+### Approximate primals retain their own derivative semantics
+
+The allocating `raster.dl.nn/gelu` uses a clamped odd rational approximation of tanh
+for vectorizable forward arithmetic. Its first and second derivative kernels differentiate
+that rational function, not a substituted libm tanh. This corrects gradients without changing
+the forward polynomial or its Float/Double arithmetic order. Existing JVP and transpose rules
+continue to use those kernels; no additional AD dispatch authority is introduced.
+
+At the raw tanh argument ±9 the clamp uses the saturated-side convention: its derivative
+is zero. Outside the clamp, GELU's derivative is the actual constant rational tail slope
+(not an assumed exact zero or one), and its second derivative is zero. NaNs propagate.
+As elsewhere, AD differentiates the arithmetic structure, not the discontinuous rounding
+of a floating-point implementation. Derivatives use dtype-specific base coefficients
+(narrowed before differentiation), evaluate the polynomial jets in Double, and narrow at
+the derivative array store. This is a smooth extension, not exact differentiation of
+every rounded Float intermediate. The separate `gelu!` and `gelu-mul!` operations still
+use libm tanh and are not bitwise-interchangeable with this allocating rational primal.
+
+Validation includes frozen forward bits, a structural polynomial-coefficient check,
+finite differences of the primal on each smooth side of the clamp, second-order AD laws,
+and changed-input device replay. A real Gemma Double diagnostic preserved all sixteen
+finite-difference forward outputs and reduced the two inspected coordinate discrepancies
+from roughly 2.4e-8/1.6e-8 to 1.2e-10/1.3e-10. Those two coordinates do not establish
+full-model Float/GPU numerical acceptance; that gate and its tolerances remain unchanged.
