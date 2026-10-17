@@ -1,7 +1,9 @@
 (ns raster.compiler.backend.jvm.hoisted-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.hoisted :as hoisted]
-            [raster.compiler.core.types :as types])
+            [raster.compiler.core.types :as types]
+            [raster.compiler.pipeline :as pipeline]
+            [raster.core :refer [deftm]])
   (:import [java.lang.reflect Modifier]
            [java.util.concurrent CountDownLatch TimeUnit]))
 
@@ -94,3 +96,94 @@
     (is (.getBoolean initialized f))
     (is (= [:left :right] (call f :apply)))
     (is (= 2 @calls))))
+
+(deftm boolean-predicate [x :- Double] :- Boolean
+  (clojure.core/< x 0.0))
+
+(deftest public-boolean-result-uses-the-object-callable-abi
+  (let [compiled (pipeline/compile-aot #'boolean-predicate :target :jvm)]
+    (doseq [x [-2.0 0.0 3.0 -0.5]]
+      (is (= (boolean-predicate x) (compiled x)))
+      (is (instance? Boolean (compiled x))))))
+
+(deftest typed-wrappers-implement-their-actual-object-return-interface
+  (doseq [[tag carrier input] [['double Double/TYPE 5.125]
+                              ['long Long/TYPE 1000]
+                              ['float Float/TYPE (float 5.125)]
+                              ['int Integer/TYPE (int 1000)]
+                              ['boolean Boolean/TYPE true]
+                              ['boolean Boolean/TYPE false]
+                              ['Object Object :value]
+                              ['Object Object (Object.)]
+                              ['Object Object (double-array [1.0 2.0])]
+                              ['void Object :ignored]]
+          cold-entry [:invoke :apply :typed]]
+    (let [parameter-tag (if (= 'void tag) 'Object tag)
+          interface (:iface-class (types/ensure-fn-interface! [parameter-tag]))
+          interface-method (.getMethod ^Class interface "invk" (into-array Class [carrier]))
+          initialized (atom [])
+          result (hoisted/compile-hoisted-class!
+                  (str (gensym "raster.compiled.ObjectReturn_"))
+                  [{:name 'compute
+                    :params [(with-meta 'x {:tag parameter-tag}) (with-meta 'field {:tag 'Object})]
+                    :return-tag tag :walked-body [(if (= 'void tag) '(do nil) 'x)]
+                    :element-type 'double :source-ns *ns*}]
+                  {:field-tags '[Object] :fn-param-tags [parameter-tag]
+                   :return-tag tag :compute-name 'compute :iface-class interface})
+          cls ^Class (:wrapper-class result)
+          f (.newInstance (.getConstructor cls (into-array Class [Object]))
+                          (object-array [(fn [argument] (swap! initialized conj argument) [:field])]))
+          invoke (fn [entry]
+                   (case entry
+                     :invoke (f input)
+                     :apply (apply f [input])
+                     :typed (.invoke interface-method f (object-array [input]))))
+          expected (when-not (= 'void tag) input)]
+      (is (= Object (.getReturnType interface-method)))
+      (is (= (if (= 'void tag) Void/TYPE carrier)
+             (.getReturnType ^java.lang.reflect.Method (get (:methods result) 'compute))))
+      (is (= expected (invoke cold-entry)))
+      (doseq [entry [:invoke :apply :typed]] (is (= expected (invoke entry))))
+      (when (= 'Object tag)
+        (doseq [entry [:invoke :apply :typed]] (is (identical? input (invoke entry)))))
+      (when (= 'boolean tag)
+        (is (thrown? NullPointerException (f nil)))
+        (is (thrown? ClassCastException (f 0)))
+        (is (thrown? ClassCastException (apply f [:truthy-is-not-boolean]))))
+      (is (= [input] @initialized) "every cold entry boxes its initializer input exactly once"))))
+
+(deftest typed-wrapper-preserves-mixed-width-argument-slots
+  (doseq [cold-entry [:invoke :apply :typed]]
+    (let [tags '[double boolean long double floats]
+          interface (:iface-class (types/ensure-fn-interface! tags))
+          method (.getMethod ^Class interface "invk"
+                             (into-array Class [Double/TYPE Boolean/TYPE Long/TYPE Double/TYPE
+                                                (class (float-array 0))]))
+          initialized (atom [])
+          result (hoisted/compile-hoisted-class!
+                  (str (gensym "raster.compiled.MixedWidth_"))
+                  [{:name 'compute
+                    :params (conj (mapv #(with-meta %1 {:tag %2}) '[left flag count right values] tags)
+                                  (with-meta 'field {:tag 'Object}))
+                    :return-tag 'double
+                    :walked-body ['(if flag (clojure.core/+ left (double count) right
+                                                          (double (clojure.core/aget values 0)))
+                                       left)]
+                    :element-type 'double :source-ns *ns*}]
+                  {:field-tags '[Object] :fn-param-tags tags
+                   :return-tag 'double :compute-name 'compute :iface-class interface})
+          cls ^Class (:wrapper-class result)
+          f (.newInstance (.getConstructor cls (into-array Class [Object]))
+                          (object-array [(fn [& arguments] (swap! initialized conj arguments) [:field])]))
+          values (float-array [4.0])
+          arguments [1.25 true (long 1000) 2.5 values]
+          invoke (fn [entry args]
+                   (case entry
+                     :invoke (let [[a b c d e] args] (f a b c d e))
+                     :apply (apply f args)
+                     :typed (.invoke method f (object-array args))))]
+      (is (= 1007.75 (invoke cold-entry arguments)))
+      (doseq [entry [:invoke :apply :typed]]
+        (is (= 1007.75 (invoke entry arguments)))
+        (is (= 1.25 (invoke entry (assoc arguments 1 false)))))
+      (is (= [arguments] (mapv vec @initialized))))))
