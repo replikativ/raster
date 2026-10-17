@@ -945,11 +945,13 @@
          #"AD through `case\*?` is not supported"
          (rev/value+grad #'laws-case-fn))))
 
-  (testing "raw (non-liftable) let-bound loop throws with a clear message"
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"Cannot differentiate through raw `loop`"
-         (rev/value+grad #'laws-loop-fn))))
+  (testing "an unsupported let-bound loop rejects through the checked loop boundary"
+    (is (= :ad-loop-structure
+           (try
+             (rev/value+grad #'laws-loop-fn)
+             nil
+             (catch clojure.lang.ExceptionInfo e
+               (:reason (ex-data e)))))))
 
   (testing "tail-loop body: canonicalizes to par/reduce and differentiates"
     ;; History: silent broken IFn → fail-loud guard (2026-07-04) → §15.2 loop
