@@ -58,6 +58,29 @@ Function inversion and log-Jacobian capabilities remain distinct from transposit
 Implementation order, acceptance gates and the original compiler obligations are retained
 in [the compiler campaign](compiler-unification-campaign.md#ad-consolidation-sequence).
 
+### Generated JVM owner: checked helper composition
+
+The internal generated ordered-SSA owner can compose read-only scalar `deftm`
+helpers through their actual selected JVM interface and retained bytecode
+emission. It completes call inputs under its own source policy, privately
+captures a paired companion, and saves the pullback produced by that forward
+call. Historical source/receiver guards also fence delayed backward execution.
+Borrowed array replay roots are mapped to the caller's inputs; this does not
+snapshot their contents or permit external mutation before backward completion.
+Inactive helper calls must satisfy the same ownership and effect checks.
+
+Scalar cotangent accumulation does not establish a physical carrier by itself:
+the reverse engine projects into the declared tangent space before attaching its
+carrier tag. Helper result seeds and input edges use the shared tangent projection;
+absence remains distinct from a present numerical zero.
+
+This is not arbitrary source-call normalization or new default nested-helper AD
+support. The ordinary source path still refuses an unowned derived helper
+pullback. Runtime private companions are not portable AOT/native/GPU artifacts.
+The marketing generator's existing single-body JVM-AOT gradient qualification is
+a regression check, not evidence that its wrapper uses this internal helper path.
+No cross-backend or performance claim follows from these JVM acceptance tests.
+
 ## Surface model
 
 Raster differentiates ordinary `deftm` code. Because every arithmetic op

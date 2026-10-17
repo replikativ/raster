@@ -33,6 +33,9 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.call-boundary :as call-boundary]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.ad.reverse.normalize :as anf]
             [raster.ad.tangent :as tangent]
@@ -364,6 +367,7 @@
 (declare ^:private let-gradient-pieces)
 (declare ^:private extract-let-parts)
 (declare ^:private product-expression)
+(declare ^:private generated-helper-record)
 
 (defn- init-active?
   "Decide whether a binding init carries gradient (is active), given the current
@@ -570,13 +574,46 @@
                                          :tag (:tag leaf) :active? (contains? active-paths path)})
                                       (product-ports/leaf-paths schema))})))
 
-(defmethod ad-record :completion [_ sym init _activity]
+(declare ^:private exact-replay-root)
+
+(defn- floating-completion-tangent-plan
+  "Transpose one owner-validated floating conversion edge. Both explicit
+   completion records and paired helper inputs consume this same contract."
+  [contract operand source-tag result-tag source-policy]
+  (value-completion/project-to-jvm-source
+   (value-completion/complete-value contract operand) source-policy)
+  (when-not (and (= :jvm-primitive-input (:source-context contract))
+                 (= :scalar (:kind (tangent/tangent-kind source-tag)))
+                 (= :scalar (:kind (tangent/tangent-kind result-tag)))
+                 (identical? (:target-carrier contract) (get types/tag->java-class result-tag)))
+    (throw (ex-info "active primitive completion requires matching floating tangent declarations"
+                    {:reason :ad-unclosed-completion-transpose
+                     :source-tag source-tag :result-tag result-tag})))
+  {:source-tag source-tag})
+
+(defmethod ad-record :completion [_ sym init activity]
   (let [{:keys [contract operand]} (value-completion/canonical-parts init)]
-    (when-not (and (symbol? operand)
-                   (contains? #{:jvm-object-input :jvm-checkcast} (:source-context contract)))
+    (when-not (symbol? operand)
       (throw (ex-info "generated completion does not have a structural identity transpose"
                       {:reason :ad-unclosed-completion-transpose :init init})))
-    {:record {:type :alias :sym sym :source operand :result-alias operand}}))
+    (case (:source-context contract)
+      (:jvm-object-input :jvm-checkcast)
+      {:record {:type :alias :sym sym :source operand :result-alias operand}}
+
+      :jvm-primitive-input
+      (do
+        ;; Validate through the source projection authority. This is the actual
+        ;; GENERATED source owner's policy, never an inferred deftm policy.
+        (value-completion/project-to-jvm-source init (:source-policy *generated-product-context*))
+        (if-not (get activity operand)
+          {:record {:type :primal :sym sym}}
+          (let [source-tag (types/sym-type-tag
+                            (exact-replay-root operand (:value-facts *source-memory-context*)))
+                result-tag (types/sym-type-tag sym)]
+            {:record (merge {:type :floating-completion :sym sym :source operand}
+                            (floating-completion-tangent-plan
+                             contract operand source-tag result-tag
+                             (:source-policy *generated-product-context*)))}))))))
 
 ;; out[e] = src[index[e]] (strided: blocks of `stride`). The forward runs as
 ;; written; the pullback is its transpose, a scatter-add into d_src.
@@ -756,6 +793,10 @@
                      (when (tmpl/reverse-rule? (first candidate)) candidate)))
         has-active-args? (some #(and (symbol? %) (get activity % false))
                                (cond-> args lexical (conj lexical)))]
+    (if-let [owned (when (and *generated-product-context* (not resolved))
+                     (generated-helper-record sym init-expr activity))]
+      owned
+      (do
     (when (and (not resolved) has-active-args?)
       (when-let [source (when-not lexical (unowned-deftm-source implementation))]
         (throw (ex-info "Derived helper AD requires a forward-owned pullback and completed call inputs"
@@ -798,7 +839,7 @@
                           args arg-tags)
                     args)]
          {:type :call :sym sym :base-op base-op :resolved-template template :args args
-          :active-args (set (filter #(and (symbol? %) (get activity % false)) args))}))}))
+          :active-args (set (filter #(and (symbol? %) (get activity % false)) args))}))}))))
 
 ;; ================================================================
 ;; The reverse-AD binding ENGINE — pure, no mutable state.
@@ -1441,6 +1482,28 @@
               (get activity source false) (update source (fnil conj []) adj-sym))
    :rev-ctx rev-ctx})
 
+(defmethod emit-backward :floating-completion
+  [{:keys [source source-tag]} adjoint _activity {:keys [adj-env rev-ctx]}]
+  (let [projected (ad-gensym "input_cotangent" (tangent/tangent-tag source-tag))]
+    {:rev-ctx (bindings-into rev-ctx [projected (tangent/project-expr source-tag adjoint)])
+     :adj-env (update adj-env source (fnil conj []) projected)}))
+
+(defmethod emit-backward :paired-helper
+  [{:keys [pullback inputs result-tag]} adjoint _activity {:keys [adj-env rev-ctx]}]
+  (let [gradients (ad-gensym "helper_gradients")
+        rev-ctx (bindings-into rev-ctx
+                               [gradients (list 'if (list 'clojure.core/nil? adjoint)
+                                                nil (list pullback (tangent/project-expr result-tag adjoint)))])]
+    (reduce
+     (fn [{:keys [adj-env rev-ctx]} [index {:keys [source source-tag floating?]}]]
+       (let [gradient (ad-gensym "helper_input_cotangent" (tangent/tangent-tag source-tag))
+             slot (list 'if (list 'clojure.core/nil? gradients) nil
+                        (list 'clojure.core/nth gradients index))
+             projected (if floating? (tangent/project-expr source-tag slot) slot)]
+         {:rev-ctx (bindings-into rev-ctx [gradient projected])
+          :adj-env (update adj-env source (fnil conj []) gradient)}))
+     {:rev-ctx rev-ctx :adj-env adj-env} (map-indexed vector inputs))))
+
 (defmethod emit-backward :par-gather
   [{:keys [sym out src index n stride d-out-sym d-src-sym d-src-zero-sym]}
    _adj-sym activity {:keys [adj-env rev-ctx]}]
@@ -1604,13 +1667,32 @@
                                   (cons sym (:written-arrs record))))
            adj-contribs (when-not (or product? array-type?) (get adj-env sym))
            sym-tag (:raster.type/tag (meta sym))
+           scalar? (= :scalar (:kind (tangent/tangent-kind sym-tag)))
+           ;; A sum of scalar cotangents need not have the primal's physical
+           ;; carrier (Float fan-in may accumulate in Double). Only an actual
+           ;; projection may establish that tag, as for product fields above.
+           accumulated-tag (when-not scalar? sym-tag)
            adj-sym (if product? (:adjoints product-adjoints)
-                       (when-not array-type? (ad-gensym (str "d_" (name sym)) sym-tag)))
+                       (when-not array-type? (ad-gensym (str "d_" (name sym)) accumulated-tag)))
            rev-ctx (if (and (not product?) adj-sym)
                      ;; Fan-out array cotangent (e.g. d_xn from q/k/v) folds via
                      ;; the resident residual-add; scalars keep the nil-safe
                      ;; grad-acc fold. See sum-contribs-into.
-                     (sum-contribs-into rev-ctx adj-sym adj-contribs nil sym-tag)
+                     (sum-contribs-into rev-ctx adj-sym adj-contribs nil accumulated-tag)
+                     rev-ctx)
+           raw-adjoint adj-sym
+           adj-sym (if (and scalar? (not product?) (not array-type?))
+                     (ad-gensym "scalar_cotangent" sym-tag) raw-adjoint)
+           rev-ctx (if (and scalar? (not product?) (not array-type?))
+                     ;; Establish the tangent port BEFORE exposing its tag to
+                     ;; rule specialization. This mirrors structural field Π.
+                     (bindings-into rev-ctx
+                                    [adj-sym (tangent/project-expr
+                                              sym-tag raw-adjoint
+                                              ;; This is the immediately preceding scalar
+                                              ;; binding. Do not rebuild the whole reverse
+                                              ;; environment at every node (quadratic).
+                                              {:binding-map {raw-adjoint (peek (:bindings rev-ctx))}})])
                      rev-ctx)]
        (if (or (seq incoming-ports) output-demand? adj-contribs)
          (let [memory-effects (record-memory-effects record nil)]
@@ -1653,16 +1735,14 @@
   no contributions) into rev-ctx; return {:rev-ctx :param-adj-syms}.
 
   Π at the boundary: each accumulated scalar adjoint is PROJECTED into the
-  primal param's tangent space — float params always (double contamination
-  via promotion is the default in raster.numeric), double params only when
-  float params are present (provably-double-only functions emit no cast).
+  primal param's tangent space. Input dtypes do not prove incoming cotangent
+  dtypes: a Double-only function can return Float. The shared projection may
+  elide itself only from retained evidence about the accumulated value.
   Array adjoints are anchored by their typed shadow buffers — no cast."
   ([active-params adj-env rev-ctx]
    (collect-param-adjoints active-params adj-env rev-ctx (:value-facts *source-memory-context*)))
   ([active-params adj-env rev-ctx value-facts]
-  (let [param-dtype #(-> % meta :raster.type/tag tangent/tangent-kind :dtype)
-        mixed-float? (boolean (some #(= :float (param-dtype %)) active-params))
-        ;; Contributions refer only to the completed reverse context, not to final
+  (let [;; Contributions refer only to the completed reverse context, not to final
         ;; parameter binders appended below. Snapshot once for all scalar projections.
         binding-map (into {} (map vec (partition 2 (:bindings rev-ctx))))]
     (reduce
@@ -1687,7 +1767,7 @@
            {:rev-ctx (bindings-into next-ctx [result (product-expression schema values)])
             :param-adj-syms (conj param-adj-syms result)})
          (let [tag (:raster.type/tag (meta p))
-             {:keys [kind dtype]} (tangent/tangent-kind tag)
+             {:keys [kind]} (tangent/tangent-kind tag)
              contribs (get adj-env p)
              adj-sym (ad-gensym (str "d_" (name p)) tag)
              ;; Internal region ports exchange absence, not public gradient
@@ -1701,9 +1781,7 @@
              (if (and (= kind :array) (>= (count contribs) 2))
                (sum-contribs-into rev-ctx adj-sym contribs default tag)
                (let [raw (sum-contribs contribs default)
-                     expr (if (and (= kind :scalar)
-                                   (or (= dtype :float)
-                                       (and (= dtype :double) mixed-float?)))
+                     expr (if (= kind :scalar)
                             (tangent/project-expr
                              tag raw {:binding-map binding-map})
                             raw)]
@@ -3996,6 +4074,244 @@
 
 (declare ad-prepare)
 
+(defn- get-paired-helper-program
+  "Compile an owned bytecode helper's paired forward/pullback program.
+
+   The caller must first match this actual emitter snapshot to its selected
+   definition. Historical static dependencies are fenced here, but this function
+   does not turn reconstructed source metadata into emission authority. Returned
+   facts retain their helper-local identities; the caller owns formal-to-actual
+   memory projection and must compose its selected-definition guard with :guard.
+   No companion is installed in dispatch or in a global Var."
+  [{:keys [backend implementation params tags return-tag body source-ns typed-interface]
+    :as emission} active-indices]
+  (method-entry/assert-emission-inputs-current! emission)
+  (when-not (and (= :jvm-bytecode backend) (some? implementation) (not (var? implementation))
+                 (vector? params) (every? #(and (symbol? %) (nil? (namespace %))) params)
+                 (= (count params) (count (distinct params)) (count tags))
+                 (vector? tags)
+                 (every? #(or (contains? types/primitive-info %)
+                               (contains? types/primitive-array-info %)) tags)
+                 (sequential? body) (seq body)
+                 (instance? clojure.lang.Namespace source-ns)
+                 (vector? active-indices) (= (count active-indices) (count (distinct active-indices)))
+                 (every? #(and (integer? %) (<= 0 %) (< % (count params))) active-indices))
+    (throw (ex-info "paired helper requires an actual primitive-carrier bytecode emission"
+                    {:reason :ad-paired-helper-emission :active-indices active-indices})))
+  ;; The primitive method return and these bytecode cast intrinsics share
+  ;; emit-coerce. Retain that completion BEFORE AD, including f32 -> f64 and
+  ;; f64 -> f32, rather than boxing the uncompleted body as the paired primal.
+  ;; Other return descriptors need their own emitter-owned completion evidence.
+  (when-not (contains? '#{float double} return-tag)
+    (throw (ex-info "paired helper return completion is not represented"
+                    {:reason :ad-paired-helper-return-completion :return-tag return-tag})))
+  (doseq [index active-indices]
+    (when-not (tangent/differentiable? (nth tags index))
+      (throw (ex-info "paired helper active port has no retained tangent space"
+                      {:reason :ad-paired-helper-active-space :index index :tag (nth tags index)}))))
+  (let [interface-name (if (class? typed-interface)
+                         (symbol (.getName ^Class typed-interface)) typed-interface)
+        interface (get @types/fn-interface-by-name interface-name)
+        ^Class interface-class (:iface-class interface)
+        methods (when (class? interface-class)
+                  (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                          (.getDeclaredMethods interface-class)))
+        ^java.lang.reflect.Method invocation (when (= 1 (count methods)) (first methods))
+        loader (.getClassLoader (class implementation))]
+    (when-not (and (class? interface-class)
+                   (or (not (class? typed-interface)) (identical? typed-interface interface-class))
+                   (.isInstance interface-class implementation)
+                   (= (vec tags) (:param-tags interface))
+                   invocation (= Object (.getReturnType invocation))
+                   (= (mapv types/tag->java-class tags) (vec (.getParameterTypes invocation)))
+                   (instance? clojure.lang.DynamicClassLoader loader)
+                   (identical? interface-class
+                               (Class/forName (.getName interface-class) false loader)))
+      (throw (ex-info "paired helper input interface does not match its actual implementation"
+                      {:reason :ad-paired-helper-interface :typed-interface typed-interface})))
+    (let [compile-pair (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-impl!)
+          revisions (requiring-resolve 'raster.ad.normalized-scalar/revisions)
+          capture (requiring-resolve 'raster.ad.normalized-scalar/execution-guard)
+          expected (revisions)
+          cache-key [::paired-helper implementation active-indices emission expected]
+          cache @vjp-cache
+          cached (when (and (= (:template-revision expected) (:registry-revision cache))
+                            (= (:compiler-revision expected) (:definition-revision cache)))
+                   (get-in cache [:entries cache-key]))]
+      (if cached
+        (do ((:guard cached)) cached)
+        (let [all-params (mapv #(vary-meta %1 assoc :raster.type/tag %2) params tags)
+              active-params (mapv all-params active-indices)
+              actual-body (if (= 1 (count body)) (first body) (list* 'do body))
+              completed-body (with-meta (list (symbol "clojure.core" (name return-tag)) actual-body)
+                               {:raster.type/tag return-tag})
+              entry-guard (capture source-ns expected [{:parameters all-params :body completed-body}])
+              _ (entry-guard)
+              program
+              (binding [*ns* source-ns
+                        *generated-product-context* nil
+                        *constant-gradient-arrays* (set (keep-indexed
+                                                        (fn [index parameter]
+                                                          (when (and (contains? types/primitive-array-info (nth tags index))
+                                                                     (not (contains? (set active-indices) index)))
+                                                            parameter)) all-params))
+                        *source-memory-context* {:values all-params
+                                                 :value-facts (into {} (map (fn [p] [p {:value p}])) all-params)
+                                                 :activity (zipmap active-params (repeat true))
+                                                 :replayed {} :unprojectable {} :aliases {}}
+                        util/*shadowing-locals* (set all-params)]
+                (with-ad-gensym
+                  (let [prepared (ad-prepare completed-body (zipmap all-params tags))
+                        [bindings results] (extract-let-parts prepared)]
+                    (if (and (= 1 (count results)) (loop-init? (first results)))
+                      (gen-reverse-loop-with-let-program bindings (first results) active-params)
+                      (gen-reverse-let-program bindings results active-params)))))
+              program-guard (capture source-ns expected [{:parameters all-params :body (:form program)}])
+              guard (fn []
+                      (method-entry/assert-emission-inputs-current! emission)
+                      (when-not (identical? source-ns (find-ns (ns-name source-ns)))
+                        (throw (ex-info "paired helper source namespace changed"
+                                        {:reason :ad-paired-helper-namespace})))
+                      (when-not (identical? interface-class
+                                            (:iface-class (get @types/fn-interface-by-name interface-name)))
+                        (throw (ex-info "paired helper interface registration changed"
+                                        {:reason :ad-paired-helper-interface})))
+                      (entry-guard)
+                      (program-guard))
+              _ (guard)
+              companion (binding [*ns* source-ns
+                                  method-entry/*compilation-classloader* loader]
+                          (compile-pair (str "raster.compiled.PairedHelper" (gensym))
+                                        params tags 'Object [(:form program)] source-ns interface-class))
+              _ (when-not (.isInstance interface-class companion)
+                  (throw (ex-info "paired helper compiler returned a different input interface"
+                                  {:reason :ad-paired-helper-interface})))
+              _ (guard)
+              result {:companion companion :program program :guard guard
+                      :emission emission :parameters all-params :active-indices active-indices
+                      :active-params active-params :interface-class interface-class :method invocation
+                      :dependency-snapshots (:dependency-snapshots emission)
+                      :definition-revision (:definition-revision emission)
+                      :return-tag return-tag
+                      :writes (:writes program) :replays (:replays program)
+                      :value-facts (:value-facts program) :aliases (:aliases program)}]
+          ;; Share the existing cache generation; an older derivation must not
+          ;; evict entries already published by a newer generation.
+          (swap! vjp-cache
+                 (fn [current]
+                   (cond
+                     (and (= (:template-revision expected) (:registry-revision current))
+                          (= (:compiler-revision expected) (:definition-revision current)))
+                     (assoc-in current [:entries cache-key] result)
+
+                     (or (and (:registry-revision current)
+                              (> (:registry-revision current) (:template-revision expected)))
+                         (and (:definition-revision current)
+                              (> (:definition-revision current) (:compiler-revision expected)))) current
+
+                     :else {:registry-revision (:template-revision expected)
+                            :definition-revision (:compiler-revision expected)
+                            :entries {cache-key result}})))
+          result)))))
+
+(defn- capture-selected-helper-emission
+  "Capture an emission through an already resolved global typed call.
+   No operand tags select a method here. The original call-site producer must
+   prove global lexical correspondence and supply its actual resolved Method.
+   Realizing the selected lazy implementation never executes its numeric body.
+   Capture is independent of derivative activity: an inactive call still needs
+   the same source/receiver ownership and historical-input checks."
+  [operation implementation-op argument-count resolved-method]
+  (let [select! (fn []
+                  (let [signature (call-boundary/selected-typed-signature
+                                   operation implementation-op argument-count resolved-method)]
+                    (when-not (= :known (:status signature))
+                      (throw (ex-info "paired helper has no verified selected typed invocation"
+                                      {:reason :ad-paired-helper-selected-definition
+                                       :operation operation :implementation-op implementation-op
+                                       :decline (:reason signature)})))
+                    signature))
+        initial (select!)
+        _ (rcore/ensure-bytecode-implementation! (get-in initial [:definition :receiver-var]))
+        {:keys [definition declaring-class] :as signature} (select!)
+        {:keys [source-var receiver-var parameters tags return-tag entry]} definition
+        emission (:raster.core/bytecode-emission (meta receiver-var))]
+    (when-not (and (= :jvm-bytecode (:backend emission))
+                   (identical? (:implementation emission) @receiver-var)
+                   (identical? (:implementation emission) (:typed-impl entry))
+                   (= (:params emission) parameters) (= (:tags emission) tags)
+                   (= (:return-tag emission) return-tag)
+                   (identical? (:source-ns emission) (.ns ^clojure.lang.Var source-var))
+                   (= (:typed-interface emission) (:typed-iface entry)))
+      (throw (ex-info "selected helper does not own its retained bytecode emission"
+                      {:reason :ad-paired-helper-emission-correspondence
+                       :operation operation :implementation-op implementation-op})))
+    (let [observations (mapv method-entry/var-snapshot [source-var receiver-var])
+          selection-guard
+          (fn []
+            (let [current (select!)]
+              (when-not (and (every? method-entry/var-snapshot-current? observations)
+                             (identical? declaring-class (:declaring-class current))
+                             (identical? source-var (get-in current [:definition :source-var]))
+                             (identical? receiver-var (get-in current [:definition :receiver-var]))
+                             (identical? (:implementation emission)
+                                         (get-in current [:definition :entry :typed-impl])))
+                (throw (ex-info "selected paired helper definition changed"
+                                {:reason :ad-paired-helper-selected-definition
+                                 :operation operation :implementation-op implementation-op})))))
+          guard (fn [] (selection-guard)
+                  (method-entry/assert-emission-inputs-current! emission)
+                  nil)
+          _ (guard)]
+      {:emission emission :guard guard :signature signature :method resolved-method})))
+
+(defn- get-selected-paired-helper-program
+  "Derive the paired program from the actual selected emission. Runtime owners
+   apply its guard to forward calls and delayed pullbacks; selection alone is
+   not authority to change the original lexical call's evaluation order."
+  [operation implementation-op argument-count resolved-method active-indices]
+  (let [{:keys [emission guard signature]}
+        (capture-selected-helper-emission operation implementation-op argument-count resolved-method)
+        artifact (get-paired-helper-program emission active-indices)
+        paired-guard (fn [] (guard) ((:guard artifact)))]
+    (paired-guard)
+    (assoc artifact :guard paired-guard :signature signature)))
+
+(defn- paired-helper-memory-region
+  "Project a paired scalar helper's retained replay roots onto caller values.
+   Primitive inputs are copied values, not borrowed storage. Array roots must
+   correspond to actual visible arguments, never private helper identifiers or
+   guessed freshness. The ordinary caller engine owns subsequent alias/write
+   checks. Mutable or private-storage exports require a richer owned interface."
+  [{:keys [parameters emission writes replays value-facts]} arguments visible-values]
+  (when-not (and (vector? parameters) (vector? arguments)
+                 (= (count parameters) (count arguments))
+                 (set? writes) (set? replays) (map? value-facts)
+                 (set? visible-values))
+    (throw (ex-info "paired helper memory projection requires its actual formal/argument interface"
+                    {:reason :ad-paired-helper-memory-interface})))
+  (when-not (and (empty? writes)
+                 (every? #(= :pure (effects/analyze-effect %)) (:body emission)))
+    (throw (ex-info "paired helper effects require an explicit owned memory export interface"
+                    {:reason :ad-paired-helper-effects :writes writes})))
+  (let [formals (zipmap parameters parameters)
+        actuals (zipmap parameters arguments)
+        projected
+        (into #{}
+              (keep (fn [replay]
+                      (let [root (exact-replay-root replay value-facts)
+                            formal (get formals root)
+                            tag (types/sym-type-tag (or formal root))]
+                        (when-not (contains? types/primitive-info tag)
+                          (let [actual (get actuals root)]
+                            (when-not (and formal (contains? types/primitive-array-info tag)
+                                           (symbol? actual) (contains? visible-values actual))
+                              (throw (ex-info "paired helper has a replay root outside its caller-owned interface"
+                                              {:reason :ad-unprojectable-helper-replay
+                                               :replay replay :root root :argument actual})))
+                            actual))))) replays)]
+    {:kind :region :regions [{:writes #{} :replays projected :value-facts {}}]}))
+
 (defn- get-vjp-fn
   "Get or compile the AD-transformed function for a deftm var.
   Cached by [template/definition revisions, var-identity, walked-body] to avoid
@@ -5007,7 +5323,16 @@
         ;; This gives us d(v^T * grad(f))/d(x) = H*v
         ;; Counter is shared — reify-pullback already consumed some,
         ;; transform-body continues from there, no collisions.
-          hvp-transformed (transform-body combined-form active-params)
+          ;; A generated pullback is another compiler input, not necessarily
+          ;; flat primitive ANF. Run the shared preparation before re-entering
+          ;; AD, including scoped nil-preserving cotangent projections.
+          hvp-transformed
+          (transform-body
+           (ad-prepare combined-form
+                       (into {} (map (fn [parameter]
+                                       [parameter (types/sym-type-tag parameter)]))
+                             (concat all-params v-syms)))
+           active-params)
 
         ;; Phase 4: Build the compiled function
         ;; Parameters: [p1 p2 ... v_a v_b ...] — ALL original params (⊥ dims
@@ -5498,6 +5823,84 @@
           unpack (vec (mapcat (fn [p i] [p (list 'clojure.core/nth args-sym i)]) params (range)))]
       (list 'fn ['& args-sym] (list 'let unpack body)))))
 
+(defn- generated-helper-owner
+  "Resolve only the actual globally retained receiver interface. No argument
+   dtype or mangled function name is method-selection authority."
+  [expression]
+  (let [{:keys [dispatch? lexical-callee operation implementation-op arguments]}
+        (op/call-description expression)]
+    (when (and dispatch? (not lexical-callee))
+      (let [hint (:tag (meta implementation-op))
+            interface-name (if (class? hint) (symbol (.getName ^Class hint)) hint)
+            interface-class (:iface-class (get @types/fn-interface-by-name interface-name))
+            methods (when (class? interface-class)
+                      (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                              (.getDeclaredMethods ^Class interface-class)))
+            method (when (= 1 (count methods)) (first methods))]
+        (when-not (and (qualified-symbol? operation) (qualified-symbol? implementation-op)
+                       method (= (count arguments) (.getParameterCount ^java.lang.reflect.Method method))
+                       (or (not (class? hint)) (identical? hint interface-class)))
+          (throw (ex-info "generated helper requires its retained unique receiver descriptor"
+                          {:reason :ad-generated-helper-descriptor :expression expression})))
+        (let [key [operation implementation-op method]
+              owners (:helpers *generated-product-context*)]
+          (or (get @owners key)
+              (let [owner (capture-selected-helper-emission
+                           operation implementation-op (count arguments) method)]
+                (when-not (every? #(= :pure (effects/analyze-effect %)) (get-in owner [:emission :body]))
+                  (throw (ex-info "generated helper requires a read-only emitted body, even when inactive"
+                                  {:reason :ad-paired-helper-effects :expression expression})))
+                (swap! owners assoc key owner)
+                (swap! (:guards *generated-product-context*) conj (:guard owner))
+                (swap! (:methods *generated-product-context*) conj method)
+                owner)))))))
+
+(defn- generated-helper-record
+  [sym expression activity]
+  (when-let [{:keys [emission method]} (generated-helper-owner expression)]
+    (let [{:keys [arguments]} (op/call-description expression)
+          indices (vec (keep-indexed (fn [i argument]
+                                      (when (and (symbol? argument) (get activity argument)) i)) arguments))
+          artifact (get-paired-helper-program emission indices)
+          _ (when-not (= (types/sym-type-tag sym) (:return-tag emission))
+              (throw (ex-info "generated helper result must retain its emitted scalar carrier"
+                              {:reason :ad-generated-helper-result :sym sym})))
+          plan (ordered-call/plan-resolved-call method
+                                               (:implementation-op (op/call-description expression))
+                                               arguments (:source-policy *generated-product-context*))
+          normalized (ordered-call/normalize-resolved-call plan ad-gensym
+                                                          @(:used-identifiers *generated-product-context*))
+          input-values (:input-values normalized)
+          inputs (mapv (fn [index]
+                         (let [source (nth arguments index)
+                               source-tag (types/sym-type-tag
+                                           (exact-replay-root source (:value-facts *source-memory-context*)))
+                               target-tag (nth (:tags emission) index)
+                               contract (nth (:input-contracts plan) index)]
+                           (if (= :jvm-primitive-input (:source-context contract))
+                             (assoc (floating-completion-tangent-plan
+                                     contract source source-tag target-tag (:source-policy *generated-product-context*))
+                                    :source source :floating? true)
+                             (do
+                               (when-not (and (= source-tag target-tag)
+                                              (contains? types/primitive-array-info source-tag))
+                                 (throw (ex-info "helper reference tangent requires its retained array carrier"
+                                                 {:reason :ad-paired-helper-active-space :source source})))
+                               {:source source :source-tag source-tag})))) indices)
+          region (paired-helper-memory-region artifact arguments (set (:values *source-memory-context*)))
+          companion (ad-gensym "helper_companion")
+          tape (ad-gensym "helper_tape")
+          pullback (ad-gensym "helper_pullback")]
+      (swap! (:captures *generated-product-context*) conj {:port companion :value (:companion artifact)})
+      (swap! (:guards *generated-product-context*) conj (:guard artifact))
+      {:record {:type :paired-helper :sym sym :pullback pullback :inputs inputs
+                :result-tag (:return-tag emission) :effects region}
+       :fwd-patch (fn [bindings]
+                    (into (vec (drop-last 2 bindings))
+                          [tape (list 'let* (:bindings normalized) (list* companion input-values))
+                           sym (list 'clojure.core/nth tape 0)
+                           pullback (list 'clojure.core/nth tape 1)]))})))
+
 (defn- assert-generated-region!
   "Check the already ordered source region. This does not normalize operands;
    child conditionals retain their own lexical bindings and evaluation order."
@@ -5505,6 +5908,7 @@
   (let [completion (value-completion/canonical-parts expression)
         {:keys [operation arguments dispatch?]} (when (seq? expression) (op/call-description expression))
         operator (when (symbol? operation) (resolve operation))
+        helper (when (and dispatch? *generated-product-context*) (generated-helper-owner expression))
         fail! #(throw (ex-info "generated product binding has an unclosed input or effect scope"
                                {:reason :ad-generated-product-region :expression expression}))]
     (cond
@@ -5528,12 +5932,12 @@
       :else
       (do
         (when (and (seq? expression) (not completion)
-                   (not (and (= :call (:kind (form/form-info expression)))
-                              (not dispatch?) (qualified-symbol? operation)
+                   (not (and (or helper (= :call (:kind (form/form-info expression))))
+                              (or helper (not dispatch?)) (qualified-symbol? operation)
                               (var? operator) (not (:macro (meta operator)))
                               (every? trivial-expr? arguments)
                               (not (op/mutating-op? (op/semantic-op expression)))
-                              (= :pure (effects/analyze-effect expression)))))
+                              (or helper (= :pure (effects/analyze-effect expression))))))
           (fail!))
         (let [operands (cond completion [(:operand completion)]
                              (seq? expression) arguments
@@ -5577,19 +5981,21 @@
                         {:reason :ad-product-unknown-tangent :parameter parameter}))))
     ;; The structural interpreter is read-only. Lexical branch regions are
     ;; checked before the existing conditional AD producer consumes them.
-    (reduce
-     (fn [visible [name expression]]
-       (assert-generated-region! visible expression)
-       (conj visible name))
-     (set params) (partition 2 bindings))
-    (let [used (atom (util/free-syms-flat [params bindings]))]
+    (let [used (atom (util/free-syms-flat [params bindings]))
+          captures (atom []) guards (atom []) methods (atom []) helpers (atom {})]
       (with-ad-gensym
-        (binding [*generated-product-context* {:source-policy source-policy :used-identifiers used}
+        (binding [*generated-product-context* {:source-policy source-policy :used-identifiers used
+                                              :captures captures :guards guards :methods methods :helpers helpers}
                   *source-memory-context* {:values params
                                           :value-facts (into {} (map (fn [p] [p {:value p}])) params)
                                           :aliases {} :activity (zipmap selected-inputs (repeat true))
                                           :replayed {} :unprojectable {}}
                   util/*shadowing-locals* (into (set params) names)]
+          (reduce
+           (fn [visible [name expression]]
+             (assert-generated-region! visible expression)
+             (conj visible name))
+           (set params) (partition 2 bindings))
           (let [{:keys [fwd-bindings value-facts] :as forward} (forward-pass bindings selected-inputs)
                 _ (when (get-in value-facts [result :product])
                     (throw (ex-info "structured result requires an explicit seed-port interface"
@@ -5601,7 +6007,7 @@
                                     {:reason :ad-generated-product-result :tag result-tag})))
                 dy (ad-gensym "generated_seed")
                 {:keys [rev-ctx param-adj-syms]} (reverse-program-projection forward selected-inputs {result [dy]})]
-            {:result-tag result-tag
+            {:result-tag result-tag :captures @captures :guards @guards :methods @methods
              :form (:standard-form (reverse-program-forms
                                     {:body-sym result :dy dy :fwd-bindings fwd-bindings
                                      :rev-bindings (vec (:bindings rev-ctx))
@@ -5673,7 +6079,8 @@
                           [source]))
                   source)
          _ (when product? (doseq [[_ carrier] input-classes] (vswap! classes conj carrier)))
-         source-identifiers (util/free-syms-flat [params source])
+         helper-captures (vec (:captures product-program))
+         source-identifiers (into (util/free-syms-flat [params source]) (map :port helper-captures))
          fresh-class-port (fn [] (loop [id (gensym "reference_class__")]
                                    (if (contains? source-identifiers id)
                                      (recur (gensym "reference_class__")) id)))
@@ -5682,23 +6089,23 @@
          reference-bindings (into {} (map (juxt :class :port)) ports)
          body (value-completion/project-to-jvm-source
                source
-               generated-source-policy reference-bindings)
-         used (util/free-syms-flat [params body])
-         captures (loop [id (gensym "reference_classes__")]
-                    (if (contains? used id) (recur (gensym "reference_classes__")) id))
-         bindings (vec (mapcat (fn [{:keys [port]} index]
-                                [port (list 'clojure.core/nth captures index)]) ports (range)))
-         factory-source (list 'fn ['& captures]
-                              (list 'let* bindings (runtime-function-form params body)))]
-     (binding [*unchecked-math* (:unchecked-math generated-source-policy)]
-       ;; Same actual compile scope as eval, never a name-only persisted proof.
-       (when normalized (ordered-call/verify-source-method! (:method normalized)))
-       (let [guard (when product?
+               generated-source-policy reference-bindings)]
+     (let [captures (into helper-captures
+                          (map (fn [{:keys [class port]}] {:port port :value class}) ports))
+           guard (when product?
                      (let [capture (requiring-resolve 'raster.ad.normalized-scalar/execution-guard)]
-                       (capture *ns* expected-revisions
-                                [{:parameters (into (vec params) (map :port ports)) :body body}])))
-             execute (apply (eval factory-source) (mapv :class ports))]
-         (when guard (guard))
+                       (let [program-guard
+                             (capture *ns* expected-revisions
+                                      [{:parameters (into (vec params) (map :port captures)) :body body}])]
+                         (fn []
+                           (program-guard)
+                           (doseq [helper-guard (:guards product-program)] (helper-guard))))))
+             execute (source-owner/compile-function
+                      params source runtime-function-form
+                      {:source-policy generated-source-policy :source-ns *ns*
+                       :captures captures
+                       :reference-bindings reference-bindings
+                       :methods (if normalized [(:method normalized)] (vec (:methods product-program))) :guard guard})]
          (if-not product? execute
            (fn [& arguments]
              (guard)
@@ -5712,7 +6119,7 @@
                          (when-not (.isInstance ^Class (get types/primitive-info (:result-tag product-program)) seed)
                            (throw (ex-info "generated scalar seed has the wrong carrier"
                                            {:reason :ad-generated-seed-carrier})))
-                         (pullback seed))]))))))))
+                         (let [gradient (pullback seed)] (guard) gradient))])))))))
 
 ;; ================================================================
 ;; Forward-mode admissibility (framework §11): mode selection is

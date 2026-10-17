@@ -404,9 +404,16 @@
                               (.replace (str mangled-sym) "." "_")
                               "_" (bit-and (hash effective-body) 0x7FFFFFFF)
                               "_" (mod (System/nanoTime) 1000000))
-              impl (@compile-typed-impl-fn class-name params tags return-tag
+              emitter @compile-typed-impl-fn
+              dependency-snapshots
+              ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/emission-input-snapshots)
+               effective-body source-ns)
+              definition-revision (dispatch/compiler-definition-revision)
+              emitted-inputs (atom {:static [] :values []})
+              impl (binding [me/*emission-inputs* emitted-inputs]
+                     (emitter class-name params tags return-tag
                                            effective-body source-ns typed-iface-name
-                                           (str (ns-name source-ns)) (str mangled-sym))]
+                                           (str (ns-name source-ns)) (str mangled-sym)))]
           (when impl
             (let [old-impl (.getRawRoot ^clojure.lang.Var impl-var)]
               (alter-var-root impl-var (constantly impl))
@@ -438,6 +445,21 @@
                         (typed-dispatch/update-dispatch-impl! dispatch-obj old-impl impl)))))
             ;; Invalidate MutableCallSites so C2 re-inlines with new impl
                 (@invalidate-callsites-fn impl-var impl)
+                ;; Compiler-owner data for paired primal/residual emission.
+                ;; This is the actual input consumed by the successful bytecode
+                ;; emitter, not a reconstructed source body or a source-policy
+                ;; assertion. Consumers must match the implementation by identity
+                ;; and retain the ordinary selected-definition/dependency guards.
+                ;; Attach only after successful dispatch/callsite publication.
+                (alter-meta! impl-var assoc ::bytecode-emission
+                             {:backend :jvm-bytecode :implementation impl
+                              :params params :tags tags :return-tag return-tag
+                              :body effective-body :source-ns source-ns
+                              :typed-interface typed-iface-name
+                              :dependency-snapshots (into dependency-snapshots (:values @emitted-inputs))
+                              :static-inputs (:static @emitted-inputs)
+                              :definition-revision definition-revision
+                              :completed-definition-revision (dispatch/compiler-definition-revision)})
                 impl
                 (catch Exception e
               ;; Rollback var to old impl on dispatch table or callsite failure

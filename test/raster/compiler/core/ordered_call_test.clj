@@ -28,6 +28,16 @@
     (try {:value (f input events) :events @events}
          (catch Throwable error {:exception (class error) :events @events}))))
 
+(deftest normalized-call-exposes-completed-inputs-in-formal-order
+  (let [method (.getMethod Math "pow" (into-array Class [Double/TYPE Double/TYPE]))
+        normalized (ordered/normalize-resolved-call
+                    (ordered/plan-resolved-call method nil ['x 'y] policy) gensym '#{x y})
+        values (:input-values normalized)
+        bindings (into {} (map vec (partition 2 (:bindings normalized))))]
+    (is (= 2 (count values)))
+    (is (= values (vec (rest (:invocation normalized)))))
+    (is (= '[x y] (mapv #(-> (get bindings %) completion/canonical-parts :operand) values)))))
+
 (defn- typed-fixture [tags]
   (let [entry (types/ensure-fn-interface! tags)
         carrier (:iface-class entry)

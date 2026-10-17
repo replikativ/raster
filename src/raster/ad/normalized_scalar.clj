@@ -13,6 +13,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
@@ -40,10 +41,7 @@
 (def ^:private ^:dynamic *proof-dependencies* nil)
 
 (defn- same-dependency? [a b]
-  (and (identical? (:var a) (:var b))
-       (= (:bound? a) (:bound? b))
-       (identical? (:value a) (:value b))
-       (= (:metadata a) (:metadata b))))
+  (method-entry/same-var-snapshot? a b))
 
 (defn- observe-dependency!
   "Keep the first effective observation, never bless a later replacement.
@@ -58,8 +56,7 @@
              (assoc-in state [:dependencies sym] snapshot)))))
 
 (defn- dependency-snapshot [v]
-  (let [is-bound (bound? v)]
-    {:var v :bound? is-bound :value (when is-bound (var-get v)) :metadata (meta v)}))
+  (method-entry/var-snapshot v))
 
 (defn- check-dependencies! [observations source-ns]
   (let [{:keys [dependencies disagreements]} @observations]

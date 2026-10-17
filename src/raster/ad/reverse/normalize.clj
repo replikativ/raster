@@ -8,6 +8,7 @@
 
    This is required before the reverse pass can track operations."
   (:require [raster.compiler.ir.form :as form]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.types :as types]))
 
 (defn trivial-expr?
@@ -39,6 +40,13 @@
     (let [head (first expr)
           extras (atom [])]
       (cond
+        ;; Completion consumes its ORIGINAL operand in an exact JVM context.
+        ;; Lifting that operand first can box a primitive result, changing its
+        ;; conversion/trap behavior. Snapshot the completed value as a whole;
+        ;; its AD producer must own the internal region and representation.
+        (completion/canonical-form? expr)
+        [[] expr]
+
         ;; An if is a region boundary, not a call with eagerly evaluated arguments.
         ;; Normalize and snapshot the predicate only; each AD mode transforms the selected
         ;; arm locally. Purity does not license speculation (sqrt/checked reads are partial).
