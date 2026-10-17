@@ -39,6 +39,48 @@
 (deftm conditional-shadow-constant [x :- Double, y :- Double] :- Double
   (if (n/> x 0.0) (let [y 7.0] y) y))
 
+(deftm conditionally-used-map [x :- Double, flag :- Long] :- Double
+  (let [out (double-array 1)
+        mapped (par/map! out i 1 double (n/sqrt x))]
+    (if (= flag 1) (ra/aget out 0) x)))
+
+(deftest absent-map-output-cotangents-skip-the-whole-backward-fragment
+  (let [gradient (rev/value+grad #'conditionally-used-map :wrt [0])]
+    (doseq [[x flag expected dx] [[0.0 0 0.0 1.0]
+                                 [0.0 1 0.0 Double/POSITIVE_INFINITY]
+                                 [4.0 0 4.0 1.0]
+                                 [4.0 1 2.0 0.25]]]
+      (is (= expected (conditionally-used-map x flag)))
+      (is (= [expected dx nil] (gradient x flag)))))
+  (let [[value pb] (rev/vjp #'conditionally-used-map 0.0 1)]
+    (is (= 0.0 value))
+    (is (Double/isNaN (double (first (pb 0.0))))
+        "a present numeric-zero array seed must still run singular arithmetic")
+    (is (= Double/POSITIVE_INFINITY (first (pb 1.0)))))
+  (let [[_ pb] (rev/vjp #'conditionally-used-map 0.0 0)]
+    (doseq [seed [0.0 1.0 2.0 1.0]]
+      (is (= seed (first (pb seed)))))))
+
+(deftm conditionally-used-mixed-map
+  [xs :- (Array double), scale :- Double, flag :- Long] :- Double
+  (let [out (double-array 2)]
+    (par/map! out i 2 double (n/* scale (ra/aget xs i)))
+    (if (= flag 1) (n/+ (ra/aget out 0) (ra/aget out 1)) scale)))
+
+(deftest absent-map-seeds-preserve-array-and-scalar-port-order
+  (doseq [[values scale] [[[2.0 -3.0] 4.0] [[5.0 7.0] -2.0]]
+          flag [0 1]]
+    (let [xs (double-array values)
+          [value pb] (rev/vjp #'conditionally-used-mixed-map xs scale flag)]
+      (is (= (if (= flag 1) (* scale (reduce + values)) scale) value))
+      (doseq [seed [1.0 0.0 2.0 1.0]]
+        (let [[dx ds df] (pb seed)]
+          (is (= (if (= flag 1) (repeat 2 (* seed scale)) [0.0 0.0])
+                 (vec dx)))
+          (is (= (* seed (if (= flag 1) (reduce + values) 1.0)) ds))
+          (is (nil? df))))
+      (is (= values (vec xs)) "pullbacks do not modify primal inputs"))))
+
 (deftm conditional-gradient-fill!
   [x :- Double, out :- (Array double), count :- Long] :- Void
   (let [vg ((rev/value+grad #'conditional-root) x)

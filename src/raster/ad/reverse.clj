@@ -1506,7 +1506,10 @@
   [{:keys [sym written-arrs read-arrs d-read-arr-syms d-scalar-syms active-free
            shadow-allocs backward-maps backward-reduces d-out-sym]}
    _adj-sym _activity {:keys [adj-env rev-ctx]}]
-  (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
+  (let [;; The output seed belongs outside the optional fragment. Its shadow
+        ;; allocations and backward kernels execute only for a present seed,
+        ;; just as an ordinary call's pullback does. A numeric-zero buffer is
+        ;; present and must not suppress singular derivative arithmetic.
         ;; d_out = adjoint of the result array. The result sym `y` aliases the
         ;; output buffer, so a downstream consumer (`(aget y i)`) scatters into
         ;; adj-env[sym]; a direct buffer write lands in adj-env[out-arr]. SUM both
@@ -1518,10 +1521,15 @@
                         default (when (empty? contribs) (array-zero-of-shape out-arr))]
                     (bindings-into rev-ctx [d-out-sym (sum-contribs contribs default)]))
                   rev-ctx)
-        rev-ctx (reduce bindings-into rev-ctx backward-maps)
-        rev-ctx (reduce bindings-into rev-ctx backward-reduces)]
+        before rev-ctx
+        after (reduce bindings-into (bindings-into before (vec shadow-allocs))
+                      (concat backward-maps backward-reduces))
+        [rev-ctx gradients] (lift-pullback-over-absence
+                             before after (vec (concat d-read-arr-syms d-scalar-syms)) d-out-sym)
+        array-gradients (subvec gradients 0 (count d-read-arr-syms))
+        scalar-gradients (subvec gradients (count d-read-arr-syms))]
     {:rev-ctx rev-ctx
-     :adj-env (wire-read-adjoints adj-env read-arrs d-read-arr-syms active-free d-scalar-syms)}))
+     :adj-env (wire-read-adjoints adj-env read-arrs array-gradients active-free scalar-gradients)}))
 
 (defmethod emit-backward :par-reduce
   [{:keys [sym read-arrs d-read-arr-syms d-scalar-syms active-free
