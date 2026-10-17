@@ -11,6 +11,7 @@
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.numerical-contract :as numerics]
@@ -1364,11 +1365,6 @@
            (every? #(strict-core-expression? % params) arguments)))
     :else false))
 
-(defn- retained-global-var [callee]
-  (when (and (symbol? callee) (namespace callee))
-    (when-let [source-ns (find-ns (symbol (namespace callee)))]
-      (.findInternedVar ^clojure.lang.Namespace source-ns (symbol (name callee))))))
-
 (defn checked-selected-primitive-result
   "Prove OUTPUT presence from the current selected implementation's closed
    strict scalar body. Inputs remain unknown/nullable. The exact receiver must
@@ -1377,37 +1373,18 @@
    the original call. Generic calls and opaque/user helper bodies stay unknown."
   [expression]
   (let [{:keys [dispatch? semantic-op implementation-op arguments]}
-        (descriptor/call-description expression)
-        generic (retained-global-var semantic-op)
-        receiver (retained-global-var implementation-op)
-        table (:raster.core/dispatch-table (meta generic))]
-    (when (and dispatch? generic receiver table
+        (descriptor/call-description expression)]
+    (when (and dispatch?
                (descriptor/scalar-op? semantic-op)
                (some-> semantic-op intrinsics/canonical intrinsics/descriptor))
-      (some
-       (fn [{:keys [tags mangled-ns typed-impl target-fn]}]
-         ;; Match the selected receiver before resolving any method source;
-         ;; unrelated overloads must not trigger source/type work.
-         (when (and (not (var? typed-impl)) (identical? typed-impl @receiver))
-           (let [source-name (types/mangle (symbol (name semantic-op)) tags)
-                 source (when mangled-ns (retained-global-var (symbol (str mangled-ns) (str source-name))))
-                 source-meta (meta source)
-                 params (:raster.core/deftm-params source-meta)
-                 source-body (:raster.core/deftm-source-body source-meta)
-                 body (when (= 1 (count source-body)) (first source-body))
-                 scalar-types (mapv dtype/dtype-for-scalar-tag tags)
-                 result-type (dtype/dtype-for-scalar-tag (:raster.core/return-tag source-meta))]
-             (when (and source
-                        (= implementation-op (symbol (str mangled-ns) (str source-name "-impl")))
-                        ;; Lazy typed stubs delegate through the mangled source
-                        ;; Var. Metadata alone cannot authorize a redefined root.
-                        (identical? target-fn @source)
-                        (= tags (:raster.core/deftm-tags source-meta))
-                        (= (count arguments) (count params) (count tags))
-                        (every? some? scalar-types) result-type
-                        ;; A declaration returning an argument directly says nothing
-                        ;; about presence, even if its annotation says Double.
-                        (seq? body) (strict-core-expression? body (set params)))
-               (let [proof (checked-scalar-result body (zipmap params scalar-types))]
-                 (when (= result-type (:type proof)) proof))))))
-       (get @table (count arguments))))))
+      (when-let [{:keys [tags parameters source-body return-tag]}
+                 (method-entry/selected-definition semantic-op implementation-op (count arguments))]
+        (let [body (when (= 1 (count source-body)) (first source-body))
+              scalar-types (mapv dtype/dtype-for-scalar-tag tags)
+              result-type (dtype/dtype-for-scalar-tag return-tag)]
+          (when (and (every? some? scalar-types) result-type
+                     ;; A declaration returning an argument directly says nothing
+                     ;; about presence, even if its annotation says Double.
+                     (seq? body) (strict-core-expression? body (set parameters)))
+            (let [proof (checked-scalar-result body (zipmap parameters scalar-types))]
+              (when (= result-type (:type proof)) proof))))))))
