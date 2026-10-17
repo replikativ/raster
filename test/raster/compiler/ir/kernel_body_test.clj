@@ -13,6 +13,19 @@
 (def ^:private lhs-layout (layout/dot-operand 0 acc-layout 2 :half))
 (def ^:private rhs-layout (layout/dot-operand 1 acc-layout 2 :half))
 
+(deftest empty-storage-does-not-admit-empty-compute-shapes
+  (let [launch (launch/spec {:workgroup-size [1] :group-count [1]})
+        kernel (body/make
+                {:id :empty-input :launch launch
+                 :parameters [(body/->KernelParameter 'x :input :float [0] :global
+                                                      (layout/row-major [0] :float) :operand)]})]
+    (is (= [0] (get-in kernel [:parameters 0 :shape])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"kernel fragment.*positive"
+         (body/make (assoc kernel :fragments [(body/->Fragment :empty :float [0] acc-layout)]))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (body/make (assoc-in kernel [:launch :workgroup-size] [0]))))))
+
 (defn- with-counted-index-expression-roots
   [f]
   (let [target (ns-resolve 'raster.compiler.ir.kernel-body 'expression-info!)

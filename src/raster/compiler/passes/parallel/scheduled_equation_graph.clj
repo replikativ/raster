@@ -936,10 +936,10 @@
     :else false))
 
 (defn- plan-equation-boundary?
-  [values equation algorithm]
+  [parallel-program equation algorithm]
   (cond
     (swr/plan? algorithm)
-    (and (swr/equation-boundary? values equation algorithm)
+    (and (swr/equation-boundary? (:values parallel-program) equation algorithm parallel-program)
          (= 1 (count (:operations equation)))
          (validated-scheduled-plan-operation? algorithm (first (:operations equation))))
 
@@ -1004,7 +1004,7 @@
   (let [parallel-program (program/validate! parallel-program)
         plan (:algorithm equation)
         _ (when-not (and (swr/plan? plan)
-                         (plan-equation-boundary? (:values parallel-program) equation plan))
+                         (plan-equation-boundary? parallel-program equation plan))
             (fail! :segmented-plan-equation-boundary
                    "segmented graph construction requires one exact validated plan equation"
                    {:equation (:id equation) :algorithm plan}))
@@ -1015,7 +1015,7 @@
                :source-dialect (:dialect parallel-program)
                :operation? #(or (swr/plan? %)
                                 (scheduled-body/scheduled-kernel-body? %))
-               :algorithm? #(plan-equation-boundary? (:values parallel-program) %1 %2)
+               :algorithm? #(plan-equation-boundary? parallel-program %1 %2)
                :body-attributes (when (seq output-allocations)
                                   {:allocations output-allocations})})
         input-buffers (mapv #(descriptor-buffer (:values body) % :input) (:operands plan))

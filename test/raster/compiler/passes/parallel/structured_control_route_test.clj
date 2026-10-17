@@ -4,6 +4,7 @@
             [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
@@ -887,6 +888,72 @@
     (is (true? (get-in shape-equation [:attributes :host-only])))
     (is (some #{'size} prefix-symbols)
         "the same pure size is materialized before allocation and retained as graph proof")))
+
+(defn- retained-length-leaves [source]
+  (walk/postwalk
+   (fn [expression]
+     (if (and (seq? expression) (= 'raster.arrays/alength (first expression)))
+       (vary-meta expression assoc :raster.type/tag 'long)
+       expression)) source))
+
+(deftest nested-allocation-metadata-becomes-one-scalar-invocation
+  (let [source (retained-length-leaves
+                '(let* [a (clojure.core/float-array left-n)
+                        b (clojure.core/float-array right-n)
+                        ^long n (java.lang.Math/min
+                                 (long (raster.arrays/alength a))
+                                 (long (raster.arrays/alength b)))
+                        out (raster.par/pmap i n float (+ (aget a i) (aget b i)))] out))
+        options {:dtype :float :array-types {} :public-parameters '[left-n right-n]
+                 :scalar-types {'left-n :long 'right-n :long}}
+        parallel (:program (typed-route/attempt source :float {}
+                                                {:scalar-types (:scalar-types options)}))
+        promoted (route/promote-program parallel options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        steps (filter #(= 'n (:symbol %)) (:steps plan))]
+    (is (= 1 (count steps)))
+    (is (invocation/scalar-compute? (first steps)))
+    (is (= #{'left-n 'right-n} (set (map :symbol (:operands (first steps))))))
+    (is (not-any? #(= '[n] (:results %)) (:equations promoted)))
+    (doseq [[left right] [[7 3] [2 9] [0 5]]]
+      (let [evaluations (atom 0)
+            result (materialization/materialize
+                    plan [left right]
+                    (fn [step operands]
+                      (swap! evaluations inc)
+                      (typed-scalar/evaluate-invocation-step *ns* step operands)))]
+        (is (= 1 @evaluations))
+        (is (= (min left right) (get-in result [:program-scalars 'n :value])))))))
+
+(deftest metadata-leaf-projection-keeps-carriers-and-refusal-boundaries
+  (let [project #'route/project-scalar-metadata
+        values {'a (av/tensor {:dtype :float :shape '[size]})
+                'size (av/tensor {:dtype :long :shape []})}
+        length (with-meta '(raster.arrays/alength a) {:raster.type/tag 'long})
+        expression (list 'clojure.core/int (list 'clojure.core/+ length (long 1)))
+        projected (project values #{} expression)]
+    (is (= '(clojure.core/int (clojure.core/+ size 1)) projected))
+    (is (= 'long (:raster.type/tag (meta (second (second projected))))))
+    (is (= expression (project values #{'a} expression)))
+    (doseq [value [(assoc (get values 'a) :shape '[size size])
+                   (assoc (get values 'a) :logical-layout {:kind :strided})
+                   (assoc (get values 'a) :representation {:kind :packed})]]
+      (is (= expression (project (assoc values 'a value) #{} expression))))
+    (is (= '(raster.arrays/alength a)
+           (project values #{} '(raster.arrays/alength a))) "no invented leaf dtype")
+    (let [int-length (vary-meta length assoc :raster.type/tag 'int)]
+      (is (= int-length (project values #{} int-length)) "narrowing needs a range proof"))
+    (let [binding (list 'let* '[a other] length)]
+      (is (= binding (project values #{} binding))))
+    (doseq [opaque [(list 'clojure.core/quote length)
+                    (list 'clojure.core/let '[a other] length)
+                    (with-meta (list '.invk 'local-helper length)
+                      {:raster.op/lexical-callee 'local-helper})
+                    (completion/complete-value completion/object-input-contract length)]]
+      (is (= opaque (project values #{} opaque))))
+    (is (= '(aget a 0) (project values #{} '(aget a 0))))
+    (is (= length (project (assoc values 'raster.arrays/alength
+                                 (av/tensor {:dtype :long :shape []})) #{} length)))))
 
 (defn- retained-core-cast
   [tag operand]

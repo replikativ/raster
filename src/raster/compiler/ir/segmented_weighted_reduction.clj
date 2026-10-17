@@ -13,6 +13,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.ir.kernel-launch :as launch]))
 
 (defrecord ScalarRegion [parameters body result-dtype])
@@ -331,20 +332,24 @@
       :else (apply launch/product dimensions))))
 
 (defn- storage-contract?
-  [value {:keys [dtype elements] :as descriptor}]
+  [value {:keys [dtype elements] :as descriptor} extent-environment]
   (and (descriptor-shape-contract? descriptor)
        value
        (seq (:shape value))
        (av/storage-contract-compatible? value (av/tensor {:dtype dtype :shape [elements]}))
        (or (= elements (shape-elements (:shape value)))
+           (and (= 1 (count (:shape value)))
+                (extent-proof/same-volume? extent-environment elements (:shape value)))
            (= [(list 'extent (:id descriptor))] (:shape value)))))
 
 (defn- plan-value-contract?
   "Source arrays are flat contiguous values; the plan retains its mathematical axes. Accept that
    exact flattening as well as the plan's own logical shape, not an arbitrary reshaped tensor."
-  [value {:keys [shape elements] :as descriptor}]
-  (and (or (= shape (:shape value)) (= [elements] (:shape value)))
-       (storage-contract? value descriptor)))
+  [value {:keys [shape elements] :as descriptor} extent-environment]
+  (and (or (= shape (:shape value)) (= [elements] (:shape value))
+           (and (= 1 (count (:shape value)))
+                (extent-proof/same-volume? extent-environment elements (:shape value))))
+       (storage-contract? value descriptor extent-environment)))
 
 (defn- runtime-value-ids
   "The current protected marker transports only normalized shape scalars or integer literals.
@@ -380,9 +385,12 @@
    ordinary result-storage attribute is the sole relation between those identities. This checks
    semantic dataflow, not the equation's operation sequence: each compilation stage must separately
    validate its typed, scheduled or emitted representation against the retained algorithm."
-  [values equation algorithm]
-  (when (plan? algorithm)
-    (let [plan (validate! algorithm)
+  ([values equation algorithm] (equation-boundary? values equation algorithm nil))
+  ([values equation algorithm context]
+  (when (and (plan? algorithm) (or (nil? context) (= values (:values context))))
+    (let [extent-environment (if context
+                               (extent-proof/parallel-environment-before context equation) {})
+          plan (validate! algorithm)
           input-descriptors (:operands plan)
           output-descriptor (:output plan)
           runtime-values (runtime-value-ids (:runtime-parameters plan))
@@ -401,15 +409,15 @@
            (= #{:memory/read :memory/write} (:effects equation))
            (= storage (get-in equation [:attributes :result-storage]))
            (every? (fn [{:keys [id] :as descriptor}]
-                     (or (plan-value-contract? (get values id) descriptor)
+                     (or (plan-value-contract? (get values id) descriptor extent-environment)
                          ;; Public backing capacity is distinct from the plan's
                          ;; logical shape. The emitted graph still checks the
                          ;; descriptor's footprint before allocation/execution.
                          (and (= [(list 'extent id)] (:shape (get values id)))
-                              (storage-contract? (get values id) descriptor))))
+                              (storage-contract? (get values id) descriptor extent-environment))))
                    input-descriptors)
-           (storage-contract? (get values (:id output-descriptor)) output-descriptor)
-           (plan-value-contract? (get values (first results)) output-descriptor)
+           (storage-contract? (get values (:id output-descriptor)) output-descriptor extent-environment)
+           (plan-value-contract? (get values (first results)) output-descriptor extent-environment)
            (every? (fn [id]
                      (let [value (get values id)]
                        (and value (empty? (:shape value))
@@ -417,7 +425,7 @@
                                        (some-> (:dtype value) dtype/canon))
                             (av/storage-contract-compatible?
                              value (av/tensor {:dtype (:dtype value) :shape []})))))
-                   runtime-values)))))
+                   runtime-values))))))
 
 (defn runtime-parameter-values
   "Ordered dynamic scalar values transported by a protected reduction marker. These are semantic

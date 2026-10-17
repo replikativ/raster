@@ -81,12 +81,12 @@
                           (assoc :attributes {:allocations [{:destination 'buffer
                                                             :source-expression expression}]}))
                   prefix (if allocation? [] [['buffer expression]])]]
-      (is (= owner (check owner prefix)))
+      (is (= owner (check owner prefix #{})))
       (let [moved (replace-binding owner 'buffer (relocated expression))]
-        (is (= moved (check moved prefix))))
+        (is (= moved (check moved prefix #{}))))
       (doseq [changed (semantic-variants expression)]
         (is (= :structured-control-host-continuation
-               (try (check (replace-binding owner 'buffer changed) prefix) nil
+               (try (check (replace-binding owner 'buffer changed) prefix #{}) nil
                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
 
 (deftest singleton-packet-source-admission-preserves-semantic-metadata

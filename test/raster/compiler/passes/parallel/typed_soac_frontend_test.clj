@@ -2481,6 +2481,58 @@
     (is (not= '[copied-length]
               (get-in (dialect/facts program) [:values 'tmp :shape])))))
 
+(deftest allocation-capacities-precede-a-minimum-length-consumer
+  (let [source '(let* [a (clojure.core/float-array left-n)
+                       b (clojure.core/float-array right-n)
+                       ^long n (java.lang.Math/min (long (clojure.core/alength a))
+                                                  (long (clojure.core/alength b)))
+                       out (raster.par/pmap i n float (+ (aget a i) (aget b i)))] out)
+        options {:dtype :float :scalar-types {'left-n :long 'right-n :long}}
+        program (frontend/form->program source options)
+        facts (dialect/facts program)
+        consumer (dialect/operation-parts (last (dialect/equations program)))]
+    (is (some? program))
+    (is (= '[left-n] (get-in facts [:values 'a :shape])))
+    (is (= '[right-n] (get-in facts [:values 'b :shape])))
+    (is (= '[n] (get-in facts [:values 'out :shape])))
+    (is (empty? (:arrays consumer)))
+    (is (= #{'a 'b} (set (:captures consumer))))
+    (is (= #{['a 'left-n :zero] ['b 'right-n :zero]}
+           (set (map (juxt :destination :extent :initialization)
+                     (get-in facts [:attributes :allocations])))))
+    (is (= :source-value-conflict
+           (try (frontend/form->program
+                 source (assoc options :values {'a (av/tensor {:dtype :float :shape [7]})}))
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "contradictory rank-one allocation contracts must not be overwritten")))
+
+(deftest allocation-shape-seeding-preserves-explicit-storage-contracts
+  (let [analyze (fn [allocation values equalities]
+                  (#'frontend/source-storage-analysis
+                   [['a allocation]] :float {'input :float 'a :float} {'n :long}
+                   false values equalities))
+        allocation '(clojure.core/float-array n)]
+    (doseq [value [(av/tensor {:dtype :float :shape [2 3]})
+                   (assoc (av/tensor {:dtype :float :shape ['n]})
+                          :logical-layout {:kind :strided})
+                   (assoc (av/tensor {:dtype :float :shape ['n]})
+                          :representation {:kind :packed})
+                   (assoc (av/tensor {:dtype :float :shape ['n]})
+                          :ownership {:kind :owned})]]
+      (is (= value (get-in (analyze allocation {'a value} {}) [:values 'a]))))
+    (is (= '[n] (get-in (analyze allocation {} {'later 'n}) [:values 'a :shape])))
+    (doseq [allocation ['(clojure.core/float-array input)
+                        '(clojure.core/float-array (opaque-length input))
+                        '(clojure.core/float-array n 7)]]
+      (is (nil? (get-in (analyze allocation {} {}) [:values 'a])))
+      (is (empty? (:allocations (analyze allocation {} {})))))
+    (let [copy (analyze '(clojure.core/aclone input) {} {})]
+      (is (= '[(clojure.core/alength input)] (get-in copy [:values 'a :shape])))
+      (is (= :copy (get-in copy [:allocations 0 :initialization]))))
+    (binding [util/*shadowing-locals* #{'float-array}]
+      (is (empty? (:allocations (analyze '(float-array n) {} {})))))))
+
 (deftest equivalent-shapes-preserve-producers-but-still-refine-unknowns
   (let [producer (av/tensor {:dtype :float :shape '[n]})
         consumer (av/tensor {:dtype :float :shape '[later-length]})
@@ -2495,6 +2547,45 @@
            (try (#'frontend/merge-value {'tmp producer} 'tmp consumer {})
                 nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest allocation-capacities-retain-source-identities
+  (let [analyze (fn [pairs scalar-types]
+                  (#'frontend/source-storage-analysis
+                   pairs :float {'a :float} scalar-types false {} {}))
+        allocation '(clojure.core/float-array capacity)
+        product '(clojure.core/* rows width)
+        pairs [[(with-meta 'capacity {:raster.type/tag 'long}) product]
+               ['a allocation]]
+        result (analyze pairs {'rows :long 'width :long})]
+    (is (= '[capacity] (get-in result [:values 'a :shape]))
+        "physical equality proofs must not replace the pointwise domain identity")
+    (is (= 'capacity (get-in result [:allocations 0 :extent]))
+        "the allocation contract retains its executable scalar identity")
+    (is (= allocation (get-in result [:allocations 0 :source-expression]))
+        "the allocator still evaluates its original SSA argument")
+    (is (= product (get-in result [:descriptions 0 :expr]))
+        "the checked product remains at its original source site")
+    (doseq [[tag expression scalar-types]
+            [['int '(clojure.core/* rows width) {'rows :int 'width :int}]
+             ['int '(clojure.core/int (clojure.core/* rows width))
+              {'rows :long 'width :long}]
+             ['long '(clojure.core/unchecked-multiply rows width)
+              {'rows :long 'width :long}]
+             ['long '(clojure.core/long (clojure.core/* rows width))
+              {'rows :double 'width :double}]]]
+      (is (= '[capacity]
+             (get-in (analyze [[(with-meta 'capacity {:raster.type/tag tag}) expression]
+                               ['a allocation]] scalar-types)
+                     [:values 'a :shape]))))
+    (is (= '[capacity]
+           (get-in (analyze (vec (reverse pairs)) {'rows :long 'width :long})
+                   [:values 'a :shape]))
+        "a future definition cannot justify an earlier allocation")
+    (let [self-length '(clojure.core/alength a)
+          self-pairs [[(with-meta 'capacity {:raster.type/tag 'long}) self-length]
+                      ['a allocation]]]
+      (is (= '[capacity] (get-in (analyze self-pairs {}) [:values 'a :shape]))
+          "metadata reads must not create an allocation self-reference"))))
 
 (deftest symbolic-traversals-retain-producer-storage-through-indexed-captures
   (let [source '(let* [^long heads-width (* heads width)

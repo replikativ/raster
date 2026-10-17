@@ -19,6 +19,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
+            [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.passes.parallel.staged-contraction-admission :as staged-admission]
             [raster.compiler.passes.parallel.staged-scalar-body :as scalar-stage-body]
             [raster.compiler.ir.index-algebra :as index-algebra]
@@ -3613,7 +3614,9 @@
    extent id as every other use of `n`, instead of each `alength` minting a fresh compound
    extent that then contradicts the buffer's shape elsewhere in the program."
   [expression]
-  (when (and (seq? expression) (descriptor/alloc-op? (descriptor/semantic-op expression)))
+  (when (and (seq? expression)
+             (not (contains? util/*shadowing-locals* (first expression)))
+             (descriptor/alloc-op? (descriptor/semantic-op expression)))
     (let [operation (descriptor/semantic-op expression)
           arguments (vec (descriptor/call-args expression))
           constructor? (or (contains? descriptor/alloc-sym->array-tag operation)
@@ -5673,13 +5676,20 @@
 (defn- merge-value
   ([values id contract] (merge-value values id contract {}))
   ([values id contract shape-equalities]
+   (merge-value values id contract shape-equalities {}))
+  ([values id contract shape-equalities extent-environment]
    (if-let [prior (get values id)]
      (let [unknown-shape? (fn [value]
                             (= [(list 'unknown-dimension id)] (:shape value)))
            same-nonshape-contract? (= (dissoc prior :shape) (dissoc contract :shape))
            equivalent-shape?
-           (= (mapv #(canonical-extent shape-equalities values %) (:shape prior))
-              (mapv #(canonical-extent shape-equalities values %) (:shape contract)))]
+           (or (= (mapv #(canonical-extent shape-equalities values %) (:shape prior))
+                  (mapv #(canonical-extent shape-equalities values %) (:shape contract)))
+               (and (= {:kind :plain} (:representation prior))
+                    (nil? (:logical-layout prior))
+                    (= 1 (count (:shape prior)) (count (:shape contract)))
+                    (extent-proof/same-volume? extent-environment
+                                               (first (:shape prior)) (:shape contract))))]
        (cond
          (= prior contract) values
          ;; Equality proves compatibility, not that the consumer's dimension spelling is
@@ -5696,7 +5706,28 @@
                 {:id id :first prior :second contract})))
      (assoc values id contract))))
 
-(declare form->program*)
+(defn- source-extent-environments
+  "Project existing typed scalar witnesses at each source boundary. Source binders start
+   unavailable; only their existing equations can publish a witness after executing."
+  [descriptions equations values scalar-types]
+  (let [values (merge (into {} (keep (fn [[id t]]
+                                     (when-let [t (some-> t dtype/canon)]
+                                       [id (tensor-value t [])]))) scalar-types)
+                      values)
+        facts {:values values
+               :attributes {:source-bindings (mapv :sym descriptions)}}
+        program (list 'soac-program facts equations [])
+        equations-by-id (into {} (map (juxt second identity)) equations)]
+    (:boundaries
+     (reduce (fn [{:keys [environment] :as state} {:keys [id]}]
+               (cond-> (assoc-in state [:boundaries id] environment)
+                 (contains? equations-by-id id)
+                 (assoc :environment (extent-proof/advance environment facts
+                                                           (equations-by-id id)))))
+             {:environment (extent-proof/initial-environment program) :boundaries {}}
+             descriptions))))
+
+(declare form->program* source-storage-analysis)
 
 (defn- preserve-map-storage-inputs
   "Use indexed captures in maps, reductions and scans when element-shape equality is not established.
@@ -5795,12 +5826,9 @@
                   array-types (binder-array-types pairs array-types dtype
                                                   preserve-declared-array-storage?)
                   describe (fn [pairs]
-                             (preserve-map-storage-inputs
-                              (normalize-extents
-                               (source-descriptions pairs dtype array-types scalar-types
-                                                    segmented-plans?)
-                               shape-equalities values)
-                              values))
+                             (:descriptions
+                              (source-storage-analysis pairs dtype array-types scalar-types
+                                                       segmented-plans? values shape-equalities)))
                   descriptions (describe pairs)
                   physical-outputs (physical-output-symbols descriptions)
                   dependencies (set (util/free-syms expression))
@@ -5862,8 +5890,40 @@
                        :extent (canonical-extent shape-equalities values extent)
                        :initialization (descriptor/allocation-initialization
                                         (descriptor/semantic-op expr))
-                       :dtype (:dtype (get values sym))}))))
+                       :dtype (or (:dtype (get values sym))
+                                  (declared-type array-types sym))}))))
           descriptions)))
+
+(defn- source-storage-analysis
+  "Establish allocation-owned extents before a consumer can infer element shapes.
+   Allocation capacity is not permission to flatten a declared logical layout. Reuse the same
+   allocation contracts for initialization later; no consumer extent may become its own producer."
+  [pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
+  (let [descriptions (normalize-extents
+                      (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
+                      shape-equalities values)
+        source-scalar-types
+        (reduce (fn [types {:keys [kind sym scalar-dtype]}]
+                  (if (and (= :scalar kind) scalar-dtype)
+                    (assoc types sym scalar-dtype) types))
+                scalar-types descriptions)
+        allocations (allocation-contracts descriptions array-types source-scalar-types values
+                                          shape-equalities)
+        values (reduce (fn [known {:keys [destination extent dtype]}]
+                         (let [prior (get known destination)]
+                           (if (and dtype
+                                    (or (nil? prior)
+                                        (and (= {:kind :plain} (:representation prior))
+                                             (nil? (:logical-layout prior))
+                                             (= 1 (count (:shape prior))))))
+                             (merge-value known destination
+                                          (if prior (assoc prior :shape [extent])
+                                              (tensor-value dtype [extent]))
+                                          shape-equalities)
+                             known)))
+                       values allocations)]
+    {:descriptions (preserve-map-storage-inputs descriptions values)
+     :values values :allocations allocations}))
 
 (defn canonicalize-fresh-full-write-maps
   "Project a closed single-write effect region to the existing functional map contract.
@@ -6048,11 +6108,9 @@
           [_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          descriptions (preserve-map-storage-inputs
-                         (normalize-extents (source-descriptions pairs dtype array-types scalar-types
-                                                                 segmented-plans?)
-                                            shape-equalities values)
-                         values)]
+          {descriptions :descriptions storage-values :values allocations :allocations}
+          (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
+                                   values shape-equalities)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)
@@ -6068,6 +6126,13 @@
               (filterv soac-description? descriptions)
               swr-descriptions (filterv swr-description? descriptions)
               physical-outputs (physical-output-symbols descriptions)
+              host-descriptions
+              (filterv #(and (= :scalar (:kind %))
+                             (not (supported-description? physical-outputs %)))
+                       descriptions)
+              host-control-descriptions (into host-descriptions swr-descriptions)
+              host-read-references (vec (distinct (mapcat #(util/free-syms (:expr %))
+                                                        host-control-descriptions)))
               ;; Source descriptions retain the same authoritative local scalar contracts used
               ;; during admission.  Thread them into AbstractValue construction as well: a
               ;; checked host boundary consumed as a launch extent must not silently fall back to
@@ -6188,17 +6253,37 @@
                                          [(list 'unknown-dimension destination)]))])
                                    (:result-storage description))))
                     semantic-descriptions)
+              ;; Allocation facts establish producer shapes during analysis, but a fact is not
+              ;; a use. Publishing dead scaffold buffers would manufacture live initialization
+              ;; obligations. Keep semantic/physical/host uses and their dimension closure only;
+              ;; caller-supplied contracts remain explicit roots.
+              published-storage-values
+              (loop [needed (into (set (concat references definitions outputs
+                                              (keys destination-values) host-read-references))
+                                 (keys values))]
+                (let [expanded (into needed
+                                     (mapcat (fn [id]
+                                               (mapcat util/free-syms
+                                                       (:shape (get storage-values id)))))
+                                     needed)]
+                  (if (= expanded needed) (select-keys storage-values needed)
+                      (recur expanded))))
               inferred-values (reduce (fn [contracts equation]
                                         (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
                                                    (equation-values equation dtype array-types'
                                                                     source-scalar-types
                                                                     contracts)))
                                       (merge destination-values
-                                             (contraction-storage-values equations dtype array-types' values))
+                                             (contraction-storage-values equations dtype array-types' values)
+                                             published-storage-values)
                                       equations)
+              extent-environments (when (seq swr-descriptions)
+                                    (source-extent-environments descriptions equations
+                                                                inferred-values source-scalar-types))
               inferred-values
               (reduce (fn [contracts description]
-                        (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
+                        (reduce-kv #(merge-value %1 %2 %3 shape-equalities
+                                                  (get extent-environments (:id description))) contracts
                                    (swr-description-values description values)))
                       inferred-values swr-descriptions)
               values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
@@ -6225,8 +6310,13 @@
                                    {:id id}))))
                       values (distinct semantic-scalar-roots))
               _ (validate-declared-array-values! array-types values)
-              allocations (allocation-contracts descriptions array-types source-scalar-types values
-                                                shape-equalities)
+              ;; Resolve metadata-only lengths using the completed producer environment, without
+              ;; re-discovering allocations from consumer equations or changing their source site.
+              allocations (mapv (fn [allocation]
+                                  (-> allocation
+                                      (update :extent #(canonical-extent shape-equalities values %))
+                                      (assoc :dtype (:dtype (get values (:destination allocation))))))
+                                allocations)
               ;; An allocation-only public dimension need not appear in a numerical equation.
               ;; Retain its declared type now; inserting the initializer later makes it an
               ;; ordinary operation input. Do not infer a missing declaration from its name.
@@ -6263,21 +6353,15 @@
                                              :host-binding (:host-binding description)})))]))
                          equation-descriptions))
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
-              host-descriptions
-              (filterv #(and (= :scalar (:kind %))
-                             (not (supported-description? physical-outputs %)))
-                       descriptions)
               ;; Protected markers stay in the reconstructed host form until their existing plan
               ;; becomes a scheduled equation. Keeping the source binding is provenance and
               ;; compatibility materialization, not a second execution path after admission.
-              host-control-descriptions (into host-descriptions swr-descriptions)
               host-binding-ids (mapv :id host-control-descriptions)
               ;; Program values a host-controlled binding reads are uses of those values: a
               ;; producer read by the host must stay materialized, whatever fusion does with
               ;; its typed consumers.
               host-read-values
-              (->> host-control-descriptions
-                   (mapcat #(util/free-syms (:expr %)))
+              (->> host-read-references
                    (filter #(contains? values %))
                    distinct
                    vec)

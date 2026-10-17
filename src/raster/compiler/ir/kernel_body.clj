@@ -383,17 +383,20 @@
            (= (vec (:distances association))
               (vec (take-while pos? (iterate #(quot % 2) (quot width 2))))))))
 
-(defn- shape! [owner shape]
-  (when-not (and (vector? shape) (seq shape)
-                 (every? #(or (value-id? %)
-                              (and (integer? %) (pos? %))
-                              (launch/dimension-expression? %)
-                              (and (record-kind?
-                                    "raster.compiler.ir.kernel_body.IndexExpr" %)
-                                   (expression? %)))
-                         shape))
-    (throw (ex-info (str owner " requires a non-empty shape of positive extents")
-                    {:shape shape}))))
+(defn- shape!
+  ([owner shape] (shape! owner shape {}))
+  ([owner shape {:keys [allow-zero?]}]
+   (when-not (and (vector? shape) (seq shape)
+                  (every? #(or (value-id? %)
+                               (and (integer? %) (if allow-zero? (not (neg? %)) (pos? %)))
+                               (launch/dimension-expression? %)
+                               (and (record-kind?
+                                     "raster.compiler.ir.kernel_body.IndexExpr" %)
+                                    (expression? %)))
+                          shape))
+     (throw (ex-info (str owner " requires a non-empty shape of "
+                         (if allow-zero? "non-negative" "positive") " extents")
+                     {:shape shape})))))
 
 (defn- layout! [owner layout]
   (when-not (and (map? layout) (keyword? (:kind layout)))
@@ -2415,7 +2418,12 @@
         (when (or (seq (:shape p)) (:layout p) (:memory-space p))
           (throw (ex-info "scalar kernel parameters cannot carry storage layout"
                           {:parameter p})))
-        (do (shape! "kernel buffer parameter" (:shape p))
+        ;; A pointer describes storage capacity, not a nonempty access or launch domain.
+        ;; Empty reductions retain zero-capacity inputs while writing their identity. Their
+        ;; source read minimum is checked independently at call admission, as for symbolic
+        ;; capacities that resolve to zero. Tiles, views and fragments still require positive
+        ;; concrete extents; this does not authorize any read from an empty input.
+        (do (shape! "kernel buffer parameter" (:shape p) {:allow-zero? true})
             (storage-layout! "kernel buffer parameter" (:shape p) (:dtype p) (:layout p))
             (when (layout/shared-memory-layout? (:layout p))
               (throw (ex-info "shared-memory layouts are restricted to workgroup allocations"

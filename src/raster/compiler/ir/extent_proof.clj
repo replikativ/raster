@@ -7,6 +7,7 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.index-algebra :as algebra]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
 (defn- integral? [t] (contains? #{:byte :short :int :long} t))
@@ -54,6 +55,7 @@
 
 (defn- opaque-value [id value]
   (when (and (= :tensor (:kind value)) (= [] (:shape value))
+             (= {:kind :plain} (:representation value)) (nil? (:logical-layout value))
              (integral? (:dtype value)))
     {:dtype (:dtype value) :product (algebra/monomial id)}))
 
@@ -123,3 +125,54 @@
    or its checked-overflow behavior."
   [environment form]
   (:product (expression environment form)))
+
+(defn- semantic-equivalent?
+  [left right]
+  (or (identical? left right)
+      (try (semantic-fingerprint/equivalent? left right)
+           (catch clojure.lang.ExceptionInfo error
+             (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
+               false (throw error))))))
+
+(defn parallel-environment-before
+  "Recompute equality witnesses from the exact retained predecessor algorithms of a parallel
+   equation. No descriptive equality metadata or future definitions supply evidence. Unknown or
+   mismatched contexts yield no additional witnesses. Pointwise tensor shapes are not rewritten."
+  [program equation]
+  (let [equations (:equations program)
+        matches (keep-indexed #(when (= (:id %2) (:id equation)) %1) equations)
+        position (when (= 1 (count matches)) (first matches))
+        target (when position (nth equations position))
+        boundary-keys [:id :operands :results :algorithm :effects]]
+    (if-not (and target (every? #(semantic-equivalent? (get target %) (get equation %))
+                                boundary-keys))
+      {}
+      (let [facts {:values (:values program) :inputs (:inputs program)
+                   :attributes {:source-bindings (vec (mapcat :results equations))}}
+            initial (initial-environment (list 'soac-program facts [] []))]
+        (reduce
+         (fn [environment predecessor]
+           (let [algorithm (:algorithm predecessor)]
+             (if-not (dialect/program-form? algorithm)
+               environment
+               (let [algorithm (dialect/validate! algorithm)
+                     inner (dialect/facts algorithm)
+                     scalar-ids (filter #(empty? (:shape (get-in inner [:values %])))
+                                        (concat (:inputs inner) (dialect/outputs algorithm)))
+                     valid? (and (empty? (:effects predecessor)) (empty? (:effects inner))
+                                 (every? #(= 'scalar (dialect/operation-kind %))
+                                         (dialect/equations algorithm))
+                                 (or (and (true? (get-in predecessor [:attributes :host-only]))
+                                          (empty? (:operations predecessor)))
+                                     (semantic-equivalent?
+                                      (:operations predecessor) (dialect/equations algorithm)))
+                                 (= (:operands predecessor) (:inputs inner))
+                                 (= (:results predecessor) (dialect/outputs algorithm))
+                                 (every? #(= (select-keys (get-in inner [:values %])
+                                                         [:kind :dtype :shape :representation :logical-layout])
+                                             (select-keys (get-in facts [:values %])
+                                                         [:kind :dtype :shape :representation :logical-layout])) scalar-ids))]
+                 (if valid?
+                   (reduce #(advance %1 inner %2) environment (dialect/equations algorithm))
+                   environment)))))
+         initial (take position equations))))))

@@ -165,13 +165,15 @@
                                :array-shapes (checked-graph-input-shapes
                                               segmap kernel-graph
                                               (merge array-shapes (:array-shapes storage-options)))
+                               :graph-node graph-node :kernel-graph kernel-graph
                                :scalar-definitions (:scalar-definitions storage-options)}
                                      (select-keys opts [:scalar-math])))
         ;; The projected operation is private schedule input. ScheduledKernelBody remains a
         ;; refinement of the exact semantic graph node, which is what later binding validates.
         scheduled (if graph-node (assoc scheduled :source segmap) scheduled)
         _ (when (or graph-node kernel-graph)
-            (segmap-body/validate-static-graph-capacities! scheduled graph-node kernel-graph))
+            (segmap-body/validate-static-graph-capacities!
+             scheduled graph-node kernel-graph storage-context))
         ;; Retained storage stays in its original representation. Exact source context still
         ;; certifies causal host definitions; shape-only leaves now have honest scalar ABI slots.
         _ (when kernel-graph
@@ -224,6 +226,7 @@
   (let [scheduled
         (segred-body/schedule segred out-sym
                              (merge {:dtype dtype :array-types array-types
+                                     :array-shapes (checked-graph-input-shapes segred kernel-graph {})
                                      :scalar-types scalar-types :coordinate-proof coordinate-proof}
                                     (select-keys opts [:scalar-math])))
         _ (when (not= (some? graph-node) (some? kernel-graph))

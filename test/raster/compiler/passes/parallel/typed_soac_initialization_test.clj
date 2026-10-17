@@ -3,6 +3,7 @@
             [raster.core :refer [deftm]]
             [raster.compiler.backend.gpu.kernel-body-compile-fixtures :as fixtures]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -47,6 +48,29 @@
           [scheduled stats] (initialization/materialize program)]
       (is (= program scheduled))
       (is (zero? (:initialization-fills stats))))))
+
+(deftest allocation-analysis-facts-do-not-manufacture-live-zero-storage
+  (let [source '(let* [unused (clojure.core/float-array capacity)
+                       output (raster.par/pmap i n float (float i))] output)
+        options {:dtype :float :scalar-types {'capacity :long 'n :long}}
+        program (frontend/form->program source options)
+        [scheduled stats] (initialization/materialize program)]
+    (is (not (contains? (:values (dialect/facts program)) 'unused)))
+    (is (= 'unused (get-in (dialect/facts program) [:attributes :allocations 0 :destination])))
+    (is (= 'capacity (get-in (dialect/facts program) [:attributes :allocations 0 :extent])))
+    (is (= program scheduled))
+    (is (zero? (:initialization-fills stats)))
+    (let [explicit (av/tensor {:dtype :float :shape '[capacity]})
+          program (frontend/form->program source (assoc options :values {'unused explicit}))]
+      (is (= explicit (get-in (dialect/facts program) [:values 'unused]))
+          "an explicit caller contract remains explicit, unlike an analysis-only fact")))
+  (let [source '(let* [storage (clojure.core/float-array n)
+                       output (raster.par/pmap i n float (aget storage i))] output)
+        program (frontend/form->program source {:dtype :float :scalar-types {'n :long}})
+        [scheduled stats] (initialization/materialize program)]
+    (is (= '[n] (get-in (dialect/facts scheduled) [:values 'storage :shape])))
+    (is (= 1 (:initialization-fills stats)))
+    (is (= 2 (count (dialect/equations scheduled))))))
 
 (deftest full-domain-proof-follows-scalar-ssa-products
   (doseq [[allocation fills] [['(* (long n) width) 0] ['(* n width 2) 1]]]
@@ -136,6 +160,43 @@
 (defn- reason [program]
   (try (initialization/materialize program) nil
        (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+
+(deftest host-only-storage-retains-its-native-owner
+  (let [source '(let* [storage (float-array 8)
+                       observed (do (aset storage 0 (float 7.0)) nil)
+                       output (raster.par/pmap i 4 float (float i))] output)
+        p (frontend/form->program
+           source {:dtype :float :values {'storage (av/tensor {:dtype :float :shape [8]})}})
+        [scheduled stats] (initialization/materialize p)
+        facts (dialect/facts scheduled)]
+    (is (= 1 (:initialization-native-providers stats)))
+    (is (zero? (:initialization-fills stats)))
+    (is (= ['storage] (get-in facts [:attributes :native-initialization-providers])))
+    (is (= (dialect/equations p) (dialect/equations scheduled)))
+    (is (= (get-in (dialect/facts p) [:attributes :allocations])
+           (get-in facts [:attributes :allocations])))
+    (is (= :structured-control-native-initialization
+           (try (structured/promote-program (route/program-envelope scheduled) {})
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (doseq [change [#(assoc-in % [:attributes :host-binding-ids] [1])
+                    #(assoc-in % [:attributes :host-binding-ids] [0])
+                    #(assoc-in % [:attributes :host-read-sites] [])
+                    #(assoc-in % [:attributes :host-read-sites]
+                               [{:source-binding-id 0 :values #{'storage}}])
+                    #(assoc-in % [:attributes :host-read-sites]
+                               [{:source-binding-id 2 :values #{'storage}}])]]
+      (is (= :typed-soac-initialization-contract (reason (with-facts p change)))))
+    (let [alias-program
+          (with-facts p
+            #(-> %
+                 (assoc-in [:equations 2 :aliases 'storage-alias] 'storage)
+                 (assoc-in [:attributes :host-read-sites]
+                           [{:source-binding-id 1 :values #{'storage-alias}}])))
+          [alias-scheduled alias-stats] (initialization/materialize alias-program)]
+      (is (= 1 (:initialization-native-providers alias-stats)))
+      (is (= ['storage] (get-in (dialect/facts alias-scheduled)
+                                [:attributes :native-initialization-providers]))))))
 
 (deftest logical-prefix-shape-is-not-the-allocation-capacity
   (doseq [domain [4 'm]]

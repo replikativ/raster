@@ -111,7 +111,7 @@
                 (= index (descriptor/unwrap-int-cast idx))))
           (mapcat descriptor/aget-reads expressions)))
 
-(declare scheduled-read-minima)
+(declare scheduled-read-minima input-read-minima)
 
 (defn lower
   "Apply a portable grid-stride scalar schedule to a typed one-dimensional SegMap."
@@ -244,11 +244,11 @@
         forms (if ordered-effects?
                 []
                 (scalar-forms (util/subst-syms (:substitutions local-state) result)))
-        explicit-forms (if primary-output (pop forms) forms)
-        primary-form (when primary-output (peek forms))
         _ (when (and primary-output (empty? forms))
             (decline! :missing-result "map result has no scalar expression"
                       {:operation (:id segmap) :output primary-output}))
+        explicit-forms (if primary-output (pop forms) forms)
+        primary-form (when primary-output (peek forms))
         environment (:environment local-state)
         lower-store
         (fn lower-store [form]
@@ -625,15 +625,9 @@
           [(body/->Guard :map-active scalar-operations)])
         ;; These are physical capacities supplied by the enclosing graph, not a proof that
         ;; arbitrary indexed accesses are in bounds. The iteration extent remains independent.
-        input-minima (when (some #(not (get array-shapes %)) inputs)
-                       (if (and (integer? bound) (zero? bound))
-                         (zipmap inputs (repeat 0))
-                         (merge
-                                   (map-reads/independent-read-requirements
-                                    (assoc segmap :scalar-region
-                                           {:locals locals :result (if effects (list* 'do effects) result)})
-                                    options)
-                                   (scheduled-read-minima index bound scheduled-operations options))))
+        ;; Knowing a buffer's physical shape does not prove it covers the reads. Keep the
+        ;; independently derived read obligation even when the graph already owns its shape.
+        input-minima (input-read-minima segmap scheduled-operations options)
         ;; The source's exact opaque bound already has an admitted typed ABI slot. Parameterize
         ;; that identity early, without projecting a compound extent or inferring any capacity.
         storage-bindings (if (and (or (symbol? bound) (keyword? bound))
@@ -654,16 +648,50 @@
                             [(launch/runtime-value (list 'extent id))])))
         pointer-parameters
         (vec (concat
-              (map #(body/->KernelParameter
-                     % :input (get array-types %) (pointer-shape %) :global
-                     (layout/row-major (pointer-shape %) (get array-types %)) :operand)
+              (map #(cond-> (body/->KernelParameter
+                             % :input (get array-types %) (pointer-shape %) :global
+                             (layout/row-major (pointer-shape %) (get array-types %)) :operand)
+                      (contains? input-minima %)
+                      (assoc :minimum-elements
+                             (launch/rebind-expression (get input-minima %) storage-bindings)))
                    read-only-inputs)
               (map #(cond-> (body/->KernelParameter
                             % (if (contains? inout %) :inout :output)
                             (get array-types %) (pointer-shape %) :global
                             (layout/row-major (pointer-shape %) (get array-types %)) :result)
+                      (and (not= % primary-output) (contains? input-minima %))
+                      (assoc :minimum-elements
+                             (launch/rebind-expression (get input-minima %) storage-bindings))
                       (= % primary-output) (assoc :minimum-elements '_n_bound))
                    outputs)))
+        _ (let [loaded (into #{} (keep #(when (= "raster.compiler.ir.kernel_body.ScalarLoad"
+                                                  (some-> % class .getName)) (:buffer %)))
+                             (tree-seq coll? seq scheduled-operations))]
+            (doseq [parameter pointer-parameters
+                    :when (and (contains? loaded (:id parameter))
+                               (some #(and (integer? %) (zero? %)) (:shape parameter))
+                               (not (contains? parameter :minimum-elements)))]
+              (decline! :input-capacity-unresolved
+                        "empty map storage requires a proved zero read domain"
+                        {:operation (:id segmap) :parameter (:id parameter)
+                         :shape (:shape parameter)})))
+        _ (doseq [parameter pointer-parameters
+                  :when (and (contains? parameter :minimum-elements)
+                             (every? integer? (:shape parameter)))
+                  :let [minimum (launch/rebind-expression
+                                 (:minimum-elements parameter) {'_n_bound bound})]
+                  :when (and (nil? (launch/backing-extent-id minimum))
+                             (empty? (launch/expression-references minimum)))
+                  :let [required (launch/resolve-expression (constantly nil) minimum)
+                        capacity (if (some zero? (:shape parameter)) 0
+                                   (launch/resolve-expression
+                                    (constantly nil) (apply launch/product (:shape parameter))))]]
+            (when (< capacity required)
+              (decline! :input-capacity
+                        "map storage capacity is smaller than its required access prefix"
+                        {:operation (:id segmap) :parameter (:id parameter)
+                         :shape (:shape parameter) :required-elements required
+                         :buffer-elements capacity})))
         storage-types (scheduled-body/storage-scalar-closure
                        pointer-parameters declared-scalar-types #{'_n_bound})
         scalars (vec (sort-by name (into (set scalars) (keys storage-types))))
@@ -717,19 +745,47 @@
 
 (defn validate-static-graph-capacities!
   "Check static graph-to-pointer correspondence, not arbitrary indexed access safety."
-  [candidate node kernel-graph]
+  ([candidate node kernel-graph]
+   (validate-static-graph-capacities! candidate node kernel-graph nil))
+  ([candidate node kernel-graph storage-context]
   (graph/validate! kernel-graph)
   (when-not (and (= (:source candidate) (:operation node))
                  (some #(= node %) (:nodes kernel-graph)))
     (throw (ex-info "map capacity projection requires its exact graph node"
                     {:reason :segmap-capacity-node})))
   (scheduled-body/validate-dense-input-storage! candidate node kernel-graph)
-  (let [primary (:out-sym (:operation node))]
+  (let [source (:operation node)
+        primary (:out-sym source)
+        {bound :bound} (first (get-in source [:space :dims]))
+        parameters (get-in candidate [:body :parameters])
+        ;; The enclosing equation owns causal scalar definitions. Recompute them from that
+        ;; source, never from the candidate's proof payload. Resolve at the graph boundary
+        ;; because scheduled-equation-graph itself uses this module to schedule maps.
+        storage-options
+        (when storage-context
+          ((requiring-resolve
+            'raster.compiler.passes.parallel.scheduled-equation-graph/input-storage-context)
+           (:program storage-context) (:equation storage-context) source))
+        options {:array-types (into {} (map (juxt :id :dtype))
+                                    (remove #(= :scalar (:kind %)) parameters))
+                 :scalar-types (merge (:scalar-types storage-options)
+                                      (into {} (map (juxt :id :dtype)) (:scalars kernel-graph)))
+                 :scalar-definitions (:scalar-definitions storage-options)}
+        minima (input-read-minima source (get-in candidate [:body :operations]) options)
+        bindings (if (and (or (symbol? bound) (keyword? bound))
+                          (not (contains? (set (:scalars source)) bound)))
+                   {bound '_n_bound} {})]
     (doseq [parameter (get-in candidate [:body :parameters])]
-      (when-not (= (when (= primary (:id parameter)) '_n_bound)
+      (when-not (= (if (= primary (:id parameter)) '_n_bound
+                     (when (contains? minima (:id parameter))
+                       (launch/rebind-expression (get minima (:id parameter)) bindings)))
                    (:minimum-elements parameter))
-        (throw (ex-info "map primary write minimum differs from its source store domain"
-                        {:reason :segmap-write-minimum :parameter (:id parameter)
+        (throw (ex-info (if (= primary (:id parameter))
+                         "map primary write minimum differs from its source store domain"
+                         "map read minimum differs from its checked source domain")
+                        {:reason (if (= primary (:id parameter))
+                                   :segmap-write-minimum :segmap-read-minimum)
+                         :parameter (:id parameter)
                          :primary primary :minimum-elements (:minimum-elements parameter)})))))
   (let [buffers (into {} (map (juxt :id identity))
                       (concat (:inputs kernel-graph) (:outputs kernel-graph)
@@ -742,7 +798,7 @@
         (throw (ex-info "map pointer capacity differs from its static graph buffer"
                         {:reason :segmap-static-capacity :buffer id
                          :expected [elements] :actual shape})))))
-  candidate)
+  candidate))
 
 (defn- scheduled-read-minima
   "The existing typed-SSA range proof, consumed before pointer parameters are constructed."
@@ -827,6 +883,32 @@
             (when (and (seq loads) (every? some? requirements))
               (reduce (fn [result [id extent]] (update result id (fnil max 0) extent))
                       {} requirements)))))
+
+(defn- input-read-minima
+  "Read prefixes are independent of physical capacity. Reuse the source address proof and
+   typed-SSA range proof; unknown reads do not acquire an invented prefix."
+  [operation scheduled-operations options]
+  (let [source (get-in options [:graph-node :operation])
+        ;; Address projection can remove the source locals used by the dense-span proof.
+        ;; Recover its semantic owner only by rechecking that exact graph-bound transform;
+        ;; an attached requirements map is not authority to assert a read minimum.
+        operation (if (and source (not= source operation))
+                    (let [projected (map-reads/validate-and-project-addresses
+                                     source (:graph-node options) (:kernel-graph options))]
+                      (when-not (= projected operation)
+                        (decline! :read-capacity-source
+                                  "map read capacity requires its exact source address projection"
+                                  {:operation (:id operation)}))
+                      source)
+                    operation)
+        {index :name bound :bound} (first (get-in operation [:space :dims]))
+        {:keys [locals result effects]} (scalar-region operation)]
+    (if (and (integer? bound) (zero? bound))
+      (zipmap (:inputs operation) (repeat 0))
+      (merge (map-reads/independent-read-requirements
+              (assoc operation :scalar-region
+                     {:locals locals :result (if effects (list* 'do effects) result)}) options)
+             (scheduled-read-minima index bound scheduled-operations options)))))
 
 (defn static-read-requirements
   "Optional all-load proof for a plain, positive static, one-dimensional result map."
