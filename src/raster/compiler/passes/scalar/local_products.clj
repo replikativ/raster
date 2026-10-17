@@ -5,7 +5,7 @@
    are snapshotted in source order; escaping products retain their source form."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.core.numeric-constant :as numeric-constant]
+            [raster.compiler.core.value-product :as value-product]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
@@ -32,8 +32,8 @@
            (= 3 (count expression)) (product-shape? (last expression)))))
 
 (defn- split-product [expression]
-  (if (vector? expression)
-    [[] expression]
+  (if-let [fields (value-product/literal-fields expression)]
+    [[] fields]
     (let [[bindings fields] (split-product (last expression))]
       [(into (vec (second expression)) bindings) fields])))
 
@@ -42,12 +42,6 @@
     (let [operation (descriptor/semantic-op expression)]
       (and (symbol? operation) (= "clojure.core" (namespace operation))
            (descriptor/cast-result-tag operation)))))
-
-(defn- projection-index [expression]
-  (when (or (integer? expression)
-            (and (primitive-cast? expression) (some? (projection-index (second expression)))))
-    (let [constant (numeric-constant/value expression)]
-      (when (integer? (:value constant)) (:value constant)))))
 
 (defn- literal-tail [expression]
   (cond (literal? expression) {:bindings [] :literal expression}
@@ -200,13 +194,13 @@
 
     ;; Constant-index projection consumes a saved product without reconstructing
     ;; its allocation. Out-of-bounds/defaulted/dynamic accesses remain unchanged.
-    (and (seq? expression) (= 'clojure.core/nth (descriptor/semantic-op expression))
-         (= 3 (count expression)) (symbol? (second expression))
+    (and (seq? expression) (symbol? (second expression))
          (get-in env [(second expression) :fields])
-         (some? (projection-index (nth expression 2)))
-         (<= 0 (projection-index (nth expression 2)))
-         (< (projection-index (nth expression 2)) (count (get-in env [(second expression) :fields]))))
-    (nth (get-in env [(second expression) :fields]) (projection-index (nth expression 2)))
+         (value-product/constant-projection
+          expression (count (get-in env [(second expression) :fields]))))
+    (let [fields (get-in env [(second expression) :fields])
+          projection (value-product/constant-projection expression (count fields))]
+      (nth fields (:index projection)))
 
     (and (seq? expression) (= 'clojure.core/nil? (descriptor/semantic-op expression)) (= 2 (count expression)))
     (let [argument (second expression) known (fact env argument)]
