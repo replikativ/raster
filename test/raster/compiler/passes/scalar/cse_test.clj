@@ -1,6 +1,17 @@
 (ns raster.compiler.passes.scalar.cse-test
   (:require [clojure.test :refer [deftest testing is]]
-            [raster.compiler.passes.scalar.cse :as cse]))
+            [raster.compiler.passes.scalar.cse :as cse]
+            [raster.compiler.core.op-descriptor :as descriptor]))
+
+(deftest declared-writes-and-allocations-stay-distinct
+  (doseq [contract [{:buffer-write {:mode :accumulate :buf-arg-idx 0}}
+                    {:buffer {:allocates? true}}]]
+    (with-redefs [descriptor/resolve-op-descriptor (fn [_] [contract 'fixture/operation])]
+      (let [expression '(fixture/operation buffer)
+            input (list 'let* ['a expression 'b expression] '[a b])
+            result (cse/cse-let input)]
+        (is (zero? (get-in result [:stats :cse-aliases])))
+        (is (= input (:form result)))))))
 
 (deftest basic-cse-test
   (testing "duplicate expressions become aliases"

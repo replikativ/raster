@@ -1,6 +1,69 @@
 (ns raster.compiler.passes.scalar.effects-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.compiler.passes.scalar.effects :as effects]))
+            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.core.op-descriptor :as descriptor]))
+
+(deftest storage-contracts-deny-cse-without-body-analysis
+  (doseq [contract [{:buffer-write {:mode :overwrite :buf-arg-idx 0}}
+                    {:buffer-write {:mode :accumulate :buf-arg-idx 0}}
+                    {:effects {:mutating? true}}
+                    {:buffer {:allocates? true}}]
+          expression ['(fixture/write! buffer value)
+                      '(fixture/write!_m_doubles_double buffer value)
+                      (with-meta '(.invk fixture/write-impl buffer value)
+                        {:raster.op/original 'fixture/write!})]]
+    (let [resolved (atom [])]
+      (with-redefs [descriptor/resolve-op-descriptor
+                    (fn [op] (swap! resolved conj op) [contract op])
+                    effects/removable-expr?
+                    (fn [_] (throw (ex-info "unnecessary body analysis" {})))]
+        (is (false? (effects/cse-safe-expr? expression)))
+        (is (= [(descriptor/semantic-op expression)] @resolved))))))
+
+(deftest storage-contracts-never-grant-cse-permission
+  (doseq [contract [nil {} {:effects {:pure? true}}
+                    {:effects {:mutating? false} :buffer {:allocates? false}}]
+          removable? [false true]]
+    (let [analyzed (atom []) expression '(fixture/operation buffer)]
+      (with-redefs [descriptor/resolve-op-descriptor (fn [_] [contract 'fixture/operation])
+                    effects/removable-expr? (fn [expr] (swap! analyzed conj expr) removable?)]
+        (is (= removable? (effects/cse-safe-expr? expression)))
+        (is (= [expression] @analyzed))))))
+
+(deftest lexical-and-unidentified-calls-do-not-borrow-storage-contracts
+  (doseq [expression [(with-meta '(fixture/write! buffer value)
+                       {:raster.op/lexical-callee true})
+                     (with-meta '(.invk fixture/write-impl buffer value)
+                       {:raster.op/lexical-callee true
+                        :raster.op/original 'fixture/write!})
+                     '(.invk fixture/write-impl buffer value)]]
+    (let [analyzed (atom [])]
+      (with-redefs [descriptor/resolve-op-descriptor
+                    (fn [_] (throw (ex-info "no global semantic identity" {})))
+                    effects/removable-expr? (fn [expr] (swap! analyzed conj expr) false)]
+        (is (false? (effects/cse-safe-expr? expression)))
+        (is (= [expression] @analyzed))))))
+
+(deftest declared-storage-resolution-preserves-qualified-identity
+  (let [resolve-contract descriptor/resolve-op-descriptor
+        operation 'raster.nn/dense-backward-dW-into!
+        contract {:buffer-write {:mode :accumulate :buf-arg-idx 2}}]
+    ;; Exercise the real resolver, including its mangled-name path, without
+    ;; requiring the training library or mutating its process-wide registry.
+    (with-redefs [descriptor/get-op-descriptor (fn [op] (when (= op operation) contract))]
+      (doseq [expression ['(raster.nn/dense-backward-dW-into! dy x out)
+                          '(raster.nn/dense-backward-dW-into!_m_doubles_doubles_doubles dy x out)
+                          (with-meta '(.invk generated/dw-impl dy x out)
+                            {:raster.op/original operation})]]
+        (with-redefs [effects/removable-expr?
+                      (fn [_] (throw (ex-info "declared writer was analyzed" {})))]
+          (is (false? (effects/cse-safe-expr? expression)))))
+      (is (nil? (resolve-contract 'foreign/dense-backward-dW-into!_m_doubles_doubles_doubles)))
+      (let [analyzed (atom 0)]
+        (with-redefs [effects/removable-expr? (fn [_] (swap! analyzed inc) false)]
+          (is (false? (effects/cse-safe-expr?
+                       '(foreign/dense-backward-dW-into!_m_doubles_doubles_doubles dy x out))))
+          (is (= 1 @analyzed)))))))
 
 (deftest beichte-analyzes-the-semantic-operation-behind-invk
   (let [pure-call
