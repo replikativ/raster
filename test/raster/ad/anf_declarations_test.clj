@@ -7,6 +7,33 @@
     (fn [prefix] (with-meta (symbol (str prefix "__" (swap! counter inc)))
                   {:test/generated true}))))
 
+(deftest existing-binders-retain-newly-exposed-result-declarations
+  (let [value (with-meta 'value {:line 4})
+        initializer (with-meta '(producer input)
+                      {:raster.type/tag 'floats :raster.op/original 'producer
+                       :raster.effect/effectful true :ownership :not-a-proof})
+        [result expression] (anf/anf-normalize-bindings [value initializer] (fresh-symbols))]
+    (is (= {:line 4 :raster.type/tag 'floats} (meta result)))
+    (is (= (meta initializer) (meta expression)))
+    (is (nil? (:tag (meta result))))
+    (is (= value result)))
+  (let [[result _] (anf/anf-normalize-bindings
+                    [(with-meta 'value {:raster.type/tag 'Object})
+                     (with-meta '(producer input) {:raster.type/tag 'floats})]
+                    (fresh-symbols))]
+    (is (= 'Object (:raster.type/tag (meta result))))
+    (is (nil? (:tag (meta result)))))
+  (let [[result _] (anf/anf-normalize-bindings '[value (unknown input)] (fresh-symbols))]
+    (is (nil? (:raster.type/tag (meta result)))))
+  (doseq [tag ['floats 'doubles 'Object]]
+    (let [metadata {:tag tag :line 5}
+          [result _] (anf/anf-normalize-bindings
+                       [(with-meta 'value metadata)
+                        (with-meta '(producer input) {:raster.type/tag 'floats})]
+                       (fresh-symbols))]
+      (is (= metadata (meta result))
+          "neither matching nor conflicting existing JVM declarations are restamped"))))
+
 (deftest lifted-arguments-retain-declared-types-without-inferring
   (doseq [tag ['int 'long 'float 'double 'doubles 'floats]]
     (let [argument (with-meta '(producer x)
