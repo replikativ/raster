@@ -14,6 +14,10 @@
 ;; ================================================================
 
 (deftest make-method-entry-test
+  (testing "typed implementations have one concrete-object representation"
+    (is (= :method-entry-mutable-implementation
+           (try (dispatch/make-method-entry ['Double] identity #'identity 'Object)
+                nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
   (testing "basic method entry has correct fields"
     (let [entry (dispatch/make-method-entry ['Double 'Double] +)]
       (is (= ['Double 'Double] (:tags entry)))

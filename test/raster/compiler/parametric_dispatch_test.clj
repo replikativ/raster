@@ -6,8 +6,8 @@
   impl; make-typed-dispatch set the typed field directly to that Var and threw
   ('can not set IFn__floats… field to clojure.lang.Var'), silently falling back
   to a plain dispatch fn. The float kernel then ran interpreted (~30x slower) —
-  e.g. UMAP's cos-dist/init-leaves over float data. Fix derefs the Var so the
-  field holds the compiled IFn__ instance."
+  e.g. UMAP's cos-dist/init-leaves over float data. Registration now supplies
+  the compiled IFn__ instance, matching ordinary methods and JIT upgrades."
   (:require [clojure.test :refer [deftest testing is]]
             [raster.core :as rcore :refer [deftm]]
             [raster.compiler.core.dispatch :as dispatch]
@@ -108,14 +108,55 @@
       ;; compiled .invk caller reaches the fast path.
       (let [ifaces (set (map #(.getName %) (.getInterfaces (class @#'pdot))))]
         (is (some #(re-find #"IFn__floats" %) ifaces)
-            (str "pdot dispatch interfaces " ifaces " — missing IFn__floats* (float .invk path)"))))))
+            (str "pdot dispatch interfaces " ifaces " — missing IFn__floats* (float .invk path)")))
+      (doseq [[tags a b array-class]
+              (take 6 (cycle [[['floats 'floats 'long] af bf (class af)]
+                              [['doubles 'doubles 'long] ad bd (class ad)]]))]
+        (let [entry (first (filter #(= tags (:tags %)) (get (rcore/methods-of #'pdot) 3)))
+              source-name (if (= 'floats (first tags))
+                            'pdot_m_floats_floats_long 'pdot_m_doubles_doubles_long)
+              source (ns-resolve 'raster.compiler.parametric-dispatch-test source-name)
+              implementation (ns-resolve 'raster.compiler.parametric-dispatch-test
+                                         (symbol (str source-name "-impl")))
+              method (.getMethod (class @#'pdot) "invk"
+                                 (into-array Class [array-class array-class Long/TYPE]))]
+          (is (ifn? (:target-fn entry)))
+          (is (identical? @source (:target-fn entry)))
+          (is (not (var? (:typed-impl entry))))
+          (is (identical? @implementation (:typed-impl entry)))
+          (is (== 10.0 ((:target-fn entry) a b 4)) "registered IFn fallback is callable")
+          (is (== 10.0 (pdot a b 4)) "generic dispatch keeps both storage specializations")
+          (is (== 10.0 (.invoke method @#'pdot (object-array [a b (long 4)])))
+              "actual typed interface dispatch keeps both specializations"))))))
 
-;; 22 params — past Clojure's 20-positional-param limit. Regression for the
-;; parametric-specialize! placeholder defn: it eval'd a POSITIONAL param vector,
-;; so any (All [T]) deftm with >20 params (e.g. a 37-param transformer block)
-;; died at specialization with "Can't specify more than 20 params". The
-;; placeholder is variadic now (the real params live in ::deftm-params meta and
-;; the bytecode impl carries the typed signature).
+(deftest parametric-method-entry-tracks-bytecode-upgrades
+  (rcore/ensure-dtype-specialization! #'pdot :float)
+  (let [tags '[floats floats long]
+        entry #(first (filter (fn [method] (= tags (:tags method)))
+                              (get (rcore/methods-of #'pdot) 3)))
+        before (entry)
+        source (ns-resolve 'raster.compiler.parametric-dispatch-test 'pdot_m_floats_floats_long)
+        impl (ns-resolve 'raster.compiler.parametric-dispatch-test 'pdot_m_floats_floats_long-impl)
+        m (meta source)
+        input (float-array [1.0 2.0 3.0])
+        weights (float-array [2.0 2.0 2.0])
+        epoch (dispatch/compiler-definition-revision)]
+    (rcore/do-bytecode-upgrade!
+     impl (:name m) (:raster.core/deftm-params m) tags (:raster.core/return-tag m)
+     (:raster.core/deftm-walked-body m) (:ns m) (str (:typed-iface before))
+     :annotations (:raster.core/deftm-annotations m)
+     :source-body (:raster.core/deftm-source-body m))
+    (is (= epoch (dispatch/compiler-definition-revision)))
+    (is (not (identical? (:typed-impl before) (:typed-impl (entry)))))
+    (is (identical? @impl (:typed-impl (entry))))
+    (is (identical? @source (:target-fn (entry))))
+    (is (== 12.0 (pdot input weights 3)))
+    (let [method (.getMethod (class @#'pdot) "invk"
+                             (into-array Class [(class input) (class weights) Long/TYPE]))]
+      (is (== 12.0 (.invoke method @#'pdot (object-array [input weights (long 3)])))))))
+
+;; 22 params — past Clojure's 20-positional-param limit. The placeholder must
+;; remain variadic; the concrete signature lives in metadata and bytecode.
 (deftm psum22
   "Sum 20 arrays element-wise over [0,n) — a >20-param parametric kernel."
   (All [T] [a1 :- (Array T) a2 :- (Array T) a3 :- (Array T) a4 :- (Array T)
