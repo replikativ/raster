@@ -774,6 +774,40 @@ budget or adding syntax hoists does not discharge the structural derivative cont
 steps are prerequisites for reusable training and direct TypedSOAC composition, not a
 replacement for the distributed, durability, portability or measurement campaign gates.
 
+### Call completion before product ANF
+
+Call normalization must preserve executable selection, input evaluation and each
+input's ABI completion in source order. Capturing a boxed value in a let binding
+does not force unboxing or a reference check. A later argument's effects cannot
+move ahead of an earlier conversion that originally threw. Likewise a dynamic
+IFn target is selected before its arguments; it must not be selected again after
+an argument changes its Var. Receiver checks and invocation-time failures are
+distinct: nil can fail at invocation after argument effects while a wrong-class
+receiver can fail its CHECKCAST before them.
+
+`call-boundary/selected-typed-signature` projects only the physical carriers of an
+already-resolved JVM Method against the existing registered global definition,
+live executable and exact interface Class. Logical dispatch tags are not this
+ABI: custom tags may be Object parameters, and typed interfaces return Object
+even for logical scalar results. Method and Class/classloader identity must be
+retained, not reconstructed from helper names or an overload search.
+
+This query does not prove that a call site is nonlexical, that a dynamic target
+can be frozen, or that a parameter conversion is identity. The caller must first
+close call syntax and lexical scope. The signature is not an argument-hoisting,
+purity, non-nullness, ownership, tangent-space or backend certificate. Missing or
+stale evidence is explicitly unknown; existing definition/owner guards still
+validate later reuse. No callee is executed or Class/forName lookup performed.
+
+The next dependent layer must retain source operand representation separately
+from semantic dtype, and retain the actual checked/unchecked conversion policy
+and source evaluation point. Boxed Number-to-Float checking is not primitive
+Double-to-Float D2F, and Boolean/Character unboxing is not truthiness/general
+character coercion. Core numeric conversion IR must not silently stand in for
+JVM reference checks. Only after completed inputs are representable and checked
+against source execution may product ANF consume them. This physical-signature
+prerequisite enables no new normalizer, source AD rule or default AD engine.
+
 Internally distinguish four states, even if the public API continues returning `nil` for
 excluded gradient slots:
 
