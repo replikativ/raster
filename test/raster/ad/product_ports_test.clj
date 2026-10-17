@@ -39,6 +39,17 @@
          (try (ports/literal-plan 'p ['(raster.numeric/* x x)] {} {'x true}) nil
               (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
 
+(deftest projection-consumes-an-owner-proved-index-not-an-index-type
+  (let [x (with-meta 'x {:raster.type/tag 'double})
+        plan (ports/literal-plan 'p [x nil] {x {:value x}} {x true})
+        facts {'p {:product (select-keys plan [:schema :active-paths])}
+               'selected {:value 'selected :constant-index 0}}]
+    (is (= [{:port 'result :path [] :tag 'double
+             :source (ports/field-port 'p [0]) :active? true}]
+           (:edges (ports/projection-plan 'result '(clojure.core/nth p selected) facts))))
+    (is (nil? (ports/projection-plan 'result '(clojure.core/nth p selected)
+                                    (assoc facts 'selected {:value 'selected :tag 'long}))))))
+
 (deftest cyclic-alias-facts-do-not-invent-a-tangent-declaration
   (is (= :ad-product-unknown-tangent
          (try (ports/literal-plan 'p ['a] {'a {:alias 'b} 'b {:alias 'a}} {'a true}) nil

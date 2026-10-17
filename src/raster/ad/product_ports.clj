@@ -110,7 +110,8 @@
         {:keys [schema active-paths]} (get-in value-facts [source :product])
         count-fields (count (:fields schema))
         projection (when (= :product (:kind schema))
-                     (or (product/constant-projection expression count-fields)
+                     (or (product/constant-projection
+                          expression count-fields #(get-in value-facts [% :constant-index]))
                          (when (and (= 2 (count expression))
                                     (= (first expression) (descriptor/semantic-op expression))
                                     (contains? '#{clojure.core/first clojure.core/second} (first expression)))

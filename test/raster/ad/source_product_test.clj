@@ -1,6 +1,8 @@
 (ns raster.ad.source-product-test
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.reverse :as reverse]
+            [raster.ad.jvp :as jvp]
+            [raster.core :refer [deftm]]
             [raster.compiler.passes.scalar.local-products :as local-products]))
 
 (defn- typed [id tag] (with-meta id {:raster.type/tag tag}))
@@ -18,6 +20,21 @@
      :paired (eval (list 'fn parameters transformed))
      :form transformed}))
 
+(deftm retained-product-normalization [x :- Double] :- Double
+  (let [scaled (raster.numeric/* x 2.0)
+        product [x scaled]]
+    (raster.numeric/+ (clojure.core/nth product 0) (clojure.core/nth product 1))))
+
+(deftest public-modes-handle-normalized-product-index-temporaries
+  (let [[reverse-fn forward-fn]
+        (with-redefs [local-products/lower-local-products identity]
+          [(reverse/value+grad #'retained-product-normalization)
+           (jvp/jvp #'retained-product-normalization)])]
+    (doseq [input [-2.0 0.0 3.5]]
+      (is (= [(* 3.0 input) 3.0] (reverse-fn input)))
+      (doseq [seed [-1.0 0.0 2.0]]
+        (is (= [(* 3.0 input) (* 3.0 seed)] (forward-fn input seed)))))))
+
 (deftest source-products-retain-nested-constructors-and-field-derivatives
   (let [x (typed 'x 'double) square (typed 'square 'double)
         a (typed 'a 'double) b (typed 'b 'double) result (typed 'result 'double)
@@ -34,6 +51,51 @@
             fd (/ (- (source (+ x h)) (source (- x h))) (* 2.0 h))]
         (is (= (* x x x) value))
         (is (< (Math/abs (- fd (first (pb 1.0)))) 1.0e-7))))))
+
+(deftest source-product-projections-follow-frozen-index-bindings
+  (let [x (typed 'x 'double) square (typed 'square 'double)
+        a (typed 'a 'double) b (typed 'b 'double) result (typed 'result 'double)
+        {:keys [source paired form]}
+        (compile-source [x]
+                        [square '(raster.numeric/* x x)
+                         'index '(clojure.core/long 0) 'saved 'index
+                         'index '(clojure.core/long 1)
+                         'p ['x 'square]
+                         a '(clojure.core/nth p saved) b '(clojure.core/nth p index)
+                         result '(raster.numeric/+ a b)] result [x])]
+    (is (some #{'(clojure.core/long 0)} (tree-seq coll? seq form))
+        "the source initializer is retained rather than evaluated/erased by projection")
+    (doseq [input [-2.0 0.0 3.0]]
+      (let [[value pullback] (paired input)]
+        (is (= (source input) value))
+        (is (= [(+ 1.0 (* 2.0 input))] (pullback 1.0)))))))
+
+(deftest unknown-index-rebinding-and-failing-index-casts-still-refuse
+  (let [x (typed 'x 'double) runtime-index (typed 'runtime-index 'long)
+        result (typed 'result 'double)]
+    (doseq [bindings [['index 0 'index runtime-index]
+                      ['index '(clojure.core/int 2147483648)]]]
+      (is (= :ad-unsupported-product-use
+             (try (compile-source [x runtime-index 'calls]
+                                  (into bindings ['p [x] result '(clojure.core/nth p index)])
+                                  result [x])
+                  :incorrectly-accepted
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest normalization-retains-effects-before-a-proved-index
+  (let [x (typed 'x 'double) result (typed 'result 'double)
+        calls (atom 0)
+        {:keys [paired]}
+        (compile-source [x 'calls]
+                        ['index '(do (swap! calls inc) 0)
+                         'p [x] result '(clojure.core/nth p index)] result [x])]
+    (is (zero? @calls) "constructing the derivative does not execute the primal")
+    (let [[value pullback] (paired 3.0 calls)]
+      (is (= 3.0 value))
+      (is (= 1 @calls))
+      (is (= [1.0] (pullback 1.0)))
+      (is (= [0.0] (pullback 0.0)))
+      (is (= 1 @calls) "the pullback does not replay the initializer's effect"))))
 
 (deftest source-product-branch-demand-is-sparse-not-an-inactive-numeric-zero
   (let [x (typed 'x 'double) flag (typed 'flag 'boolean)
