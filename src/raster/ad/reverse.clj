@@ -39,6 +39,7 @@
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
+            [raster.compiler.passes.scalar.local-products :as local-products]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
             [raster.compiler.passes.parallel.patterns :as patterns]
@@ -624,9 +625,15 @@
   ;; backward reconstructs every step's inputs from out[] — no closure tape,
   ;; no ArrayList, no separate residual stack (Griewank store-the-carry
   ;; checkpointing at every step; zero recompute depth).
-  (let [active-set (vec (keys (filter val activity)))]
-    {:record (assoc (gen-reverse-par-scan init-expr active-set)
-                    :sym sym :result-alias (second init-expr))}))
+  (if (init-active? init-expr activity)
+    (let [active-set (vec (keys (filter val activity)))]
+      {:record (assoc (gen-reverse-par-scan init-expr active-set)
+                      :sym sym :result-alias (second init-expr))})
+    ;; The primal still executes and forward-pass still checks its source
+    ;; writes/exit aliases through shared memory analysis. No active input
+    ;; means no reverse recurrence or carry reconstruction is required.
+    {:record {:type :primal :sym sym :written-arrs [(second init-expr)]
+              :result-alias (second init-expr)}}))
 
 (defmethod ad-record :dotimes [_ sym init-expr activity]
   (let [active-set (vec (keys (filter val activity)))
@@ -1193,6 +1200,11 @@
   {:adj-env :rev-ctx}. `adj-sym` is this record's gensym'd adjoint (nil for the
   array SOACs, which carry their own d_out/d_acc syms in the record)."
   (fn [record _adj-sym _activity _state] (:type record)))
+
+(defmethod emit-backward :primal [_ _ _ state]
+  ;; Primal-only regions still own their memory footprint and result identity.
+  ;; Their checked activity says there is no input tangent to transpose.
+  state)
 
 (defmethod emit-backward :call
   [{:keys [sym base-op args active-args]} adj-sym _activity {:keys [adj-env rev-ctx]}]
@@ -3616,7 +3628,8 @@
     :else
     [[] [form]]))
 
-(declare ^:private lift-loop-to-tail)
+(declare ^:private lift-loop-to-tail
+         ^:private retain-source-scan-checkpoint-obligations)
 
 (defn transform-body
   "Transform a single walked body expression for reverse-mode AD.
@@ -3629,7 +3642,12 @@
   adjoints [d_param1 d_param2 ...] in the same order as active-params."
   [form active-params]
   (with-ad-gensym
-    (let [;; Binding-position loops are routed by gen-reverse-let's existing
+    (let [;; Generated derivative programs may reenter here without ad-prepare.
+          ;; Use the same lexical value normalization as source preparation;
+          ;; products are not new differentiable primitives or opaque calls.
+          form (-> form retain-source-scan-checkpoint-obligations
+                   local-products/lower-local-products)
+          ;; Binding-position loops are routed by gen-reverse-let's existing
           ;; activity decision. Unconditionally tail-lifting here rewrites even
           ;; primal-only loops and bypasses that decision/checkpoint obligation.
           [bindings body-exprs] (extract-let-parts form)
@@ -4326,6 +4344,7 @@
   ([body] (ad-prepare body nil))
   ([body param-env]
    (let [body (retain-source-scan-checkpoint-obligations body)
+         body (local-products/lower-local-products body)
          body (inline/inline-transparent-lexical-calls body param-env)
          ;; A source-written reduction must project its initializer and step
         ;; before broad ANF is allowed to move either across the binder.
