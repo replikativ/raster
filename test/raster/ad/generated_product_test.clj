@@ -233,6 +233,27 @@
     (is (instance? Float gradient))
     (is (= (float 12.0) gradient))))
 
+(deftest mixed-field-cotangents-are-projected-before-type-stamping
+  (let [x (typed 'x 'float) y (typed 'y 'double)
+        result (typed 'result 'double)
+        f (compile-program [x y]
+                           ['p ['x 'y]
+                            'a '(clojure.core/first p)
+                            'b '(clojure.core/second p)
+                            result '(raster.numeric/+ a b)] result ['x 'y])
+        [value pb] (f (float 2.0) 3.0)
+        [dx dy] (pb 1.0)]
+    (is (= 5.0 value))
+    (is (instance? Float dx))
+    (is (instance? Double dy))
+    (is (= (float 1.0) dx))
+    (is (= 1.0 dy))
+    (doseq [seed [Math/PI -1.00000001 1.00000006]]
+      (let [[dx dy] (pb seed)]
+        (is (= (Float/floatToRawIntBits (float seed))
+               (Float/floatToRawIntBits dx)))
+        (is (= seed dy))))))
+
 (deftest generated-product-ids-do-not-capture-existing-source-names
   (let [x (typed 'generated_seed__1 'double)
         square (typed 'square 'double)

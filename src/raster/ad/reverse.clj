@@ -1492,9 +1492,20 @@
                             (filter #(seq (get adj-env (:key %))) (:cotangent-ports record)))
            product-adjoints (when product?
                               (reduce (fn [{:keys [adjoints rev-ctx]} {:keys [key tag]}]
-                                        (let [value (ad-gensym "field_cotangent" tag)]
+                                        (let [scalar? (= :scalar (:kind (tangent/tangent-kind tag)))
+                                              raw (ad-gensym "field_contribution" (when-not scalar? tag))
+                                              accumulated (sum-contribs-into rev-ctx raw (get adj-env key) nil
+                                                                            (when-not scalar? tag))
+                                              value (if scalar? (ad-gensym "field_cotangent" tag) raw)
+                                              accumulated (if scalar?
+                                                            ;; A primal-space declaration is not evidence
+                                                            ;; that incoming arithmetic used that dtype.
+                                                            ;; Project before attaching the field tag.
+                                                            (bindings-into accumulated
+                                                                           [value (tangent/project-expr tag raw)])
+                                                            accumulated)]
                                           {:adjoints (assoc adjoints key value)
-                                           :rev-ctx (sum-contribs-into rev-ctx value (get adj-env key) nil tag)}))
+                                           :rev-ctx accumulated}))
                                       {:adjoints {} :rev-ctx rev-ctx} incoming-ports))
            rev-ctx (if product? (:rev-ctx product-adjoints) rev-ctx)
            ;; Array writers can receive cotangents through either their result

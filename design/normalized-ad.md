@@ -49,6 +49,10 @@ compiler cache, generic product flattening, or fake writes for field activity.
 Inputs and scalar seeds must have their declared JVM carriers. Input arrays remain
 borrowed: the caller must keep their contents stable until the pullback finishes;
 this entry neither snapshots them nor establishes concurrent mutation safety.
+Each scalar field's contributions retain the existing ordered raw fold, followed
+by one nil-preserving projection into that leaf's tangent space before its typed
+binding is introduced. A retained leaf tag alone does not attest incoming dtype;
+this is not permission to round each contribution or reassociate the fold.
 Generated execution and pullbacks reuse the existing normalized execution guard
 for rule/callee staleness. That sequential guard is not an ABA or lifetime proof.
 
