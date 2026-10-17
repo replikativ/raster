@@ -1576,7 +1576,10 @@
                          (:fn result)))]
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
-          (compile!))))))))
+          (compile!))))))
+   (when target-device
+     (fn [compiled]
+       ((requiring-resolve 'raster.gpu.ze-runtime/close!) compiled)))))
 
 ;; ================================================================
 ;; Resident GPU program extraction (Option A: bound-dispatch path)

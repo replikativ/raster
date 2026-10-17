@@ -117,12 +117,44 @@
 (defn call-with-definition-inputs
   "Own normalization and emission together for a static compiled artifact.
    Dynamic executables additionally retain these observations in their existing
-   execution guard. A nested owner contributes to the enclosing collector."
-  [compile!]
-  (binding [*emission-inputs* (or *emission-inputs* (atom {:static [] :values []}))]
-    (let [result (compile!)]
-      (assert-definition-inputs-current! @*emission-inputs*)
-      result)))
+   execution guard. A nested owner contributes to the enclosing collector.
+   Lazy compilation may replace a consulted definition: retry the WHOLE owning
+   compilation at most twice, never refresh observations around old output.
+   Resource-producing owners supply their own discard! for rejected results;
+   compile! remains responsible for cleanup when it throws before returning."
+  ([compile!] (call-with-definition-inputs compile! nil))
+  ([compile! discard!]
+  (let [attempt! (fn []
+                   (let [result (compile!)]
+                     (try
+                       (assert-definition-inputs-current! @*emission-inputs*)
+                       result
+                       (catch Throwable failure
+                         (when discard!
+                           (try (discard! result)
+                                (catch Throwable discard-failure
+                                  (.addSuppressed discard-failure failure)
+                                  (throw (ex-info "rejected compiler result could not be released"
+                                                  {:reason :definition-proof-discard-failed}
+                                                  discard-failure)))))
+                         (throw failure)))))]
+    (if *emission-inputs*
+      ;; An enclosing compilation must restart from its own earliest proof,
+      ;; not keep its stale observations while an inner owner retries.
+      (attempt!)
+      (loop [attempt 0]
+        (let [outcome (try
+                        {:result (binding [*emission-inputs* (atom {:static [] :values []})]
+                                   (attempt!))}
+                        (catch clojure.lang.ExceptionInfo failure {:failure failure}))]
+          (if-let [failure (:failure outcome)]
+            (if (and (< attempt 2)
+                     (contains? #{:stale-definition-proof-input
+                                  :unstable-definition-proof-input}
+                                (:reason (ex-data failure))))
+              (recur (inc attempt))
+              (throw failure))
+            (:result outcome))))))))
 
 (declare validate-static-emission!)
 

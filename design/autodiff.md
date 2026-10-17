@@ -85,6 +85,10 @@ collector. Static JVM/resident/equation-first owners validate before publication
 private generated and paired AD owners also validate before forward and delayed
 backward execution. These are sequential staleness fences, not concurrent
 redefinition or ABA guarantees. No passive source metadata is proof authority.
+Cold lazy materialization may invalidate an observation: the outer static owner
+then rederives the entire compilation, with at most two retries. Rejected staged
+results and partial GPU attempts release their own arenas before retry; cleanup
+failure stops the operation rather than publishing or retrying leaked ownership.
 
 For two independently present, homogeneous floating arrays, optional accumulation
 may project to its existing `raster.numeric/+` operation after proving that actual

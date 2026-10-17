@@ -81,12 +81,47 @@
     (try
       (is (= :stale-definition-proof-input
              (reason
-              #(entry/call-with-definition-inputs
-                (fn []
-                  (is (= {:presence :present :array-tag 'floats} (array-sum-proof)))
-                  (alter-var-root allocator (constantly (fn [_] nil)))
-                  :must-not-be-published)))))
+              #(binding [entry/*emission-inputs* (atom {:static [] :values []})]
+                 (entry/call-with-definition-inputs
+                  (fn []
+                    (is (= {:presence :present :array-tag 'floats} (array-sum-proof)))
+                    (alter-var-root allocator (constantly (fn [_] nil)))
+                    :must-not-be-published))))))
       (finally (alter-var-root allocator (constantly original))))))
+
+(deftest static-owner-restarts-whole-compilation-after-lazy-definition-change
+  (let [scope (create-ns (gensym "raster.proof-retry."))
+        old (fn [] :old) replacement (fn [] :new)
+        v (intern scope 'input old)
+        attempts (atom 0)]
+    (try
+      (let [result (entry/call-with-definition-inputs
+                    #(do
+                       (swap! attempts inc)
+                       (entry/observe-definition-input! v scope 'input)
+                       (let [emitted @v]
+                         (when (= 1 @attempts)
+                           (alter-var-root v (constantly replacement)))
+                         emitted)))]
+        (is (= 2 @attempts))
+        (is (identical? replacement result))
+        (is (= :new (result))))
+      (reset! attempts 0)
+      (is (= :stale-definition-proof-input
+             (reason #(entry/call-with-definition-inputs
+                       (fn []
+                         (swap! attempts inc)
+                         (entry/observe-definition-input! v scope 'input)
+                         (alter-var-root v (constantly (fn [] :changed))))))))
+      (is (= 3 @attempts) "persistent changes refuse after three fresh derivations")
+      (reset! attempts 0)
+      (is (= :unrelated-compiler-refusal
+             (reason #(entry/call-with-definition-inputs
+                       (fn []
+                         (swap! attempts inc)
+                         (throw (ex-info "no retry permission" {:reason :unrelated-compiler-refusal})))))))
+      (is (= 1 @attempts))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest proof-collection-never-refreshes-a-first-observation
   (let [inputs (atom {:static [] :values []})
