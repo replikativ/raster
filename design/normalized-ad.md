@@ -1,5 +1,33 @@
 # Normalized AD design proposal
 
+## Ordered generated-call source owner
+
+The shared `core/ordered-call` consumer normalizes an already-resolved JVM
+invocation: capture/check its executable first, complete each original operand
+in source order, then invoke the exact parameter signature. It performs no
+operand inference or overload selection. Plans containing live Methods/Classes
+are ephemeral owner data, not persistent form metadata or a new registry.
+The producer still owns Method/source-expression correspondence; a semantic op
+or scalar dtype alone does not establish it.
+
+The internal three-argument `make-runtime-value+grad-fn` entry owns compilation
+of this explicit GENERATED program under its supplied source policy. A private
+variadic factory captures actual reference Classes, avoiding source Class
+literals which can be reconstructed by name in the wrong loader. All generated
+IDs are checked against source identifiers and enclosing parameters. Invocation
+Classes must independently match the active compiler resolver immediately before
+eval; a successful reference check does not prove that correspondence. This is
+a compile-scope check, not a persistent certificate for changed loaders.
+
+Only primitive, Object and array input contexts are currently closed. Arbitrary
+reference parameters may require functional-interface adaptation and refuse;
+explicit CHECKCAST terms are not a general reference-conversion rule. Nil passes
+a receiver check, so null invocation failure remains after argument effects.
+The ordinary two-argument runtime compiler path is unchanged. This capability
+does not infer the missing original `deftm` compilation policy, discover source
+calls, authorize captured global AD correspondence, or enable completion/product
+AD records. Those remain requirements before default normalization can migrate.
+
 ## Current implementation boundary
 
 Normalized AD is opt-in. The source AD engine remains the default structural reference;

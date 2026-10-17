@@ -27,6 +27,8 @@
             [raster.compiler.ad.bind-ctx :as bind-ctx]
             [raster.compiler.ad.flatten :as ad-flatten]
             [raster.compiler.core.op-descriptor :as op]
+            [raster.compiler.core.ordered-call :as ordered-call]
+            [raster.compiler.core.value-completion :as value-completion]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
@@ -5243,12 +5245,27 @@
          :result-sym (:result-sym flat)
          :param-adj-syms (:param-adj-syms flat)}))))
 
+(defn- runtime-function-form
+  [params body]
+  (if (<= (count params) 20)
+    (list 'fn (vec params) body)
+    (let [used (util/free-syms-flat [params body])
+          args-sym (loop [id (gensym "args__")]
+                     (if (contains? used id) (recur (gensym "args__")) id))
+          unpack (vec (mapcat (fn [p i] [p (list 'clojure.core/nth args-sym i)]) params (range)))]
+      (list 'fn ['& args-sym] (list 'let unpack body)))))
+
 (defn- make-runtime-value+grad-fn
   "Build a runtime IFn from the AD-transformed walked body.
   Uses (& args) + indexed unpack so deftms with >20 params (Clojure's fn
   positional-arg limit) still work. The unpacking lets are trivially
-  eliminated by the JVM JIT for the common ≤20-param case."
-  [walked-body params]
+  eliminated by the JVM JIT for the common ≤20-param case.
+
+  Three-argument INTERNAL entry compiles an explicit generated ordered-call
+  program under its OWN supplied policy, capturing actual Classes in private
+  factory parameters. It does not derive an original deftm policy or enable
+  completion AD rules/source-call normalization on the default path."
+  ([walked-body params]
   ;; The body is eval'd WITHOUT type hints, so `clojure.core/alength` on an
   ;; untyped INTERMEDIATE array (e.g. a broadcast result `y`) reflects ambiguously
   ;; ("more than one matching method: alength"). Rewrite to the polymorphic
@@ -5256,13 +5273,32 @@
   ;; reflection, and params (already typed) keep working.
   (let [body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
                                     (first walked-body))]
-    (if (<= (count params) 20)
-      (eval (list 'fn (vec params) body))
-      (let [args-sym (gensym "args__")
-            unpack (vec (mapcat (fn [p i] [p `(nth ~args-sym ~i)])
-                                params (range)))]
-        (eval (list 'fn ['& args-sym]
-                    (list 'let unpack body)))))))
+    (eval (runtime-function-form params body))))
+  ([generated-call params {:keys [generated-source-policy] :as context}]
+   ;; Explicit internal generated-program entry, not source-facing AD support.
+   ;; The old two-argument path above neither discovers calls nor gains rules.
+   (when-not (and (= #{:generated-source-policy} (set (keys context)))
+                  (value-completion/source-policy? generated-source-policy)
+                  (= generated-source-policy (:source-policy generated-call)))
+     (throw (ex-info "generated invocation requires its own retained source policy"
+                     {:reason :unclosed-generated-call-policy})))
+   (let [normalized (ordered-call/normalize-resolved-call generated-call gensym (set params))
+         ports (:class-ports normalized)
+         reference-bindings (into {} (map (juxt :class :port)) ports)
+         body (value-completion/project-to-jvm-source
+               (list 'let* (:bindings normalized) (:invocation normalized))
+               generated-source-policy reference-bindings)
+         used (util/free-syms-flat [params body])
+         captures (loop [id (gensym "reference_classes__")]
+                    (if (contains? used id) (recur (gensym "reference_classes__")) id))
+         bindings (vec (mapcat (fn [{:keys [port]} index]
+                                [port (list 'clojure.core/nth captures index)]) ports (range)))
+         factory-source (list 'fn ['& captures]
+                              (list 'let* bindings (runtime-function-form params body)))]
+     (binding [*unchecked-math* (:unchecked-math generated-source-policy)]
+       ;; Same actual compile scope as eval, never a name-only persisted proof.
+       (ordered-call/verify-source-method! (:method normalized))
+       (apply (eval factory-source) (mapv :class ports))))))
 
 ;; ================================================================
 ;; Forward-mode admissibility (framework §11): mode selection is
