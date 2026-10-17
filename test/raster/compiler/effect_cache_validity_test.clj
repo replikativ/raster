@@ -11,12 +11,12 @@
     (try
       (doseq [name ["effect_cache_pure"]]
         (let [resource (io/resource (str "raster/compiler/fixtures/" name ".source"))]
-          (load-file (.getPath resource))))
+          (load-file (.getPath (io/file resource)))))
       (f fixture-ns)
       (finally (remove-ns fixture-ns)))))
 
 (defn- mutate! []
-  (load-file (.getPath (io/resource "raster/compiler/fixtures/effect_cache_mutating.source"))))
+  (load-file (.getPath (io/file (io/resource "raster/compiler/fixtures/effect_cache_mutating.source")))))
 
 (deftest ordinary-helper-redefinition-invalidates-purity
   (with-definitions
