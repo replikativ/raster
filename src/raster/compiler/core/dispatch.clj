@@ -430,6 +430,16 @@
 
 (defonce dispatch-tables (atom {}))
 
+(defn publish-dispatch!
+  "Publish an actually constructed dispatcher with its existing table owner.
+   Queries must never bless an arbitrary current Var root after replacement.
+   This is sequential correspondence, not an atomic concurrent mutation fence."
+  [fn-var dispatcher table]
+  (alter-var-root fn-var (constantly dispatcher))
+  (alter-meta! fn-var assoc :raster.core/dispatch-table table
+               :raster.core/dispatch-owner {:var fn-var :root dispatcher :table table})
+  fn-var)
+
 ;; Process-local compiler-visible definition epoch. Compilation-template caches capture this after
 ;; specialization so a REPL redefinition of an inlined callee cannot reuse stale generated code.
 (defonce ^:private compiler-definition-revision* (atom 0))
@@ -882,6 +892,7 @@
                                (every? #(true? (get-in % [:warning-meta
                                                           :raster.compiler/host-only]))
                                        methods))]
+       (publish-dispatch! v dispatch-obj table-atom)
        (alter-meta! v assoc
                     :raster.core/generic-function true
                     :raster.core/dispatch-table table-atom
@@ -919,7 +930,7 @@
                        (let [make-td (resolve 'raster.compiler.core.typed-dispatch/make-typed-dispatch)]
                          (if make-td (make-td fn-name table-atom dfn) dfn))
                        (catch Exception _ dfn))]
-    (alter-var-root fn-var (constantly dispatch-obj)))
+    (publish-dispatch! fn-var dispatch-obj table-atom))
   (bump-compiler-definition-revision!)
   fn-var)
 
@@ -936,6 +947,7 @@
       (let [table-atom (get-or-create-table! k)
             dfn (make-dispatch-fn simple-name table-atom false target-ns)
             v (intern target-ns simple-name dfn)]
+        (publish-dispatch! v dfn table-atom)
         (alter-meta! v assoc
                      :raster.core/generic-function true
                      :raster.core/dispatch-table table-atom)

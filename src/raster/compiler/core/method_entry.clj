@@ -44,8 +44,10 @@
          :snapshot-kind :emission-definition))
 
 (def ^:dynamic *emission-inputs*
-  "Request-local collector {:static [...], :values [...]} of consumed inputs.
-   A compiler producer binds this; it is neither a registry nor a cache."
+  "Request-local collector {:static [...], :values [...]} of consumed inputs,
+   including definitions consulted by normalization before emission. The owner
+   must validate collected observations before publication (and retain a guard
+   for dynamic execution). This is neither a registry nor a cache."
   nil)
 
 (defn- var-reference-current?
@@ -73,6 +75,86 @@
                            (if (= :emission-definition (:snapshot-kind snapshot))
                              (emission-definition-snapshot (:var snapshot))
                              (var-snapshot (:var snapshot))))))
+
+(defn observe-definition-input!
+  "Retain a definition actually consulted by a normalization proof.
+   Return false without a collecting owner: optional analysis must then decline.
+   Keep the first observation and all lookup sites, never refresh a stale proof."
+  [v lookup-ns lookup-symbol]
+  (when *emission-inputs*
+    (let [snapshot (assoc (emission-definition-snapshot v)
+                          :lookups #{[lookup-ns lookup-symbol]})]
+      (swap! *emission-inputs*
+             (fn [inputs]
+               (if-let [prior (get-in inputs [:definition-proofs v])]
+                 (do
+                   (when-not (same-var-snapshot? prior snapshot)
+                     (throw (ex-info "definition changed while deriving a compiler proof"
+                                     {:reason :unstable-definition-proof-input :source v})))
+                   (let [updated (update prior :lookups into (:lookups snapshot))]
+                     (-> inputs
+                         (assoc-in [:definition-proofs v] updated)
+                         ;; Emission artifacts serialize :values, not the
+                         ;; request-local proof index. Retain every lookup edge.
+                         (update :values
+                                 (fn [values]
+                                   (mapv #(if (identical? prior %) updated %) values))))))
+                 (-> inputs
+                     (assoc-in [:definition-proofs v] snapshot)
+                     (update :values (fnil conj []) snapshot)))))
+      true)))
+
+(defn assert-definition-inputs-current!
+  "Validate normalization's historical definition observations, not a fresh
+   post-hoc source traversal. Sequential staleness fence, not an ABA guarantee."
+  [inputs]
+  (doseq [snapshot (vals (:definition-proofs inputs))]
+    (when-not (var-snapshot-current? snapshot)
+      (throw (ex-info "compiler proof inputs changed before publication or execution"
+                      {:reason :stale-definition-proof-input :source (:var snapshot)}))))
+  true)
+
+(defn call-with-definition-inputs
+  "Own normalization and emission together for a static compiled artifact.
+   Dynamic executables additionally retain these observations in their existing
+   execution guard. A nested owner contributes to the enclosing collector.
+   Lazy compilation may replace a consulted definition: retry the WHOLE owning
+   compilation at most twice, never refresh observations around old output.
+   Resource-producing owners supply their own discard! for rejected results;
+   compile! remains responsible for cleanup when it throws before returning."
+  ([compile!] (call-with-definition-inputs compile! nil))
+  ([compile! discard!]
+  (let [attempt! (fn []
+                   (let [result (compile!)]
+                     (try
+                       (assert-definition-inputs-current! @*emission-inputs*)
+                       result
+                       (catch Throwable failure
+                         (when discard!
+                           (try (discard! result)
+                                (catch Throwable discard-failure
+                                  (.addSuppressed discard-failure failure)
+                                  (throw (ex-info "rejected compiler result could not be released"
+                                                  {:reason :definition-proof-discard-failed}
+                                                  discard-failure)))))
+                         (throw failure)))))]
+    (if *emission-inputs*
+      ;; An enclosing compilation must restart from its own earliest proof,
+      ;; not keep its stale observations while an inner owner retries.
+      (attempt!)
+      (loop [attempt 0]
+        (let [outcome (try
+                        {:result (binding [*emission-inputs* (atom {:static [] :values []})]
+                                   (attempt!))}
+                        (catch clojure.lang.ExceptionInfo failure {:failure failure}))]
+          (if-let [failure (:failure outcome)]
+            (if (and (< attempt 2)
+                     (contains? #{:stale-definition-proof-input
+                                  :unstable-definition-proof-input}
+                                (:reason (ex-data failure))))
+              (recur (inc attempt))
+              (throw failure))
+            (:result outcome))))))))
 
 (declare validate-static-emission!)
 
@@ -190,10 +272,41 @@
                         (= tags (:raster.core/deftm-tags source-meta))
                         (= argument-count (count params) (count tags)))
                {:entry entry :operation operation :implementation-op implementation-op
-                :source-var source :receiver-var receiver :parameters params :tags tags
+                :source-var source :generic-var generic :receiver-var receiver :parameters params :tags tags
                 :return-tag (:raster.core/return-tag source-meta)
                 :source-body (:raster.core/deftm-source-body source-meta)
                 :walked-body (:raster.core/deftm-walked-body source-meta)}))))
+       (get @table argument-count)))))
+
+(defn direct-selected-definition
+  "Correspondence for an already selected plain mangled function call.
+   The dispatcher and table must have their producer-owned identity; the exact
+   registered invocation target must still occupy the mangled Var. This selects
+   no overload, executes nothing and does not infer presence or argument types."
+  [operation implementation-op argument-count]
+  (let [generic (retained-global-var operation)
+        source (retained-global-var implementation-op)
+        table (:raster.core/dispatch-table (meta generic))
+        owner (:raster.core/dispatch-owner (meta generic))]
+    (when (and generic source table
+               (identical? generic (:var owner))
+               (identical? table (:table owner))
+               (bound? generic) (identical? (var-get generic) (:root owner)))
+      (some
+       (fn [{:keys [tags mangled-ns target-fn typed-target-fn] :as entry}]
+         (let [name (types/mangle (symbol (name operation)) tags)
+               metadata (meta source)
+               parameters (:raster.core/deftm-params metadata)]
+           (when (and (= implementation-op (symbol (str mangled-ns) (str name)))
+                      (or (nil? typed-target-fn) (identical? target-fn typed-target-fn))
+                      (bound? source) (identical? target-fn (var-get source))
+                      (= tags (:raster.core/deftm-tags metadata))
+                      (= argument-count (count parameters) (count tags)))
+             {:entry entry :operation operation :implementation-op implementation-op
+              :source-var source :generic-var generic :parameters parameters :tags tags
+              :return-tag (:raster.core/return-tag metadata)
+              :source-body (:raster.core/deftm-source-body metadata)
+              :walked-body (:raster.core/deftm-walked-body metadata)})))
        (get @table argument-count)))))
 
 (def ^:dynamic *compilation-classloader*

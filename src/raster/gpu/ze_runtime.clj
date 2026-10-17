@@ -1868,10 +1868,19 @@
   [compile-thunk]
   (let [arena-id (make-kernel-arena!)]
     (binding [*current-arena* arena-id]
-      (let [compiled (compile-thunk)]
-        ;; If the pipeline injected Closeable into the reify, it's already there.
-        ;; Always store :arena-id in metadata for ze/close! and introspection.
-        (with-meta compiled (assoc (meta compiled) :arena-id arena-id))))))
+      (try
+        (let [compiled (compile-thunk)]
+          ;; If the pipeline injected Closeable into the reify, it's already there.
+          ;; Always store :arena-id in metadata for ze/close! and introspection.
+          (with-meta compiled (assoc (meta compiled) :arena-id arena-id)))
+        (catch Throwable failure
+          (try (close-kernel-arena! arena-id)
+               (catch Throwable cleanup-failure
+                 (.addSuppressed cleanup-failure failure)
+                 (throw (ex-info "failed GPU compilation arena could not be released"
+                                 {:reason :gpu-compilation-cleanup-failed :arena-id arena-id}
+                                 cleanup-failure))))
+          (throw failure))))))
 
 (defn register-kernel!
   "Register a kernel's compilation artifacts (source, spv-bytes, etc.).

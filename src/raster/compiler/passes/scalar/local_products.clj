@@ -22,7 +22,8 @@
   (with-meta (apply list children) (meta original)))
 
 (defn- fact [env expression]
-  (cond (literal? expression) (cond-> {:literal expression}
+  (cond (literal? expression) (cond-> {:literal expression
+                                     :presence (if (nil? expression) :absent :present)}
                                (number? expression)
                                (assoc :scalar-type (some-> (inference/infer-arg-tag expression {})
                                                           dtype/dtype-for-scalar-tag)))
@@ -62,8 +63,9 @@
   (if (and (seq? test) (= 2 (count test)) (symbol? (second test))
            (= 'clojure.core/nil? (descriptor/semantic-op test)))
     (let [value (second test) known (get env value)]
-      [(assoc env value (-> known (dissoc :fields :present? :scalar-type) (assoc :literal nil)))
-       (assoc env value (-> known (dissoc :literal) (assoc :present? true)))])
+      [(assoc env value (-> known (dissoc :fields :present? :scalar-type :array-tag)
+                           (assoc :literal nil :presence :absent)))
+       (assoc env value (-> known (dissoc :literal) (assoc :present? true :presence :present)))])
     [env env]))
 
 (def ^:private conditional-expansion-limit 4096)
@@ -114,12 +116,15 @@
         known (or known
                   (when-let [proof (scalar-body/checked-selected-primitive-result init)]
                     {:present? true :scalar-type (:type proof)})
-                  (when (= :present (normal-return/presence init)) {:present? true}))
+                  (let [result (normal-return/result-fact init scope)]
+                    (when (= :present (:presence result))
+                      (assoc result :present? true))))
         retained (some-> (:raster.type/tag (meta id)) dtype/dtype-for-scalar-tag)
         ;; Retained consumer declarations are not physical producer evidence.
         ;; Keep that distinction through aliases for checked sum projection.
         producer-type (or (:producer-scalar-type known) (:scalar-type known))]
     (cond-> known
+      (:present? known) (assoc :presence :present)
       producer-type (assoc :producer-scalar-type producer-type)
       (and (:scalar-type known) retained) (assoc :scalar-type retained))))
 
@@ -143,6 +148,16 @@
                probe (with-meta (apply list (first addition) ports) (meta addition))
                proof (scalar-body/checked-primitive-result probe (zipmap ports (repeat dt)))]
            (= dt (:type proof))))))))
+
+(defn- project-array-accumulation [env expression]
+  (when (accumulation/approved-call? expression)
+    (let [facts (mapv #(normal-return/result-fact % env)
+                      (:arguments (descriptor/call-description expression)))]
+      (accumulation/project-checked-array-addition
+       expression facts
+       (fn [addition tag]
+         (= {:presence :present :array-tag tag}
+            (normal-return/result-fact addition env)))))))
 
 (defn- lower-let [env expression products?]
   (let [[head bindings & body] expression]
@@ -260,7 +275,8 @@
 
     (seq? expression)
     (let [lowered (relist expression (map #(lower env % products?) expression))]
-      (or (project-scalar-accumulation env lowered) lowered))
+      (or (project-scalar-accumulation env lowered)
+          (project-array-accumulation env lowered) lowered))
     (vector? expression) (with-meta (mapv #(lower env % products?) expression) (meta expression))
     (map? expression) (into (empty expression) (map (fn [[k v]] [(lower env k products?) (lower env v products?)])) expression)
     (set? expression) (into (empty expression) (map #(lower env % products?)) expression)

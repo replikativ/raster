@@ -16,6 +16,7 @@
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -675,6 +676,8 @@
   ([f-var] (compile f-var {}))
   ([f-var options] (compile f-var options nil))
   ([f-var {:keys [target dtype] :or {target :ze:0} :as options} captured-target]
+   (method-entry/call-with-definition-inputs
+    (fn []
    (when (contains? options :resident-outputs)
      (fail! :equation-first-resident-outputs
             "explicit resident outputs are available only for source-free TypedSOAC compilation"
@@ -748,7 +751,7 @@
              {:id id :function-id (function-symbol f-var) :target target
               :dtype (:dtype compiler-options) :source-ns source-ns-symbol
               :options options :compiler-options compiler-options})
-      semantic))))
+      semantic))))))
 
 (defn- lower-in-context
   "Specialize a compiled equation-first program against ordered public arguments.

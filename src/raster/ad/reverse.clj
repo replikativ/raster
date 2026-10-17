@@ -201,7 +201,7 @@
           (identical? (:root approved-grad-acc-definition) (.getRawRoot ^clojure.lang.Var v))
           (= (:metadata approved-grad-acc-definition) (meta v))))))
 
-;; Typed only when both adjoints share a tag: a known tag rules out nil, and
+;; A common retained tag describes the payload carrier, not its presence, and
 ;; mixed scalar/array operands broadcast to the array, so no single arg decides.
 (op/register-result-type! 'raster.ad.reverse/grad-acc :common-arg-tag)
 
@@ -1229,112 +1229,11 @@
   [rev-ctx kvs]
   (update rev-ctx :bindings into kvs))
 
-(def ^:private nil-possible-heads
-  "Adjoint-IR operator heads whose result MAY be the dynamic 0̄ (nil): the
-  nil-safe `grad-acc` fold (nil iff both inputs nil), a pullback-vector slot
-  `nth` (nil for an inactive/zero component), and `if` (an untaken branch may be
-  a nil zero). Anything else in adjoint position is an allocated array/number
-  kernel output, hence non-nil."
-  '#{raster.ad.reverse/grad-acc grad-acc
-     clojure.core/nth nth
-     if if*})
-
-(defn- provably-non-nil-contrib?
-  "Conservative static test: can `contrib` NEVER evaluate to nil (the dynamic 0̄)?
-  True only when `contrib` resolves — possibly through a chain of pure symbol
-  ALIASES in `binding-map` (the rev-ctx bindings gathered so far) — to a plain
-  op-call whose head is not a nil-producing form, i.e. a real backward-kernel /
-  allocation output (`linear-dx`, `mse-grad`, `rms-norm-backward-dx`,
-  `residual-add`, `float-array`, …).
-
-  Alias-following is essential: a residual cotangent is a bare symbol alias.
-  `sum-contribs` returns a single contribution AS ITSELF (an alias), and
-  `residual-add`'s identity-grad passthrough forwards its output adjoint SYMBOL to
-  both input slots — so a fan-out contribution like `d_z` binds to `d_pred` which
-  binds to `(mse-grad …)`. TWO symbol hops precede the kernel. We chase them,
-  validating EVERY hop.
-
-  Returns false for: a literal nil, a `(nth grads i)` pullback slot, a nil-safe
-  `grad-acc`, an `(if …)`, a symbol bound to any of those (directly or through
-  aliases), or a free symbol not in `binding-map` (a param / the `dy__rad` seed —
-  we can't vouch for it). When in doubt, false: the caller then keeps the nil-safe
-  `grad-acc` fold.
-
-  SOUND because every binding is a pure SSA alias (`s1 = s2` ⇒ equal runtime
-  values) and the binding-map is acyclic (reverse-pass gensyms, each bound once,
-  referencing only earlier bindings). A chain is non-nil iff its terminal op-call
-  is non-nil, and EVERY hop is checked — a chain passing through a nil-possible
-  head (grad-acc / nth / if) or a nil binding is still rejected. This is what keeps
-  the resident `residual-add` reroute nil-safe: `residual-add` has no nil check, so
-  it may only see cotangents that are provably present."
-  [binding-map contrib]
-  (letfn [(go [c seen]
-              (cond
-                (nil? c)     false
-                (symbol? c)  (cond
-                               (contains? seen c)        false   ;; cycle guard (SSA ⇒ unreachable)
-                               (contains? binding-map c) (recur (get binding-map c) (conj seen c))
-                               :else                     false)  ;; free var / dy__rad seed
-                (seq? c)     (and (symbol? (first c))
-                                  (not (contains? nil-possible-heads (first c))))
-                :else        false))]
-    (go contrib #{})))
-
 (defn- sum-contribs-into
-  "Bind `target-sym` to the sum of `contribs` (default when empty) inside
-  `rev-ctx`, choosing a GPU-RESIDENT lowering for the multi-contribution ARRAY
-  fan-out case.
-
-  For a SCALAR (or empty / single-contribution) target this is exactly the old
-  `(bindings-into rev-ctx [target-sym (sum-contribs contribs default)])`: the
-  scalar fold stays `grad-acc` (its nil-safety is load-bearing on the interpreted
-  CPU path, and a scalar grad-acc lowers as a host scalar-let anyway).
-
-  For an ARRAY target with ≥2 contributions that are ALL PROVABLY NON-NIL — a
-  value/param that FANS OUT to several ACTIVE downstream consumers (e.g. `xn`
-  feeding q/k/v, whose cotangents are `linear-dx` kernel outputs) — `grad-acc`'s
-  nil-safe `defn` has no GPU kernel, so the array accumulation hits
-  `:unlowered-array-op` and defeats residency. Here we instead SEED the
-  accumulator with the first contribution directly (numerically identical to
-  `(reduce grad-acc contribs)`, which also starts from the first element) and fold
-  the rest with the already RESIDENT element-wise `raster.dl.nn/residual-add` (a
-  `broadcast +` → `:map` kernel). Each intermediate accumulator is stamped with
-  the target's array `tag` so it devirtualizes to the cotangent element dtype
-  (float here, not a silently-widened double). The per-add element count is
-  `(alength <seed>)`, which `resolve-alength` traces to the seed buffer's
-  allocation size host-side.
-
-  CRITICAL soundness gate: `residual-add` has NO nil check, but a cotangent
-  contribution can be nil at RUNTIME (a statically-nil template gradient, a
-  pullback slot for an inactive arg, an untaken `if` branch). grad-acc's
-  `(nil? b) → a` silently drops those; residual-add would NPE. So the reroute
-  fires ONLY when every contribution is `provably-non-nil-contrib?`; otherwise we
-  keep the nil-safe grad-acc fold (correct on CPU, and grad-acc still lowers as a
-  host scalar-let for scalars / is DCE'd when dead). This is exactly the
-  attention-block fan-out (all q/k/v cotangents are active kernel outputs) while a
-  dot-product / train-step d_W accumulation — which includes a nil template
-  gradient — falls back to grad-acc unchanged."
-  [rev-ctx target-sym contribs default tag]
-  (let [binding-map (into {} (map vec (partition 2 (:bindings rev-ctx))))]
-    (if (and (>= (count contribs) 2)
-             (= :array (:kind (tangent/tangent-kind tag)))
-             (every? #(provably-non-nil-contrib? binding-map %) contribs))
-      (let [[seed & more] contribs
-            n-sym   (ad-gensym "gacc_n")
-            rev-ctx (bindings-into rev-ctx [n-sym (list 'raster.arrays/alength seed)])
-            ;; Fold the remaining contributions with the resident add; the LAST add
-            ;; binds `target-sym` directly (no trailing alias for the extractor to
-            ;; copy-propagate). Intermediates carry `tag` → float-typed buffers.
-            n     (count more)
-            kvs   (loop [acc seed, cs more, i 0, out []]
-                    (if (empty? cs)
-                      out
-                      (let [dst (if (= i (dec n)) target-sym (ad-gensym "gacc" tag))]
-                        (recur dst (rest cs) (inc i)
-                               (into out [dst (list 'raster.dl.nn/residual-add
-                                                    acc (first cs) n-sym)])))))]
-        (bindings-into rev-ctx kvs))
-      (bindings-into rev-ctx [target-sym (sum-contribs contribs default)]))))
+  "Retain ordered optional accumulation. Physical array lowering belongs to
+   the shared producer/presence analysis, not a blacklist of source call heads."
+  [rev-ctx target-sym contribs default]
+  (bindings-into rev-ctx [target-sym (sum-contribs contribs default)]))
 
 (defmulti ^:private emit-backward
   "Reverse-pass per-record emission (PURE): returns the updated
@@ -1637,8 +1536,7 @@
                               (reduce (fn [{:keys [adjoints rev-ctx]} {:keys [key tag]}]
                                         (let [scalar? (= :scalar (:kind (tangent/tangent-kind tag)))
                                               raw (ad-gensym "field_contribution" (when-not scalar? tag))
-                                              accumulated (sum-contribs-into rev-ctx raw (get adj-env key) nil
-                                                                            (when-not scalar? tag))
+                                              accumulated (sum-contribs-into rev-ctx raw (get adj-env key) nil)
                                               value (if scalar? (ad-gensym "field_cotangent" tag) raw)
                                               accumulated (if scalar?
                                                             ;; A primal-space declaration is not evidence
@@ -1668,10 +1566,9 @@
            adj-sym (if product? (:adjoints product-adjoints)
                        (when-not array-type? (ad-gensym (str "d_" (name sym)) accumulated-tag)))
            rev-ctx (if (and (not product?) adj-sym)
-                     ;; Fan-out array cotangent (e.g. d_xn from q/k/v) folds via
-                     ;; the resident residual-add; scalars keep the nil-safe
-                     ;; grad-acc fold. See sum-contribs-into.
-                     (sum-contribs-into rev-ctx adj-sym adj-contribs nil accumulated-tag)
+                     ;; Presence and physical array lowering are established by
+                     ;; the shared producer pass, never from the target tag.
+                     (sum-contribs-into rev-ctx adj-sym adj-contribs nil)
                      rev-ctx)
            raw-adjoint adj-sym
            adj-sym (if (and scalar? (not product?) (not array-type?))
@@ -1769,11 +1666,10 @@
              default (when-not (or (:internal-region? *generated-product-context*)
                                    (:internal-region? *source-memory-context*))
                        (param-zero-expr p))
-             ;; ARRAY param fan-out (a weight consumed by ≥2 ops) accumulates via
-             ;; the resident residual-add (no scalar projection applies to arrays).
+             ;; Array and scalar contributions share the same optional sum.
              rev-ctx
              (if (and (= kind :array) (>= (count contribs) 2))
-               (sum-contribs-into rev-ctx adj-sym contribs default tag)
+               (sum-contribs-into rev-ctx adj-sym contribs default)
                (let [raw (sum-contribs contribs default)
                      expr (if (= kind :scalar)
                             (tangent/project-expr
@@ -4139,8 +4035,10 @@
                                {:raster.type/tag return-tag})
               entry-guard (capture source-ns expected [{:parameters all-params :body completed-body}])
               _ (entry-guard)
+              proof-inputs (atom {:static [] :values []})
               program
               (binding [*ns* source-ns
+                        method-entry/*emission-inputs* proof-inputs
                         *generated-product-context* nil
                         *constant-gradient-arrays* (set (keep-indexed
                                                         (fn [index parameter]
@@ -4172,6 +4070,7 @@
                         (throw (ex-info "paired helper interface registration changed"
                                         {:reason :ad-paired-helper-interface})))
                       (entry-guard)
+                      (method-entry/assert-definition-inputs-current! @proof-inputs)
                       (program-guard))
               _ (guard)
               companion (binding [*ns* source-ns
@@ -6047,7 +5946,10 @@
          ;; code derived in one epoch could be blessed with the next epoch.
          expected-revisions (when product?
                               ((requiring-resolve 'raster.ad.normalized-scalar/revisions)))
-         product-program (when product? (generated-product-form generated-call params))
+         proof-inputs (atom {:static [] :values []})
+         product-program (when product?
+                           (binding [method-entry/*emission-inputs* proof-inputs]
+                             (generated-product-form generated-call params)))
          normalized (when-not product? (ordered-call/normalize-resolved-call generated-call gensym (set params)))
          source (if product?
                   (:form product-program)
@@ -6100,6 +6002,7 @@
                              (capture *ns* expected-revisions
                                       [{:parameters (into (vec params) (map :port captures)) :body body}])]
                          (fn []
+                           (method-entry/assert-definition-inputs-current! @proof-inputs)
                            (program-guard)
                            (doseq [helper-guard (:guards product-program)] (helper-guard))))))
              execute (source-owner/compile-function
