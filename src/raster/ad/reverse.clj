@@ -1206,13 +1206,35 @@
   ;; Their checked activity says there is no input tangent to transpose.
   state)
 
+(defn- lift-pullback-over-absence
+  "Lift a checked pullback over the dynamic absent cotangent (nil).
+   Do not execute its bindings on an absent edge. Numeric zero is a present
+   edge and must retain the template's arithmetic, including singularities."
+  [before after grad-syms adjoint]
+  (let [prefix (vec (:bindings before))
+        body (subvec (vec (:bindings after)) (count prefix))
+        result (ad-gensym "present_pullback")
+        slots (mapv (fn [gradient]
+                      (when (some? gradient)
+                        (ad-gensym "present_gradient" (:raster.type/tag (meta gradient)))))
+                    grad-syms)
+        guarded (list 'if (list 'clojure.core/nil? adjoint)
+                      (vec (repeat (count grad-syms) nil))
+                      (list 'let* body (vec grad-syms)))
+        bindings (vec (concat prefix [result guarded]
+                              (mapcat (fn [[index slot]]
+                                        (when slot [slot (list 'clojure.core/nth result index)]))
+                                      (map-indexed vector slots))))]
+    [(assoc after :bindings bindings) slots]))
+
 (defmethod emit-backward :call
   [{:keys [sym base-op args active-args]} adj-sym _activity {:keys [adj-env rev-ctx]}]
   (let [[template _] (tmpl/resolve-template base-op)
         has-template? (and template (or (:grads template) (:grads-fn template)))]
     (if has-template?
       ;; Template path: ctx-aware instantiation (already pure — returns new ctx).
-      (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx template args sym adj-sym rev-ctx)]
+      (let [[template-ctx template-grads] (tmpl/instantiate-template-ctx template args sym adj-sym rev-ctx)
+            [new-ctx grad-syms] (lift-pullback-over-absence rev-ctx template-ctx template-grads adj-sym)]
         {:rev-ctx new-ctx
          :adj-env (reduce (fn [ae [i grad-sym]]
                             (if (and (some? grad-sym) (< i (count args))
@@ -1223,9 +1245,12 @@
       ;; Closure fallback — nil pullback entries propagate as nil.
       (let [pb-sym (ad-gensym "pb") grads-sym (ad-gensym "grads")]
         {:rev-ctx (bindings-into rev-ctx
-                                 [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
-                                                      (list 'quote base-op)) sym args)
-                                  grads-sym (list pb-sym adj-sym)])
+                                 [grads-sym
+                                  (list 'if (list 'clojure.core/nil? adj-sym)
+                                        (vec (repeat (count args) nil))
+                                        (list 'let* [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
+                                                                       (list 'quote base-op)) sym args)]
+                                              (list pb-sym adj-sym)))])
          :adj-env (reduce (fn [ae [i arg]]
                             (if (and (symbol? arg) (contains? active-args arg))
                               (update ae arg (fnil conj []) (list 'nth grads-sym i))
