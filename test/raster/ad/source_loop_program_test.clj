@@ -119,18 +119,21 @@
 (deftest unvisited-writing-loop-fragments-are-not-certified-by-summary
   ;; Exercise the parsed phase boundary directly: surface normalization can
   ;; move a recur argument into the checked prelude, which is a different case.
-  (doseq [[phase loop-form]
-          [[:test '(loop* [i 0 acc x]
+  (doseq [[reason phase loop-form]
+          [[:unclosed-loop-effect :test '(loop* [i 0 acc x]
                      (if (do (aset ys 0 7.0) (< i 2))
                        (recur (inc i) (* acc x)) acc))]
-           [:inactive-recur '(loop* [i 0 acc x]
+           ;; The shared step now visits inactive recur arguments. This raw
+           ;; private entry lacks a declared ys port, so it must still refuse
+           ;; the write rather than certifying it through a summary.
+           [:ad-unprojectable-write-root nil '(loop* [i 0 acc x]
                                (if (< i 2)
                                  (recur (let* [s (identity ys) ignored (aset s 0 7.0)] (inc i))
                                         (* acc x)) acc))]]]
     (with-bindings {#'rev/*gensym-counter* (atom 0)}
       (let [failure (try (#'rev/gen-reverse-loop-program* loop-form '[x]) nil
                          (catch clojure.lang.ExceptionInfo e (ex-data e)))]
-        (is (= :unclosed-loop-effect (:reason failure)))
+        (is (= reason (:reason failure)))
         (is (= phase (:phase failure)))))))
 
 (deftest nested-pullback-replay-survives-parent-map-boundary
