@@ -30,7 +30,7 @@ AD records on the default path. Those remain requirements before default normali
 
 ## Internal structural product interpretation
 
-The explicit generated-source owner additionally accepts a closed, straight-line
+The explicit generated-source owner additionally accepts a closed, read-only
 SSA binding program with declared numeric input carriers and a scalar result.
 This is not source-call discovery or permission to normalize arbitrary arguments.
 Literal immutable vectors are products; constant projections and exact aliases
@@ -59,6 +59,27 @@ for rule/callee staleness. That sequential guard is not an ABA or lifetime proof
 Default source AD, imported/conditional products, general loops, higher-order
 closure and real training acceptance are separate remaining obligations. The
 focused analytic/finite-difference tests qualify only this internal interpretation.
+
+Scalar-result conditional regions now use the existing conditional residual
+producer and reverse-program pieces to import captured product schemas and
+export cotangents by field path. Child-local SSA identities never become schema
+facts. Only the selected arm and its residual execute. Nested regions retain
+lexical scope; the input checker accepts only already-ordered trivial call
+operands, not arbitrary source-call normalization.
+
+Internal region exports remain sparse for scalar, array and product captures.
+An undemanded slot is nil, not numeric zero. Call pullbacks in this explicit
+interpretation execute only for a present seed; an actual zero still executes
+the derivative arithmetic, including singularities. The final public gradient
+boundary alone materializes absent slots as typed/shape-matched zeros. This
+distinction is necessary to avoid evaluating an upstream singular derivative
+on a zero that the compiler invented for an unused capture.
+
+Product-valued choices still refuse until both arms have a checked field-seed
+interface. This does not yet admit public product parameters, derivative re-entry
+through mixed original/generated calls, higher-order product differentiation or
+the held training migration. Existing Hessian/D/SGD tests remain default-path
+regression controls, not evidence of those additional capabilities.
 
 ## Current implementation boundary
 
