@@ -24,6 +24,7 @@
             [raster.ad.purity :as purity]
             [raster.numeric :as numeric]
             [raster.ad.templates :as tmpl]
+            [raster.ad.product-ports :as product-ports]
             [raster.compiler.ad.bind-ctx :as bind-ctx]
             [raster.compiler.ad.flatten :as ad-flatten]
             [raster.compiler.core.op-descriptor :as op]
@@ -75,6 +76,8 @@
    Child fact catalogs do not extend visibility or prove freshness."
   {:values [] :value-facts {} :replayed {} :unprojectable {} :aliases {}})
 
+(def ^:private ^:dynamic *generated-product-context* nil)
+
 (defn- gradient-bearing-array-read?
   "Only reads from differentiated arrays need scatter cotangents. Reads from
   explicitly constant parameter arrays stay ordinary scalar expressions."
@@ -88,9 +91,14 @@
   Optional type-tag stamps :raster.type/tag metadata so downstream
   passes can read types without re-inference."
   ([prefix]
-   (symbol (str prefix "__" (swap! *gensym-counter* inc))))
+   (loop [id (symbol (str prefix "__" (swap! *gensym-counter* inc)))]
+     (if-let [used (:used-identifiers *generated-product-context*)]
+       (if (contains? @used id)
+         (recur (symbol (str prefix "__" (swap! *gensym-counter* inc))))
+         (do (swap! used conj id) id))
+       id)))
   ([prefix type-tag]
-   (let [sym (symbol (str prefix "__" (swap! *gensym-counter* inc)))]
+   (let [sym (ad-gensym prefix)]
      (if type-tag
        (vary-meta sym assoc :raster.type/tag type-tag)
        sym))))
@@ -370,6 +378,18 @@
   orchestrators (gen-reverse-let / gen-reverse-loop-with-let / reify-pullback)."
   [init-expr activity]
   (cond
+    (and *generated-product-context* (vector? init-expr))
+    (boolean (some #(get activity % false) (util/free-syms init-expr)))
+
+    (and *generated-product-context* (value-completion/canonical-parts init-expr))
+    (boolean (some #(get activity % false)
+                   (util/free-syms (:operand (value-completion/canonical-parts init-expr)))))
+
+    (and *generated-product-context*
+         (product-ports/projection-plan 'activity init-expr (:value-facts *source-memory-context*)))
+    (boolean (seq (:active-paths
+                   (product-ports/projection-plan 'activity init-expr (:value-facts *source-memory-context*)))))
+
     ;; Literal: never active (a symbol alias is active iff its source is)
     (trivial-expr? init-expr)
     (if (symbol? init-expr) (get activity init-expr false) false)
@@ -469,6 +489,17 @@
   symbol, used only for a fail-loud message on unsupported control-flow forms."
   [init-expr active? sym]
   (cond
+    (and *generated-product-context* (vector? init-expr)) :product
+    (and *generated-product-context* (symbol? init-expr)
+         (get-in *source-memory-context* [:value-facts init-expr :product])) :product-alias
+    (and *generated-product-context* (value-completion/canonical-parts init-expr)) :completion
+    (and *generated-product-context*
+         (product-ports/projection-plan sym init-expr (:value-facts *source-memory-context*))) :product-projection
+    (and *generated-product-context* active? (seq? init-expr)
+         (some #(get-in *source-memory-context* [:value-facts % :product])
+               (:arguments (op/call-description init-expr))))
+    (throw (ex-info "active product has no closed structural consumer"
+                    {:reason :ad-unsupported-product-use :init init-expr :sym sym}))
     (and (seq? init-expr) (soac-record-kinds (first init-expr)))   (soac-record-kinds (first init-expr))
     (not active?)                                                   :inactive
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
@@ -515,6 +546,37 @@
   (fn [kind _sym _init-expr _activity] kind))
 
 (defmethod ad-record :inactive [_ _sym _init _activity] {:record nil})
+
+(defn- product-record [sym plan]
+  (let [structured? (= :product (get-in plan [:schema :kind]))]
+    {:record {:type :product-edges :sym sym :edges (:edges plan)
+              :cotangent-ports (mapv (fn [edge] {:key (:port edge) :tag (:tag edge)})
+                                     (filter :active? (:edges plan)))
+              :value-facts (when structured?
+                             {sym {:product (select-keys plan [:schema :active-paths])}})}}))
+
+(defmethod ad-record :product [_ sym init activity]
+  (product-record sym (product-ports/literal-plan sym init (:value-facts *source-memory-context*) activity)))
+
+(defmethod ad-record :product-projection [_ sym init _activity]
+  (product-record sym (product-ports/projection-plan sym init (:value-facts *source-memory-context*))))
+
+(defmethod ad-record :product-alias [_ sym source _activity]
+  (let [{:keys [schema active-paths]} (get-in *source-memory-context* [:value-facts source :product])]
+    (product-record sym {:schema schema :active-paths active-paths
+                         :edges (mapv (fn [[path leaf]]
+                                        {:port (product-ports/field-port sym path)
+                                         :source (product-ports/field-port source path)
+                                         :tag (:tag leaf) :active? (contains? active-paths path)})
+                                      (product-ports/leaf-paths schema))})))
+
+(defmethod ad-record :completion [_ sym init _activity]
+  (let [{:keys [contract operand]} (value-completion/canonical-parts init)]
+    (when-not (and (symbol? operand)
+                   (contains? #{:jvm-object-input :jvm-checkcast} (:source-context contract)))
+      (throw (ex-info "generated completion does not have a structural identity transpose"
+                      {:reason :ad-unclosed-completion-transpose :init init})))
+    {:record {:type :alias :sym sym :source operand :result-alias operand}}))
 
 ;; out[e] = src[index[e]] (strided: blocks of `stride`). The forward runs as
 ;; written; the pullback is its transpose, a scatter-add into d_src.
@@ -937,7 +999,8 @@
    (fn [{:keys [activity fwd-bindings records replayed writes aliases input-replay-conditions
                 values value-facts unprojectable]}
         [sym init-expr]]
-     (let [active?  (init-active? init-expr activity)
+     (let [active?  (binding [*source-memory-context* (assoc *source-memory-context* :value-facts value-facts)]
+                      (init-active? init-expr activity))
            activity (assoc activity sym active?)
            may-aliases #(memory/transitive-closure (set %) aliases)
            scope (source-memory-scope
@@ -948,13 +1011,14 @@
            ;; Inactive choices can still change storage dependencies. Shared
            ;; effect analysis selects the existing scoped adapter conservatively;
            ;; it is not a freshness or derivative certificate.
-           kind (if (and (seq? init-expr) (= 'if (first init-expr))
+           kind (binding [*source-memory-context* scope]
+                  (if (and (seq? init-expr) (= 'if (first init-expr))
                          (or (and (or (seq ambient) (seq unknown))
                                   (seq (written-syms init-expr)))
                              (and (not active?)
                                   (not= :pure (effects/analyze-effect init-expr)))))
                   :if
-                  (ad-form-kind init-expr active? sym))
+                  (ad-form-kind init-expr active? sym)))
            {:keys [record fwd-patch]}
            (binding [*source-memory-context* scope]
              (ad-record kind sym init-expr activity))
@@ -1047,8 +1111,10 @@
         ;; identity comes from the existing record or shared exact-tail authority.
         :values (conj values sym)
         :value-facts (assoc value-facts sym
-                            {:value sym :alias (or (:result-alias record)
-                                                   (form/tail-symbol init-expr))})
+                            (cond-> {:value sym :alias (or (:result-alias record)
+                                                           (form/tail-symbol init-expr))}
+                              (get-in value-facts [sym :product])
+                              (assoc :product (get-in value-facts [sym :product]))))
         :unprojectable (join-input-replay-conditions unprojectable private-conditions)
         :input-replay-conditions (join-input-replay-conditions
                                   input-replay-conditions
@@ -1207,6 +1273,15 @@
   ;; Primal-only regions still own their memory footprint and result identity.
   ;; Their checked activity says there is no input tangent to transpose.
   state)
+
+(defmethod emit-backward :product-edges
+  [{:keys [edges]} adjoints _activity {:keys [adj-env rev-ctx]}]
+  {:rev-ctx rev-ctx
+   :adj-env (reduce (fn [environment {:keys [port source active?]}]
+                      (if (and active? (contains? adjoints port))
+                        (update environment source (fnil conj []) (get adjoints port))
+                        environment))
+                    adj-env edges)})
 
 (defmethod emit-backward :call
   [{:keys [sym base-op args active-args]} adj-sym _activity {:keys [adj-env rev-ctx]}]
@@ -1412,24 +1487,34 @@
   ([records activity seed-adj-env value-facts]
   (reduce
    (fn [{:keys [adj-env rev-ctx pullback-replays pullback-replay-conditions]} {:keys [type sym] :as record}]
-     (let [;; Array writers can receive cotangents through either their result
+     (let [product? (contains? record :cotangent-ports)
+           incoming-ports (when product?
+                            (filter #(seq (get adj-env (:key %))) (:cotangent-ports record)))
+           product-adjoints (when product?
+                              (reduce (fn [{:keys [adjoints rev-ctx]} {:keys [key tag]}]
+                                        (let [value (ad-gensym "field_cotangent" tag)]
+                                          {:adjoints (assoc adjoints key value)
+                                           :rev-ctx (sum-contribs-into rev-ctx value (get adj-env key) nil tag)}))
+                                      {:adjoints {} :rev-ctx rev-ctx} incoming-ports))
+           rev-ctx (if product? (:rev-ctx product-adjoints) rev-ctx)
+           ;; Array writers can receive cotangents through either their result
            ;; or any declared output buffer. No incoming edge means no reverse
            ;; execution; an explicit nil/zero-valued seed is still an edge.
            array-type? (boolean (seq (:written-arrs record)))
            output-demand? (when array-type?
                             (some #(seq (get adj-env %))
                                   (cons sym (:written-arrs record))))
-           adj-contribs (when-not array-type? (get adj-env sym))
+           adj-contribs (when-not (or product? array-type?) (get adj-env sym))
            sym-tag (:raster.type/tag (meta sym))
-           adj-sym (when-not array-type?
-                     (ad-gensym (str "d_" (name sym)) sym-tag))
-           rev-ctx (if adj-sym
+           adj-sym (if product? (:adjoints product-adjoints)
+                       (when-not array-type? (ad-gensym (str "d_" (name sym)) sym-tag)))
+           rev-ctx (if (and (not product?) adj-sym)
                      ;; Fan-out array cotangent (e.g. d_xn from q/k/v) folds via
                      ;; the resident residual-add; scalars keep the nil-safe
                      ;; grad-acc fold. See sum-contribs-into.
                      (sum-contribs-into rev-ctx adj-sym adj-contribs nil sym-tag)
                      rev-ctx)]
-       (if (or output-demand? adj-contribs)
+       (if (or (seq incoming-ports) output-demand? adj-contribs)
          (let [memory-effects (record-memory-effects record nil)]
            (assoc (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
                   :pullback-replays (into pullback-replays (:replays memory-effects))
@@ -5255,6 +5340,94 @@
           unpack (vec (mapcat (fn [p i] [p (list 'clojure.core/nth args-sym i)]) params (range)))]
       (list 'fn ['& args-sym] (list 'let unpack body)))))
 
+(defn- generated-product-form
+  [program params]
+  (let [{:keys [bindings result active-inputs source-policy]} program
+        names (when (vector? bindings) (vec (take-nth 2 bindings)))
+        selected-inputs (when (vector? active-inputs) (mapv (zipmap params params) active-inputs))]
+    (when-not (and (= #{:kind :bindings :result :active-inputs :source-policy} (set (keys program)))
+                   (= :generated-product-bindings (:kind program))
+                   (vector? params) (every? #(and (symbol? %) (nil? (namespace %))) params)
+                   (= (count params) (count (distinct params)))
+                   (value-completion/source-policy? source-policy)
+                   (vector? bindings) (even? (count bindings))
+                   (every? #(and (symbol? %) (nil? (namespace %))) names)
+                   (= (count names) (count (distinct names)))
+                   (empty? (set/intersection (set names) (set params)))
+                   (symbol? result) (contains? (into (set params) names) result)
+                   (vector? active-inputs) (= (count active-inputs) (count (distinct active-inputs)))
+                   (every? (set params) active-inputs))
+      (throw (ex-info "generated product AD requires a closed SSA binding program"
+                      {:reason :ad-generated-product-program})))
+    (doseq [parameter params]
+      (when-not (or (get types/primitive-info (types/sym-type-tag parameter))
+                    (get types/primitive-array-info (types/sym-type-tag parameter)))
+        (throw (ex-info "generated product input requires a numeric carrier declaration"
+                        {:reason :ad-generated-input-carrier :parameter parameter}))))
+    (doseq [parameter selected-inputs]
+      (when-not (tangent/differentiable? (types/sym-type-tag parameter))
+        (throw (ex-info "generated product input has no retained tangent declaration"
+                        {:reason :ad-product-unknown-tangent :parameter parameter}))))
+    ;; This first structural interpreter is straight-line and read-only. It is
+    ;; not a new route around the existing loop/choice or memory contracts.
+    (reduce
+     (fn [visible [name expression]]
+       (let [completion (value-completion/canonical-parts expression)
+             {:keys [operation arguments dispatch?]} (when (seq? expression) (op/call-description expression))
+             operator (when (symbol? operation) (resolve operation))]
+         (when (and (seq? expression) (not completion)
+                    (not (and (= :call (:kind (form/form-info expression)))
+                               ;; Captured/host/dynamic callees need their own
+                               ;; correspondence; do not infer it from a name.
+                               (not dispatch?) (qualified-symbol? operation)
+                               (var? operator) (not (:macro (meta operator)))
+                               (every? trivial-expr? arguments)
+                               (not (op/mutating-op? (op/semantic-op expression)))
+                               (= :pure (effects/analyze-effect expression)))))
+           (throw (ex-info "generated product binding has an unclosed input or effect scope"
+                           {:reason :ad-generated-product-region :expression expression})))
+         ;; Data values used in another expression must already have been
+         ;; snapshotted in this scope. Callee Vars are not numeric coefficients.
+         (let [operands (cond completion [(:operand completion)]
+                              (seq? expression) arguments
+                              (vector? expression) expression
+                              (symbol? expression) [expression]
+                              :else [])
+               ;; Only literal product nesting is data structure here. A
+               ;; compound field/operand has a separate unclosed-form refusal;
+               ;; its callee is not an SSA data value.
+               identifiers (into #{} (filter symbol?) (tree-seq vector? seq operands))]
+           (when-not (every? visible identifiers)
+             (throw (ex-info "generated product references a value outside its SSA scope"
+                             {:reason :ad-generated-open-value :expression expression
+                              :values (set/difference identifiers visible)}))))
+         (conj visible name)))
+     (set params) (partition 2 bindings))
+    (let [used (atom (util/free-syms-flat [params bindings]))]
+      (with-ad-gensym
+        (binding [*generated-product-context* {:source-policy source-policy :used-identifiers used}
+                  *source-memory-context* {:values params
+                                          :value-facts (into {} (map (fn [p] [p {:value p}])) params)
+                                          :aliases {} :activity (zipmap selected-inputs (repeat true))
+                                          :replayed {} :unprojectable {}}
+                  util/*shadowing-locals* (into (set params) names)]
+          (let [{:keys [fwd-bindings value-facts] :as forward} (forward-pass bindings selected-inputs)
+                _ (when (get-in value-facts [result :product])
+                    (throw (ex-info "structured result requires an explicit seed-port interface"
+                                    {:reason :ad-generated-product-result})))
+                result-tag (or (types/sym-type-tag result)
+                               (some-> (get-in value-facts [result :value]) types/sym-type-tag))
+                _ (when-not (= :scalar (:kind (tangent/tangent-kind result-tag)))
+                    (throw (ex-info "generated product result requires a scalar tangent declaration"
+                                    {:reason :ad-generated-product-result :tag result-tag})))
+                dy (ad-gensym "generated_seed")
+                {:keys [rev-ctx param-adj-syms]} (reverse-program-projection forward selected-inputs {result [dy]})]
+            {:result-tag result-tag
+             :form (:standard-form (reverse-program-forms
+                                    {:body-sym result :dy dy :fwd-bindings fwd-bindings
+                                     :rev-bindings (vec (:bindings rev-ctx))
+                                     :param-adj-syms param-adj-syms}))}))))))
+
 (defn- make-runtime-value+grad-fn
   "Build a runtime IFn from the AD-transformed walked body.
   Uses (& args) + indexed unpack so deftms with >20 params (Clojure's fn
@@ -5282,11 +5455,54 @@
                   (= generated-source-policy (:source-policy generated-call)))
      (throw (ex-info "generated invocation requires its own retained source policy"
                      {:reason :unclosed-generated-call-policy})))
-   (let [normalized (ordered-call/normalize-resolved-call generated-call gensym (set params))
-         ports (:class-ports normalized)
+   (let [product? (= :generated-product-bindings (:kind generated-call))
+         ;; Capture before template derivation, not just before eval: otherwise
+         ;; code derived in one epoch could be blessed with the next epoch.
+         expected-revisions (when product?
+                              ((requiring-resolve 'raster.ad.normalized-scalar/revisions)))
+         product-program (when product? (generated-product-form generated-call params))
+         normalized (when-not product? (ordered-call/normalize-resolved-call generated-call gensym (set params)))
+         source (if product?
+                  (:form product-program)
+                  (list 'let* (:bindings normalized) (:invocation normalized)))
+         ;; Derive private Class ports from canonical completion terms only.
+         ;; Unlike a Class literal these lexical ports retain loader identity.
+         classes (volatile! #{})
+         _ (when product?
+             (util/postwalk-preserving-meta
+              (fn [node]
+                (when-let [{:keys [contract]} (value-completion/canonical-parts node)]
+                  (when (= :jvm-checkcast (:source-context contract))
+                    (vswap! classes conj (:target-carrier contract)))) node)
+              source))
+         input-classes (when product?
+                         (mapv (fn [parameter]
+                                 (let [tag (types/sym-type-tag parameter)]
+                                   [parameter (or (get types/primitive-info tag)
+                                                  (get types/primitive-array-info tag))])) params))
+         source (if product?
+                  (list* 'do
+                         (concat
+                          (map (fn [[parameter carrier]]
+                                 (list 'if (list 'clojure.core/nil? parameter)
+                                       (list 'throw (list 'clojure.core/ex-info
+                                                          "generated numeric input must be present"
+                                                          {:reason :ad-generated-input-carrier}))
+                                       (value-completion/complete-value
+                                        (value-completion/reference-check-contract carrier) parameter)))
+                               input-classes)
+                          [source]))
+                  source)
+         _ (when product? (doseq [[_ carrier] input-classes] (vswap! classes conj carrier)))
+         source-identifiers (util/free-syms-flat [params source])
+         fresh-class-port (fn [] (loop [id (gensym "reference_class__")]
+                                   (if (contains? source-identifiers id)
+                                     (recur (gensym "reference_class__")) id)))
+         ports (if product? (mapv (fn [carrier] {:class carrier :port (fresh-class-port)}) @classes)
+                   (:class-ports normalized))
          reference-bindings (into {} (map (juxt :class :port)) ports)
          body (value-completion/project-to-jvm-source
-               (list 'let* (:bindings normalized) (:invocation normalized))
+               source
                generated-source-policy reference-bindings)
          used (util/free-syms-flat [params body])
          captures (loop [id (gensym "reference_classes__")]
@@ -5297,8 +5513,27 @@
                               (list 'let* bindings (runtime-function-form params body)))]
      (binding [*unchecked-math* (:unchecked-math generated-source-policy)]
        ;; Same actual compile scope as eval, never a name-only persisted proof.
-       (ordered-call/verify-source-method! (:method normalized))
-       (apply (eval factory-source) (mapv :class ports))))))
+       (when normalized (ordered-call/verify-source-method! (:method normalized)))
+       (let [guard (when product?
+                     (let [capture (requiring-resolve 'raster.ad.normalized-scalar/execution-guard)]
+                       (capture *ns* expected-revisions
+                                [{:parameters (into (vec params) (map :port ports)) :body body}])))
+             execute (apply (eval factory-source) (mapv :class ports))]
+         (when guard (guard))
+         (if-not product? execute
+           (fn [& arguments]
+             (guard)
+             (let [[primal pullback] (apply execute arguments)]
+               (guard)
+               (when-not (.isInstance ^Class (get types/primitive-info (:result-tag product-program)) primal)
+                 (throw (ex-info "generated scalar result has the wrong carrier"
+                                 {:reason :ad-generated-result-carrier})))
+               [primal (fn [seed]
+                         (guard)
+                         (when-not (.isInstance ^Class (get types/primitive-info (:result-tag product-program)) seed)
+                           (throw (ex-info "generated scalar seed has the wrong carrier"
+                                           {:reason :ad-generated-seed-carrier})))
+                         (pullback seed))]))))))))
 
 ;; ================================================================
 ;; Forward-mode admissibility (framework §11): mode selection is
