@@ -19,6 +19,138 @@
   when compiled (eval'd) code calls back into dispatch."
   (:require [raster.compiler.core.types :as types]))
 
+(defn var-snapshot
+  "Observe an existing Var's effective value and retained definition metadata.
+   This is compiler-owner data, not a portable or authenticated certificate."
+  [v]
+  (let [is-bound (bound? v)]
+    {:var v :bound? is-bound :value (when is-bound (var-get v)) :metadata (meta v)}))
+
+(defn same-var-snapshot?
+  "Compare observations without resolving names or executing the definition.
+   A staleness guard must supply an actual fresh observation, not asserted data."
+  [a b]
+  (and (var? (:var a)) (var? (:var b))
+       (identical? (:var a) (:var b))
+       (= (:bound? a) (:bound? b))
+       (identical? (:value a) (:value b))
+       (= (:metadata a) (:metadata b))))
+
+(defn emission-definition-snapshot
+  "Observe definition inputs, excluding only this emitter's static cache output.
+   Actually consumed static artifacts are retained separately by the emitter."
+  [v]
+  (assoc (update (var-snapshot v) :metadata dissoc :raster.core/deftm-bytecode)
+         :snapshot-kind :emission-definition))
+
+(def ^:dynamic *emission-inputs*
+  "Request-local collector {:static [...], :values [...]} of consumed inputs.
+   A compiler producer binds this; it is neither a registry nor a cache."
+  nil)
+
+(defn- var-reference-current?
+  "Match historical Var identity and original lookup sites.
+   A detached Var can retain its old root after ns-unmap/reintern or namespace
+   recreation; reobserving that object alone would bless a different callee."
+  [{:keys [var metadata lookups]}]
+  (let [source-ns (:ns metadata)
+        source-name (:name metadata)]
+    (and (var? var) (instance? clojure.lang.Namespace source-ns)
+         (symbol? source-name)
+         (identical? source-ns (find-ns (ns-name source-ns)))
+         (identical? var (.findInternedVar ^clojure.lang.Namespace source-ns source-name))
+         (every? (fn [[lookup-ns lookup-symbol]]
+                   (and (instance? clojure.lang.Namespace lookup-ns)
+                        (symbol? lookup-symbol)
+                        (identical? lookup-ns (find-ns (ns-name lookup-ns)))
+                        (identical? var (ns-resolve lookup-ns lookup-symbol)))) lookups))))
+
+(defn var-snapshot-current?
+  "Match both the original lookup and its effective definition observation."
+  [snapshot]
+  (and (var-reference-current? snapshot)
+       (same-var-snapshot? snapshot
+                           (if (= :emission-definition (:snapshot-kind snapshot))
+                             (emission-definition-snapshot (:var snapshot))
+                             (var-snapshot (:var snapshot))))))
+
+(declare validate-static-emission!)
+
+(defn- validate-emission-inputs!
+  "Fence reuse of an actual emitter's historical input observations.
+
+   A fresh snapshot taken at differentiation time cannot certify an older
+   emission. Require its original observations and reject a definition change
+   across compilation, even if all currently observed roots happen to match.
+   This checks sequential reuse, not concurrent mutation/ABA or call-site
+   receiver correspondence; the owner must establish those separately."
+  [{:keys [dependency-snapshots static-inputs definition-revision completed-definition-revision]
+    :as emission} seen]
+  (when-not (and (vector? dependency-snapshots)
+                 (every? #(and (map? %) (var? (:var %))
+                               (boolean? (:bound? %)) (map? (:metadata %))
+                               (set? (:lookups %)) (seq (:lookups %))
+                               (every? (fn [lookup]
+                                         (and (vector? lookup) (= 2 (count lookup))
+                                              (instance? clojure.lang.Namespace (first lookup))
+                                              (symbol? (second lookup)))) (:lookups %)))
+                         dependency-snapshots)
+                 (vector? static-inputs)
+                 (every? #(and (map? %) (var? (:source-var %)) (map? (:artifact %))) static-inputs)
+                 (integer? definition-revision)
+                 (integer? completed-definition-revision))
+    (throw (ex-info "bytecode emission has no historical dependency observations"
+                    {:reason :missing-emission-input-observations})))
+  (when-not (= definition-revision completed-definition-revision)
+    (throw (ex-info "compiler definitions changed during bytecode emission"
+                    {:reason :unstable-emission-inputs
+                     :before definition-revision :after completed-definition-revision})))
+  (let [changed (filterv (complement var-snapshot-current?) dependency-snapshots)]
+    (when (seq changed)
+      (throw (ex-info "bytecode emission inputs no longer match their historical definitions"
+                      {:reason :stale-emission-inputs
+                       :dependencies (mapv (fn [{:keys [var]}]
+                                             (symbol (str (:ns (meta var)))
+                                                     (str (:name (meta var))))) changed)}))))
+  (doseq [{:keys [source-var artifact]} static-inputs]
+    (validate-static-emission! source-var artifact seen))
+  emission)
+
+(defn- validate-static-emission!
+  [source cached ^java.util.IdentityHashMap seen]
+  (let [{:keys [source-snapshot] :as inputs} (:raster.compiler/emission-inputs cached)]
+      (when-not (and (map? inputs) (map? source-snapshot)
+                     (identical? source (:var source-snapshot)))
+        (throw (ex-info "static code has no historical input lineage"
+                        {:reason :unowned-static-emission-inputs :source source})))
+      ;; Owner correspondence is checked BEFORE memoization: the same artifact
+      ;; cannot be attached to another Var and bypass its historical owner.
+      (when-not (and (= :emission-definition (:snapshot-kind source-snapshot))
+                     (var-snapshot-current? source-snapshot))
+        (throw (ex-info "static code no longer matches its emitted source definition"
+                        {:reason :stale-static-emission-source :source source})))
+      (case (.get seen cached)
+        :checked cached
+        :checking (throw (ex-info "static emission input lineage is cyclic"
+                                  {:reason :cyclic-static-emission-inputs}))
+        (do
+          (.put seen cached :checking)
+          (validate-emission-inputs! inputs seen)
+          (.put seen cached :checked)
+          cached))))
+
+(defn assert-emission-inputs-current!
+  "Validate historical input observations and recursive static-code lineage.
+   Sequential reuse fence only; not concurrent mutation/ABA authentication."
+  [emission]
+  (validate-emission-inputs! emission (java.util.IdentityHashMap.)))
+
+(defn assert-static-emission-current!
+  "Validate one actual static artifact against its historical source and inputs.
+   A fresh observation cannot certify an older unowned cache entry."
+  [source cached]
+  (validate-static-emission! source cached (java.util.IdentityHashMap.)))
+
 (defn- retained-global-var [callee]
   (when (and (symbol? callee) (namespace callee))
     (when-let [source-ns (find-ns (symbol (namespace callee)))]
