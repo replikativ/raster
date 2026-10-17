@@ -313,11 +313,10 @@
          :candidate-params (mapv params candidate-indices)
          :no-tangent-indices (vec (keep-indexed #(when (= :none (:kind %2)) %1) spaces))}))))
 
-(defn- auto-make-deftm-rule
-  "Create a transient AD rule for a deftm op that has no explicit template.
-  Returns [{:pullback-factory rule-fn} canonical-op] or nil.
-  Does NOT register in the global template registry — this is a local
-  fallback for runtime AD, not a compile-time directive."
+(defn- unowned-deftm-source
+  "Identify a deftm without a registered reverse rule for a precise refusal.
+   A source definition is not an owned pullback: deriving VJP in the backward
+   pass would repeat its primal and can observe effects or changed storage."
   [op]
   (when (qualified-symbol? op)
     (try
@@ -327,15 +326,8 @@
                          (let [base-name (subs (name op) 0 (clojure.core/- (count (name op)) 5))
                                base-sym (symbol (namespace op) base-name)]
                            (when-let [bv (resolve base-sym)]
-                             (when (:raster.core/deftm (meta bv)) bv)))))
-            canonical-sym (when fn-var (symbol (str (.ns fn-var)) (str (.sym fn-var))))
-            existing-closure (when canonical-sym (tmpl/get-pullback-factory canonical-sym))]
-        (when fn-var
-          (let [rule-fn (or existing-closure
-                            (fn [_result & args]
-                              (let [[_ pb] (apply vjp fn-var args)]
-                                pb)))]
-            [{:pullback-factory rule-fn} op])))
+                             (when (:raster.core/deftm (meta bv)) bv)))))]
+        fn-var)
       (catch Exception _ nil))))
 
 (def ^:private comparison-op? op/comparison-op?)
@@ -760,11 +752,18 @@
   (let [{op :operation args :arguments implementation :implementation-op lexical :lexical-callee}
         (op/call-description init-expr)
         resolved (when-not lexical
-                   (or (tmpl/resolve-template op)
-                       (auto-make-deftm-rule implementation)))
+                   (let [candidate (tmpl/resolve-template op)]
+                     (when (tmpl/reverse-rule? (first candidate)) candidate)))
         has-active-args? (some #(and (symbol? %) (get activity % false))
                                (cond-> args lexical (conj lexical)))]
     (when (and (not resolved) has-active-args?)
+      (when-let [source (when-not lexical (unowned-deftm-source implementation))]
+        (throw (ex-info "Derived helper AD requires a forward-owned pullback and completed call inputs"
+                        {:reason :ad-unowned-derived-pullback
+                         :op op :implementation-op implementation
+                         :source (symbol (str (.ns source)) (str (.sym source)))
+                         :sym sym :form init-expr
+                         :active (filterv #(and (symbol? %) (get activity % false)) args)})))
       (throw (ex-info (str "No AD template for `" (or lexical op)
                            "` which has active (differentiable) inputs. "
                            "Register an AD template or mark inputs as constant.")
@@ -773,7 +772,7 @@
                        :active (filterv #(and (symbol? %) (get activity % false)) args)})))
     {:record
      (when resolved
-       (let [[_ base-op] resolved
+       (let [[template base-op] resolved
              arg-tags (let [n (name implementation)
                             idx (.indexOf ^String n "_m_")]
                         (when (pos? idx)
@@ -798,7 +797,7 @@
                               a))
                           args arg-tags)
                     args)]
-         {:type :call :sym sym :base-op base-op :args args
+         {:type :call :sym sym :base-op base-op :resolved-template template :args args
           :active-args (set (filter #(and (symbol? %) (get activity % false)) args))}))}))
 
 ;; ================================================================
@@ -1346,8 +1345,12 @@
      slots]))
 
 (defmethod emit-backward :call
-  [{:keys [sym base-op args active-args]} adj-sym _activity {:keys [adj-env rev-ctx]}]
-  (let [[template _] (tmpl/resolve-template base-op)
+  [{:keys [sym base-op args active-args resolved-template]} adj-sym _activity {:keys [adj-env rev-ctx]}]
+  ;; Static emission consumes the SAME selected rule that admitted the call.
+  ;; These records are ephemeral derivation data, not persistent source IR.
+  ;; Registered opaque factories retain their existing runtime lookup contract;
+  ;; this does not claim to capture them or introduce a private closure owner.
+  (let [template resolved-template
         has-template? (and template (or (:grads template) (:grads-fn template)))]
     (if has-template?
       ;; Template path: ctx-aware instantiation (already pure — returns new ctx).

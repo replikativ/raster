@@ -5,6 +5,7 @@
             [raster.ad.reverse :as reverse]
             [raster.ad.jvp :as jvp]
             [raster.ad.templates :as templates]
+            [raster.compiler.ad.bind-ctx :as bind-ctx]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
 (def ^:private helper-calls (atom 0))
@@ -57,7 +58,7 @@
     (let [resolved (atom [])
           record (with-redefs [templates/resolve-template (fn [operation]
                                                           (swap! resolved conj operation)
-                                                          [{} operation])]
+                                                          [{:grads-fn (fn [& _])} operation])]
                    (#'reverse/ad-record :call 'result call {'x true 'y true}))
           forward (with-redefs [templates/op-jvp-fn
                                (fn [operation]
@@ -72,6 +73,55 @@
         (is (= ['float 'float] (mapv #(-> % meta :raster.type/tag)
                                      (get-in record [:record :args])))
             "dispatch tags come from implementation identity, not the semantic name")))))
+
+(deftest backward-emission-consumes-the-admitted-static-rule-snapshot
+  (let [selected {:grads-fn (fn [& _] (throw (AssertionError. "instantiation is observed below")))}
+        record (:record (with-redefs [templates/resolve-template (fn [_] [selected 'example/f])]
+                          (#'reverse/ad-record :call 'result '(example/f x) {'x true})))
+        instantiated (atom nil)
+        emitted (with-redefs [templates/resolve-template
+                             (fn [_] (throw (AssertionError. "backward emission re-resolved the rule")))
+                             templates/instantiate-template-ctx
+                             (fn [template args result seed context]
+                               (reset! instantiated [template args result seed])
+                               [context ['dx]])]
+                  (#'reverse/emit-backward record 'dy {'x true}
+                   {:adj-env {} :rev-ctx (bind-ctx/make-ctx gensym)}))]
+    (is (identical? selected (:resolved-template record)))
+    (is (identical? selected (first @instantiated)))
+    (is (= ['[x] 'result 'dy] (rest @instantiated)))
+    (is (= {'x ['dx]} (:adj-env emitted)))))
+
+(deftest registered-opaque-pullbacks-retain-their-existing-runtime-contract
+  (let [factory (fn [_result x] (fn [seed] [(* 7.0 x seed)]))
+        record (:record (with-redefs [templates/resolve-template
+                                     (fn [_] [{:pullback-factory factory} 'example/opaque])]
+                          (#'reverse/ad-record :call 'result '(example/opaque x) {'x true})))
+        emitted (with-bindings {#'reverse/*gensym-counter* (atom 0)}
+                  (with-redefs [templates/resolve-template
+                                (fn [_] (throw (AssertionError. "must use the admitted rule kind")))]
+                    (#'reverse/emit-backward record 'dy {'x true}
+                     {:adj-env {} :rev-ctx (bind-ctx/make-ctx gensym)})))
+        expression (list 'let (into '[result 5.0 x 2.0 dy 3.0] (get-in emitted [:rev-ctx :bindings]))
+                         (first (get-in emitted [:adj-env 'x])))
+        looked-up (atom [])]
+    ;; The named lookup remains deliberately explicit; this test does not claim
+    ;; opaque factory snapshotting or forward-owned residual support.
+    (with-redefs [templates/get-pullback-factory
+                  (fn [operation] (swap! looked-up conj operation) factory)]
+      (is (= 42.0 (eval expression))))
+    (is (= ['example/opaque] @looked-up))))
+
+(deftest forward-only-template-is-not-reverse-admission
+  (let [lookups (atom [])
+        forward-only {:jvp-fn (fn [& _] (throw (AssertionError. "must not execute the JVP")))}]
+    (with-redefs [templates/resolve-template
+                  (fn [operation] (swap! lookups conj operation) [forward-only operation])]
+      (let [error (try (#'reverse/ad-record :call 'result '(example/forward-only x) {'x true})
+                       (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :ad-missing-rule (:reason (ex-data error))))
+        (is (= ['example/forward-only] @lookups))
+        (is (= ['x] (:active (ex-data error))))))))
 
 (deftest active-plain-helpers-decline-at-construction-without-execution
   (reset! helper-calls 0)

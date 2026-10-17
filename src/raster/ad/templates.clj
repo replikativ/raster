@@ -417,6 +417,14 @@
             (apply f (concat args [result adjoint])))))
       (or (:pullback-factory template) (:closure template)))))
 
+(defn reverse-rule?
+  "Whether an already resolved template supplies a reverse rule.
+   Does not consult the registry; retained admission and emission share this
+   predicate with the mangled-name-aware operation lookup below."
+  [template]
+  (boolean (or (:grads template) (:grads-fn template)
+               (:pullback-factory template) (:closure template))))
+
 (defn has-reverse-rule?
   "True if op has a REVERSE-mode AD rule: a static :grads/:grads-fn template OR a
   runtime :pullback-factory/:closure. A jvp-only template (forward mode) does NOT
@@ -426,7 +434,7 @@
   Keys on the resolved (mangled-name aware) template."
   [op]
   (when-let [[t _] (resolve-template op)]
-    (or (:grads t) (:grads-fn t) (:pullback-factory t) (:closure t))))
+    (reverse-rule? t)))
 
 ;; ================================================================
 ;; Arithmetic templates
