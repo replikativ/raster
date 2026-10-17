@@ -80,6 +80,7 @@
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.invariants :as invariants]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.analysis.memory :as mem]
             [clojure.set :as set]
             [raster.compiler.core.method-entry :as me]
@@ -436,6 +437,18 @@
 
 (declare record-fixpoint-census!)
 
+(defn- fixpoint-equivalent?
+  "Convergence includes retained type/operation metadata and numeric carriers.
+   Runtime objects have no portable semantic encoding: keep iterating up to the
+   existing cap rather than treating printing, class names or Clojure = as proof."
+  [left right]
+  (try
+    (semantic-fingerprint/equivalent? left right)
+    (catch clojure.lang.ExceptionInfo error
+      (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
+        false
+        (throw error)))))
+
 (defn- pass-fixpoint
   "Fixpoint pass: expand → conditional rewalk → PE+CSE until stable.
 
@@ -507,8 +520,8 @@
                          (let [rw-result (rewalk/pe-rewalk expanded opts)]
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
-          (if (= rewalked current)
-            (let [final (-> (ensure-let*-result current)
+          (if (fixpoint-equivalent? rewalked current)
+            (let [final (-> (ensure-let*-result rewalked)
                             (tag-binding-types (:param-env opts))
                             carry-void-binding-contracts)]
               (record-fixpoint-census! :final final opts)

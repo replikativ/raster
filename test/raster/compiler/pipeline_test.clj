@@ -4,9 +4,70 @@
             [pattern.nanopass.dialect :as nanopass]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.simplify :as simplify]
+            [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.passes.scalar.soa-lower :as soa-lower]
+            [raster.compiler.passes.scalar.local-products :as local-products]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ad.flatten :as flat]
             [raster.compiler.ir.dialects :as dialects]
             [raster.ad.reverse :as rad]))
+
+(defn- isolated-fixpoint [input expand]
+  ;; Isolate termination from producer behavior. Real compiled workloads remain
+  ;; covered by pipeline-quality-test; these controls exercise metadata invisible
+  ;; to Clojure = without asking another pass to invent that metadata for us.
+  (with-redefs-fn
+    {#'inline/expand-for-backends (fn [form & _] (expand form))
+     #'soa-lower/lower-local-constructors (fn [form & _] form)
+     #'local-products/lower-local-products identity
+     #'pipeline/tag-binding-types (fn [form & _] form)
+     #'pipeline/carry-void-binding-contracts identity
+     #'pipeline/record-fixpoint-census! (fn [& _])}
+    #(#'pipeline/pass-fixpoint input {})))
+
+(deftest fixpoint-consumes-metadata-only-repairs
+  (let [input '(let* [value 1.0] value)
+        repaired (list 'let* (second input)
+                       (with-meta 'value {:raster.type/tag 'double}))
+        seen (atom [])
+        result (isolated-fixpoint input (fn [form] (swap! seen conj form) repaired))]
+    (is (= input repaired) "ordinary equality misses the retained reference type")
+    (is (= 2 (count @seen)) "the next iteration must consume newly retained facts")
+    (is (= 'double (:raster.type/tag (meta (last (second @seen))))))
+    (is (= 'double (:raster.type/tag (meta (last (:form result))))))
+    (is (= 1 (get-in result [:stats :fixpoint-iterations])))))
+
+(deftest fixpoint-stability-retains-the-latest-form
+  (let [input (with-meta '(let* [value 1.0] value) {:line 1})
+        latest (with-meta input {:line 900 :column 12})
+        seen (atom 0)
+        result (isolated-fixpoint input (fn [_] (swap! seen inc) latest))]
+    (is (= 1 @seen) "source locations alone do not require another iteration")
+    (is (= {:line 900 :column 12} (meta (:form result))))))
+
+(deftest fixpoint-compares-numeric-carriers-and-semantic-metadata
+  (doseq [[left right] [[0.0 -0.0] [(float 1.0) (double 1.0)]
+                       [(with-meta 'value {:raster.type/tag 'float})
+                        (with-meta 'value {:raster.type/tag 'double})]
+                       [(with-meta '[x] {:raster.type/element 'float})
+                        (with-meta '[x] {:raster.type/element 'double})]]]
+    (is (not (#'pipeline/fixpoint-equivalent? left right))))
+  (is (#'pipeline/fixpoint-equivalent? Double/NaN Double/NaN)))
+
+(deftest unsupported-fixpoint-evidence-does-not-certify-stability
+  (let [input (with-meta '(let* [value 1.0] value) {:tag Double})
+        seen (atom 0)
+        result (isolated-fixpoint input
+                 (fn [form] (vary-meta form assoc :line (swap! seen inc))))]
+    (is (= 5 @seen) "unsupported runtime metadata uses the existing iteration cap")
+    (is (= 5 (get-in result [:stats :fixpoint-iterations])))
+    (is (= 5 (:line (meta (:form result)))))
+    (is (identical? Double (:tag (meta (:form result))))))
+  (let [failure (ex-info "unexpected fingerprint failure" {:reason :different-error})]
+    (with-redefs [semantic-fingerprint/equivalent? (fn [& _] (throw failure))]
+      (is (identical? failure
+                     (try (#'pipeline/fixpoint-equivalent? 'x 'x)
+                          (catch clojure.lang.ExceptionInfo error error)))))))
 
 (defn- form-contains?
   "True if sym appears anywhere in a nested form (symbols, lists, vectors)."
