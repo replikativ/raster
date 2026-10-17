@@ -597,7 +597,11 @@
                       {:reason :ad-unclosed-completion-transpose :init init})))
     (case (:source-context contract)
       (:jvm-object-input :jvm-checkcast)
-      {:record {:type :alias :sym sym :source operand :result-alias operand}}
+      ;; The transpose transports the tangent unchanged, not the physical
+      ;; primal value. Both contexts consume an Object and may first box a
+      ;; primitive operand. Preserve possible borrowed-reference aliases, but
+      ;; do not publish an exact replay-root substitution from a logical dtype.
+      {:record {:type :alias :sym sym :source operand :result-aliases #{operand}}}
 
       :jvm-primitive-input
       (do
@@ -1137,9 +1141,10 @@
                                     (may-aliases (:written-arrs record))))))
            ;; Even an inactive alias can write an earlier residual. Records
            ;; describe result/output identity without another operation registry.
-           result-aliases (if-let [result-alias (:result-alias record)]
-                            #{result-alias}
-                            (:symbols (form/normal-exit-facts init-expr)))
+           result-aliases (into (or (:result-aliases record) #{})
+                               (if-let [result-alias (:result-alias record)]
+                                 #{result-alias}
+                                 (:symbols (form/normal-exit-facts init-expr))))
            aliases (:aliases
                     (memory/track-aliases {:aliases aliases :consumed #{}}
                                           ;; Partial positive evidence survives
