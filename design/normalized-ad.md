@@ -741,6 +741,39 @@ SOAC algebra. See `../jax/jax/_src/interpreters/ad.py`, functions `linearize_jax
 
 ## Tangent and activity contracts
 
+### Immutable value-product consolidation (implementation campaign)
+
+Residual vectors are real immutable products when they cross a conditional or closure
+boundary. Scalar replacement is an optimization, not a prerequisite for a correct derivative.
+An active field must not become inactive merely because its constructor is data rather than
+a call. Conversely, an unknown field's type or presence is not proof of a tangent space.
+
+The next bounded vertical uses these landing gates, within the existing compiler campaign:
+
+1. Share constructor-field and checked constant-projection evidence between the scalar
+   normalizer and structural AD. Reuse canonical operation identity and constant evaluation;
+   do not introduce an `nth` template registry, parse helper names or grant array ownership.
+2. Represent product cotangents fieldwise at staging time. Constructor transposition routes
+   each incoming field to its original evaluated port; projection transposition inserts its
+   seed at the selected field. Whole-product absence and per-field absence remain distinct
+   from an explicit numeric zero. Preserve field precision and contribution order.
+3. Extend the existing conditional-region residual and seed contracts with that checked
+   structure. Only the executed arm contributes. Flags stay discrete; saved differentiable
+   fields remain differentiable for higher-order AD. Do not exempt compiler tapes by name.
+4. Restore analytic `D`/`DD`/`DDD`/`D4`, Hessian and third-derivative controls, including nested
+   products and duplicated field ports. An unsupported opaque observer, dynamic projection
+   or unknown structure must refuse explicitly, never silently discard a contribution.
+5. Check constructor effects/traps and object identity once, and selected-path replay against
+   mutable-array versions. Arrays stored in an immutable tuple remain borrowed references,
+   not fresh allocations. Product scalar replacement must preserve those obligations.
+6. Recheck the pinned resident finetune preparation, real OpenCL/Level Zero gradient gates
+   and original Gemma numerical tolerances before merging the held AD composition stack.
+
+Bounded continuation distribution may still simplify products, but increasing its expansion
+budget or adding syntax hoists does not discharge the structural derivative contract. These
+steps are prerequisites for reusable training and direct TypedSOAC composition, not a
+replacement for the distributed, durability, portability or measurement campaign gates.
+
 Internally distinguish four states, even if the public API continues returning `nil` for
 excluded gradient slots:
 

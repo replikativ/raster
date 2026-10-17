@@ -5,7 +5,7 @@
    are snapshotted in source order; escaping products retain their source form."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.core.numeric-constant :as numeric-constant]
+            [raster.compiler.core.value-product :as value-product]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
@@ -32,8 +32,8 @@
            (= 3 (count expression)) (product-shape? (last expression)))))
 
 (defn- split-product [expression]
-  (if (vector? expression)
-    [[] expression]
+  (if-let [fields (value-product/literal-fields expression)]
+    [[] fields]
     (let [[bindings fields] (split-product (last expression))]
       [(into (vec (second expression)) bindings) fields])))
 
@@ -43,12 +43,6 @@
       (and (symbol? operation) (= "clojure.core" (namespace operation))
            (descriptor/cast-result-tag operation)))))
 
-(defn- projection-index [expression]
-  (when (or (integer? expression)
-            (and (primitive-cast? expression) (some? (projection-index (second expression)))))
-    (let [constant (numeric-constant/value expression)]
-      (when (integer? (:value constant)) (:value constant)))))
-
 (defn- literal-tail [expression]
   (cond (literal? expression) {:bindings [] :literal expression}
         (and (seq? expression) (= 'let* (first expression)) (= 3 (count expression)))
@@ -57,6 +51,17 @@
         :else nil))
 
 (declare lower)
+
+(defn- nil-test-branches [env test]
+  ;; A canonical direct nil test refines only the value it actually reads.
+  ;; Do not infer presence from dtype tags or carry predicate facts across
+  ;; later rebinding of a lexical name.
+  (if (and (seq? test) (= 2 (count test)) (symbol? (second test))
+           (= 'clojure.core/nil? (descriptor/semantic-op test)))
+    (let [value (second test) known (get env value)]
+      [(assoc env value (-> known (dissoc :fields :present? :scalar-type) (assoc :literal nil)))
+       (assoc env value (-> known (dissoc :literal) (assoc :present? true)))])
+    [env env]))
 
 (def ^:private conditional-expansion-limit 4096)
 (def ^:dynamic ^:private *conditional-expansion-budget* nil)
@@ -88,6 +93,13 @@
 
 (defn- binding-fact [scope id init]
   (let [known (or (fact scope init)
+                  ;; A real primitive conversion cannot return nil. This is a
+                  ;; normal-return fact, not permission to remove its source
+                  ;; evaluation or the exception raised for a nullable input.
+                  (when (primitive-cast? init)
+                    (let [type (some-> (descriptor/semantic-op init)
+                                       descriptor/cast-result-tag dtype/dtype-for-scalar-tag)]
+                      (cond-> {:present? true} type (assoc :scalar-type type))))
                   (when-let [proof (and (seq? init)
                                        (descriptor/scalar-op? (descriptor/semantic-op init))
                                        (scalar-body/checked-primitive-result
@@ -126,9 +138,8 @@
                                    (relist expression
                                            (concat [head (into [id arm] suffix)] body))))
                        _ (spend-conditional-expansion! (concat suffix body))
-                       choice (relist init ['if test
-                                            (lower scope (continue then) products?)
-                                            (lower scope (continue else) products?)])]
+                       choice (lower scope (relist init ['if test (continue then) (continue else)])
+                                     products?)]
                    (relist expression [head (with-meta (vec output) (meta bindings)) choice]))
 
                  (and products? (:fields alias))
@@ -183,13 +194,13 @@
 
     ;; Constant-index projection consumes a saved product without reconstructing
     ;; its allocation. Out-of-bounds/defaulted/dynamic accesses remain unchanged.
-    (and (seq? expression) (= 'clojure.core/nth (descriptor/semantic-op expression))
-         (= 3 (count expression)) (symbol? (second expression))
+    (and (seq? expression) (symbol? (second expression))
          (get-in env [(second expression) :fields])
-         (some? (projection-index (nth expression 2)))
-         (<= 0 (projection-index (nth expression 2)))
-         (< (projection-index (nth expression 2)) (count (get-in env [(second expression) :fields]))))
-    (nth (get-in env [(second expression) :fields]) (projection-index (nth expression 2)))
+         (value-product/constant-projection
+          expression (count (get-in env [(second expression) :fields]))))
+    (let [fields (get-in env [(second expression) :fields])
+          projection (value-product/constant-projection expression (count fields))]
+      (nth fields (:index projection)))
 
     (and (seq? expression) (= 'clojure.core/nil? (descriptor/semantic-op expression)) (= 2 (count expression)))
     (let [argument (second expression) known (fact env argument)]
@@ -211,8 +222,9 @@
       (if tail
         (let [branch (lower env (if (:literal tail) then else) products?)]
           (if (seq (:bindings tail)) (list 'let* (:bindings tail) branch) branch))
-        (relist expression (cond-> [head test' (lower env then products?)]
-                            (= 4 (count expression)) (conj (lower env else products?))))))
+        (let [[then-env else-env] (nil-test-branches env test')]
+          (relist expression (cond-> [head test' (lower then-env then products?)]
+                              (= 4 (count expression)) (conj (lower else-env else products?)))))))
 
     (and (seq? expression) (form/scope-info expression))
     (lower-scopes env expression products?)
