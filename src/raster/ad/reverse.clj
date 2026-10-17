@@ -5429,6 +5429,13 @@
   (cond
     (not (seq? form)) form
 
+    ;; Data and owned input-completion regions are opaque to this hoister,
+    ;; just as they are to the shared ANF normalizer. Entering quoted data
+    ;; executes it; lifting a completion's operand changes its original JVM
+    ;; evaluation context (primitive versus boxed conversion, for example).
+    (or (contains? '#{quote clojure.core/quote} (first form))
+        (value-completion/canonical-parts form)) form
+
     ;; Already a let/let* — hoist in bindings and body. A binding whose init is
     ;; itself a let (e.g. acc ← (let [...] array-result), as an unrolled fold
     ;; accumulator produces) must be FLATTENED into this let*: splice the inner

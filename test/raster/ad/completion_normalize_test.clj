@@ -1,9 +1,48 @@
 (ns raster.ad.completion-normalize-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :refer [deftm]]
+            [raster.numeric :as n]
+            [raster.ad.reverse :as rev]
+            [raster.ad.jvp :as jvp]
             [raster.ad.reverse.normalize :as anf]
             [raster.compiler.core.value-completion :as completion]))
 
 (def policy {:unchecked-math false})
+
+(deftm quoted-scale [x :- Double] :- Double
+  (let [data '(let* [inner 7.0] inner)
+        scale (double (count data))]
+    (n/* x scale)))
+
+(deftest source-ad-preserves-quoted-binding-data
+  (doseq [x [0.0 2.0 -3.0]]
+    (is (= (* 3.0 x) (quoted-scale x)))
+    (is (= [(* 3.0 x) 3.0] ((rev/value+grad #'quoted-scale) x)))
+    (is (= [(* 3.0 x) 6.0] ((jvp/jvp #'quoted-scale) x 2.0)))))
+
+(deftest nested-let-hoisting-preserves-opaque-regions
+  (let [data '(let* [tick (swap! events conj :must-not-run)] tick)
+        quoted (list 'quote data)
+        normalized (#'rev/hoist-nested-lets quoted)
+        events (atom [])]
+    (is (identical? quoted normalized))
+    (is (= data ((eval (list 'fn '[events] normalized)) events)))
+    (is (= [] @events)))
+  (doseq [contract [completion/object-input-contract
+                    (completion/primitive-input-contract Float/TYPE policy)]]
+    (let [expression (completion/complete-value contract '(let* [input x] input))]
+      (is (identical? expression (#'rev/hoist-nested-lets expression))))))
+
+(deftest hoisting-does-not-admit-malformed-reserved-completions
+  (doseq [source [(list completion/completion-symbol {:source-context :unknown}
+                       '(let* [input 1.0] input))
+                  (list completion/completion-symbol completion/object-input-contract
+                        '(let* [input 1.0] input) :extra)]]
+    (let [normalized (rev/call-with-shared-ad-gensym
+                       #(#'rev/hoist-nested-lets source))]
+      (is (= :invalid-value-completion
+             (try (completion/project-to-jvm-source normalized policy) :accepted
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
 (defn- source-function [parameters source]
   (binding [*unchecked-math* false]
@@ -68,10 +107,13 @@
                (completion/primitive-input-contract Double/TYPE policy) 'x)
         expression (list 'vector input
                          '(let* [tick (swap! events conj :later)] 2.0))
-        [bindings value] (anf/normalize-for-ad [] [expression] gensym)
-        source (source-function '[x events] expression)
-        prepared (source-function '[x events] (list 'let* bindings value))]
-    (doseq [f [source prepared]]
+        source (source-function '[x events] expression)]
+    (doseq [normalize [identity (fn [form]
+                                 (rev/call-with-shared-ad-gensym
+                                   #(#'rev/hoist-nested-lets form)))]
+            :let [[bindings value] (anf/normalize-for-ad [] [(normalize expression)] gensym)
+                  prepared (source-function '[x events] (list 'let* bindings value))]
+            f [source prepared]]
       (let [events (atom [])]
         (is (thrown? NullPointerException (f nil events)))
         (is (= [] @events)))
