@@ -100,6 +100,31 @@
   Distinguished from :void which means 'no value but execution continues'."
   [t] (identical? t :diverge))
 
+(defn- numeric-literal-stack-type
+  "Physical primitive carrier of a supported retained numeric literal. Magnitude
+   is not permission to narrow Long, nor is Float interchangeable with Double.
+   Byte/Short use the JVM int stack; this does not establish their Object boxing
+   class or literal identity. Nonprimitive numbers require a reference lowering."
+  [value]
+  (when (number? value)
+    (cond
+      (instance? Long value) :long
+      (or (instance? Integer value) (instance? Byte value) (instance? Short value)) :int
+      (instance? Float value) :float
+      (instance? Double value) :double
+      :else (throw (ex-info "Numeric literal requires an owned JVM reference lowering"
+                            {:reason :unsupported-jvm-numeric-literal
+                             :literal-class (class value)})))))
+
+(defn- emit-numeric-literal [code value]
+  (let [carrier (numeric-literal-stack-type value)]
+    (case carrier
+      :long (.ldc code (long value))
+      :int (.ldc code (int value))
+      :float (.ldc code (float value))
+      :double (.ldc code (double value)))
+    carrier))
+
 (defn- typed-interface?
   "True if this symbol/string names a Raster typed function interface (IFn__)."
   [s] (and s (.contains (str s) "IFn__")))
@@ -242,8 +267,7 @@
     (nil? form) :ref
     (true? form) :bool
     (false? form) :bool
-    (float? form) :double
-    (integer? form) :int
+    (number? form) (numeric-literal-stack-type form)
     (symbol? form) (or (when-let [{:keys [type]} (get locals form)] type)
                        ;; Fallback: read walker/AD-stamped type tag
                        (when-let [tag (or (:raster.type/tag (meta form))
@@ -3302,7 +3326,7 @@
    from a reference one — without re-deriving types by walking the expression."
   [arg locals]
   (boolean
-   (or (and (number? arg) (not (ratio? arg)))
+   (or (and (number? arg) (numeric-literal-stack-type arg))
        (char? arg)
        (instance? Boolean arg)
        (and (symbol? arg)
@@ -3828,12 +3852,11 @@
 (defn- widen-loop-type
   "Slot type for a loop var = LUB(init type, recur-value type), promoting only in
   the value-preserving numeric direction (never narrowing). This matters because
-  e.g. (loop [d 0] ... (recur (inc d) ...)) has an int init but a long recur value
-  (Clojure's 0 is a Long; the walker widens uses to long). Without unification the
-  var is stored as int and every iteration round-trips i2l…l2i, which defeats C2's
-  counted-loop recognition and blocks SuperWord auto-vectorization. Unifying to
-  long yields a clean long counted loop. Returns init-t when no safe widening
-  applies."
+  explicit int seeds may recur with long values. Without unification the var
+  would round-trip i2l…l2i each iteration, defeating counted-loop recognition.
+  Ordinary source Long seeds already start as long; backend-owned int literals
+  or explicit casts retain their narrower carrier. Returns init-t when no safe
+  widening applies."
   [init-t recur-t]
   (let [num? #{:int :long :float :double}
         rank {:int 0 :long 1 :float 2 :double 3}]
@@ -4238,8 +4261,7 @@
                                     (MethodTypeDesc/of sym-cd (into-array ClassDesc [str-cd str-cd])))
                      :ref)
       (string? v)  (do (.ldc code v) :ref)
-      (integer? v) (do (.ldc code (int v)) :int)
-      (float? v)   (do (.ldc code (double v)) :double)
+      (number? v) (emit-numeric-literal code v)
       (true? v)    (do (.getstatic code (ClassDesc/ofDescriptor "Ljava/lang/Boolean;")
                                    "TRUE" (ClassDesc/ofDescriptor "Ljava/lang/Boolean;"))
                        :ref)
@@ -4422,12 +4444,7 @@
       (nil? form)     (do (.aconst_null code) :ref)
       (true? form)    (do (.ldc code (int 1)) :bool)
       (false? form)   (do (.ldc code (int 0)) :bool)
-      (integer? form) (if (and (instance? Long form)
-                               (or (> (long form) Integer/MAX_VALUE)
-                                   (< (long form) Integer/MIN_VALUE)))
-                        (do (.ldc code (long form)) :long)
-                        (do (.ldc code (int form)) :int))
-      (float? form)   (do (.ldc code (double form)) :double)
+      (number? form)  (emit-numeric-literal code form)
       (char? form)    (do (.ldc code (int form)) :int) ;; JVM chars are ints
       (string? form)  (do (.ldc code form) :ref)
       (keyword? form) (let [kw-cd (ClassDesc/of "clojure.lang" "Keyword")

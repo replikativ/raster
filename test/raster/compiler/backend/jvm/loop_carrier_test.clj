@@ -248,8 +248,13 @@
 (deftest dependent-carry-widening-reaches-a-fixed-point
   (let [pairs [['a '(float 1.0e8)] ['b '(float 0.0)] ['i 0]]
         body '((if (< i 2) (recur (+ a step) (+ b a) (inc i)) b))]
+    (is (= [:double :double :long]
+           (#'bytecode/loop-recur-types-in-scope pairs body {'step {:type :double}}))
+        "an ordinary source Long zero does not become an int slot")
     (is (= [:double :double :int]
-           (#'bytecode/loop-recur-types-in-scope pairs body {'step {:type :double}})))))
+           (#'bytecode/loop-recur-types-in-scope
+            (assoc pairs 2 ['i '(clojure.core/int 0)]) body {'step {:type :double}}))
+        "an explicit int seed retains the narrower counter carrier")))
 
 (deftest coupled-carries-preserve-the-wider-value
   (is (== 200000001.0 (coupled-carry 1.0)))
