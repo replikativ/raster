@@ -371,6 +371,7 @@
 (declare ^:private gen-reverse-par-scan)
 (declare ^:private let-gradient-pieces)
 (declare ^:private extract-let-parts)
+(declare ^:private product-expression)
 
 (defn- init-active?
   "Decide whether a binding init carries gradient (is active), given the current
@@ -485,7 +486,8 @@
 (defn- ad-form-kind
   "Classify a binding init into a reverse-record kind. SOACs (soac-record-kinds)
   are recognized BEFORE the activity gate (they manage their own activity via
-  the active-set); everything else is gated on `active?`. `sym` is the binding
+  the active-set). Explicit generated structural interfaces also survive
+  inactivity; other scalar records are gated on `active?`. `sym` is the binding
   symbol, used only for a fail-loud message on unsupported control-flow forms."
   [init-expr active? sym]
   (cond
@@ -495,8 +497,10 @@
     (and *generated-product-context* (value-completion/canonical-parts init-expr)) :completion
     (and *generated-product-context*
          (product-ports/projection-plan sym init-expr (:value-facts *source-memory-context*))) :product-projection
+    ;; Structural interfaces survive inactive choices too. Otherwise a later
+    ;; active join forgets the shape of an already known constant product.
+    (and *generated-product-context* (seq? init-expr) (= 'if (first init-expr))) :if
     (and *generated-product-context* active? (seq? init-expr)
-         (not= 'if (first init-expr))
          (some #(get-in *source-memory-context* [:value-facts % :product])
                (:arguments (op/call-description init-expr))))
     (throw (ex-info "active product has no closed structural consumer"
@@ -551,8 +555,11 @@
 (defn- product-record [sym plan]
   (let [structured? (= :product (get-in plan [:schema :kind]))]
     {:record {:type :product-edges :sym sym :edges (:edges plan)
-              :cotangent-ports (mapv (fn [edge] {:key (:port edge) :tag (:tag edge)})
-                                     (filter :active? (:edges plan)))
+              :cotangent-ports (mapv (fn [[path leaf]]
+                                       {:key (if structured? (product-ports/field-port sym path) sym)
+                                        :tag (:tag leaf)})
+                                     (filter (fn [[path _]] (contains? (:active-paths plan) path))
+                                             (product-ports/leaf-paths (:schema plan))))
               :value-facts (when structured?
                              {sym {:product (select-keys plan [:schema :active-paths])}})}}))
 
@@ -596,17 +603,22 @@
   {:record {:type :alias :sym sym :source init-expr :result-alias init-expr}})
 
 (defmethod ad-record :if [_ sym init-expr activity]
-  (let [[_ branch then else] init-expr]
-    (when (and *generated-product-context*
-               (some #(or (vector? %)
-                          (get-in *source-memory-context* [:value-facts % :product])) [then else]))
-      (throw (ex-info "product-valued choice requires a checked field seed interface"
-                      {:reason :ad-unclosed-product-choice :init init-expr})))
+  (let [[_ branch then else] init-expr
+        then-product (when *generated-product-context*
+                       (get-in *source-memory-context* [:value-facts then :product]))
+        else-product (when *generated-product-context*
+                       (get-in *source-memory-context* [:value-facts else :product]))]
     (when-not (trivial-expr? branch)
       (throw (ex-info "Reverse AD conditional test survived predicate normalization"
                       {:reason :ad-region-unclosed-test :sym sym :test branch})))
-    (if (every? trivial-expr? [then else])
+    (cond
+      (and (every? trivial-expr? [then else]) (or then-product else-product))
+      (product-record sym (product-ports/choice-plan sym branch then then-product else else-product))
+
+      (every? trivial-expr? [then else])
       {:record {:type :if :sym sym :branch branch :then then :else else}}
+
+      :else
       (let [free (set/union (util/free-syms then) (util/free-syms else))
             params (vec (sort-by str (filter #(and (get activity %) (contains? free %))
                                             (keys activity))))
@@ -618,10 +630,9 @@
                                          (assoc *generated-product-context* :internal-region? true))]
                                (let-gradient-pieces bindings body params dy))))
                          [then else])
-            _ (when (and *generated-product-context*
-                         (some #(get-in % [:value-facts (:body-sym %) :product]) pieces))
-                (throw (ex-info "product-valued choice requires a checked field seed interface"
-                                {:reason :ad-unclosed-product-choice :init init-expr})))
+            result-products (mapv :result-product pieces)
+            result-product (when (some some? result-products)
+                             (apply product-ports/join-facts result-products))
             tape (vary-meta (ad-gensym "branch_tape") assoc
                             :raster.ad/residual
                             {:kind :conditional :representation :persistent-vector
@@ -642,7 +653,7 @@
                                    ;; subsequent linearization can traverse this tape.
                                    (into [body-sym saved] (map first conditions)))))
                          pieces)]
-        {:record {:type :if-region :sym sym :branch branch :params params
+        {:record (cond-> {:type :if-region :sym sym :branch branch :params params
                   :parameter-products (when *generated-product-context*
                                         (into {} (keep (fn [parameter]
                                                          (when-let [product (get-in *source-memory-context*
@@ -654,6 +665,10 @@
                   (into {} (map-indexed (fn [index root]
                                          [root (list 'clojure.core/nth tape (clojure.core/+ 2 index))]) replay-roots))
                   :effects {:kind :choice :regions pieces}}
+                   result-product
+                   (merge {:result-product result-product
+                           :cotangent-ports (:cotangent-ports (:record (product-record sym result-product)))
+                           :value-facts {sym {:product result-product}}}))
          :fwd-patch (fn [bindings]
                       (into (vec (drop-last 2 bindings))
                             [tape (list 'if branch (first paired) (second paired))
@@ -832,7 +847,10 @@
                         {:reason :ad-region-effects :effects (:effects record)})))
       {:writes (reduce into #{} (map :writes regions))
        :replays (reduce into #{} (map :replays regions))
-       :value-facts (reduce merge {} (map :value-facts regions))
+       :value-facts (merge (reduce merge {} (map :value-facts regions))
+                           ;; The region owner may publish its checked joined
+                           ;; result interface; child catalogs do not define it.
+                           (:value-facts record))
        ;; Child scopes were checked independently by the same forward pass.
        ;; The choice itself has no additional source write outside those scopes.
        :local-writes #{}
@@ -1296,9 +1314,14 @@
 (defmethod emit-backward :product-edges
   [{:keys [edges]} adjoints _activity {:keys [adj-env rev-ctx]}]
   {:rev-ctx rev-ctx
-   :adj-env (reduce (fn [environment {:keys [port source active?]}]
+   :adj-env (reduce (fn [environment {:keys [port source active? branch arm]}]
                       (if (and active? (contains? adjoints port))
-                        (update environment source (fnil conj []) (get adjoints port))
+                        (let [value (get adjoints port)
+                              value (case arm
+                                      :then (list 'if branch value nil)
+                                      :else (list 'if branch nil value)
+                                      value)]
+                          (update environment source (fnil conj []) value))
                         environment))
                     adj-env edges)})
 
@@ -1378,13 +1401,19 @@
     {:adj-env adj-env :rev-ctx rev-ctx}))
 
 (defmethod emit-backward :if-region
-  [{:keys [branch params dy tape pieces parameter-products]} adj-sym _activity {:keys [adj-env rev-ctx]}]
+  [{:keys [sym branch params dy tape pieces parameter-products result-product]} adj-sym _activity {:keys [adj-env rev-ctx]}]
   (let [saved (ad-gensym "branch_saved")
+        seed (if result-product
+               (product-expression (:schema result-product)
+                                   (into {} (map (fn [[path _]]
+                                                   [path (get adj-sym (product-ports/field-port sym path))]))
+                                         (product-ports/leaf-paths (:schema result-product))))
+               adj-sym)
         arms (mapv (fn [{:keys [fwd-bindings rev-bindings param-adj-syms]}]
                      (let [restore (mapcat (fn [index value]
                                              [value (list 'clojure.core/nth saved index)])
                                            (range) (take-nth 2 fwd-bindings))]
-                       (list 'let* (vec (concat restore [dy adj-sym] rev-bindings))
+                       (list 'let* (vec (concat restore [dy seed] rev-bindings))
                              (vec param-adj-syms))))
                    pieces)
         grads (ad-gensym "branch_grads")
@@ -1705,14 +1734,16 @@
 (defn- process-bindings
   "The shared engine: run Phases 1-3 over a NORMALIZED binding vector and return
   the raw pieces. Pure — no atoms. Wrappers assemble their own output shape.
-  opts: {:seed-adj-env <map sym->[adj-expr]>}."
-  [norm-bindings active-params {:keys [seed-adj-env]}]
+  opts: {:seed-adj-env <map sym->[adj-expr]>}, or a local :seed-projection
+  that constructs field seeds from the completed forward interface."
+  [norm-bindings active-params {:keys [seed-adj-env seed-projection]}]
   (binding [util/*shadowing-locals* (into (into util/*shadowing-locals* active-params)
                                        (take-nth 2 norm-bindings))]
     (let [{:keys [activity fwd-bindings records replayed writes value-facts] :as forward-state}
           (forward-pass norm-bindings active-params)
           {:keys [adj-env rev-ctx pullback-replays pullback-replay-conditions param-adj-syms]}
-          (reverse-program-projection forward-state active-params seed-adj-env)]
+          (reverse-program-projection forward-state active-params
+                                      (if seed-projection (seed-projection forward-state) seed-adj-env))]
       {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
        :rev-ctx rev-ctx :param-adj-syms param-adj-syms :replays replayed :writes writes
        :value-facts value-facts :forward-scope (source-memory-scope forward-state)
@@ -1733,11 +1764,19 @@
         {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope adj-env
                 pullback-replays pullback-replay-conditions]}
         (process-bindings norm-bindings active-params
-                          {:seed-adj-env {body-sym [dy-sym]}})]
+                          {:seed-projection
+                           (fn [{:keys [value-facts]}]
+                             (if-let [{:keys [active-paths]} (when *generated-product-context*
+                                                               (get-in value-facts [body-sym :product]))]
+                               (into {} (map (fn [path]
+                                               [(product-ports/field-port body-sym path)
+                                                [(product-leaf-expression dy-sym path)]])) active-paths)
+                               {body-sym [dy-sym]}))})]
     {:body-sym body-sym :dy dy-sym
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
      :replays replays :writes writes :value-facts value-facts :forward-scope forward-scope
+     :result-product (when *generated-product-context* (get-in value-facts [body-sym :product]))
      :parameter-product-demands
      (when *generated-product-context*
        (into {} (keep (fn [parameter]
@@ -5469,7 +5508,6 @@
       (and (seq? expression) (= 'if (first expression)))
       (do
         (when-not (and (= 4 (count expression)) (trivial-expr? (second expression))) (fail!))
-        (when (some vector? (drop 2 expression)) (fail!))
         (doseq [part (rest expression)] (assert-generated-region! visible part)))
 
       (and (seq? expression) (contains? #{'let 'let*} (first expression)))

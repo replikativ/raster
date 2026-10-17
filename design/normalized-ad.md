@@ -56,7 +56,7 @@ this is not permission to round each contribution or reassociate the fold.
 Generated execution and pullbacks reuse the existing normalized execution guard
 for rule/callee staleness. That sequential guard is not an ABA or lifetime proof.
 
-Default source AD, imported/conditional products, general loops, higher-order
+Default source AD, public imported products, general loops, higher-order
 closure and real training acceptance are separate remaining obligations. The
 focused analytic/finite-difference tests qualify only this internal interpretation.
 
@@ -75,11 +75,20 @@ boundary alone materializes absent slots as typed/shape-matched zeros. This
 distinction is necessary to avoid evaluating an upstream singular derivative
 on a zero that the compiler invented for an unused capture.
 
-Product-valued choices still refuse until both arms have a checked field-seed
-interface. This does not yet admit public product parameters, derivative re-entry
+Product-valued choices join only equal retained field schemas, including nested
+shape and tangent declarations. Direct choices retain the selected existing
+product's identity; lexical arms use their own field seeds and saved residuals.
+Inactive choices retain structure independently of tangent activity. Incompatible
+shape/dtype or unknown product/scalar joins refuse; this is not a nullable sum
+type or permission to unify unknown declarations. Numeric literal fields use
+the shared source literal-tag authority, not function return-type inference.
+
+This does not yet admit public product parameters, derivative re-entry
 through mixed original/generated calls, higher-order product differentiation or
 the held training migration. Existing Hessian/D/SGD tests remain default-path
-regression controls, not evidence of those additional capabilities.
+regression controls, not evidence of those additional capabilities. Native/device
+product storage or verified elimination at their compiler boundaries remains a
+separate requirement; host fieldwise AD alone does not establish training residency.
 
 ## Current implementation boundary
 

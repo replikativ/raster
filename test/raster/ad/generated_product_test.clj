@@ -275,5 +275,5 @@
     (is (= :ad-unsupported-product-use
            (reason ['p ['x] 'r '(clojure.core/count p)] 'r)))
     (is (= :ad-generated-product-result (reason ['p ['x]] 'p)))
-    (is (= :ad-generated-product-region
+    (is (= :ad-generated-product-result
            (reason ['p '(if true [x] [x])] 'p)))))
