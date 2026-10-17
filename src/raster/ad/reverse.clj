@@ -496,6 +496,7 @@
     (and *generated-product-context*
          (product-ports/projection-plan sym init-expr (:value-facts *source-memory-context*))) :product-projection
     (and *generated-product-context* active? (seq? init-expr)
+         (not= 'if (first init-expr))
          (some #(get-in *source-memory-context* [:value-facts % :product])
                (:arguments (op/call-description init-expr))))
     (throw (ex-info "active product has no closed structural consumer"
@@ -596,6 +597,11 @@
 
 (defmethod ad-record :if [_ sym init-expr activity]
   (let [[_ branch then else] init-expr]
+    (when (and *generated-product-context*
+               (some #(or (vector? %)
+                          (get-in *source-memory-context* [:value-facts % :product])) [then else]))
+      (throw (ex-info "product-valued choice requires a checked field seed interface"
+                      {:reason :ad-unclosed-product-choice :init init-expr})))
     (when-not (trivial-expr? branch)
       (throw (ex-info "Reverse AD conditional test survived predicate normalization"
                       {:reason :ad-region-unclosed-test :sym sym :test branch})))
@@ -607,8 +613,15 @@
             dy (ad-gensym "branch_dy" (:raster.type/tag (meta sym)))
             pieces (mapv (fn [arm]
                            (let [[bindings body] (extract-let-parts (util/alpha-convert arm))]
-                             (let-gradient-pieces bindings body params dy)))
+                             (binding [*generated-product-context*
+                                       (when *generated-product-context*
+                                         (assoc *generated-product-context* :internal-region? true))]
+                               (let-gradient-pieces bindings body params dy))))
                          [then else])
+            _ (when (and *generated-product-context*
+                         (some #(get-in % [:value-facts (:body-sym %) :product]) pieces))
+                (throw (ex-info "product-valued choice requires a checked field seed interface"
+                                {:reason :ad-unclosed-product-choice :init init-expr})))
             tape (vary-meta (ad-gensym "branch_tape") assoc
                             :raster.ad/residual
                             {:kind :conditional :representation :persistent-vector
@@ -630,6 +643,12 @@
                                    (into [body-sym saved] (map first conditions)))))
                          pieces)]
         {:record {:type :if-region :sym sym :branch branch :params params
+                  :parameter-products (when *generated-product-context*
+                                        (into {} (keep (fn [parameter]
+                                                         (when-let [product (get-in *source-memory-context*
+                                                                                  [:value-facts parameter :product])]
+                                                           [parameter (assoc product :active-paths
+                                                                             (into #{} (mapcat #(get-in % [:parameter-product-demands parameter])) pieces))]))) params))
                   :dy dy :tape tape :pieces pieces
                   :replay-conditions
                   (into {} (map-indexed (fn [index root]
@@ -1283,13 +1302,36 @@
                         environment))
                     adj-env edges)})
 
+(defn- lift-pullback-over-absence
+  "Lift one checked call pullback to the dynamic absent cotangent. A numeric
+   zero remains present and executes the original derivative arithmetic."
+  [before after gradients adjoint]
+  (let [prefix (vec (:bindings before))
+        body (subvec (vec (:bindings after)) (count prefix))
+        result (ad-gensym "present_pullback")
+        slots (mapv (fn [gradient]
+                      (when (some? gradient)
+                        (ad-gensym "present_gradient" (:raster.type/tag (meta gradient))))) gradients)]
+    [(assoc after :bindings
+            (vec (concat prefix
+                         [result (list 'if (list 'clojure.core/nil? adjoint)
+                                       (vec (repeat (count gradients) nil))
+                                       (list 'let* body (vec gradients)))]
+                         (mapcat (fn [[index slot]]
+                                   (when slot [slot (list 'clojure.core/nth result index)]))
+                                 (map-indexed vector slots)))))
+     slots]))
+
 (defmethod emit-backward :call
   [{:keys [sym base-op args active-args]} adj-sym _activity {:keys [adj-env rev-ctx]}]
   (let [[template _] (tmpl/resolve-template base-op)
         has-template? (and template (or (:grads template) (:grads-fn template)))]
     (if has-template?
       ;; Template path: ctx-aware instantiation (already pure — returns new ctx).
-      (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx template args sym adj-sym rev-ctx)]
+      (let [[template-ctx template-gradients] (tmpl/instantiate-template-ctx template args sym adj-sym rev-ctx)
+            [new-ctx grad-syms] (if *generated-product-context*
+                                 (lift-pullback-over-absence rev-ctx template-ctx template-gradients adj-sym)
+                                 [template-ctx template-gradients])]
         {:rev-ctx new-ctx
          :adj-env (reduce (fn [ae [i grad-sym]]
                             (if (and (some? grad-sym) (< i (count args))
@@ -1298,11 +1340,17 @@
                               ae))
                           adj-env (map-indexed vector grad-syms))})
       ;; Closure fallback — nil pullback entries propagate as nil.
-      (let [pb-sym (ad-gensym "pb") grads-sym (ad-gensym "grads")]
-        {:rev-ctx (bindings-into rev-ctx
-                                 [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
-                                                      (list 'quote base-op)) sym args)
-                                  grads-sym (list pb-sym adj-sym)])
+      (let [pb-sym (ad-gensym "pb") grads-sym (ad-gensym "grads")
+            call-bindings [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
+                                              (list 'quote base-op)) sym args)
+                           grads-sym (list pb-sym adj-sym)]
+            rev-ctx (if *generated-product-context*
+                      (bindings-into rev-ctx
+                                     [grads-sym (list 'if (list 'clojure.core/nil? adj-sym)
+                                                      (vec (repeat (count args) nil))
+                                                      (list 'let* call-bindings grads-sym))])
+                      (bindings-into rev-ctx call-bindings))]
+        {:rev-ctx rev-ctx
          :adj-env (reduce (fn [ae [i arg]]
                             (if (and (symbol? arg) (contains? active-args arg))
                               (update ae arg (fnil conj []) (list 'nth grads-sym i))
@@ -1318,9 +1366,10 @@
   ;; typed Π, which unlike the old scalar 0.0 cannot mis-shape an array slot.
   ;; `zero` is a delay so the fail-loud path only fires when a branch
   ;; actually materializes the zero.
-  (let [zero (delay (if (some? (:raster.type/tag (meta sym)))
-                      (array-zero-of-shape sym)
-                      (list 'raster.ad.tangent/zero-like sym)))
+  (let [zero (delay (when-not *generated-product-context*
+                      (if (some? (:raster.type/tag (meta sym)))
+                        (array-zero-of-shape sym)
+                        (list 'raster.ad.tangent/zero-like sym))))
         adj-env (cond-> adj-env
                   (and (symbol? then) (get activity then false))
                   (update then (fnil conj []) (list 'if branch adj-sym @zero))
@@ -1329,7 +1378,7 @@
     {:adj-env adj-env :rev-ctx rev-ctx}))
 
 (defmethod emit-backward :if-region
-  [{:keys [branch params dy tape pieces]} adj-sym _activity {:keys [adj-env rev-ctx]}]
+  [{:keys [branch params dy tape pieces parameter-products]} adj-sym _activity {:keys [adj-env rev-ctx]}]
   (let [saved (ad-gensym "branch_saved")
         arms (mapv (fn [{:keys [fwd-bindings rev-bindings param-adj-syms]}]
                      (let [restore (mapcat (fn [index value]
@@ -1344,8 +1393,14 @@
                                 grads (list 'if branch (first arms) (second arms))])]
     {:rev-ctx rev-ctx
      :adj-env (reduce (fn [env [index param]]
-                        (update env param (fnil conj [])
-                                (list 'clojure.core/nth grads index)))
+                        (let [gradient (list 'clojure.core/nth grads index)]
+                          (if-let [{:keys [active-paths]} (get parameter-products param)]
+                            (reduce (fn [env path]
+                                      (update env (product-ports/field-port param path) (fnil conj [])
+                                              (reduce (fn [value index] (list 'clojure.core/nth value index))
+                                                      gradient path)))
+                                    env (sort active-paths))
+                            (update env param (fnil conj []) gradient))))
                       adj-env (map-indexed vector params))}))
 
 (defmethod emit-backward :alias
@@ -1551,6 +1606,16 @@
       :scalar (tangent/zero-expr tag nil)
       0.0)))
 
+(defn- product-leaf-expression [value path]
+  (reduce (fn [value index] (list 'clojure.core/nth value index)) value path))
+
+(defn- product-expression [schema values]
+  (letfn [(build [schema path]
+            (if (= :product (:kind schema))
+              (mapv (fn [index child] (build child (conj path index))) (range) (:fields schema))
+              (get values path)))]
+    (build schema [])))
+
 (defn- collect-param-adjoints
   "Phase 3 (pure): bind a d_<param> for each active param (shape-matched zero when
   no contributions) into rev-ctx; return {:rev-ctx :param-adj-syms}.
@@ -1560,7 +1625,9 @@
   via promotion is the default in raster.numeric), double params only when
   float params are present (provably-double-only functions emit no cast).
   Array adjoints are anchored by their typed shadow buffers — no cast."
-  [active-params adj-env rev-ctx]
+  ([active-params adj-env rev-ctx]
+   (collect-param-adjoints active-params adj-env rev-ctx (:value-facts *source-memory-context*)))
+  ([active-params adj-env rev-ctx value-facts]
   (let [param-dtype #(-> % meta :raster.type/tag tangent/tangent-kind :dtype)
         mixed-float? (boolean (some #(= :float (param-dtype %)) active-params))
         ;; Contributions refer only to the completed reverse context, not to final
@@ -1568,27 +1635,59 @@
         binding-map (into {} (map vec (partition 2 (:bindings rev-ctx))))]
     (reduce
      (fn [{:keys [rev-ctx param-adj-syms]} p]
-       (let [tag (:raster.type/tag (meta p))
+       (if-let [{:keys [schema active-paths]} (when *generated-product-context*
+                                              (get-in value-facts [p :product]))]
+         (let [leaves (filterv (fn [[path _]] (and (contains? active-paths path)
+                                                 (seq (get adj-env (product-ports/field-port p path)))))
+                               (product-ports/leaf-paths schema))
+               parameters (mapv (fn [[_ leaf]] (ad-gensym "field_primal" (:tag leaf))) leaves)
+               rev-ctx (bindings-into rev-ctx
+                                      (vec (mapcat (fn [parameter [path _]]
+                                                     [parameter (product-leaf-expression p path)])
+                                                   parameters leaves)))
+               field-env (into {} (map (fn [parameter [path _]]
+                                         [parameter (get adj-env (product-ports/field-port p path))])
+                                       parameters leaves))
+               {next-ctx :rev-ctx fields :param-adj-syms}
+               (collect-param-adjoints parameters field-env rev-ctx {})
+               result (ad-gensym "d_product")
+               values (zipmap (map first leaves) fields)]
+           {:rev-ctx (bindings-into next-ctx [result (product-expression schema values)])
+            :param-adj-syms (conj param-adj-syms result)})
+         (let [tag (:raster.type/tag (meta p))
              {:keys [kind dtype]} (tangent/tangent-kind tag)
              contribs (get adj-env p)
              adj-sym (ad-gensym (str "d_" (name p)) tag)
+             ;; Internal region ports exchange absence, not public gradient
+             ;; materializations. A fabricated zero can activate a singular
+             ;; upstream pullback even when this parameter was never demanded.
+             default (when-not (:internal-region? *generated-product-context*)
+                       (param-zero-expr p))
              ;; ARRAY param fan-out (a weight consumed by ≥2 ops) accumulates via
              ;; the resident residual-add (no scalar projection applies to arrays).
              rev-ctx
              (if (and (= kind :array) (>= (count contribs) 2))
-               (sum-contribs-into rev-ctx adj-sym contribs (param-zero-expr p) tag)
-               (let [raw (sum-contribs contribs (param-zero-expr p))
+               (sum-contribs-into rev-ctx adj-sym contribs default tag)
+               (let [raw (sum-contribs contribs default)
                      expr (if (and (= kind :scalar)
                                    (or (= dtype :float)
                                        (and (= dtype :double) mixed-float?)))
                             (tangent/project-expr
                              tag raw {:binding-map binding-map})
                             raw)]
-                 (bindings-into rev-ctx [adj-sym expr])))]
+                 (bindings-into rev-ctx [adj-sym expr])))
+             public? (and *generated-product-context*
+                          (not (:internal-region? *generated-product-context*)))
+             public-sym (if public? (ad-gensym "public_cotangent" tag) adj-sym)
+             rev-ctx (if public?
+                       (bindings-into rev-ctx
+                                      [public-sym (list 'if (list 'clojure.core/nil? adj-sym)
+                                                        default adj-sym)])
+                       rev-ctx)]
          {:rev-ctx rev-ctx
-          :param-adj-syms (conj param-adj-syms adj-sym)}))
+          :param-adj-syms (conj param-adj-syms public-sym)})))
      {:rev-ctx rev-ctx :param-adj-syms []}
-     active-params)))
+     active-params))))
 
 (defn- reverse-program-projection
   "Project one output seed environment through an already checked forward
@@ -1598,7 +1697,7 @@
   (let [{:keys [adj-env rev-ctx pullback-replays pullback-replay-conditions]}
         (reverse-pass records activity seed-adj-env value-facts)
         {:keys [rev-ctx param-adj-syms]}
-        (collect-param-adjoints active-params adj-env rev-ctx)]
+        (collect-param-adjoints active-params adj-env rev-ctx value-facts)]
     {:adj-env adj-env :rev-ctx rev-ctx :param-adj-syms param-adj-syms
      :pullback-replays pullback-replays
      :pullback-replay-conditions pullback-replay-conditions}))
@@ -1631,7 +1730,7 @@
   representation; the latter must not allocate a closure per iteration."
   [bindings body-exprs active-params dy-sym]
   (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope
+        {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope adj-env
                 pullback-replays pullback-replay-conditions]}
         (process-bindings norm-bindings active-params
                           {:seed-adj-env {body-sym [dy-sym]}})]
@@ -1639,6 +1738,12 @@
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
      :replays replays :writes writes :value-facts value-facts :forward-scope forward-scope
+     :parameter-product-demands
+     (when *generated-product-context*
+       (into {} (keep (fn [parameter]
+                        (when-let [{:keys [active-paths]} (get-in value-facts [parameter :product])]
+                          [parameter (into #{} (filter #(seq (get adj-env (product-ports/field-port parameter %)))) active-paths)])))
+             active-params))
      :pullback-replays pullback-replays
      :pullback-replay-conditions pullback-replay-conditions
      :param-adj-syms param-adj-syms}))
@@ -5351,6 +5456,56 @@
           unpack (vec (mapcat (fn [p i] [p (list 'clojure.core/nth args-sym i)]) params (range)))]
       (list 'fn ['& args-sym] (list 'let unpack body)))))
 
+(defn- assert-generated-region!
+  "Check the already ordered source region. This does not normalize operands;
+   child conditionals retain their own lexical bindings and evaluation order."
+  [visible expression]
+  (let [completion (value-completion/canonical-parts expression)
+        {:keys [operation arguments dispatch?]} (when (seq? expression) (op/call-description expression))
+        operator (when (symbol? operation) (resolve operation))
+        fail! #(throw (ex-info "generated product binding has an unclosed input or effect scope"
+                               {:reason :ad-generated-product-region :expression expression}))]
+    (cond
+      (and (seq? expression) (= 'if (first expression)))
+      (do
+        (when-not (and (= 4 (count expression)) (trivial-expr? (second expression))) (fail!))
+        (when (some vector? (drop 2 expression)) (fail!))
+        (doseq [part (rest expression)] (assert-generated-region! visible part)))
+
+      (and (seq? expression) (contains? #{'let 'let*} (first expression)))
+      (let [[_ bindings result] expression
+            names (when (vector? bindings) (take-nth 2 bindings))]
+        (when-not (and (= 3 (count expression)) (vector? bindings) (even? (count bindings))
+                       (every? #(and (symbol? %) (nil? (namespace %))) names)
+                       (= (count names) (count (distinct names)))
+                       (empty? (set/intersection (set names) visible))) (fail!))
+        (let [scope (reduce (fn [scope [name value]]
+                              (assert-generated-region! scope value) (conj scope name))
+                            visible (partition 2 bindings))]
+          (assert-generated-region! scope result)))
+
+      :else
+      (do
+        (when (and (seq? expression) (not completion)
+                   (not (and (= :call (:kind (form/form-info expression)))
+                              (not dispatch?) (qualified-symbol? operation)
+                              (var? operator) (not (:macro (meta operator)))
+                              (every? trivial-expr? arguments)
+                              (not (op/mutating-op? (op/semantic-op expression)))
+                              (= :pure (effects/analyze-effect expression)))))
+          (fail!))
+        (let [operands (cond completion [(:operand completion)]
+                             (seq? expression) arguments
+                             (vector? expression) expression
+                             (symbol? expression) [expression]
+                             :else [])
+              identifiers (into #{} (filter symbol?) (tree-seq vector? seq operands))]
+          (when-not (every? visible identifiers)
+            (throw (ex-info "generated product references a value outside its SSA scope"
+                            {:reason :ad-generated-open-value :expression expression
+                             :values (set/difference identifiers visible)})))))))
+  expression)
+
 (defn- generated-product-form
   [program params]
   (let [{:keys [bindings result active-inputs source-policy]} program
@@ -5379,40 +5534,12 @@
       (when-not (tangent/differentiable? (types/sym-type-tag parameter))
         (throw (ex-info "generated product input has no retained tangent declaration"
                         {:reason :ad-product-unknown-tangent :parameter parameter}))))
-    ;; This first structural interpreter is straight-line and read-only. It is
-    ;; not a new route around the existing loop/choice or memory contracts.
+    ;; The structural interpreter is read-only. Lexical branch regions are
+    ;; checked before the existing conditional AD producer consumes them.
     (reduce
      (fn [visible [name expression]]
-       (let [completion (value-completion/canonical-parts expression)
-             {:keys [operation arguments dispatch?]} (when (seq? expression) (op/call-description expression))
-             operator (when (symbol? operation) (resolve operation))]
-         (when (and (seq? expression) (not completion)
-                    (not (and (= :call (:kind (form/form-info expression)))
-                               ;; Captured/host/dynamic callees need their own
-                               ;; correspondence; do not infer it from a name.
-                               (not dispatch?) (qualified-symbol? operation)
-                               (var? operator) (not (:macro (meta operator)))
-                               (every? trivial-expr? arguments)
-                               (not (op/mutating-op? (op/semantic-op expression)))
-                               (= :pure (effects/analyze-effect expression)))))
-           (throw (ex-info "generated product binding has an unclosed input or effect scope"
-                           {:reason :ad-generated-product-region :expression expression})))
-         ;; Data values used in another expression must already have been
-         ;; snapshotted in this scope. Callee Vars are not numeric coefficients.
-         (let [operands (cond completion [(:operand completion)]
-                              (seq? expression) arguments
-                              (vector? expression) expression
-                              (symbol? expression) [expression]
-                              :else [])
-               ;; Only literal product nesting is data structure here. A
-               ;; compound field/operand has a separate unclosed-form refusal;
-               ;; its callee is not an SSA data value.
-               identifiers (into #{} (filter symbol?) (tree-seq vector? seq operands))]
-           (when-not (every? visible identifiers)
-             (throw (ex-info "generated product references a value outside its SSA scope"
-                             {:reason :ad-generated-open-value :expression expression
-                              :values (set/difference identifiers visible)}))))
-         (conj visible name)))
+       (assert-generated-region! visible expression)
+       (conj visible name))
      (set params) (partition 2 bindings))
     (let [used (atom (util/free-syms-flat [params bindings]))]
       (with-ad-gensym
