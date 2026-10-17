@@ -25,6 +25,7 @@
 (def ^:private long-box-cd (ClassDesc/of "java.lang" "Long"))
 (def ^:private int-box-cd (ClassDesc/of "java.lang" "Integer"))
 (def ^:private flt-box-cd (ClassDesc/of "java.lang" "Float"))
+(def ^:private bool-box-cd (ClassDesc/of "java.lang" "Boolean"))
 ;; AFunction extends AFn and implements IObj (metadata), Comparator, Serializable
 (def ^:private afn-cd (ClassDesc/of "clojure.lang" "AFunction"))
 
@@ -41,17 +42,8 @@
     :double (.dload code (int slot))
     :long (.lload code (int slot))
     :float (.fload code (int slot))
-    :int (.iload code (int slot))
+    (:int :bool) (.iload code (int slot))
     (.aload code (int slot))))
-
-(defn- emit-return [code stack-type]
-  (case stack-type
-    :double (.dreturn code)
-    :long (.lreturn code)
-    :float (.freturn code)
-    :int (.ireturn code)
-    :void (.return_ code)
-    (.areturn code)))
 
 (defn- emit-unbox
   "Emit bytecode to unbox an Object on the stack to a typed primitive/reference."
@@ -65,6 +57,8 @@
                (.invokevirtual code number-cd "floatValue" (MethodTypeDesc/of F-cd empty-cds)))
     :int (do (.checkcast code number-cd)
              (.invokevirtual code number-cd "intValue" (MethodTypeDesc/of I-cd empty-cds)))
+    :bool (do (.checkcast code bool-box-cd)
+               (.invokevirtual code bool-box-cd "booleanValue" (MethodTypeDesc/of Z-cd empty-cds)))
     (when (not (.equals ^ClassDesc target-cd obj-cd))
       (.checkcast code target-cd))))
 
@@ -81,6 +75,8 @@
                           (MethodTypeDesc/of flt-box-cd (into-array ClassDesc [F-cd])))
     :int (.invokestatic code int-box-cd "valueOf"
                         (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
+    :bool (.invokestatic code bool-box-cd "valueOf"
+                         (MethodTypeDesc/of bool-box-cd (into-array ClassDesc [Z-cd])))
     nil)) ;; :ref — already Object
 
 (defn compile-hoisted-class!
@@ -90,8 +86,10 @@
    - Extends clojure.lang.AFn (implements IFn)
    - Holds hoisted buffers as instance fields
    - Has an initFn field for lazy buffer allocation
+   - invk implements the argument-specialized interface's Object-return ABI;
+     only the static compute method retains its primitive return descriptor.
    - invoke(Object...) checks initialized flag, allocates on first call,
-     then unboxes args → invk → boxes result. No Clojure fn wrapper needed.
+     then unboxes args → invk → returns its completed Object result.
 
    Returns {:statics-class Class, :wrapper-class Class, :methods {...}}."
   [class-name fn-specs instance-spec]
@@ -115,7 +113,6 @@
                                (:class-desc info)))
                            fn-param-infos fn-param-tags)
         ret-info (tag->jvm-info return-tag src-ns)
-        ret-cd (:class-desc ret-info)
         iface-cd (class-desc-of iface-class)
         compute-method (get (:methods statics-result) compute-name)
         compute-param-types (.getParameterTypes ^java.lang.reflect.Method compute-method)
@@ -135,6 +132,9 @@
         n-fields (count field-tags)
         invoke-params (into-array ClassDesc (repeat n-fn-params obj-cd))
         invoke-mt (MethodTypeDesc/of obj-cd invoke-params)
+        ;; Dispatch specializes arguments, not return types. This must be the
+        ;; same Object-returning descriptor as types/ensure-fn-interface!.
+        invk-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc fn-param-cds))
         ;; init method: takes same Object params as invoke, calls initFn, stores fields
         init-mt (MethodTypeDesc/of void-cd invoke-params)
         wrapper-bytes
@@ -252,8 +252,7 @@
                                          (.putfield code wrapper-cd "initialized" Z-cd)
                                          (.return_ code))))
 
-              ;; Typed invk: check initialized, load params + fields, invokestatic compute
-                    (let [invk-mt (MethodTypeDesc/of ret-cd (into-array ClassDesc fn-param-cds))]
+              ;; Typed invk: call primitive compute, then complete its Object result ONCE.
                       (.withMethodBody cb "invk" invk-mt (int 0x0001)
                                        (reify java.util.function.Consumer
                                          (accept [_ code]
@@ -280,10 +279,11 @@
                                              (.aload code 0)
                                              (.getfield code wrapper-cd fname fcd))
                                            (.invokestatic code statics-cd compute-mn compute-mt)
-                                           (emit-return code (:stack-type ret-info))))))
+                                           (emit-box code (:stack-type ret-info) empty-cds)
+                                           (.areturn code))))
 
               ;; IFn.invoke(Object...) → Object
-              ;; Check initialized, call doInit if needed, then unbox→invk→box
+              ;; Check initialized, call doInit if needed, then unbox→Object invk
                     (when (<= n-fn-params 20)
                       (.withMethodBody cb "invoke" invoke-mt (int 0x0001)
                                        (reify java.util.function.Consumer
@@ -303,9 +303,7 @@
                                            (doseq [[i fi fcd] (map vector (range) fn-param-infos fn-param-cds)]
                                              (.aload code (inc i))
                                              (emit-unbox code (:stack-type fi) fcd empty-cds))
-                                           (let [invk-mt (MethodTypeDesc/of ret-cd (into-array ClassDesc fn-param-cds))]
-                                             (.invokevirtual code wrapper-cd "invk" invk-mt))
-                                           (emit-box code (:stack-type ret-info) empty-cds)
+                                           (.invokevirtual code wrapper-cd "invk" invk-mt)
                                            (.areturn code)))))
 
               ;; applyTo(ISeq) — required for >20 params, but always useful
@@ -344,9 +342,7 @@
                                              (doseq [[i fi fcd] (map vector (range) fn-param-infos fn-param-cds)]
                                                (.aload code (+ base-slot i))
                                                (emit-unbox code (:stack-type fi) fcd empty-cds))
-                                             (let [invk-mt (MethodTypeDesc/of ret-cd (into-array ClassDesc fn-param-cds))]
-                                               (.invokevirtual code wrapper-cd "invk" invk-mt))
-                                             (emit-box code (:stack-type ret-info) empty-cds)
+                                             (.invokevirtual code wrapper-cd "invk" invk-mt)
                                              (.areturn code)))))))))
         ;; Verify bytecode before loading — catches type errors early
         _ (try (.verify (ClassFile/of) wrapper-bytes)
