@@ -40,6 +40,9 @@
   ([tags target-fn typed-impl typed-iface typed-target-fn warning-meta]
    (make-method-entry tags target-fn typed-impl typed-iface typed-target-fn warning-meta nil))
   ([tags target-fn typed-impl typed-iface typed-target-fn warning-meta mangled-ns]
+   (when (var? typed-impl)
+     (throw (ex-info "MethodEntry requires a concrete typed implementation, not a Var"
+                     {:reason :method-entry-mutable-implementation :tags tags})))
    {:tags tags
     :arity (count tags)
     :check-classes (mapv types/tag->check-class tags)

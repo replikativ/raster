@@ -1779,8 +1779,11 @@
                 (alter-var-root mangled-var
                                 (constantly (fn [& call-args] (apply @impl-var call-args))))
                 ;; Register in dispatch table
-                (dispatch/register-method! (str mangled) fn-name tags source-ns
-                                           impl-var typed-iface-name
+                ;; Match ordinary deftm registration: MethodEntry contains
+                ;; concrete function/implementation objects, not a name and a
+                ;; mutable Var. JIT upgrades already refresh those objects.
+                (dispatch/register-method! @mangled-var fn-name tags source-ns
+                                           @impl-var typed-iface-name
                                            ;; typed-target-fn: routes through -impl
                                            (fn [& call-args]
                                              (apply @impl-var call-args))
