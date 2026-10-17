@@ -28,6 +28,19 @@
 (defn- primitive-carrier? [carrier]
   (and (class? carrier) (.isPrimitive ^Class carrier) (not= Void/TYPE carrier)))
 
+(defn reference-check-contract
+  "Retain a source CHECKCAST, including its exact Class identity.
+   This is NOT a general reference-parameter conversion: source compilation may
+   adapt functional interfaces instead of simply checking a reference. The
+   producer must prove a CHECKCAST context, not infer one from a semantic tag.
+   Nil passes the check; null receiver invocation still fails after arguments."
+  [reference-class]
+  (when-not (and (class? reference-class) (not (.isPrimitive ^Class reference-class)))
+    (throw (ex-info "reference check completion requires a reference Class"
+                    {:reason :unsupported-value-completion :carrier reference-class})))
+  {:source-context :jvm-checkcast :target-carrier reference-class
+   :policy :preserve-source-reference-check})
+
 (defn primitive-input-contract
   "Retain an actual resolved parameter Class and its source compiler policy.
    This is not a tag-to-cast inference API. Call-site and policy correspondence
@@ -43,6 +56,11 @@
 (defn canonical-contract? [contract]
   (and (map? contract)
        (or (= object-input-contract contract)
+           (and (= #{:source-context :target-carrier :policy} (set (keys contract)))
+                (= :jvm-checkcast (:source-context contract))
+                (= :preserve-source-reference-check (:policy contract))
+                (class? (:target-carrier contract))
+                (not (.isPrimitive ^Class (:target-carrier contract))))
            (and (= #{:source-context :target-carrier :policy :source-policy}
                    (set (keys contract)))
                 (= :jvm-primitive-input (:source-context contract))
@@ -95,6 +113,16 @@
   ;; primitive-vs-boxed and checked-vs-unchecked semantics without re-inference.
   (list (with-meta 'clojure.lang.RT/box {:param-tags [(:target-carrier contract)]}) operand))
 
+(defn- reference-class-expression [contract reference-bindings]
+  ;; Class literals are NOT an identity-preserving constant transport: Clojure
+  ;; can reconstruct them by binary name in another loader. The compilation
+  ;; owner must capture the actual Class in a private lexical value port.
+  (let [port (get reference-bindings (:target-carrier contract))]
+    (when-not (and (symbol? port) (nil? (namespace port)))
+      (throw (ex-info "reference completion requires an owner-bound Class value"
+                      {:reason :unclosed-reference-completion-class :contract contract})))
+    (with-meta port {:tag 'java.lang.Class})))
+
 (defn project-to-jvm-source
   "Project validated completion terms to JVM source, retaining other forms.
 
@@ -110,16 +138,24 @@
    than replacing it with a guessed core cast. The caller MUST compile the
    returned form under that same retained policy and physical lexical scope;
    this pure projection does not execute or police later compilation.
+   CHECKCAST contexts additionally require an owner-local map from the actual
+   Class to a fresh lexical Class value port. The owner must bind the actual
+   Class there and preserve its scope; a Class literal can lose loader identity.
+   This map is not persistent metadata or a global registry.
    Native/device consumers must discharge or refuse these source contexts."
   ([expression] (project-to-jvm-source expression nil))
   ([expression compilation-policy]
+   (project-to-jvm-source expression compilation-policy {}))
+  ([expression compilation-policy reference-bindings]
   (util/postwalk-preserving-meta
    (fn [form]
      (if (and (seq? form) (= completion-symbol (first form)))
        (if-let [{:keys [contract operand]} (canonical-parts form)]
-         (with-meta (if (= object-input-contract contract)
-                      (list '. (list 'do Object) (list 'cast operand))
-                      (project-primitive-input contract operand compilation-policy))
+         (with-meta (case (:source-context contract)
+                      :jvm-object-input (list '. (list 'do Object) (list 'cast operand))
+                      :jvm-checkcast (list '. (reference-class-expression contract reference-bindings)
+                                          (list 'cast operand))
+                      :jvm-primitive-input (project-primitive-input contract operand compilation-policy))
            (value-meta contract form))
          (throw (ex-info "invalid canonical value completion"
                          {:reason :invalid-value-completion :expression form})))
@@ -131,7 +167,9 @@
   ([expression] (project-to-jvm-source expression))
   ([expression supplied] (verified-jvm-source-projection expression supplied nil))
   ([expression supplied compilation-policy]
-   (let [verified (project-to-jvm-source expression compilation-policy)]
+   (verified-jvm-source-projection expression supplied compilation-policy {}))
+  ([expression supplied compilation-policy reference-bindings]
+   (let [verified (project-to-jvm-source expression compilation-policy reference-bindings)]
      (when (and (some? supplied) (not= supplied verified))
        (throw (ex-info "supplied value completion projection differs"
                        {:reason :value-completion-projection-mismatch
