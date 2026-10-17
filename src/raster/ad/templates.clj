@@ -21,6 +21,7 @@
      :grads-fn (optional)  ;; (fn [ctx params result-sym adjoint-sym gensym-fn]
                            ;;   -> [updated-ctx [grad-sym ...]]) for flat bindings}"
   (:require [raster.compiler.support.mangled :as mangled]
+            [raster.compiler.core.inference :as inference]
             [raster.compiler.core.util :as util]
             [raster.compiler.ad.bind-ctx :as bind-ctx]
             [raster.ad.tangent :as tangent]))
@@ -256,8 +257,15 @@
                            e (if (and t (seq? e)
                                       (nil? (:raster.type/tag (meta e))))
                                (vary-meta e assoc :raster.type/tag t)
-                               e)]
-                       [(conj acc s e) (if t (assoc env s t) env)]))
+                           e)
+                           ;; Preserve result facts of earlier intermediate
+                           ;; expressions for subsequent call selection. This
+                           ;; uses the compiler's existing inference, not the
+                           ;; desired tangent type of a later gradient slot.
+                           ;; Keep it in the lexical environment only: a dtype
+                           ;; fact is not a non-null or primitive-local proof.
+                           result-tag (or t (inference/infer-arg-tag e env))]
+                       [(conj acc s e) (if (symbol? s) (assoc env s result-tag) env)]))
                    [[] {}] (partition 2 new-bindings))]
     [pairs (mapv stamp-sym grad-syms)]))
 

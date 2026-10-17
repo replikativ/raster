@@ -14,6 +14,7 @@
             [raster.compiler.ad.bind-ctx :as bind-ctx]
             ;; external :grads-fn registration sites (Phase 1d — tagged mints)
             [raster.dl.nn]
+            [raster.dl.loss]
             [raster.dl.array-ops]
             [raster.dl.attention]
             [raster.nn]))
@@ -28,6 +29,46 @@
 (defn- tag-of [x] (some-> x meta :raster.type/tag))
 
 (defn- tagged [sym tag] (with-meta sym {:raster.type/tag tag}))
+
+(deftest intermediate-expression-facts-reach-subsequent-call-selection
+  (let [[template _] (tmpl/resolve-template 'raster.dl.loss/mse-loss)
+        [ctx _] (tmpl/instantiate-template-ctx
+                  template [(tagged 'pred 'floats) (tagged 'target 'floats)
+                            (tagged 'n 'long)]
+                  nil (tagged 'dy 'double) (make-test-ctx))
+        pairs (vec (partition 2 (:bindings ctx)))
+        [n-binding scale-binding gradient-binding] pairs
+        call (second gradient-binding)]
+    (is (= '.invk (first call)))
+    (is (= 'raster.dl.loss/mse-grad (:raster.op/original (meta call))))
+    (is (= 'floats (tag-of (first gradient-binding))))
+    ;; Carrying facts in the resolver environment must not assert that a
+    ;; nullable intermediate is an unboxed primitive local.
+    (is (nil? (:tag (meta (first n-binding)))))
+    (is (nil? (:tag (meta (first scale-binding)))))
+    (is (= 'long (first (second n-binding))))))
+
+(deftest unknown-intermediates-mask-earlier-selection-facts
+  (let [pred (tagged 'pred 'floats)
+        target (tagged 'target 'floats)
+        gradient (tagged 'gradient 'floats)
+        call (list 'raster.dl.loss/mse-grad pred target 'scale 'count)
+        resolve-bindings
+        (fn [prefix]
+          (first (#'tmpl/stamp-emitted-bindings
+                   (into prefix [gradient call]) [pred target] [gradient nil])))]
+    (is (= '.invk (first (last (resolve-bindings
+                                ['count '(clojure.core/long n)
+                                 'scale '(clojure.core/double dy)])))))
+    (doseq [prefix [['count '(clojure.core/long n) 'scale 'unknown]
+                    ['count '(clojure.core/long n) 'scale '(clojure.core/double dy)
+                     'count 'unknown]
+                    ['count '(clojure.core/long n) 'scale '(clojure.core/double dy)
+                     'scale 'unknown]
+                    ['count '(clojure.core/long n) 'scale '(clojure.core/double dy)
+                     'scale '(opaque-result dy)]]]
+      (is (= 'raster.dl.loss/mse-grad
+             (first (last (resolve-bindings prefix))))))))
 
 (deftest materialized-scalar-projection-does-not-infer-a-missing-expression-dtype
   (let [unknown '(opaque-result x)
