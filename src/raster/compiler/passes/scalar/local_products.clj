@@ -9,6 +9,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]
             [raster.compiler.core.util :as util]))
 
 (defn- literal? [x]
@@ -69,7 +70,8 @@
                     {:present? true :scalar-type (:type proof)}))
         known (or known
                   (when-let [proof (scalar-body/checked-selected-primitive-result init)]
-                    {:present? true :scalar-type (:type proof)}))
+                    {:present? true :scalar-type (:type proof)})
+                  (when (= :present (normal-return/presence init)) {:present? true}))
         retained (some-> (:raster.type/tag (meta id)) dtype/dtype-for-scalar-tag)]
     (cond-> known (and (:scalar-type known) retained) (assoc :scalar-type retained))))
 

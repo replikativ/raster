@@ -44,13 +44,16 @@
                         (double clojure.core/double) :double
                         (throw (ex-info (str "materialize: cannot determine element type for par/map with cast `"
                                              cast "`. Ensure walker stamps :elem-type metadata.")
-                                        {:sym sym :cast cast}))))
+                                        {:reason :unsupported-pure-map-materialization
+                                         :sym sym :cast cast}))))
         alloc-fn (or (get elem-type->alloc-fn elem-type)
                      (throw (ex-info (str "materialize: no alloc-fn for elem-type " elem-type)
-                                     {:elem-type elem-type})))
+                                     {:reason :unsupported-pure-map-materialization
+                                      :elem-type elem-type})))
         array-tag (or (get elem-type->array-tag elem-type)
                       (throw (ex-info (str "materialize: no array-tag for elem-type " elem-type)
-                                      {:elem-type elem-type})))
+                                      {:reason :unsupported-pure-map-materialization
+                                       :elem-type elem-type})))
         ;; the binding symbol IS the buffer (no separate out-sym alias)
         buf-sym (with-meta sym
                   {:tag array-tag

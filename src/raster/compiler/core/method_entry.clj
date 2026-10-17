@@ -16,7 +16,44 @@
 
   Previously a defrecord, now a plain map to avoid classloader conflicts.
   Maps use value equality across classloaders, eliminating ClassCastException
-  when compiled (eval'd) code calls back into dispatch.")
+  when compiled (eval'd) code calls back into dispatch."
+  (:require [raster.compiler.core.types :as types]))
+
+(defn- retained-global-var [callee]
+  (when (and (symbol? callee) (namespace callee))
+    (when-let [source-ns (find-ns (symbol (namespace callee)))]
+      (.findInternedVar ^clojure.lang.Namespace source-ns (symbol (name callee))))))
+
+(defn selected-definition
+  "Project the live registered definition of an already selected typed call.
+   This is correspondence evidence, not a purity, type-inference or result
+   presence rule. No method is selected from guessed operand types or invoked.
+   Both the receiver and its delegated source root must still match registration.
+   Unresolved/generic calls and legacy mutable-Var entries have no projection."
+  [operation implementation-op argument-count]
+  (let [generic (retained-global-var operation)
+        receiver (retained-global-var implementation-op)
+        table (:raster.core/dispatch-table (meta generic))]
+    (when (and generic receiver table)
+      (some
+       (fn [{:keys [tags mangled-ns typed-impl target-fn] :as entry}]
+         (when (and (some? typed-impl) (not (var? typed-impl))
+                    (identical? typed-impl @receiver))
+           (let [source-name (types/mangle (symbol (name operation)) tags)
+                 source (when mangled-ns (retained-global-var (symbol (str mangled-ns) (str source-name))))
+                 source-meta (meta source)
+                 params (:raster.core/deftm-params source-meta)]
+             (when (and source
+                        (= implementation-op (symbol (str mangled-ns) (str source-name "-impl")))
+                        (identical? target-fn @source)
+                        (= tags (:raster.core/deftm-tags source-meta))
+                        (= argument-count (count params) (count tags)))
+               {:entry entry :operation operation :implementation-op implementation-op
+                :source-var source :receiver-var receiver :parameters params :tags tags
+                :return-tag (:raster.core/return-tag source-meta)
+                :source-body (:raster.core/deftm-source-body source-meta)
+                :walked-body (:raster.core/deftm-walked-body source-meta)}))))
+       (get @table argument-count)))))
 
 (def ^:dynamic *compilation-classloader*
   "When bound, ALL defineClass calls during BC compilation use this DCL.
