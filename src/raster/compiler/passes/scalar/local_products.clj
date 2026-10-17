@@ -58,6 +58,34 @@
 
 (declare lower)
 
+(def ^:private conditional-expansion-limit 4096)
+(def ^:dynamic ^:private *conditional-expansion-budget* nil)
+
+(defn- product-arity [expression]
+  (cond
+    (vector? expression) (count expression)
+    (and (seq? expression) (= 'let* (first expression)) (= 3 (count expression)))
+    (product-arity (last expression))
+    (and (seq? expression) (= 'if (first expression)) (= 4 (count expression)))
+    (let [left (product-arity (nth expression 2))
+          right (product-arity (nth expression 3))]
+      (when (and (some? left) (= left right)) left))
+    :else nil))
+
+(defn- conditional-product? [expression]
+  (and (seq? expression) (= 'if (first expression))
+       (= 4 (count expression)) (some? (product-arity expression))))
+
+(defn- spend-conditional-expansion! [continuation]
+  ;; Account for the duplicated continuation before constructing it. The
+  ;; bounded walk also avoids traversing an arbitrarily large rejected body.
+  (let [remaining @*conditional-expansion-budget*
+        cost (count (take (inc remaining) (tree-seq coll? seq continuation)))]
+    (when (> cost remaining)
+      (throw (ex-info "Conditional product replacement exceeds its expansion budget"
+                      {:reason :local-product-budget})))
+    (swap! *conditional-expansion-budget* - cost)))
+
 (defn- binding-fact [scope id init]
   (let [known (or (fact scope init)
                   (when-let [proof (and (seq? init)
@@ -81,15 +109,30 @@
                    (every? symbol? (take-nth 2 bindings)))
       (throw (ex-info "Local product replacement requires lexical symbol bindings"
                       {:reason :local-product-decline})))
-    (let [[local output]
-          (reduce
-           (fn [[scope output] [id init]]
-             (let [init (if (and products? (symbol? init) (:fields (get scope init)))
-                          init (lower scope init products?))
-                   alias (when (symbol? init) (get scope init))]
-               (cond
+    (loop [remaining (seq (partition 2 bindings)) scope env output []]
+      (if-let [[id original-init] (first remaining)]
+        (let [init (if (and products? (symbol? original-init) (:fields (get scope original-init)))
+                     original-init (lower scope original-init products?))
+              alias (when (symbol? init) (get scope init))]
+          (cond
+                 ;; Replace a nonescaping product join by its lexical
+                 ;; continuation in the selected arm. Predicate, arm effects
+                 ;; and continuation each execute once, in their source order.
+                 (and products? (conditional-product? init))
+                 (let [[_ test then else] init
+                       suffix (vec (mapcat identity (next remaining)))
+                       continue (fn [arm]
+                                  (util/alpha-convert
+                                   (relist expression
+                                           (concat [head (into [id arm] suffix)] body))))
+                       _ (spend-conditional-expansion! (concat suffix body))
+                       choice (relist init ['if test
+                                            (lower scope (continue then) products?)
+                                            (lower scope (continue else) products?)])]
+                   (relist expression [head (with-meta (vec output) (meta bindings)) choice]))
+
                  (and products? (:fields alias))
-                 [(assoc scope id alias) output]
+                 (recur (next remaining) (assoc scope id alias) output)
 
                  (and products? (product-shape? init))
                  (let [[prefix fields] (split-product (util/alpha-convert init))
@@ -101,14 +144,14 @@
                        scope (reduce (fn [local [id init]]
                                        (assoc local id (binding-fact local id init)))
                                      scope (partition 2 lifted))]
-                   [(assoc scope id {:fields (mapv first snapshots)})
-                    (into output lifted)])
+                   (recur (next remaining) (assoc scope id {:fields (mapv first snapshots)})
+                          (into output lifted)))
 
                  :else
-                 [(assoc scope id (binding-fact scope id init)) (conj output id init)])))
-           [env []] (partition 2 bindings))]
-      (relist expression (concat [head (with-meta (vec output) (meta bindings))]
-                                 (map #(lower local % products?) body))))))
+                 (recur (next remaining) (assoc scope id (binding-fact scope id init))
+                        (conj output id init))))
+        (relist expression (concat [head (with-meta (vec output) (meta bindings))]
+                                   (map #(lower scope % products?) body)))))))
 
 (defn- lower-scopes [env expression products?]
   (let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expression)
@@ -183,12 +226,15 @@
 (defn lower-local-products
   "Refine only literal/alias presence and scalar-replace projectively used local
    vectors. Unknown calls/parameters never prove presence. If any product escapes,
-   retain all product allocations and perform only literal presence refinement."
+   retain all product allocations and perform only literal presence refinement.
+   Conditional product joins distribute only a bounded lexical continuation;
+   an escape or expansion limit rolls the entire product rewrite back."
   [expression]
-  (try (lower {} expression true)
+  (try (binding [*conditional-expansion-budget* (atom conditional-expansion-limit)]
+         (lower {} expression true))
        (catch clojure.lang.ExceptionInfo e
          (case (:reason (ex-data e))
-           :local-product-escape (try (lower {} expression false)
+           (:local-product-escape :local-product-budget) (try (lower {} expression false)
                                       (catch clojure.lang.ExceptionInfo e
                                         (if (= :local-product-decline (:reason (ex-data e))) expression (throw e))))
            :local-product-decline expression
