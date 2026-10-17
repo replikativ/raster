@@ -137,9 +137,18 @@
     (is (= [32.0 80.0 nil nil] (gradient 2.0 counts 3)))
     (is (= [4] (vec counts)))))
 
-(deftest unsupported-terminal-lexical-region-remains-explicit
-  ;; This exact shape also refuses before the terminal-tape repair. Do not
-  ;; silently drop its prefix statements to make a nested tail look supported.
-  (is (= :ad-active-unlinearized-region
-         (try (rev/value+grad #'terminal-tail-let :wrt [0]) nil
-              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+(deftest terminal-lexical-initializers-preserve-primal-effects-and-adjoints
+  ;; This shape formerly refused. Lexical normalization now retains both
+  ;; terminal statements, including the one before the nested tail let.
+  (let [gradient (rev/value+grad #'terminal-tail-let :wrt [0])]
+    (doseq [cnt [0 1 3] x [-2.0 0.0 0.5 2.0]]
+      (let [power (+ 2 (max 1 cnt))
+            expected (Math/pow x power)
+            derivative (* power (Math/pow x (dec power)))]
+        (.set ^java.util.concurrent.atomic.AtomicLong terminal-draws 0)
+        (is (= expected (terminal-tail-let x cnt)))
+        (is (= 2 (.get ^java.util.concurrent.atomic.AtomicLong terminal-draws)))
+        (.set ^java.util.concurrent.atomic.AtomicLong terminal-draws 0)
+        (is (= [expected derivative nil] (gradient x cnt)))
+        (is (= 2 (.get ^java.util.concurrent.atomic.AtomicLong terminal-draws))
+            "the pullback must not replay either terminal effect")))))
