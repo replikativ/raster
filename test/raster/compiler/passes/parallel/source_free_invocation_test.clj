@@ -272,13 +272,22 @@
       (is (= 0 (get-in (-> zero soac/equations first soac/operation-parts)
                        [:attributes :extent])))
       (doseq [target [:opencl-intel :opencl-portable :cuda :hip]]
-        (let [failure (try (c-family/emit-program
-                            scheduled {:target-dialect target :dtype :float}) nil
-                           (catch clojure.lang.ExceptionInfo error error))]
-          (is (instance? clojure.lang.ExceptionInfo failure))
-          (is (some #(and (map? %) (= [0] (:shape %)))
-                    (nested-records (ex-data failure)))
-              (str target " retains exact zero capacity and refuses the current nonempty KernelBody boundary")))))))
+        (let [emitted (c-family/emit-program scheduled {:target-dialect target :dtype :float})
+              kernel (first (:kernels emitted))
+              body (get-in kernel [:attributes :kernel-body])
+              inputs (filter #(= :input (:kind %)) (:parameters body))
+              bindings (zipmap (map :name (:abi kernel)) (:arguments kernel))
+              loops (distinct (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                                      (nested-records body)))]
+          (is (= 1 (count (:kernels emitted))) (str target))
+          (is (= [[0] [0]] (mapv :shape inputs)) "empty inputs are not padded to fake capacity")
+          (is (= (mapv :shape inputs) (mapv #(get-in % [:layout :shape]) inputs)))
+          (is (= [[1] [1]] [(:workgroup-size (:launch body)) (:group-count (:launch body))]))
+          (is (= 1 (count loops)))
+          (is (= 0 (get-in (first loops) [:lower :argument])))
+          (is (= 1 (:step (first loops))))
+          (is (= '_n_bound (get-in (first loops) [:upper :argument])))
+          (is (= 0 (get bindings '_n_bound)) "the ordered loop performs no input reads"))))))
 
 (deftest source-free-ordered-effect-schedules-one-ordered-loop-without-atomics
   (let [promoted (route/promote-typed-effect-algorithm (ordered-effect-program))

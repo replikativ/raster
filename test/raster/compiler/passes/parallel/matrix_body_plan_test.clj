@@ -128,9 +128,7 @@
                         :dimensions dimensions :result-dtype :float
                         :tile (hardware/derive-gemm-tile {})}))
         kernel (make-kernel '[m n k])]
-    (is (thrown? clojure.lang.ExceptionInfo (make-kernel [0 0 0]))
-        "static empty storage remains outside the existing KernelBody contract")
-    (doseq [dimensions [[65 79 64] '[m n k]]]
+    (doseq [dimensions [[0 0 0] [65 79 64] '[m n k]]]
       (is (= {'c (subvec (vec dimensions) 0 2)}
              (matrix-plan/dense-result-write-domain (make-kernel dimensions)))
           "partial tiles retain logical coverage, not rounded buffer capacity"))
