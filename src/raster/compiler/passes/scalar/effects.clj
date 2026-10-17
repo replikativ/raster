@@ -304,11 +304,18 @@
    when its result is dead, yet two live allocations have distinct mutable
    identities and must never be coalesced.  Keep that distinction here rather
    than teaching individual compiler markers or consumers to protect their
-   operands."
+   operands. Declared storage writes, mutation and allocation also rule out CSE
+   without reanalyzing the callee body. These contracts only deny sharing;
+   their absence never substitutes for Beichte's purity proof."
   [expr]
   (and (seq? expr)
        (symbol? (first expr))
        (not (descriptor/alloc-op? (form/effective-op expr)))
+       (not (when-let [op (descriptor/semantic-op expr)]
+              (let [[contract] (descriptor/resolve-op-descriptor op)]
+                (or (:buffer-write contract)
+                    (true? (get-in contract [:effects :mutating?]))
+                    (true? (get-in contract [:buffer :allocates?]))))))
        (removable-expr? expr)))
 
 (defn replay-safe-value?
