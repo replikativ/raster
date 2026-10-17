@@ -366,6 +366,9 @@
       (is (= [3] (shapes 'b)))
       (is (= [12] (shapes 'C)))
       (is (= [a-capacity 3] (mapv :elements (:inputs emitted))))
+      (is (= {'a 4 'b 3}
+             (into {} (comp (filter #(= :input (:kind %)))
+                            (map (juxt :id :minimum-elements))) (:parameters body))))
       (is (= 12 (get-in body [:attributes :extent])))
       (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact))))))
 
@@ -398,6 +401,55 @@
                        (catch clojure.lang.ExceptionInfo error error))]
       (is (instance? clojure.lang.ExceptionInfo failure))
       (is (= [0] (:shape (ex-data failure)))))))
+
+(deftest map-storage-capacity-does-not-replace-its-read-obligation
+  (doseq [capacity [0 1 2 3]]
+    (try
+      (sg/generate-kernel-graph (assoc-in (capacity-fixture/graph) [:inputs 0 :elements] capacity))
+      (is false "a quotient-index input needs four elements, independently of the output width")
+      (catch clojure.lang.ExceptionInfo failure
+        (is (= :input-capacity (:missing-rule (ex-data failure))))
+        (is (= 4 (:required-elements (ex-data failure))))
+        (is (= capacity (:buffer-elements (ex-data failure)))))))
+  (let [graph (assoc-in (capacity-fixture/graph) [:inputs 0 :elements] '(extent a))
+        artifact (get-in (sg/generate-kernel-graph graph) [:nodes 0 :operation])
+        candidate (get-in artifact [:attributes :scheduled-kernel-body])
+        bind (fn [capacity]
+               (let [buffers {'a (float-array capacity) 'b (float-array 3) 'C (float-array 12)}
+                     arguments (mapv (fn [slot argument]
+                                       (if (= :scalar (:kind slot))
+                                         {:type (:kernel-dtype slot) :value argument}
+                                         (get buffers argument)))
+                                     (:abi artifact) (:arguments artifact))]
+                 (kernel-call/validate-retained-input-capacities!
+                  artifact arguments (fn [value _] (java.lang.reflect.Array/getLength value)))))]
+    (is (identical? artifact (bind 4)))
+    (is (identical? artifact (bind 8)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than" (bind 3)))
+    (doseq [tamper [#(dissoc % :minimum-elements)
+                    #(assoc % :minimum-elements 0) #(assoc % :minimum-elements 1)]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"read minimum differs"
+           (segmap-body/validate-static-graph-capacities!
+            (update-in candidate [:body :parameters 0] tamper) (first (:nodes graph)) graph)))))
+  (let [operation (segop/->SegMap
+                   :unknown-empty-read (segop/make-seg-space 'i 4)
+                   (segop/->SegLevel :thread :virtual)
+                   '(clojure.core/aget a (clojure.core/aget indices i))
+                   nil #{'a 'indices} #{'out} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'out nil)]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"requires a proved zero read domain"
+         (sg/generate-scheduled-segmap-kernel
+          operation :array-types {'a :float 'indices :int 'out :float}
+          :array-shapes {'a [0] 'indices [4] 'out [4]})))
+    (let [empty (sg/generate-scheduled-segmap-kernel
+                 (assoc operation :space (segop/make-seg-space 'i 0))
+                 :array-types {'a :float 'indices :int 'out :float}
+                 :array-shapes {'a [0] 'indices [0] 'out [0]})]
+      (is (= [0 0] (mapv :minimum-elements
+                         (filter #(= :input (:kind %))
+                                 (get-in empty [:attributes :kernel-body :parameters]))))))))
 
 (deftest raw-primary-inout-keeps-its-known-written-prefix
   (let [operation (segop/->SegMap
@@ -440,6 +492,32 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"writable results may only read"
                          (emit (assoc operation :lambda '(inc (clojure.core/aget out 0)))))
         "constant cross-lane reads do not bypass the independent alias contract")))
+
+(deftest ordered-effects-cannot-smuggle-a-primary-cross-lane-read
+  (let [operation (assoc
+                   (segop/->SegMap
+                    :ordered-primary-read (segop/make-seg-space 'i 4)
+                    (segop/->SegLevel :thread :virtual)
+                    nil nil #{'out} #{'out} #{}
+                    (segop/->KernelGrid 1 32 0) :float 'out nil)
+                   :scalar-region
+                   {:locals [] :iteration-order :sequential
+                    :effects ['(clojure.core/aset out i
+                                (clojure.core/aget out (clojure.core/+ i 1)))]})
+        emit (fn [capacity]
+               (sg/generate-scheduled-segmap-kernel
+                operation :array-types {'out :float} :array-shapes {'out [capacity]}))
+        result-operation (-> operation
+                             (assoc :scalar-region nil
+                                    :lambda '(clojure.core/aget out (clojure.core/+ i 1))))]
+    ;; Ordered effects have explicit stores and no primary result. The malformed mixed
+    ;; representation must decline before constructing a pointer contract (or popping forms).
+    (doseq [capacity [4 5]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"map result has no scalar expression"
+                           (emit capacity))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"writable results may only read"
+                         (sg/generate-scheduled-segmap-kernel
+                          result-operation :array-types {'out :float} :array-shapes {'out [5]})))))
 
 (deftest secondary-indexed-store-does-not-inherit-the-primary-write-minimum
   (let [operation (segop/->SegMap

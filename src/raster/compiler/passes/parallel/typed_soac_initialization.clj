@@ -50,6 +50,10 @@
 (defn- fresh-symbol [used prefix]
   (first (remove used (map #(symbol (str prefix %)) (range)))))
 
+(defn- physical-host-read-sites [facts destination]
+  (filter #(some (fn [value] (= destination (physical-id facts value))) (:values %))
+          (get-in facts [:attributes :host-read-sites])))
+
 (defn- initialization-site! [facts {:keys [destination source-binding-id] :as allocation} consumer]
   (let [consumer-facts (get-in facts [:equations (second consumer)])
         placements (or (seq (keys (get-in consumer-facts [:attributes :fusion/constituents])))
@@ -58,10 +62,8 @@
       (fail! "initialization requires an ordered analyzed-source consumer"
              {:allocation allocation :consumer (second consumer) :placements placements}))
     (let [placement (apply max placements)
-          reads (filter #(and (some (fn [value] (= destination (physical-id facts value)))
-                                   (:values %))
-                              (< source-binding-id (:source-binding-id %) placement))
-                        (get-in facts [:attributes :host-read-sites]))
+          reads (filter #(< source-binding-id (:source-binding-id %) placement)
+                        (physical-host-read-sites facts destination))
           host-sites (set (get-in facts [:attributes :host-binding-ids]))
           native? (and (seq reads)
                        (every? #(and (contains? host-sites (:source-binding-id %))
@@ -83,6 +85,17 @@
       (let [value (get-in facts [:values extent])]
         (and (dialect/value-id? extent) (= :tensor (:kind value))
              (= [] (:shape value)) (contains? #{:int :long} (:dtype value))))))
+
+(defn- host-only-native-provider?
+  "A retained host allocator owns storage never touched by a typed equation. Its host uses
+   must all follow allocation; an unused fact or unowned observation is not such a provider."
+  [facts {:keys [destination source-binding-id]}]
+  (let [host-sites (set (get-in facts [:attributes :host-binding-ids]))
+        reads (physical-host-read-sites facts destination)]
+    (and (contains? host-sites source-binding-id)
+         (seq reads)
+         (every? #(and (contains? host-sites (:source-binding-id %))
+                       (< source-binding-id (:source-binding-id %))) reads))))
 
 (defn- initializer [facts {:keys [destination extent dtype source-binding-id] :as allocation}
                     placement]
@@ -210,6 +223,13 @@
          {:facts original-facts :equations [] :pending (vec allocations) :fills 0 :elided 0 :native 0
           :available-extents (extent-proof/initial-environment program)}
          (dialect/equations program))
+        native-only (filterv #(host-only-native-provider? facts %) pending)
+        pending (remove (set native-only) pending)
+        facts (if (seq native-only)
+                (update-in facts [:attributes :native-initialization-providers]
+                           #(vec (distinct (concat % (map :destination native-only)))))
+                facts)
+        native (+ native (count native-only))
         _ (when (seq pending)
             (fail! "live zero storage has no typed initialization site"
                    {:allocations pending}))

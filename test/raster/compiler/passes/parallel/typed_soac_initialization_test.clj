@@ -161,6 +161,43 @@
   (try (initialization/materialize program) nil
        (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
+(deftest host-only-storage-retains-its-native-owner
+  (let [source '(let* [storage (float-array 8)
+                       observed (do (aset storage 0 (float 7.0)) nil)
+                       output (raster.par/pmap i 4 float (float i))] output)
+        p (frontend/form->program
+           source {:dtype :float :values {'storage (av/tensor {:dtype :float :shape [8]})}})
+        [scheduled stats] (initialization/materialize p)
+        facts (dialect/facts scheduled)]
+    (is (= 1 (:initialization-native-providers stats)))
+    (is (zero? (:initialization-fills stats)))
+    (is (= ['storage] (get-in facts [:attributes :native-initialization-providers])))
+    (is (= (dialect/equations p) (dialect/equations scheduled)))
+    (is (= (get-in (dialect/facts p) [:attributes :allocations])
+           (get-in facts [:attributes :allocations])))
+    (is (= :structured-control-native-initialization
+           (try (structured/promote-program (route/program-envelope scheduled) {})
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (doseq [change [#(assoc-in % [:attributes :host-binding-ids] [1])
+                    #(assoc-in % [:attributes :host-binding-ids] [0])
+                    #(assoc-in % [:attributes :host-read-sites] [])
+                    #(assoc-in % [:attributes :host-read-sites]
+                               [{:source-binding-id 0 :values #{'storage}}])
+                    #(assoc-in % [:attributes :host-read-sites]
+                               [{:source-binding-id 2 :values #{'storage}}])]]
+      (is (= :typed-soac-initialization-contract (reason (with-facts p change)))))
+    (let [alias-program
+          (with-facts p
+            #(-> %
+                 (assoc-in [:equations 2 :aliases 'storage-alias] 'storage)
+                 (assoc-in [:attributes :host-read-sites]
+                           [{:source-binding-id 1 :values #{'storage-alias}}])))
+          [alias-scheduled alias-stats] (initialization/materialize alias-program)]
+      (is (= 1 (:initialization-native-providers alias-stats)))
+      (is (= ['storage] (get-in (dialect/facts alias-scheduled)
+                                [:attributes :native-initialization-providers]))))))
+
 (deftest logical-prefix-shape-is-not-the-allocation-capacity
   (doseq [domain [4 'm]]
     (let [p (frontend/form->program (source '(float-array 8) domain)
