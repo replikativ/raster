@@ -369,6 +369,35 @@
                    (catch Throwable _ form)))
             walked-body))))
 
+(clojure.core/defn ^:private emit-owned-bytecode!
+  "Emit against historical inputs and validate BEFORE publishing an impl.
+   Lazy materialization can change dependency metadata on the first attempt;
+   retry the emission, not its certificate, using the same bounded policy as
+   static bytecode production. No numeric body executes here."
+  [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym]
+  (loop [attempt 0]
+    (let [dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/emission-input-snapshots)
+                        body source-ns)
+          revision (dispatch/compiler-definition-revision)
+          inputs (atom {:static [] :values []})
+          implementation
+          (binding [me/*emission-inputs* inputs]
+            (emitter (str class-name (gensym "__owned")) params tags return-tag
+                     body source-ns typed-interface (str (ns-name source-ns)) (str mangled-sym)))
+          emission {:backend :jvm-bytecode :implementation implementation
+                    :params params :tags tags :return-tag return-tag :body body :source-ns source-ns
+                    :typed-interface typed-interface
+                    :dependency-snapshots (into dependencies (:values @inputs))
+                    :static-inputs (:static @inputs) :definition-revision revision
+                    :completed-definition-revision (dispatch/compiler-definition-revision)}
+          failure (when implementation
+                    (try (me/assert-emission-inputs-current! emission) nil
+                         (catch clojure.lang.ExceptionInfo e e)))]
+      (if (and failure (< attempt 2) (me/retryable-emission-change? failure))
+        (recur (inc attempt))
+        (do (when failure (throw failure))
+            {:implementation implementation :emission emission})))))
+
 (clojure.core/defn ^:no-doc do-bytecode-upgrade!
   "Compile a deftm body to bytecode and swap the -impl var.
   Julia model: re-walks from source body with TC at JIT time for
@@ -404,9 +433,10 @@
                               (.replace (str mangled-sym) "." "_")
                               "_" (bit-and (hash effective-body) 0x7FFFFFFF)
                               "_" (mod (System/nanoTime) 1000000))
-              impl (@compile-typed-impl-fn class-name params tags return-tag
-                                           effective-body source-ns typed-iface-name
-                                           (str (ns-name source-ns)) (str mangled-sym))]
+              {:keys [implementation emission]}
+              (emit-owned-bytecode! @compile-typed-impl-fn class-name params tags return-tag
+                                    effective-body source-ns typed-iface-name mangled-sym)
+              impl implementation]
           (when impl
             (let [old-impl (.getRawRoot ^clojure.lang.Var impl-var)]
               (alter-var-root impl-var (constantly impl))
@@ -438,6 +468,13 @@
                         (typed-dispatch/update-dispatch-impl! dispatch-obj old-impl impl)))))
             ;; Invalidate MutableCallSites so C2 re-inlines with new impl
                 (@invalidate-callsites-fn impl-var impl)
+                ;; Compiler-owner data for paired primal/residual emission.
+                ;; This is the actual input consumed by the successful bytecode
+                ;; emitter, not a reconstructed source body or a source-policy
+                ;; assertion. Consumers must match the implementation by identity
+                ;; and retain the ordinary selected-definition/dependency guards.
+                ;; Attach only after successful dispatch/callsite publication.
+                (alter-meta! impl-var assoc ::bytecode-emission emission)
                 impl
                 (catch Exception e
               ;; Rollback var to old impl on dispatch table or callsite failure

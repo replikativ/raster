@@ -687,7 +687,7 @@
   "Comparison/boolean operations — zero gradient in AD."
   #{'< '> '<= '>= '== '!= 'not
     'clojure.core/< 'clojure.core/> 'clojure.core/<= 'clojure.core/>=
-    'clojure.core/== 'clojure.core/not= 'clojure.core/not
+    'clojure.core/== 'clojure.core/not= 'clojure.core/not 'clojure.core/nil?
     'clojure.core/zero? 'clojure.core/pos? 'clojure.core/neg?})
 
 (defn comparison-op?

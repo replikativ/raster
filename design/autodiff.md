@@ -58,6 +58,29 @@ Function inversion and log-Jacobian capabilities remain distinct from transposit
 Implementation order, acceptance gates and the original compiler obligations are retained
 in [the compiler campaign](compiler-unification-campaign.md#ad-consolidation-sequence).
 
+### Generated JVM owner: checked helper composition
+
+The internal generated ordered-SSA owner can compose read-only scalar `deftm`
+helpers through their actual selected JVM interface and retained bytecode
+emission. It completes call inputs under its own source policy, privately
+captures a paired companion, and saves the pullback produced by that forward
+call. Historical source/receiver guards also fence delayed backward execution.
+Borrowed array replay roots are mapped to the caller's inputs; this does not
+snapshot their contents or permit external mutation before backward completion.
+Inactive helper calls must satisfy the same ownership and effect checks.
+
+Scalar cotangent accumulation does not establish a physical carrier by itself:
+the reverse engine projects into the declared tangent space before attaching its
+carrier tag. Helper result seeds and input edges use the shared tangent projection;
+absence remains distinct from a present numerical zero.
+
+This is not arbitrary source-call normalization or new default nested-helper AD
+support. The ordinary source path still refuses an unowned derived helper
+pullback. Runtime private companions are not portable AOT/native/GPU artifacts.
+The marketing generator's existing single-body JVM-AOT gradient qualification is
+a regression check, not evidence that its wrapper uses this internal helper path.
+No cross-backend or performance claim follows from these JVM acceptance tests.
+
 ## Surface model
 
 Raster differentiates ordinary `deftm` code. Because every arithmetic op
@@ -663,6 +686,32 @@ independent of AD.
   inside it (a `[F→[D` primal miscompile — a devirt hole, not an AD defect; worked
   around with single-method float wrappers). #75: `par/reduce` over `aget` reads has
   a namespace-sensitive lowering hazard (segred aget).
+
+## Structural products and optional cotangents
+
+Reverse AD uses the same constructor, alias, constant-projection and field-port
+algebra for ordinary derivative re-entry and internally generated programs.
+This does not grant an ordinary program a generated call's source policy or
+private helper ownership. Field interfaces come from actual constructors and
+retained declarations; incompatible conditional layouts and unclosed active
+fields or consumers still refuse. The primal retains its original product
+allocation, identity, field evaluation order and selected branch.
+
+Re-entry normalizes lexical binding initializers at their original positions,
+including their body statements and retained result types. It does not move
+arguments past their original input conversions. Nullable tangent projections
+retain the actual cast arm's type as well as the outer result type.
+
+An absent cotangent (`nil`) is distinct from a present numeric zero. Internal
+branch ports and paired helper pullbacks preserve absence, and a pullback is
+not executed for an absent seed. A present zero still executes derivative
+arithmetic, including singularities. Only the outer public gradient boundary
+materializes shape- and dtype-matched zeros for selected differentiable inputs.
+Consequently, a selected scalar input of a zero-trip reduction now receives a
+numeric zero rather than the historical `nil`. Excluded `:wrt` and NoTangent
+argument slots remain `nil`; primitive tangent projection itself still
+preserves absence. This makes public zero gradients consistent without sending
+fabricated zero edges into unused, potentially singular upstream computations.
 
 ## Summary
 

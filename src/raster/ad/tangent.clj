@@ -25,6 +25,7 @@
   without creating cycles."
   (:refer-clojure :exclude [])
   (:require [raster.compiler.core.types :as types]
+            [raster.ad.accumulation :as accumulation]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
 (def ^:private scalar-tag->dtype {'double :double 'float :float})
@@ -145,8 +146,8 @@
 
 (defn- expr-manifest-tag
   "The statically KNOWN scalar tag of an IR expression — carried or manifest,
-  never inferred: a symbol's/form's carried :raster.type/tag stamp, the head
-  of an explicit float/double cast form, or a numeric literal's own type.
+  never guessed from the target primal: a carried :raster.type/tag stamp,
+  explicit cast, literal, or the approved optional sum's retained result facet.
   nil when the expression's type is not statically known."
   ([expr] (expr-manifest-tag expr {}))
   ([expr binding-map]
@@ -154,8 +155,11 @@
              (or (cond
                    (or (symbol? expr) (seq? expr))
                    (or (:raster.type/tag (meta expr))
-                       (explicit-scalar-cast-tag expr))
-                   (float? expr) 'double  ;; a bare Clojure literal like 0.0 is a double
+                       (explicit-scalar-cast-tag expr)
+                       (when (and (seq? expr) (accumulation/approved-call? expr))
+                         (accumulation/nullable-result-tag
+                          expr (mapv #(known-tag % seen) (descriptor/call-args expr)))))
+                   (float? expr) (types/literal-tag expr)
                    :else nil)
                  ;; SSA aliases retain the source value's type even when an intermediate
                  ;; binder has no tag. Never infer a function's result or the desired target
@@ -209,6 +213,7 @@
                         (select-keys (meta cotangent-expr) [:raster.type/tag]))]
             (with-meta
               (list 'let* [input cotangent-expr]
-                    (list 'if (list 'clojure.core/nil? input) nil (list cast-op input)))
+                    (list 'if (list 'clojure.core/nil? input) nil
+                          (with-meta (list cast-op input) {:raster.type/tag cast-tag})))
               {:raster.type/tag cast-tag}))))
       cotangent-expr))))

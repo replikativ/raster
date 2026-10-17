@@ -5,6 +5,52 @@
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
+(deftest actual-owned-emission-retries-changed-inputs-before-returning-code
+  (let [scope (create-ns (gensym "raster.emission-retry."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm square [x :- Double] :- Double
+                 (raster.numeric/* x x))))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'square))
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            _ (core/ensure-bytecode-implementation! receiver)
+            {:keys [params tags return-tag body typed-interface]} (:raster.core/bytecode-emission (meta receiver))
+            inputs (bytecode/emission-input-snapshots body scope)
+            dependency (:var (first inputs))
+            original (meta dependency)
+            emitted (atom [])
+            compile! (fn [change?]
+                       (#'core/emit-owned-bytecode!
+                        (fn [& args]
+                          (let [impl (apply bytecode/compile-typed-impl! args)]
+                            (swap! emitted conj impl)
+                            (when (change? (count @emitted))
+                              ;; The generated code is real; a consumed definition
+                              ;; changes after emission but before publication.
+                              (alter-meta! dependency update :raster.core/deftm-walked-body
+                                           #(vector (list 'do (first %) 0.0))))
+                            impl))
+                        "raster.compiled.OwnedRetry" params tags return-tag body scope
+                        typed-interface (:name (meta source))))]
+        (is (var? dependency))
+        (try
+          (let [{:keys [implementation emission]} (compile! #(= 1 %))]
+            (is (= 2 (count @emitted)))
+            (is (not (identical? (first @emitted) implementation)))
+            (is (identical? (last @emitted) implementation))
+            (is (= 9.0 (implementation 3.0)))
+            (is (identical? emission (method-entry/assert-emission-inputs-current! emission))))
+          (finally (reset-meta! dependency original)))
+        (reset! emitted [])
+        (try
+          (is (= :stale-emission-inputs
+                 (try (compile! (constantly true)) :incorrectly-published
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+          (is (= 3 (count @emitted)) "persistent change is bounded, not recertified")
+          (finally (reset-meta! dependency original))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest emission-inputs-retain-transitive-static-source-observations
   (let [scope (create-ns (gensym "raster.emission-dependencies."))]
     (try

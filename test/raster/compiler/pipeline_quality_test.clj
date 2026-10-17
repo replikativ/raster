@@ -84,27 +84,66 @@
 ;; Bytecode quality — catches loop/comparison/checkcast regressions
 ;; ================================================================
 
-(defn- sgd-helper-names
-  "Identify this fixture's SGD helpers by counted loop, store and learning-rate capture.
-   Typed admission may hoist alength into a scalar extent outside the helper."
+(defn- sgd-loop? [expr]
+  (and (seq? expr)
+       (contains? '#{loop* dotimes clojure.core/dotimes} (first expr))
+       (form-contains-name? expr "aset")
+       (contains? (util/free-syms expr) 'lr)))
+
+(defn- sgd-methods
+  "Find every actual SGD owner, including conditional loops in compute.
+   Method partitioning is not evidence that an update vanished or survived."
   [diag]
-  (for [[name info] (:helper-map diag)
+  (for [[name info] (assoc (:helper-map diag) "compute" {:expr (:compute-form diag)})
         :let [expr (:expr info)]
-        :when (and (form-contains-name? expr "loop*")
-                   (form-contains-name? expr "aset")
-                   (contains? (util/free-syms expr) 'lr))]
-    name))
+        :when (some sgd-loop? (tree-seq coll? seq expr))]
+    [name expr]))
+
+(defn- check-sgd-updates! [compiled]
+  (let [parameters [(double-array [0.2 0.3 0.4 0.5]) (double-array [0.1 0.2])
+                    (double-array [0.3 -0.2 -0.1 0.4]) (double-array [0.05 -0.05])]
+        args (into parameters [(double-array [0.7 1.1]) (double-array [0.0 1.0])])
+        original-parameters (mapv vec parameters)
+        original-inputs (mapv vec (drop 4 args))
+        rate 0.01 h 1.0e-6
+        primal (apply nn/loss-fn args)
+        expected (mapv (fn [^doubles parameter]
+                         (mapv (fn [i]
+                                 (let [original (aget parameter i)
+                                       derivative
+                                       (try
+                                         (aset parameter i (+ original h))
+                                         (let [plus (apply nn/loss-fn args)]
+                                           (aset parameter i (- original h))
+                                           (/ (- plus (apply nn/loss-fn args)) (* 2.0 h)))
+                                         (finally (aset parameter i original)))]
+                                   (- original (* rate derivative))))
+                               (range (alength parameter)))) parameters)
+        actual (apply compiled (conj args rate))]
+    (is (< (Math/abs (- (double primal) (double actual))) 1.0e-10))
+    (is (= original-inputs (mapv vec (drop 4 args))))
+    (doseq [[before after] (map vector original-parameters expected)]
+      (is (some true? (map #(> (Math/abs (- (double %1) (double %2))) 1.0e-8) before after))
+          "the oracle requires a nonzero update in each parameter array"))
+    (doseq [[parameter reference] (map vector parameters expected)
+            [actual expected] (map vector parameter reference)]
+      (is (< (Math/abs (- (double actual) (double expected))) 1.0e-8)
+          "all four nonzero parameter updates agree with independent finite differences"))))
 
 (deftest compiled-bytecode-quality-test
-  (testing "Compiled SGD helpers have optimal bytecode"
+  (testing "Actual SGD-owning methods retain typed counted-loop bytecode"
     (let [f (pipeline/compile-aot #'test-train-step :simd? false)
           diag (inspect/compiled-diagnostics #'test-train-step)
-          helpers (sgd-helper-names diag)]
-      (is (>= (count helpers) 2)
-          "Should have at least 2 SGD update helpers")
+          methods (sgd-methods diag)]
+      (is (seq methods) "SGD must have an actual emitted method owner")
+      (is (>= (count (filter sgd-loop? (mapcat #(tree-seq coll? seq (second %)) methods))) 4)
+          "all four parameter arrays retain their SGD loops")
+      (check-sgd-updates! f)
+      (is (some? (:statics-bytes diag)) "compiled bytecode diagnostics must be retained")
       (when-let [bytes (:statics-bytes diag)]
-        (doseq [helper-name helpers]
+        (doseq [[helper-name _] methods]
           (let [bc (with-out-str (inspect/disassemble bytes {:method helper-name}))]
+            (is (seq bc) (str "missing disassembly for SGD owner " helper-name))
             (when (seq bc)
               (testing (str helper-name " uses integer comparison")
                 (is (.contains bc "IF_ICMPGE")

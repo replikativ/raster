@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :refer [deftm]]
             [raster.numeric :as n]
+            [raster.ad.reverse :as reverse]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.local-products :as products]))
 
@@ -10,6 +11,20 @@
         values (if (clojure.core/nil? seed) [nil nil]
                    (let [scaled (n/* x 2.0)] [x scaled]))]
     (n/+ (clojure.core/nth values 0) (clojure.core/nth values 1))))
+
+(deftm scalar-square [x :- Double] :- Double (n/* x x))
+
+(deftm scalar-square-gradient [x :- Double] :- Double
+  (nth ((reverse/value+grad #'scalar-square) x) 1))
+
+(deftest scalar-ad-fanin-compiles-through-the-shared-native-and-jvm-front-end
+  (doseq [target [:jvm :c]]
+    (let [compiled (pipeline/compile-aot #'scalar-square-gradient :target target :dtype :double)]
+      (try
+        (doseq [x [0.0 2.0 -3.5 Math/PI]]
+          (is (= (* 2.0 x) (double (compiled x)))))
+        (finally (when (instance? java.lang.AutoCloseable compiled)
+                   (.close ^java.lang.AutoCloseable compiled)))))))
 
 (deftest local-products-share-the-jvm-and-native-front-end
   (doseq [target [:jvm :c]]
@@ -22,6 +37,57 @@
 
 (defn- run [expression & arguments]
   (apply (eval (list 'fn* '[x calls] expression)) arguments))
+
+(deftest scalar-accumulation-lowering-requires-independent-present-carriers
+  (let [source '(let* [left (clojure.core/double x)
+                       right (clojure.core/double 2.0)]
+                  (raster.ad.reverse/grad-acc left right))
+        lowered (products/lower-local-products source)]
+    (is (some #{'clojure.core/+} (tree-seq coll? seq lowered)))
+    (is (not-any? #{'raster.ad.reverse/grad-acc} (tree-seq coll? seq lowered)))
+    (doseq [x [0.0 -0.0 Math/PI -2.0]]
+      (is (= (run source x nil) (run lowered x nil))))
+    (is (thrown? NullPointerException (run lowered nil nil))))
+  (doseq [source ['(raster.ad.reverse/grad-acc x 1.0)
+                  '(raster.ad.reverse/grad-acc nil 1.0)
+                  '(raster.ad.reverse/grad-acc (clojure.core/float x)
+                                             (clojure.core/double 1.0))
+                  '(raster.ad.reverse/grad-acc [1.0] [2.0])]]
+    (is (= source (products/lower-local-products source))
+        "unknown, absent, mixed-width and product operands are not scalar proofs")))
+
+(deftest scalar-accumulation-does-not-change-effects-or-association
+  (let [source '(let* [a (clojure.core/double (do (swap! calls conj :a) x))
+                       b (clojure.core/double (do (swap! calls conj :b) 1.0))
+                       c (clojure.core/double (do (swap! calls conj :c) -1.0e16))]
+                  (raster.ad.reverse/grad-acc
+                   (raster.ad.reverse/grad-acc a b) c))
+        lowered (products/lower-local-products source)
+        before (atom []) after (atom [])]
+    (is (= (run source 1.0e16 before) (run lowered 1.0e16 after)))
+    (is (= [:a :b :c] @before @after))))
+
+(deftest float-scalar-accumulation-keeps-the-existing-float-addition
+  (let [source '(let* [left (clojure.core/float x)
+                       right (clojure.core/float 1.0)]
+                  (raster.ad.reverse/grad-acc left right))
+        lowered (products/lower-local-products source)]
+    (is (some #{'raster.numeric/+} (tree-seq coll? seq lowered)))
+    (is (not-any? #{'raster.ad.reverse/grad-acc} (tree-seq coll? seq lowered)))
+    (doseq [x [0.0 -0.0 Math/PI 16777216.0]]
+      (is (= (Float/floatToIntBits (float (run source x nil)))
+             (Float/floatToIntBits (float (run lowered x nil))))))))
+
+(deftest scalar-accumulation-refuses-forged-width-or-replaced-helper
+  (let [binder (with-meta 'left {:raster.type/tag 'double})
+        source (list 'let* [binder '(clojure.core/float x)]
+                     '(raster.ad.reverse/grad-acc left (clojure.core/double 2.0)))]
+    (is (some #{'raster.ad.reverse/grad-acc}
+              (tree-seq coll? seq (products/lower-local-products source)))))
+  (let [source '(raster.ad.reverse/grad-acc (clojure.core/double x)
+                                          (clojure.core/double 2.0))]
+    (with-redefs [reverse/grad-acc (fn [& _] (throw (AssertionError. "must not execute helper")))]
+      (is (= source (products/lower-local-products source))))))
 
 (deftest selected-nil-tests-refine-repeated-optional-products-without-growing-the-budget
   (let [ids (mapv #(symbol (str "p" %)) (range 30))

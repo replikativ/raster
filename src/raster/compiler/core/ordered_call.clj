@@ -135,7 +135,7 @@
                                 (cond-> (:input-contracts checked)
                                   (:receiver-contract checked) (conj (:receiver-contract checked)))))
         class-ports (mapv (fn [carrier] {:class carrier :port (fresh! "reference_class")}) classes)]
-    {:bindings (vec bindings)
+    {:bindings (vec bindings) :input-values input-values
      :invocation (list* invoke-head (if static? input-values (into [receiver-value] input-values)))
      :class-ports class-ports :source-policy source-policy
      ;; Owner-side data only. A downstream source/AD consumer must derive the
