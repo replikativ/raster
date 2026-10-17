@@ -3,6 +3,7 @@
             [raster.core :refer [deftm]]
             [raster.compiler.backend.gpu.kernel-body-compile-fixtures :as fixtures]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -47,6 +48,29 @@
           [scheduled stats] (initialization/materialize program)]
       (is (= program scheduled))
       (is (zero? (:initialization-fills stats))))))
+
+(deftest allocation-analysis-facts-do-not-manufacture-live-zero-storage
+  (let [source '(let* [unused (clojure.core/float-array capacity)
+                       output (raster.par/pmap i n float (float i))] output)
+        options {:dtype :float :scalar-types {'capacity :long 'n :long}}
+        program (frontend/form->program source options)
+        [scheduled stats] (initialization/materialize program)]
+    (is (not (contains? (:values (dialect/facts program)) 'unused)))
+    (is (= 'unused (get-in (dialect/facts program) [:attributes :allocations 0 :destination])))
+    (is (= 'capacity (get-in (dialect/facts program) [:attributes :allocations 0 :extent])))
+    (is (= program scheduled))
+    (is (zero? (:initialization-fills stats)))
+    (let [explicit (av/tensor {:dtype :float :shape '[capacity]})
+          program (frontend/form->program source (assoc options :values {'unused explicit}))]
+      (is (= explicit (get-in (dialect/facts program) [:values 'unused]))
+          "an explicit caller contract remains explicit, unlike an analysis-only fact")))
+  (let [source '(let* [storage (clojure.core/float-array n)
+                       output (raster.par/pmap i n float (aget storage i))] output)
+        program (frontend/form->program source {:dtype :float :scalar-types {'n :long}})
+        [scheduled stats] (initialization/materialize program)]
+    (is (= '[n] (get-in (dialect/facts scheduled) [:values 'storage :shape])))
+    (is (= 1 (:initialization-fills stats)))
+    (is (= 2 (count (dialect/equations scheduled))))))
 
 (deftest full-domain-proof-follows-scalar-ssa-products
   (doseq [[allocation fills] [['(* (long n) width) 0] ['(* n width 2) 1]]]

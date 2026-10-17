@@ -6097,6 +6097,13 @@
               (filterv soac-description? descriptions)
               swr-descriptions (filterv swr-description? descriptions)
               physical-outputs (physical-output-symbols descriptions)
+              host-descriptions
+              (filterv #(and (= :scalar (:kind %))
+                             (not (supported-description? physical-outputs %)))
+                       descriptions)
+              host-control-descriptions (into host-descriptions swr-descriptions)
+              host-read-references (vec (distinct (mapcat #(util/free-syms (:expr %))
+                                                        host-control-descriptions)))
               ;; Source descriptions retain the same authoritative local scalar contracts used
               ;; during admission.  Thread them into AbstractValue construction as well: a
               ;; checked host boundary consumed as a launch extent must not silently fall back to
@@ -6217,6 +6224,21 @@
                                          [(list 'unknown-dimension destination)]))])
                                    (:result-storage description))))
                     semantic-descriptions)
+              ;; Allocation facts establish producer shapes during analysis, but a fact is not
+              ;; a use. Publishing dead scaffold buffers would manufacture live initialization
+              ;; obligations. Keep semantic/physical/host uses and their dimension closure only;
+              ;; caller-supplied contracts remain explicit roots.
+              published-storage-values
+              (loop [needed (into (set (concat references definitions outputs
+                                              (keys destination-values) host-read-references))
+                                 (keys values))]
+                (let [expanded (into needed
+                                     (mapcat (fn [id]
+                                               (mapcat util/free-syms
+                                                       (:shape (get storage-values id)))))
+                                     needed)]
+                  (if (= expanded needed) (select-keys storage-values needed)
+                      (recur expanded))))
               inferred-values (reduce (fn [contracts equation]
                                         (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
                                                    (equation-values equation dtype array-types'
@@ -6224,7 +6246,7 @@
                                                                     contracts)))
                                       (merge destination-values
                                              (contraction-storage-values equations dtype array-types' values)
-                                             storage-values)
+                                             published-storage-values)
                                       equations)
               inferred-values
               (reduce (fn [contracts description]
@@ -6298,21 +6320,15 @@
                                              :host-binding (:host-binding description)})))]))
                          equation-descriptions))
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
-              host-descriptions
-              (filterv #(and (= :scalar (:kind %))
-                             (not (supported-description? physical-outputs %)))
-                       descriptions)
               ;; Protected markers stay in the reconstructed host form until their existing plan
               ;; becomes a scheduled equation. Keeping the source binding is provenance and
               ;; compatibility materialization, not a second execution path after admission.
-              host-control-descriptions (into host-descriptions swr-descriptions)
               host-binding-ids (mapv :id host-control-descriptions)
               ;; Program values a host-controlled binding reads are uses of those values: a
               ;; producer read by the host must stay materialized, whatever fusion does with
               ;; its typed consumers.
               host-read-values
-              (->> host-control-descriptions
-                   (mapcat #(util/free-syms (:expr %)))
+              (->> host-read-references
                    (filter #(contains? values %))
                    distinct
                    vec)
