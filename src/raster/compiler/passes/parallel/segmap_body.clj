@@ -888,7 +888,20 @@
   "Read prefixes are independent of physical capacity. Reuse the source address proof and
    typed-SSA range proof; unknown reads do not acquire an invented prefix."
   [operation scheduled-operations options]
-  (let [{index :name bound :bound} (first (get-in operation [:space :dims]))
+  (let [source (get-in options [:graph-node :operation])
+        ;; Address projection can remove the source locals used by the dense-span proof.
+        ;; Recover its semantic owner only by rechecking that exact graph-bound transform;
+        ;; an attached requirements map is not authority to assert a read minimum.
+        operation (if (and source (not= source operation))
+                    (let [projected (map-reads/validate-and-project-addresses
+                                     source (:graph-node options) (:kernel-graph options))]
+                      (when-not (= projected operation)
+                        (decline! :read-capacity-source
+                                  "map read capacity requires its exact source address projection"
+                                  {:operation (:id operation)}))
+                      source)
+                    operation)
+        {index :name bound :bound} (first (get-in operation [:space :dims]))
         {:keys [locals result effects]} (scalar-region operation)]
     (if (and (integer? bound) (zero? bound))
       (zipmap (:inputs operation) (repeat 0))

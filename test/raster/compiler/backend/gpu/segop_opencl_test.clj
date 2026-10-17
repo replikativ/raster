@@ -19,6 +19,8 @@
             [raster.compiler.backend.gpu.kernel-body-target :as kernel-target]
             [raster.compiler.backend.gpu.emitted-graph-interface :as emitted-interface]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.dl.nn :as dl-nn]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
@@ -351,6 +353,44 @@
       (is (= (into {} (map (fn [[id n]] [id [n]])) expected)
              (into {} (comp (filter #(= :input (:kind %))) (map (juxt :id :shape)))
                    (get-in artifact [:attributes :kernel-body :parameters])))))))
+
+(deftest public-symbolic-map-retains-read-minima-after-address-projection
+  (let [compilation (equation-first/compile #'dl-nn/batch-norm
+                                           {:target :cuda:0 :dtype :float})
+        parameters (mapcat #(get-in % [:attributes :kernel-body :parameters])
+                           (:kernels compilation))
+        beta (filter #(= 'beta (:id %)) parameters)]
+    (is (= 4 (count (:kernels compilation))))
+    (is (= 1 (count beta)))
+    (is (= '[features] (:shape (first beta))))
+    (is (= 'features (:minimum-elements (first beta))))
+    (is (every? #(= :kernel-body (kart/emission-route %)) (:kernels compilation)))))
+
+(deftest read-minima-reject-an-unrelated-source-address-projection
+  (let [initial (capacity-fixture/graph)
+        index (get-in initial [:nodes 0 :operation :space :dims 0 :name])
+        operation (assoc (get-in initial [:nodes 0 :operation])
+                         :space (segop/make-seg-space index 'n) :scalars #{'n}
+                         :scalar-region
+                         {:locals [] :result (list '* (list 'aget 'a index) (list 'aget 'b index))})
+        certificate (map-reads/symbolic-read-certificate operation {})
+        node (assoc (first (:nodes initial)) :operation operation
+                    :scalar-uses #{'n} :read-capacity-certificate certificate)
+        graph (kgraph/make {:inputs [(kgraph/buffer 'a :float 'n :device :input)
+                                     (kgraph/buffer 'b :float 'n :device :input)]
+                            :outputs [(kgraph/buffer 'C :float 'n :device :output)]
+                            :scalars [(kgraph/scalar 'n :long)] :nodes [node]})
+        projected (map-reads/validate-and-project-addresses (:operation node) node graph)
+        altered (assoc-in projected [:scalar-region :result] (float 0.0))]
+    (is (= :zero-based-dense-read-spans (:kind certificate)))
+    (is (= :read-capacity-source
+           (try (segmap-body/schedule
+                 altered {:array-types {'a :float 'b :float 'C :float}
+                          :array-shapes {'a '[n] 'b '[n] 'C '[n]}
+                          :scalar-types {'n :long}
+                          :graph-node node :kernel-graph graph})
+                nil
+                (catch clojure.lang.ExceptionInfo error (:missing-rule (ex-data error))))))))
 
 (deftest typed-map-preserves-independent-static-graph-capacities
   (doseq [a-capacity [4 8]

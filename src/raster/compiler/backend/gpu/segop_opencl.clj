@@ -165,6 +165,7 @@
                                :array-shapes (checked-graph-input-shapes
                                               segmap kernel-graph
                                               (merge array-shapes (:array-shapes storage-options)))
+                               :graph-node graph-node :kernel-graph kernel-graph
                                :scalar-definitions (:scalar-definitions storage-options)}
                                      (select-keys opts [:scalar-math])))
         ;; The projected operation is private schedule input. ScheduledKernelBody remains a
