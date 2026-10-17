@@ -688,7 +688,8 @@
   #{'< '> '<= '>= '== '!= 'not
     'clojure.core/< 'clojure.core/> 'clojure.core/<= 'clojure.core/>=
     'clojure.core/== 'clojure.core/not= 'clojure.core/not
-    'clojure.core/zero? 'clojure.core/pos? 'clojure.core/neg?})
+    'clojure.core/zero? 'clojure.core/pos? 'clojure.core/neg?
+    'clojure.core/nil?})
 
 (defn comparison-op?
   "True if sym is a comparison/boolean op (non-differentiable)."
