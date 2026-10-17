@@ -808,6 +808,37 @@ JVM reference checks. Only after completed inputs are representable and checked
 against source execution may product ANF consume them. This physical-signature
 prerequisite enables no new normalizer, source AD rule or default AD engine.
 
+Object inputs also have a completion obligation even without a numeric cast.
+For example, moving a literal vector field to a primitive-inferred local can
+change its boxed identity. Value equality and once-only evaluation are therefore
+insufficient source-equivalence gates. Conversely, a primitive parameter can box
+separately at each field, so merging those materializations is not justified.
+
+`core.value-completion` now owns an explicit completion term, initially for an
+original JVM Object-input context. Its contract is not inferred from scalar
+dtype, and must not be substituted for a primitive or checked-reference input.
+The term's reserved IR head is not the constructor Var: an unprojected term must
+not accidentally execute the constructor as a runtime value operation. The
+checked JVM source projection consumes the operand in Object context and returns
+that very reference, including nil, preserving source boxing. It uses `Class.cast`
+on the actual bootstrap Object Class literal through an expression receiver;
+neither lexical class-name lookup nor an overload search supplies the meaning.
+Malformed terms and a different supplied projection refuse explicitly.
+
+This is shared value-completion vocabulary, not a collection of Class.cast
+patterns or an AD template for that Java method. A future AD consumer handles
+Object materialization as structural identity on its checked field port, not a
+numeric dtype conversion. Native/device consumers may discharge this completion
+only after proving object identity unobservable or the representation eliminated;
+otherwise they must refuse. A tuple field containing an array still denotes its
+borrowed reference, not a copy, new allocation or ownership proof. Only retained
+value declarations/source positions cross the term; callee/effect/ownership and
+JVM primitive-hint metadata are not transplanted to its result.
+
+There is no normalizer or AD consumer enabled yet. Original field/argument
+sequencing, receiver selection/check timing, primitive-vs-boxed numeric behavior,
+and checked/unchecked policy remain independent obligations before call rewriting.
+
 Internally distinguish four states, even if the public API continues returning `nil` for
 excluded gradient slots:
 
