@@ -9,6 +9,7 @@
    This is required before the reverse pass can track operations."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.types :as types]))
 
 (defn trivial-expr?
@@ -40,6 +41,10 @@
     (let [head (first expr)
           extras (atom [])]
       (cond
+        ;; Quoted syntax is data, including apparent binders and effects.
+        (contains? #{'quote 'clojure.core/quote} head)
+        [[] expr]
+
         ;; Completion consumes its ORIGINAL operand in an exact JVM context.
         ;; Lifting that operand first can box a primitive result, changing its
         ;; conversion/trap behavior. Snapshot the completed value as a whole;
@@ -99,26 +104,36 @@
   Output: flat bindings vector with nested calls flattened."
   [bindings gensym-fn]
   (let [result (atom [])]
-    (doseq [[sym init] (partition 2 bindings)]
-      (let [;; Shared hoisting can retain call identity on its binding rather than the
-            ;; reconstructed initializer. Project that retained identity, never decode an impl.
-            init (if (and (seq? init) (= '.invk (first init))
-                          (nil? (:raster.op/original (meta init)))
-                          (:raster.op/original (meta sym)))
-                   (vary-meta init assoc :raster.op/original
-                              (:raster.op/original (meta sym)))
-                   init)
-            [extras normalized] (anf-normalize-expr init gensym-fn)
-            ;; Composite expansion can supply a declared result type after
-            ;; this binder was minted. Retain that existing declaration on
-            ;; the value identity, just as lifted argument identities do.
-            ;; This does not infer a type or establish non-nullness.
-            sym (if-let [tag (and (nil? (types/sym-type-tag sym))
-                                 (:raster.type/tag (meta normalized)))]
-                  (vary-meta sym assoc :raster.type/tag tag)
-                  sym)]
-        (swap! result into extras)
-        (swap! result conj sym normalized)))
+    (letfn [(retain-value-tag [id expression]
+              (if-let [tag (and (nil? (types/sym-type-tag id))
+                                 (:raster.type/tag (meta expression)))]
+                (vary-meta id assoc :raster.type/tag tag)
+                id))
+            (emit! [sym init]
+              ;; Flatten only an initializer's lexical value region, at that
+              ;; exact binding position. Do not move call arguments across
+              ;; their original typed input conversions or speculate branches.
+              (let [sym (retain-value-tag sym init)]
+               (if (and (seq? init) (contains? #{'let 'let*} (first init)))
+                (let [[_ inner & body] (util/alpha-convert init)
+                      _ (doseq [[id value] (partition 2 inner)] (emit! id value))
+                      [extras value] (anf-normalize-expr (cons 'do body) gensym-fn)]
+                  (doseq [[id value] (partition 2 extras)] (emit! id value))
+                  (emit! sym value))
+                (let [;; Retain existing call identity, never decode an impl.
+                      init (if (and (seq? init) (= '.invk (first init))
+                                    (nil? (:raster.op/original (meta init)))
+                                    (:raster.op/original (meta sym)))
+                             (vary-meta init assoc :raster.op/original
+                                        (:raster.op/original (meta sym)))
+                             init)
+                      [extras normalized] (anf-normalize-expr init gensym-fn)
+                      ;; Retain a declaration supplied by composite expansion;
+                      ;; this neither infers a type nor proves non-nullness.
+                      sym (retain-value-tag sym normalized)]
+                  (doseq [[id value] (partition 2 extras)] (emit! id value))
+                  (swap! result conj sym normalized)))))]
+      (doseq [[sym init] (partition 2 bindings)] (emit! sym init)))
     @result))
 
 (defn normalize-for-ad
@@ -139,6 +154,9 @@
         [extras normalized] (anf-normalize-expr body-expr gensym-fn)
         body-sym (if (symbol? normalized) normalized
                      (with-meta (gensym-fn "body") (meta body-expr)))]
-    [(cond-> (into (vec anf-bindings) extras)
-       (not (symbol? normalized)) (into [body-sym normalized]))
+    [(into (vec anf-bindings)
+           (anf-normalize-bindings
+            (cond-> (vec extras)
+              (not (symbol? normalized)) (into [body-sym normalized]))
+            gensym-fn))
      body-sym]))

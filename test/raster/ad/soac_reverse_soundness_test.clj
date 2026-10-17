@@ -423,8 +423,10 @@
           sum (/ (* m (dec m)) 2.0)]
       (testing m
         (is (close? (* 2.0 sum) value))
-        ;; A zero-trip closure tape produces the existing absent/zero tangent.
-        (if (zero? m) (is (nil? dw)) (is (close? sum dw)))
+        ;; The zero-trip residual is internally absent, but a selected scalar
+        ;; gradient is a typed numeric zero at the public value+grad boundary.
+        (is (instance? Double dw))
+        (is (close? sum dw))
         (is (= [(double m)] (vec scratch)))))))
 
 ;; A map with nothing to differentiate still fills its output.

@@ -687,6 +687,32 @@ independent of AD.
   around with single-method float wrappers). #75: `par/reduce` over `aget` reads has
   a namespace-sensitive lowering hazard (segred aget).
 
+## Structural products and optional cotangents
+
+Reverse AD uses the same constructor, alias, constant-projection and field-port
+algebra for ordinary derivative re-entry and internally generated programs.
+This does not grant an ordinary program a generated call's source policy or
+private helper ownership. Field interfaces come from actual constructors and
+retained declarations; incompatible conditional layouts and unclosed active
+fields or consumers still refuse. The primal retains its original product
+allocation, identity, field evaluation order and selected branch.
+
+Re-entry normalizes lexical binding initializers at their original positions,
+including their body statements and retained result types. It does not move
+arguments past their original input conversions. Nullable tangent projections
+retain the actual cast arm's type as well as the outer result type.
+
+An absent cotangent (`nil`) is distinct from a present numeric zero. Internal
+branch ports and paired helper pullbacks preserve absence, and a pullback is
+not executed for an absent seed. A present zero still executes derivative
+arithmetic, including singularities. Only the outer public gradient boundary
+materializes shape- and dtype-matched zeros for selected differentiable inputs.
+Consequently, a selected scalar input of a zero-trip reduction now receives a
+numeric zero rather than the historical `nil`. Excluded `:wrt` and NoTangent
+argument slots remain `nil`; primitive tangent projection itself still
+preserves absence. This makes public zero gradients consistent without sending
+fabricated zero edges into unused, potentially singular upstream computations.
+
 ## Summary
 
 | Operator | Mode / mechanism | Use case | Law |

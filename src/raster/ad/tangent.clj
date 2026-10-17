@@ -213,6 +213,7 @@
                         (select-keys (meta cotangent-expr) [:raster.type/tag]))]
             (with-meta
               (list 'let* [input cotangent-expr]
-                    (list 'if (list 'clojure.core/nil? input) nil (list cast-op input)))
+                    (list 'if (list 'clojure.core/nil? input) nil
+                          (with-meta (list cast-op input) {:raster.type/tag cast-tag})))
               {:raster.type/tag cast-tag}))))
       cotangent-expr))))

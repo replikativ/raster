@@ -32,7 +32,10 @@
 (defn- collector [parameter-tag cotangent-tag]
   (let [parameter (with-meta 'parameter {:raster.type/tag parameter-tag})
         cotangent (with-meta 'cotangent {:raster.type/tag cotangent-tag})
-        result (with-bindings {#'reverse/*gensym-counter* (atom 0)}
+        ;; These are tests of an internal nullable Π port, not public-gradient
+        ;; materialization. The public boundary has its own zero contract.
+        result (with-bindings {#'reverse/*gensym-counter* (atom 0)
+                               #'reverse/*source-memory-context* {:internal-region? true}}
                  (#'reverse/collect-param-adjoints
                   [parameter] {parameter [cotangent]} (bind-ctx/make-ctx gensym) {}))]
     (eval (list 'fn [cotangent]

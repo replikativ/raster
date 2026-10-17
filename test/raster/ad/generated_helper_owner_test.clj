@@ -24,6 +24,34 @@
     :bindings bindings :result result :active-inputs active}
    params {:generated-source-policy {:unchecked-math false}}))
 
+(deftest paired-helper-unused-input-cotangents-stay-absent-inside-the-owner
+  (let [scope (create-ns (gensym "raster.helper-sparse-inputs."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm keep-a [a :- Double b :- Double] :- Double a))
+        (eval '(raster.core/deftm choose [a :- Double b :- Double flag :- Long] :- Double
+                 (if (= flag 1) b a)))
+        (let [x (typed 'x 'double) flag (typed 'flag 'long)
+              b (typed 'b 'double) result (typed 'result 'double)
+              only-a (compile-program [x]
+                                      [b '(raster.numeric/sqrt x)
+                                       result (helper-call scope 'keep-a [x b])] result [x])
+              choose (compile-program [x flag]
+                                      [b '(raster.numeric/sqrt x)
+                                       result (helper-call scope 'choose [x b flag])] result [x])]
+          (doseq [seed [0.0 1.0 2.0]]
+            (doseq [pb [(second (only-a 0.0)) (second (choose 0.0 0))]]
+              (is (= [seed] (pb seed))
+                  "an unused helper input must not send present zero into sqrt"))
+            (let [[value pb] (choose 0.0 1)
+                  dx (first (pb seed))]
+              (is (= 0.0 value))
+              (if (zero? seed)
+                (is (Double/isNaN dx))
+                (is (= Double/POSITIVE_INFINITY dx)))))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest generated-owner-composes-a-reduction-helper-and-its-array-pullback
   (let [scope (create-ns (gensym "raster.generated-helper-owner."))]
     (try

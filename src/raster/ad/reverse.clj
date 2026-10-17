@@ -375,15 +375,14 @@
   orchestrators (gen-reverse-let / gen-reverse-loop-with-let / reify-pullback)."
   [init-expr activity]
   (cond
-    (and *generated-product-context* (vector? init-expr))
+    (vector? init-expr)
     (boolean (some #(get activity % false) (util/free-syms init-expr)))
 
     (and *generated-product-context* (value-completion/canonical-parts init-expr))
     (boolean (some #(get activity % false)
                    (util/free-syms (:operand (value-completion/canonical-parts init-expr)))))
 
-    (and *generated-product-context*
-         (product-ports/projection-plan 'activity init-expr (:value-facts *source-memory-context*)))
+    (product-ports/projection-plan 'activity init-expr (:value-facts *source-memory-context*))
     (boolean (seq (:active-paths
                    (product-ports/projection-plan 'activity init-expr (:value-facts *source-memory-context*)))))
 
@@ -482,21 +481,20 @@
 (defn- ad-form-kind
   "Classify a binding init into a reverse-record kind. SOACs (soac-record-kinds)
   are recognized BEFORE the activity gate (they manage their own activity via
-  the active-set). Explicit generated structural interfaces also survive
+  the active-set). Actual constructor/projection structural interfaces survive
   inactivity; other scalar records are gated on `active?`. `sym` is the binding
   symbol, used only for a fail-loud message on unsupported control-flow forms."
   [init-expr active? sym]
   (cond
-    (and *generated-product-context* (vector? init-expr)) :product
-    (and *generated-product-context* (symbol? init-expr)
+    (vector? init-expr) :product
+    (and (symbol? init-expr)
          (get-in *source-memory-context* [:value-facts init-expr :product])) :product-alias
     (and *generated-product-context* (value-completion/canonical-parts init-expr)) :completion
-    (and *generated-product-context*
-         (product-ports/projection-plan sym init-expr (:value-facts *source-memory-context*))) :product-projection
+    (product-ports/projection-plan sym init-expr (:value-facts *source-memory-context*)) :product-projection
     ;; Structural interfaces survive inactive choices too. Otherwise a later
     ;; active join forgets the shape of an already known constant product.
-    (and *generated-product-context* (seq? init-expr) (= 'if (first init-expr))) :if
-    (and *generated-product-context* active? (seq? init-expr)
+    (and (seq? init-expr) (= 'if (first init-expr))) :if
+    (and active? (seq? init-expr)
          (some #(get-in *source-memory-context* [:value-facts % :product])
                (:arguments (op/call-description init-expr))))
     (throw (ex-info "active product has no closed structural consumer"
@@ -633,10 +631,8 @@
 
 (defmethod ad-record :if [_ sym init-expr activity]
   (let [[_ branch then else] init-expr
-        then-product (when *generated-product-context*
-                       (get-in *source-memory-context* [:value-facts then :product]))
-        else-product (when *generated-product-context*
-                       (get-in *source-memory-context* [:value-facts else :product]))]
+        then-product (get-in *source-memory-context* [:value-facts then :product])
+        else-product (get-in *source-memory-context* [:value-facts else :product])]
     (when-not (trivial-expr? branch)
       (throw (ex-info "Reverse AD conditional test survived predicate normalization"
                       {:reason :ad-region-unclosed-test :sym sym :test branch})))
@@ -654,7 +650,8 @@
             dy (ad-gensym "branch_dy" (:raster.type/tag (meta sym)))
             pieces (mapv (fn [arm]
                            (let [[bindings body] (extract-let-parts (util/alpha-convert arm))]
-                             (binding [*generated-product-context*
+                             (binding [*source-memory-context* (assoc *source-memory-context* :internal-region? true)
+                                       *generated-product-context*
                                        (when *generated-product-context*
                                          (assoc *generated-product-context* :internal-region? true))]
                                (let-gradient-pieces bindings body params dy))))
@@ -683,12 +680,11 @@
                                    (into [body-sym saved] (map first conditions)))))
                          pieces)]
         {:record (cond-> {:type :if-region :sym sym :branch branch :params params
-                  :parameter-products (when *generated-product-context*
-                                        (into {} (keep (fn [parameter]
+                  :parameter-products (into {} (keep (fn [parameter]
                                                          (when-let [product (get-in *source-memory-context*
                                                                                   [:value-facts parameter :product])]
                                                            [parameter (assoc product :active-paths
-                                                                             (into #{} (mapcat #(get-in % [:parameter-product-demands parameter])) pieces))]))) params))
+                                                                             (into #{} (mapcat #(get-in % [:parameter-product-demands parameter])) pieces))]))) params)
                   :dy dy :tape tape :pieces pieces
                   :replay-conditions
                   (into {} (map-indexed (fn [index root]
@@ -1396,9 +1392,7 @@
     (if has-template?
       ;; Template path: ctx-aware instantiation (already pure — returns new ctx).
       (let [[template-ctx template-gradients] (tmpl/instantiate-template-ctx template args sym adj-sym rev-ctx)
-            [new-ctx grad-syms] (if *generated-product-context*
-                                 (lift-pullback-over-absence rev-ctx template-ctx template-gradients adj-sym)
-                                 [template-ctx template-gradients])]
+            [new-ctx grad-syms] (lift-pullback-over-absence rev-ctx template-ctx template-gradients adj-sym)]
         {:rev-ctx new-ctx
          :adj-env (reduce (fn [ae [i grad-sym]]
                             (if (and (some? grad-sym) (< i (count args))
@@ -1411,12 +1405,10 @@
             call-bindings [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
                                               (list 'quote base-op)) sym args)
                            grads-sym (list pb-sym adj-sym)]
-            rev-ctx (if *generated-product-context*
-                      (bindings-into rev-ctx
+            rev-ctx (bindings-into rev-ctx
                                      [grads-sym (list 'if (list 'clojure.core/nil? adj-sym)
                                                       (vec (repeat (count args) nil))
-                                                      (list 'let* call-bindings grads-sym))])
-                      (bindings-into rev-ctx call-bindings))]
+                                                      (list 'let* call-bindings grads-sym))])]
         {:rev-ctx rev-ctx
          :adj-env (reduce (fn [ae [i arg]]
                             (if (and (symbol? arg) (contains? active-args arg))
@@ -1426,22 +1418,14 @@
 
 (defmethod emit-backward :if
   [{:keys [sym branch then else]} adj-sym activity {:keys [adj-env rev-ctx]}]
-  ;; Route the adjoint to the taken branch; the other branch gets a SHAPE-matched
-  ;; zero (a scalar 0.0 where an array is expected crashes array-add-backward).
-  ;; Tagged syms get a STATIC typed zero (fail-loud for known-⊥ tags); untagged
-  ;; syms fall back to the runtime `zero-like` on the primal — dynamically
-  ;; typed Π, which unlike the old scalar 0.0 cannot mis-shape an array slot.
-  ;; `zero` is a delay so the fail-loud path only fires when a branch
-  ;; actually materializes the zero.
-  (let [zero (delay (when-not *generated-product-context*
-                      (if (some? (:raster.type/tag (meta sym)))
-                        (array-zero-of-shape sym)
-                        (list 'raster.ad.tangent/zero-like sym))))
-        adj-env (cond-> adj-env
+  ;; The unselected edge is absent, not a present zero. The latter could
+  ;; activate a singular upstream pullback (0*infinity) or have the wrong
+  ;; array shape. Public gradient materialization belongs to the boundary.
+  (let [adj-env (cond-> adj-env
                   (and (symbol? then) (get activity then false))
-                  (update then (fnil conj []) (list 'if branch adj-sym @zero))
+                  (update then (fnil conj []) (list 'if branch adj-sym nil))
                   (and else (symbol? else) (get activity else false))
-                  (update else (fnil conj []) (list 'if branch @zero adj-sym)))]
+                  (update else (fnil conj []) (list 'if branch nil adj-sym)))]
     {:adj-env adj-env :rev-ctx rev-ctx}))
 
 (defmethod emit-backward :if-region
@@ -1731,8 +1715,9 @@
     (build schema [])))
 
 (defn- collect-param-adjoints
-  "Phase 3 (pure): bind a d_<param> for each active param (shape-matched zero when
-  no contributions) into rev-ctx; return {:rev-ctx :param-adj-syms}.
+  "Phase 3 (pure): bind a d_<param> for each active param into rev-ctx;
+  return {:rev-ctx :param-adj-syms}. Internal ports preserve absent cotangents;
+  the public boundary materializes a typed shape-matched zero.
 
   Π at the boundary: each accumulated scalar adjoint is PROJECTED into the
   primal param's tangent space. Input dtypes do not prove incoming cotangent
@@ -1747,8 +1732,7 @@
         binding-map (into {} (map vec (partition 2 (:bindings rev-ctx))))]
     (reduce
      (fn [{:keys [rev-ctx param-adj-syms]} p]
-       (if-let [{:keys [schema active-paths]} (when *generated-product-context*
-                                              (get-in value-facts [p :product]))]
+       (if-let [{:keys [schema active-paths]} (get-in value-facts [p :product])]
          (let [leaves (filterv (fn [[path _]] (and (contains? active-paths path)
                                                  (seq (get adj-env (product-ports/field-port p path)))))
                                (product-ports/leaf-paths schema))
@@ -1773,7 +1757,8 @@
              ;; Internal region ports exchange absence, not public gradient
              ;; materializations. A fabricated zero can activate a singular
              ;; upstream pullback even when this parameter was never demanded.
-             default (when-not (:internal-region? *generated-product-context*)
+             default (when-not (or (:internal-region? *generated-product-context*)
+                                   (:internal-region? *source-memory-context*))
                        (param-zero-expr p))
              ;; ARRAY param fan-out (a weight consumed by ≥2 ops) accumulates via
              ;; the resident residual-add (no scalar projection applies to arrays).
@@ -1786,8 +1771,8 @@
                              tag raw {:binding-map binding-map})
                             raw)]
                  (bindings-into rev-ctx [adj-sym expr])))
-             public? (and *generated-product-context*
-                          (not (:internal-region? *generated-product-context*)))
+             public? (not (or (:internal-region? *generated-product-context*)
+                              (:internal-region? *source-memory-context*)))
              public-sym (if public? (ad-gensym "public_cotangent" tag) adj-sym)
              rev-ctx (if public?
                        (bindings-into rev-ctx
@@ -1847,8 +1832,7 @@
         (process-bindings norm-bindings active-params
                           {:seed-projection
                            (fn [{:keys [value-facts]}]
-                             (if-let [{:keys [active-paths]} (when *generated-product-context*
-                                                               (get-in value-facts [body-sym :product]))]
+                             (if-let [{:keys [active-paths]} (get-in value-facts [body-sym :product])]
                                (into {} (map (fn [path]
                                                [(product-ports/field-port body-sym path)
                                                 [(product-leaf-expression dy-sym path)]])) active-paths)
@@ -1857,13 +1841,12 @@
      :fwd-bindings fwd-bindings
      :rev-bindings (vec (:bindings rev-ctx))
      :replays replays :writes writes :value-facts value-facts :forward-scope forward-scope
-     :result-product (when *generated-product-context* (get-in value-facts [body-sym :product]))
+     :result-product (get-in value-facts [body-sym :product])
      :parameter-product-demands
-     (when *generated-product-context*
-       (into {} (keep (fn [parameter]
+     (into {} (keep (fn [parameter]
                         (when-let [{:keys [active-paths]} (get-in value-facts [parameter :product])]
                           [parameter (into #{} (filter #(seq (get adj-env (product-ports/field-port parameter %)))) active-paths)])))
-             active-params))
+             active-params)
      :pullback-replays pullback-replays
      :pullback-replay-conditions pullback-replay-conditions
      :param-adj-syms param-adj-syms}))
@@ -4155,7 +4138,10 @@
                                                           (when (and (contains? types/primitive-array-info (nth tags index))
                                                                      (not (contains? (set active-indices) index)))
                                                             parameter)) all-params))
-                        *source-memory-context* {:values all-params
+                        ;; A paired companion is a compositional pullback,
+                        ;; not the final public gradient boundary. An unused
+                        ;; input must remain absent across this helper edge.
+                        *source-memory-context* {:values all-params :internal-region? true
                                                  :value-facts (into {} (map (fn [p] [p {:value p}])) all-params)
                                                  :activity (zipmap active-params (repeat true))
                                                  :replayed {} :unprojectable {} :aliases {}}
