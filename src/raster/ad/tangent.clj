@@ -19,12 +19,13 @@
     long longs int ints boolean … → ⊥ (no tangent space)
     Object, reference tags, and nil     → unknown (not evidence of ⊥)
 
-  Dependency-light BY DESIGN: only the compiler's retained JVM tag vocabulary
-  is required. Both raster.ad.reverse and
+  Dependency-light BY DESIGN: only retained type vocabulary and canonical
+  operation identity are required. Both raster.ad.reverse and
   raster.compiler.ad.flatten (and compiler passes) may require this ns
   without creating cycles."
   (:refer-clojure :exclude [])
-  (:require [raster.compiler.core.types :as types]))
+  (:require [raster.compiler.core.types :as types]
+            [raster.compiler.core.op-descriptor :as descriptor]))
 
 (def ^:private scalar-tag->dtype {'double :double 'float :float})
 (def ^:private array-tag->dtype  {'doubles :double 'floats :float})
@@ -137,6 +138,11 @@
                                (class x))
                           {:class (class x)}))))
 
+(defn- explicit-scalar-cast-tag [expression]
+  (when (and (seq? expression) (= 1 (count (descriptor/call-args expression))))
+    (let [tag (descriptor/cast-result-tag (descriptor/semantic-op expression))]
+      (when (contains? scalar-tag->dtype tag) tag))))
+
 (defn- expr-manifest-tag
   "The statically KNOWN scalar tag of an IR expression — carried or manifest,
   never inferred: a symbol's/form's carried :raster.type/tag stamp, the head
@@ -148,12 +154,7 @@
              (or (cond
                    (or (symbol? expr) (seq? expr))
                    (or (:raster.type/tag (meta expr))
-                       (when (and (seq? expr)
-                                  (contains? #{'float 'clojure.core/float} (first expr)))
-                         'float)
-                       (when (and (seq? expr)
-                                  (contains? #{'double 'clojure.core/double} (first expr)))
-                         'double))
+                       (explicit-scalar-cast-tag expr))
                    (float? expr) 'double  ;; a bare Clojure literal like 0.0 is a double
                    :else nil)
                  ;; SSA aliases retain the source value's type even when an intermediate
@@ -170,11 +171,10 @@
 
   Emission is TYPED IR whenever the cotangent's type is statically known
   (carried tag / manifest cast / literal): same dtype → identity (no wrap),
-  different scalar dtype → a bare primitive cast, which devirtualizes to a
-  zero-cost intrinsic on every backend. A statically-typed cotangent is a
-  materialized typed value — never the runtime nil 0̄ — so the nil-safe
-  runtime helpers (project-double/project-float) are emitted ONLY for
-  UNTAGGED cotangents (the dynamic/interpreted path, where nil can flow).
+  different scalar dtype → a nil-preserving primitive conversion. A carried
+  scalar tag describes the present value's dtype, not proof that a nullable
+  cotangent is present. Unknown/nullable values use ordinary let/if/cast IR,
+  evaluating their source once; no opaque runtime projection call is emitted.
   Arrays and unknown primal tags pass through unchanged (array adjoints are
   anchored by their typed shadow buffers).
 
@@ -189,19 +189,26 @@
   ([tag cotangent-expr {:keys [materialized? binding-map]}]
   (let [{:keys [kind dtype]} (tangent-kind tag)]
     (if (= kind :scalar)
-      (let [ct (tangent-kind (expr-manifest-tag cotangent-expr binding-map))]
+      (let [ct (tangent-kind (expr-manifest-tag cotangent-expr binding-map))
+            cast-tag (case dtype :float 'float :double 'double)
+            cast-op (symbol "clojure.core" (name cast-tag))]
         (cond
           ;; Statically in the primal's tangent space already — Π is the identity.
           (and (= :scalar (:kind ct)) (= dtype (:dtype ct)))
           cotangent-expr
-          ;; Statically scalar of the other dtype — Π is a primitive cast.
-          (or (= :scalar (:kind ct)) materialized?)
-          (let [cast-tag (case dtype :float 'float :double 'double)]
-            (with-meta (list cast-tag cotangent-expr)
-              {:raster.type/tag cast-tag}))
-          ;; Untagged — the runtime nil-safe projection (dynamic 0̄ may flow).
+          ;; Explicit source casts and literals are materialized on normal
+          ;; return. Their evaluation (including original traps) stays intact.
+          (or materialized? (number? cotangent-expr)
+              (explicit-scalar-cast-tag cotangent-expr))
+          (with-meta (list cast-op cotangent-expr)
+            {:raster.type/tag cast-tag})
+          ;; Nullable/unknown: retain absence and single source evaluation.
+          ;; A tag alone must never turn nil into a primitive-cast exception.
           :else
-          (case dtype
-            :float  (list 'raster.ad.tangent/project-float cotangent-expr)
-            :double (list 'raster.ad.tangent/project-double cotangent-expr))))
+          (let [input (with-meta (gensym "projection_input__")
+                        (select-keys (meta cotangent-expr) [:raster.type/tag]))]
+            (with-meta
+              (list 'let* [input cotangent-expr]
+                    (list 'if (list 'clojure.core/nil? input) nil (list cast-op input)))
+              {:raster.type/tag cast-tag}))))
       cotangent-expr))))

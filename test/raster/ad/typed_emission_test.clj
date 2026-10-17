@@ -70,12 +70,19 @@
       (is (= 'raster.dl.loss/mse-grad
              (first (last (resolve-bindings prefix))))))))
 
+(defn- nil-safe-projection? [target source expression]
+  (let [[head bindings body] expression
+        [input init] bindings]
+    (and (= 'let* head) (= 2 (count bindings)) (= source init)
+         (= (list 'if (list 'clojure.core/nil? input) nil
+                  (list (symbol "clojure.core" (name target)) input)) body))))
+
 (deftest materialized-scalar-projection-does-not-infer-a-missing-expression-dtype
   (let [unknown '(opaque-result x)
         dynamic (tangent/project-expr 'float unknown)
         concrete (tangent/project-expr 'float unknown {:materialized? true})]
-    (is (= '(raster.ad.tangent/project-float (opaque-result x)) dynamic))
-    (is (= '(float (opaque-result x)) concrete))
+    (is (nil-safe-projection? 'float unknown dynamic))
+    (is (= '(clojure.core/float (opaque-result x)) concrete))
     (is (= 'float (tag-of concrete)))
     (is (= unknown (tangent/project-expr nil unknown {:materialized? true})))))
 
@@ -83,13 +90,14 @@
   (let [source (tagged 'source 'double)
         bindings {'outer 'inner 'inner source}
         projected (tangent/project-expr 'float 'outer {:binding-map bindings})]
-    (is (= '(float outer) projected))
+    (is (nil-safe-projection? 'float 'outer projected))
     (is (= 'float (tag-of projected)))
     (is (= 'outer (tangent/project-expr 'double 'outer {:binding-map bindings}))))
   (is (= 'outer (tangent/project-expr
                 'float 'outer {:binding-map {'outer 'inner 'inner (tagged 'source 'float)}})))
-  (is (= '(float outer)
-         (tangent/project-expr 'float 'outer {:binding-map {'outer 'inner 'inner '(double x)}})))
+  (is (nil-safe-projection? 'float 'outer
+                           (tangent/project-expr 'float 'outer
+                                                 {:binding-map {'outer 'inner 'inner '(double x)}})))
   (let [source (tagged 'source 'float)]
     (is (= source (tangent/project-expr
                   'float source {:binding-map {'source '(double x)}}))
@@ -100,8 +108,50 @@
                    {'outer 'inner 'inner 'outer}
                    {'outer 'unbound}
                    {'outer '(opaque-result x)}]]
-    (is (= '(raster.ad.tangent/project-float outer)
-           (tangent/project-expr 'float 'outer {:binding-map bindings})))))
+    (is (nil-safe-projection? 'float 'outer
+                             (tangent/project-expr 'float 'outer {:binding-map bindings})))))
+
+(deftest nullable-scalar-tags-do-not-authorize-unboxing
+  (doseq [[source-tag target cast] [['float 'double double] ['double 'float float]]]
+    (let [source (tagged 'x source-tag)
+          expression (tangent/project-expr target source)
+          projection (eval (list 'fn* '[x] expression))]
+      (is (nil-safe-projection? target source expression))
+      (is (nil? (projection nil)))
+      (doseq [value [(float -0.0) 1.0000000596046448 -2.75]]
+        (is (= (class (cast value)) (class (projection value))))
+        (is (= (Double/doubleToRawLongBits (double (cast value)))
+               (Double/doubleToRawLongBits (double (projection value)))))))))
+
+(deftest nullable-projection-preserves-evaluation-and-original-traps
+  (let [source '(do (swap! calls inc) x)
+        expression (tangent/project-expr 'float source)
+        projection (eval (list 'fn* '[x calls] expression))
+        calls (atom 0)]
+    (is (nil? (projection nil calls)))
+    (is (= (float 2.0) (projection 2.0 calls)))
+    (is (= 2 @calls)))
+  (let [source '(double (do (swap! calls inc) x))
+        projection (eval (list 'fn* '[x calls] (tangent/project-expr 'float source)))
+        calls (atom 0)]
+    (is (thrown? NullPointerException (projection nil calls)))
+    (is (= 1 @calls))))
+
+(deftest lexical-cast-shaped-call-does-not-prove-presence-or-dtype
+  (doseq [head ['float 'double]
+          target ['float 'double]]
+    (let [source (with-meta (list head 'x) {:raster.op/lexical-callee true})
+          projected (tangent/project-expr target source)]
+      (is (nil-safe-projection? target source projected))
+      (let [projection (eval (list 'fn* [head 'x] projected))
+            calls (atom 0)]
+        (is (nil? (projection (fn [_] (swap! calls inc) nil) 1.0)))
+        (is (= 1 @calls))
+        (let [value (projection (fn [_] (swap! calls inc) 7.25) 1.0)
+              expected (if (= target 'float) (float 7.25) (double 7.25))]
+          (is (= (class expected) (class value)))
+          (is (= expected value))
+          (is (= 2 @calls)))))))
 
 (deftest derived-scalar-adjoints-project-before-claiming-their-tangent-tag
   (let [[template _] (tmpl/resolve-template 'raster.par/scale)
@@ -113,7 +163,7 @@
         scalar-expression (get (into {} (map vec (partition 2 (:bindings ctx))))
                                (first gradients))]
     (is (= '[float doubles] (mapv tag-of gradients)))
-    (is (= 'float (first scalar-expression))
+    (is (= 'clojure.core/float (first scalar-expression))
         "a desired Float binder tag must be backed by an actual Double-to-Float projection")
     (is (= 'float (tag-of scalar-expression)))
     (is (= 'double (tag-of (second scalar-expression)))
