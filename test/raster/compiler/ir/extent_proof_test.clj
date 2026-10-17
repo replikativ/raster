@@ -9,6 +9,39 @@
    'n {:dtype :long :product {:const 1 :factors ['n]}}
    'i {:dtype :int :product {:const 1 :factors ['i]}}})
 
+(deftest parallel-storage-equality-requires-the-exact-predecessor-context
+  (let [values (into {} (map #(vector % (av/tensor {:dtype :long :shape []}))) '[m n total])
+        scalar '(= product [total]
+                   (scalar {:dtypes [:long]} [m n]
+                           (lambda [a b] (region [] [(clojure.core/* a b)]))))
+        algorithm (dialect/make
+                   (dialect/default-program-facts
+                    {:values values :inputs '[m n]
+                     :equations {'product (dialect/default-equation-facts)}})
+                   [scalar] '[total])
+        predecessor {:id :product :operands '[m n] :results '[total]
+                     :algorithm algorithm :effects #{} :operations [] :attributes {:host-only true}}
+        consumer {:id :consumer :operands '[total m n] :results [] :algorithm nil :effects #{}}
+        program {:values values :inputs '[m n] :equations [predecessor consumer]}
+        equal? (fn [context]
+                 (proof/same-volume? (proof/parallel-environment-before context consumer)
+                                     'total '[(clojure.core/* m n)]))]
+    (is (equal? program))
+    (is (not (equal? (assoc program :equations [consumer predecessor]))))
+    (is (not (equal? (assoc program :equations [predecessor consumer consumer]))))
+    (is (not (equal? (assoc-in program [:values 'n :dtype] :int))))
+    (is (not (equal? (update program :values dissoc 'n))))
+    (is (not (equal? (assoc-in program [:equations 0 :effects] #{:memory/write}))))
+    (is (not (equal? (assoc-in program [:equations 0 :operations] [:forged]))))
+    (is (not (equal? (assoc-in program [:values 'n :representation]
+                              {:kind :resident-scalar-buffer :elements 1}))))
+    (is (not (proof/same-volume? (proof/parallel-environment-before program consumer)
+                                 'total '[(clojure.core/* m n 2)])))
+    (is (= {} (proof/parallel-environment-before program (assoc consumer :operands '[m]))))
+    (is (= {} (proof/parallel-environment-before program (assoc consumer :algorithm (Object.))))
+        "unsupported descriptive objects cannot supply an equality witness")
+    (is (= {} (proof/parallel-environment-before program (assoc consumer :id :absent))))))
+
 (deftest extent-equality-is-a-proof-not-cast-stripping
   (doseq [extent ['(* m n) '(* n m) '(* (long m) n) '(* m (* n 1))]]
     (is (proof/same-volume? environment extent '[m n])))

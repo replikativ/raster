@@ -537,8 +537,8 @@
    accumulator remain uniform (int32/int64/FP32/FP64). A certified resident singleton used only
    by the terminal result region retains its own operand dtype. Integral combines retain their
    certified wrapping policy; integral scalar parameters may also participate in index expressions."
-  [segred out-sym & {:keys [dtype array-types scalar-types coordinate-proof scalar-math]
-                     :or {dtype :double array-types {} scalar-types {}}}]
+  [segred out-sym & {:keys [dtype array-types array-shapes scalar-types coordinate-proof scalar-math]
+                     :or {dtype :double array-types {} array-shapes {} scalar-types {}}}]
   (let [{validated-dtype :dtype output :output result-region :result-region
          result-operands :result-operands
          output-dtype :output-dtype}
@@ -672,18 +672,28 @@
               (barrier)]))
          (take-while pos? (iterate #(quot % 2) (quot workgroup-size 2))))
         final-value 'workgroup-result
-        parameters
+        read-minimum (fn [id] (if (contains? resident-scalar-captures id) 1 '_n_bound))
+        storage-bindings (if (and (symbol? bound) (not (contains? (set scalars) bound)))
+                           {bound '_n_bound} {})
+        pointer-shape (fn [id]
+                        (mapv #(launch/rebind-expression % storage-bindings)
+                              (or (get array-shapes id) [(read-minimum id)])))
+        pointer-parameters
         (vec (concat
-              (map #(body/->KernelParameter
-                     % :input (dtype/canon (array-dtype %))
-                     [(if (contains? resident-scalar-captures %) 1 '_n_bound)] :global
-                     (layout/row-major [(if (contains? resident-scalar-captures %) 1 '_n_bound)]
-                                       (dtype/canon (array-dtype %)))
-                     :operand)
+              (map #(assoc (body/->KernelParameter
+                            % :input (dtype/canon (array-dtype %)) (pointer-shape %) :global
+                            (layout/row-major (pointer-shape %) (dtype/canon (array-dtype %)))
+                            :operand)
+                           :minimum-elements (read-minimum %))
                    arrays)
               [(body/->KernelParameter output :output output-dtype [group-count] :global
-                                       (layout/row-major [group-count] output-dtype) :result)]
-              (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
+                                       (layout/row-major [group-count] output-dtype) :result)]))
+        storage-types (scheduled-body/storage-scalar-closure pointer-parameters scalar-types #{'_n_bound})
+        scalars (vec (sort-by name (into (set scalars) (keys storage-types))))
+        parameters
+        (vec (concat pointer-parameters
+              (map #(body/->KernelParameter % :scalar (or (get storage-types %) (scalar-dtype %))
+                                           [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
         transformed
@@ -818,6 +828,7 @@
    (let [{:keys [kernel-body operator identity numerical-policy arrays scalars output bound group-count result-region]}
         (lower segred out-sym
                :dtype (:dtype options) :array-types (:array-types options)
+               :array-shapes (:array-shapes options)
                :scalar-types scalar-types :coordinate-proof (:coordinate-proof options)
                :scalar-math (:scalar-math options))
         arguments (mapv (fn [parameter]
@@ -959,10 +970,20 @@
             source-elements (cond
                               (= :result (:role parameter)) output-elements
                               (contains? resident-scalar-captures (:id parameter)) 1
-                              :else (:bound (segop/seg-space-reduced-dim (:space source))))]
+                              :else (:bound (segop/seg-space-reduced-dim (:space source))))
+            input? (= :input (:kind parameter))
+            minimum (:minimum-elements parameter)
+            expected-minimum (when input?
+                               (if (contains? resident-scalar-captures (:id parameter)) 1 '_n_bound))]
         (when-not (and buffer
+                       (= expected-minimum minimum)
+                       (= 1 (count realized-shape))
+                       (= (layout/row-major (:shape parameter) (:dtype parameter)) (:layout parameter))
                        (= (project-extent source-elements)
-                          (project-extent realized-elements)
+                          (project-extent (if input?
+                                            (launch/rebind-expression minimum bindings)
+                                            realized-elements)))
+                       (= (project-extent realized-elements)
                           (project-extent (:elements buffer))))
           (decline! :storage-extent
                     "scalar SegRed pointer extent differs across source, body, and graph"
@@ -999,6 +1020,11 @@
                              (merge (select-keys options [:scalar-math])
                                     {:dtype (:dtype source)
                                      :array-types array-types
+                                     ;; The preceding checks independently close these exact
+                                     ;; flat shapes over graph storage, including checked prefix
+                                     ;; aliases. They parameterize representation, not arithmetic.
+                                     :array-shapes (into {} (map (juxt :id :shape))
+                                                         (filter #(= :input (:kind %)) parameters))
                                      :scalar-types scalar-types}))]
       (when-not (= expected scheduled)
         (decline! :schedule-source

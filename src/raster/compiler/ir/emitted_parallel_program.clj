@@ -89,7 +89,7 @@
                 (every? (fn [emitted]
                           (and (= algorithm (:algorithm emitted))
                                (swr/equation-boundary? (get-in emitted [:body :values])
-                                                       equation algorithm)))
+                                                       equation algorithm (:body emitted))))
                         candidates))))
 
     :else false))

@@ -202,9 +202,35 @@
 (deftest outer-shape-refinement-does-not-manufacture-singleton-capacity
   (let [program (:program (route-source terminal-source {'input :float}))
         result (first (:outputs program))
-        forged (-> program
+        without-outer-allocation (assoc-in program [:attributes :allocations] [])
+        inner-out-shapes
+        (fn [p]
+          (keep #(get-in (dialect/facts (:algorithm %)) [:values 'out :shape])
+                (:equations p)))
+        forged (-> without-outer-allocation
                    (assoc-in [:values 'out :shape] [1])
-                   (assoc-in [:attributes :allocations] []))]
+                   (update :equations
+                           (fn [equations]
+                             (mapv (fn [equation]
+                                     (let [algorithm (:algorithm equation)
+                                           facts (dialect/facts algorithm)]
+                                       (if (get-in facts [:values 'out])
+                                         (assoc equation :algorithm
+                                                (dialect/make
+                                                 (assoc-in facts [:values 'out :shape]
+                                                           ['(unknown-dimension out)])
+                                                 (dialect/equations algorithm)
+                                                 (dialect/outputs algorithm)))
+                                         equation)))
+                                   equations))))]
+    ;; Producer extent analysis now retains the allocator's real inner witness.
+    ;; Removing only the outer metadata must not erase that genuine authority.
+    (is (seq (inner-out-shapes program)))
+    (is (every? #{[1]} (inner-out-shapes program)))
+    (is (resident/validated-terminal-resident-output without-outer-allocation result))
+    ;; Unknown inner capacity permits refinement but does not prove a singleton.
+    (is (seq (inner-out-shapes forged)))
+    (is (every? #{['(unknown-dimension out)]} (inner-out-shapes forged)))
     (is (nil? (resident/validated-terminal-resident-output forged result)))))
 
 (deftest unsupported-terminal-captures-restore-the-source-return

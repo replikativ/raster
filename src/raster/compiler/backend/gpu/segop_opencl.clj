@@ -224,6 +224,7 @@
   (let [scheduled
         (segred-body/schedule segred out-sym
                              (merge {:dtype dtype :array-types array-types
+                                     :array-shapes (checked-graph-input-shapes segred kernel-graph {})
                                      :scalar-types scalar-types :coordinate-proof coordinate-proof}
                                     (select-keys opts [:scalar-math])))
         _ (when (not= (some? graph-node) (some? kernel-graph))

@@ -19,6 +19,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
+            [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.passes.parallel.staged-contraction-admission :as staged-admission]
             [raster.compiler.passes.parallel.staged-scalar-body :as scalar-stage-body]
             [raster.compiler.ir.index-algebra :as index-algebra]
@@ -5675,13 +5676,20 @@
 (defn- merge-value
   ([values id contract] (merge-value values id contract {}))
   ([values id contract shape-equalities]
+   (merge-value values id contract shape-equalities {}))
+  ([values id contract shape-equalities extent-environment]
    (if-let [prior (get values id)]
      (let [unknown-shape? (fn [value]
                             (= [(list 'unknown-dimension id)] (:shape value)))
            same-nonshape-contract? (= (dissoc prior :shape) (dissoc contract :shape))
            equivalent-shape?
-           (= (mapv #(canonical-extent shape-equalities values %) (:shape prior))
-              (mapv #(canonical-extent shape-equalities values %) (:shape contract)))]
+           (or (= (mapv #(canonical-extent shape-equalities values %) (:shape prior))
+                  (mapv #(canonical-extent shape-equalities values %) (:shape contract)))
+               (and (= {:kind :plain} (:representation prior))
+                    (nil? (:logical-layout prior))
+                    (= 1 (count (:shape prior)) (count (:shape contract)))
+                    (extent-proof/same-volume? extent-environment
+                                               (first (:shape prior)) (:shape contract))))]
        (cond
          (= prior contract) values
          ;; Equality proves compatibility, not that the consumer's dimension spelling is
@@ -5697,6 +5705,27 @@
                 "source bindings imply incompatible AbstractValues for one logical value"
                 {:id id :first prior :second contract})))
      (assoc values id contract))))
+
+(defn- source-extent-environments
+  "Project existing typed scalar witnesses at each source boundary. Source binders start
+   unavailable; only their existing equations can publish a witness after executing."
+  [descriptions equations values scalar-types]
+  (let [values (merge (into {} (keep (fn [[id t]]
+                                     (when-let [t (some-> t dtype/canon)]
+                                       [id (tensor-value t [])]))) scalar-types)
+                      values)
+        facts {:values values
+               :attributes {:source-bindings (mapv :sym descriptions)}}
+        program (list 'soac-program facts equations [])
+        equations-by-id (into {} (map (juxt second identity)) equations)]
+    (:boundaries
+     (reduce (fn [{:keys [environment] :as state} {:keys [id]}]
+               (cond-> (assoc-in state [:boundaries id] environment)
+                 (contains? equations-by-id id)
+                 (assoc :environment (extent-proof/advance environment facts
+                                                           (equations-by-id id)))))
+             {:environment (extent-proof/initial-environment program) :boundaries {}}
+             descriptions))))
 
 (declare form->program* source-storage-analysis)
 
@@ -6248,9 +6277,13 @@
                                              (contraction-storage-values equations dtype array-types' values)
                                              published-storage-values)
                                       equations)
+              extent-environments (when (seq swr-descriptions)
+                                    (source-extent-environments descriptions equations
+                                                                inferred-values source-scalar-types))
               inferred-values
               (reduce (fn [contracts description]
-                        (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
+                        (reduce-kv #(merge-value %1 %2 %3 shape-equalities
+                                                  (get extent-environments (:id description))) contracts
                                    (swr-description-values description values)))
                       inferred-values swr-descriptions)
               values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)

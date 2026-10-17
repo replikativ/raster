@@ -57,7 +57,7 @@
 
 
 (defn- typed-algorithm-boundary?
-  [values equation algorithm]
+  [parallel-program equation algorithm]
   (cond
     (control/loop-program? algorithm)
     (and (loop-boundary? equation algorithm)
@@ -71,7 +71,8 @@
 
     (swr/plan? algorithm)
     (and (= [algorithm] (:operations equation))
-         (boolean (swr/equation-boundary? values equation algorithm)))
+         (boolean (swr/equation-boundary? (:values parallel-program) equation algorithm
+                                           parallel-program)))
 
     :else false))
 
@@ -93,7 +94,7 @@
                   (every? segop/segop-node? (:operations equation)))))
 
     (swr/plan? algorithm)
-    (and (swr/equation-boundary? (:values parallel-program) equation algorithm)
+    (and (swr/equation-boundary? (:values parallel-program) equation algorithm parallel-program)
          (= 1 (count (:operations equation)))
          (let [certificate (first (:operations equation))]
            (and (scheduled-body/scheduled-kernel-body? certificate)
@@ -125,7 +126,7 @@
            "typed structured-control routing requires :typed-parallel"
            {:dialect (:dialect parallel-program)}))
   (program/validate! parallel-program typed-operation?
-                     (partial typed-algorithm-boundary? (:values parallel-program))))
+                     (partial typed-algorithm-boundary? parallel-program)))
 
 (defn valid-typed-program?
   [parallel-program]
@@ -574,7 +575,7 @@
   [parallel-program equation]
   (let [algorithm (:algorithm equation)]
     (try
-      (when (typed-algorithm-boundary? (:values parallel-program) equation algorithm)
+      (when (typed-algorithm-boundary? parallel-program equation algorithm)
         (cond
           (soac/program-form? algorithm)
           (let [facts (soac/facts algorithm)
@@ -614,7 +615,7 @@
             outer (get (:values parallel-program) result)
             authoritative
             (try
-              (when (typed-algorithm-boundary? (:values parallel-program) equation algorithm)
+              (when (typed-algorithm-boundary? parallel-program equation algorithm)
                 (cond
                   (soac/program-form? algorithm) (get-in (soac/facts algorithm) [:values result])
                   (control/loop-program? algorithm) (get (control/outer-values algorithm) result)
@@ -640,7 +641,7 @@
             outer (get (:values parallel-program) result)
             inner-facts (when (and (soac/program-form? algorithm)
                                    (or (typed-algorithm-boundary?
-                                        (:values parallel-program) equation algorithm)
+                                        parallel-program equation algorithm)
                                        (scheduled-algorithm-boundary?
                                         parallel-program equation algorithm)))
                           (soac/facts algorithm))
@@ -1343,7 +1344,8 @@
            :attributes {:host-control :typed-structured-control
                         :mixed-algorithms (boolean suffix)}
            :operation? typed-operation?
-           :algorithm? (partial typed-algorithm-boundary? values)})
+           :algorithm? (partial typed-algorithm-boundary?
+                                {:values values :inputs inputs :equations equations})})
          public-parameters (or (:public-parameters options) (:active-params options))]
      (if (seq public-parameters)
        (let [plan (invocation/from-prefix

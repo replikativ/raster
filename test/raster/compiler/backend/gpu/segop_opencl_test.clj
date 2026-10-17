@@ -1131,6 +1131,54 @@
                  (scheduled-body/validate-artifact-projection!
                   certificate artifact))))))))
 
+(deftest scalar-reduction-separates-physical-capacity-from-read-minimum
+  (let [source '(let* [a (raster.par/pmap j 8 double (clojure.core/double j))
+                       result (raster.par/reduce acc 0.0 i n
+                                                 (+ acc (clojure.core/aget a i)))] result)
+        options {:dtype :double :scalar-types {'n :long}}
+        typed (:program (typed-route/attempt source :double {} options))
+        scheduled (:form (segop-lower/segop-lower-pass typed options))
+        algorithm (equation-graph/algorithm-for-equations scheduled (:equations scheduled))
+        graph (equation-graph/make algorithm scheduled)
+        node-index (first (keep-indexed #(when (some #{'a} (:inputs (:operation %2))) %1)
+                                       (:nodes graph)))
+        node (nth (:nodes graph) node-index)
+        operation (:operation node)
+        artifact (sg/generate-segred-kernel operation (first (:outputs operation))
+                                           :dtype :double :scalar-types {'n :long}
+                                           :graph-node node :kernel-graph graph)
+        certificate (get-in artifact [:attributes :scheduled-kernel-body])
+        parameter (first (get-in artifact [:attributes :kernel-body :parameters]))
+        arguments (fn [capacity n]
+                    (mapv (fn [slot]
+                            (case (:kind slot)
+                              :input (double-array capacity)
+                              :output (double-array 64)
+                              :scalar {:type (:dtype slot) :value n}))
+                          (:abi artifact)))
+        admit (fn [capacity n]
+                (kernel-call/validate-retained-input-capacities!
+                 artifact (arguments capacity n)
+                 (fn [buffer _] (java.lang.reflect.Array/getLength buffer))))]
+    (is (some #(and (= 'a (:id %)) (= 8 (:elements %))) (:temporaries graph))
+        "the reduction consumes genuinely internal storage, not a caller input")
+    (is (= [8] (:shape parameter)))
+    (is (= '_n_bound (:minimum-elements parameter)))
+    (is (identical? artifact (admit 8 4)))
+    (is (identical? artifact (admit 8 0)))
+    (doseq [[capacity n] [[7 4] [8 9]]]
+      (is (= :kernel-body-buffer-capacity
+             (try (admit capacity n) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (doseq [tamper [#(dissoc % :minimum-elements)
+                    #(assoc % :minimum-elements 0) #(assoc % :minimum-elements 1)]]
+      (is (= :storage-extent
+             (try (segred-body/validate-against-node!
+                   (update-in certificate [:body :parameters 0] tamper)
+                   (nth (:nodes graph) node-index) graph)
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:missing-rule (ex-data error)))))))))
+
 (deftest scalar-segred-schedule-rejects-a-forged-graph-source
   (let [source '(let* [result (raster.par/reduce acc 0.0 i n
                                                  (+ acc (clojure.core/aget a i)))]
@@ -1377,6 +1425,7 @@
                                      (get-in certificate [:body :operations])))]
     (is (= :float (:dtype resident-parameter)))
     (is (= [1] (:shape resident-parameter)))
+    (is (= 1 (:minimum-elements resident-parameter)))
     (is (= #{'resident}
            (get-in terminal [:reduction :attributes :resident-scalar-captures])))
     (is (= (axis-map/singleton-broadcast)
