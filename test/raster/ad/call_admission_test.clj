@@ -84,13 +84,20 @@
                              templates/instantiate-template-ctx
                              (fn [template args result seed context]
                                (reset! instantiated [template args result seed])
-                               [context ['dx]])]
+                               (let [[context gradient]
+                                     (bind-ctx/genlet context "dx" (list 'clojure.core/* (first args) seed))]
+                                 [context [gradient]]))]
                   (#'reverse/emit-backward record 'dy {'x true}
                    {:adj-env {} :rev-ctx (bind-ctx/make-ctx gensym)}))]
     (is (identical? selected (:resolved-template record)))
     (is (identical? selected (first @instantiated)))
     (is (= ['[x] 'result 'dy] (rest @instantiated)))
-    (is (= {'x ['dx]} (:adj-env emitted)))))
+    (is (= 1 (count (get-in emitted [:adj-env 'x]))))
+    (doseq [[seed expected] [[3.0 6.0] [0.0 0.0] [nil nil]]]
+      (is (= expected
+             (eval (list 'let* (into ['x 2.0 'result 5.0 'dy seed]
+                                    (get-in emitted [:rev-ctx :bindings]))
+                         (first (get-in emitted [:adj-env 'x])))))))))
 
 (deftest registered-opaque-pullbacks-retain-their-existing-runtime-contract
   (let [factory (fn [_result x] (fn [seed] [(* 7.0 x seed)]))

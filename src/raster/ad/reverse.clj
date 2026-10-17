@@ -1367,10 +1367,11 @@
   [before after gradients adjoint]
   (let [prefix (vec (:bindings before))
         body (subvec (vec (:bindings after)) (count prefix))
-        result (ad-gensym "present_pullback")
+        fresh (:gensym-fn before)
+        result (fresh "present_pullback")
         slots (mapv (fn [gradient]
                       (when (some? gradient)
-                        (ad-gensym "present_gradient" (:raster.type/tag (meta gradient))))) gradients)]
+                        (fresh "present_gradient" (:raster.type/tag (meta gradient))))) gradients)]
     [(assoc after :bindings
             (vec (concat prefix
                          [result (list 'if (list 'clojure.core/nil? adjoint)
