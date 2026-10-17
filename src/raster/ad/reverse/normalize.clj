@@ -7,7 +7,8 @@
    - Body is reduced to a single symbol
 
    This is required before the reverse pass can track operations."
-  (:require [raster.compiler.ir.form :as form]))
+  (:require [raster.compiler.ir.form :as form]
+            [raster.compiler.core.types :as types]))
 
 (defn trivial-expr?
   "True if expr is simple enough to not need its own binding."
@@ -99,7 +100,15 @@
                    (vary-meta init assoc :raster.op/original
                               (:raster.op/original (meta sym)))
                    init)
-            [extras normalized] (anf-normalize-expr init gensym-fn)]
+            [extras normalized] (anf-normalize-expr init gensym-fn)
+            ;; Composite expansion can supply a declared result type after
+            ;; this binder was minted. Retain that existing declaration on
+            ;; the value identity, just as lifted argument identities do.
+            ;; This does not infer a type or establish non-nullness.
+            sym (if-let [tag (and (nil? (types/sym-type-tag sym))
+                                 (:raster.type/tag (meta normalized)))]
+                  (vary-meta sym assoc :raster.type/tag tag)
+                  sym)]
         (swap! result into extras)
         (swap! result conj sym normalized)))
     @result))
