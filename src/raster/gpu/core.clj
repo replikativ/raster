@@ -1976,7 +1976,7 @@
   ([sess graph-key graph buffer-keys scalar-values {:keys [profile? record?]
                                                     :or {profile? false record? true}}]
    (with-session-use sess
-     (let [{:keys [device-id closed?]} @sess
+     (let [{:keys [device-id arena-id closed?]} @sess
            graph (kexec/validate! graph)
            external-ids (external-graph-buffer-ids graph)]
        (when closed?
@@ -2018,7 +2018,7 @@
                  execution-plan (execution/from-kernel-graph-call graph-call)]
              (doseq [node (:nodes graph)]
                (let [artifact (:operation node)]
-                 (register! (:kernel-name artifact) artifact)))
+                 (register! (:kernel-name artifact) artifact arena-id)))
              (doseq [node-call (:nodes graph-call)]
                (let [prepared (assoc (bind-call! (:call node-call)
                                                  {:adopt-cleanup! #(adopt-cleanup! cleanup-debts %)})
@@ -2082,7 +2082,7 @@
   ([sess call-key artifact arguments {:keys [profile? group-count]
                                       :or {profile? false}}]
    (with-session-use sess
-     (let [{:keys [device-id closed?]} @sess
+     (let [{:keys [device-id arena-id closed?]} @sess
            artifact (kart/validate! artifact)
            abi (:abi artifact)]
        (when closed?
@@ -2114,7 +2114,7 @@
                  register! (rt-resolve device-id "register-kernel!")
                  bind-call! (rt-resolve device-id "bind-kernel-call")
                  record! (rt-resolve device-id "record-graph!")
-                 _ (register! (:kernel-name artifact) artifact)
+                 _ (register! (:kernel-name artifact) artifact arena-id)
                  prepared (assoc (bind-call! call {:adopt-cleanup! #(adopt-cleanup! cleanup-debts %)}) :phase call-key)
                  _ (vreset! prepareds [prepared])
                  _ (vreset! runtime-graph
@@ -2526,7 +2526,7 @@
 (defn- bind-selected-executable
   "Bind one selected KernelArtifact/KernelGraph without recording it. The returned value is the
    common per-step ownership unit used by whole programs and descriptor composition."
-  [device-id executable runtime-arguments phase constant-buffer-ids group-count construction]
+  [device-id arena-id executable runtime-arguments phase constant-buffer-ids group-count construction]
   (let [executable (kexec/validate! executable)
         register! (rt-resolve device-id "register-kernel!")
         bind-call! (rt-resolve device-id "bind-kernel-call")
@@ -2546,7 +2546,7 @@
     (case (kexec/kind executable)
       :kernel-artifact
       (do
-        (register! (:kernel-name executable) executable)
+        (register! (:kernel-name executable) executable arena-id)
         (->BoundExecutableStep
          [(bind! (kcall/make executable runtime-arguments
                             (cond-> {} group-count (assoc :group-count group-count)))
@@ -2584,7 +2584,7 @@
                       constant? (and (true? (get-in artifact
                                                     [:attributes :cacheable-transform?]))
                                      (every? constants reads))]
-                  (register! (:kernel-name artifact) artifact)
+                  (register! (:kernel-name artifact) artifact arena-id)
                   (vswap! prepareds conj
                           (bind! (:call called-node)
                                  ;; Preserve the graph node's identity while retaining the
@@ -2603,7 +2603,7 @@
   "The single descriptor-step binder. `resolve-buffer` maps a compiler array symbol to a resident
    DeviceBuffer. Both whole-program binding and composition call this function; convention-specific
    runtime expansion is confined here."
-  [device-id step args resolve-buffer schedule roles construction]
+  [device-id arena-id step args resolve-buffer schedule roles construction]
   (let [{:keys [kernel-name phase convention artifact argument-specs]}
         step]
     (case convention
@@ -2645,7 +2645,7 @@
             ;; binder cannot reinterpret an occupancy-capped partial-reduction artifact.
             group-count nil]
         (assoc (bind-selected-executable
-                device-id selected ordered-args phase constant-buffer-ids group-count construction)
+                device-id arena-id selected ordered-args phase constant-buffer-ids group-count construction)
                :execution-info execution-info))
 
       (throw (ex-info (str "resident step binder cannot bind a " convention " step ("
@@ -2672,7 +2672,7 @@
    (with-session-use sess
      (assert-session-open! sess)
      (assert-source-unrecorded! sess :phase (:phase step))
-     (let [device-id (:device-id @sess)
+     (let [{:keys [device-id arena-id]} @sess
            {:keys [kernel-name phase]} step
            materialized (volatile! {})
            construction (volatile! {:prepareds [] :temporary-buffers {} :temporary-owners {}
@@ -2723,7 +2723,7 @@
        (try
          (let [bound-step (own-kernel-graph-entry
                            device-id
-                           (assoc (bind-resident-step device-id step args resolve-buf schedule roles
+                           (assoc (bind-resident-step device-id arena-id step args resolve-buf schedule roles
                                                       construction)
                                   :cleanup-debts (:cleanup-debts @construction)
                                   :temporary-owners (:temporary-owners @construction)

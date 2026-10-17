@@ -80,7 +80,7 @@
    (let [m 13 n 640 k 262144
         descriptor (split-gemm-descriptor)
         plan (split-gemm-plan descriptor m n k captured?)
-        session (atom {:device-id :ze:0 :session-id :mock-session
+        session (atom {:device-id :ze:0 :session-id :mock-session :arena-id :mock-session-arena
                        :buffers {} :allocations {} :prepared {} :graphs {}
                        :kernel-graphs {} :events {} :closed? false})
         ;; Runtime allocations are distinct even when their dtype and extent agree.  The
@@ -107,7 +107,7 @@
             "array->buffer!" (fn [buffer _] buffer)
             "buffer-as-float-buffer" (fn [& _] (throw (AssertionError. "unused")))
             "buffer-as-int-buffer" (fn [& _] (throw (AssertionError. "unused")))
-            "register-kernel!" (fn [name artifact] (swap! registered conj [name artifact]))
+            "register-kernel!" (fn [name artifact _arena-id] (swap! registered conj [name artifact]))
             "bind-kernel-call" (fn [call & _] {:kernel-call call ::cleanup/owner (cleanup/owner [])})
             "record-graph!" (fn [bounds & [options]]
                               (let [graph {:bounds (vec bounds) :options options}]

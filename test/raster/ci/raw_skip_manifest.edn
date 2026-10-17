@@ -54,6 +54,12 @@
   {:count 1 :class :toolchain :reason "Optional C compiler execution gate"}
   "test/raster/gpu/byte_transpose_test.clj"
   {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/gpu/cuda_copy_device_test.clj"
+  {:count 1 :class :device-test
+   :reason "CUDA D2D is optional on generic CI; no shared CUDA skip gate exists; RASTER_REQUIRE_CUDA_DEVICE=1 requires an actual ready probe and forbids skipping"}
+  "test/raster/gpu/cuda_generated_replay_device_test.clj"
+  {:count 1 :class :device-test
+   :reason "Generated CUDA replay is optional on generic CI; no shared CUDA gate exists; either RASTER_REQUIRE_CUDA_DEVICE=1 or RASTER_REQUIRE_NVRTC=1 requires both real device and NVRTC and forbids skipping"}
   "test/raster/gpu/cuda_nvrtc_test.clj"
   {:count 1 :class :optional-library
    :reason "NVRTC is optional on generic CI; RASTER_REQUIRE_NVRTC=1 makes this a required native gate"}
