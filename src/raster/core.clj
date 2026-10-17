@@ -1495,7 +1495,8 @@
     (let [m (meta fn-var)
           reducible? (::reducible m)
           fn-name (symbol (clojure.core/name (:name m)))]
-      (alter-var-root fn-var (constantly (dispatch/make-dispatch-fn fn-name table-atom reducible?))))
+      (dispatch/publish-dispatch! fn-var
+                                 (dispatch/make-dispatch-fn fn-name table-atom reducible?) table-atom))
     (dispatch/bump-compiler-definition-revision!)
     fn-var))
 
@@ -1517,7 +1518,8 @@
     (let [m (meta fn-var)
           reducible? (::reducible m)
           fn-name (symbol (clojure.core/name (:name m)))]
-      (alter-var-root fn-var (constantly (dispatch/make-dispatch-fn fn-name table-atom reducible?))))
+      (dispatch/publish-dispatch! fn-var
+                                 (dispatch/make-dispatch-fn fn-name table-atom reducible?) table-atom))
     (dispatch/bump-compiler-definition-revision!)
     fn-var))
 

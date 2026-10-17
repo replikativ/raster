@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.scalar.normal-return-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [raster.core :as core :refer [deftm]]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
@@ -7,6 +7,20 @@
             [raster.compiler.passes.scalar.local-products :as products]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.pipeline :as pipeline]))
+
+(use-fixtures :each
+  (fn [test!]
+    (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
+      (test!))))
+
+(deftest definition-dependent-analysis-needs-an-owning-collector
+  (binding [method-entry/*emission-inputs* nil]
+    (is (= {:presence :present :array-tag 'floats}
+           (normal/result-fact '(clojure.core/float-array 0))))
+    (is (= {:presence :unknown}
+           (normal/result-fact '(raster.numeric/+ a b)
+                               {'a {:presence :present :array-tag 'floats}
+                                'b {:presence :present :array-tag 'floats}})))))
 
 (deftm allocated [n :- Long] :- (Array double)
   (let [out (clojure.core/double-array n)] out))
@@ -23,13 +37,7 @@
 (deftm nullable-array [flag :- Boolean] :- (Array double)
   (if flag (clojure.core/double-array 0) nil))
 
-(deftm throwing-array [n :- Long] :- (Array double)
-  (if (< n 0)
-    (throw (ex-info "negative test input" {:n n}))
-    (clojure.core/double-array n)))
-
-(deftm throwing-array-guard [n :- Long] :- Long
-  (let [out (throwing-array n)] (if (clojure.core/nil? out) 1 2)))
+(deftm borrowed-array-with-count [n :- Long x :- (Array double)] :- (Array double) x)
 
 (defn- selected-call [v args]
   (let [m (meta v) operation (symbol (str (:ns m)) (str (:name m)))
@@ -37,6 +45,68 @@
         name (types/mangle (:name m) (:tags entry))]
     (with-meta (list* '.invk (symbol (str (:mangled-ns entry)) (str name "-impl")) args)
       {:raster.op/original operation})))
+
+(deftest lexical-producer-facts-cross-selected-formals-without-type-assumptions
+  (let [call (selected-call #'borrowed-array-with-count '[0 input])
+        producer (normal/result-fact '(clojure.core/double-array 0))]
+    (is (= {:presence :present :array-tag 'doubles} producer))
+    (is (= producer (normal/result-fact call {'input producer})))
+    (is (= {:presence :absent} (normal/result-fact call {'input {:presence :absent}})))
+    (is (= {:presence :unknown} (normal/result-fact call)))
+    (is (= {:presence :present}
+           (normal/result-fact call {'input {:presence :present :array-tag 'floats}}))
+        "an argument's different array carrier cannot certify the formal return")
+    (is (= {:presence :unknown}
+           (normal/result-fact (with-meta call {:raster.op/lexical-callee true})
+                               {'input producer})))))
+
+(deftest nil-tests-refine-only-their-real-lexical-argument
+  (is (= {:presence :present}
+         (normal/result-fact '(if (clojure.core/nil? input) [] input))))
+  (is (= {:presence :absent}
+         (normal/result-fact '(if (clojure.core/nil? input) input nil))))
+  (doseq [test ['(foreign/nil? input)
+                (with-meta '(clojure.core/nil? input) {:raster.op/lexical-callee true})]]
+    (is (= {:presence :unknown}
+           (normal/result-fact (list 'if test [] 'input)))))
+  (is (= {:presence :unknown}
+         (normal/result-fact '(if (clojure.core/nil? input) [] input)
+                             {'clojure.core/nil? {:presence :present}}))))
+
+(deftest aliases-transport-physical-array-producer-facts-not-result-hints
+  (is (= {:presence :present :array-tag 'floats}
+         (normal/result-fact '(let* [a (clojure.core/float-array 0) b a] b))))
+  (is (= {:presence :unknown}
+         (normal/result-fact (with-meta '(unknown-array) {:raster.type/tag 'floats}))))
+  (is (= {:presence :present :array-tag 'floats}
+         (normal/result-fact '(raster.par/pmap i 0 float i)))))
+
+(deftest branch-and-formal-scopes-do-not-borrow-unrelated-array-facts
+  (let [producer {:presence :present :array-tag 'doubles}
+        call (selected-call #'borrowed-array-with-count '[0 unknown])]
+    (is (= {:presence :unknown} (normal/result-fact call {'x producer})))
+    (is (= {:presence :absent}
+           (normal/result-fact '(if (clojure.core/nil? input) input nil)
+                               {'input {:array-tag 'doubles}})))
+    (is (= {:presence :present}
+           (normal/result-fact '(if predicate (clojure.core/float-array 0)
+                                   (clojure.core/double-array 0)))))
+    (let [definition method-entry/selected-definition]
+      (with-redefs [method-entry/selected-definition
+                    (fn [& args] (some-> (apply definition args)
+                                          (assoc :walked-body nil
+                                                 :source-body '[(par/scan output a 0 i n float a)])))]
+        (is (= {:presence :unknown}
+               (normal/result-fact (selected-call #'borrowed-array-with-count '[0 input])
+                                   {'input producer 'output producer})))))))
+
+(deftm throwing-array [n :- Long] :- (Array double)
+  (if (< n 0)
+    (throw (ex-info "negative test input" {:n n}))
+    (clojure.core/double-array n)))
+
+(deftm throwing-array-guard [n :- Long] :- Long
+  (let [out (throwing-array n)] (if (clojure.core/nil? out) 1 2)))
 
 (deftest normal-return-lattice-and-lexical-roots
   (doseq [expression [false 0 [] '(clojure.core/float-array 0)
@@ -53,6 +123,7 @@
   (doseq [expression ['(let* [out (clojure.core/float-array 0)] (unknown out))
                       '(let* [out (clojure.core/float-array 0)] borrowed)
                       '(fake/float-array 0) '(float-array 0) '(fake/zeros-like input 0)
+                      '((fn* [x] x) input)
                       (with-meta '(clojure.core/doubles nil) {:raster.type/tag 'doubles})
                       (with-meta '(clojure.core/float-array 0) {:raster.op/lexical-callee true})
                       (with-meta '(.invk fake/receiver 0) {:raster.op/original 'clojure.core/float-array})]]
@@ -76,6 +147,9 @@
 
 (deftest analysis-does-not-run-effects-and-does-not-grant-ownership
   (let [counter (long-array [0]) call (selected-call #'effectful-allocation '[counter n])]
+    ;; Realize the executable before the first proof observation. Calling it
+    ;; below must not replace a lazy receiver in the middle of this owner's life.
+    (core/ensure-bytecode-implementation! (ns-resolve *ns* (second call)))
     (is (= :present (normal/presence call)))
     (is (= 0 (aget counter 0)))
     (is (= 0 (alength (effectful-allocation counter 0))))

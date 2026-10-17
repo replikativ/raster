@@ -74,6 +74,30 @@ the reverse engine projects into the declared tangent space before attaching its
 carrier tag. Helper result seeds and input edges use the shared tangent projection;
 absence remains distinct from a present numerical zero.
 
+Normal-return presence and array storage carriers are independent producer facts,
+not consequences of an array annotation. The shared local-product pass can
+transport those facts through aliases, branches and selected definitions. A
+definition-dependent proof requires an enclosing compilation-input owner; an
+unclosed caller keeps the nullable operation. Consulted generic dispatchers,
+selected sources and receivers (including transitive allocation helpers) retain
+their historical identities and lookup sites in the existing request-local input
+collector. Static JVM/resident/equation-first owners validate before publication;
+private generated and paired AD owners also validate before forward and delayed
+backward execution. These are sequential staleness fences, not concurrent
+redefinition or ABA guarantees. No passive source metadata is proof authority.
+
+For two independently present, homogeneous floating arrays, optional accumulation
+may project to its existing `raster.numeric/+` operation after proving that actual
+selected call's result carrier and presence. It does not substitute a same-size
+residual kernel: empty/unequal extents, Float checkpoints and contribution order
+retain ordinary addition's semantics. Unknown or mixed carriers remain optional.
+The former reverse-only arbitrary-call non-null blacklist is removed.
+
+This representation slice does not close whole-model training. The pinned reduced
+SFT backward preparation clears conditional-product expansion but still refuses
+an unbound internal shape scalar at the invocation boundary; device execution,
+numerical parity and competitive performance remain separate acceptance gates.
+
 This is not arbitrary source-call normalization or new default nested-helper AD
 support. The ordinary source path still refuses an unowned derived helper
 pullback. Runtime private companions are not portable AOT/native/GPU artifacts.

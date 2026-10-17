@@ -1475,6 +1475,8 @@
   [f-var & {:keys [inline? simd? dtype target-device preserve-declared-array-storage?
                    reuse-buffers?]
             :or {inline? true simd? true}}]
+  (me/call-with-definition-inputs
+   (fn []
   (let [;; Use the classloader that defined the target function's defrecord types.
         ;; Creating a child DCL causes class identity issues: defrecord classes
         ;; loaded through a child resolve to DIFFERENT Class objects than those
@@ -1574,7 +1576,7 @@
                          (:fn result)))]
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
-          (compile!))))))
+          (compile!))))))))
 
 ;; ================================================================
 ;; Resident GPU program extraction (Option A: bound-dispatch path)
@@ -2004,6 +2006,8 @@
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?
                             preserve-declared-array-storage?]
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
+  (me/call-with-definition-inputs
+   (fn []
   (when (dispatch/host-only? f-var)
     (throw (ex-info "GPU compilation was requested for an explicitly host-only deftm"
                     {:reason :gpu-compiler-host-only
@@ -2436,7 +2440,7 @@
          (report/with-residency
            (report/from-pipeline
             (diagnostic->pipeline-map raw-form :opencl compiler-diagnostic))
-           (count (:allocs prog))))})))
+           (count (:allocs prog))))})))))
 
 (defn- realize-identity-tail
   "Expose an uncoerced final initializer at the source projection's tail.
