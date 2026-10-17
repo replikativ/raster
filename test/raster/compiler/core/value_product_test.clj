@@ -26,3 +26,20 @@
                       (with-meta '(.invk arbitrary p 0) {:raster.op/original 'clojure.core/nth})]]
     (is (nil? (product/constant-projection expression 2)) (pr-str expression)))
   (is (nil? (product/constant-projection '(clojure.core/nth p 0) 0))))
+
+(deftest lexical-index-evidence-is-frozen-and-never-inferred-from-a-type
+  (let [known {'zero 0 'one 1 'unknown 'zero 'typed {:raster.type/tag 'long}}
+        lookup #(get known %)]
+    (is (= 0 (product/index-value 'zero lookup)))
+    (is (= 1 (product/index-value '(clojure.core/int one) lookup)))
+    (is (= {:source 'p :index 1}
+           (product/constant-projection '(clojure.core/nth p one) 2 lookup)))
+    (doseq [expression ['unknown 'typed 'missing '(opaque zero)
+                        '(do (side-effect) 0) '(clojure.core/int 2147483648)
+                        '(clojure.core/long (clojure.core/double 0))
+                        (with-meta '(clojure.core/long 0) {:raster.op/lexical-callee true})]]
+      (is (nil? (product/index-value expression lookup))))
+    (doseq [expression ['(clojure.core/nth p one :default) '(clojure.core/nth p 2)
+                        (with-meta '(clojure.core/nth p zero)
+                          {:raster.op/lexical-callee true})]]
+      (is (nil? (product/constant-projection expression 2 lookup))))))

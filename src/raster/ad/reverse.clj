@@ -30,6 +30,7 @@
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.ordered-call :as ordered-call]
             [raster.compiler.core.value-completion :as value-completion]
+            [raster.compiler.core.value-product :as value-product]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
@@ -1158,6 +1159,10 @@
               ;; child's checks execute. An unclosed non-choice target refuses.
               (into (:local-writes memory-effects) (:written-arrs record))
               (when active? (:written-arrs record)) prior-activity))
+           ;; Freeze the integer proof at this binding's source position. Following raw
+           ;; initializer aliases later could observe a different lexical rebinding.
+           constant-index (value-product/index-value
+                           init-expr #(get-in value-facts [% :constant-index]))
            fwd (into (into (into fwd-bindings guard-bindings) disjoint-bindings)
                      [sym (qualify-fwd-expr init-expr)])]
        (when overwritten
@@ -1186,6 +1191,7 @@
         :value-facts (assoc value-facts sym
                             (cond-> {:value sym :alias (or (:result-alias record)
                                                            (form/tail-symbol init-expr))}
+                              (some? constant-index) (assoc :constant-index constant-index)
                               (get-in value-facts [sym :product])
                               (assoc :product (get-in value-facts [sym :product]))))
         :unprojectable (join-input-replay-conditions unprojectable private-conditions)
