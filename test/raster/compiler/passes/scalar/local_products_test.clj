@@ -23,6 +23,80 @@
 (defn- run [expression & arguments]
   (apply (eval (list 'fn* '[x calls] expression)) arguments))
 
+(deftest conditional-products-preserve-selected-effects-and-lexical-scope
+  (let [source '(let* [outside (do (swap! calls conj :prefix) 7.0)
+                       p (if (do (swap! calls conj :test) (pos? x))
+                           (let* [outside (do (swap! calls conj :then) 100.0)]
+                             [outside (do (swap! calls conj :field) x)])
+                           (let* [outside (do (swap! calls conj :else) -100.0)]
+                             [outside (do (swap! calls conj :field) x)]))
+                       alias p
+                       value (+ outside (clojure.core/nth alias 0)
+                                (clojure.core/nth p 1))]
+                 (swap! calls conj :continuation)
+                 value)
+        lowered (products/lower-local-products source)]
+    (doseq [[x expected path] [[2.0 109.0 :then] [-2.0 -95.0 :else]]]
+      (let [a (atom []) b (atom [])]
+        (is (= expected (run source x a) (run lowered x b)))
+        (is (= [:prefix :test path :field :continuation] @a @b))))
+    (is (not-any? #{'clojure.core/nth} (tree-seq coll? seq lowered)))))
+
+(deftest conditional-fields-retain-selected-traps-and-do-not-replay-effects
+  (let [source '(let* [p (if (do (swap! calls conj :test) (pos? x))
+                           [(do (swap! calls conj :then) (/ 1 0))]
+                           [(do (swap! calls conj :else) (/ 1 0))])]
+                 (swap! calls conj :unreachable)
+                 (clojure.core/nth p 0))
+        lowered (products/lower-local-products source)]
+    (doseq [[x path] [[1.0 :then] [-1.0 :else]]]
+      (let [a (atom []) b (atom [])
+            failure (fn [expression calls]
+                      (try (run expression x calls) nil
+                           (catch Throwable e (class e))))]
+        (is (= ArithmeticException (failure source a) (failure lowered b)))
+        (is (= [:test path] @a @b))))))
+
+(deftest conditional-product-joins-decline-unproved-or-escaping-shapes
+  (doseq [source ['(let* [p (if x [1.0] nil)] (clojure.core/nth p 0))
+                  '(let* [p (if x [1.0] (opaque-result))] (clojure.core/nth p 0))
+                  '(let* [p (if x [1.0] [2.0 3.0])] (clojure.core/nth p 0))
+                  '(let* [p (if x [1.0])] (clojure.core/nth p 0))
+                  '(let* [p (if x [1.0] [2.0])] (identity p))
+                  '(let* [p (if x [1.0] [2.0])] (clojure.core/nth p x))]]
+    (is (= source (products/lower-local-products source)))))
+
+(deftest conditional-product-growth-budget-rolls-back-atomically
+  (let [source '(let* [p (if x [1.0] [2.0])]
+                 (+ (clojure.core/nth p 0) (clojure.core/nth p 0)))]
+    (with-redefs-fn {#'products/conditional-expansion-limit 1}
+      #(is (= source (products/lower-local-products source))))))
+
+(deftest nested-product-joins-preserve-loop-recur-scope
+  (let [source '(loop* [i 0 acc 0.0]
+                 (if (< i 2)
+                   (let* [p (if (pos? x)
+                              (if (zero? i) [1.0 9.0] [2.0 18.0])
+                              [3.0 27.0])]
+                     (swap! calls conj i)
+                     (recur (inc i) (+ acc (clojure.core/nth p 0)
+                                      (clojure.core/nth p 1))))
+                   acc))
+        lowered (products/lower-local-products source)]
+    (doseq [[x expected] [[1.0 30.0] [-1.0 60.0]]]
+      (let [a (atom []) b (atom [])]
+        (is (= expected (run source x a) (run lowered x b)))
+        (is (= [0 1] @a @b))))))
+
+(deftest conditional-product-fields-can-be-captured-without-capturing-arm-locals
+  (let [source '(let* [outside 7.0
+                       p (if (pos? x) (let* [outside 100.0] [outside]) [200.0])
+                       f (fn* [x] (+ outside x (clojure.core/nth p 0)))]
+                 (f 3.0))
+        lowered (products/lower-local-products source)]
+    (doseq [[x expected] [[1.0 110.0] [-1.0 210.0]]]
+      (is (= expected (run source x (atom [])) (run lowered x (atom [])))))))
+
 (deftest lexical-presence-does-not-execute-or-classify-calls
   (is (= '(let* [a 1.0 b a] :present)
          (products/lower-local-products
