@@ -67,6 +67,9 @@
                                                                [argument type])))
                                                    (descriptor/call-args init))))]
                     {:present? true :scalar-type (:type proof)}))
+        known (or known
+                  (when-let [proof (scalar-body/checked-selected-primitive-result init)]
+                    {:present? true :scalar-type (:type proof)}))
         retained (some-> (:raster.type/tag (meta id)) dtype/dtype-for-scalar-tag)]
     (cond-> known (and (:scalar-type known) retained) (assoc :scalar-type retained))))
 

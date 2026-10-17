@@ -1309,6 +1309,24 @@
             :results (mapv :result lowered-results)
             :types (mapv :type lowered-results)}))})))
 
+(defn- checked-scalar-result
+  [expression scalar-types]
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :reason :primitive-presence-decline :rule rule))))
+        lowerer (make-lowerer {:scalar-types scalar-types :array-types {} :arrays #{}
+                              :index-scope #{} :source-region expression
+                              :lower-index (fn [& _]
+                                             (decline! :presence-index "Presence proof has no index owner" {}))
+                              :require-source-types? true :decline! decline!})]
+    (try
+      (when-let [source-type ((:source-type lowerer) expression scalar-types)]
+        (let [result ((:lower lowerer) expression source-type scalar-types)]
+          (when (and (= source-type (:type result))
+                     (or (= :predicate source-type) (dtype/info source-type)))
+            {:type source-type})))
+      (catch clojure.lang.ExceptionInfo e
+        (if (= :primitive-presence-decline (:reason (ex-data e))) nil (throw e))))))
+
 (defn checked-primitive-result
   "Prove primitive presence on normal return of one canonical scalar call using
    this same strict source-lowering authority. `present-types` contains ONLY
@@ -1325,18 +1343,71 @@
     (when (and (symbol? operation) (namespace operation) (descriptor/scalar-op? operation)
                intrinsic
                (every? known? arguments))
-      (let [decline! (fn [rule message data]
-                       (throw (ex-info message (assoc data :reason :primitive-presence-decline :rule rule))))
-            lowerer (make-lowerer {:scalar-types present-types :array-types {} :arrays #{}
-                                  :index-scope #{} :source-region expression
-                                  :lower-index (fn [& _]
-                                                 (decline! :presence-index "Presence proof has no index owner" {}))
-                                  :require-source-types? true :decline! decline!})]
-        (try
-          (when-let [source-type ((:source-type lowerer) expression present-types)]
-            (let [result ((:lower lowerer) expression source-type present-types)]
-              (when (and (= source-type (:type result))
-                         (or (= :predicate source-type) (dtype/info source-type)))
-                {:type source-type})))
-          (catch clojure.lang.ExceptionInfo e
-            (if (= :primitive-presence-decline (:reason (ex-data e))) nil (throw e))))))))
+      (checked-scalar-result expression present-types))))
+
+(defn- strict-core-expression?
+  "Closed scalar producer grammar, not a purity test. A root symbol may be
+   nullable; only a real strict core call/cast proves a result on normal return."
+  [expression params]
+  (cond
+    (number? expression) true
+    (symbol? expression) (contains? params expression)
+    (seq? expression)
+    (let [operation (descriptor/semantic-op expression)
+          arguments (descriptor/call-args expression)]
+      (and (not= '.invk (first expression))
+           (symbol? operation)
+           (contains? #{"clojure.core" "Math" "java.lang.Math"} (namespace operation))
+           (or (and (descriptor/cast-result-tag operation) (= 1 (count arguments)))
+               (and (descriptor/scalar-op? operation)
+                    (some-> operation intrinsics/canonical intrinsics/descriptor)))
+           (every? #(strict-core-expression? % params) arguments)))
+    :else false))
+
+(defn- retained-global-var [callee]
+  (when (and (symbol? callee) (namespace callee))
+    (when-let [source-ns (find-ns (symbol (namespace callee)))]
+      (.findInternedVar ^clojure.lang.Namespace source-ns (symbol (name callee))))))
+
+(defn checked-selected-primitive-result
+  "Prove OUTPUT presence from the current selected implementation's closed
+   strict scalar body. Inputs remain unknown/nullable. The exact receiver must
+   match a live registered method, including its scalar signature and source.
+   This never invokes a method, invents a registry, or authorizes moving/removing
+   the original call. Generic calls and opaque/user helper bodies stay unknown."
+  [expression]
+  (let [{:keys [dispatch? semantic-op implementation-op arguments]}
+        (descriptor/call-description expression)
+        generic (retained-global-var semantic-op)
+        receiver (retained-global-var implementation-op)
+        table (:raster.core/dispatch-table (meta generic))]
+    (when (and dispatch? generic receiver table
+               (descriptor/scalar-op? semantic-op)
+               (some-> semantic-op intrinsics/canonical intrinsics/descriptor))
+      (some
+       (fn [{:keys [tags mangled-ns typed-impl target-fn]}]
+         ;; Match the selected receiver before resolving any method source;
+         ;; unrelated overloads must not trigger source/type work.
+         (when (and (not (var? typed-impl)) (identical? typed-impl @receiver))
+           (let [source-name (types/mangle (symbol (name semantic-op)) tags)
+                 source (when mangled-ns (retained-global-var (symbol (str mangled-ns) (str source-name))))
+                 source-meta (meta source)
+                 params (:raster.core/deftm-params source-meta)
+                 source-body (:raster.core/deftm-source-body source-meta)
+                 body (when (= 1 (count source-body)) (first source-body))
+                 scalar-types (mapv dtype/dtype-for-scalar-tag tags)
+                 result-type (dtype/dtype-for-scalar-tag (:raster.core/return-tag source-meta))]
+             (when (and source
+                        (= implementation-op (symbol (str mangled-ns) (str source-name "-impl")))
+                        ;; Lazy typed stubs delegate through the mangled source
+                        ;; Var. Metadata alone cannot authorize a redefined root.
+                        (identical? target-fn @source)
+                        (= tags (:raster.core/deftm-tags source-meta))
+                        (= (count arguments) (count params) (count tags))
+                        (every? some? scalar-types) result-type
+                        ;; A declaration returning an argument directly says nothing
+                        ;; about presence, even if its annotation says Double.
+                        (seq? body) (strict-core-expression? body (set params)))
+               (let [proof (checked-scalar-result body (zipmap params scalar-types))]
+                 (when (= result-type (:type proof)) proof))))))
+       (get @table (count arguments))))))
