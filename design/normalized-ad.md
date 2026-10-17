@@ -26,7 +26,39 @@ a receiver check, so null invocation failure remains after argument effects.
 The ordinary two-argument runtime compiler path is unchanged. This capability
 does not infer the missing original `deftm` compilation policy, discover source
 calls, authorize captured global AD correspondence, or enable completion/product
-AD records. Those remain requirements before default normalization can migrate.
+AD records on the default path. Those remain requirements before default normalization can migrate.
+
+## Internal structural product interpretation
+
+The explicit generated-source owner additionally accepts a closed, straight-line
+SSA binding program with declared numeric input carriers and a scalar result.
+This is not source-call discovery or permission to normalize arbitrary arguments.
+Literal immutable vectors are products; constant projections and exact aliases
+carry fieldwise cotangents. A product field has an owner-rooted port and a retained
+tangent declaration. Its schema never exports a child's private SSA identifiers.
+Constructor, alias and projection edges transpose locally; fan-out sums at each
+field port. An absent cotangent is distinct from a present numeric zero.
+
+Compound product fields must already be owned SSA values. Unknown active field
+declarations, open data references, unsupported structured uses, effectful regions
+and structured results without a seed-port interface refuse explicitly. Exact
+scalar aliases transport existing declarations without inferring operation types.
+The interpreter does not introduce helper-specific derivative rules, a second
+compiler cache, generic product flattening, or fake writes for field activity.
+
+Inputs and scalar seeds must have their declared JVM carriers. Input arrays remain
+borrowed: the caller must keep their contents stable until the pullback finishes;
+this entry neither snapshots them nor establishes concurrent mutation safety.
+Each scalar field's contributions retain the existing ordered raw fold, followed
+by one nil-preserving projection into that leaf's tangent space before its typed
+binding is introduced. A retained leaf tag alone does not attest incoming dtype;
+this is not permission to round each contribution or reassociate the fold.
+Generated execution and pullbacks reuse the existing normalized execution guard
+for rule/callee staleness. That sequential guard is not an ABA or lifetime proof.
+
+Default source AD, imported/conditional products, general loops, higher-order
+closure and real training acceptance are separate remaining obligations. The
+focused analytic/finite-difference tests qualify only this internal interpretation.
 
 ## Current implementation boundary
 
