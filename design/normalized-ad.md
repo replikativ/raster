@@ -799,9 +799,9 @@ purity, non-nullness, ownership, tangent-space or backend certificate. Missing o
 stale evidence is explicitly unknown; existing definition/owner guards still
 validate later reuse. No callee is executed or Class/forName lookup performed.
 
-The next dependent layer must retain source operand representation separately
-from semantic dtype, and retain the actual checked/unchecked conversion policy
-and source evaluation point. Boxed Number-to-Float checking is not primitive
+The next dependent layer must preserve the source operand's physical evaluation
+context separately from semantic dtype, and retain the actual checked/unchecked
+conversion policy and source evaluation point. Boxed Number-to-Float checking is not primitive
 Double-to-Float D2F, and Boolean/Character unboxing is not truthiness/general
 character coercion. Core numeric conversion IR must not silently stand in for
 JVM reference checks. Only after completed inputs are representable and checked
@@ -838,6 +838,32 @@ JVM primitive-hint metadata are not transplanted to its result.
 There is no normalizer or AD consumer enabled yet. Original field/argument
 sequencing, receiver selection/check timing, primitive-vs-boxed numeric behavior,
 and checked/unchecked policy remain independent obligations before call rewriting.
+
+The same completion vocabulary can retain an original primitive-parameter input
+context, using the actual resolved parameter Class and explicit source policy
+(`:unchecked-math` false, true, or `:warn-on-boxed`). Projection requires an
+explicit matching compilation policy. The producer must establish the actual
+call-site/policy correspondence, and the eventual compilation consumer must
+enforce that policy at compilation, not merely pass matching data to a projector.
+No consumer or general argument-hoisting rule is enabled by this extension.
+
+Its JVM projection uses the existing `RT.box(T)` overload with exact Class-valued
+`:param-tags` on the qualified method symbol. This requires the pinned Clojure
+1.12+ source dialect; an unsupported dialect refuses rather than guessing an
+overload. Clojure itself completes the original operand in the expected T
+context. Keeping the original expression, metadata and physical lexical scope
+inside that context preserves primitive-versus-boxed narrowing without a second
+type/function inference table. A normalizer must not first rebox the operand in
+an unconstrained local and only then complete the changed expression.
+
+The completed primitive can differ from its operand, so its result does not
+inherit a possibly stale operand dtype declaration. A later consumer needs its
+own retained result declaration or must leave it unknown. There is no wrapper
+identity promise: the original primitive ABI cannot expose that wrapper. Tests
+qualify all eight wrapper re-unboxings through actual resolved typed calls,
+including signed zero, NaN payloads, infinities, checked/unchecked overflow and
+once-only effectful/trapping Number conversions. This remains a source-context
+projection, not a portable IEEE conversion or an AD template for `RT.box`.
 
 Internally distinguish four states, even if the public API continues returning `nil` for
 excluded gradient slots:
