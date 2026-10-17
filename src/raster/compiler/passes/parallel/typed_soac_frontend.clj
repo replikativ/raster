@@ -3613,7 +3613,9 @@
    extent id as every other use of `n`, instead of each `alength` minting a fresh compound
    extent that then contradicts the buffer's shape elsewhere in the program."
   [expression]
-  (when (and (seq? expression) (descriptor/alloc-op? (descriptor/semantic-op expression)))
+  (when (and (seq? expression)
+             (not (contains? util/*shadowing-locals* (first expression)))
+             (descriptor/alloc-op? (descriptor/semantic-op expression)))
     (let [operation (descriptor/semantic-op expression)
           arguments (vec (descriptor/call-args expression))
           constructor? (or (contains? descriptor/alloc-sym->array-tag operation)
@@ -5696,7 +5698,7 @@
                 {:id id :first prior :second contract})))
      (assoc values id contract))))
 
-(declare form->program*)
+(declare form->program* source-storage-analysis)
 
 (defn- preserve-map-storage-inputs
   "Use indexed captures in maps, reductions and scans when element-shape equality is not established.
@@ -5795,12 +5797,9 @@
                   array-types (binder-array-types pairs array-types dtype
                                                   preserve-declared-array-storage?)
                   describe (fn [pairs]
-                             (preserve-map-storage-inputs
-                              (normalize-extents
-                               (source-descriptions pairs dtype array-types scalar-types
-                                                    segmented-plans?)
-                               shape-equalities values)
-                              values))
+                             (:descriptions
+                              (source-storage-analysis pairs dtype array-types scalar-types
+                                                       segmented-plans? values shape-equalities)))
                   descriptions (describe pairs)
                   physical-outputs (physical-output-symbols descriptions)
                   dependencies (set (util/free-syms expression))
@@ -5862,8 +5861,40 @@
                        :extent (canonical-extent shape-equalities values extent)
                        :initialization (descriptor/allocation-initialization
                                         (descriptor/semantic-op expr))
-                       :dtype (:dtype (get values sym))}))))
+                       :dtype (or (:dtype (get values sym))
+                                  (declared-type array-types sym))}))))
           descriptions)))
+
+(defn- source-storage-analysis
+  "Establish allocation-owned extents before a consumer can infer element shapes.
+   Allocation capacity is not permission to flatten a declared logical layout. Reuse the same
+   allocation contracts for initialization later; no consumer extent may become its own producer."
+  [pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
+  (let [descriptions (normalize-extents
+                      (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
+                      shape-equalities values)
+        source-scalar-types
+        (reduce (fn [types {:keys [kind sym scalar-dtype]}]
+                  (if (and (= :scalar kind) scalar-dtype)
+                    (assoc types sym scalar-dtype) types))
+                scalar-types descriptions)
+        allocations (allocation-contracts descriptions array-types source-scalar-types values
+                                          shape-equalities)
+        values (reduce (fn [known {:keys [destination extent dtype]}]
+                         (let [prior (get known destination)]
+                           (if (and dtype
+                                    (or (nil? prior)
+                                        (and (= {:kind :plain} (:representation prior))
+                                             (nil? (:logical-layout prior))
+                                             (= 1 (count (:shape prior))))))
+                             (merge-value known destination
+                                          (if prior (assoc prior :shape [extent])
+                                              (tensor-value dtype [extent]))
+                                          shape-equalities)
+                             known)))
+                       values allocations)]
+    {:descriptions (preserve-map-storage-inputs descriptions values)
+     :values values :allocations allocations}))
 
 (defn canonicalize-fresh-full-write-maps
   "Project a closed single-write effect region to the existing functional map contract.
@@ -6048,11 +6079,9 @@
           [_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          descriptions (preserve-map-storage-inputs
-                         (normalize-extents (source-descriptions pairs dtype array-types scalar-types
-                                                                 segmented-plans?)
-                                            shape-equalities values)
-                         values)]
+          {descriptions :descriptions storage-values :values allocations :allocations}
+          (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
+                                   values shape-equalities)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)
@@ -6194,7 +6223,8 @@
                                                                     source-scalar-types
                                                                     contracts)))
                                       (merge destination-values
-                                             (contraction-storage-values equations dtype array-types' values))
+                                             (contraction-storage-values equations dtype array-types' values)
+                                             storage-values)
                                       equations)
               inferred-values
               (reduce (fn [contracts description]
@@ -6225,8 +6255,13 @@
                                    {:id id}))))
                       values (distinct semantic-scalar-roots))
               _ (validate-declared-array-values! array-types values)
-              allocations (allocation-contracts descriptions array-types source-scalar-types values
-                                                shape-equalities)
+              ;; Resolve metadata-only lengths using the completed producer environment, without
+              ;; re-discovering allocations from consumer equations or changing their source site.
+              allocations (mapv (fn [allocation]
+                                  (-> allocation
+                                      (update :extent #(canonical-extent shape-equalities values %))
+                                      (assoc :dtype (:dtype (get values (:destination allocation))))))
+                                allocations)
               ;; An allocation-only public dimension need not appear in a numerical equation.
               ;; Retain its declared type now; inserting the initializer later makes it an
               ;; ordinary operation input. Do not infer a missing declaration from its name.

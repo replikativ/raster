@@ -9,8 +9,12 @@
             [raster.compiler.core.callee-identity :as callee-identity]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
@@ -214,13 +218,65 @@
     (when (and dimension (host-computable-dimension? program-values dimension))
       (dimension-expression dimension))))
 
+(defn- project-scalar-metadata
+  "Project retained, exactly typed length leaves, not the enclosing scalar computation.
+   Unknown widths, layouts and lexical regions remain unchanged. In particular a long storage
+   dimension cannot silently replace an int length result without a separate range proof."
+  [program-values public-inputs expression]
+  (letfn [(project [expression]
+            (if (or (not (seq? expression))
+                    (contains? program-values (first expression))
+                    (:raster.op/lexical-callee (meta expression))
+                    (contains? '#{quote clojure.core/quote var clojure.core/var}
+                               (first expression))
+                    (completion/canonical-parts expression)
+                    (form/scope-info expression))
+              expression
+              (let [operation (descriptor/semantic-op expression)
+                    source (when (and (descriptor/alength-op? operation)
+                                      (= 1 (count (descriptor/call-args expression))))
+                             (first (descriptor/call-args expression)))
+                    value (get program-values source)
+                    dimension (when (and (symbol? source)
+                                         (not (contains? public-inputs source))
+                                         (= {:kind :plain} (:representation value))
+                                         (nil? (:logical-layout value)))
+                                (certified-shape-dimension program-values source))
+                    leaf-dtype (some-> (types/sym-type-tag expression)
+                                       dtype/dtype-for-scalar-tag dtype/canon)
+                    dimension-dtype (when (symbol? dimension)
+                                      (:dtype (get program-values dimension)))
+                    dimension (if (and (symbol? dimension) dimension-dtype)
+                                (vary-meta dimension assoc :raster.type/tag
+                                           (dtype/scalar-tag-for-dtype dimension-dtype))
+                                dimension)]
+                (cond
+                  (and (contains? #{:int :long} leaf-dtype)
+                       (contains? #{:int :long} dimension-dtype)
+                       (= [:exact :exact]
+                          (scalar-conversion/policy dimension-dtype leaf-dtype)))
+                  (if (= leaf-dtype dimension-dtype) dimension
+                      (with-meta (list (symbol "clojure.core"
+                                               (name (dtype/scalar-tag-for-dtype leaf-dtype)))
+                                       dimension)
+                        (meta expression)))
+
+                  ;; Do not inspect binding bodies under a different lexical environment, quote
+                  ;; data, or computed callees. Call argument order and original metadata survive.
+                  (not (symbol? (first expression))) expression
+
+                  :else (with-meta (apply list (first expression)
+                                          (map project (rest expression)))
+                          (meta expression))))))]
+    (project expression)))
+
 (defn- canonicalize-shape-projection
   [program-values public-inputs symbol expression]
   (let [source (shape-projection-source expression)
         dimension (when (and source (not (contains? public-inputs source)))
                     (certified-shape-dimension program-values source))]
     (if-not dimension
-      expression
+      (project-scalar-metadata program-values public-inputs expression)
       (let [result-dtype (:dtype (get program-values symbol))
             dimension-dtype (when (symbol? dimension)
                               (:dtype (get program-values dimension)))]
@@ -243,6 +299,26 @@
                          (util/subst-syms (zipmap parameters captures)
                                           (first body-results)))]
         expression))))
+
+(defn- project-scalar-equation-metadata
+  [program-values public-inputs equation]
+  (if-let [expression (scalar-equation-expression equation)]
+    (let [projected (project-scalar-metadata program-values public-inputs expression)]
+      (if (semantic/equivalent? expression projected)
+        equation
+        (let [result (first (:results equation))
+              scalar-types (into {} (keep (fn [[id value]]
+                                            (when (scalar-value? value) [id (:dtype value)])))
+                                 program-values)
+              algorithm (:algorithm equation)
+              operation (typed-frontend/scalar-equation
+                         {:id (second (first (soac/equations algorithm)))
+                          :sym result :expr projected} scalar-types scalar-types)
+              captures (:captures (soac/operation-parts operation))
+              facts (assoc (soac/facts algorithm) :values program-values :inputs captures)
+              algorithm (soac/validate! (soac/make facts [operation] [result]))]
+          (assoc equation :algorithm algorithm :operations [operation] :operands captures))))
+    equation))
 
 (defn- host-invocation-equation?
   [available program-outputs required-shape-scalars source-prefix? equation]
@@ -283,12 +359,15 @@
         (if (= required dependencies) required (recur dependencies))))))
 
 (defn- hoist-host-invocation-equations
-  [parallel-program]
+  [parallel-program public-inputs]
   (let [program-outputs (:outputs parallel-program)
         shape-scalars (required-shape-scalars parallel-program)
         {:keys [hoisted retained]}
         (reduce (fn [{:keys [available source-prefix?] :as state} equation]
-                  (let [expression (scalar-equation-expression equation)
+                  (let [original-equation equation
+                        equation (project-scalar-equation-metadata (:values parallel-program)
+                                                                  public-inputs equation)
+                        expression (scalar-equation-expression equation)
                         scalar? (some? expression)
                         required-shape? (some shape-scalars (:results equation))
                         exceptional-shape? (and required-shape?
@@ -337,8 +416,8 @@
                           (update :available into (:results equation)))
 
                       :else
-                      (update state :retained conj equation))))
-                {:available (set (:inputs parallel-program))
+                      (update state :retained conj original-equation))))
+                {:available (set/union (set (:inputs parallel-program)) public-inputs)
                  :source-prefix? true :hoisted [] :retained []}
                 (:equations parallel-program))]
     (if (and (empty? hoisted) (= retained (:equations parallel-program)))
@@ -767,7 +846,7 @@
   "Host-controlled bindings may remain in an island's retained source, but a complete
    invocation must either execute them or prove them removable. Exact retained binding
    expressions, not advisory host IDs or coincident source sites, certify coverage."
-  [parallel-program prefix]
+  [parallel-program prefix public-inputs]
   (let [prefix-bindings (into {} prefix)
         allocations (into {} (map (juxt :destination :source-expression))
                           (get-in parallel-program [:attributes :allocations]))
@@ -779,7 +858,12 @@
                       (:equations parallel-program))]
     (doseq [[symbol expression] (partition 2 (second (:source parallel-program)))
             :when (and (not (and (contains? prefix-bindings symbol)
-                                 (semantic/equivalent? expression (get prefix-bindings symbol))))
+                                 (semantic/equivalent?
+                                  (canonicalize-shape-projection
+                                   (:values parallel-program)
+                                   public-inputs
+                                   symbol expression)
+                                  (get prefix-bindings symbol))))
                        (not (program/equation-for-binding parallel-program symbol expression))
                        (not (typed-route/realization-binding? parallel-program symbol expression))
                        (not (and (contains? allocations symbol)
@@ -817,8 +901,9 @@
                              (validate-source-result! options)
                              (assoc :dialect :typed-parallel)
                              validate-typed-program!)
-        parallel-program (hoist-host-invocation-equations parallel-program)
         public-parameters (vec (or public-parameters active-params))
+        parallel-program (hoist-host-invocation-equations parallel-program
+                                                         (set public-parameters))
         _ (when-not (seq public-parameters)
             (fail! :structured-control-public-parameters
                    "loop-free equation-first promotion requires ordered public parameters" {}))
@@ -861,7 +946,7 @@
                                                    (:equations parallel-program))
         parallel-program (assoc parallel-program :values program-values)
         prefix (invocation-prefix parallel-program public-parameters host-values)
-        _ (validate-host-coverage! parallel-program prefix)
+        _ (validate-host-coverage! parallel-program prefix (set public-parameters))
         binding-values
         (into {}
               (map (fn [[symbol expression]]
