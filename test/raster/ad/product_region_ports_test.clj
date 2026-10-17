@@ -133,7 +133,7 @@
            (reason [result '(if flag
                               (let* [written (raster.arrays/aset xs 0 x)] x)
                               x)])))
-    (is (= :ad-unclosed-product-choice
+    (is (= :ad-generated-product-result
            (reason ['p ['x] result '(if flag p p)])))))
 
 (deftest unused-scalar-captures-do-not-create-present-zero-edges

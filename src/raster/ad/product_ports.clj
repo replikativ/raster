@@ -20,16 +20,44 @@
              (map-indexed vector (:fields schema)))
      [[prefix schema]])))
 
+(defn join-facts
+  "Join two already-owned product interfaces, without importing private value
+   identities or treating an unknown shape as evidence of compatibility."
+  [then-fact else-fact]
+  (when-not (and (= :product (get-in then-fact [:schema :kind]))
+                 (= (:schema then-fact) (:schema else-fact)))
+    (throw (ex-info "conditional product arms require identical retained field schemas"
+                    {:reason :ad-product-choice-schema
+                     :then (:schema then-fact) :else (:schema else-fact)})))
+  {:schema (:schema then-fact)
+   :active-paths (into (:active-paths then-fact) (:active-paths else-fact))})
+
+(defn choice-plan
+  "Route a joined field port only to the selected existing product value.
+   The primal choice is retained verbatim; no product identity is reconstructed."
+  [owner branch then-source then-fact else-source else-fact]
+  (let [joined (join-facts then-fact else-fact)]
+    (assoc joined :edges
+           (vec (mapcat (fn [[path leaf]]
+                          (keep (fn [[source fact arm]]
+                                  (when (contains? (:active-paths fact) path)
+                                    {:port (field-port owner path) :path path :tag (:tag leaf)
+                                     :source (field-port source path) :active? true
+                                     :branch branch :arm arm}))
+                                [[then-source then-fact :then] [else-source else-fact :else]]))
+                        (leaf-paths (:schema joined)))))))
+
 (defn- leaf-tag [expression value-facts]
   ;; Exact aliases transport an existing declaration; they do not justify
   ;; operation/type inference. Facts may be supplied by another owner, so stop
   ;; on cycles rather than allowing malformed provenance to hang compilation.
-  (loop [value expression seen #{}]
-    (when (and (symbol? value) (not (contains? seen value)))
-      (or (types/sym-type-tag value)
-          (some-> (get-in value-facts [value :value]) types/sym-type-tag)
-          (when-let [alias (get-in value-facts [value :alias])]
-            (recur alias (conj seen value)))))))
+  (or (when (number? expression) (types/literal-tag expression))
+      (loop [value expression seen #{}]
+        (when (and (symbol? value) (not (contains? seen value)))
+          (or (types/sym-type-tag value)
+              (some-> (get-in value-facts [value :value]) types/sym-type-tag)
+              (when-let [alias (get-in value-facts [value :alias])]
+                (recur alias (conj seen value))))))))
 
 (defn literal-plan
   "Derive a constructor's field edges from actual literal syntax and visible
