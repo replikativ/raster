@@ -58,6 +58,17 @@
 
 (declare lower)
 
+(defn- nil-test-branches [env test]
+  ;; A canonical direct nil test refines only the value it actually reads.
+  ;; Do not infer presence from dtype tags or carry predicate facts across
+  ;; later rebinding of a lexical name.
+  (if (and (seq? test) (= 2 (count test)) (symbol? (second test))
+           (= 'clojure.core/nil? (descriptor/semantic-op test)))
+    (let [value (second test) known (get env value)]
+      [(assoc env value (-> known (dissoc :fields :present? :scalar-type) (assoc :literal nil)))
+       (assoc env value (-> known (dissoc :literal) (assoc :present? true)))])
+    [env env]))
+
 (def ^:private conditional-expansion-limit 4096)
 (def ^:dynamic ^:private *conditional-expansion-budget* nil)
 
@@ -88,6 +99,13 @@
 
 (defn- binding-fact [scope id init]
   (let [known (or (fact scope init)
+                  ;; A real primitive conversion cannot return nil. This is a
+                  ;; normal-return fact, not permission to remove its source
+                  ;; evaluation or the exception raised for a nullable input.
+                  (when (primitive-cast? init)
+                    (let [type (some-> (descriptor/semantic-op init)
+                                       descriptor/cast-result-tag dtype/dtype-for-scalar-tag)]
+                      (cond-> {:present? true} type (assoc :scalar-type type))))
                   (when-let [proof (and (seq? init)
                                        (descriptor/scalar-op? (descriptor/semantic-op init))
                                        (scalar-body/checked-primitive-result
@@ -126,9 +144,8 @@
                                    (relist expression
                                            (concat [head (into [id arm] suffix)] body))))
                        _ (spend-conditional-expansion! (concat suffix body))
-                       choice (relist init ['if test
-                                            (lower scope (continue then) products?)
-                                            (lower scope (continue else) products?)])]
+                       choice (lower scope (relist init ['if test (continue then) (continue else)])
+                                     products?)]
                    (relist expression [head (with-meta (vec output) (meta bindings)) choice]))
 
                  (and products? (:fields alias))
@@ -211,8 +228,9 @@
       (if tail
         (let [branch (lower env (if (:literal tail) then else) products?)]
           (if (seq (:bindings tail)) (list 'let* (:bindings tail) branch) branch))
-        (relist expression (cond-> [head test' (lower env then products?)]
-                            (= 4 (count expression)) (conj (lower env else products?))))))
+        (let [[then-env else-env] (nil-test-branches env test')]
+          (relist expression (cond-> [head test' (lower then-env then products?)]
+                              (= 4 (count expression)) (conj (lower else-env else products?)))))))
 
     (and (seq? expression) (form/scope-info expression))
     (lower-scopes env expression products?)

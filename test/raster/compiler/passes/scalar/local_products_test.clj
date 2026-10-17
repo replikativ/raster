@@ -23,6 +23,48 @@
 (defn- run [expression & arguments]
   (apply (eval (list 'fn* '[x calls] expression)) arguments))
 
+(deftest selected-nil-tests-refine-repeated-optional-products-without-growing-the-budget
+  (let [ids (mapv #(symbol (str "p" %)) (range 30))
+        bindings (vec (mapcat (fn [[previous id]]
+                               [id (list 'if (list 'clojure.core/nil? previous) [nil]
+                                         (list 'let* ['tick '(swap! calls inc)] [previous]))
+                                (symbol (str id "-field")) (list 'clojure.core/nth id 0)])
+                             (map vector (cons 'x (map #(symbol (str % "-field")) (butlast ids))) ids)))
+        source (list 'let* bindings (symbol (str (last ids) "-field")))
+        lowered (products/lower-local-products source)]
+    (is (not-any? #{'clojure.core/nth} (tree-seq coll? seq lowered)))
+    (doseq [x [nil false 0.0 2.0]]
+      (let [a (atom 0) b (atom 0)]
+        (is (= x (run source x a) (run lowered x b)))
+        (is (= (if (nil? x) 0 30) @a @b))))))
+
+(deftest nil-test-refinement-does-not-leak-through-shadowing-or-lexical-callees
+  (let [source '(if (clojure.core/nil? x)
+                 (let* [x 2.0] (clojure.core/nil? x))
+                 ((fn* [x] (clojure.core/nil? x)) nil))
+        lowered (products/lower-local-products source)]
+    (doseq [x [nil 1.0]]
+      (is (= (run source x (atom 0)) (run lowered x (atom 0))))))
+  (let [test (with-meta '(clojure.core/nil? x) {:raster.op/lexical-callee true})
+        source (list 'if test '(clojure.core/nil? x) false)]
+    (is (= source (products/lower-local-products source)))))
+
+(deftest strict-cast-bindings-prove-only-normal-return-presence
+  (let [source '(let* [value (clojure.core/double (do (swap! calls inc) x))]
+                 (if (clojure.core/nil? value) :absent :present))
+        lowered (products/lower-local-products source)]
+    (is (not-any? #{'clojure.core/nil?} (tree-seq coll? seq lowered)))
+    (let [a (atom 0) b (atom 0)]
+      (is (= :present (run source 2.0 a) (run lowered 2.0 b)))
+      (is (= 1 @a @b)))
+    (let [a (atom 0) b (atom 0)]
+      (is (thrown? NullPointerException (run source nil a)))
+      (is (thrown? NullPointerException (run lowered nil b)))
+      (is (= 1 @a @b))))
+  (let [cast (with-meta '(clojure.core/double x) {:raster.op/lexical-callee true})
+        source (list 'let* ['value cast] '(clojure.core/nil? value))]
+    (is (= source (products/lower-local-products source)))))
+
 (deftest conditional-products-preserve-selected-effects-and-lexical-scope
   (let [source '(let* [outside (do (swap! calls conj :prefix) 7.0)
                        p (if (do (swap! calls conj :test) (pos? x))
