@@ -145,6 +145,15 @@
   [emission]
   (validate-emission-inputs! emission (java.util.IdentityHashMap.)))
 
+(defn retryable-emission-change?
+  "Lazy compilation may materialize an input definition during emission. Only
+   these historical-input failures authorize a bounded fresh emission, never
+   blessing the already emitted code with a new snapshot."
+  [failure]
+  (contains? #{:stale-emission-inputs :stale-static-emission-source
+               :unstable-emission-inputs :unowned-static-emission-inputs}
+             (:reason (ex-data failure))))
+
 (defn assert-static-emission-current!
   "Validate one actual static artifact against its historical source and inputs.
    A fresh observation cannot certify an older unowned cache entry."

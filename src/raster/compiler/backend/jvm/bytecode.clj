@@ -5135,9 +5135,7 @@
           failure (try (me/assert-static-emission-current! deftm-var bc-info) nil
                        (catch clojure.lang.ExceptionInfo e e))]
         (if (and failure (< attempt 2)
-                 (contains? #{:stale-emission-inputs :stale-static-emission-source
-                              :unstable-emission-inputs :unowned-static-emission-inputs}
-                            (:reason (ex-data failure))))
+                 (me/retryable-emission-change? failure))
           (recur (inc attempt))
           (do
             (when failure (throw failure))
