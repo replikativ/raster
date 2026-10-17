@@ -2571,6 +2571,24 @@
           (let [st (class-type->stack ret-class)]
             (if (= st :void) (do (.aconst_null code) :ref) st)))))))
 
+(defn- consumed-static-input!
+  [source artifact]
+  (when me/*emission-inputs*
+    (swap! me/*emission-inputs* update :static conj {:source-var source :artifact artifact}))
+  artifact)
+
+(defn- current-cached-deftm!
+  "Reuse owned static code, or renew legacy/stale entries through the emitter."
+  [v cached]
+  (let [current (try (me/assert-static-emission-current! v cached)
+                     (catch clojure.lang.ExceptionInfo e
+                       (if (contains? #{:unowned-static-emission-inputs :stale-static-emission-source
+                                        :stale-emission-inputs :unstable-emission-inputs
+                                        :missing-emission-input-observations}
+                                      (:reason (ex-data e)))
+                         nil (throw e))))]
+    (or current (compile-and-cache-deftm! v))))
+
 (defn- emit-deftm-call
   "Emit bytecode for a mangled deftm call using a three-tier dispatch strategy:
   1. Already compiled to bytecode → invokestatic via bc-info metadata
@@ -2581,7 +2599,7 @@
         m  (meta v)]
       ;; 1. Already compiled to bytecode → invokestatic
     (if-let [bc-info (:raster.core/deftm-bytecode m)]
-      (emit-deftm-invokestatic code bc-info args locals ctx)
+      (emit-deftm-invokestatic code (consumed-static-input! v (current-cached-deftm! v bc-info)) args locals ctx)
         ;; 2. Fallback static-call lowering when bytecode metadata is absent
       (let [si (resolve-static-call
                 ((requiring-resolve 'raster.core/ensure-walked-body!) v) (:raster.core/deftm-params m)
@@ -2616,7 +2634,7 @@
               (case (first ret-str)
                 \D :double \J :long \I :int \V :void :ref)))
             ;; 3. Compile deftm body on demand → invokestatic
-          (let [bc-info (compile-and-cache-deftm! v)]
+          (let [bc-info (consumed-static-input! v (compile-and-cache-deftm! v))]
             (emit-deftm-invokestatic code bc-info args locals ctx)))))))
 
 (defn- emit-boxed-ifn-call
@@ -3722,7 +3740,16 @@
     (if-let [v (try (ns-resolve (or (:source-ns ctx) *ns*) form)
                     (catch Exception _ nil))]
       (if (var? v)
-        (let [root (try (.getRawRoot ^clojure.lang.Var v) (catch Exception _ nil))]
+        (let [root (try (.getRawRoot ^clojure.lang.Var v) (catch Exception _ nil))
+              _ (when (and me/*emission-inputs*
+                           (or (instance? Double root) (instance? Long root)
+                               (instance? Float root) (instance? Integer root)))
+                  (let [snapshot (assoc (me/emission-definition-snapshot v)
+                                        :lookups #{[(or (:source-ns ctx) *ns*) form]})]
+                    (when-not (identical? root (:value snapshot))
+                      (throw (ex-info "numeric global has different effective and emitted root values"
+                                      {:reason :thread-bound-emission-constant :symbol form})))
+                    (swap! me/*emission-inputs* update :values conj snapshot)))]
           (cond
             (instance? Double root)  (do (.ldc code (double root)) :double)
             (instance? Long root)    (do (.ldc code (long root)) :long)
@@ -4576,9 +4603,8 @@
   [v]
   (dispatch/no-inline? v))
 
-(defn- scan-deftm-refs
-  "Walk forms to find all referenced deftm vars.
-  Returns a set of vars that have ::deftm metadata.
+(defn- scan-deftm-inputs
+  "Walk forms to retain referenced deftm Vars and their actual lookup sites.
   Handles both direct calls (ns/fn args...) and .invk forms
   (.invk ^IFace ns/fn-impl args...)."
   [forms source-ns]
@@ -4598,14 +4624,14 @@
                             (when (and (var? v)
                                        (:raster.core/deftm (meta v))
                                        (not (no-inline-deftm? v)))
-                              (swap! refs conj v)))))
+                              (swap! refs conj {:var v :lookup [source-ns base-sym]})))))
                       (doseq [f (drop 2 form)] (scan f)))
                     ;; Normal call
                     (do (when-let [v (try (ns-resolve source-ns h) (catch Exception _ nil))]
                           (when (and (var? v)
                                      (:raster.core/deftm (meta v))
                                      (not (no-inline-deftm? v)))
-                            (swap! refs conj v)))
+                            (swap! refs conj {:var v :lookup [source-ns h]})))
                         (doseq [f (rest form)] (scan f)))))
                 (seq? form) (doseq [f form] (scan f))
                 (vector? form) (doseq [f form] (scan f))
@@ -4613,9 +4639,33 @@
       (doseq [f forms] (scan f)))
     @refs))
 
+(defn- scan-deftm-refs
+  "Project the emitter's reference discovery onto its static sibling Var set."
+  [forms source-ns]
+  (into #{} (map :var) (scan-deftm-inputs forms source-ns)))
+
 ;; ================================================================
 ;; tag->jvm-info — type tag to JVM descriptor mapping
 ;; ================================================================
+
+(defn ^:no-doc emission-input-snapshots
+  "Observe retained global deftm inputs before emitting static/sibling methods.
+   Reuse the emitter's reference discovery; do not invent another callee table.
+   Traversal never invokes or materializes a numerical body. A missing walked
+   body can be filled by emission itself, which then invalidates this snapshot
+   and requires a fresh original emission before paired re-emission is admitted."
+  [walked-body source-ns]
+  (loop [pending (seq (scan-deftm-inputs walked-body source-ns)) observations {}]
+    (if-let [{v :var lookup :lookup} (first pending)]
+      (if (contains? observations v)
+        (recur (next pending) (update-in observations [v :lookups] conj lookup))
+        (let [snapshot (assoc (me/emission-definition-snapshot v) :lookups #{lookup})
+              metadata (:metadata snapshot)
+              body (or (:raster.core/deftm-walked-body-typed metadata)
+                       (:raster.core/deftm-walked-body metadata))
+              nested (when body (scan-deftm-inputs body (or (:ns metadata) source-ns)))]
+          (recur (concat (next pending) nested) (assoc observations v snapshot))))
+      (mapv observations (sort-by str (keys observations))))))
 
 (defn- tag->jvm-info
   "Map a deftm type tag to JVM type information.
@@ -5051,24 +5101,48 @@
   #{})
 
 (defn- compile-and-cache-deftm!
-  "Lazily compile a deftm body to bytecode, caching the result on var metadata."
+  "Emit static code with actual historical input lineage, then cache it.
+   Lazy child compilation can change input metadata. Retry that materialization
+   boundary, never bless the first emission using fresh post-hoc snapshots."
   [deftm-var]
-  (let [m (meta deftm-var)
-        var-sym (symbol (str (ns-name (:ns m))) (str (:name m)))]
+  (let [var-sym (symbol (str (ns-name (:ns (meta deftm-var)))) (str (:name (meta deftm-var))))]
     (when (contains? *compiling-deftms* var-sym)
       (throw (ex-info (str "Cycle detected compiling deftm: " var-sym)
                       {:var var-sym})))
-    (let [walked-body ((requiring-resolve 'raster.core/ensure-walked-body!) deftm-var)
+    (loop [attempt 0]
+      (let [walked-body ((requiring-resolve 'raster.core/ensure-walked-body!) deftm-var)
+          m (meta deftm-var)
           params      (:raster.core/deftm-params m)
           tags        (:raster.core/deftm-tags m)
           return-tag  (:raster.core/return-tag m)
           source-ns   (:ns m)
-          class-name  (str (ns-name source-ns) "." (:name m) "__DeftmBC")
-          bc-info     (binding [*compiling-deftms* (conj *compiling-deftms* var-sym)]
+          source-snapshot (me/emission-definition-snapshot deftm-var)
+          dependency-snapshots (emission-input-snapshots walked-body source-ns)
+          emitted-inputs (atom {:static [] :values []})
+          definition-revision (dispatch/compiler-definition-revision)
+          class-name  (str (ns-name source-ns) "." (:name m) (gensym "__DeftmBC"))
+          bc-info     (binding [*compiling-deftms* (conj *compiling-deftms* var-sym)
+                               me/*emission-inputs* emitted-inputs]
                         (compile-deftm-method! class-name "invoke"
-                                               params tags return-tag walked-body source-ns))]
-      (alter-meta! deftm-var assoc :raster.core/deftm-bytecode bc-info)
-      bc-info)))
+                                               params tags return-tag walked-body source-ns))
+          bc-info (assoc bc-info :raster.compiler/emission-inputs
+                         {:source-snapshot source-snapshot
+                          :body walked-body :params params :tags tags :return-tag return-tag
+                          :dependency-snapshots (into dependency-snapshots (:values @emitted-inputs))
+                          :static-inputs (:static @emitted-inputs)
+                          :definition-revision definition-revision
+                          :completed-definition-revision (dispatch/compiler-definition-revision)})
+          failure (try (me/assert-static-emission-current! deftm-var bc-info) nil
+                       (catch clojure.lang.ExceptionInfo e e))]
+        (if (and failure (< attempt 2)
+                 (contains? #{:stale-emission-inputs :stale-static-emission-source
+                              :unstable-emission-inputs :unowned-static-emission-inputs}
+                            (:reason (ex-data failure))))
+          (recur (inc attempt))
+          (do
+            (when failure (throw failure))
+            (alter-meta! deftm-var assoc :raster.core/deftm-bytecode bc-info)
+            bc-info))))))
 
 ;; ================================================================
 ;; compile-typed-impl! — replace deftm deftype with bytecode-compiled impl
