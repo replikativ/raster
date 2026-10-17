@@ -5,6 +5,7 @@
    emit the linear rules; the ordinary compiler consumes the resulting retained let forms.
    The closed first vertical deliberately rejects effects, scopes and active precision changes."
   (:require [clojure.set :as set]
+            [raster.ad.accumulation :as accumulation]
             [raster.ad.templates :as templates]
             ;; Existing rule emitters produce grad-acc; its runtime Var must exist
             ;; before source/rule epochs and executable dependencies are captured.
@@ -1177,8 +1178,6 @@
               argument-dtypes (mapv #(expression-dtype values %) arguments)]
           (when-not (and (not dispatch?)
                          (symbol? implementation-op)
-                         (identical? #'raster.ad.reverse/grad-acc (resolve implementation-op))
-                         (raster.ad.reverse/approved-grad-acc-definition?)
                          (= 2 (count arguments))
                          (= [result-dtype result-dtype] argument-dtypes))
             (fail! :ad-normalized-scalar-accumulation
@@ -1189,11 +1188,14 @@
           ;; scalar case, then prove the replacement through the ordinary addition authority too.
           (binding-dtype! values result expression)
           (selected-call-contract! call argument-dtypes result-dtype)
-          (let [addition (tagged (list 'raster.numeric/+ (first arguments) (second arguments))
-                                 result-dtype)
-                addition-call (call! values addition)]
-            (selected-call-contract! addition-call argument-dtypes result-dtype)
-            addition))))))
+          (or (accumulation/project-checked-addition
+               expression (mapv (fn [dt] {:present? true :dtype dt}) argument-dtypes)
+               (fn [addition dt]
+                 (selected-call-contract! (call! values addition) argument-dtypes dt)
+                 true))
+              (fail! :ad-normalized-scalar-accumulation
+                     {:result result :expression expression
+                      :result-dtype result-dtype :argument-dtypes argument-dtypes})))))))
 
 (defn- scalar-program-lambda [program parameters outputs]
   (let [values (:values (soac/facts program))]

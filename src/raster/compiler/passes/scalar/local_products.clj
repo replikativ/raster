@@ -1,9 +1,12 @@
 (ns raster.compiler.passes.scalar.local-products
   "Closed lexical presence refinement and nonescaping local vector replacement.
-   No calls are evaluated and no arithmetic is rewritten. Primitive result
-   presence is proved only by the existing checked scalar lowerer. Fields
+   No calls are evaluated or arithmetic reassociated. An approved optional
+   scalar sum projects to addition only with independent present, homogeneous
+   producer carriers and the existing checked scalar lowerer. Owners retaining
+   definition-freshness guards must capture dependencies before projection. Fields
    are snapshotted in source order; escaping products retain their source form."
   (:require [raster.compiler.ir.form :as form]
+            [raster.ad.accumulation :as accumulation]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.value-product :as value-product]
             [raster.compiler.core.dtype :as dtype]
@@ -104,7 +107,7 @@
                                        (descriptor/scalar-op? (descriptor/semantic-op init))
                                        (scalar-body/checked-primitive-result
                                         init (into {} (keep (fn [argument]
-                                                             (when-let [type (:scalar-type (get scope argument))]
+                                                             (when-let [type (:producer-scalar-type (get scope argument))]
                                                                [argument type])))
                                                    (descriptor/call-args init))))]
                     {:present? true :scalar-type (:type proof)}))
@@ -112,8 +115,34 @@
                   (when-let [proof (scalar-body/checked-selected-primitive-result init)]
                     {:present? true :scalar-type (:type proof)})
                   (when (= :present (normal-return/presence init)) {:present? true}))
-        retained (some-> (:raster.type/tag (meta id)) dtype/dtype-for-scalar-tag)]
-    (cond-> known (and (:scalar-type known) retained) (assoc :scalar-type retained))))
+        retained (some-> (:raster.type/tag (meta id)) dtype/dtype-for-scalar-tag)
+        ;; Retained consumer declarations are not physical producer evidence.
+        ;; Keep that distinction through aliases for checked sum projection.
+        producer-type (or (:producer-scalar-type known) (:scalar-type known))]
+    (cond-> known
+      producer-type (assoc :producer-scalar-type producer-type)
+      (and (:scalar-type known) retained) (assoc :scalar-type retained))))
+
+(defn- project-scalar-accumulation [env expression]
+  (when (accumulation/approved-call? expression)
+    (let [arguments (:arguments (descriptor/call-description expression))
+          facts (mapv (fn [argument]
+                        (let [known (binding-fact env (gensym "sum_operand__") argument)
+                              dt (:producer-scalar-type known)]
+                          (when (and dt (= dt (:scalar-type known))
+                                     (or (:present? known)
+                                         (and (contains? known :literal) (some? (:literal known)))))
+                            {:present? true :dtype dt}))) arguments)]
+      (accumulation/project-checked-addition
+       expression facts
+       (fn [addition dt]
+         ;; Validate the selected operation using independently established
+         ;; producer widths. Proxies are proof inputs, not emitted temporaries:
+         ;; original operands and their evaluation order remain unchanged.
+         (let [ports [(gensym "sum_left__") (gensym "sum_right__")]
+               probe (with-meta (apply list (first addition) ports) (meta addition))
+               proof (scalar-body/checked-primitive-result probe (zipmap ports (repeat dt)))]
+           (= dt (:type proof))))))))
 
 (defn- lower-let [env expression products?]
   (let [[head bindings & body] expression]
@@ -229,7 +258,9 @@
     (and (seq? expression) (form/scope-info expression))
     (lower-scopes env expression products?)
 
-    (seq? expression) (relist expression (map #(lower env % products?) expression))
+    (seq? expression)
+    (let [lowered (relist expression (map #(lower env % products?) expression))]
+      (or (project-scalar-accumulation env lowered) lowered))
     (vector? expression) (with-meta (mapv #(lower env % products?) expression) (meta expression))
     (map? expression) (into (empty expression) (map (fn [[k v]] [(lower env k products?) (lower env v products?)])) expression)
     (set? expression) (into (empty expression) (map #(lower env % products?)) expression)

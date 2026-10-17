@@ -1,7 +1,33 @@
 (ns raster.ad.parameter-projection-test
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.reverse :as reverse]
+            [raster.ad.tangent :as tangent]
             [raster.compiler.ad.bind-ctx :as bind-ctx]))
+
+(deftest optional-sum-carrier-proof-does-not-assert-presence-or-guess-a-target
+  (let [d (with-meta 'd {:raster.type/tag 'double})
+        e (with-meta 'e {:raster.type/tag 'double})
+        f (with-meta 'f {:raster.type/tag 'float})
+        sum (list 'raster.ad.reverse/grad-acc d e)
+        expression-tag #'tangent/expr-manifest-tag]
+    (is (= 'double (expression-tag sum)))
+    (is (= sum (tangent/project-expr 'double sum)))
+    (let [project (eval (list 'fn '[d e] (tangent/project-expr 'double sum)))]
+      (is (nil? (project nil nil)))
+      (is (= 2.0 (project nil 2.0)))
+      (is (= 5.0 (project 2.0 3.0))))
+    (is (nil? (expression-tag (list 'raster.ad.reverse/grad-acc f f))))
+    (is (nil? (expression-tag (list 'raster.ad.reverse/grad-acc d f))))
+    (is (= 'float (expression-tag (float 1.0))))
+    (is (= 'double (expression-tag 1.0)))
+    (is (nil? (expression-tag (list 'raster.ad.reverse/grad-acc (float 1.0) (float 2.0)))))
+    (is (nil? (expression-tag (list 'raster.ad.reverse/grad-acc (float 1.0) 2.0))))
+    (is (nil? (expression-tag '(raster.ad.reverse/grad-acc unknown unknown))))
+    (is (nil? (expression-tag (with-meta sum {:raster.op/lexical-callee true}))))
+    (is (= 'double (expression-tag '(raster.ad.reverse/grad-acc a b) {'a d 'b e})))
+    (is (nil? (expression-tag '(raster.ad.reverse/grad-acc a b) {'a 'b 'b 'a})))
+    (with-redefs [reverse/grad-acc (fn [& _] (throw (AssertionError. "must not evaluate helper")))]
+      (is (nil? (expression-tag sum))))))
 
 (defn- collector [parameter-tag cotangent-tag]
   (let [parameter (with-meta 'parameter {:raster.type/tag parameter-tag})

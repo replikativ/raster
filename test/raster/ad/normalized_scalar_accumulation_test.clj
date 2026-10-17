@@ -29,7 +29,8 @@
                                         ['result expression] '[result])
           region (#'normalized/scalar-program-lambda program '[left right] '[result])
           local (first (:locals (soac/lambda-parts region)))]
-      (is (= '(raster.numeric/+ left right) projected))
+      (is (= (list (if (= :double dtype) 'clojure.core/+ 'raster.numeric/+) 'left 'right)
+             projected))
       (is (= (case dtype :float 'float :double 'double)
              (:raster.type/tag (meta projected))))
       (is (= dtype (:dtype local)))
@@ -92,7 +93,8 @@
           (is (= :ad-normalized-scalar-accumulation (reason construct))))
         (is (zero? @calls) "definition/dispatch checks never invoke the unapproved helper"))
       (is (true? (reverse/approved-grad-acc-definition?)))
-      (is (= '(raster.numeric/+ left right) (project values 'result expression)))
+      (is (= (list (if (= :double dtype) 'clojure.core/+ 'raster.numeric/+) 'left 'right)
+             (project values 'result expression)))
       (is (map? (build)) "restoring the exact library root restores construction"))))
 
 (deftest accumulation-projection-refuses-helper-metadata-replacement
@@ -112,7 +114,8 @@
         (finally (reset-meta! v original-metadata)))
       (is (true? (reverse/approved-grad-acc-definition?)))
       (is (= original-metadata (meta v)))
-      (is (= '(raster.numeric/+ left right) (project values 'result expression)))
+      (is (= (list (if (= :double dtype) 'clojure.core/+ 'raster.numeric/+) 'left 'right)
+             (project values 'result expression)))
       (is (map? (build)) "restoring exact metadata restores construction"))))
 
 (deftest runtime-guard-retains-the-original-accumulation-helper-dependency

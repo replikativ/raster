@@ -8,6 +8,37 @@
             [raster.par]
             [raster.numeric :as n]))
 
+(deftest paired-owner-retains-a-helper-premise-removed-by-scalar-projection
+  (let [scope (create-ns (gensym "raster.projected-helper-premise."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm twice [x :- Double] :- Double
+                 (let [left (double x) right (double x)]
+                   (raster.ad.reverse/grad-acc left right)))))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'twice))
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            _ (core/ensure-bytecode-implementation! receiver)
+            emission (:raster.core/bytecode-emission (meta receiver))
+            prepared (binding [*ns* scope]
+                       (reverse/ad-prepare (first (:body emission))
+                                           (zipmap (:params emission) (:tags emission))))
+            artifact (#'reverse/get-paired-helper-program emission [0])
+            [value pullback] ((:companion artifact) 3.0)
+            reason #(try ((:guard artifact)) nil
+                         (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))]
+        (is (= 6.0 value))
+        (is (= [2.0] (pullback 1.0)))
+        (is (not-any? #{'raster.ad.reverse/grad-acc} (tree-seq coll? seq prepared))
+            "the source helper call really was projected away")
+        ;; The entry guard captures the actual original program before
+        ;; ad-prepare erases this call; scanning only the projected form could
+        ;; not establish the dependency. Replacement must not execute.
+        (with-redefs [reverse/grad-acc (fn [& _] (throw (AssertionError. "must not invoke replacement")))]
+          (is (= :ad-normalized-execution-callee (reason))))
+        (is (nil? (reason))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest paired-helper-retains-primal-pullback-and-historical-dependencies
   (let [scope (create-ns (gensym "raster.paired-helper-emission."))]
     (try
