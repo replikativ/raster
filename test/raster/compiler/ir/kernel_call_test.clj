@@ -50,6 +50,18 @@
 (defn- host-capacity [value _slot]
   (java.lang.reflect.Array/getLength value))
 
+(deftest empty-retained-storage-does-not-waive-read-minimums
+  (let [artifact (assoc-in (retained-capacity-artifact [0])
+                           [:attributes :kernel-body :parameters 0 :minimum-elements] 'n)
+        bind #(kcall/validate-retained-input-capacities!
+               artifact [(float-array 0) (float-array 1) {:type :int :value %}] host-capacity)]
+    (is (= [0] (get-in artifact [:attributes :kernel-body :parameters 0 :shape])))
+    (is (identical? artifact (bind 0)))
+    (is (= :kernel-body-buffer-capacity
+           (try (bind 1) :accepted
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+    (is (thrown? clojure.lang.ExceptionInfo (retained-capacity-artifact [-1])))))
+
 (deftest retained-minimum-elements-is-independent-of-physical-storage
   (let [artifact (retained-capacity-artifact [(klaunch/runtime-value '(extent x))])
         kernel (assoc-in artifact [:attributes :kernel-body :parameters 0 :minimum-elements] 'n)
