@@ -86,6 +86,144 @@
           * (* (:value (get operands (nth expression 2))) (double (second expression))))]
     {:type (get-in step [:value :dtype]) :value value}))
 
+(defn- materialization-reason [f]
+  (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest incremental-materialization-shares-the-eager-interpreter
+  (let [plan (fixture-plan)
+        arguments [(double-array [1.0 2.0 3.0]) 0.25 7]
+        calls (atom [])
+        evaluate (fn [step operands]
+                   (swap! calls conj (:symbol step))
+                   (evaluate-scalar step operands))
+        initial (materialization/begin-materialization plan arguments)]
+    (is (zero? (:next-step initial)))
+    (is (= (set (map :id (:parameters plan))) (set (keys (:values initial)))))
+    (is (empty? @calls))
+    (is (= :invocation-materialization-incomplete
+           (materialization-reason #(materialization/finish-materialization initial))))
+    (let [complete (reduce (fn [state _] (materialization/materialize-next state evaluate))
+                           initial (:steps plan))
+          result (materialization/finish-materialization complete)]
+      (is (= '[half-dt nsteps] @calls))
+      (is (= result (materialization/materialize plan arguments evaluate-scalar)))
+      (is (= :invocation-materialization-complete
+             (materialization-reason #(materialization/materialize-next complete evaluate))))
+      (is (= '[half-dt nsteps] @calls))
+      (is (zero? (:next-step initial)) "an advance does not mutate an earlier state"))))
+
+(defn- staged-invocation-plan []
+  (invocation/from-prefix
+   {:id :deferred-square
+    :parameters '[n] :parameter-values {'n (scalar :long)}
+    :bindings '[[prefix (double-array 1)] [square (* n n)]
+                [out (double-array square)] [tail (inc square)]]
+    :binding-values {'prefix (array-value :double 1) 'square (scalar :long)
+                     'out (array-value :double 'square) 'tail (scalar :long)}
+    :program-values {'prefix (array-value :double 1) 'square (scalar :long)
+                     'out (array-value :double 'square) 'tail (scalar :long)}
+    :program-inputs '[prefix square out tail] :program-outputs '[out]}))
+
+(deftest incremental-check-failure-does-not-materialize-the-suffix
+  (let [plan (staged-invocation-plan)]
+    (doseq [n [3 Long/MAX_VALUE]]
+      (let [events (atom [])
+            initial (materialization/begin-materialization plan [n])
+            prefix (materialization/materialize-next initial nil)
+            evaluate (fn [step operands]
+                       (swap! events conj (:symbol step))
+                       {:type :long
+                        :value (case (:symbol step)
+                                 square (let [v (:value (get operands 'n))] (* v v))
+                                 tail (inc (:value (get operands 'square))))})]
+        (is (empty? @events) "prefix preparation has not evaluated the later check")
+        ;; The caller's real graph completion will occupy this boundary. This
+        ;; interpreter test does not claim to submit or await a device event.
+        (swap! events conj :device-completed)
+        (if (= n Long/MAX_VALUE)
+          (do
+            (is (thrown? ArithmeticException (materialization/materialize-next prefix evaluate)))
+            (is (= [:device-completed 'square] @events))
+            (is (= 1 (:next-step prefix)))
+            (is (= (inc (count (:parameters plan))) (count (:values prefix))))
+            (is (= :invocation-materialization-incomplete
+                   (materialization-reason #(materialization/finish-materialization prefix)))))
+          (let [square (materialization/materialize-next prefix evaluate)
+                allocated (materialization/materialize-next square nil)
+                complete (materialization/materialize-next allocated evaluate)
+                result (materialization/finish-materialization complete)]
+            (is (= [:device-completed 'square 'tail] @events))
+            (is (= [9] (get-in result [:program-buffers 'out :shape])))
+            (is (= {:type :long :value 9} (get-in result [:program-scalars 'square])))
+            (is (= {:type :long :value 10} (get-in result [:program-scalars 'tail])))))))))
+
+(deftest incremental-prefix-validation-does-not-run-the-evaluator
+  (let [state (materialization/begin-materialization (fixture-plan)
+                                                    [(double-array 3) 0.25 7])
+        calls (atom 0)
+        evaluate (fn [& _] (swap! calls inc))
+        parameter (:id (last (:parameters (:plan state))))]
+    (doseq [forged [(assoc state :next-step -1)
+                    (assoc state :next-step 100)
+                    (assoc state :lexical {})
+                    (assoc-in state [:values :unavailable] {:type :long :value 1})
+                    (assoc-in state [:values parameter] 7)
+                    (assoc-in state [:values parameter] {:type :long :value 1.5})]]
+      (is (some? (materialization-reason #(materialization/materialize-next forged evaluate)))))
+    (is (zero? @calls))))
+
+(deftest incremental-structured-prefix-values-retain-their-producers
+  (let [plan (staged-invocation-plan)
+        prefix (materialization/materialize-next
+                (materialization/begin-materialization plan [3]) nil)
+        id (:id (first (:steps plan)))
+        calls (atom 0)
+        evaluate (fn [& _] (swap! calls inc))]
+    (doseq [[field value] [[:shape [2]] [:id :different-storage] [:initialization :unspecified]]]
+      (is (= :invocation-materialization-state-producer
+             (materialization-reason
+              #(materialization/materialize-next (assoc-in prefix [:values id field] value)
+                                                  evaluate)))))
+    (is (zero? @calls)))
+  (let [plan (fixture-plan)
+        initial (materialization/begin-materialization plan [(double-array 3) 0.25 7])
+        projected (materialization/materialize-next initial nil)
+        id (:id (first (:steps plan)))]
+    (is (= :invocation-materialization-state-producer
+           (materialization-reason
+            #(materialization/materialize-next (assoc-in projected [:values id :value] 4) nil)))))
+  (let [array (array-value :double '(extent x))
+        plan (invocation/from-prefix
+              {:id :retained-alias :parameters '[x] :parameter-values {'x array}
+               :bindings '[[alias x]] :binding-values {'alias array}
+               :program-values {'alias array} :program-inputs '[alias] :program-outputs '[alias]})
+        initial (materialization/begin-materialization plan [(double-array 3)])
+        aliased (materialization/materialize-next initial nil)
+        id (:id (first (:steps plan)))
+        forged (assoc-in aliased [:values id :source] (double-array 3))]
+    (is (= :invocation-materialization-state-producer
+           (materialization-reason #(materialization/finish-materialization forged))))))
+
+(deftest retained-buffers-cannot-change-the-plan-storage-contract
+  (let [array (array-value :double '(extent x))
+        plan (invocation/from-prefix
+              {:id :retained-buffer-contract :parameters '[x] :parameter-values {'x array}
+               :bindings [] :binding-values {} :program-values {'x array}
+               :program-inputs '[x] :program-outputs '[x]})
+        state (materialization/begin-materialization plan [(double-array 3)])
+        id (:id (first (:parameters plan)))
+        original (get-in state [:values id])
+        different (assoc original :value (array-value :float '(extent x)) :source (float-array 3))
+        complete (materialization/finish-materialization state)]
+    (is (= :invocation-materialization-buffer-value
+           (materialization-reason
+            #(materialization/finish-materialization (assoc-in state [:values id] different)))))
+    (is (= :invocation-materialization-buffer-value
+           (materialization-reason
+            #(materialization/validate! (-> complete
+                                           (assoc-in [:values id] different)
+                                           (assoc-in [:program-buffers 'x] different))))))))
+
 (deftest checked-dimension-algebra-shares-graph-extent-semantics
   (let [make-plan
         (fn [dimension scalar-type]
