@@ -496,8 +496,9 @@
            (get-in materialized [:program-scalars 'n])))
     (is (= :invocation-materialization-arity
            (reason #(materialization/materialize plan [input] nil))))
-    (is (= :invocation-materialization-shape-value
-           (reason #(materialization/materialize plan [input 3.0] nil))))
+    (is (= :invocation-materialization-scalar
+           (reason #(materialization/materialize plan [input 3.0] nil)))
+        "the nonintegral scalar is now rejected before shape evaluation")
     (is (= '[x n] (mapv :symbol (:parameters plan)))
         "buffer-before-dimension order is retained and materializes from the complete scalar set"))
   (testing "the existing materializer executes its canonical value and self-extent forms"
