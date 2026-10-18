@@ -622,14 +622,31 @@
           (fail! :invocation-ordered-allocation-shape
                  "retained storage differs from the evaluated source constructor count"
                  {:shape shape :constructor-count elements :destination destination}))
-        (let [[realized token] (allocate-result (:realized state) (get-in materialization [:plan :id])
-                                                destination abstract scalars :result)
+        (let [step (when-let [id (:invocation-step entry)]
+                     (let [next-step (nth (get-in materialization [:plan :steps])
+                                          (:next-step materialization) nil)]
+                       (when-not (and (= id (:id next-step))
+                                      (invocation/buffer-allocation? next-step))
+                         (fail! :invocation-ordered-allocation-step
+                                "source allocation differs from the next invocation step" {:entry entry}))
+                       next-step))
+              materialization (if step (materialization/materialize-next materialization nil)
+                                  materialization)
+              [realized token]
+              (if step
+                (let [buffer (get-in materialization [:values (:id step)])
+                      token (:id buffer)]
+                  [(-> (:realized state)
+                       (assoc-in [:buffers destination] token)
+                       (add-storage token destination abstract shape nil :zero)) token])
+                (allocate-result (:realized state) (get-in materialization [:plan :id])
+                                 destination abstract scalars :result))
               _ (when (contains? (:acquired-storage state) token)
                   (fail! :invocation-ordered-allocation-acquired
                          "source allocation is already acquired in this invocation" {:storage token}))
               realized (assoc-in realized [:storage token :initialization] :zero)
               layout (storage-link-layout realized scalars (:target state) #{token} [token])]
-          {:state (assoc state :realized realized
+          {:state (assoc state :realized realized :materialization materialization
                                :pending {:kind :source-allocation :storage token
                                          :source-cursor (:source-cursor state)})
            :nodes (:nodes layout) :values (:values layout)
@@ -663,7 +680,17 @@
                     boundaries)
           overwrite (write-before-read-inputs boundaries available scalars)
           acquired (:acquired-storage state)
-          realized (add-materialized-inputs (:realized state) available (:values program)
+          unacquired (update available :program-buffers
+                             (fn [buffers]
+                               (into {} (remove (fn [[id buffer]]
+                                                  (when (contains? acquired (:id buffer))
+                                                    (when-not (= (:id buffer)
+                                                                 (get-in state [:realized :buffers id]))
+                                                      (fail! :invocation-ordered-input-storage
+                                                             "acquired input lost its logical storage binding"
+                                                             {:value id}))
+                                                    true))) buffers)))
+          realized (add-materialized-inputs (:realized state) unacquired (:values program)
                                             overwrite required)
           realized (lower-equation-storage realized (get-in materialization [:plan :id]) equation
                                             (:values program) scalars (:projections state))
@@ -715,7 +742,8 @@
    Retained validation is internal exact-owner static evidence, not a runtime proof;
    materialization, call bindings and final LinkPlan memory/effect obligations remain fresh.
    Only unchanged static program validation can be shared with final construction."
-  [materialized parallel-program target evaluate-host project retained-validation caller-options]
+  [materialized parallel-program target evaluate-host project retained-validation caller-options
+   & [source-state]]
   (let [materialized (materialization/validate! materialized)
         ;; Without a retained owner, independently prove this exact program once for this
         ;; synchronous lowering. The same sealed report feeds the storage/call/final phases;
@@ -742,18 +770,21 @@
                    {:invocation-inputs (:program-inputs invocation-plan)
                     :program-inputs (:inputs parallel-program)}))
         scalars (:program-scalars materialized)
-        shape-scalars (merge (invocation-shape-scalars materialized) scalars)
+        shape-scalars (merge (invocation-shape-scalars materialized) scalars (:host-scalars source-state))
         boundaries (equation-boundaries parallel-program (:projections retained-validation))
         overwrite-inputs (write-before-read-inputs boundaries
                                                    materialized shape-scalars)
         required-buffers (required-materialized-buffers parallel-program boundaries)
-        initial (add-materialized-inputs {:buffers {} :loop-scratch {} :storage {}}
-                                         materialized (:values parallel-program)
-                                         overwrite-inputs required-buffers)
-        realized (reduce #(lower-equation-storage %1 invocation-id %2
-                                                  (:values parallel-program) shape-scalars
-                                                  (:projections retained-validation))
-                         initial (:equations parallel-program))
+        initial (when-not source-state
+                  (add-materialized-inputs {:buffers {} :loop-scratch {} :storage {}}
+                                           materialized (:values parallel-program)
+                                           overwrite-inputs required-buffers))
+        realized (if source-state
+                   (:realized source-state)
+                   (reduce #(lower-equation-storage %1 invocation-id %2
+                                                    (:values parallel-program) shape-scalars
+                                                    (:projections retained-validation))
+                           initial (:equations parallel-program)))
         call-scalars (select-keys shape-scalars (keys (:values parallel-program)))
         ;; Shape-only invocation scalars are part of the physical program contract even when no
         ;; kernel ABI consumes them. Retain them in the call so logical N-D values can be proved
@@ -1089,6 +1120,42 @@
    (lower-for-request materialized parallel-program target evaluate-host project retained-validation nil))
   ([materialized parallel-program target evaluate-host project retained-validation caller-options]
    (lower-for-request materialized parallel-program target evaluate-host project retained-validation caller-options)))
+
+(defn ^:no-doc finish-ordered-realization
+  "Construct and independently validate the ordinary whole-program boundary after source work.
+   Cached host results are looked up, not recomputed. Zeroed source allocations remain conditional
+   initialized inputs; the runtime must prove their actual completed initialization before export."
+  [state caller-options]
+  (when-not (= caller-options (:caller-options state))
+    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
+  (when-not (and (nil? (:pending state))
+                 (= (:source-cursor state) (count (:source-order state))))
+    (fail! :invocation-ordered-incomplete "source work has not completed" {}))
+  (let [materialized (materialization/finish-materialization (:materialization state))
+        initialized-tokens (into #{}
+                                 (keep (fn [[token storage]]
+                                         (when (= :zero (:initialization storage)) token)))
+                                 (get-in state [:realized :storage]))
+        evaluate-host (fn [equation _]
+                        (let [step (get-in state [:host-steps (:id equation)])]
+                          (when-not (= equation (:equation step))
+                            (fail! :invocation-ordered-host-result
+                                   "completed source work lacks this exact host definition"
+                                   {:equation (:id equation)}))
+                          (:results step)))
+        project (fn [candidate]
+                  {:plan (update candidate :nodes
+                                 (fn [nodes]
+                                   (reduce (fn [nodes token]
+                                             (when-not (contains? nodes token)
+                                               (fail! :invocation-ordered-storage
+                                                      "source allocation is absent from final storage"
+                                                      {:storage token}))
+                                             (assoc-in nodes [token :role] :state))
+                                           nodes initialized-tokens)))})]
+    (link/without-validation-context
+     #(lower-in-context materialized (:program state) (:target state) evaluate-host project nil
+                        caller-options state))))
 
 (def ^:private resident-layout-keys
   #{:target :nodes :values :buffer-bindings :scalar-values :public-inputs})
