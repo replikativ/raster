@@ -573,10 +573,13 @@
                [])))
 
 (defn- prefix-step
-  [plan-id ordinal symbol expression value environment]
+  [plan-id ordinal symbol expression value environment lexical-values]
   (let [id (binding-id plan-id ordinal symbol)
         operation (descriptor/semantic-op expression)
-        initialization (descriptor/allocation-initialization operation)]
+        projection (when (buffer-value? value)
+                     (descriptor/direct-allocation-projection expression lexical-values))
+        initialization (descriptor/allocation-initialization
+                        (if projection (descriptor/semantic-op (:constructor projection)) operation))]
     (cond
       (invocation-source/shape-projection-source expression)
       (let [operands (referenced-operands expression environment)
@@ -593,8 +596,9 @@
         (->BufferClone id symbol operands (get environment source-symbol) value))
 
       initialization
-      (->BufferAllocation id symbol (allocation-operands value environment)
-                          initialization value)
+      (cond-> (->BufferAllocation id symbol (allocation-operands value environment)
+                                  initialization value)
+        (:helper projection) (assoc :source-projection projection))
 
       (symbol? expression)
       (->ValueAlias id symbol (referenced-operands expression environment)
@@ -639,7 +643,8 @@
                       (fail! :invocation-prefix-value
                              "invocation prefix binding has no retained AbstractValue"
                              {:symbol symbol :expression expression}))
-                    (let [step (prefix-step id ordinal symbol expression value environment)]
+                    (let [lexical-values (into {} (map (fn [[symbol id]] [symbol (get values id)])) environment)
+                          step (prefix-step id ordinal symbol expression value environment lexical-values)]
                       {:steps (conj steps step)
                        :values (assoc values (:id step) value)
                        :environment (assoc environment symbol (:id step))})))
@@ -821,7 +826,8 @@
                     actual (get steps-by-symbol symbol)
                     _ (when (and (buffer-allocation? actual)
                                  (not (invocation-source/allocation-corresponds?
-                                       canonical (:value actual) (:initialization actual))))
+                                       canonical (:value actual) (:initialization actual)
+                                       (into {} (map (fn [[symbol id]] [symbol (get-in plan [:values id])])) environment))))
                         (fail! :invocation-source-allocation
                                "source constructor differs from the retained allocation contract"
                                {:binding symbol :source canonical :value (:value actual)}))
@@ -838,7 +844,8 @@
                                "source length conversions are not the retained exact projection"
                                {:binding symbol :source canonical}))
                     step (prefix-step (:id plan) ordinal symbol canonical
-                                      (:value (get steps-by-symbol symbol)) environment)]
+                                      (:value (get steps-by-symbol symbol)) environment
+                                      (into {} (map (fn [[symbol id]] [symbol (get-in plan [:values id])])) environment))]
                 {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
             {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
             (map-indexed vector step-pairs)))
@@ -868,7 +875,7 @@
                           (not (invocation-source/allocation-corresponds?
                                 expression (get-in program [:values symbol])
                                 (descriptor/allocation-initialization
-                                 (descriptor/semantic-op expression)))))
+                                 (descriptor/semantic-op expression)) (:values program))))
                  (fail! :invocation-source-allocation
                         "source storage allocation differs from its retained physical contract"
                         {:binding symbol :source expression}))

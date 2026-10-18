@@ -7,6 +7,8 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-source-order-test :as source-order-fixture]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.ir.kernel-body :as kernel-body]
@@ -285,6 +287,22 @@
      (boring/decode
       (boring/encode (#'artifact/prepare-sequences value) options)
       options))))
+
+(deftest helper-allocation-correspondence-survives-the-compiler-record-codec
+  (let [program (:semantic (equation-first/compile
+                           #'source-order-fixture/helper-source-zero-observed
+                           {:target target :dtype :double}))
+        original (get-in program [:attributes :invocation-plan])
+        restored (compiler-record-round-trip original)
+        helper-step (first (filter :source-projection (:steps restored)))]
+    (is (some? helper-step))
+    (is (fingerprint/equivalent? original restored))
+    (is (= (invocation/source-order original program)
+           (invocation/source-order restored program)))
+    (is (= 'raster.arrays/zeros-like
+           (get-in helper-step [:source-projection :helper :operation])))
+    (is (= 'clojure.core/double-array
+           (first (get-in helper-step [:source-projection :constructor]))))))
 
 (deftest retained-minimum-round-trips-through-the-existing-compiler-record-codec
   (let [launch (kernel-launch/spec {:workgroup-size [4] :group-count [1]})

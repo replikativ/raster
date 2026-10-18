@@ -11,6 +11,7 @@
   Compiler passes and op libraries should register and query metadata directly
   through this registry."
   (:require [raster.compiler.support.mangled :as mangled]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]))
 
@@ -61,6 +62,7 @@
   ;; evidence. Suffixes, initializer/copy overloads and shape-helper calls do not
   ;; establish the splitting contract; their explicit registered facets remain.
   (when (and (seq? form) (= 2 (count form))
+             (not (:raster.op/lexical-callee (meta form)))
              (contains? alloc-ops (first form))
              (identical? (resolve (first form))
                          (ns-resolve 'clojure.core (symbol (name (first form)))))
@@ -141,6 +143,11 @@
               (let [alloc-ctor (symbol "clojure.core" (name (first body)))]
                 {:allocates? true
                  :auto-detected? true
+                 ;; Data witness for the direct-constructor case only. General alloc/compute
+                 ;; rewrites below must not acquire allocation-only equivalence authority.
+                 :direct-allocation {:parameters params
+                                     :parameter-tags (:raster.core/deftm-tags m)
+                                     :constructor (list alloc-ctor size)}
                  :parameters params
                  :parameter-tags (:raster.core/deftm-tags m)
                  :source-ns (:ns m)
@@ -809,6 +816,60 @@
                :implementation-op implementation :operation (when-not lexical (or recorded implementation))
                :arguments (vec (call-args form))}
         lexical (assoc :lexical-callee lexical)))))
+
+(defn direct-allocation-projection
+  "Project an exact constructor or a definition-derived direct allocation helper.
+
+   Helpers require the selected qualified implementation's actual retained deftm body, not a
+   registered alloc-form or allocator basename. Actual arguments must already be bound values
+   with matching retained storage/scalar types: substituting them cannot discard evaluation of
+   an unused argument, duplicate a check, or reorder call-argument effects. Returned helper data
+   is correspondence material, not a frozen-definition/completion certificate."
+  [expression values]
+  (if (array-allocation-size expression)
+    {:constructor expression}
+    (let [{:keys [implementation-op arguments lexical-callee dispatch? semantic-op]} (call-description expression)
+          operation (if dispatch? (or semantic-op (mangled/impl->op implementation-op))
+                        (or (mangled/impl->op implementation-op) semantic-op))
+          select! #(if dispatch?
+                     (method-entry/selected-definition operation implementation-op (count arguments))
+                     (method-entry/direct-selected-definition operation implementation-op (count arguments)))]
+      (when (and (not lexical-callee) (symbol? implementation-op) (namespace implementation-op)
+                 (every? #(and (symbol? %) (contains? values %)) arguments))
+        ;; Mangling is only a lookup address. The existing registered MethodEntry must prove
+        ;; the exact executable receiver and delegated source; no overload is inferred here.
+        (when-let [{v :source-var} (select!)]
+          (when (and (var? v) (:raster.core/deftm (meta v)))
+            ;; Lazy walking may publish metadata. Complete that compiler-owned analysis before
+            ;; snapshotting the definition rather than making admission depend on REPL warmth.
+            (when-not (:raster.core/deftm-walked-body (meta v))
+              ((requiring-resolve 'raster.core/ensure-walked-body!) v))
+            (let [root (.getRawRoot ^clojure.lang.Var v)
+                  metadata (meta v)
+                  selected (select!)
+                  observations (mapv method-entry/var-snapshot
+                                     (distinct (keep #(get selected %) [:source-var :generic-var :receiver-var])))
+                  definition (:direct-allocation (detect-auto-buffer-semantics v))
+                  {:keys [parameters parameter-tags constructor]} definition
+                  compatible? (fn [argument tag]
+                                (let [array? (types/array-tag? tag)
+                                      expected (if array? (dtype/dtype-for-array-tag tag)
+                                                   (dtype/dtype-for-scalar-tag tag))
+                                      actual (get values argument)]
+                                  (and expected (= (dtype/canon expected) (:dtype actual))
+                                       (= array? (boolean (seq (:shape actual)))))))]
+              (when (and definition (= (count parameters) (count arguments) (count parameter-tags))
+                         (every? true? (map compatible? arguments parameter-tags))
+                         (identical? root (.getRawRoot ^clojure.lang.Var v))
+                         (identical? v (:source-var (select!)))
+                         (every? method-entry/var-snapshot-current? observations)
+                         (identical? metadata (meta v)))
+                (let [substitute (requiring-resolve 'raster.compiler.core.util/subst-syms)
+                      projected (substitute (zipmap parameters arguments) constructor)]
+                  (when (array-allocation-size projected)
+                    {:constructor projected
+                     :helper {:operation operation :implementation implementation-op :definition definition
+                              :arguments arguments}}))))))))))
 
 (defn- unwrap-array-arg
   "Unwrap a cast wrapper around an array argument — (double arr) → arr,
