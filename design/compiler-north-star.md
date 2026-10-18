@@ -1320,7 +1320,7 @@ ownership. A host definition represented in both forms denotes one evaluation. T
 correspondence is not execution, hoisting, lifetime, or completion evidence; source-free programs
 retain their separate explicit execution contracts.
 
-Ordered resident execution remains a pending implementation obligation. It must use the existing
+Public activation of source-ordered resident execution remains an implementation obligation. It uses the existing
 linked root, lifetime lock, replay transaction and cleanup machinery, with entry storage distinct
 from completed public outputs. A pending invocation has no completed LinkPlan/output boundary;
 an empty placeholder plan is not legal. Publish its real plan and resident views together only
@@ -1341,8 +1341,19 @@ validation, plus the existing owner-local acquisition ledger. Reused roots are n
 and neither acquisition nor a logical storage description proves initialized contents.
 Local OpenCL and Level Zero tests compose these boundaries through a test harness, including an
 early write followed by a failed count, an empty allocation, completed zeroing and a suffix graph.
-These tests do not yet establish automatic linked-root execution, changed-input replay, final
-output publication or a performance improvement. Those remain the activation gate above.
+The internal owned `LinkedExecutable` path now drives those actions automatically through the
+existing `run!` replay transaction. It checks initialized requirements before graph binding,
+awaits and releases each prepared fragment, and credits complete writes only after completion.
+The ordinary whole-program call and LinkPlan are constructed at the end using the retained
+source storage and cached host results; acquired-root and initialized-view checks precede atomic
+publication of the final resident boundary. A failure poisons the same root and publishes no
+successful replay or lease. Owner-retained roots receive changed public inputs on the next replay,
+and source constructor zeroing repeats at its source position rather than only at first acquisition.
+Actual OpenCL and Level Zero root tests cover these behaviors, non-default caller math intent,
+void leased-call rejection before effects, and retained cleanup after a retry-safe stage-release
+failure. These are restricted internal runtime results, not public `Compiled` activation or a
+performance improvement. Public preparation/composition/frontier projection, attached roots,
+entry replacement, profiling, structured-loop fragments and prefix-result views remain gates.
 
 JAX pytrees are the model for separating user structure from flat leaves, but
 Raster trees should retain stable keyed paths and type/shape information. JAX

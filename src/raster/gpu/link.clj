@@ -12,6 +12,8 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -27,7 +29,7 @@
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.value :as value]))
 
-(declare close! run!)
+(declare close! run! run-ordered-invocation!)
 
 (defrecord LinkedExecutable
            [plan session owns-session? graph-key phases prepared-program allocation-keys node-views
@@ -599,14 +601,16 @@
   (when-not (:execution-state executable)
     (throw (ex-info "linked executable lacks execution state"
                     {:reason :link-execution-state-missing})))
-  (swap! (:execution-state executable) update :value-epoch inc)
+  (swap! (:execution-state executable)
+         #(cond-> (update % :value-epoch inc) (:ordered %) (dissoc :resident-boundary)))
   (reset! (:output-ready? executable) false))
 
 (defn- poison-execution! [executable error]
   ;; Reentrant restoration may already have poisoned this owner. Preserve the first backend
   ;; failure rather than replacing it with an outer already-poisoned wrapper.
   (swap! (:execution-state executable)
-         #(if (:failure %) % (assoc % :failure error)))
+         #(cond-> (if (:failure %) % (assoc % :failure error))
+            (:ordered %) (dissoc :resident-boundary)))
   (reset! (:output-ready? executable) false)
   (throw error))
 
@@ -657,10 +661,14 @@
   "Resolve the concrete resident boundary in one place. An absent plan is not an empty
    successful output set; deferred execution must publish its real boundary before access."
   [executable operation]
-  (when-not (map? (:plan executable))
-    (throw (ex-info "linked executable has no concrete resident boundary"
-                    {:reason :link-runtime-boundary-unavailable :operation operation})))
-  {:plan (:plan executable) :node-views (:node-views executable)})
+  (let [state (some-> (:execution-state executable) deref)
+        boundary (if (:ordered state)
+                   (:resident-boundary state)
+                   {:plan (:plan executable) :node-views (:node-views executable)})]
+    (when-not (map? (:plan boundary))
+      (throw (ex-info "linked executable has no concrete resident boundary"
+                      {:reason :link-runtime-boundary-unavailable :operation operation})))
+    boundary))
 
 (defn- boundary-node-view! [{:keys [node-views]} node-id]
   (or (get node-views node-id)
@@ -760,7 +768,7 @@
    (linked-dispatch executable nil step-selector))
   ([executable instance-selector step-selector]
    (let [executable (ensure-live! executable :linked-dispatch)
-         instance (select-instance (:plan executable) instance-selector)]
+         instance (select-instance (:plan (resident-boundary! executable :linked-dispatch)) instance-selector)]
      (when (or (link-plan/program-link-instance? instance)
                (link-plan/graph-link-instance? instance))
        (throw (ex-info "emitted program/graph instances do not expose one descriptor dispatch"
@@ -844,7 +852,7 @@
    (dispatch-arguments executable nil step-selector descriptor-arguments))
   ([executable instance-selector step-selector descriptor-arguments]
    (let [executable (ensure-live! executable :dispatch-arguments)
-         plan (:plan executable)
+         plan (:plan (resident-boundary! executable :dispatch-arguments))
          instance (select-instance plan instance-selector)
          descriptor (:descriptor instance)
          {:keys [step-index step dispatch] :as selected}
@@ -999,14 +1007,13 @@
   (when (some-> executable :execution-state deref :exclusive-mutation?)
     (throw (ex-info "output leases cannot escape an exclusive mutation scope"
                     {:reason :link-mutation-scope-active})))
-  (when-not (and (:owns-session? executable)
-                 (seq (get-in executable [:plan :outputs]))
-                 (every? #(= :owned (get-in executable [:plan :nodes % :view
-                                                         :allocation :ownership]))
-                         (get-in executable [:plan :outputs])))
-    (throw (ex-info "output leases require owned resident outputs in an owned session"
-                    {:reason :link-output-lease-ownership
-                     :plan (get-in executable [:plan :id])}))))
+  (let [{:keys [plan]} (resident-boundary! executable :output-lease!)]
+    (when-not (and (:owns-session? executable)
+                   (seq (:outputs plan))
+                   (every? #(= :owned (get-in plan [:nodes % :view :allocation :ownership]))
+                           (:outputs plan)))
+      (throw (ex-info "output leases require owned resident outputs in an owned session"
+                      {:reason :link-output-lease-ownership :plan (:id plan)})))))
 
 (defn output-lease!
   "Pin one completed replay's owned resident outputs until the returned Closeable is released.
@@ -1078,9 +1085,11 @@
                         {:reason :link-pending-inputs :plan (get-in executable [:plan :id])
                          :nodes @(:pending-inputs executable)})))
       (execute-once! executable :run!
-                     #(if-let [recorded (:graph-key executable)]
-                        (gpu/replay! (:session executable) recorded)
-                        (parallel-program/run-prepared! (:prepared-program executable))))
+                     #(if (:ordered @(:execution-state executable))
+                        (run-ordered-invocation! executable)
+                        (if-let [recorded (:graph-key executable)]
+                          (gpu/replay! (:session executable) recorded)
+                          (parallel-program/run-prepared! (:prepared-program executable)))))
       (outputs executable))))
 
 (defn run-and-lease!
@@ -1091,9 +1100,200 @@
   (let [executable (ensure-live! executable :run-and-lease!)]
     (locking (:lifetime-lock executable)
       (ensure-live! executable :run-and-lease!)
-      (require-owned-output-boundary! executable)
+      (if-let [ordered (some-> (:execution-state executable) deref :ordered)]
+        (when-not (and (:owns-session? executable) (:leaseable-output? ordered))
+          (throw (ex-info "output leases require owned resident outputs in an owned session"
+                          {:reason :link-output-lease-ownership})))
+        (require-owned-output-boundary! executable))
       (run! executable)
       (output-lease! executable))))
+
+(defn- release-ordered-program! [execution-state position prepared]
+  (parallel-program/release-prepared! prepared)
+  (swap! execution-state update-in [:ordered :prepared] dissoc position))
+
+(defn ^:no-doc instantiate-ordered-invocation!
+  "Internal owned-root vertical for source-ordered invocation execution. No numerical storage
+   or suffix graph is acquired here. Attached sessions and profiling need their own activation
+   tests before this path is exposed by Compiled; the ordinary eager instantiator is unchanged."
+  [compilation arguments opts]
+  (when (or (:session opts) (:profile? opts)
+            (seq (set/difference (set (keys opts)) #{:scalar-math :profile?})))
+    (throw (ex-info "ordered invocation activation currently requires an owned unprofiled session"
+                    {:reason :link-ordered-options})))
+  (let [caller-options (caller-math-options opts)
+        initial (invocation-link/begin-ordered-realization compilation arguments caller-options)
+        _ (doseq [entry (:source-order initial)
+                  :let [step (when-let [id (:invocation-step entry)]
+                               (some #(when (= id (:id %)) %)
+                                     (get-in initial [:materialization :plan :steps])))]]
+            (when (or (:realization entry)
+                      (and step (not (or (invocation/scalar-compute? step)
+                                                        (invocation/shape-projection? step)
+                                                        (and (:storage entry)
+                                                             (invocation/buffer-allocation? step))))))
+              (throw (ex-info "ordered source entry requires an unimplemented realization action"
+                              {:reason :link-ordered-source-action :entry entry}))))
+        execution-state (atom {:value-epoch 0
+                               :ordered {:compilation compilation :arguments (vec arguments)
+                                         :caller-options caller-options
+                                         :leaseable-output?
+                                         (boolean
+                                          (some (fn [id]
+                                                  (or (seq (get-in initial [:program :values id :shape]))
+                                                      (some #(and (not (true? (get-in % [:attributes :host-only])))
+                                                                  (some #{id} (:results %)))
+                                                            (get-in initial [:program :equations]))))
+                                                (get-in initial [:program :outputs])))
+                                         :execution-id (random-uuid) :roots {} :node-views {}
+                                         :prepared {} :ledger (volatile! []) :timings (volatile! {})}})
+        session (gpu/make-session (:target compilation))
+        owner (cleanup/owner
+               [{:id :programs
+                 :release #(doseq [[position prepared] (get-in @execution-state [:ordered :prepared])]
+                             (release-ordered-program! execution-state position prepared))}
+                {:id :session :after #{:programs} :release #(gpu/close-session! session)}])]
+    (cleanup/build!
+     owner
+     #(own-linked-executable
+       (->LinkedExecutable nil session true nil [] nil [] {}
+                           {:source :ordered-invocation :owned-allocations 0}
+                           (atom #{}) (atom #{}) false (atom false) (Object.)
+                           (atom 0) (atom 0) (atom false) execution-state)
+       owner)
+     nil)))
+
+(defn- ordered-require-initialized! [nodes initialized ids]
+  (doseq [id ids]
+    (let [view (get-in nodes [id :view])]
+      (when-not (and view (bview/covered-contiguous? view initialized))
+        (throw (ex-info "ordered stage requires storage that has not completed initialization"
+                        {:reason :link-ordered-uninitialized :node id}))))))
+
+(defn- acquire-ordered-storage! [executable nodes aliases]
+  (let [execution-state (:execution-state executable)
+        {:keys [execution-id ledger timings roots]} (:ordered @execution-state)
+        storage (realize-storage-nodes! nodes aliases (:session executable) execution-id {}
+                                       ledger timings roots)
+        by-id (if (map? nodes) nodes (into {} (map (juxt :id identity)) nodes))]
+    ;; An owner-retained root is reused across invocations, but each current public source must
+    ;; be uploaded once again. Within this invocation acquired nodes carry no stale initializer.
+    (doseq [[id node] by-id
+            :when (and (:source node) (contains? roots (get-in node [:view :allocation :id])))]
+      (gpu/upload-range! (:session executable) (get-in storage [:node-views id]) (:source node)
+                         {:elements (reduce *' 1 (get-in node [:view :shape]))}))
+    (swap! execution-state
+           (fn [state]
+             (-> state
+                 (assoc-in [:ordered :roots] (:roots storage))
+                 (update-in [:ordered :node-views] merge (:node-views storage))
+                 (update-in [:ordered :initialized] into
+                            (keep #(when (:source %) (:view %)) (vals by-id))))))
+    storage))
+
+(defn- run-ordered-stage! [executable ready]
+  (let [execution-state (:execution-state executable)
+        {:keys [execution-id ledger caller-options]} (:ordered @execution-state)
+        plan (:stage-plan ready)
+        storage (acquire-ordered-storage! executable (:nodes plan) (:aliases plan))
+        initialized (get-in @execution-state [:ordered :initialized])
+        _ (ordered-require-initialized! (:nodes plan) initialized
+                                       (get-in ready [:entry-contract :requires]))
+        call (:call ready)
+        position (get-in ready [:state :source-cursor])
+        executor (resident-program-executor plan (:session executable) execution-id
+                                            (:node-views storage) false false ledger)
+        instances [{:id [:source position] :kind :graph
+                    :call {:graph (:graph call) :bindings (:buffers call)
+                           :scalar-values (:scalar-values call)}}]
+        prepared (if (nil? caller-options)
+                   (parallel-program/prepare-sequence-with! instances executor)
+                   (parallel-program/prepare-sequence-with! instances executor caller-options))
+        failure (volatile! nil)]
+    (swap! execution-state assoc-in [:ordered :prepared position] prepared)
+    (try
+      (parallel-program/run-prepared! prepared)
+      (catch Throwable error (vreset! failure error) (throw error))
+      (finally
+        (try (release-ordered-program! execution-state position prepared)
+             (catch Throwable error
+               (if-let [primary @failure]
+                 (when-not (identical? primary error) (.addSuppressed primary error))
+                 (throw error))))))
+    ;; run-prepared! is synchronous. Only now may the source cursor and initialized postcondition
+    ;; advance; having bound a graph or acquired its storage never supplies this evidence.
+    (swap! execution-state update-in [:ordered :initialized] into
+           (map #(get-in plan [:nodes % :view]) (get-in ready [:entry-contract :full-produces])))
+    (-> (:state ready)
+        (dissoc :pending)
+        (update :source-cursor inc)
+        (update :acquired-storage into (keys (allocation-groups plan))))))
+
+(defn- run-ordered-allocation! [executable state]
+  (let [execution-state (:execution-state executable)
+        compilation (get-in @execution-state [:ordered :compilation])
+        request (get-in @execution-state [:ordered :caller-options])
+        prepared (invocation-link/prepare-source-allocation
+                  state (fn [expression scalars]
+                          (scalar/evaluate-array-size (:source-ns compilation)
+                                                       (update-vals scalars :value) expression)) request)
+        storage (acquire-ordered-storage! executable (:nodes prepared) #{})
+        token (:storage prepared)
+        view (get-in storage [:node-views token])]
+    (gpu/zero-buffer! (:session executable) view)
+    (swap! execution-state update-in [:ordered :initialized] conj
+           (:view (first (:nodes prepared))))
+    (-> (:state prepared) (dissoc :pending) (update :source-cursor inc)
+        (update :acquired-storage conj token))))
+
+(defn- finish-ordered-invocation! [executable state]
+  (let [execution-state (:execution-state executable)
+        {:keys [caller-options roots execution-id ledger timings initialized]} (:ordered @execution-state)
+        final (invocation-link/finish-ordered-realization state caller-options)
+        plan (:plan final)
+        groups (allocation-groups plan)]
+    (when-not (set/subset? (set (keys groups)) (:acquired-storage state))
+      (throw (ex-info "final output boundary contains storage not acquired by this invocation"
+                      {:reason :link-ordered-incomplete-storage})))
+    (ordered-require-initialized! (:nodes plan) initialized
+                                 (into (set (:outputs plan))
+                                       (get-in final [:effect-evidence :initialization :requires])))
+    ;; Every root is already ledgered. The ordinary realization helper checks its immutable
+    ;; contract/liveness and creates final logical views, but cannot acquire a missing root here.
+    (when-not (set/subset? (set (keys groups)) (set (keys roots)))
+      (throw (ex-info "completed invocation lost an acquired root"
+                      {:reason :link-ordered-incomplete-storage})))
+    (let [storage (realize-plan-storage! plan (:session executable) execution-id groups {}
+                                        ledger timings roots)]
+      (swap! execution-state assoc :resident-boundary {:plan plan :node-views (:node-views storage)}))))
+
+(defn- run-ordered-invocation! [executable]
+  (let [execution-state (:execution-state executable)
+        {:keys [compilation arguments caller-options prepared]} (:ordered @execution-state)]
+    (when (seq prepared)
+      (throw (ex-info "ordered invocation still owns an unfinished prepared stage"
+                      {:reason :link-ordered-prepared-stage})))
+    (let [initial (invocation-link/begin-ordered-realization compilation arguments caller-options)]
+      (swap! execution-state update :ordered assoc :current initial :initialized [])
+      (loop [state initial]
+        (swap! execution-state assoc-in [:ordered :current] state)
+        (if-let [entry (nth (:source-order state) (:source-cursor state) nil)]
+          (let [equation (when-let [id (:equation entry)]
+                           (some #(when (= id (:id %)) %) (get-in state [:program :equations])))
+                next-state
+                (cond
+                  (:storage entry) (run-ordered-allocation! executable state)
+                  (and equation (not (true? (get-in equation [:attributes :host-only]))))
+                  (run-ordered-stage! executable
+                                      (invocation-link/realize-ready-equation state (:id equation)
+                                                                            caller-options))
+                  (or (:invocation-step entry) equation)
+                  (invocation-link/advance-host-source
+                   state (partial scalar/evaluate-invocation-step (:source-ns compilation))
+                   (partial scalar/evaluate-host-equation (:source-ns compilation)) caller-options)
+                  :else (update state :source-cursor inc))]
+            (recur next-state))
+          (finish-ordered-invocation! executable state))))))
 
 (defn- failed-write!
   "A failed backend transfer can have changed any byte in its destination. Keep every overlapping
@@ -1108,12 +1308,18 @@
     (swap! (:tainted-inputs executable) into affected)
     (throw error)))
 
+(defn- require-static-entry-mutation! [executable operation]
+  (when (some-> (:execution-state executable) deref :ordered)
+    (throw (ex-info "ordered invocation entry replacement must use its public argument boundary"
+                    {:reason :link-ordered-entry-mutation :operation operation}))))
+
 (defn upload!
   "Upload an exact contiguous host value into one live LinkNode view. Returns the executable.
    A runtime transfer failure leaves the destination and overlapping views requiring explicit
    reinitialization. Pure validation errors leave readiness unchanged."
   [executable node-id source]
   (let [executable (ensure-live! executable :upload!)
+        _ (require-static-entry-mutation! executable :upload!)
         node (get-in executable [:plan :nodes node-id])]
     (locking (:lifetime-lock executable)
       (ensure-live! executable :upload!)
@@ -1254,6 +1460,7 @@
    its own source independently; this is not a retained proof or authorization token."
   [executable node-id source]
   (let [executable (ensure-live! executable :validate-write!)]
+    (require-static-entry-mutation! executable :validate-write!)
     (locking (:lifetime-lock executable)
       (ensure-live! executable :validate-write!)
       (ensure-no-output-leases! executable :validate-write!)
@@ -1275,6 +1482,7 @@
    Returns the executable."
   [executable node-id source]
   (let [executable (ensure-live! executable :write!)]
+    (require-static-entry-mutation! executable :write!)
     (locking (:lifetime-lock executable)
       (ensure-live! executable :write!)
       (ensure-no-output-leases! executable :write!)
@@ -1311,6 +1519,9 @@
    without pretending they performed dispatch selection or expanding structured-loop trip counts."
   [executable]
   (let [executable (ensure-live! executable :execution-info)]
+    (when (some-> (:execution-state executable) deref :ordered)
+      (throw (ex-info "ordered invocation stages are not retained as a static bound recording"
+                      {:reason :link-ordered-static-inspection})))
     (cond
       (nil? (:prepared-program executable))
       (mapv (fn [phase]
@@ -1362,6 +1573,9 @@
    hoisted. This report does not attest completion, escape safety, or alias realization."
   [executable]
   (let [executable (ensure-live! executable :execution-order)]
+    (when (some-> (:execution-state executable) deref :ordered)
+      (throw (ex-info "ordered invocation stages are not retained as a static bound recording"
+                      {:reason :link-ordered-static-inspection})))
     (if (and (:prepared-program executable) (nil? (:graph-key executable)))
       (let [order (parallel-program/execution-order
                    (:prepared-program executable)
@@ -1535,7 +1749,7 @@
   "Download one complete contiguous LinkNode view. Debug/host-boundary helper, not invocation."
   [executable node-id]
   (let [executable (ensure-live! executable :download)
-        node (get-in executable [:plan :nodes node-id])
+        node (get-in (resident-boundary! executable :download) [:plan :nodes node-id])
         _ (when-not node (node-view executable node-id))
         n (reduce * 1 (get-in node [:view :shape]))
         dt (get-in node [:view :dtype])
