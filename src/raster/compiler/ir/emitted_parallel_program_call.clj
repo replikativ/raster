@@ -392,6 +392,7 @@
                                                  *validated-boundary-projections*) caller-options))
                              (:equations parallel-program))
         current-buffers (volatile! entry-buffers)
+        prior-device-results (volatile! #{})
         current-scalars (volatile! scalar-values)]
     (doseq [[field value] [[:entry-buffers entry-buffers] [:buffers buffers] [:scalar-values scalar-values]
                            [:loop-scratch loop-scratch] [:outputs outputs]
@@ -422,7 +423,8 @@
             (when-not (= equation (:equation step))
               (fail! :emitted-program-call-step-equation
                      "evaluated host step changed equation identity" {:equation (:id equation)}))
-            (let [dependencies (set/intersection device-results (set (:operands equation)))]
+            (let [dependencies (set/intersection @prior-device-results
+                                                 (set (:operands equation)))]
               (when (seq dependencies)
                 (fail! :emitted-program-host-device-dependency
                        "a host scalar equation cannot be staged before a device result"
@@ -483,7 +485,11 @@
                            "emitted equation bindings differ from its entry environment"
                            {:equation (:id equation) :field field
                             :expected (get expected field) :actual (get step field)}))))
-              (vreset! current-buffers next-buffers))))
+              (vreset! current-buffers next-buffers)))
+          (vswap! prior-device-results into
+                  (device-equation-results equation
+                                           (or constructor-projections
+                                               *validated-boundary-projections*) caller-options)))
 
         (loop-call/structured-loop-call? step)
         (let [operation (first (:operations equation))
@@ -498,7 +504,8 @@
           (if (nil? caller-options)
             (loop-call/validate-in-context! step @current-buffers @current-scalars loop-scratch)
             (loop-call/validate-in-context! step @current-buffers @current-scalars loop-scratch caller-options))
-          (vswap! current-buffers merge (:outputs step)))
+          (vswap! current-buffers merge (:outputs step))
+          (vswap! prior-device-results into (:results equation)))
 
         :else
         (fail! :emitted-program-call-step "emitted program call has an unknown step"

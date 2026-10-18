@@ -8,7 +8,8 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted]
             [raster.compiler.ir.emitted-parallel-program-call :as call]
             [raster.compiler.ir.parallel-program :as program]
-            [raster.compiler.ir.soac-dialect :as soac]))
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.dl.attention :as attention]))
 
 (defn- host-equation [values id operands result expression & [parameters]]
   (let [algorithm (soac/make
@@ -141,3 +142,28 @@
                         #(call/validate-with-retained-program! % extended-proof)]]
         (is (= :emitted-program-host-device-dependency
                (reason #(validate fabricated))))))))
+
+(deftest entry-storage-shape-can-be-read-before-a-later-in-place-write
+  (let [compiled (equation-first/compile #'attention/softmax-rows!
+                                        {:target :ocl:0 :dtype :float})
+        linked (equation-first/lower compiled [(float-array 6) 2 3])
+        original (get-in linked [:instances 0 :call])
+        p (:program original)
+        proof (emitted/validate-with-physical-results! p)
+        projected (fn [step]
+                    (when (call/emitted-equation-call? step)
+                      (let [operation (first (:operations (:equation step)))]
+                        (into (set (:results (:equation step)))
+                              (vals (emitted-equation/physical-results operation))))))
+        witnesses (for [[i step] (map-indexed vector (:steps original))
+                        :when (call/evaluated-host-equation? step)
+                        id (keys (:operands step))
+                        :when (and (not-any? #(contains? (projected %) id)
+                                             (take i (:steps original)))
+                                   (some #(contains? (projected %) id)
+                                         (drop (inc i) (:steps original))))]
+                    id)]
+    (is (seq witnesses) "this control must read storage before its later physical update")
+    (is (= original (call/validate! original)))
+    (is (= original (call/validate-with-retained-program! original proof)))
+    (is (map? (call/preparation-plan original :in-place-entry-shape)))))
