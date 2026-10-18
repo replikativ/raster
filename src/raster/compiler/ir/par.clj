@@ -214,14 +214,18 @@
 (defn expand-par-reduce
   "Expand a (raster.par/reduce acc init idx bound body) form to an int-counted
   loop* S-expression. See expand-par-map! for rationale."
-  [form]
-  (let [[_ acc-sym init-expr i-sym bound-expr body-expr] form
-        n-sym (gensym "n__")]
-    (list 'let* [n-sym (list 'int bound-expr)]
-          (list 'loop* [i-sym '(int 0) acc-sym init-expr]
-                (list 'if (list '< i-sym n-sym)
-                      (list 'recur (list 'clojure.core/unchecked-inc-int i-sym) body-expr)
-                      acc-sym)))))
+  ([form] (expand-par-reduce form (fn [_ node] node)))
+  ([form retain-node]
+   ;; A backend may retain the nodes it actually constructs, without recovering
+   ;; expansion correspondence later by matching equivalent source syntax.
+   (let [[_ acc-sym init-expr i-sym bound-expr body-expr] form
+         n-sym (gensym "n__")
+         recur-node (retain-node :recur
+                                (list 'recur (list 'clojure.core/unchecked-inc-int i-sym) body-expr))
+         loop-node (retain-node :loop
+                               (list 'loop* [i-sym '(int 0) acc-sym init-expr]
+                                     (list 'if (list '< i-sym n-sym) recur-node acc-sym)))]
+     (retain-node :bound-scope (list 'let* [n-sym (list 'int bound-expr)] loop-node)))))
 
 (defn expand-par-scan
   "Expand a (raster.par/scan out acc init idx bound cast body) form to a

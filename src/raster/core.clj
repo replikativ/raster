@@ -376,12 +376,13 @@
    static bytecode production. No numeric body executes here."
   [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym]
   (loop [attempt 0]
-    (let [{owned-body :body invocation-catalog :catalog binding-catalog :binding-catalog}
+    (let [{owned-body :body invocation-catalog :catalog binding-catalog :binding-catalog
+           reduction-catalog :reduction-catalog}
           ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retain-invocation-occurrences) body)
           dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/emission-input-snapshots)
                         body source-ns)
           revision (dispatch/compiler-definition-revision)
-          inputs (atom {:static [] :values []})
+          inputs (atom {:static [] :values [] :reduction-sources reduction-catalog})
           implementation
           (binding [me/*emission-inputs* inputs]
             (emitter (str class-name (gensym "__owned")) params tags return-tag
@@ -391,6 +392,9 @@
                     :invocation-catalog invocation-catalog
                     :binding-catalog binding-catalog :binding-contexts (:binding-contexts @inputs)
                     :floating-conversion-contexts (:floating-conversion-contexts @inputs)
+                    :reduction-catalog reduction-catalog
+                    :reduction-expansions (:reduction-expansions @inputs)
+                    :reduction-contexts (:reduction-contexts @inputs)
                     :body-contexts (:body-contexts @inputs)
                     :invocation-contexts (:invocation-contexts @inputs)
                     :typed-interface typed-interface

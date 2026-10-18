@@ -621,7 +621,7 @@
    catalog is private to the owning emission, not a source/cache identity or
    authority reconstructed by comparing expressions. Quoted values stay opaque."
   [body]
-  (let [catalog (atom {}) scopes (atom {})]
+  (let [catalog (atom {}) scopes (atom {}) reductions (atom {})]
     (letfn [(visit [expression]
               (if (and (seq? expression)
                        (contains? #{'quote 'clojure.core/quote} (first expression)))
@@ -629,9 +629,15 @@
                 (let [node (mex/walk-preserving-meta
                             visit identity
                             (if (instance? clojure.lang.IObj expression)
-                              (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence)
+                              (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence
+                                         ::reduction-occurrence ::reduction-witness ::reduction-role)
                               expression))]
                   (cond
+                    (par/par-reduce-form? node)
+                    (let [token (Object.)
+                          owned (vary-meta node assoc ::reduction-occurrence token)]
+                      (swap! reductions assoc token owned)
+                      owned)
                     (form-ir/binding-form? node)
                     (let [token (Object.)
                           owned (vary-meta node assoc ::binding-scope-occurrence token)]
@@ -644,7 +650,79 @@
                       (swap! catalog assoc token owned)
                       owned)))))]
       (let [owned (with-meta (mapv visit body) {::body-occurrence (Object.)})]
-        {:body owned :catalog @catalog :binding-catalog @scopes}))))
+        {:body owned :catalog @catalog :binding-catalog @scopes :reduction-catalog @reductions}))))
+
+(defn- retain-reduction-observation! [ctx role observation]
+  (when (and me/*emission-inputs* (= role (::reduction-role ctx)))
+    (when-let [witness (::reduction-witness ctx)]
+      (let [key [witness role]
+            record (assoc observation :status :known :witness witness
+                          :expression (::call-expression ctx))]
+        (swap! me/*emission-inputs* update :reduction-contexts
+               (fn [contexts]
+                 (assoc contexts key (if (contains? contexts key)
+                                       {:status :ambiguous} record))))))))
+
+(defn- reduction-label-id! [label]
+  ;; Label implementations may retain the entire mutable CodeBuilder. Retain
+  ;; only an opaque identity in published observations; this request-local
+  ;; registry dies with emission and is never copied into the artifact.
+  (when me/*emission-inputs*
+    (let [^java.util.IdentityHashMap labels
+          (or (:reduction-labels @me/*emission-inputs*)
+              (let [labels (java.util.IdentityHashMap.)]
+                (swap! me/*emission-inputs* assoc :reduction-labels labels)
+                labels))]
+      (or (.get labels label)
+          (let [id (Object.)] (.put labels label id) id)))))
+
+(defn- expand-owned-reduction [form]
+  (let [token (::reduction-occurrence (meta form))
+        source (when me/*emission-inputs* (get-in @me/*emission-inputs* [:reduction-sources token]))]
+    (if-not source
+      (par/expand-par-reduce form)
+      (let [witness (Object.)
+            nodes (atom {})
+            expanded (par/expand-par-reduce
+                      form (fn [role node]
+                             (let [owned (vary-meta node assoc ::reduction-witness witness ::reduction-role role)]
+                               (swap! nodes assoc role owned)
+                               owned)))
+            record {:status :known :source source :source-token token :witness witness
+                    :expanded expanded :nodes @nodes}]
+        (swap! me/*emission-inputs* update :reduction-expansions
+               (fn [expansions]
+                 (assoc expansions token (if (contains? expansions token)
+                                          {:status :ambiguous} record))))
+        expanded))))
+
+(defn ^:no-doc retained-reduction-emission
+  "Collect actual expansion/slot/backedge observations for an ORIGINAL region.
+   This is not permission to reparse source or differentiate arbitrary loops.
+   A consumer still owes count/init/control, read, replay and step proofs."
+  [emission original]
+  (let [token (::reduction-occurrence (meta original))
+        expansion (get (:reduction-expansions emission) token)
+        witness (:witness expansion)
+        contexts (:reduction-contexts emission)
+        bound (get contexts [witness :bound-scope])
+        loop-entry (get contexts [witness :loop])
+        backedge (get contexts [witness :recur])
+        variables (:variables loop-entry)]
+    (when (and (= :jvm-bytecode (:backend emission)) token witness
+               (identical? original (get (:reduction-catalog emission) token))
+               (identical? original (:source expansion))
+               (every? #(= :known (:status %)) [expansion bound loop-entry backedge])
+               (every? #(identical? witness (:witness %)) [bound loop-entry backedge])
+               (= 1 (:binding-count bound))
+               (= :int (get-in bound [:after :type]))
+               (= (:after bound) (get-in loop-entry [:outer-locals (:binder bound)]))
+               (= [(nth original 3) (nth original 1)] variables)
+               (= (mapv #(get (:locals loop-entry) %) variables) (:targets backedge))
+               (some? (:label-id loop-entry))
+               (identical? (:label-id loop-entry) (:label-id backedge)))
+      (me/assert-emission-inputs-current! emission)
+      {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge})))
 
 (defn- retain-binding-context! [ctx binding-count index binder initializer before after]
   (when-let [token (::binding-scope-occurrence ctx)]
@@ -849,8 +927,7 @@
        (list 'dotimes [idx-sym bound-expr] body-expr)))
 
     (par/par-reduce-form? form)
-    (try (par/expand-par-reduce form)
-         (catch Throwable _ form))
+    (expand-owned-reduction form)
 
     ;; Replace (dotimes [i n] body) with int-counted loop*
     (and (seq? form)
@@ -3238,9 +3315,9 @@
                              (catch Exception _)))
                       ;; Binding inits must always produce a value (for the local
                       ;; variable slot), so strip :void-context from ctx.
-                      (let [t (emit-form code init locs
-                                         (assoc (dissoc ctx :void-context :object-result?)
-                                                :preserve-source-call-results? true))
+                      (let [initializer-ctx (assoc (dissoc ctx :void-context :object-result?)
+                                                   :preserve-source-call-results? true)
+                            t (emit-form code init locs initializer-ctx)
                              ;; Handle type hints on let bindings
                              ;; ^objects → checkcast [Ljava/lang/Object;
                              ;; ^doubles → checkcast [D
@@ -3415,6 +3492,10 @@
                                                           :verified (boolean (and tag (not= tag 'Object)))}
                                                          (= :ref t) (assoc :reference-class (or reference-class Object))))]
                             (retain-binding-context! ctx (count pairs) (dec @binding-idx) sym init locs (get new-locs sym))
+                            (retain-reduction-observation! ctx :bound-scope
+                                                           {:binder sym :initializer init :before locs
+                                                            :context (completion/bytecode-operand-context initializer-ctx)
+                                                            :after (get new-locs sym) :binding-count (count pairs)})
                             (when (and (System/getProperty "raster.debug.locals")
                                        (or (.startsWith (str sym) "K_")
                                            (.startsWith (str sym) "V_")
@@ -4271,11 +4352,13 @@
         ;; its Float accumulator made that expression guess Double and silently
         ;; widened otherwise typed Float carries in the lazy-JIT path.
         recur-types (loop-recur-types-in-scope pairs body locals)
+        initializers (when (= :loop (::reduction-role ctx)) (atom []))
         loop-locals (reduce
                      (fn [locs [[sym init] rt]]
-                       (let [t (emit-form code init locs
-                                          (assoc (dissoc ctx :void-context :object-result?)
-                                                 :preserve-source-call-results? true))
+                       (let [initializer-ctx (assoc (dissoc ctx :void-context :object-result?)
+                                                    :preserve-source-call-results? true)
+                             t (emit-form code init locs initializer-ctx)
+                             emitted-type t
                              stamp-t (some->> (:raster.type/tag (meta sym))
                                               (get {'double :double 'float :float
                                                     'long :long 'int :int}))
@@ -4327,9 +4410,19 @@
                              (:int :bool) (.istore code slot)
                              :float  (.fstore code slot)
                              (.astore code slot))
-                           (assoc locs sym {:slot slot :type slot-t}))))
+                           (let [facts {:slot slot :type slot-t}]
+                             (when initializers
+                               (swap! initializers conj {:binder sym :initializer init :before locs
+                                                         :context (completion/bytecode-operand-context initializer-ctx)
+                                                         :input-type emitted-type :completed-type t :after facts}))
+                             (assoc locs sym facts)))))
                      locals (map vector pairs recur-types))
         loop-var-syms (mapv first pairs)]
+    (when initializers
+      (retain-reduction-observation! ctx :loop
+                                     {:outer-locals locals :locals loop-locals :initializers @initializers
+                                      :variables loop-var-syms :label-id (reduction-label-id! loop-label)
+                                      :body (vec body)}))
     (.labelBinding code loop-label)
     (let [ctx (assoc ctx :loop-label loop-label
                      :loop-vars (mapv #(get loop-locals %) loop-var-syms)
@@ -4367,8 +4460,14 @@
                                target (:type loop-var)]
                            (when (not= t target)
                              (emit-coerce code t target))
-                           {:type target}))
+                           {:type target :input-type t :operand arg
+                            :context (completion/bytecode-operand-context (dissoc ctx :object-result?))
+                            :locals locals}))
                        args loop-vars)]
+        (when (= :recur (::reduction-role ctx))
+          (retain-reduction-observation! ctx :recur
+                                         {:label-id (reduction-label-id! loop-label)
+                                          :targets loop-vars :values vals}))
         (doseq [[_ {:keys [slot type]}]
                 (reverse (map vector vals loop-vars))]
           (case type
@@ -4882,6 +4981,8 @@
         ;; This node's occurrence never leaks into an unannotated child.
         ctx (assoc ctx ::call-occurrence (::call-occurrence (meta form))
                        ::binding-scope-occurrence (::binding-scope-occurrence (meta form))
+                       ::reduction-witness (::reduction-witness (meta form))
+                       ::reduction-role (::reduction-role (meta form))
                        ::call-expression form)]
     (cond
       ;; --- Atoms ---

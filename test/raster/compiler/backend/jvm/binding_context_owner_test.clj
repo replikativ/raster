@@ -3,6 +3,7 @@
             [clojure.set :as set]
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as n]
+            [raster.par :as par]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
 (deftm response [a :- Double k :- Double x :- Double] :- Double
@@ -13,6 +14,13 @@
   (let [a (aget theta 0) a (aget theta 1)] (response a a x)))
 (deftm inferred-binding [x :- Double] :- Double
   (let [power (n/* x x)] power))
+(deftm weighted-reduction [xs :- (Array double) coefficient :- Double cnt :- Long] :- Double
+  (let [gain (n/* coefficient coefficient)]
+    (par/reduce acc 0.0 i cnt (n/+ acc (n/* gain (aget xs i))))))
+(deftm float-reduced [xs :- (Array float) cnt :- Long] :- Float
+  (par/reduce acc (float 0.0) i cnt (n/+ acc (aget xs i))))
+(deftm initialized-reduction [xs :- (Array double) events :- (Array long) cnt :- Long] :- Double
+  (par/reduce acc (double (do (aset events 0 (long 1)) (aget xs 0))) i cnt (n/+ acc 1.0)))
 
 (use-fixtures :once (fn [run] (response 0.8 0.7 1.0) (run)))
 
@@ -84,3 +92,48 @@
                (assoc-in emission [:binding-contexts key :binding-count] 2) scope 0)))
     (is (nil? (bytecode/retained-binding-context
                (assoc-in emission [:binding-contexts key :binder] 'different) scope 0)))))
+
+(deftest reduction-observations-retain-the-actual-loop-and-backedge-carriers
+  (let [emission (emitted #'weighted-reduction)
+        source (first (vals (:reduction-catalog emission)))
+        {:keys [expansion bound loop recur] :as observed}
+        (bytecode/retained-reduction-emission emission source)]
+    (is (some? observed))
+    (is (identical? source (:source expansion)))
+    (is (= [:int :double] (mapv #(get-in loop [:locals % :type]) (:variables loop))))
+    (is (= [:int :double] (mapv #(get-in % [:after :type]) (:initializers loop))))
+    (is (= [:int :double] (mapv :type (:values recur))))
+    (is (= {:object-result? false :object-call-result? false
+            :preserve-source-call-results? true :void-context false}
+           (:context bound)))
+    (is (every? #(= (:context bound) (:context %)) (:initializers loop)))
+    (is (identical? (:label-id loop) (:label-id recur)))
+    (is (= (:after bound) (get-in loop [:outer-locals (:binder bound)])))
+    (is (= :ref (get-in loop [:outer-locals 'gain :type])))
+    (is (identical? Object (get-in loop [:outer-locals 'gain :reference-class])))
+    (is (not (contains? emission :reduction-labels)))
+    (is (nil? (bytecode/retained-reduction-emission
+               emission (with-meta (apply list source) (meta source)))))
+    (is (nil? (bytecode/retained-reduction-emission
+               (assoc-in emission [:reduction-contexts [(:witness expansion) :recur] :label-id] (Object.))
+               source)))))
+
+(deftest reduction-observations-do-not-assume-double-carries
+  (let [emission (emitted #'float-reduced)
+        source (first (vals (:reduction-catalog emission)))
+        observed (bytecode/retained-reduction-emission emission source)]
+    (is (some? observed))
+    (is (= [:int :float] (mapv #(get-in observed [:loop :locals % :type])
+                              (get-in observed [:loop :variables]))))))
+
+(deftest observed-reduction-retains-count-before-initializer-order
+  (doseq [cnt [-1 0 2]]
+    (let [events (long-array [0])]
+      (is (= (+ 3.0 (max 0 cnt)) (initialized-reduction (double-array [3.0]) events cnt)))
+      (is (= [1] (vec events)))))
+  (let [events (long-array [0])
+        expected (try (int Long/MAX_VALUE) nil (catch Exception error (class error)))
+        actual (try (initialized-reduction (double-array 0) events Long/MAX_VALUE) nil
+                    (catch Exception error (class error)))]
+    (is (= expected actual))
+    (is (= [0] (vec events)))))
