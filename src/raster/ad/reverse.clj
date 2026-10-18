@@ -6292,10 +6292,12 @@
   (let [body-context ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-body-context) emission)
         retained (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-invocation-context)
         binding-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-binding-context)
+        conversion-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-floating-conversion)
         calls (java.util.IdentityHashMap.)
         state (atom {:bindings [] :helpers [] :activity (zipmap active (repeat true))})
-        fail! #(throw (ex-info "Owned caller needs an attested numerical lexical region"
-                              {:reason :ad-unclosed-bytecode-body-region}))
+        fail! (fn [& [details]]
+                (throw (ex-info "Owned caller needs an attested numerical lexical region"
+                                (merge {:reason :ad-unclosed-bytecode-body-region} details))))
         env (into {} (map (fn [source value]
                            [source {:value value :facts (get-in body-context [:locals source])}])
                          (:params emission) params))]
@@ -6311,7 +6313,8 @@
               (let [context (retained emission expression)
                     {:keys [dispatch? lexical-callee operation implementation-op]} (op/call-description expression)]
                 (when-not (and context dispatch? (nil? lexical-callee)
-                               (contains? #{Float/TYPE Double/TYPE Object} (:return-carrier context))) (fail!))
+                               (contains? #{Float/TYPE Double/TYPE Object} (:return-carrier context)))
+                  (fail! {:phase :call-context :form expression}))
                 (let [inputs
                       (mapv (fn [index input]
                               (check-ports! (:ports input) env)
@@ -6380,6 +6383,27 @@
                                (integer? index) (<= 0 index Integer/MAX_VALUE)) (fail!))
                 (append! result (with-meta (list 'clojure.core/aget (:value source) index)
                                           {:raster.type/tag tag}))))
+            (lower-conversion [expression env]
+              (let [{:keys [operand input-type target-carrier ports context] :as record}
+                    (conversion-context emission expression)
+                    source (first (util/call-args expression))]
+                (check-ports! ports env)
+                ;; This first closed cast domain is a primitive local/literal.
+                ;; For it emit-form and emit-argument-value have the same load
+                ;; and conversion semantics. Arbitrary calls/reference values
+                ;; need their original cast-specific operand context instead.
+                (when-not (and record (= 2 (count expression))
+                               (contains? #{:long :int :float :double} input-type)
+                               (contains? #{Float/TYPE Double/TYPE} target-carrier)
+                               (or (and (symbol? source) (= source operand))
+                                   (and (number? source) (identical? source operand))))
+                  (fail! {:phase :floating-conversion :form expression :input-type input-type}))
+                (let [value (lower source env)
+                      tag (if (identical? Float/TYPE target-carrier) 'float 'double)
+                      result (ad-gensym "body_conversion" tag)]
+                  (append! result (value-completion/complete-value
+                                   (value-completion/bytecode-floating-input-contract target-carrier context)
+                                   value)))))
             (lower-scope [expression env]
               (let [{:keys [sequential? scopes outer]} (form/scope-info expression)
                     {:keys [binders inits body]} (first scopes)]
@@ -6397,6 +6421,7 @@
                                         (cond
                                           (op/aget-call? actual) (lower-read actual current after)
                                           (trivial-expr? initializer) (lower initializer current)
+                                          (conversion-context emission initializer) (lower-conversion initializer current)
                                           :else
                                           (do (when-not (identical? actual (:expression (retained emission initializer))) (fail!))
                                               (lower-call initializer current)))
@@ -6433,6 +6458,7 @@
                 (form/binding-form? expression) (lower-scope expression env)
                 (and (seq? expression) (= 'clojure.core/aget (first expression)))
                 (lower-read expression env nil)
+                (conversion-context emission expression) (lower-conversion expression env)
                 (seq? expression) (lower-call expression env)
                 :else (fail!)))]
       (let [body-result (last (mapv #(lower % env) (:body emission)))

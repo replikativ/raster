@@ -770,6 +770,32 @@
                          (identical? call-token (::call-occurrence (meta actual)))))
             (assoc input :source-original source)))))))
 
+(defn- retain-floating-conversion! [ctx operand input-type target-carrier locals]
+  (when-let [token (::call-occurrence ctx)]
+    (when me/*emission-inputs*
+      (let [free (binding [util/*shadowing-locals* (set (keys locals))] (util/free-syms operand))
+            record {:status :known :expression (::call-expression ctx)
+                    :operand operand :input-type input-type :target-carrier target-carrier
+                    :context (completion/bytecode-operand-context ctx)
+                    :ports (select-keys locals free)}]
+        (swap! me/*emission-inputs* update :floating-conversion-contexts
+               (fn [contexts]
+                 (assoc contexts token (if (contains? contexts token)
+                                         {:status :ambiguous} record))))))))
+
+(defn ^:no-doc retained-floating-conversion
+  "Actual emitted FP conversion of an exact original source occurrence.
+   Consumers separately prove their admitted operand domain; the source name
+   or logical result tag alone cannot establish this evidence."
+  [emission original]
+  (let [token (::call-occurrence (meta original))
+        record (get (:floating-conversion-contexts emission) token)]
+    (when (and (= :jvm-bytecode (:backend emission)) token
+               (identical? original (get (:invocation-catalog emission) token))
+               (= :known (:status record)))
+      (me/assert-emission-inputs-current! emission)
+      record)))
+
 (defn- comparison-form?
   "True if form is a comparison call: (< a b), (>= a b), (== a b), etc."
   [form]
@@ -2410,8 +2436,10 @@
                            (.newarray code java.lang.classfile.TypeKind/FLOAT) :ref)))
     ;; Casts
     "double" (let [t (emit-form code (first args) locals ctx)]
+               (retain-floating-conversion! ctx (first args) t Double/TYPE locals)
                (if (= t :double) t (do (emit-coerce code t :double) :double)))
     "float"  (let [t (emit-form code (first args) locals ctx)]
+               (retain-floating-conversion! ctx (first args) t Float/TYPE locals)
                (if (= t :float) t (do (emit-coerce code t :float) :float)))
     "int"    (let [t (emit-form code (first args) locals ctx)]
                (case t

@@ -390,6 +390,7 @@
                     :params params :tags tags :return-tag return-tag :body owned-body :source-ns source-ns
                     :invocation-catalog invocation-catalog
                     :binding-catalog binding-catalog :binding-contexts (:binding-contexts @inputs)
+                    :floating-conversion-contexts (:floating-conversion-contexts @inputs)
                     :body-contexts (:body-contexts @inputs)
                     :invocation-contexts (:invocation-contexts @inputs)
                     :typed-interface typed-interface

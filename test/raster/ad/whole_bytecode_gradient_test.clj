@@ -42,6 +42,10 @@
 (deftm array-input-factor [theta :- (Array double) exposure :- Double] :- Double
   (let [a (aget theta 0) k (aget theta 1)]
     (n/* 2.0 (response a k (aget theta 2)))))
+(deftm count-input-factor [theta :- (Array double) cnt :- Long] :- Double
+  (let [a (aget theta 0) k (aget theta 1)]
+    (n/* 2.0 (response a k (double cnt)))))
+(deftm explicit-float [x :- Double] :- Float (float x))
 (deftm mismatched-array-alias [xs :- (Array double) x :- Double] :- Double
   (let [^floats unused xs] (n/* x x)))
 
@@ -175,6 +179,32 @@
                emission (with-meta (apply list original) (meta original)) 0)))
     (is (nil? (bytecode/retained-input-source-context emission original -1)))
     (is (nil? (bytecode/retained-input-source-context emission original 3)))))
+
+(deftest explicit-primitive-casts-use-actual-emitted-conversion-evidence
+  (let [p (prepared #'count-input-factor)
+        f (#'reverse/compile-prepared-value+grad p)
+        emission (get-in p [:source-owner :emission])
+        original (first (filter #(bytecode/retained-floating-conversion emission %)
+                                (vals (:invocation-catalog emission))))
+        context (bytecode/retained-floating-conversion emission original)]
+    (is (= :long (:input-type context)))
+    (is (identical? Double/TYPE (:target-carrier context)))
+    (is (nil? (bytecode/retained-floating-conversion
+               emission (with-meta (apply list original) (meta original)))))
+    (doseq [cnt [1 3 19]]
+      (let [[value gradient inactive] (f (double-array [0.8 0.7]) cnt)
+            den (+ 0.7 cnt)]
+        (is (= (count-input-factor (double-array [0.8 0.7]) cnt) value))
+        (is (nil? inactive))
+        (is (< (Math/abs (- (aget gradient 0) (/ (* 2.0 cnt) den))) 1e-12)))))
+  (let [p (prepared #'explicit-float)
+        f (#'reverse/compile-prepared-value+grad p)]
+    (doseq [x [0.1 -0.0 Double/MAX_VALUE Double/NaN]]
+      (let [[value gradient] (f x)]
+        (is (instance? Float value))
+        (is (= (Float/floatToRawIntBits (explicit-float x))
+               (Float/floatToRawIntBits value)))
+        (is (= 1.0 gradient))))))
 
 (deftest producer-renewal-replaces-code-without-revalidating-old-artifacts
   (let [scope (create-ns (gensym "raster.ad.owned-renewal."))]
