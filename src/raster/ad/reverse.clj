@@ -664,6 +664,33 @@
 (defmethod ad-record :alias [_ sym init-expr _activity]
   {:record {:type :alias :sym sym :source init-expr :result-alias init-expr}})
 
+(defn- ordered-active-inputs
+  "Internal region ports in structural visitation order, not evaluation order.
+   Reuse the closed-core scope engine: activity-map iteration and fresh symbol
+   hashes must not choose a numerical region's product layout. Preserve the
+   declaration's metadata. Public parameter/gradient order is unaffected.
+   Alpha-stable visitation applies to ordered code nodes (seqs/vectors), not
+   arbitrary hash-ordered executable maps, sets or IR record fields."
+  [expression activity]
+  (let [declarations (into {} (filter (comp boolean val)) activity)
+        eligible (binding [util/*shadowing-locals*
+                           (into util/*shadowing-locals* (keys declarations))]
+                   (util/free-syms expression))
+        ;; Literal replacements avoid capture-driven alpha-renaming in the
+        ;; shared walker; the leaf returns the original expression unchanged.
+        substitutions (zipmap (keys declarations) (repeat nil))
+        seen (volatile! #{})
+        ordered (volatile! [])]
+    (util/subst-syms
+     substitutions expression
+     (fn [visible symbol]
+       (when (and (contains? visible symbol) (contains? eligible symbol)
+                  (not (contains? @seen symbol)))
+         (vswap! seen conj symbol)
+         (vswap! ordered conj (find declarations symbol)))
+       symbol))
+    (mapv key @ordered)))
+
 (defmethod ad-record :if [_ sym init-expr activity]
   (let [[_ branch then else] init-expr
         then-product (get-in *source-memory-context* [:value-facts then :product])
@@ -679,9 +706,7 @@
       {:record {:type :if :sym sym :branch branch :then then :else else}}
 
       :else
-      (let [free (set/union (util/free-syms then) (util/free-syms else))
-            params (vec (sort-by str (filter #(and (get activity %) (contains? free %))
-                                            (keys activity))))
+      (let [params (ordered-active-inputs (list 'do then else) activity)
             dy (ad-gensym "branch_dy" (:raster.type/tag (meta sym)))
             pieces (mapv (fn [arm]
                            (let [[bindings body] (extract-let-parts (util/alpha-convert arm))]
@@ -748,7 +773,7 @@
           {:sym sym :form-head 'loop})))
 
 (defmethod ad-record :par-map [_ sym init-expr activity]
-  (let [active-set (vec (keys (filter val activity)))
+  (let [active-set (ordered-active-inputs init-expr activity)
         pm-info (assoc (gen-reverse-par-map init-expr active-set) :sym sym)
         tape-sym (:tape-sym pm-info)
         ;; Bind the result sym to the OUTPUT BUFFER (the forward-code populated it),
@@ -766,7 +791,7 @@
                     bs))}))
 
 (defmethod ad-record :par-reduce [_ sym init-expr activity]
-  (let [active-set (vec (keys (filter val activity)))
+  (let [active-set (ordered-active-inputs init-expr activity)
         pr-info (assoc (gen-reverse-par-reduce init-expr active-set) :sym sym)
         reduce-result-sym (:reduce-result-sym pr-info)]
     {:record pr-info
@@ -784,7 +809,7 @@
   ;; no ArrayList, no separate residual stack (Griewank store-the-carry
   ;; checkpointing at every step; zero recompute depth).
   (if (init-active? init-expr activity)
-    (let [active-set (vec (keys (filter val activity)))]
+    (let [active-set (ordered-active-inputs init-expr activity)]
       {:record (assoc (gen-reverse-par-scan init-expr active-set)
                       :sym sym :result-alias (second init-expr))})
     ;; The primal still executes and forward-pass still checks its source
@@ -794,7 +819,7 @@
               :result-alias (second init-expr)}}))
 
 (defmethod ad-record :dotimes [_ sym init-expr activity]
-  (let [active-set (vec (keys (filter val activity)))
+  (let [active-set (ordered-active-inputs init-expr activity)
         dt-info (assoc (gen-reverse-dotimes init-expr active-set) :sym sym)
         tape-sym (:tape-sym dt-info)
         ;; Bind the result sym to the output buffer (populated by forward-code),
