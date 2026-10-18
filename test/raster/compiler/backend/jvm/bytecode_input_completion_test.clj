@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.types :as types]
             [raster.core :as core :refer [deftm]]))
 
 (deftm retained-helper [x :- Double] :- Double x)
@@ -39,6 +40,30 @@
   ;; below retains its own distinct producer context explicitly.
   (completion/bytecode-floating-input-contract
    carrier (completion/bytecode-operand-context {:preserve-source-call-results? true})))
+
+(deftest outlined-compound-input-is-an-actual-bytecode-region-not-object-source
+  (doseq [tags [['double 'double] ['Object 'Object]]]
+    (let [operand (list 'clojure.core// (typed-helper-call #'retained-caller 'numerator)
+                        (typed-helper-call #'retained-caller 'denominator))
+          body (typed-helper-call #'retained-caller operand)
+          interface (types/ensure-fn-interface! tags)
+          {:keys [implementation emission]}
+          (#'core/emit-owned-bytecode!
+           bytecode/compile-typed-impl! "raster.compiled.CompoundRegionOriginal"
+           '[numerator denominator] tags 'double [body]
+           (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+           (:iface-name interface) 'compound-input)
+          original (first (:body emission))
+          region (bytecode/compile-invocation-input-region emission original 0)]
+      (is (= '[numerator denominator] (:parameters region)))
+      (doseq [[n d expected] [[1.0 2.0 0.5] [1.0 0.0 Double/POSITIVE_INFINITY]
+                              [0.0 0.0 Double/NaN] [-0.0 2.0 -0.0]]]
+        (let [original (implementation n d)
+              outlined ((:invoke region) n d)]
+          (is (= (Double/doubleToRawLongBits original) (Double/doubleToRawLongBits outlined)))
+          (if (Double/isNaN expected)
+            (is (Double/isNaN outlined))
+            (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits outlined)))))))))
 
 (deftest contexts-are-captured-from-the-original-input-producer
   (doseq [[return-tag expected] [['Object {:object-result? false :object-call-result? false

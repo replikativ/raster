@@ -3256,7 +3256,7 @@
                             ;; the typed value, but C2 uses them as type proofs for downstream
                             ;; optimizations. Removing them causes 2x regression.
                             ;; Skip IFn__ types — handled by wrapper guard.
-                            _ (when (and tag (= t :ref)
+                            reference-class (when (and tag (= t :ref)
                                          (not (typed-interface? tag)))
                                 (let [src-ns (or (:source-ns ctx) *ns*)
                                       cls (cond
@@ -3285,7 +3285,8 @@
                                   ;; narrower type proof. Keep all real array/record
                                   ;; casts, but do not emit this no-op instruction.
                                   (when (and cls (not= cls Object))
-                                    (.checkcast code (class-desc-of cls)))))
+                                    (.checkcast code (class-desc-of cls))
+                                    cls)))
                             ;; Skip store for void results (effectful calls like Arrays.fill)
                             slot (when-not (#{:void :diverge} t) (alloc-slot! ctx t))]
                         (when slot
@@ -3296,8 +3297,9 @@
                             :float  (.fstore code slot)
                             (.astore code slot)))
                         (if slot
-                          (let [new-locs (assoc locs sym {:slot slot :type t :hint tag
-                                                          :verified (boolean (and tag (not= tag 'Object)))})]
+                          (let [new-locs (assoc locs sym (cond-> {:slot slot :type t :hint tag
+                                                          :verified (boolean (and tag (not= tag 'Object)))}
+                                                         (= :ref t) (assoc :reference-class (or reference-class Object))))]
                             (when (and (System/getProperty "raster.debug.locals")
                                        (or (.startsWith (str sym) "K_")
                                            (.startsWith (str sym) "V_")
@@ -5066,7 +5068,9 @@
   "Map a specialized function param type hint to JVM descriptor info for fn-spec params.
   Returns {:class-desc ClassDesc, :stack-type keyword}"
   [tag]
-  (case tag
+  (if (class? tag)
+    {:class tag :class-desc (class-desc-of tag) :stack-type (class-type->stack tag)}
+    (case tag
     double   {:class-desc D-cd :stack-type :double}
     float    {:class-desc F-cd :stack-type :float}
     long     {:class-desc J-cd :stack-type :long}
@@ -5085,23 +5089,23 @@
     ;; first direct JVM call of a monomorphic Void deftm).
     (void Void) {:class-desc V-cd :stack-type :void}
     boolean  {:class-desc (ClassDesc/ofDescriptor "Z") :stack-type :bool}
-    objects  {:class-desc objarr-cd :stack-type :ref}
-    doubles  {:class-desc dblarr-cd :stack-type :ref}
-    floats   {:class-desc fltarr-cd :stack-type :ref}
-    longs    {:class-desc (ClassDesc/ofDescriptor "[J") :stack-type :ref}
-    ints     {:class-desc (ClassDesc/ofDescriptor "[I") :stack-type :ref}
-    bytes    {:class-desc (ClassDesc/ofDescriptor "[B") :stack-type :ref}
-    shorts   {:class-desc (ClassDesc/ofDescriptor "[S") :stack-type :ref}
-    chars    {:class-desc (ClassDesc/ofDescriptor "[C") :stack-type :ref}
-    booleans {:class-desc (ClassDesc/ofDescriptor "[Z") :stack-type :ref}
-    Number   {:class-desc obj-cd :stack-type :ref}
-    Object   {:class-desc obj-cd :stack-type :ref}
+    objects  {:class (Class/forName "[Ljava.lang.Object;") :class-desc objarr-cd :stack-type :ref}
+    doubles  {:class (Class/forName "[D") :class-desc dblarr-cd :stack-type :ref}
+    floats   {:class (Class/forName "[F") :class-desc fltarr-cd :stack-type :ref}
+    longs    {:class (Class/forName "[J") :class-desc (ClassDesc/ofDescriptor "[J") :stack-type :ref}
+    ints     {:class (Class/forName "[I") :class-desc (ClassDesc/ofDescriptor "[I") :stack-type :ref}
+    bytes    {:class (Class/forName "[B") :class-desc (ClassDesc/ofDescriptor "[B") :stack-type :ref}
+    shorts   {:class (Class/forName "[S") :class-desc (ClassDesc/ofDescriptor "[S") :stack-type :ref}
+    chars    {:class (Class/forName "[C") :class-desc (ClassDesc/ofDescriptor "[C") :stack-type :ref}
+    booleans {:class (Class/forName "[Z") :class-desc (ClassDesc/ofDescriptor "[Z") :stack-type :ref}
+    Number   {:class Object :class-desc obj-cd :stack-type :ref}
+    Object   {:class Object :class-desc obj-cd :stack-type :ref}
     ;; Default: try to resolve class (handles IFn__ interfaces, defvalue types, etc.)
     (let [tag-str (str tag)]
       (if-let [cls (when (pos? (count tag-str))
                      (try (Class/forName tag-str) (catch Exception _ nil)))]
-        {:class-desc (class-desc-of cls) :stack-type :ref}
-        {:class-desc obj-cd :stack-type :ref}))))
+        {:class cls :class-desc (class-desc-of cls) :stack-type :ref}
+        {:class Object :class-desc obj-cd :stack-type :ref})))))
 
 ;; ================================================================
 ;; compile-specialized-class!
@@ -5163,6 +5167,8 @@
                                 :method-type mt
                                 :params method-params
                                 :param-descs param-descs
+                                :param-reference-classes
+                                (mapv #(when (= :ref (:stack-type %)) (:class %)) param-jvm-infos)
                                 :param-stack-types param-stack-types
                                 :return-stack-type ret-st}))
                            fn-specs)
@@ -5216,9 +5222,10 @@
                             (.with cb ^java.lang.classfile.ClassElement
                                    (SourceFileAttribute/of (str source-file))))
                     ;; Emit fn-spec methods (with typed params)
-                          (doseq [[{:keys [method-name method-type params param-descs param-stack-types
+                          (doseq [[{:keys [method-name method-type params param-descs param-stack-types param-reference-classes
                                            return-stack-type]}
-                                   {:keys [walked-body element-type source-ns]}]
+                                   {:keys [walked-body element-type source-ns]
+                                    input-port-layout ::input-port-layout}]
                                   (map vector method-specs fn-specs)]
                             (.withMethodBody cb method-name method-type
                                              (int 0x0009)  ;; PUBLIC + STATIC
@@ -5243,11 +5250,11 @@
                                                                (fn [locs [idx p]]
                                                                  (let [{:keys [slot stack-type]} (nth slot-assignments idx)]
                                                                    (if (symbol? p)
-                                                                     (let [tag (:tag (meta p))]
+                                                                     (let [tag (:tag (meta p))
                                                                        ;; Checkcast ref params with known types at entry.
                                                                        ;; Skip IFn__ types — the .invk handler has its own
                                                                        ;; instanceof guard for typed/untyped callers.
-                                                                       (when (and (= stack-type :ref) tag
+                                                                           checked-reference (when (and (= stack-type :ref) tag
                                                                                   (not (contains? #{'Object 'doubles 'floats
                                                                                                     'longs 'ints 'objects} tag))
                                                                                   (not (typed-interface? tag)))
@@ -5260,9 +5267,11 @@
                                                                            (when cls
                                                                              (.aload code slot)
                                                                              (.checkcast code (class-desc-of cls))
-                                                                             (.astore code slot))))
+                                                                             (.astore code slot)
+                                                                             cls)))]
                                                                        (assoc locs p {:slot slot :type stack-type
                                                                                       :hint (when (= stack-type :ref) tag)
+                                                                                      :reference-class (or checked-reference (nth param-reference-classes idx))
                                                                                       ;; Verified only for non-Object, non-IFn__ ref types
                                                                                       ;; (Object needs checkcast to array type for aget)
                                                                                       :verified (boolean (and (= stack-type :ref) tag
@@ -5286,6 +5295,31 @@
                                                                       locs
                                                                       (map-indexed vector p)))))
                                                                {} (map-indexed vector params))
+                                                       ;; An outlined original input has a physical ABI
+                                                       ;; distinct from its logical tangent declarations.
+                                                       ;; Rebase slots; never reuse the parent's slot numbers
+                                                       ;; or turn an Object port into a primitive by its hint.
+                                                       locals
+                                                       (if-not input-port-layout locals
+                                                         (let [reference-classes (zipmap params param-reference-classes)]
+                                                           (when-not (= (set params) (set (keys input-port-layout)))
+                                                             (throw (ex-info "Outlined input has an open lexical ABI"
+                                                                             {:reason :open-bytecode-input-ports})))
+                                                           (reduce-kv
+                                                            (fn [result parameter original]
+                                                              (when-not (= (:type original) (get-in result [parameter :type]))
+                                                                (throw (ex-info "Outlined input changed a physical port"
+                                                                                {:reason :bytecode-input-port-carrier
+                                                                                 :parameter parameter})))
+                                                              (when (and (= :ref (:type original))
+                                                                         (not (identical? (or (:reference-class original) Object)
+                                                                                          (get reference-classes parameter))))
+                                                                (throw (ex-info "Outlined input changed a verifier reference carrier"
+                                                                                {:reason :bytecode-input-reference-carrier
+                                                                                 :parameter parameter})))
+                                                              (update result parameter merge
+                                                                      (select-keys original [:hint :verified :reference-class])))
+                                                            locals input-port-layout)))
                                                        ctx {:class-desc       class-desc
                                                             :literal-owner literal-owner
                                                             :object-result? (= :ref return-stack-type)
@@ -5372,6 +5406,7 @@
                                                                          (.astore code slot))))
                                                                    (assoc locs p {:slot slot :type st
                                                                                   :hint (when (= st :ref) tag)
+                                                                                  :reference-class (when (= st :ref) (:class info))
                                                                                   :verified (boolean (and (= st :ref) tag
                                                                                                           (not= tag 'Object)
                                                                                                           (not (typed-interface? tag))))})))
@@ -5466,6 +5501,85 @@
      :method-type mt
      :return-stack-type (:stack-type ret-jvm)
      :bytes (:bytes result)}))
+
+(defn ^:no-doc compile-invocation-input-region
+  "Outline one ORIGINAL completed floating input using its owning emitter.
+
+   This is an owner-private numerical region, not a portable source projection.
+   The caller separately proves selected-parent implementation correspondence
+   and supplies the original lexical values in :parameters order. Physical
+   primitive ports must already be completed values; Object ports stay Object
+   even if their logical declaration is Double. Original stack slots are NOT
+   transferable identities. The retained transparent :spec is for composition
+   through this same bytecode compiler, never Clojure eval or another backend.
+
+   Compilation and execution fence historical dependencies. No AD rule or
+   permission to flatten this region is established by outlining it."
+  [emission original input-index]
+  (let [record (retained-invocation-context emission original)
+        input (when (and record (integer? input-index)
+                         (<= 0 input-index) (< input-index (count (:inputs record))))
+                (nth (:inputs record) input-index))]
+    (when-not input
+      (throw (ex-info "Input outlining requires an original owned invocation occurrence"
+                      {:reason :unowned-bytecode-input-region :input-index input-index})))
+    (let [^java.lang.reflect.Method method (:method record)
+          carrier (nth (vec (.getParameterTypes method)) input-index)
+          contract (completion/bytecode-floating-input-contract carrier (:context input))
+          ports (:ports input)
+          parameters (mapv key (sort-by (comp :slot val) ports))
+          physical-parameters
+          (mapv (fn [parameter]
+                  (let [tag (case (get-in ports [parameter :type])
+                              :double 'double :float 'float :long 'long
+                              :int 'int :bool 'boolean
+                              :ref (or (get-in ports [parameter :reference-class])
+                                       (when-not (get-in ports [parameter :verified]) Object)
+                                       (throw (ex-info "Input region lacks its original verifier carrier"
+                                                       {:reason :bytecode-input-reference-carrier
+                                                        :parameter parameter})))
+                              (throw (ex-info "Input region has an unsupported physical port"
+                                              {:reason :bytecode-input-port-carrier
+                                               :parameter parameter})))]
+                    (with-meta parameter (assoc (meta parameter) :tag tag)))) parameters)
+          spec {:name 'input :params physical-parameters
+                :return-tag (if (= carrier Double/TYPE) 'double 'float)
+                :walked-body [(completion/complete-value contract (:operand input))]
+                :source-ns (:source-ns emission) :element-type (:element-type record)
+                ::input-port-layout ports}
+          guard (fn []
+                  (when-not (identical? record (retained-invocation-context emission original))
+                    (throw (ex-info "Input region lost its owning invocation"
+                                    {:reason :unowned-bytecode-input-region}))))
+          _ (guard)
+          result (binding [me/*compilation-classloader*
+                           (.getClassLoader (class (:implementation emission)))]
+                   (compile-specialized-class! "raster.compiled.InvocationInput" [spec]))
+          compiled-method (get-in result [:methods 'input])
+          actual-classes (vec (.getParameterTypes ^java.lang.reflect.Method compiled-method))
+          _ (when-not (and (= (count parameters) (count actual-classes))
+                           (every? true?
+                                   (map (fn [parameter ^Class actual]
+                                          (let [port (get ports parameter)]
+                                            (and (= (:type port) (class-type->stack actual))
+                                                 (or (not= :ref (:type port))
+                                                     (identical? (or (:reference-class port) Object) actual)))))
+                                        parameters actual-classes))
+                           (identical? carrier (.getReturnType ^java.lang.reflect.Method compiled-method)))
+              (throw (ex-info "Outlined input resolved a different runtime ABI"
+                              {:reason :bytecode-input-method-carrier})))
+          _ (guard)]
+      {:kind :owned-bytecode-input-region :parameters parameters :physical-ports ports
+       :input input :input-contract contract :spec spec :method compiled-method
+       :guard guard
+       :invoke (fn [& arguments]
+                 (guard)
+                 (let [value (try
+                               (.invoke ^java.lang.reflect.Method compiled-method nil (object-array arguments))
+                               (catch java.lang.reflect.InvocationTargetException e
+                                 (throw (.getCause e))))]
+                   (guard)
+                   value))})))
 
 (def ^:dynamic *compiling-deftms*
   "Set of deftm var symbols currently being compiled, for cycle detection."

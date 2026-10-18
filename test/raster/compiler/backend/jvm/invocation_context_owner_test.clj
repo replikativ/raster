@@ -1,9 +1,10 @@
 (ns raster.compiler.backend.jvm.invocation-context-owner-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [clojure.set :as set]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as entry]
             [raster.core :as core :refer [deftm]]
+            [raster.arrays :as arrays]
             [raster.numeric :as n]))
 
 (deftm scalar-helper [x :- Double] :- Double (n/* x x))
@@ -14,6 +15,21 @@
         x (n/+ x 1.0)
         right (scalar-helper x)]
     (n/+ left right)))
+(deftm float-helper [x :- Float] :- Float x)
+(deftm narrowing-call [x :- Double] :- Double (float-helper (float x)))
+(deftm array-input [xs :- (Array double) index :- Long] :- Double
+  (scalar-helper (arrays/aget xs index)))
+(deftm let-array-input [xs :- (Array double) index :- Long] :- Double
+  (let [copy xs] (scalar-helper (arrays/aget copy index))))
+
+(use-fixtures :once
+  (fn [run]
+    ;; Materialize shared numerical helper dependencies before capturing caller
+    ;; emissions. A later unrelated lazy JIT is a real historical invalidation,
+    ;; not permission to refresh an already captured owner's certificate.
+    (scalar-helper 1.0)
+    (n/+ 1.0 1.0)
+    (run)))
 
 (defn- receiver [v]
   (let [source (core/resolve-deftm-var v)]
@@ -58,6 +74,70 @@
     ;; is Object-carried, whereas the original parameter is primitive.
     (is (= {:double 1 :ref 1} (frequencies (map :type ports))))
     (is (= 2 (count (set (map :slot ports)))))))
+
+(deftest outlined-inputs-preserve-the-original-physical-lexical-abi
+  (let [emitted (emission #'shadowed-calls)]
+    (doseq [call (helper-occurrences emitted)]
+      (let [region (bytecode/compile-invocation-input-region emitted call 0)
+            original-port (first (vals (:physical-ports region)))
+            parameter-class (first (.getParameterTypes ^java.lang.reflect.Method (:method region)))
+            run (:invoke region)]
+        (is (= (if (= :double (:type original-port)) Double/TYPE Object) parameter-class))
+        (is (= (:physical-ports region) (get-in region [:spec ::bytecode/input-port-layout])))
+        (doseq [value [1.5 -0.0 Double/POSITIVE_INFINITY Double/NaN]]
+          (is (= (Double/doubleToRawLongBits value)
+                 (Double/doubleToRawLongBits (run value)))))
+        (when (= :ref (:type original-port))
+          (is (thrown? NullPointerException (run nil)))
+          (is (thrown? ClassCastException (run "not a number"))))))))
+
+(deftest outlined-float-input-keeps-narrowing-and-original-operand
+  (let [emitted (emission #'narrowing-call)
+        call (first (filter #(= 'raster.compiler.backend.jvm.invocation-context-owner-test/float-helper
+                                (:raster.op/original (meta %)))
+                            (vals (:invocation-catalog emitted))))
+        region (bytecode/compile-invocation-input-region emitted call 0)
+        record (bytecode/retained-invocation-context emitted call)]
+    (is (identical? (get-in record [:inputs 0 :operand])
+                    (get-in region [:input :operand])))
+    (is (= Float/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+    (doseq [value [0.1 -0.0 Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NaN]]
+      (is (= (Double/doubleToRawLongBits (narrowing-call value))
+             (Double/doubleToRawLongBits (double ((:invoke region) value))))))))
+
+(deftest outlining-refuses-copied-occurrences-and-stale-dependencies
+  (let [emitted (emission #'duplicate-calls)
+        call (first (helper-occurrences emitted))
+        region (bytecode/compile-invocation-input-region emitted call 0)]
+    (doseq [[node index] [[(with-meta (apply list call) (meta call)) 0]
+                         [call -1] [call 1]]]
+      (is (= :unowned-bytecode-input-region
+             (try (bytecode/compile-invocation-input-region emitted node index)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (with-redefs-fn {(:var (first (:dependency-snapshots emitted))) (fn [& _] :stale)}
+      #(is (thrown? clojure.lang.ExceptionInfo ((:invoke region) 2.0))))
+    (is (= 2.0 ((:invoke region) 2.0)))))
+
+(deftest outlined-array-input-restores-an-actual-verifier-carrier
+  (doseq [v [#'array-input #'let-array-input]]
+    (let [emitted (emission v)
+          call (first (helper-occurrences emitted))
+          region (bytecode/compile-invocation-input-region emitted call 0)
+          classes (vec (.getParameterTypes ^java.lang.reflect.Method (:method region)))
+          array-port (first (keep (fn [[id port]]
+                                    (when (= :ref (:type port)) id)) (:physical-ports region)))
+          args (fn [xs i] (mapv #(if (= array-port %) xs i) (:parameters region)))]
+      (is (some #{(class (double-array 0))} classes))
+      (is (= (class (double-array 0)) (get-in region [:physical-ports array-port :reference-class])))
+      (is (= 7.5 (apply (:invoke region) (args (double-array [2.0 7.5]) 1))))
+      (is (thrown? NullPointerException (apply (:invoke region) (args nil 0))))
+      (is (thrown? ArrayIndexOutOfBoundsException
+                   (apply (:invoke region) (args (double-array 0) 0))))
+      (let [weakened (update (:spec region) :params
+                             #(mapv (fn [p] (if (= p array-port) (vary-meta p assoc :tag 'Object) p)) %))]
+        (is (= :bytecode-input-reference-carrier
+               (try (bytecode/compile-specialized-class! "raster.compiled.WeakenedInput" [weakened])
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
 
 (deftest annotations-are-private-fresh-and-quote-opaque
   (let [quoted '(quote (scalar-helper x))
