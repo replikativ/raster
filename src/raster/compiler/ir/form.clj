@@ -695,6 +695,51 @@
   [form]
   (contains? #{:invk :call} (:kind (form-info form))))
 
+(defn normal-exit-region?
+  "Whether map-normal-exits knows the enclosing result-region grammar. This
+   says nothing about the effects or AD support of its leaves."
+  [expression]
+  (boolean (and (seq? expression)
+                (let [head (first expression)]
+                  (or (let-head? head) (loop-head? head)
+                      (= 'do head) (= 'if head))))))
+
+(defn map-normal-exits
+  "Apply `f` to the original value expressions at normal exits of a result
+   region. Enter only let/loop bodies, do tails and if arms. Initializers,
+   predicates, preceding effects and recur/throw operands retain their exact
+   evaluation contexts. Other expressions are opaque leaves: this is not a
+   generic walk, an effect proof or permission to enter a function body.
+
+   The callback owns whether a leaf has a supported interpretation. In
+   particular try/finally and other unhandled regions are passed whole to it,
+   never silently treated as one of the supported scopes."
+  [f expression]
+  (letfn [(body-exit [body]
+            (if (seq body)
+              (conj (vec (butlast body)) (visit (last body)))
+              [(visit nil)]))
+          (visit [e]
+            (if-not (seq? e)
+              (f e)
+              (let [head (first e)]
+                (cond
+                  (or (let-head? head) (loop-head? head))
+                  (let [{:keys [scopes outer rebuild]} (scope-info e)]
+                    (rebuild (mapv #(update % :body body-exit) scopes) outer))
+
+                  (= 'do head)
+                  (with-meta (cons head (body-exit (rest e))) (meta e))
+
+                  (= 'if head)
+                  (with-meta (list head (second e)
+                                   (visit (nth e 2 nil))
+                                   (visit (nth e 3 nil))) (meta e))
+
+                  (contains? #{'recur 'throw} head) e
+                  :else (f e)))))]
+    (visit expression)))
+
 (defn normal-exit-facts
   "Positive enclosing return symbols and whether other exits are unknown.
    Keep partial evidence through joins: an unknown arm cannot erase a known

@@ -12,6 +12,8 @@
     (pure-sexp? '(Math/sin x))    ;; -> true
     (validate-for-ad! body params) ;; warns on impure ops in active flow"
   (:require [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.types :as types]))
 
 (defn init-raster-registry!
@@ -41,6 +43,21 @@
   "Check if a var is pure according to beichte."
   [v]
   (= :pure (effects/analyze-var-effect v)))
+
+(defn pure-object-result-region?
+  "Positive external-purity check for a result region with Object completion.
+   Object completion adds no external writes; inspect its ORIGINAL operand for
+   this analysis only. Never execute or optimize using the analysis projection.
+   Primitive/checkcast/malformed contexts stay opaque and conservatively fail
+   unless the existing effect authority can prove them independently."
+  [expression]
+  (true?
+   (pure-sexp?
+    (util/postwalk-preserving-meta
+     (fn [node]
+       (let [{:keys [contract operand]} (completion/canonical-parts node)]
+         (if (= completion/object-input-contract contract) operand node)))
+     expression))))
 
 ;; ================================================================
 ;; Symbol-level purity check (for walked S-expressions)

@@ -74,14 +74,14 @@
       (is (= [3.0 2.0] (prepared 3.0 events)))
       (is (= [:later] @events)))))
 
-(deftest object-completion-does-not-lift-a-compound-operand
+(deftest object-completion-distributes-before-normalizing-original-exits
   (let [expression (completion/complete-value completion/object-input-contract
                                               '(do (swap! events conj :operand) x))
         [bindings normalized] (anf/anf-normalize-expr expression gensym)
         f (source-function '[x events] (list 'let* bindings normalized))
         input (Object.) events (atom [])]
-    (is (= [] bindings))
-    (is (identical? expression normalized))
+    (is (= 2 (count bindings)))
+    (is (= (completion/complete-value completion/object-input-contract 'x) normalized))
     (is (identical? input (f input events)))
     (is (= [:operand] @events))))
 

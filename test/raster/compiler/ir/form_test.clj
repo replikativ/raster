@@ -6,6 +6,68 @@
 ;; form-info classification
 ;; ================================================================
 
+(deftest mapping-normal-exits-preserves-input-and-control-contexts
+  (let [init '(source-init x)
+        predicate '(source-test x)
+        effect '(source-effect x)
+        recurrence '(recur (next-value x))
+        thrown '(throw (source-error x))
+        expression (with-meta
+                     (list 'let* ['x init]
+                           effect
+                           (list 'loop* ['carry 'x]
+                                 (list 'if predicate recurrence
+                                       (list 'do effect (list 'if 'fail thrown 'carry)))))
+                     {:line 71 :raster.type/tag 'double})
+        seen (atom [])
+        mapped (form/map-normal-exits
+                (fn [leaf] (swap! seen conj leaf) (list 'completed leaf)) expression)]
+    (is (= ['carry] @seen))
+    (is (= '(let* [x (source-init x)]
+              (source-effect x)
+              (loop* [carry x]
+                (if (source-test x) (recur (next-value x))
+                    (do (source-effect x)
+                        (if fail (throw (source-error x)) (completed carry)))))) mapped))
+    (is (= (meta expression) (meta mapped)))
+    (is (identical? init (get-in (vec mapped) [1 1])))
+    (let [mapped-loop (nth mapped 3)
+          mapped-if (nth mapped-loop 2)]
+      (is (identical? predicate (second mapped-if)))
+      (is (identical? recurrence (nth mapped-if 2))))))
+
+(deftest normal-exit-mapping-is-not-a-general-scope-or-argument-walk
+  (doseq [leaf '[(f (g x)) (quote (if p x y)) [x (f y)]
+                 (fn* [x] (if p x y))
+                 (try (f x) (finally (cleanup)))
+                 (dotimes [i n] (f i))]]
+    (let [seen (atom [])]
+      (is (= (list 'completed leaf)
+             (form/map-normal-exits #(do (swap! seen conj %) (list 'completed %)) leaf)))
+      (is (= [leaf] @seen))
+      (is (identical? leaf (first @seen)))))
+  (is (= '(if predicate (completed yes) (completed nil))
+         (form/map-normal-exits #(list 'completed %) '(if predicate yes))))
+  (is (= '(do (completed nil))
+         (form/map-normal-exits #(list 'completed %) '(do))))
+  (doseq [head (concat form/let-heads form/loop-heads)]
+    (is (= (list head ['x 'init] '(completed x))
+           (form/map-normal-exits #(list 'completed %) (list head ['x 'init] 'x))))))
+
+(deftest normal-exit-mapping-retains-zero-trip-and-selected-effect-order
+  (doseq [n [0 1 3] flag [false true]]
+    (let [events (atom [])
+          expression `(let* [~'events ~'events]
+                        (loop* [~'i 0]
+                          (if (< ~'i ~n)
+                            (do (swap! ~'events conj ~'i) (recur (inc ~'i)))
+                            (if ~flag :yes :no))))
+          mapped (form/map-normal-exits
+                   #(list 'do '(swap! events conj :exit) %) expression)
+          run (eval (list 'fn ['events] mapped))]
+      (is (= (if flag :yes :no) (run events)))
+      (is (= (conj (vec (range n)) :exit) @events)))))
+
 (deftest normal-exit-alternatives-are-not-exact-identity
   (is (= '#{xs ys} (form/normal-exit-symbols '(if flag xs ys))))
   (is (nil? (form/tail-symbol '(if flag xs ys))))

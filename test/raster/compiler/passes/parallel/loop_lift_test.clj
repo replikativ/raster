@@ -2,8 +2,24 @@
   (:require [clojure.test :refer [deftest testing is]]
             [raster.par :as par]
             [raster.compiler.ir.par :as ir.par]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]))
+
+(deftest lifting-does-not-substitute-a-new-producer-into-a-source-context
+  (let [a (with-meta 'acc {:raster.type/tag 'double})
+        update (with-meta (list 'raster.numeric/+ a 'x) {:raster.type/tag 'double})
+        source (fn [exit]
+                 (list 'loop* ['i 0 a 0.0]
+                       (list 'if '(< i n) (list 'recur '(inc i) update) exit)))]
+    (is (= 1 (get-in (loop-lift/lift-parallel-forms (source a)) [:stats :reduces-detected])))
+    (doseq [exit [(completion/complete-value completion/object-input-contract a)
+                  (list 'if 'p (completion/complete-value completion/object-input-contract a) a)
+                  (completion/complete-value
+                   (completion/primitive-input-contract Float/TYPE {:unchecked-math false}) a)]]
+      (let [original (source exit) lifted (loop-lift/lift-parallel-forms original)]
+        (is (= original (:form lifted)))
+        (is (zero? (get-in lifted [:stats :reduces-detected])))))))
 
 (deftest reduction-accumulator-casts-use-canonical-identity
   (doseq [expression ['s '(double s) '(clojure.core/double s)]]
