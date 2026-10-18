@@ -423,6 +423,50 @@
       (is (= [value value] (get-in multiply [:expression :arguments])))
       (is (= :float (get-in multiply [:result :type]))))))
 
+(deftest retained-lexical-conditional-join-preserves-branch-arithmetic-width
+  (let [env {'selected :predicate 'x :float 'y :double}
+        lower (:lower
+               (scalar/make-lowerer
+                {:arrays #{} :array-types {} :scalar-types env
+                 :lower-index (fn [expression _] expression)
+                 :require-source-types? true :conversion-policy conversion/policy
+                 :decline! (fn [rule message data]
+                             (throw (ex-info message (assoc data :rule rule))))}))
+        joined (with-meta 'joined {:raster.type/tag 'double})
+        choice '(if selected (clojure.core/+ x (clojure.core/float 1.0)) y)
+        expression (list 'let* [joined choice] joined)
+        lowered (lower expression :double env)
+        branch (last (:operations lowered))
+        operations (:then-operations branch)
+        addition (first (filter #(= :+ (get-in % [:expression :op])) operations))
+        widening (last (filter #(= :cast (get-in % [:expression :op])) operations))]
+    (is (instance? raster.compiler.ir.kernel_body.IfRegion branch))
+    (is (= :float (get-in addition [:result :type]))
+        "16777216f + 1f must round before the Double join")
+    (is (= :double (get-in widening [:result :type])))
+    (is (= [(get-in addition [:result :id])]
+           (get-in widening [:expression :arguments])))
+    (is (= {:rounding :exact :overflow :exact}
+           (get-in widening [:expression :options])))
+    (is (= :double (:type lowered)))
+    (let [predicate (with-meta 'predicate {:raster.type/tag 'boolean})]
+      (is (= :predicate
+             (:type (lower (list 'let* [predicate '(if selected true false)] predicate)
+                           :predicate env)))
+          "an already-typed predicate join stays on the existing path"))
+    (is (= :scalar-source-type
+           (try (lower (list 'let* [joined '(if selected selected y)] joined) :double env)
+                nil
+                (catch clojure.lang.ExceptionInfo exception (:rule (ex-data exception)))))
+        "predicate/numeric alternatives decline before requesting a numeric conversion policy")
+    (doseq [[expression expected] [[choice :double]
+                                 [(list 'let* ['joined choice] 'joined) :double]
+                                 [(list 'let* [joined '(if selected x unknown)] joined) :double]
+                                 [(list 'let* [(with-meta 'joined {:raster.type/tag 'float})
+                                              '(if selected x y)] 'joined) :float]]]
+      (is (thrown? clojure.lang.ExceptionInfo (lower expression expected env))
+          "consumer hints, missing branch types and implicit narrowing cannot prove a join"))))
+
 (deftest reduction-element-conversions-retain-their-stricter-admission
   (let [local (with-meta 'local {:raster.type/tag 'float})
         result (segred/lower-element-operations
