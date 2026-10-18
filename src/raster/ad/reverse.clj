@@ -3449,7 +3449,7 @@
    layer does not rerun source read/carry analysis. Scalar differentiation
    still uses the common binding engine."
   [{:keys [acc-sym init-expr idx-sym bound-expr body-expr
-           agets scalar-bindings body-result free-syms typed-double? replay-values]}
+           agets scalar-bindings body-result free-syms typed-double? replay-values step-program]}
    active-params]
   (let [;; Read arrays (via aget in body)
         read-arrs (vec (distinct (map :arr agets)))
@@ -3480,6 +3480,15 @@
         aget-syms (mapv :sym agets)
         ;; Include acc-sym as an active input (its adjoint chains through iterations)
         iter-active (vec (distinct (concat [acc-sym] aget-syms active-free)))
+        ;; Prepared pieces preserve their own source evaluation order. Initially
+        ;; consume them only through saved pullbacks, NEVER carry replay: the
+        ;; latter additionally requires complete primal read/effect closure.
+        _ (when (and step-program
+                     (not (and (not typed-double?) (empty? agets)
+                               (= iter-active (:active-inputs step-program))
+                               (= #{} (:writes step-program)))))
+            (throw (ex-info "Prepared ordered step requires saved pullbacks and exact tangent ports"
+                            {:reason :ad-prepared-reduction-step-ports})))
 
         ;; Scalar bindings minus aget bindings
         pure-scalar-bindings (vec (mapcat identity
@@ -3500,8 +3509,9 @@
                         (vec (concat pure-scalar-bindings [val-result-sym body-result]))
                         [val-result-sym body-result])
         scalar-program (when (and (seq iter-active) (not typed-double?))
-                         (gen-reverse-read-region step-bindings [val-result-sym] iter-active
-                                                  (index-replays agets idx-sym)))
+                         (or step-program
+                             (gen-reverse-read-region step-bindings [val-result-sym] iter-active
+                                                      (index-replays agets idx-sym))))
         scalar-transform (when (seq iter-active)
                            (if typed-double?
                              (gen-inline-step-gradients step-bindings [val-result-sym]
@@ -6090,8 +6100,15 @@
             (throw (ex-info "generated product result requires a scalar tangent declaration"
                             {:reason :ad-generated-product-result :tag result-tag})))
         dy (ad-gensym "generated_seed")
-        {:keys [rev-ctx param-adj-syms]} (reverse-program-projection forward selected-inputs {result [dy]})]
+        {:keys [rev-ctx param-adj-syms pullback-replays pullback-replay-conditions]}
+        (reverse-program-projection forward selected-inputs {result [dy]})]
     {:result-tag result-tag :result result :seed dy
+     :active-inputs (vec selected-inputs)
+     :writes (:writes forward) :value-facts value-facts
+     ;; These are PULLBACK requirements only. Re-executing the forward program
+     ;; needs a separate complete primal-read/external-effect proof.
+     :replays (memory/transitive-closure pullback-replays (:aliases forward))
+     :pullback-replay-conditions pullback-replay-conditions
      :forward-bindings fwd-bindings :reverse-bindings (vec (:bindings rev-ctx))
      :parameter-adjoints param-adj-syms
      :form (:standard-form (reverse-program-forms
