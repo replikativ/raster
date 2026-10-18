@@ -405,7 +405,32 @@
     (is (thrown? clojure.lang.ExceptionInfo (conversion/policy :missing :float)))
     (is (thrown? clojure.lang.ExceptionInfo (conversion/policy :int :float :unchecked)))))
 
+(deftest reduction-element-locals-lower-once-through-the-shared-ssa-builder
+  (doseq [unused? [false true]]
+    (let [bindings (cond-> [] unused? (into '[unused (clojure.core/aget x i)]))
+          expression (with-meta
+                       (list 'let* (into bindings '[value (clojure.core/aget x i)])
+                             (with-meta '(* value value) {:raster.type/tag 'float}))
+                       {:raster.type/tag 'float})
+          result (segred/lower-element-operations
+                  expression {:dtype :float :index 'i :coordinate 'i
+                              :arrays #{'x} :array-types {'x :float}})
+          loads (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %) (:operations result))
+          multiply (last (:operations result))
+          value (get-in (last loads) [:result :id])]
+      (is (= (if unused? 2 1) (count loads))
+          "local initializers, including unused reads, are neither duplicated nor discarded")
+      (is (= [value value] (get-in multiply [:expression :arguments])))
+      (is (= :float (get-in multiply [:result :type]))))))
+
 (deftest reduction-element-conversions-retain-their-stricter-admission
+  (let [local (with-meta 'local {:raster.type/tag 'float})
+        result (segred/lower-element-operations
+                (list 'let* [local 0.1] (list 'double local)) {:dtype :double})
+        casts (filter #(= :cast (get-in % [:expression :op])) (:operations result))]
+    (is (= [:float :double] (mapv #(get-in % [:result :type]) casts)))
+    (is (= [{:rounding :nearest-even :overflow :ieee} {:rounding :exact :overflow :exact}]
+           (mapv #(get-in % [:expression :options]) casts))))
   (let [expression (with-meta '(+ (aget x i) scale) {:raster.type/tag 'double})
         options {:index 'i :coordinate 'i :dtype :double
                  :arrays #{'x} :array-types {'x :float}

@@ -283,9 +283,10 @@
                    {:accumulator 'acc :neutral 0.0 :dtype :double
                     :result 'sum :index 'i :step-result step})
         retained (first (:results (reduction/fold-region reduction)))]
-    (is (= (list 'clojure.core/+ 'acc (list 'clojure.core/double conversion))
+    (is (= (list 'clojure.core/+ 'acc
+                 (list 'clojure.core/double (list 'let* ['term conversion] 'term)))
            retained)
-        "normalizing a let must not make the element invisible to carrier adaptation")))
+        "retaining a local region must not make its result type invisible to carrier adaptation")))
 
 (deftest scalar-reduction-certification-uses-its-declared-parameter-types
   (let [step '(let* [diff (clojure.core/-
@@ -299,8 +300,10 @@
                   :result 'sum :index 'i :step-result step})
         retained (first (:results (reduction/fold-region product)))]
     (is (= 'clojure.core/+ (first retained)))
-    (is (not-any? #{'let*} (tree-seq coll? seq retained))
-        "a long reduction index makes its identity casts total during safe let normalization")))
+    (is (= 'let* (first (nth retained 2)))
+        "declared numeric parameters do not authorize duplicating local array reads")
+    (is (= (second step) (second (nth retained 2)))
+        "the local initializer and its explicit index casts remain once-only")))
 
 (deftest scalar-reduction-projection-preserves-devirtualized-operation-metadata
   (let [conversion (dialect/scalar-convert
