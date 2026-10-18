@@ -1382,6 +1382,22 @@ check capability coverage, including existing model, contraction and scientific 
 unsupported ordering obligation cannot fall back eagerly. No new compiler cache, record family,
 backend executor or performance claim follows from this phase.
 
+Auxiliary realization bindings are executable source actions, not scaffolding that can be
+discarded because a later kernel overwrites the result. The internal ordered root now recovers
+their exact source-position/equation witness: a result allocation executes the existing
+constructor-count check, acquisition and zeroing path before its producer, whose lowering must
+reuse that exact physical token. A storage alias binds an already acquired destination and
+grants no allocation, initialization or completion credit. Local OpenCL/Level Zero controls
+cover the existing four-layer dense program, changed-input replays, empty functional results,
+late constructor failures and aliases after fused writes. Distinct logical/physical result
+storage, prefix views and aliases before target acquisition remain explicit capability limits;
+this does not enable automatic frontend selection.
+Preparation and native-root construction share one structural source-action coverage gate before
+capture or effects. It refuses unsupported steps/realizations, structured-loop fragments and
+missing native-content-provider contracts without evaluating a checked source size. Runtime
+constructor counts, argument availability, alias readiness and logical-view reconciliation still
+require their own ordered checks; structural admission is not a completion or totality proof.
+
 JAX pytrees are the model for separating user structure from flat leaves, but
 Raster trees should retain stable keyed paths and type/shape information. JAX
 donation and sharding contracts are also useful references; Raster's existing

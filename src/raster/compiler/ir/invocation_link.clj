@@ -573,6 +573,9 @@
       (fail! :invocation-ordered-program
              "ordered realization requires the exact retained semantic and emitted boundary" {}))
     {:program program :source-order order :source-cursor 0
+     :source-realizations (into {} (keep (fn [entry]
+                                          (when-let [action (invocation-source/realization-action semantic-program entry)]
+                                            [(:position entry) action]))) order)
      :materialization (materialization/begin-materialization invocation arguments)
      :realized {:buffers {} :storage {} :loop-scratch {}}
      :acquired-storage #{}
@@ -580,6 +583,49 @@
                               (get-in semantic-program [:attributes :allocations]))
      :projections (:projections checked) :target (:target compilation)
      :caller-options caller-options}))
+
+(defn- validate-source-result-allocation! [state entry action]
+  (let [destination (:binding action)
+        equation (some #(when (= (:equation action) (:id %)) %) (get-in state [:program :equations]))
+        operation (first (:operations equation))
+        projection (when operation
+                     (emitted-program/operation-projection (:projections state) operation))]
+    ;; Prefix-result views and distinct logical/physical storage need their own reconciliation.
+    (when-not (and (symbol? destination)
+                   (contains? (:physical-results projection) destination)
+                   (= destination (get-in projection [:physical-results destination])))
+      (fail! :invocation-ordered-realization-storage
+             "source allocation must be the equation's exact physical result"
+             {:entry entry :destination destination}))))
+
+(defn ^:no-doc validate-ordered-source-actions!
+  "Check structural executor coverage after begin-ordered-realization, before capture or source
+   effects. This evaluates no source operand, acquires no storage and grants no completion proof.
+   Runtime counts, initialization, input ownership and logical-view checks remain separate."
+  [state]
+  (when-let [providers (seq (get-in state [:program :attributes :native-initialization-providers]))]
+    (fail! :invocation-link-native-initialization
+           "ordered linking requires an explicit native-content provider"
+           {:destinations (vec providers)}))
+  (let [steps (into {} (map (juxt :id identity)) (get-in state [:materialization :plan :steps]))
+        equations (into {} (map (juxt :id identity)) (get-in state [:program :equations]))]
+    (doseq [entry (:source-order state)
+            :let [step (get steps (:invocation-step entry))
+                  equation (get equations (:equation entry))
+                  action (get (:source-realizations state) (:position entry))]]
+      (when (or (and (:realization entry)
+                     (not (contains? #{:result-allocation :storage-alias} (:kind action))))
+                (and step (not (or (invocation/scalar-compute? step)
+                                         (invocation/shape-projection? step)
+                                         (and (:storage entry) (invocation/buffer-allocation? step))))))
+        (fail! :invocation-ordered-source-action
+               "ordered source entry requires an unimplemented realization action" {:entry entry}))
+      (when (some emitted-loop/emitted-loop? (:operations equation))
+        (fail! :invocation-ordered-source-action
+               "ordered execution does not yet admit structured-loop fragments" {:entry entry}))
+      (when (= :result-allocation (:kind action))
+        (validate-source-result-allocation! state entry action))))
+  state)
 
 (defn ^:no-doc ordered-input-arguments
   "Preflight primitive host-array replacements without evaluating source steps or mutating an
@@ -690,8 +736,10 @@
   (when (:pending state)
     (fail! :invocation-ordered-pending "the preceding source action has not completed" {}))
   (let [entry (nth (:source-order state) (:source-cursor state) nil)
-        destination (:storage entry)
-        expression (get (:source-allocations state) destination)
+        action (get (:source-realizations state) (:source-cursor state))
+        auxiliary? (= :result-allocation (:kind action))
+        destination (or (:storage entry) (when auxiliary? (:binding action)))
+        expression (if auxiliary? (:expression action) (get (:source-allocations state) destination))
         abstract (get-in state [:program :values destination])
         values (get-in state [:program :values])
         projection (invocation-source/allocation-source expression values)
@@ -702,6 +750,7 @@
                    (invocation-source/allocation-corresponds? expression abstract initialization values))
       (fail! :invocation-ordered-next-allocation
              "the next source entry is not an admitted size-only zero allocation" {:entry entry}))
+    (when auxiliary? (validate-source-result-allocation! state entry action))
     (when (and (:helper projection)
                (not (semantic/equivalent? (select-keys projection [:constructor :helper])
                                          (:source-projection step))))
@@ -769,6 +818,36 @@
                                          :source-cursor (:source-cursor state)})
            :nodes (:nodes layout) :values (:values layout)
            :storage token :initialization :zero :elements elements})))))
+
+(defn ^:no-doc advance-source-alias
+  "Bind one validated source alias to already acquired storage. This neither acquires storage
+   nor grants initialization or producer-completion credit."
+  [state caller-options]
+  (when-not (= caller-options (:caller-options state))
+    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
+  (when (:pending state)
+    (fail! :invocation-ordered-pending "the preceding source action has not completed" {}))
+  (let [entry (nth (:source-order state) (:source-cursor state) nil)
+        {:keys [kind binding expression]} (get (:source-realizations state) (:source-cursor state))
+        realized (:realized state)
+        token (get-in realized [:buffers expression])
+        existing (get-in realized [:buffers binding])]
+    (when-not (and (= :storage-alias kind) (= binding (:binding entry))
+                   (symbol? expression) token (contains? (:acquired-storage state) token)
+                   (or (nil? existing) (= existing token)))
+      (fail! :invocation-ordered-alias-storage
+             "source alias requires the exact already acquired destination storage"
+             {:entry entry :source expression :storage token}))
+    (let [available (materialization/prefix-bindings (:materialization state))
+          scalars (merge (invocation-shape-scalars (:materialization state))
+                         (:program-scalars available) (:host-scalars state))
+          abstract (get-in state [:program :values binding])
+          shape (concrete-shape binding abstract scalars (:buffers realized) (:storage realized))]
+      (-> state
+          (assoc :realized (-> realized
+                              (assoc-in [:buffers binding] token)
+                              (add-storage token binding abstract shape nil :unspecified)))
+          (update :source-cursor inc)))))
 
 (defn ^:no-doc realize-ready-equation
   "Realize only the next numerical source entry into an ordinary concrete graph LinkPlan.

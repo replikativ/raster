@@ -1057,7 +1057,8 @@
                             {:reason :compiled-ordered-capability})))
         caller-options (when (contains? opts :scalar-math)
                          {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math opts))})
-        initial (invocation-link/begin-ordered-realization compilation args caller-options)
+        initial (invocation-link/validate-ordered-source-actions!
+                 (invocation-link/begin-ordered-realization compilation args caller-options))
         available (materialization/prefix-bindings (:materialization initial))
         buffers (:program-buffers available)
         parameters (:parameters invocation-plan)

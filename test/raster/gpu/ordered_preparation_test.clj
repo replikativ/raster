@@ -3,6 +3,10 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
+            [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
@@ -13,6 +17,44 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest source-action-coverage-is-shared-before-preparation-and-native-capture
+  (let [compilation (equation-first/compile #'fixture/write-before-shape {:target :ocl:0 :dtype :double})
+        arguments [(double-array [7.0]) (double-array 1) Long/MAX_VALUE]
+        initial (invocation-link/begin-ordered-realization compilation arguments nil)
+        calls (atom 0)
+        forbidden (fn [& _] (throw (Exception. "source preflight evaluated source work or touched a driver")))]
+    (with-redefs [scalar/evaluate-invocation-step forbidden scalar/evaluate-host-equation forbidden
+                  gpu/make-session forbidden]
+      (is (identical? initial (invocation-link/validate-ordered-source-actions! initial)))
+      (is (= :invocation-link-native-initialization
+             (reason #(invocation-link/validate-ordered-source-actions!
+                       (assoc-in initial [:program :attributes :native-initialization-providers] ['external])))))
+      (is (= :invocation-ordered-source-action
+             (reason #(invocation-link/validate-ordered-source-actions!
+                       (assoc-in initial [:program :equations 0 :operations]
+                                 [(emitted-loop/map->EmittedStructuredLoop {})])))))
+      (is (= :invocation-ordered-source-action
+             (reason #(invocation-link/validate-ordered-source-actions!
+                       (update-in initial [:materialization :plan :steps 0]
+                                  (fn [step] (invocation/map->BufferClone (into {} step))))))))
+      (with-redefs [invocation-link/validate-ordered-source-actions!
+                    (fn [_] (swap! calls inc)
+                      (throw (ex-info "unsupported source action" {:reason :test-source-capability})))]
+        (is (= :test-source-capability
+               (reason #(#'compiled/prepare-ordered-equation-first compilation arguments {} nil))))
+        (is (= :test-source-capability
+               (reason #(link/instantiate-ordered-invocation! compilation arguments {})))))
+      (is (= 2 @calls))))
+  (let [compilation (equation-first/compile #'root-fixture/functional-source-allocation
+                                           {:target :ocl:0 :dtype :double})
+        initial (invocation-link/begin-ordered-realization
+                 compilation [(double-array [7.0]) (double-array 1) 2] nil)]
+    (is (seq (:source-realizations initial)))
+    (is (identical? initial (invocation-link/validate-ordered-source-actions! initial)))
+    (with-redefs [emitted-program/operation-projection (fn [& _] {:physical-results {}})]
+      (is (= :invocation-ordered-realization-storage
+             (reason #(invocation-link/validate-ordered-source-actions! initial)))))))
 
 (deftest preparation-retains-semantics-without-evaluating-the-late-source-check
   (let [compilation (equation-first/compile #'fixture/write-before-shape {:target :ocl:0 :dtype :double})
