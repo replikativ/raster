@@ -5,6 +5,7 @@
             [raster.numeric :as n]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.passes.scalar.local-products :as products]
+            [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- call [operation implementation]
@@ -43,6 +44,13 @@
   (binding [entry/*emission-inputs* nil]
     (is (nil? (scalar/checked-selected-primitive-evaluation
                divide [primitive-double primitive-double])))))
+
+(deftest a-refused-scalar-proof-does-not-create-an-artifact-dependency
+  (let [owner (atom {:static [] :values []})]
+    (binding [entry/*emission-inputs* owner]
+      (is (nil? (scalar/checked-selected-primitive-evaluation divide [primitive-double {}])))
+      (is (= {:presence :unknown} (normal/result-fact divide)))
+      (is (empty? (:definition-proofs @owner))))))
 
 (deftest ieee-division-and-comparison-have-real-value-oracles
   (let [receiver @(find-var 'raster.numeric/_div__m_double_double-impl)

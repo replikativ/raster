@@ -1445,13 +1445,15 @@
    the selected implementation. Missing/legacy lineage, generic calls and
    opaque/user helper bodies stay unknown; this query never forces a JIT."
   [expression]
-  (when-let [{:keys [definition body]} (selected-strict-scalar-source expression)]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+    (when-let [{:keys [definition body]} (selected-strict-scalar-source expression)]
     (let [{:keys [tags parameters return-tag]} definition
           scalar-types (mapv dtype/dtype-for-scalar-tag tags)
           result-type (dtype/dtype-for-scalar-tag return-tag)]
       (when (and (every? some? scalar-types) result-type)
         (let [proof (checked-scalar-result body (zipmap parameters scalar-types))]
-          (when (= result-type (:type proof)) proof))))))
+          (when (= result-type (:type proof)) proof))))))))
 
 (defn- completed-fp-body-carrier
   "Bounded completion summary INSIDE a selected primitive entry, not source inference.
@@ -1521,7 +1523,9 @@
    arithmetic/conversion completion only: it is not proof against cold JIT or
    VM allocation failure and must never feed global removability directly."
   [expression argument-facts]
-  (when-let [{:keys [definition entry body arguments]}
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+    (when-let [{:keys [definition entry body arguments]}
              (selected-strict-scalar-source expression)]
     (let [{:keys [parameters tags return-tag]} definition
           carriers (:parameter-carriers entry)]
@@ -1543,4 +1547,4 @@
              :scope :completed-fp-scalar
              :presence :present :builtin-class (case result-type
                                                 :float Float :double Double :predicate Boolean)
-             :nonthrowing? true}))))))
+             :nonthrowing? true}))))))))

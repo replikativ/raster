@@ -44,7 +44,7 @@
           (summary (:form result) env (conj visited key))
           unknown)))))
 
-(defn- selected-result [expression env visited]
+(defn- selected-result* [expression env visited]
   (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
         (descriptor/call-description expression)
         definition (when (and method-entry/*emission-inputs*
@@ -88,6 +88,12 @@
               unknown)))
         unknown)
       unknown)))
+
+(defn- selected-result [expression env visited]
+  (or (method-entry/call-with-optional-definition-inputs
+       #(let [result (selected-result* expression env visited)]
+          (when (or (not= :unknown (:presence result)) (:array-tag result)) result)))
+      unknown))
 
 (defn- conditional-result [expression env visited]
   (let [[_ test then else] expression

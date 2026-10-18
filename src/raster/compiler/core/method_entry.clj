@@ -114,6 +114,48 @@
                       {:reason :stale-definition-proof-input :source (:var snapshot)}))))
   true)
 
+(defn call-with-optional-definition-inputs
+  "Retain observations only when an optional proof returns a truthy result.
+   A refused query is not an executable dependency. The child starts with the
+   parent's HISTORICAL observations, so it cannot refresh an already stale proof.
+   This request-local transaction assumes sequential ownership; a competing
+   owner update retries construction rather than losing either observation."
+  [prove!]
+  (if-not *emission-inputs*
+    (prove!)
+    (let [owner *emission-inputs*
+          historical @owner
+          child (atom historical)
+          result (binding [*emission-inputs* child] (prove!))]
+      (when result
+        (assert-definition-inputs-current! @child)
+        (when-not (compare-and-set! owner historical @child)
+          (throw (ex-info "compiler proof owner changed during optional analysis"
+                          {:reason :unstable-definition-proof-input}))))
+      result)))
+
+(defn prepare-pending-definition-inputs!
+  "Prepare observed pending JIT receivers before publishing a long-lived artifact.
+   `prepare!` is the existing non-evaluating compiler entry, not a numerical call.
+   Preparation has separate ownership. Afterwards ORIGINAL observations are checked:
+   a promotion must discard/retry construction, never refresh the rejected result.
+   Refused optional queries must not contribute observations to this owner."
+  [prepare!]
+  (when-not *emission-inputs*
+    (throw (ex-info "definition preparation requires a compiler owner"
+                    {:reason :missing-definition-preparation-owner})))
+  (let [historical @*emission-inputs*
+        pending (into [] (keep (fn [[v snapshot]]
+                                 (when (map? (get-in snapshot [:metadata :raster.core/jit-spec]))
+                                   v)))
+                      (:definition-proofs historical))]
+    (assert-definition-inputs-current! historical)
+    ;; One batch may promote several entries. Do not expose the deliberately
+    ;; stale enclosing owner to each dependency's own compilation transaction.
+    (binding [*emission-inputs* nil]
+      (doseq [v pending] (prepare! v)))
+    (assert-definition-inputs-current! historical)))
+
 (defn call-with-definition-inputs
   "Own normalization and emission together for a static compiled artifact.
    Dynamic executables additionally retain these observations in their existing
