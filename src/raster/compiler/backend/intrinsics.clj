@@ -21,7 +21,9 @@
               :fn    (function call)    | :special (custom per-backend sequence)
      :wasm    {vt → encoder-opcode-keyword}  (vt ∈ #{:f64 :f32 :i32}); absent = unsupported
      :c       C/OpenCL form — infix string, or {:fn name} (GLSL fn override via :glsl)
-     :wgsl    WGSL form — infix string or {:fn name}"
+     :wgsl    WGSL form — infix string or {:fn name}
+     :primitive-fp-total  nonthrowing only after actual primitive FP operand completion;
+                          never a purity, unboxing or generic source-call certificate"
   (:require [clojure.string :as str]
             [raster.compiler.core.op-descriptor :as operation]
             [raster.compiler.support.mangled :as mangled]))
@@ -115,15 +117,15 @@
 
 (def table
   {;; binary arithmetic
-   :+ {:arity 2 :kind :infix :wasm (vt3 :f64.add :f32.add :i32.add) :c "+" :wgsl "+"}
-   :- {:arity 2 :kind :infix :wasm (vt3 :f64.sub :f32.sub :i32.sub) :c "-" :wgsl "-"}
-   :* {:arity 2 :kind :infix :wasm (vt3 :f64.mul :f32.mul :i32.mul) :c "*" :wgsl "*"}
-   :div {:arity 2 :kind :infix :wasm (vt3 :f64.div :f32.div :i32.div_s) :c "/" :wgsl "/"}
+   :+ {:arity 2 :kind :infix :primitive-fp-total true :wasm (vt3 :f64.add :f32.add :i32.add) :c "+" :wgsl "+"}
+   :- {:arity 2 :kind :infix :primitive-fp-total true :wasm (vt3 :f64.sub :f32.sub :i32.sub) :c "-" :wgsl "-"}
+   :* {:arity 2 :kind :infix :primitive-fp-total true :wasm (vt3 :f64.mul :f32.mul :i32.mul) :c "*" :wgsl "*"}
+   :div {:arity 2 :kind :infix :primitive-fp-total true :wasm (vt3 :f64.div :f32.div :i32.div_s) :c "/" :wgsl "/"}
    ;; comparisons (bool result)
-   :lt {:arity 2 :kind :cmp :wasm (vt3 :f64.lt :f32.lt :i32.lt_s) :c "<" :wgsl "<"}
-   :gt {:arity 2 :kind :cmp :wasm (vt3 :f64.gt :f32.gt :i32.gt_s) :c ">" :wgsl ">"}
-   :le {:arity 2 :kind :cmp :wasm (vt3 :f64.le :f32.le :i32.le_s) :c "<=" :wgsl "<="}
-   :ge {:arity 2 :kind :cmp :wasm (vt3 :f64.ge :f32.ge :i32.ge_s) :c ">=" :wgsl ">="}
+   :lt {:arity 2 :kind :cmp :primitive-fp-total true :wasm (vt3 :f64.lt :f32.lt :i32.lt_s) :c "<" :wgsl "<"}
+   :gt {:arity 2 :kind :cmp :primitive-fp-total true :wasm (vt3 :f64.gt :f32.gt :i32.gt_s) :c ">" :wgsl ">"}
+   :le {:arity 2 :kind :cmp :primitive-fp-total true :wasm (vt3 :f64.le :f32.le :i32.le_s) :c "<=" :wgsl "<="}
+   :ge {:arity 2 :kind :cmp :primitive-fp-total true :wasm (vt3 :f64.ge :f32.ge :i32.ge_s) :c ">=" :wgsl ">="}
    :eq {:arity 2 :kind :cmp :wasm (vt3 :f64.eq :f32.eq :i32.eq) :c "==" :wgsl "=="}
    :ne {:arity 2 :kind :cmp :wasm (vt3 :f64.ne :f32.ne :i32.ne) :c "!=" :wgsl "!="}
    ;; integer bitwise + shifts (i32/i64); used by hashing / noise / bit twiddling
@@ -336,6 +338,20 @@
     :else nil))
 
 (defn descriptor [op] (get table (canonical op)))
+
+(defn primitive-fp-total?
+  "Whether this intrinsic is nonthrowing on already completed JVM primitive FP
+   operands. `carriers` are actual primitive Classes, not logical dtype tags.
+   The source owner must independently prove operand/callee correspondence and
+   completion; this query licenses neither unboxing nor moving the source call.
+   NaN, infinities, overflow and division by zero remain IEEE values. Integral
+   arithmetic, Object/boxed inputs and absent contracts conservatively abstain."
+  [op carriers]
+  (let [intrinsic (descriptor op)]
+    (boolean
+     (and (true? (:primitive-fp-total intrinsic))
+          (vector? carriers) (= (:arity intrinsic) (count carriers))
+          (every? #{Float/TYPE Double/TYPE} carriers)))))
 
 ;; These source operations carry a semantic promise that is not part of canonical operator
 ;; identity: JVM-width integral arithmetic wraps modulo 2^N.  Keep the distinction here, beside
