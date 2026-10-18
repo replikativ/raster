@@ -238,42 +238,11 @@
       (when (number? expression)
         (some-> expression types/literal-tag dtype/dtype-for-scalar-tag))))
 
-(defn- inline-scalar-bindings
-  [expression]
-  (if (and (seq? expression) (contains? #{'let 'let*} (first expression)))
-    (let [[_ bindings & body] expression
-          pairs (vec (partition 2 bindings))
-          initializers (vec (take-nth 2 (rest bindings)))]
-      (when-not (= 1 (count body))
-        (decline! :multi-expression-let
-                  "KernelBody scalar reduction requires a single-expression let region"
-                  {:expression expression}))
-      (when (some util/effectful? initializers)
-        (decline! :effectful-scalar-binding
-                  "KernelBody scalar reduction cannot inline effectful scalar bindings"
-                  {:expression expression}))
-      (let [substitutions (util/binding-env bindings)]
-        (doseq [[binding _] pairs
-                :let [initializer (get substitutions binding)
-                      binding-dtype (some-> binding types/sym-type-tag
-                                            dtype/dtype-for-scalar-tag)
-                      initializer-dtype (source-value-dtype initializer)]
-                :when (and binding-dtype initializer-dtype
-                           (not= binding-dtype initializer-dtype))]
-          (decline! :typed-scalar-binding-conversion
-                    "KernelBody reduction cannot erase a typed scalar binding conversion"
-                    {:binding binding :binding-dtype binding-dtype
-                     :initializer initializer :initializer-dtype initializer-dtype}))
-        ;; The shared inliner owns capture avoidance, sequential substitution and authoritative
-        ;; binder-type transfer. This reduction adapter retains only its stricter admission gate.
-        (recur (util/inline-pure-lets expression :deep? false))))
-    expression))
-
 (defn scalar-plan
   "Project one scalar SegRed into an explicit combine operator, identity and element expression."
   [segred]
   (let [{:keys [acc init lambda]} (segop/scalar-reduce-op segred)
-        expression (inline-scalar-bindings lambda)
+        expression lambda
         certification-expression (dialect/scalar-converts->source expression)
         component (first (get-in segred [:reduction :components]))
         dtype (:dtype component)
@@ -468,7 +437,6 @@
                       lower-load-index
                       load-predicate load-other declared-result-dtype scalar-math]}]
   (let [dtype (dtype/canon dtype)
-        expression (inline-scalar-bindings expression)
         _ (validate-reduction-value-language! expression (some? declared-result-dtype))
         array-types (into {} (map (fn [id] [id (dtype/canon (get array-types id dtype))]))
                           arrays)
@@ -520,6 +488,7 @@
                   :conversion-policy cast-policy :decline! decline! :id-prefix "element"
                   :require-source-types? true})
         source-result-dtype (or (retained-expression-dtype expression)
+                                ((:source-type lowerer) expression scalar-types)
                                 (source-value-dtype expression)
                                 (some-> declared-result-dtype dtype/canon)
                                 dtype)

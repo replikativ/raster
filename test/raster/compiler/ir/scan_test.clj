@@ -105,7 +105,7 @@
     (is (= {:nan-policy :propagate :signed-zero-policy :prefer-negative}
            (select-keys minimum [:nan-policy :signed-zero-policy])))))
 
-(deftest reassociation-certification-uses-the-shared-pure-let-rewrite
+(deftest reassociation-certification-retains-the-local-element-region
   (let [facts (scan/certify-reassociation
                {:acc 'acc :init 0.0
                 :lambda '(let* [difference (- (aget x i) (aget target i))]
@@ -113,9 +113,10 @@
                :double)]
     (is (scan/associative-scan? facts))
     (is (= '+ (:combine facts)))
-    (is (= '(* (- (aget x i) (aget target i))
-               (- (aget x i) (aget target i)))
-           (:element facts)))))
+    (is (= '(let* [difference (- (aget x i) (aget target i))]
+              (* difference difference))
+           (:element facts)))
+    (is (identical? facts (scan/validate! facts)))))
 
 (deftest reassociation-certification-uses-the-central-effect-analysis
   (let [facts (scan/certify-reassociation
@@ -181,21 +182,53 @@
     (catch clojure.lang.ExceptionInfo exception
       (is (= :scan-certificate-projection (:reason (ex-data exception)))))))
 
-(deftest projected-certification-normalizes-only-removable-let-bindings
+(deftest projected-certification-preserves-once-only-element-evaluation
   (let [step '(let* [term (* (clojure.core/aget values i)
                              (clojure.core/aget values i))]
                      (+ acc term))
         proof (scan/certify-projected-scan {:acc 'acc :init 0.0 :lambda step} :double)]
-    (is (= '(+ acc (* (clojure.core/aget values i)
-                      (clojure.core/aget values i)))
+    (is (= '(+ acc (let* [term (* (clojure.core/aget values i)
+                                  (clojure.core/aget values i))] term))
            (:normalized-step-result proof)))
-    (is (= '(* (clojure.core/aget values i) (clojure.core/aget values i))
+    (is (= '(let* [term (* (clojure.core/aget values i) (clojure.core/aget values i))] term)
            (:element proof))))
-  (try
-    (scan/certify-projected-scan
-     {:acc 'acc :init 0 :lambda '(let* [term (int x)] (+ acc term))} :int)
-    (is false "a checked let initializer cannot be duplicated or delayed by certification")
-    (catch clojure.lang.ExceptionInfo exception
-      (is (= :scan-certificate-projection (:reason (ex-data exception))))
-      (is (= :impure-binding
-             (get-in (ex-data exception) [:normalization-error :reason]))))))
+  (let [proof (scan/certify-projected-scan
+               {:acc 'acc :init 0 :lambda '(let* [term (int x)] (+ acc term))} :int)]
+    (is (= '(let* [term (int x)] term) (:element proof)))
+    (is (= '(+ acc (let* [term (int x)] term)) (:normalized-step-result proof)))))
+
+(deftest retained-element-regions-preserve-values-checks-and-unused-bindings
+  (doseq [step ['(let* [term (clojure.core/aget values i)] (+ acc (* term term)))
+               '(let* [unused (int x) term (clojure.core/aget values i)] (+ acc term))
+               '(let* [term (clojure.core/aget values i)]
+                  (let* [term (+ term 1.0)] (+ acc (* term term))))
+               '(do (int x) (+ acc (clojure.core/aget values i)))]]
+    (let [proof (scan/certify-projected-scan {:acc 'acc :init 0.0 :lambda step} :double)
+          compile-step (fn [body] (eval (list 'fn '[acc values i x] body)))
+          source (compile-step step)
+          normalized (compile-step (:normalized-step-result proof))]
+      (doseq [[values i x] [[(double-array [2.0 3.0]) 0 7]
+                            [(double-array 0) 0 7]
+                            [(double-array 0) 0 Long/MAX_VALUE]
+                            [(double-array [2.0]) 0 Long/MAX_VALUE]
+                            [nil 0 7]]]
+        (let [observe (fn [f]
+                        (try [:value (f 1.0 values i x)]
+                             (catch Throwable error [:error (class error)])))]
+          (is (= (observe source) (observe normalized)))))))
+  (doseq [step ['(let* [term acc] (+ acc term))
+               '(let* [acc 1.0] (+ acc x))
+               '(let* [+ custom] (+ acc x))
+               '(let* [term (do (println "effect") x)] (+ acc term))]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scan/certify-projected-scan {:acc 'acc :init 0.0 :lambda step} :double)))))
+
+(deftest element-factoring-does-not-rebind-an-accumulator-conversion
+  (doseq [step ['(let* [double (fn [_] 7.0)] (+ (double acc) x))
+               (list 'let* ['callee 'unknown]
+                     (with-meta '(.invk callee acc x) {:raster.op/original 'clojure.core/+}))
+               (list 'clojure.core/+
+                     (with-meta '(double acc) {:raster.op/lexical-callee true}) 'x)]
+          certify [scan/certify-reassociation scan/certify-projected-scan]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (certify {:acc 'acc :init 0.0 :lambda step} :double)))))

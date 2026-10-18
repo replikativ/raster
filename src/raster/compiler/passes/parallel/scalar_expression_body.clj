@@ -413,6 +413,28 @@
                (fn [{:keys [operations substitutions environment]} [id init]]
                  (let [init (util/subst-syms substitutions init)
                        binding-type (canon-type (resolve-binding-type id init environment))
+                       ;; A retained lexical binder can own a conditional join even
+                       ;; when its alternatives have different source widths. Prove
+                       ;; those widths independently and permit only exact widening;
+                       ;; the existing branch lowerer preserves each operation's
+                       ;; width and converts only the selected result at the join.
+                       ;; An enclosing consumer hint is not a lexical contract.
+                       init (if (and (retained-type id)
+                                     (nil? (retained-type init))
+                                     (seq? init) (= 'if (first init)) (= 4 (count init))
+                                     (nil? (authoritative-source-type init environment))
+                                     (every?
+                                      (fn [branch]
+                                        (when-let [source (authoritative-source-type branch environment)]
+                                          (or (= (canon-type source) binding-type)
+                                              (and (dtype/known? source)
+                                                   (dtype/known? binding-type)
+                                                   (= [:exact :exact]
+                                                      (scalar-conversion/policy
+                                                       (canon-type source) binding-type))))))
+                                      [(nth init 2) (nth init 3)]))
+                              (normalized-form init binding-type init)
+                              init)
                        lowered (lower init binding-type environment)
                        _ (when-not (= binding-type (:type lowered))
                            (decline! mismatch-rule mismatch-message

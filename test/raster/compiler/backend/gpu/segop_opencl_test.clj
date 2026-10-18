@@ -1159,9 +1159,12 @@
   (testing "a reduce lambda with a multi-statement let body is rejected, not (last bdy)-dropped"
     ;; The single-aset-void store-drop shape on the reduce side: (last bdy) silently dropped
     ;; the earlier body forms.
-    (is (thrown-with-msg?
-         Exception #"certified associative reduction"
-         (segred-source '(let* [t (clojure.core/aget a j)] (+ acc t) (+ acc t)))))))
+    (let [failure (try
+                    (segred-source '(let* [t (clojure.core/aget a j)] (+ acc t) (+ acc t)))
+                    nil
+                    (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+      (is (= :scalar-reduction-certificate-projection (:reason failure)))
+      (is (= :reduction-not-elementwise (get-in failure [:normalization-error :reason]))))))
 
 (deftest segred-devirtualized-aget-lowers-to-subscript
   (testing "the parametric (.invk aget-impl …) shape — the qlinear-k side of #55"
@@ -1687,9 +1690,9 @@
              (:missing-rule
               (decline (with-meta '(* scale (clojure.core/aget a i))
                          {:raster.type/tag 'double}))))))
-    (testing "beta reduction cannot erase a typed local conversion"
+    (testing "retained local conversions cannot silently narrow the region result"
       (let [local (with-meta 'local {:raster.type/tag 'float})]
-        (is (= :typed-scalar-binding-conversion
+        (is (= :element-result-dtype
                (:missing-rule
                 (decline (list 'let* [local 0.1] (list 'double local))))))))))
 
