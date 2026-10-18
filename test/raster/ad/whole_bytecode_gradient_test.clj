@@ -49,6 +49,9 @@
 (deftm explicit-float [x :- Double] :- Float (float x))
 (deftm scalar-carry-region [x :- Double cnt :- Long] :- Double
   (par/reduce acc 1.0 i cnt (n/* acc x)))
+(deftm array-carry-region [xs :- (Array double) coefficient :- Double cnt :- Long] :- Double
+  (let [gain (n/* coefficient coefficient)]
+    (par/reduce acc 0.0 i cnt (n/+ acc (n/* gain (aget xs i))))))
 (deftm mismatched-array-alias [xs :- (Array double) x :- Double] :- Double
   (let [^floats unused xs] (n/* x x)))
 
@@ -81,6 +84,43 @@
     (is (seq (:bindings program)))
     (is (= 'double (:raster.type/tag (meta (:result program)))))
     (is (pos? (.size ^java.util.IdentityHashMap (:calls program))))))
+
+(deftest actual-step-entry-preserves-object-captures-and-inactive-indexed-data
+  (let [source (core/resolve-deftm-var #'array-carry-region)
+        receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))
+        _ (core/ensure-current-owned-bytecode! receiver)
+        emission (:raster.core/bytecode-emission (meta receiver))
+        original (first (vals (:reduction-catalog emission)))
+        body-context (bytecode/retained-body-context emission)
+        params (mapv #(vary-meta %1 assoc :raster.type/tag %2) (:params emission) (:tags emission))
+        env (into {} (map (fn [id value] [id {:value value :facts (get-in body-context [:locals id])}])
+                         (:params emission) params))
+        binding-record (bytecode/retained-binding-context emission (first (:body emission)) 0)
+        gain (with-meta 'captured_gain {:tag 'Object :raster.type/tag 'double})
+        env (assoc env (:binder binding-record) {:value gain :facts (:after binding-record)})
+        produce (fn [original env active]
+                  (with-bindings {#'reverse/*gensym-counter* (atom 0)}
+                    (#'reverse/owned-bytecode-reduction-step-program emission original params active env)))
+        program (produce original env [gain])
+        reads (filter #(and (seq? %) (= 'clojure.core/aget (first %)))
+                      (tree-seq coll? seq (:bindings program)))
+        completions (keep completion/canonical-parts (tree-seq coll? seq (:bindings program)))]
+    (is (= :ref (get-in binding-record [:after :type])))
+    (is (identical? Object (get-in binding-record [:after :reference-class])))
+    (is (= 'Object (:tag (meta gain))))
+    (is (= 'int (:raster.type/tag (meta (:index program)))))
+    (is (= 'double (:raster.type/tag (meta (:carry program)))))
+    (is (some #(= (:index program) (nth % 2 nil)) reads))
+    (is (some #(= gain (:operand %)) completions))
+    (is (= :ad-unclosed-bytecode-reduction-entry
+           (try (produce (with-meta (apply list original) (meta original)) env [gain]) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :ad-unclosed-bytecode-reduction-entry
+           (try (produce original (update-in env [(:binder binding-record) :facts :slot] inc) [gain]) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :ad-unclosed-bytecode-body-region
+           (try (produce original env [gain (first params)]) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
 
 (defn- check [v values offset zero-prefix]
   (let [p (prepared v)

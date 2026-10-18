@@ -6398,18 +6398,26 @@
             (lower-read [actual env after]
               (let [[array index] (op/call-args actual)
                     source (get env array)
+                    index-port (get env index)
+                    attested-index (:index-port body-context)
+                    indexed? (and (symbol? index) (= index (:source attested-index))
+                                  (= (:facts index-port) (:facts attested-index))
+                                  (= :int (get-in index-port [:facts :type]))
+                                  (not (get-in @state [:activity (:value index-port)]))
+                                  (not (get-in @state [:activity (:value source)])))
                     tag (get types/primitive-array-element-types (types/sym-type-tag (:value source)))
                     result (ad-gensym "body_read" tag)]
-                ;; The initial admitted intrinsic is a literal indexed read
-                ;; from the actual primitive array carrier. Symbolic/control
-                ;; index regions require their own conversion evidence.
+                ;; Symbolic reads initially admit only an inactive attested
+                ;; reduction index into inactive data. Other symbolic/control
+                ;; indices and active-array scatters need their own evidence.
                 (when-not (and (seq? actual) (= 'clojure.core/aget (first actual)) (= 3 (count actual))
                                source (contains? '#{double float} tag)
                                (or (nil? after) (= (:type after) (keyword (name tag))))
                                (identical? (get types/primitive-array-info (types/sym-type-tag (:value source)))
                                            (get-in source [:facts :reference-class]))
-                               (integer? index) (<= 0 index Integer/MAX_VALUE)) (fail!))
-                (append! result (with-meta (list 'clojure.core/aget (:value source) index)
+                               (or (and (integer? index) (<= 0 index Integer/MAX_VALUE)) indexed?)) (fail!))
+                (append! result (with-meta (list 'clojure.core/aget (:value source)
+                                                (if indexed? (:value index-port) index))
                                           {:raster.type/tag tag}))))
             (lower-conversion [expression env]
               (let [{:keys [operand input-type target-carrier ports context] :as record}
@@ -6511,6 +6519,38 @@
      (into {} (map (fn [source value]
                      [source {:value value :facts (get-in context [:locals source])}])
                    (:params emission) params)))))
+
+(defn- owned-bytecode-reduction-step-program
+  "Establish an actual Double-carry step entry, then use the SAME producer.
+   Outer values retain their checked logical tags and physical Object carriers;
+   local slot categories cannot supply those declarations. No AD admission or
+   forward-replay permission follows from this normalization alone."
+  [emission original params active outer-env]
+  (let [observed ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-reduction-emission)
+                   emission original)
+        [index-source carry-source] (get-in observed [:loop :variables])
+        locals (get-in observed [:loop :locals])
+        index-facts (get locals index-source)
+        carry-facts (get locals carry-source)
+        fail! #(throw (ex-info "Reduction step has no closed actual entry interface"
+                               {:reason :ad-unclosed-bytecode-reduction-entry :form original}))]
+    (when-not (and observed (= 'double (:raster.type/tag (meta original)))
+                   (= :int (:type index-facts)) (= :double (:type carry-facts))
+                   (= :double (get-in observed [:recur :values 1 :type]))
+                   (every? (fn [[source {:keys [facts value]}]]
+                             (and (symbol? value)
+                                  (= facts (get-in observed [:loop :outer-locals source])))) outer-env))
+      (fail!))
+    (let [index (ad-gensym "reduction_index" 'int)
+          carry (ad-gensym "reduction_carry" 'double)
+          env (assoc outer-env index-source {:value index :facts index-facts}
+                               carry-source {:value carry :facts carry-facts})
+          context {:body [(nth original 5)] :return-stack-type :double
+                   :result-context (get-in observed [:recur :values 1 :context])
+                   :index-port {:source index-source :facts index-facts}}
+          program (owned-bytecode-region-program emission (into (vec params) [index carry])
+                                                 (into [carry] active) context env)]
+      (assoc program :index index :carry carry :observed observed))))
 
 (defn- prepare-owned-bytecode-value+grad-once
   "Prepare a whole selected numerical caller from its actual guarded emission.
