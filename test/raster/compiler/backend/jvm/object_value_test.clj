@@ -64,6 +64,62 @@
           (is (identical? token captured))
           (is (= (+ 21 offset) last-value)))))))
 
+(deftest bitwise-input-representation-does-not-change-width-or-traps
+  (let [outcome (fn [f left right trace]
+                  (try (let [value (f left right trace)]
+                         {:value value :class (class value)})
+                       (catch Throwable failure {:exception (class failure)})))]
+    (doseq [[operation arity] [['clojure.core/bit-and 2] ['clojure.core/bit-or 2]
+                               ['clojure.core/bit-xor 2] ['clojure.core/bit-not 1]
+                               ['clojure.core/bit-shift-left 2] ['clojure.core/bit-shift-right 2]
+                               ['clojure.core/unsigned-bit-shift-right 2]]
+            cast [nil 'clojure.core/int 'clojure.core/long 'clojure.core/float
+                   'clojure.core/double 'clojure.core/boolean]]
+      (let [operand (fn [id event]
+                      (list 'do (list 'swap! 'trace 'conj event)
+                            (if cast (list cast id) id)))
+            args (cond-> [(operand 'left :left)]
+                   (= arity 2) (conj (operand 'right :right)))
+            expression (cons operation args)
+            reference (eval (list 'fn '[left right trace] expression))
+            execute (:run (compile-value '[left right trace] expression))
+            inputs (if cast
+                     [[7 40] [-1 33] [123 64] [7 -1] [-1 129] [123 -65]]
+                     [[Long/MIN_VALUE 12] [4294967296 40] [-1 33]
+                      [(byte 7) (short 3)] [(short -1) (byte 2)]
+                      [nil 2] [1.5 2] [(float 1.5) 2] [1N 2] [1/2 2]
+                      [\a 2] [true 2] [1 nil] [1 1.5]
+                      [-1 -1] [Long/MAX_VALUE 2147483688] [Long/MIN_VALUE Long/MAX_VALUE]])]
+        (doseq [[left right] inputs]
+          (let [a (atom []) b (atom [])]
+            (is (= (outcome reference left right a) (outcome execute left right b))
+                (str operation " " cast " " [left right]))
+            (is (= @a @b) "input validation must not cross later operand effects")))))))
+
+(deftest bitwise-width-proof-requires-canonical-core-identity
+  (doseq [head '[clojure.core/bit-xor bit-xor unrelated.numeric/bit-xor]]
+    (is (= (when (= head 'clojure.core/bit-xor) :long)
+           (#'bytecode/infer-arg-stack-type-structural (list head 'left 'right) head {}))))
+  (is (nil? (#'bytecode/infer-arg-stack-type-structural
+             '(clojure.core/bit-xor left right) 'clojure.core/bit-xor
+             {'clojure.core/bit-xor {:type :ref}}))))
+
+(deftest variadic-bitwise-calls-retain-all-operands-and-validation-order
+  (doseq [operation '[clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor]]
+    (let [expression (list operation
+                           '(do (swap! trace conj :left) left)
+                           '(do (swap! trace conj :right) right)
+                           '(do (swap! trace conj :third) third))
+          reference (eval (list 'fn '[left right third trace] expression))
+          execute (:run (compile-value '[left right third trace] expression))
+          outcome (fn [f x y z trace]
+                    (try {:value (f x y z trace)}
+                         (catch Throwable failure {:exception (class failure)})))]
+      (doseq [[x y z] [[7 3 1] [4294967296 -1 4294967296] [nil 2 3] [1 2 1.5]]]
+        (let [a (atom []) b (atom [])]
+          (is (= (outcome reference x y z a) (outcome execute x y z b)))
+          (is (= @a @b)))))))
+
 (deftest product-fields-and-identity-observers-share-original-literal-references
   (doseq [value [(Long/valueOf 1000) (Double/valueOf 5.125) (float 1.25) \a]]
     (let [expression (list 'let* ['pair [value '(do nil)]]

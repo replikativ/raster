@@ -335,13 +335,12 @@
         (and (seq ts) (every? #(contains? #{:int :long} %) ts))
         (if (some #(= :long %) ts) :long :int)
         :else :double))
-        ;; Bitwise / shifts: integer-typed (any long operand ⇒ long). Without
-        ;; this rule they inferred nil and poisoned enclosing arithmetic to the
-        ;; :double guess (the quant int8 dot's (* (long ..) (bit-and ..))).
-    (contains? #{"bit-and" "bit-or" "bit-xor" "bit-not"
-                 "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"}
-               (name h))
-    (if (some #(= :long (infer-arg-stack-type % locals)) (rest form)) :long :int)
+        ;; Core bitwise operations return long, including int/Object inputs.
+        ;; Width is an operation contract, not the first operand's stack slot.
+    (contains? '#{clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor
+                  clojure.core/bit-not clojure.core/bit-shift-left
+                  clojure.core/bit-shift-right clojure.core/unsigned-bit-shift-right} h)
+    :long
         ;; Comparison ops produce primitive :bool (int 0/1) — see emit-comparison.
     (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :bool
         ;; if → infer from branches (enables skip-box for nested ifs)
@@ -2346,55 +2345,35 @@
           "unchecked-multiply" (do (.lmul code) :long))))
 
     ;; ---- Bitwise operations ----
-    ("bit-and" "bit-or" "bit-xor")
-    (let [t1 (emit-form code (first args) locals ctx)
-          use-long? (= t1 :long)]
-      (if use-long?
-        (do (let [t2 (emit-form code (second args) locals ctx)]
-              (when (not= t2 :long) (emit-coerce code t2 :long)))
-            (case head-name
-              "bit-and" (.land code)
-              "bit-or"  (.lor code)
-              "bit-xor" (.lxor code))
-            :long)
-        (do (when (not= t1 :int) (emit-coerce code t1 :int))
-            (let [t2 (emit-form code (second args) locals ctx)]
-              (when (not= t2 :int) (emit-coerce code t2 :int)))
-            (case head-name
-              "bit-and" (.iand code)
-              "bit-or"  (.ior code)
-              "bit-xor" (.ixor code))
-            :int)))
-
-    "bit-not"
-    (let [t (emit-form code (first args) locals ctx)]
-      (if (= t :long)
-        (do (.ldc code (long -1)) (.lxor code) :long)
-        (do (when (not= t :int) (emit-coerce code t :int))
-            (.ldc code (int -1)) (.ixor code) :int)))
-
-    ("bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right")
-    (let [_ (when (not= 2 (count args))
-              (throw (ex-info (str head-name " requires exactly 2 args, got " (count args))
-                              {:op head-name :arg-count (count args)})))
-          t1 (emit-form code (first args) locals ctx)
-          use-long? (= t1 :long)]
-      (if use-long?
-        (do (let [t2 (emit-form code (second args) locals ctx)]
-              (when (not= t2 :int) (emit-coerce code t2 :int)))
-            (case head-name
-              "bit-shift-left"          (.lshl code)
-              "bit-shift-right"         (.lshr code)
-              "unsigned-bit-shift-right" (.lushr code))
-            :long)
-        (do (when (not= t1 :int) (emit-coerce code t1 :int))
-            (let [t2 (emit-form code (second args) locals ctx)]
-              (when (not= t2 :int) (emit-coerce code t2 :int)))
-            (case head-name
-              "bit-shift-left"          (.ishl code)
-              "bit-shift-right"         (.ishr code)
-              "unsigned-bit-shift-right" (.iushr code))
-            :int)))
+    ("bit-and" "bit-or" "bit-xor" "bit-not"
+     "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right")
+    (let [arity (if (= "bit-not" head-name) 1 2)]
+      ;; Clojure inlines variadic and/or/xor as a left-associated expression:
+      ;; a failing inner call runs before later operands. Do not replace that
+      ;; with an eager variadic IFn call or silently truncate the operand list.
+      (if (and (contains? #{"bit-and" "bit-or" "bit-xor"} head-name)
+               (< 2 (count args)))
+        (emit-form code (reduce (fn [left right]
+                                 (list (symbol "clojure.core" head-name) left right)) args) locals ctx)
+        ;; Invalid arities fall through to the core Var without emitting inputs.
+        (when (= arity (count args))
+          (let [method-name (case head-name
+                              "bit-and" "and" "bit-or" "or" "bit-xor" "xor" "bit-not" "not"
+                              "bit-shift-left" "shiftLeft" "bit-shift-right" "shiftRight"
+                              "unsigned-bit-shift-right" "unsignedShiftRight")
+                inputs (mapv (fn [argument]
+                               (let [t (emit-form code argument locals
+                                                  (assoc ctx :preserve-source-call-results? true))]
+                                 (case t
+                                   :long J-cd
+                                   :int (do (emit-coerce code :int :long) J-cd)
+                                   ;; Preserve Object input validation and its timing.
+                                   ;; Number.longValue would accept floating inputs and
+                                   ;; could throw before later argument effects execute.
+                                   (do (when (not= t :ref) (emit-box-to-ref code t)) obj-cd)))) args)]
+            (.invokestatic code (ClassDesc/of "clojure.lang.Numbers") method-name
+                           (MethodTypeDesc/of J-cd (into-array ClassDesc inputs)))
+            :long))))
 
     ;; ---- mod / rem / quot ----
     "rem" (let [_ (when (not= 2 (count args))
