@@ -6,6 +6,7 @@
   special forms + function calls.  Same approach as partial-cps/ioc.clj.
   This generalizes to arbitrary Clojure code in deftm bodies."
   (:require [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.form :as form-ir]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.value-completion :as completion]
@@ -613,6 +614,75 @@
     (seq? form) (with-meta (apply list (map desugar-invk form)) (meta form))
     (vector? form) (with-meta (mapv desugar-invk form) (meta form))
     :else form))
+
+(defn ^:no-doc retain-invocation-occurrences
+  "Give each executable call occurrence an emission-local identity.
+   Run after semantic source transforms, before backend macroexpansion. This
+   catalog is private to the owning emission, not a source/cache identity or
+   authority reconstructed by comparing expressions. Quoted values stay opaque."
+  [body]
+  (let [catalog (atom {})]
+    (letfn [(visit [expression]
+              (if (and (seq? expression)
+                       (contains? #{'quote 'clojure.core/quote} (first expression)))
+                expression
+                (let [node (mex/walk-preserving-meta
+                            visit identity
+                            (if (instance? clojure.lang.IObj expression)
+                              (vary-meta expression dissoc ::call-occurrence)
+                              expression))]
+                  (if-not (form-ir/call-form? node) node
+                    (let [token (Object.)
+                          owned (vary-meta node assoc ::call-occurrence token)]
+                      (swap! catalog assoc token owned)
+                      owned)))))]
+      (let [owned (mapv visit body)]
+        {:body owned :catalog @catalog}))))
+
+(defn- retain-invocation-context!
+  [method receiver arguments mode return-carrier locals ctx]
+  (when-let [token (::call-occurrence ctx)]
+    (when me/*emission-inputs*
+      (let [visible (set (keys locals))
+            input (fn [operand]
+                    (let [free (binding [util/*shadowing-locals* visible]
+                                 (util/free-syms operand))]
+                      {:operand operand
+                       :context (completion/bytecode-operand-context ctx)
+                       ;; :type is the ACTUAL local stack category. :hint is
+                       ;; retained for compilation, never a nonnull/Class proof.
+                       :ports (select-keys locals (filter visible free))}))
+            guarded? (= mode :guarded-local-typed-interface)
+            record (cond-> {:status (if guarded? :unsupported :known)
+                    :method method :receiver receiver
+                    :receiver-input (input receiver)
+                    :invocation-mode mode :return-carrier return-carrier
+                    :element-type (:element-type ctx)
+                    :inputs (mapv input arguments)}
+                     guarded? (assoc :reason :runtime-selected-input-context))]
+        (swap! me/*emission-inputs*
+               update :invocation-contexts
+               (fn [contexts]
+                 (if (contains? contexts token)
+                   ;; Syntax equality ignores metadata and quoted identities.
+                   ;; Until cloned regions have an exact equivalence proof,
+                   ;; refuse even superficially equal repeated emissions.
+                   (assoc contexts token {:status :ambiguous
+                                          :reason :repeated-emitted-invocation-context})
+                   (assoc contexts token record))))))))
+
+(defn ^:no-doc retained-invocation-context
+  "Query one ORIGINAL occurrence from a trusted, guarded bytecode emission.
+   The caller separately owns selected-definition/implementation correspondence.
+   Copies, missing/cloned contexts and stale dependencies cannot establish it."
+  [emission expression]
+  (let [token (::call-occurrence (meta expression))
+        original (get (:invocation-catalog emission) token)
+        record (get (:invocation-contexts emission) token)]
+    (when (and (= :jvm-bytecode (:backend emission))
+               token (identical? original expression) (= :known (:status record)))
+      (me/assert-emission-inputs-current! emission)
+      record)))
 
 (defn- comparison-form?
   "True if form is a comparison call: (< a b), (>= a b), (== a b), etc."
@@ -3514,7 +3584,13 @@
                                     (boolean Boolean) Boolean/TYPE
                                     (void Void)       Void/TYPE
                                     nil))
-            is-var? (and (namespace obj) (not (get locals obj)))]
+            is-var? (and (namespace obj) (not (get locals obj)))
+            _ (retain-invocation-context!
+               method obj (vec method-args)
+               (cond is-var? :global-typed-indy
+                     (:verified (get locals obj)) :local-typed-interface
+                     :else :guarded-local-typed-interface)
+               (if is-var? (or prim-ret-class ret-class) ret-class) locals ctx)]
         (if is-var?
           ;; Var reference (e.g. raster.numeric/_plus__m_double_double-impl)
           ;; → emit args first, then invokedynamic (static-like, no receiver).
@@ -4685,7 +4761,9 @@
   ;; from map/for that need to be materialized for pattern matching
   (let [form (if (and (seq? form) (not (list? form)))
                (with-meta (apply list form) (meta form))
-               form)]
+               form)
+        ;; This node's occurrence never leaks into an unannotated child.
+        ctx (assoc ctx ::call-occurrence (::call-occurrence (meta form)))]
     (cond
       ;; --- Atoms ---
       (nil? form)     (do (.aconst_null code) :ref)
