@@ -809,7 +809,15 @@
 
 (defmethod ad-record :par-reduce [_ sym init-expr activity]
   (let [active-set (ordered-active-inputs init-expr activity)
-        pr-info (assoc (gen-reverse-par-reduce init-expr active-set) :sym sym)
+        owned? (= :jvm-bytecode (:backend *generated-product-context*))
+        regions (:owned-reduction-regions *generated-product-context*)
+        owned (when regions (.get ^java.util.IdentityHashMap regions init-expr))
+        _ (when (and owned? (not (identical? init-expr (:form owned))))
+            (throw (ex-info "Bytecode reduction is outside its owning region"
+                            {:reason :ad-unowned-bytecode-reduction-edge})))
+        pr-info (assoc (if owned?
+                         (assemble-ordered-reduce (:step owned) active-set)
+                         (gen-reverse-par-reduce init-expr active-set)) :sym sym)
         reduce-result-sym (:reduce-result-sym pr-info)]
     {:record pr-info
      :fwd-patch (fn [bs]
@@ -6317,6 +6325,8 @@
       (let [result (lower-input original input-index)]
         {:bindings @bindings :result (:value result) :calls calls :helpers @helpers}))))
 
+(declare ^:private owned-bytecode-reduction-step-program)
+
 (defn- owned-bytecode-region-program
   "Normalize an attested region, retaining its actual lexical binding evidence.
    This producer supplies ordered bindings to the existing AD engine. It does
@@ -6326,6 +6336,7 @@
         binding-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-binding-context)
         conversion-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-floating-conversion)
         calls (java.util.IdentityHashMap.)
+        reductions (java.util.IdentityHashMap.)
         state (atom {:bindings [] :helpers [] :activity (zipmap active (repeat true))})
         fail! (fn [& [details]]
                 (throw (ex-info "Owned caller needs an attested numerical lexical region"
@@ -6440,6 +6451,65 @@
                   (append! result (value-completion/complete-value
                                    (value-completion/bytecode-floating-input-contract target-carrier context)
                                    value)))))
+            (lower-reduction [expression env]
+              (when (:reduction-step? body-context)
+                (fail! {:phase :nested-reduction :form expression}))
+              (let [observed ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-reduction-emission)
+                               emission expression)
+                    [_ _ init-source _ bound-source] expression
+                    bound (:bound observed)
+                    init (get-in observed [:loop :initializers 1])
+                    bound-facts (get-in env [bound-source :facts])]
+                ;; First integration: source primitive count/local and primitive
+                ;; Double seed only. Compound seeds/counts need their own entry
+                ;; contexts; never pull a loop-index initializer into outer scope.
+                (when-not (and observed
+                               (or (and (integer? bound-source) (<= Long/MIN_VALUE bound-source Long/MAX_VALUE))
+                                   (and (symbol? bound-source) (contains? #{:int :long} (:type bound-facts))))
+                               (= 2 (count (:initializer bound)))
+                               (contains? '#{int clojure.core/int} (first (:initializer bound)))
+                               (= bound-source (second (:initializer bound)))
+                               (= :double (:input-type init) (:completed-type init) (get-in init [:after :type]))
+                               (= init-source (:initializer init))
+                               (or (instance? Double init-source)
+                                   (and (symbol? init-source)
+                                        (not= init-source (nth expression 3))
+                                        (= :double (get-in env [init-source :facts :type])))))
+                  (fail! {:phase :reduction-entry :form expression}))
+                (let [count-value (append! (ad-gensym "reduction_count" 'int)
+                                           (list 'clojure.core/int (lower bound-source env)))
+                      init-value (append! (ad-gensym "reduction_initial" 'double) (lower init-source env))
+                      step (owned-bytecode-reduction-step-program
+                            emission expression params
+                            (vec (keep (fn [[id active?]] (when active? id)) (:activity @state))) env)
+                      iterator (ad-gensym "reduction_iterator" 'long)
+                      ;; Restore the attested Int port from the assembler's
+                      ;; in-range iteration counter before evaluating any step.
+                      step-body (list 'let* [(:index step) (list 'clojure.core/int iterator)]
+                                      (list 'let* (:bindings step) (:result step)))
+                      marker (with-meta (list 'raster.par/reduce (:carry step) init-value iterator count-value step-body)
+                               {:raster.type/tag 'double})
+                      free (util/free-syms (list 'let* (:bindings step) (:result step)))
+                      active-free (filterv free (ordered-active-inputs marker (:activity @state)))
+                      _ (when-not (every? #(= :scalar (:kind (tangent/tangent-kind (types/sym-type-tag %)))) active-free)
+                          (fail! {:phase :active-reduction-array :form expression}))
+                      visible (vec (distinct (concat params (map :value (vals env)) [(:index step) (:carry step)])))
+                      program (binding [*generated-product-context*
+                                        {:backend :jvm-bytecode :internal-region? true
+                                         :owned-helper-calls (:calls step)}
+                                        *constant-gradient-arrays* (set (remove (set active-free) visible))
+                                        *source-memory-context* {:values visible :internal-region? true
+                                                                :value-facts {} :aliases {} :replayed {} :unprojectable {}}]
+                                (derive-flat-product-program (:bindings step) (:result step)
+                                                             (into [(:carry step)] active-free)))
+                      program (update program :form #(list 'let* [(:index step) (list 'clojure.core/int iterator)] %))
+                      spec {:acc-sym (:carry step) :init-expr init-value :idx-sym iterator
+                            :bound-expr count-value :body-expr step-body
+                            :agets [] :scalar-bindings [] :body-result (:result step) :free-syms free
+                            :typed-double? false :replay-values #{} :step-program program}]
+                  (swap! state update :helpers into (:helpers step))
+                  (.put reductions marker {:form marker :step spec})
+                  (append! (ad-gensym "body_reduction" 'double) marker))))
             (lower-scope [expression env]
               (let [{:keys [sequential? scopes outer]} (form/scope-info expression)
                     {:keys [binders inits body]} (first scopes)]
@@ -6458,6 +6528,12 @@
                                           (op/aget-call? actual) (lower-read actual current after)
                                           (trivial-expr? initializer) (lower initializer current)
                                           (conversion-context emission initializer) (lower-conversion initializer current)
+                                          (par-ir/par-reduce-form? initializer)
+                                          (do (when-not (identical? actual
+                                                                   (get-in ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-reduction-emission)
+                                                                             emission initializer)
+                                                                           [:bound :expression])) (fail!))
+                                              (lower-reduction initializer current))
                                           :else
                                           (do (when-not (identical? actual (:expression (retained emission initializer))) (fail!))
                                               (lower-call initializer current)))
@@ -6492,6 +6568,7 @@
                                 :else (fail!))]
                   (append! (ad-gensym "body_literal" tag) expression))
                 (form/binding-form? expression) (lower-scope expression env)
+                (par-ir/par-reduce-form? expression) (lower-reduction expression env)
                 (and (seq? expression) (= 'clojure.core/aget (first expression)))
                 (lower-read expression env nil)
                 (conversion-context emission expression) (lower-conversion expression env)
@@ -6505,7 +6582,7 @@
         ;; This is the original METHOD return boundary, independent of the
         ;; body's logical tail dtype. Reverse projection transposes it too.
         (append! result (value-completion/complete-value contract body-result))
-        (assoc @state :result result :calls calls)))))
+        (assoc @state :result result :calls calls :reductions reductions)))))
 
 (defn- owned-bytecode-body-program
   "Establish the original method entry before using the shared region producer."
@@ -6545,7 +6622,7 @@
           carry (ad-gensym "reduction_carry" 'double)
           env (assoc outer-env index-source {:value index :facts index-facts}
                                carry-source {:value carry :facts carry-facts})
-          context {:body [(nth original 5)] :return-stack-type :double
+          context {:body [(nth original 5)] :return-stack-type :double :reduction-step? true
                    :result-context (get-in observed [:recur :values 1 :context])
                    :index-port {:source index-source :facts index-facts}}
           program (owned-bytecode-region-program emission (into (vec params) [index carry])
@@ -6582,7 +6659,8 @@
               active (:candidate-params (tangent-parameter-plan params tags wrt))
               ordered (owned-bytecode-body-program emission params active)
               program (binding [*generated-product-context* {:backend :jvm-bytecode :used-identifiers used
-                                                             :owned-helper-calls (:calls ordered)}
+                                                             :owned-helper-calls (:calls ordered)
+                                                             :owned-reduction-regions (:reductions ordered)}
                                 *constant-gradient-arrays* (set (remove (set active) params))
                                 *source-memory-context* {:values params :value-facts {} :aliases {}
                                                         :replayed {} :unprojectable {}}]

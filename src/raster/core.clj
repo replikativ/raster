@@ -432,7 +432,20 @@
                          (jit-walk-with-tc (vec source-body) params tags annotations source-ns)
                          walked-body)]
         (try
-        (let [;; Re-walk from source body with TC for better devirtualization
+        (let [;; Publish the genuine source-walk cache before emission captures
+              ;; dependencies. A later AOT cache fill must not invalidate code
+              ;; solely by materializing this same derived compiler output.
+              ;; Never cache the AD/SIMD-transformed body as source walking.
+              _ (when (and source-entry source-body annotations)
+                  (me/assert-source-entry-current! source-entry)
+                  (alter-meta! source-var
+                               (fn [metadata]
+                                 (me/assert-source-entry-current! source-entry)
+                                 (if (seq (::deftm-walked-body metadata))
+                                   metadata
+                                   (assoc metadata ::deftm-walked-body (vec fresh-body)))))
+                  (me/assert-source-entry-current! source-entry))
+              ;; Re-walk from source body with TC for better devirtualization
               effective-body fresh-body
               ;; Use the same retained AD program as AOT, without expanding ordinary
               ;; helper boundaries or rewalking its typed conversions. Lazy resolution
@@ -559,11 +572,17 @@
               (throw (ex-info "Current bytecode requires its actual owning implementation"
                               {:reason :unowned-bytecode-implementation :var impl-var})))
           failure (try (me/assert-emission-inputs-current! emission) nil
-                       (catch clojure.lang.ExceptionInfo error error))]
-      (if-not failure
+                       (catch clojure.lang.ExceptionInfo error error))
+          ;; Older concrete producers may predate source-cache publication.
+          ;; Renew from frozen source rather than restamping their observations.
+          source-var (some-> (:source-entry emission) :source-var)
+          missing-walk? (and source-var
+                             (not (seq (::deftm-walked-body (meta source-var)))))]
+      (if-not (or failure missing-walk?)
         emission
         (do
-          (when-not (me/retryable-emission-change? failure) (throw failure))
+          (when (and failure (not (me/retryable-emission-change? failure)))
+            (throw failure))
           (let [{:keys [source-name params tags return-tag source-ns typed-interface
                         annotations source-body] :as lineage} (:source-entry emission)]
             (me/assert-source-entry-current! lineage)

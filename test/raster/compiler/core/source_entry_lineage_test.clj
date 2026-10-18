@@ -51,6 +51,33 @@
       (is (= Object (:result-carrier warm)))
       (is (= before @body-calls)))))
 
+(deftest bytecode-publishes-source-walking-before-dependencies-are-sealed
+  (let [{:keys [receiver source]} (fresh-entry)]
+    (core/ensure-bytecode-implementation! receiver)
+    (let [cache (:raster.core/deftm-walked-body (meta source))
+          emission (:raster.core/bytecode-emission (meta receiver))
+          before (meta source)]
+      (is (seq cache))
+      (is (= cache (core/ensure-walked-body! source)))
+      (is (identical? cache (:raster.core/deftm-walked-body (meta source))))
+      (is (= before (meta source)))
+      (is (identical? emission (core/ensure-current-owned-bytecode! receiver)))
+      ;; Legacy concrete producers without their genuine walked output must
+      ;; re-emit from raw source, never re-seal the old code's observations.
+      (alter-meta! source dissoc :raster.core/deftm-walked-body)
+      (let [fresh (core/ensure-current-owned-bytecode! receiver)]
+        (is (seq (:raster.core/deftm-walked-body (meta source))))
+        (is (not (identical? emission fresh)))
+        (is (not (identical? (:implementation emission) (:implementation fresh))))
+        (is (entry/source-entry-current? (:source-entry fresh)))
+        (let [populated (:raster.core/deftm-walked-body (meta source))
+              lineage (:source-entry fresh)]
+          (core/do-bytecode-upgrade! receiver (:source-name lineage) (:params lineage)
+                                    (:tags lineage) (:return-tag lineage) nil
+                                    (:source-ns lineage) (:typed-interface lineage)
+                                    :annotations (:annotations lineage) :source-body (:source-body lineage))
+          (is (identical? populated (:raster.core/deftm-walked-body (meta source)))))))))
+
 (deftest missing-or-mismatched-entry-lineage-abstains
   (let [{:keys [receiver source operation implementation] :as selected} (fresh-entry)
         original (meta receiver)]

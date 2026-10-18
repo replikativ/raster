@@ -49,6 +49,10 @@
 (deftm explicit-float [x :- Double] :- Float (float x))
 (deftm scalar-carry-region [x :- Double cnt :- Long] :- Double
   (par/reduce acc 1.0 i cnt (n/* acc x)))
+(deftm active-seed-region [x :- Double seed :- Double cnt :- Long] :- Double
+  (par/reduce acc seed i cnt (n/* acc x)))
+(deftm overwritten-carry-region [x :- Double cnt :- Long] :- Double
+  (par/reduce acc x i cnt x))
 (deftm array-carry-region [xs :- (Array double) coefficient :- Double cnt :- Long] :- Double
   (let [gain (n/* coefficient coefficient)]
     (par/reduce acc 0.0 i cnt (n/+ acc (n/* gain (aget xs i))))))
@@ -59,6 +63,23 @@
 
 (defn- prepared [v]
   (reverse/prepare-owned-bytecode-value+grad v [0]))
+
+(deftest owned-ordered-reductions-execute-with-active-seeds-and-zero-trips
+  (let [prepared (reverse/prepare-owned-bytecode-value+grad #'active-seed-region [0 1])
+        invoke (#'reverse/compile-prepared-value+grad prepared)]
+    (doseq [x [0.7 1.2] seed [0.4 -0.3] cnt [-1 0 1 3]]
+      (let [[value dx ds inactive] (invoke x seed cnt)
+            trips (max 0 cnt)]
+        (is (nil? inactive))
+        (is (< (Math/abs (- value (* seed (Math/pow x trips)))) 1e-12))
+        (is (< (Math/abs (- dx (if (zero? trips) 0.0 (* seed trips (Math/pow x (dec trips)))))) 1e-12))
+        (is (< (Math/abs (- ds (Math/pow x trips))) 1e-12))))
+    (is (thrown? ArithmeticException (invoke 0.7 0.4 Long/MAX_VALUE)))))
+
+(deftest overwritten-carry-does-not-require-a-carry-cotangent
+  (let [invoke (#'reverse/compile-prepared-value+grad (prepared #'overwritten-carry-region))]
+    (doseq [cnt [-1 0 1 3]]
+      (is (= [0.7 1.0 nil] (invoke 0.7 cnt))))))
 
 (deftest actual-reduction-step-uses-the-same-owned-region-producer
   (let [source (core/resolve-deftm-var #'scalar-carry-region)
