@@ -2,24 +2,28 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.tooling.inspect :as inspect]
             [raster.core :refer [deftm]]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as completion])
   (:import [java.lang.reflect InvocationTargetException Proxy InvocationHandler]))
 
 (deftm object-boundary-helper [x :- Double] :- Double x)
+(deftm array-boundary-helper [x :- (Array double)] :- (Array double) x)
 
-(defn- compile-value [params expression]
+(defn- compile-value
+  ([params expression] (compile-value params expression 'Object))
+  ([params expression return-tag]
   (let [{:keys [methods] :as artifact}
         (bytecode/compile-specialized-class!
          "raster.compiled.ObjectValueContext"
-         [{:name 'run :params params :return-tag 'Object
+         [{:name 'run :params params :return-tag return-tag
            :walked-body [expression] :source-ns *ns*}])
         method (get methods 'run)]
     (assoc artifact :run
            (fn [& arguments]
              (try (.invoke ^java.lang.reflect.Method method nil (object-array arguments))
-                  (catch InvocationTargetException failure (throw (.getCause failure))))))))
+                  (catch InvocationTargetException failure (throw (.getCause failure)))))))))
 
 (deftest quoted-cons-bodies-remain-owned-data-not-executable-code
   (let [body (cons 'let* (list ['x 1.0] '(throw (Exception. "quoted only"))))
@@ -59,6 +63,62 @@
         (let [[captured last-value] (apply owned (mapv (comp long #(+ offset %)) (range 22)))]
           (is (identical? token captured))
           (is (= (+ 21 offset) last-value)))))))
+
+(deftest bitwise-input-representation-does-not-change-width-or-traps
+  (let [outcome (fn [f left right trace]
+                  (try (let [value (f left right trace)]
+                         {:value value :class (class value)})
+                       (catch Throwable failure {:exception (class failure)})))]
+    (doseq [[operation arity] [['clojure.core/bit-and 2] ['clojure.core/bit-or 2]
+                               ['clojure.core/bit-xor 2] ['clojure.core/bit-not 1]
+                               ['clojure.core/bit-shift-left 2] ['clojure.core/bit-shift-right 2]
+                               ['clojure.core/unsigned-bit-shift-right 2]]
+            cast [nil 'clojure.core/int 'clojure.core/long 'clojure.core/float
+                   'clojure.core/double 'clojure.core/boolean]]
+      (let [operand (fn [id event]
+                      (list 'do (list 'swap! 'trace 'conj event)
+                            (if cast (list cast id) id)))
+            args (cond-> [(operand 'left :left)]
+                   (= arity 2) (conj (operand 'right :right)))
+            expression (cons operation args)
+            reference (eval (list 'fn '[left right trace] expression))
+            execute (:run (compile-value '[left right trace] expression))
+            inputs (if cast
+                     [[7 40] [-1 33] [123 64] [7 -1] [-1 129] [123 -65]]
+                     [[Long/MIN_VALUE 12] [4294967296 40] [-1 33]
+                      [(byte 7) (short 3)] [(short -1) (byte 2)]
+                      [nil 2] [1.5 2] [(float 1.5) 2] [1N 2] [1/2 2]
+                      [\a 2] [true 2] [1 nil] [1 1.5]
+                      [-1 -1] [Long/MAX_VALUE 2147483688] [Long/MIN_VALUE Long/MAX_VALUE]])]
+        (doseq [[left right] inputs]
+          (let [a (atom []) b (atom [])]
+            (is (= (outcome reference left right a) (outcome execute left right b))
+                (str operation " " cast " " [left right]))
+            (is (= @a @b) "input validation must not cross later operand effects")))))))
+
+(deftest bitwise-width-proof-requires-canonical-core-identity
+  (doseq [head '[clojure.core/bit-xor bit-xor unrelated.numeric/bit-xor]]
+    (is (= (when (= head 'clojure.core/bit-xor) :long)
+           (#'bytecode/infer-arg-stack-type-structural (list head 'left 'right) head {}))))
+  (is (nil? (#'bytecode/infer-arg-stack-type-structural
+             '(clojure.core/bit-xor left right) 'clojure.core/bit-xor
+             {'clojure.core/bit-xor {:type :ref}}))))
+
+(deftest variadic-bitwise-calls-retain-all-operands-and-validation-order
+  (doseq [operation '[clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor]]
+    (let [expression (list operation
+                           '(do (swap! trace conj :left) left)
+                           '(do (swap! trace conj :right) right)
+                           '(do (swap! trace conj :third) third))
+          reference (eval (list 'fn '[left right third trace] expression))
+          execute (:run (compile-value '[left right third trace] expression))
+          outcome (fn [f x y z trace]
+                    (try {:value (f x y z trace)}
+                         (catch Throwable failure {:exception (class failure)})))]
+      (doseq [[x y z] [[7 3 1] [4294967296 -1 4294967296] [nil 2 3] [1 2 1.5]]]
+        (let [a (atom []) b (atom [])]
+          (is (= (outcome reference x y z a) (outcome execute x y z b)))
+          (is (= @a @b)))))))
 
 (deftest product-fields-and-identity-observers-share-original-literal-references
   (doseq [value [(Long/valueOf 1000) (Double/valueOf 5.125) (float 1.25) \a]]
@@ -121,6 +181,118 @@
     (write-field cell)
     (is (identical? token (.val cell)))))
 
+(deftest cached-array-source-roots-do-not-authorize-old-static-bodies
+  (let [source (ns-resolve 'raster.compiler.backend.jvm.object-value-test 'array-boundary-helper_m_doubles)
+        head (symbol (str (:ns (meta source))) (str (:name (meta source))))
+        expression (list head 'input)
+        execute (:run (compile-value '[input] expression))
+        input (double-array [1.0]) cached (double-array [9.0])]
+    (is (identical? input (execute input)))
+    (with-redefs-fn {source (fn [_] cached)}
+      (fn []
+        (is (identical? cached (execute input)))
+        (let [inputs (atom {:static [] :values []})
+              artifact (binding [method-entry/*emission-inputs* inputs]
+                         (compile-value '[input] expression))]
+          (is (identical? cached ((:run artifact) input)))
+          (is (empty? (:static @inputs)) "a replacement root is not its retained body"))))
+    (is (identical? input (execute input)))))
+
+(deftest owned-source-calls-use-the-real-object-abi-not-declared-scalar-tags
+  (let [source (ns-resolve 'raster.compiler.backend.jvm.object-value-test 'object-boundary-helper_m_double)
+        head (symbol (str (:ns (meta source))) (str (:name (meta source))))
+        token (Double. 5.125) calls (atom 0)
+        replacement (fn [_] (swap! calls inc) token)]
+    (with-redefs-fn
+      {source replacement}
+      (fn []
+        ;; Old scalar metadata and registration do not authorize interpreting
+        ;; the replacement body. Only its actual erased invocation is used.
+        (let [inputs (atom {:static [] :values []})
+                artifact (binding [method-entry/*emission-inputs* inputs]
+                           (compile-value '[input] (list head 'input)))]
+            (binding [method-entry/*emission-inputs* inputs]
+              (is (some? (#'bytecode/owned-source-call head ['input] {} {:source-ns *ns*}))))
+            (is (zero? @calls) "neither planning nor compilation invokes the source")
+            (is (identical? token ((:run artifact) (Object.)))
+                "the actual source ABI accepts an Object, irrespective of the logical Double declaration")
+            (is (= 1 @calls))
+            (is (empty? (:static @inputs)))
+            (is (empty? (:definition-proofs @inputs))))))))
+
+(deftest guarded-array-source-calls-use-live-roots
+  (let [source (ns-resolve 'raster.compiler.backend.jvm.object-value-test 'array-boundary-helper_m_doubles)
+        head (symbol (str (:ns (meta source))) (str (:name (meta source))))
+        expression (list head 'input) input (double-array [1.0])
+        compile-owned (fn []
+                        (let [inputs (atom {:static [] :values []})
+                              artifact (binding [method-entry/*emission-inputs* inputs]
+                                         (compile-value '[input] expression))]
+                          {:artifact artifact :inputs inputs}))]
+    (doseq [_ (range 2)]
+      (let [{:keys [artifact inputs]} (compile-owned)]
+        (is (identical? input ((:run artifact) input)))
+        (is (empty? (:static @inputs)) "this route calls the source, not recompiled retained code")
+        (is (empty? (:definition-proofs @inputs)) "the runtime class guard needs no dispatch/body proof")
+        (let [replacement-result (double-array [9.0])]
+          (with-redefs-fn {source (fn [_] replacement-result)}
+            (fn []
+              ;; The actual invocation, not a manual dependency assertion,
+              ;; establishes that a different source Fn class is accepted.
+              (is (identical? replacement-result ((:run artifact) input))))))))
+    (let [metadata (meta source)
+          invalid-cache {:not-an-executable :must-not-be-used}]
+      (try
+        (alter-meta! source assoc :raster.core/deftm-bytecode invalid-cache)
+        (let [{:keys [artifact inputs]} (compile-owned)]
+          (is (identical? invalid-cache (:raster.core/deftm-bytecode (meta source))))
+          (is (empty? (:static @inputs)))
+          (is (identical? input ((:run artifact) input))))
+        (finally
+          (alter-meta! source #(if (contains? metadata :raster.core/deftm-bytecode)
+                                (assoc % :raster.core/deftm-bytecode (:raster.core/deftm-bytecode metadata))
+                                (dissoc % :raster.core/deftm-bytecode))))))))
+
+(deftest guarded-source-receivers-retain-selection-and-trap-order
+  (let [source (ns-resolve 'raster.compiler.backend.jvm.object-value-test 'array-boundary-helper_m_doubles)
+        original @source
+        head (symbol (str (:ns (meta source))) (str (:name (meta source))))
+        expression (list head '(argument))
+        source-fn (eval (list 'fn* '[argument] expression))
+        artifact (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
+                   (compile-value '[argument] expression))
+        input (double-array [1.0]) cached (double-array [9.0])
+        replacement (fn [_] cached)
+        run-case (fn [execute root change-root? throw-argument?]
+                   (let [trace (atom [])
+                         result (with-redefs-fn {source root}
+                                  #(try
+                                     [:value (execute (fn []
+                                                        (swap! trace conj :argument)
+                                                        (when change-root? (alter-var-root source (constantly replacement)))
+                                                        (when throw-argument? (throw (IllegalArgumentException. "operand")))
+                                                        input))]
+                                     (catch Throwable failure [:throw (class failure)])))]
+                     {:result result :trace @trace}))]
+    (doseq [root [original replacement (Object.) nil]
+            change-root? [false true]
+            throw-argument? [false true]]
+      (let [expected (run-case source-fn root change-root? throw-argument?)
+            actual (run-case (:run artifact) root change-root? throw-argument?)]
+        (is (= expected actual))
+        (when (= :value (first (:result expected)))
+          (is (identical? (second (:result expected)) (second (:result actual)))))))
+    (let [code (with-out-str (inspect/disassemble (:bytes artifact) {:method "run"}))
+          helper (first (filter #(= "__raster_source_callable" (str (.methodName %)))
+                                (.methods (.parse (java.lang.classfile.ClassFile/of) ^bytes (:bytes artifact)))))
+          instructions (filter #(instance? java.lang.classfile.Instruction %)
+                               (seq (.get (.code helper))))]
+      (is (re-find #"(?s)INSTANCEOF.*?IFNE.*?INVOKESTATIC.*?__raster_source_callable" code)
+          "the receiver validator is behind the failed concrete-class guard")
+      (is (= ["ALOAD_0" "CHECKCAST" "ARETURN"]
+             (mapv #(str (.opcode ^java.lang.classfile.Instruction %)) instructions))
+          "the cold helper only validates and returns the captured receiver"))))
+
 (deftest object-return-literals-have-owned-reference-lowering
   (doseq [value [(int 1000) (short 3) (byte 2) 1/3
                  (bigint "1208925819614629174706176") (bigdec "1.25")]]
@@ -153,14 +325,15 @@
       (is (= 0 (get-in (materialize (list 'let* [] expression) nil) [:stats :materialized]))))))
 
 (deftest literal-owner-method-name-is-not-a-public-function-slot
-  (is (= :reserved-jvm-method-name
-         (try
-           (bytecode/compile-specialized-class!
-            "raster.compiled.ReservedObjectOwner"
-            [{:name '__raster_literal :params [] :return-tag 'Object
-              :walked-body [nil] :source-ns *ns*}])
-           nil
-           (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+  (doseq [method-name '[__raster_literal __raster_source_callable]]
+    (is (= {:reason :reserved-jvm-method-name :method (str method-name)}
+           (try
+             (bytecode/compile-specialized-class!
+              "raster.compiled.ReservedObjectOwner"
+              [{:name method-name :params [] :return-tag 'Object
+                :walked-body [nil] :source-ns *ns*}])
+             nil
+             (catch clojure.lang.ExceptionInfo failure (ex-data failure)))))))
 
 (deftest object-context-stays-in-selected-result-regions
   (let [value (Double. 5.125)
@@ -218,14 +391,45 @@
         receiver (with-meta 'raster.compiler.backend.jvm.object-value-test/cached-object-result
                    {:tag iface-name :raster.type/tag iface-name :raster.type/ret-tag 'double})
         input (with-meta 'input {:tag 'double})
-        expression [(list '. receiver 'invk input) token]]
+        call (list '. receiver 'invk input)
+        expressions [[call 'expected-value]
+                     (list 'let* ['saved call] ['saved 'saved 'expected-value])
+                     (list 'if true (list 'let* ['saved call] ['saved 'saved 'expected-value]) nil)
+                     (list 'loop* ['i '(int 0)]
+                           (list 'if '(< i 1) '(recur (unchecked-inc-int i))
+                                 (list 'let* ['saved call] ['saved 'saved 'expected-value])))]]
     (try
-      (let [execute (:run (compile-value [input] expression))]
+      (doseq [expression expressions]
+       (let [execute (:run (compile-value [input 'expected-value] expression))
+             source (eval (list 'fn* [input 'expected-value] expression))]
         (doseq [input [1.0 -2.0]]
-          (let [[actual expected] (execute input)]
-            (is (identical? token expected))
-            (is (identical? expected actual)))))
-      (is (= 2 @calls))
+          (let [expected (source input token) actual (execute input token)]
+            (is (= expected actual))
+            (is (every? #(identical? token %) expected))
+            (is (every? #(identical? token %) actual))))))
+      (doseq [expression [(list 'let* ['saved call]
+                                     '(if (clojure.core/identical? saved expected-value) 1 0))
+                          (list 'loop* ['saved call]
+                                '(if (clojure.core/identical? saved expected-value) 1 0))
+                          (list 'loop* [(with-meta 'saved {:raster.type/tag 'double}) call]
+                                '(if (clojure.core/identical? saved expected-value) 1 0))
+                          (list 'loop* ['i '(int 0) 'saved call]
+                                '(if (< i 2)
+                                   (recur (unchecked-inc-int i) saved)
+                                   (if (clojure.core/identical? saved expected-value) 1 0)))]]
+       (let [source (eval (list 'fn* [input 'expected-value] expression))
+            execute (:run (compile-value [input 'expected-value] expression 'long))]
+        (doseq [input [1.0 -2.0]]
+          (is (= 1 (source input token)))
+          (is (= (source input token) (execute input token))))))
+      (let [saved 'saved
+            expression (list 'let* [saved (list 'clojure.core/double call)]
+                             '(clojure.core/identical? saved saved))
+            source (eval (list 'fn* [input] expression))
+            execute (:run (compile-value [input] expression 'boolean))]
+        (is (false? (source 1.0)))
+        (is (= (source 1.0) (execute 1.0))))
+      (is (= 43 @calls))
       (finally (ns-unmap (:ns (meta target)) (:name (meta target)))))))
 
 (deftest initialization-failure-never-returns-a-callable-artifact
