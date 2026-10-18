@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.reverse :as reverse]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
+            [raster.compiler.passes.scalar.inline :as inline]
             [raster.core :as core]
             [raster.par]
             [raster.arrays]
@@ -23,6 +25,89 @@
    {:kind :generated-product-bindings :source-policy {:unchecked-math false}
     :bindings bindings :result result :active-inputs active}
    params {:generated-source-policy {:unchecked-math false}}))
+
+(deftest prepared-program-retains-helper-ownership-until-compilation
+  (let [scope (create-ns (gensym "raster.prepared-helper-owner."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm helper [x :- Double] :- Double (raster.numeric/* x x)))
+        (let [x (typed 'x 'double) result (typed 'result 'double)
+              call (helper-call scope 'helper [x])
+              ;; Preparation must not compile/evaluate the outer program. The
+              ;; existing helper producer may compile its private companion.
+              prepared (with-redefs [source-owner/compile-function
+                                     (fn [& _] (throw (AssertionError. "outer execution compiled during preparation")))]
+                         (#'reverse/prepare-generated-value+grad
+                          {:kind :generated-product-bindings :source-policy {:unchecked-math false}
+                           :bindings [result call] :result result :active-inputs [x]}
+                          [x] {:generated-source-policy {:unchecked-math false}}))
+              {:keys [region companion-port]} (first (:call-regions prepared))
+              capture (some #(when (= companion-port (:port %)) %) (get-in prepared [:source-owner :captures]))]
+          (is (= 1 (count (:call-regions prepared))))
+          (is (identical? call (:original region)))
+          (is (identical? (:value capture) (get-in region [:helper :companion])))
+          (is (= {:unchecked-math false} (get-in prepared [:source-owner :source-policy])))
+          (is (= :unprojected-jvm-source-owner
+                 (try (source-owner/assert-portable-source! prepared)
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+          (let [f (#'reverse/compile-prepared-value+grad prepared)
+                [value pb] (f 3.0)]
+            (is (= 9.0 value))
+            (is (= [12.0] (pb 2.0)))
+            (is (= :ad-generated-seed-carrier
+                   (try (pb (float 1.0))
+                        (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+            (with-redefs-fn {(ns-resolve scope (second call)) (fn [& _] :stale)}
+              #(do (is (thrown? clojure.lang.ExceptionInfo (f 3.0)))
+                   (is (thrown? clojure.lang.ExceptionInfo (pb 1.0))))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest indirect-source-inlining-cannot-drop-private-owner-metadata
+  (let [scope (create-ns (gensym "raster.owner-inline-refusal."))]
+    (try
+      (let [v (intern scope 'owned
+                      (with-meta (fn [x] x)
+                        {:raster.core/deftm-walked-body ['x]
+                         :raster.core/deftm-params ['x]
+                         :raster.core/deftm-tags ['double]
+                         ;; Even a malformed owner must not become unowned source.
+                         :raster.compiler/source-owner nil}))]
+        (is (= :unprojected-jvm-source-owner
+               (try (#'inline/try-resolve-walked-body v)
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is (= :unprojected-jvm-source-owner
+               (try (#'inline/resolve-deftm-for-ad (symbol (str (ns-name scope)) "owned"))
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is (= :unprojected-jvm-source-owner
+               (try (reverse/value+grad v)
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest flat-owned-preparation-keeps-runtime-guards
+  (let [current? (atom true)
+        entered (atom 0)
+        guard (fn [] (when-not @current?
+                       (throw (ex-info "owner changed" {:reason :test-owner-changed}))))
+        prepared {:params ['x] :walked-body ['[x]]
+                  :source-owner {:source-policy {:unchecked-math false} :source-ns *ns*
+                                 :captures [] :reference-bindings {} :methods [] :guard guard}}
+        f (#'reverse/compile-prepared-value+grad prepared)]
+    (is (= [3.0] (f 3.0)))
+    (reset! current? false)
+    (is (= :test-owner-changed
+           (try (f 4.0) (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    ;; Post-call fencing is independent of paired-result carrier validation.
+    (reset! current? true)
+    (let [port 'change-owner
+          f (#'reverse/compile-prepared-value+grad
+             (-> prepared
+                 (assoc :walked-body [(list 'do (list port) '[x])])
+                 (assoc-in [:source-owner :captures]
+                           [{:port port :value #(do (swap! entered inc) (reset! current? false))}])))]
+      (is (= :test-owner-changed
+             (try (f 5.0) (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (= 1 @entered)))))
 
 (deftest paired-helper-unused-input-cotangents-stay-absent-inside-the-owner
   (let [scope (create-ns (gensym "raster.helper-sparse-inputs."))]
