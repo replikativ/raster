@@ -4058,7 +4058,7 @@
                                (Class/forName (.getName interface-class) false loader)))
       (throw (ex-info "paired helper input interface does not match its actual implementation"
                       {:reason :ad-paired-helper-interface :typed-interface typed-interface})))
-    (let [compile-pair (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-impl!)
+    (let [compile-pair (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-entrypoint!)
           revisions (requiring-resolve 'raster.ad.normalized-scalar/revisions)
           capture (requiring-resolve 'raster.ad.normalized-scalar/execution-guard)
           expected (revisions)
@@ -4114,15 +4114,16 @@
                       (method-entry/assert-definition-inputs-current! @proof-inputs)
                       (program-guard))
               _ (guard)
-              companion (binding [*ns* source-ns
+              companion-entrypoint (binding [*ns* source-ns
                                   method-entry/*compilation-classloader* loader]
                           (compile-pair (str "raster.compiled.PairedHelper" (gensym))
                                         params tags 'Object [(:form program)] source-ns interface-class))
+              companion (:implementation companion-entrypoint)
               _ (when-not (.isInstance interface-class companion)
                   (throw (ex-info "paired helper compiler returned a different input interface"
                                   {:reason :ad-paired-helper-interface})))
               _ (guard)
-              result {:companion companion :program program :guard guard
+              result {:companion companion :entrypoint companion-entrypoint :program program :guard guard
                       :emission emission :parameters all-params :active-indices active-indices
                       :active-params active-params :interface-class interface-class :method invocation
                       :dependency-snapshots (:dependency-snapshots emission)

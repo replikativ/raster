@@ -25,6 +25,8 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
@@ -33,6 +35,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.scalar.host-entry-contract :as host-entry]
+            [raster.compiler.passes.scalar.numeric-regions :as numeric-regions]
             [raster.compiler.passes.scalar.peephole :as peephole]))
 
 (def ^:dynamic *simd-preamble*
@@ -889,6 +892,14 @@
   With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
   __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
   [f-var dtype & {:keys [simd? reuse-buffers? no-alias?] :or {simd? false no-alias? true}}]
+  ;; Native compilation owns normalization's definition-dependent premises
+  ;; just like JVM AOT. Start before frontend facts, not after projection: a
+  ;; post-hoc snapshot cannot certify decisions already made from old roots.
+  ;; This is a frozen static artifact; no numerical body executes here. Native
+  ;; library handles use the existing process-global loader and no invocation
+  ;; staging/output arenas have been allocated at this point.
+  (method-entry/call-with-definition-inputs
+   (fn []
   (let [return-tag (:return-tag (pl/deftm-frontend-facts f-var dtype))
         return-type (some-> return-tag dtype/dtype-for-scalar-tag)
         return-class (get types/tag->java-class return-tag)
@@ -901,6 +912,28 @@
         (fused-scalar-form f-var dtype :simd? simd? :no-alias? no-alias?)
         form (recover-rectangular-maps form)
         {nform :form length-syms :length-syms} (normalize-for-c form)
+        ;; Derive proof ports from this native signature's actual scalar ABI,
+        ;; not from the desired dtype of a consumer inside the source region.
+        array-params  (vec (for [p params :when (contains? array-tags (get param-env p))]
+                             [p (elem->ctype (tag->elem (get param-env p)) "double")]))
+        scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
+                             [p (elem->ctype (tag->elem (get param-env p)) "int")]))
+        nform (if (completion/contains-completion? nform)
+                (or (:form (numeric-regions/project-closed-double-region
+                            nform
+                            (into {} (map (fn [[id ct]]
+                                            [id (case ct "double" Double/TYPE "float" Float/TYPE
+                                                      "long" Long/TYPE "int" Integer/TYPE nil)]))
+                                  scalar-params)
+                            (when (= :double return-type) Double/TYPE)
+                            {:on-decline
+                             (fn [{:keys [expression]}]
+                               (throw (ex-info "Native Object use has no closed primitive representation"
+                                               {:reason :unsupported-native-object-region
+                                                :expression expression :form nform})))}))
+                    (throw (ex-info "Native Object values require a closed primitive numeric region"
+                                    {:reason :unsupported-native-object-region :form nform})))
+                nform)
         ;; The lowering pipeline uses hygienic gensyms. Canonicalize the final
         ;; closed-core program before deriving its ABI and C source so equivalent
         ;; compilations receive byte-identical source and can share native cache
@@ -908,12 +941,6 @@
         {nform :form host-value-remap :host-value-remap}
         (canonical-host-projection nform parallel-program params)
         {buffers :buffers unsimplified :stripped} (split-let nform)
-        ;; input array params as [sym ctype] (per-element type), scalars as [sym ctype]
-        array-params  (vec (for [p params :when (contains? array-tags (get param-env p))]
-                             [p (elem->ctype (tag->elem (get param-env p)) "double")]))
-        ;; scalar params typed from their tag (double eps, long n, ...), not all int.
-        scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
-                             [p (elem->ctype (tag->elem (get param-env p)) "int")]))
         ;; Retain access authority BEFORE discharging source assertions. Removing
         ;; an entry guard cannot turn an originally writable argument into const.
         written (written-pointer-syms unsimplified parallel-program
@@ -970,4 +997,4 @@
       {:c-source src :kernel-name kernel-name :native-call-policy :ordinary
        :native-alias-policy (if no-alias? :disjoint :same-region-pointwise)
        :entry-preconditions (:preconditions entry-contract)
-       :native-pointer-access pointer-access})))
+       :native-pointer-access pointer-access})))))

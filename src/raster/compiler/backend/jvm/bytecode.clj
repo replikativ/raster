@@ -5389,7 +5389,7 @@
             bc-info))))))
 
 ;; ================================================================
-;; compile-typed-impl! — replace deftm deftype with bytecode-compiled impl
+;; compile-typed-entrypoint! — actual typed implementation and ABI evidence
 ;; ================================================================
 
 (defn- class-desc-of-class
@@ -5531,9 +5531,37 @@
      :main-body rewritten-body
      :helpers @helpers}))
 
-(defn compile-typed-impl!
+(defn- emit-typed-object-result!
+  "Emit the actual typed wrapper's result completion and describe ONLY that
+   recipe. In particular JVM int-stack Byte/Short/Char returns currently box
+   as Integer; a primitive Class-to-wrapper lookup would claim false evidence."
+  [code ^Class carrier]
+  (let [descriptor (.descriptorString carrier)
+        wrapper (case descriptor
+                  "D" (do (emit-box-to-ref code :double) Double)
+                  "J" (do (emit-box-to-ref code :long) Long)
+                  "F" (do (emit-box-to-ref code :float) Float)
+                  "Z" (let [bool-cd (ClassDesc/of "java.lang" "Boolean")]
+                        (.invokestatic code bool-cd "valueOf"
+                                       (MethodTypeDesc/of bool-cd
+                                                          (into-array ClassDesc [(ClassDesc/ofDescriptor "Z")])))
+                        Boolean)
+                  ("I" "B" "S" "C") (do (emit-box-to-ref code :int) Integer)
+                  "V" (do (.aconst_null code) nil)
+                  nil)]
+    (cond
+      wrapper {:kind :boxed :primitive-carrier carrier :object-carrier wrapper :presence :present
+               :boxing-method (.getMethod ^Class wrapper "valueOf"
+                                          (into-array Class [(if (contains? #{"I" "B" "S" "C"} descriptor)
+                                                               Integer/TYPE carrier)]))}
+      (= "V" descriptor) {:kind :absent :primitive-carrier carrier :presence :absent}
+      :else {:kind :reference :source-carrier carrier :presence :unknown})))
+
+(defn compile-typed-entrypoint!
   "Compile a deftm walked body into a class implementing the typed interface.
-  Returns an instance of the compiled class, or nil on failure.
+  Returns the implementation together with its actual invocation/compute
+  Methods and emitted result-completion recipe. The publishing owner retains
+  this artifact alongside its historical emission-input observations.
 
   The compiled class has a single `invk` method that:
   1. Checkcasts Object params to the types expected by the static method
@@ -5549,6 +5577,7 @@
   ;; and the typed `invk` method as usual; the `invoke(Object…)` overloads
   ;; are skipped (existing guard) and the applyTo path uses a reflective
   ;; fallback into compute_static (emitted below).
+  (binding [me/*compilation-classloader* (compilation-loader)]
   (let [;; Par-extraction splitting: extract par/map! and par/reduce forms into
         ;; separate static methods. Keeps scalar code in the main method.
         ;; Uses size estimate to avoid splitting small bodies unnecessarily.
@@ -5603,6 +5632,13 @@
         compute-params (.getParameterTypes compute-method)
         compute-param-cds (mapv class-desc-of-class compute-params)
         compute-ret-cd (class-desc-of-class (.getReturnType compute-method))
+        guarded-indices (vec (keep (fn [i]
+                                     (let [ipd (.descriptorString ^ClassDesc (nth param-cds i))
+                                           cpd (.descriptorString ^ClassDesc (nth compute-param-cds i))]
+                                       (when (and (= ipd "Ljava/lang/Object;")
+                                                  (typed-interface? cpd)) i)))
+                                   (range (count param-cds))))
+        return-completion (volatile! nil)
         cf (ClassFile/of)
         wrapper-name (str class-name "$TI")
         wdot (.lastIndexOf ^String wrapper-name (int \.))
@@ -5641,13 +5677,6 @@
                                                 (let [pd (.descriptorString ^ClassDesc (nth param-cds i))
                                                       w (if (#{"D" "J"} pd) 2 1)]
                                                   (recur (inc i) (+ slot w) (conj acc slot)))))
-                                guarded-indices (vec (keep (fn [i]
-                                                             (let [ipd (.descriptorString ^ClassDesc (nth param-cds i))
-                                                                   cpd (.descriptorString ^ClassDesc (nth compute-param-cds i))]
-                                                               (when (and (= ipd "Ljava/lang/Object;")
-                                                                          (typed-interface? cpd))
-                                                                 i)))
-                                                           (range (count param-cds))))
                                 emit-load-and-cast
                                 (fn [code]
                                   (loop [slot 1 i 0]
@@ -5686,18 +5715,9 @@
                                                (accept [_ code]
                                                  (if (empty? guarded-indices)
                                                    (do (emit-load-and-cast code)
-                                                       (let [crd (.descriptorString ^ClassDesc compute-ret-cd)]
-                                                         (cond
-                                                           (= crd "D") (emit-box-to-ref code :double)
-                                                           (= crd "J") (emit-box-to-ref code :long)
-                                                           (= crd "F") (emit-box-to-ref code :float)
-                                                           (= crd "Z") (let [bool-cd (ClassDesc/of "java.lang" "Boolean")]
-                                                                         (.invokestatic code bool-cd "valueOf"
-                                                                                        (MethodTypeDesc/of bool-cd (into-array ClassDesc [(ClassDesc/ofDescriptor "Z")]))))
-                                                           (#{"I" "B" "S" "C"} crd) (emit-box-to-ref code :int)
-                                                           (= crd "V") (.aconst_null code)
-                                                           :else nil)
-                                                         (.areturn code)))
+                                                       (vreset! return-completion
+                                                                (emit-typed-object-result! code (.getReturnType compute-method)))
+                                                       (.areturn code))
                               ;; Has IFn__ params — instanceof guard at boundary
                                                    (let [boxed-label (.newLabel code)]
                                                      (doseq [gi guarded-indices]
@@ -5705,18 +5725,9 @@
                                                        (.instanceOf code (nth compute-param-cds gi))
                                                        (.ifeq code boxed-label))
                                                      (emit-load-and-cast code)
-                                                     (let [crd (.descriptorString ^ClassDesc compute-ret-cd)]
-                                                       (cond
-                                                         (= crd "D") (emit-box-to-ref code :double)
-                                                         (= crd "J") (emit-box-to-ref code :long)
-                                                         (= crd "F") (emit-box-to-ref code :float)
-                                                         (= crd "Z") (let [bool-cd (ClassDesc/of "java.lang" "Boolean")]
-                                                                       (.invokestatic code bool-cd "valueOf"
-                                                                                      (MethodTypeDesc/of bool-cd (into-array ClassDesc [(ClassDesc/ofDescriptor "Z")]))))
-                                                         (#{"I" "B" "S" "C"} crd) (emit-box-to-ref code :int)
-                                                         (= crd "V") (.aconst_null code)
-                                                         :else nil)
-                                                       (.areturn code))
+                                                     (vreset! return-completion
+                                                              (emit-typed-object-result! code (.getReturnType compute-method)))
+                                                     (.areturn code)
                                 ;; Boxed fallback
                                                      (.labelBinding code boxed-label)
                                                      (emit-var-constant! code (or fallback-ns (str (ns-name source-ns))) (or fallback-name (str class-name)))
@@ -5797,7 +5808,12 @@
                                                              (.checkcast code bool-cd)
                                                              (.invokevirtual code bool-cd "booleanValue"
                                                                              (MethodTypeDesc/of (ClassDesc/ofDescriptor "Z") no-cd)))
-                                                           (#{"I" "B" "S" "C"} cpd)
+                                                           (= cpd "C")
+                                                           (let [char-cd (ClassDesc/of "java.lang" "Character")]
+                                                             (.checkcast code char-cd)
+                                                             (.invokevirtual code char-cd "charValue"
+                                                                             (MethodTypeDesc/of (ClassDesc/ofDescriptor "C") no-cd)))
+                                                           (#{"I" "B" "S"} cpd)
                                                            (do (.checkcast code number-cd)
                                                                (.invokevirtual code number-cd "intValue"
                                                                                (MethodTypeDesc/of I-cd no-cd)))
@@ -5880,9 +5896,21 @@
                                                      (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
                                                      (.areturn code))))))))))
         loader (compilation-loader)
-        wrapper-class (.defineClass loader wrapper-name bytes nil)]
-    (.newInstance (.getDeclaredConstructor wrapper-class (into-array Class []))
-                  (into-array Object []))))
+        wrapper-class (.defineClass loader wrapper-name bytes nil)
+        implementation (.newInstance (.getDeclaredConstructor wrapper-class (into-array Class []))
+                                     (into-array Object []))
+        _ (when-not (.isInstance iface-class implementation)
+            (throw (ex-info "Typed entrypoint linked a different interface Class"
+                            {:reason :raster/bug :rule :typed-entrypoint-interface
+                             :interface iface-class :implementation-class wrapper-class})))]
+    {:implementation implementation
+     :invocation-method (.getMethod wrapper-class "invk" iface-param-types)
+     :compute-owner statics-class
+     :compute-method compute-method
+     :return-completion (if (seq guarded-indices)
+                          {:kind :guarded :compute-return @return-completion
+                           :guarded-indices guarded-indices :presence :unknown}
+                          @return-completion)})))
 
 ;; ================================================================
 ;; compile-pipeline! — batch recompilation into a single class

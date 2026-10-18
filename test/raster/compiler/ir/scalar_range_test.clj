@@ -3,6 +3,35 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.scalar-range :as ranges]))
 
+(deftest dyadic-specialization-domains-are-reusable-and-representable
+  (doseq [type [:byte :int :long]
+          [value expected] [[0 {:lower 0 :upper 0}]
+                            [1 {:lower 1 :upper 1}]
+                            [3 {:lower 1 :upper 4}]
+                            [4 {:lower 1 :upper 4}]
+                            [5 {:lower 1 :upper 8}]
+                            [-3 {:lower -4 :upper -1}]
+                            [-4 {:lower -4 :upper -1}]
+                            [-5 {:lower -8 :upper -1}]]]
+    (is (= expected (ranges/dyadic-domain value type))))
+  (doseq [type [:byte :int :long]
+          :let [{minimum :lower maximum :upper} (ranges/for-dtype type)]]
+    (is (= {:lower minimum :upper -1} (ranges/dyadic-domain minimum type)))
+    (is (= {:lower 1 :upper maximum} (ranges/dyadic-domain maximum type)))
+    (doseq [value [(dec (bigint minimum)) (inc (bigint maximum)) nil 1.0 'n]]
+      (is (nil? (ranges/dyadic-domain value type)))))
+  (doseq [type [:float :double :half]]
+    (is (nil? (ranges/dyadic-domain 3 type))))
+  (doseq [type [:boolean nil]]
+    (is (= :unknown-dtype
+           (try (ranges/dyadic-domain 3 type) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+  (doseq [value (range -128 128)
+          :let [{:keys [lower upper] :as domain} (ranges/dyadic-domain value :byte)]]
+    (is (<= -128 lower value upper 127))
+    (is (= domain (ranges/dyadic-domain (if (neg? value) lower upper) :byte)))
+    (is (or (= lower upper 0) (pos? lower) (neg? upper)))))
+
 (deftest counted-loop-proof-includes-the-terminal-increment
   (doseq [[lower upper step terminal]
           [[0 8 1 8] [0 8 3 9] [8 8 3 8] [9 8 3 9] [-5 4 3 4]
@@ -70,15 +99,19 @@
                                       1 :inclusive)))
   (is (zero? (ranges/counted-loop-trips 1 0 1 :inclusive))))
 
-(deftest quotient-proof-requires-a-positive-constant-divisor
+(deftest quotient-proof-requires-a-strictly-positive-divisor-interval
   (doseq [lo (range -9 10) hi (range lo 10) divisor [1 2 7]]
     (let [proof (ranges/quotient [{:lower lo :upper hi}
                                  {:lower divisor :upper divisor}])]
       (is (every? #(<= (:lower proof) (quot % divisor) (:upper proof))
                   (range lo (inc hi))))))
   (doseq [divisor [nil {:lower 0 :upper 0} {:lower -1 :upper -1}
-                   {:lower -1 :upper 1} {:lower 1 :upper 2}]]
-    (is (nil? (ranges/quotient [(ranges/for-dtype :long) divisor])))))
+                   {:lower -1 :upper 1} {:lower 0 :upper 2}]]
+    (is (nil? (ranges/quotient [(ranges/for-dtype :long) divisor]))))
+  (doseq [lo (range -5 6) hi (range lo 6) lower (range 1 4) upper (range lower 5)]
+    (let [proof (ranges/quotient [{:lower lo :upper hi} {:lower lower :upper upper}])
+          actual (for [n (range lo (inc hi)) d (range lower (inc upper))] (quot n d))]
+      (is (= {:lower (reduce min actual) :upper (reduce max actual)} proof)))))
 
 (deftest typed-index-ranges-cover-every-small-domain-value
   (doseq [width [1 2 7 12] divisor [1 2 3 5]

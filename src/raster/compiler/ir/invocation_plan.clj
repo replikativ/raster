@@ -366,7 +366,8 @@
       (let [source-value (get values (:source step))]
         (when-not (and (= 1 (count operands))
                        (= (:source step) (first operand-values))
-                       (compatible-value? source-value value))
+                       (compatible-value? source-value value)
+                       (av/scalar-domain-implies? source-value value))
           (fail! :invocation-value-alias
                  "value alias requires one storage-compatible earlier value"
                  {:step id :source (:source step) :value value}))))
@@ -513,7 +514,9 @@
                {:values (set missing)}))
       (doseq [{program-value :program-value invocation-value :invocation-value}
               (concat bindings ordinary-storage)]
-        (when-not (compatible-value? (get values program-value) (get values invocation-value))
+        (when-not (and (compatible-value? (get values program-value) (get values invocation-value))
+                       (av/scalar-domain-implies? (get values invocation-value)
+                                                  (get values program-value)))
           (fail! :invocation-program-input-contract
                  "public materialization differs from the internal program value contract"
                  {:program-value program-value :invocation-value invocation-value

@@ -7,6 +7,31 @@
 (defn- scalar [dtype]
   (av/tensor {:dtype dtype :shape []}))
 
+(deftest scalar-domain-flow-requires-a-strong-enough-producer
+  (let [bounded (fn [domain]
+                  (av/tensor {:dtype :long :shape []
+                              :attributes (if domain {:scalar-domain domain} {})}))
+        required (bounded {:lower 2 :upper 8})
+        direct (fn [offered]
+                 (invocation/from-prefix
+                  {:id :direct-domain :parameters '[n] :parameter-values {'n offered}
+                   :bindings [] :binding-values {} :program-values {'n required}
+                   :program-inputs '[n] :program-outputs '[n]}))]
+    (doseq [offered [(bounded nil) (bounded {:lower 0 :upper 10})]]
+      (is (= :invocation-program-input-contract
+             (try (direct offered) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (doseq [offered [required (bounded {:lower 3 :upper 7})]]
+      (is (invocation/invocation-plan? (direct offered))))
+    (is (= :invocation-value-alias
+           (try (invocation/from-prefix
+                 {:id :alias-domain :parameters '[n] :parameter-values {'n (bounded nil)}
+                  :bindings '[[alias n]] :binding-values {'alias required}
+                  :program-values {'alias required} :program-inputs '[alias]
+                  :program-outputs '[alias]})
+                nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        "an alias cannot manufacture a tighter domain without a guard")))
+
 (deftest wrapping-casts-are-not-shape-identities
   (is (= 'xs (#'invocation/shape-source '(clojure.core/long (alength xs)))))
   (is (nil? (#'invocation/shape-source '(clojure.core/unchecked-int (alength xs))))))

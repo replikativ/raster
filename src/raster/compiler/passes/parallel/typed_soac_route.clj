@@ -1834,7 +1834,7 @@
    (attempt form dtype array-types {}))
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
                                    resident-uniform-input-loads?
-                                   scalar-types values abstract-machine segmented-plans?
+                                   scalar-types values abstract-machine segmented-plans? public-parameters
                                    preserve-declared-array-storage? host-scalars?]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
@@ -1843,6 +1843,7 @@
        (try
          (let [frontend-options {:dtype dtype :array-types array-types
                                  :scalar-types scalar-types :values values
+                                 :public-parameters public-parameters
                                  :host-scalars? host-scalars?
                                  :segmented-plans? segmented-plans?
                                  :preserve-declared-array-storage? preserve-declared-array-storage?}

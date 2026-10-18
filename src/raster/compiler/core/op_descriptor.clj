@@ -53,9 +53,10 @@
 
 (defonce ^:private auto-buffer-cache (atom {}))
 
-(defn- array-alloc-size
+(defn array-alloc-size
   "If form is a pure array allocation, return the size expression. Nil otherwise.
-   Does NOT match aclone (copy, not pure allocation)."
+   Does NOT match aclone (copy, not pure allocation). Shared with source extent
+   obligation analysis; recognizing an extent is not proof that it is valid."
   [form]
   ;; Only the existing exact core identities and size-only overload are enough
   ;; evidence. Suffixes, initializer/copy overloads and shape-helper calls do not

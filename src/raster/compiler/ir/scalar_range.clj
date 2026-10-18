@@ -57,6 +57,22 @@
              {:lower (reduce min products) :upper (reduce max products)})
         nil))))
 
+(defn dyadic-domain
+  "Choose a reusable same-sign power-of-two input domain containing one value.
+   The range is clipped to the declared integral dtype. It is a proposed
+   specialization contract, NOT proof until the invocation boundary guards it."
+  [value type]
+  (when-let [{minimum :lower maximum :upper} (for-dtype type)]
+    (when (and (integer? value) (literal value type))
+      (if (zero? value)
+        {:lower 0 :upper 0}
+        (let [magnitude (if (neg? value) (-' value) value)
+              bits (.bitLength (biginteger (dec magnitude)))
+              bound (bigint (.shiftLeft java.math.BigInteger/ONE bits))]
+          (if (pos? value)
+            {:lower 1 :upper (long (min maximum bound))}
+            {:lower (long (max minimum (-' bound))) :upper -1}))))))
+
 (defn counted-loop-trips
   "Exact trip count for static positive-step loops; unknown bounds decline. Proof arithmetic is
    unbounded, including an inclusive endpoint at the maximum finite-width integer."
@@ -136,19 +152,26 @@
             :upper (reduce max (map :upper operands))}
       nil)))
 
+(defn strictly-positive-integral-divisor?
+  "Whether an integral divisor interval excludes zero and the signed MIN/-1 case."
+  [interval]
+  (and interval (integer? (:lower interval)) (integer? (:upper interval))
+       (<= 1 (:lower interval) (:upper interval))))
+
 (defn quotient
-  "Interval transfer for truncating quotient by one statically positive divisor.
+  "Interval transfer for truncating quotient over a strictly positive divisor interval.
 
   Truncation toward zero is monotone for a positive divisor, including negative numerators.  We
-  intentionally require an exact divisor literal/range: a zero or sign-varying denominator has
-  distinct exceptional semantics and carries no schedule proof here."
+  A zero, negative or sign-varying denominator carries no proof here. Bounds
+  are extrema at interval corners; no finite-width arithmetic is used by the proof."
   [operands]
   (when (every? some? operands)
-    (let [[numerator divisor] operands
-          divisor-value (:lower divisor)]
-      (when (and (= divisor-value (:upper divisor)) (pos? divisor-value))
-        {:lower (quot (:lower numerator) divisor-value)
-         :upper (quot (:upper numerator) divisor-value)}))))
+    (let [[numerator divisor] operands]
+      (when (and (<= (:lower numerator) (:upper numerator))
+                 (strictly-positive-integral-divisor? divisor))
+        (let [corners (for [n [(:lower numerator) (:upper numerator)]
+                           d [(:lower divisor) (:upper divisor)]] (quot n d))]
+          {:lower (reduce min corners) :upper (reduce max corners)})))))
 
 (defn typed-index-range
   "Conditional interval proof for a bounded typed index tree.

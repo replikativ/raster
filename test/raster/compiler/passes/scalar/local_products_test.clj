@@ -4,6 +4,7 @@
             [raster.numeric :as n]
             [raster.ad.reverse :as reverse]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.local-products :as products]))
 
 (deftm projected-product [x :- Double] :- Double
@@ -14,8 +15,62 @@
 
 (deftm scalar-square [x :- Double] :- Double (n/* x x))
 
+(deftest product-liveness-closes-before-gpu-typedness
+  (let [x (with-meta 'x {:raster.type/tag 'double})
+        result (with-meta 'result {:raster.type/tag 'double})
+        source (list 'let* ['product [nil x] result '(clojure.core/nth product 1)] result)
+        output (:form (#'pipeline/pass-fixpoint
+                       source {:param-env {'x 'double} :source-ns *ns*
+                               :target-device :ocl:0}))
+        completions (keep completion/canonical-parts (tree-seq coll? seq output))]
+    (is (= 1 (count completions)))
+    (is (= x (:operand (first completions)))
+        "the live Object context remains; no invented primitive replacement")
+    (is (= completion/object-input-contract (:contract (first completions))))
+    (let [source-fn (eval (list 'fn '[x] source))
+          output-fn (eval (list 'fn '[x] (completion/project-to-jvm-source output)))]
+      (doseq [value [-0.0 3.125 nil]]
+        (is (identical? (source-fn value) (output-fn value)))))))
+
 (deftm scalar-square-gradient [x :- Double] :- Double
   (nth ((reverse/value+grad #'scalar-square) x) 1))
+
+(deftm repeated-field-identity [x :- Double] :- Long
+  (let [product [(n/* x 2.0)]]
+    (if (identical? (nth product 0) (nth product 0)) 1 0)))
+
+(deftm repeated-primitive-field-identity [x :- Double] :- Long
+  (let [product [(double x)]]
+    (if (identical? (nth product 0) (nth product 0)) 1 0)))
+
+(deftm repeated-field-with-unrelated-source-call [x :- Double] :- Long
+  (let [product [(double x)]]
+    (if (completion/source-policy? {:unchecked-math false})
+      (if (identical? (nth product 0) (nth product 0)) 1 0)
+      -1)))
+
+(deftest projected-fields-preserve-their-original-object-materialization
+  (doseq [field ['(clojure.core/long 1000) '(clojure.core/double 5.125)]]
+    (let [source (list 'let* ['product [field]]
+                       '(clojure.core/identical? (clojure.core/nth product 0)
+                                                 (clojure.core/nth product 0)))
+          lowered (products/lower-local-products source)]
+      (is (true? (eval source)))
+      (is (= (eval source) (eval (completion/project-to-jvm-source lowered)))
+          "repeated projections observe the one object originally stored in the product"))))
+
+(deftest compiled-projected-fields-preserve-object-materialization
+  (doseq [source [#'repeated-field-identity #'repeated-primitive-field-identity
+                  #'repeated-field-with-unrelated-source-call]]
+    (let [compiled (pipeline/compile-aot source :target :jvm)]
+      (doseq [x [500.0 2.5625]]
+        (is (= 1 (source x)))
+        (is (= (source x) (compiled x)))))))
+
+(deftest source-ad-consumes-completed-product-fields
+  (let [paired (reverse/value+grad #'projected-product)]
+    (doseq [x [-2.0 0.0 3.0]]
+      (is (= [(* 3.0 x) 3.0] (paired x))))))
 
 (deftest scalar-ad-fanin-compiles-through-the-shared-native-and-jvm-front-end
   (doseq [target [:jvm :c]]
@@ -36,7 +91,43 @@
                    (.close ^java.lang.AutoCloseable compiled)))))))
 
 (defn- run [expression & arguments]
-  (apply (eval (list 'fn* '[x calls] expression)) arguments))
+  (apply (eval (list 'fn* '[x calls] (completion/project-to-jvm-source expression))) arguments))
+
+(deftest actual-array-producers-need-no-object-boxing
+  (let [source '(let* [a (do (swap! calls inc) (clojure.core/double-array 2))
+                       p [a a]
+                       ignored (clojure.core/aset a 0 (double x))]
+                 [(clojure.core/identical? (clojure.core/nth p 0) a)
+                  (clojure.core/identical? (clojure.core/nth p 0) (clojure.core/nth p 1))
+                  (clojure.core/aget (clojure.core/nth p 1) 0)])
+        lowered (products/lower-local-products source)]
+    (is (not (completion/contains-completion? lowered)))
+    (doseq [x [-0.0 3.125]]
+      (let [a (atom 0) b (atom 0)]
+        (is (= [true true x] (run source x a) (run lowered x b)))
+        (is (= 1 @a @b) "construction still evaluates exactly once"))))
+  (let [completed (completion/complete-value completion/object-input-contract 'a)
+        source (list 'let* ['a '(clojure.core/double-array 2) 'saved completed] 'saved)
+        lowered (products/lower-local-products source)]
+    (is (not (completion/contains-completion? lowered)))
+    (is (= [0.0 0.0] (vec (run lowered nil nil)))))
+  (let [hinted (with-meta 'x {:raster.type/tag 'doubles})
+        source (list 'let* ['p [hinted]] '(clojure.core/nth p 0))]
+    (is (completion/contains-completion? (products/lower-local-products source))
+        "an annotation on an unknown input is not an array producer proof"))
+  (let [source '(let* [a (do (swap! calls inc) (clojure.core/double-array (long x)))
+                       p [a]] (clojure.core/nth p 0))
+        lowered (products/lower-local-products source)
+        a (atom 0) b (atom 0)]
+    (is (thrown? NegativeArraySizeException (run source -1 a)))
+    (is (thrown? NegativeArraySizeException (run lowered -1 b)))
+    (is (= 1 @a @b) "reference projection does not erase failing construction"))
+  (doseq [contract [(completion/reference-check-contract String)
+                    (completion/primitive-input-contract Long/TYPE {:unchecked-math false})]]
+    (let [source (list 'let* ['a '(clojure.core/double-array 2)
+                              'saved (completion/complete-value contract 'a)] 'saved)]
+      (is (completion/contains-completion? (products/lower-local-products source))
+          "an array producer does not discharge a distinct conversion contract"))))
 
 (deftest scalar-accumulation-lowering-requires-independent-present-carriers
   (let [source '(let* [left (clojure.core/double x)
@@ -55,6 +146,43 @@
                   '(raster.ad.reverse/grad-acc [1.0] [2.0])]]
     (is (= source (products/lower-local-products source))
         "unknown, absent, mixed-width and product operands are not scalar proofs")))
+
+(deftest object-completion-transports-facts-without-erasing-materialization
+  (let [completed #(completion/complete-value completion/object-input-contract %)
+        source (list 'let* ['a '(clojure.core/double x)
+                           'b '(clojure.core/double 2.0)
+                           'saved-a (completed 'a)
+                           'saved-b (completed 'b)]
+                     '(raster.ad.reverse/grad-acc saved-a saved-b))
+        lowered (products/lower-local-products source)]
+    (is (some #{'clojure.core/+} (tree-seq coll? seq lowered)))
+    (is (not-any? #{'raster.ad.reverse/grad-acc} (tree-seq coll? seq lowered)))
+    (is (= 2 (count (filter completion/canonical-form? (tree-seq coll? seq lowered))))
+        "producer facts do not authorize dropping either Object completion")
+    (doseq [x [-0.0 0.0 Math/PI]]
+      (is (= (run source x nil) (run lowered x nil))))
+    (is (thrown? NullPointerException (run lowered nil nil))))
+  (let [source (list 'let* ['saved (completion/complete-value completion/object-input-contract 'x)]
+                     '(if (clojure.core/nil? saved) :absent :present))
+        lowered (products/lower-local-products source)]
+    (is (= source lowered) "unknown Object input does not become a present scalar")
+    (doseq [x [nil false 1.0]]
+      (is (= (run source x nil) (run lowered x nil))))))
+
+(deftest completed-facts-do-not-cross-a-conversion-or-hide-mixed-widths
+  (doseq [[left right]
+          [[(completion/complete-value completion/object-input-contract '(clojure.core/float x))
+            (completion/complete-value completion/object-input-contract '(clojure.core/double 2.0))]
+           [(completion/complete-value
+             (completion/primitive-input-contract Double/TYPE {:unchecked-math false})
+             '(clojure.core/float x))
+            (completion/complete-value completion/object-input-contract '(clojure.core/double 2.0))]]]
+    (let [source (list 'let* ['left left 'right right]
+                       '(raster.ad.reverse/grad-acc left right))
+          lowered (products/lower-local-products source)]
+      (is (some #{'raster.ad.reverse/grad-acc} (tree-seq coll? seq lowered)))
+      (is (= source lowered)
+          "Object alias analysis neither guesses conversion results nor homogenizes widths"))))
 
 (deftest scalar-accumulation-does-not-change-effects-or-association
   (let [source '(let* [a (clojure.core/double (do (swap! calls conj :a) x))

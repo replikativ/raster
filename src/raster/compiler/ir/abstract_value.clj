@@ -5,7 +5,8 @@
    placement and sharding constraints. It deliberately contains no BufferView or backend handle.
    Physical realization is a later concern; one logical value may become one dense buffer or an
    ordered tree of packed/scale/index buffers without teaching the allocator its numeric format."
-  (:require [raster.compiler.core.dtype :as dtype]))
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.scalar-range :as scalar-range]))
 
 (def value-kinds #{:tensor :record :opaque})
 
@@ -64,7 +65,23 @@
                       {:reason :abstract-value-effects :effects effects})))
     (when-not (map? attributes)
       (throw (ex-info "abstract value attributes must be a map"
-                      {:reason :abstract-value-attributes :attributes attributes}))))
+                      {:reason :abstract-value-attributes :attributes attributes})))
+    ;; This is a semantic entry/value precondition, not descriptive range
+    ;; evidence. Consumers may use it only where the matching invocation
+    ;; boundary enforces it. No domain is inferred from a name or shape use.
+    (when (contains? attributes :scalar-domain)
+      (let [domain (:scalar-domain attributes)
+            scalar-type (when (and (keyword? dtype) (dtype/known? dtype))
+                          (dtype/canon dtype))]
+        (when-not (and (= :tensor kind) (= [] shape) (some? scalar-type)
+                       (some? (scalar-range/for-dtype scalar-type))
+                       (map? domain) (= #{:lower :upper} (set (keys domain)))
+                       (integer? (:lower domain)) (integer? (:upper domain))
+                       (<= (:lower domain) (:upper domain))
+                       (scalar-range/contained-in-dtype? domain scalar-type))
+          (throw (ex-info "scalar domain must be a closed integral interval within its scalar dtype"
+                          {:reason :abstract-value-scalar-domain
+                           :dtype dtype :shape shape :domain domain}))))))
   value)
 
 (defn make
@@ -100,21 +117,35 @@
   [left right]
   (= (storage-contract left) (storage-contract right)))
 
+(defn scalar-domain-implies?
+  "Whether a source's declared domain entails a consumer's required domain.
+   This proves only interval implication, not storage compatibility or ownership
+   of an entry guard. An unrestricted producer cannot satisfy a narrower consumer."
+  [source target]
+  (validate! source)
+  (validate! target)
+  (let [offered (get-in source [:attributes :scalar-domain])
+        required (get-in target [:attributes :scalar-domain])]
+    (or (nil? required)
+        (and (some? offered)
+             (<= (:lower required) (:lower offered))
+             (<= (:upper offered) (:upper required))))))
+
 (defn- unknown-dimension?
   [dimension]
   (and (seq? dimension) (= 'unknown-dimension (first dimension)) (= 2 (count dimension))))
 
 (defn merge-refinement
-  "Join two facts for the same SSA value when they differ only by unknown shape dimensions.
+  "Refine facts for one SSA value by known shape dimensions and scalar-domain intersection.
 
    A concrete/static/symbolic dimension refines `(unknown-dimension id)`; two distinct known
-   dimensions remain a contradiction. All non-shape AbstractValue facets must agree exactly, so
-   this is a checked information refinement rather than dtype/layout/ownership inference. Returns
-   nil when neither value refines the other."
+   dimensions remain a contradiction. Other facets must agree exactly; disjoint domains conflict.
+   This combines constraints, not evidence that an input guard or a producer established them."
   [left right]
   (let [left (validate! left)
         right (validate! right)]
-    (when (and (= (assoc left :shape []) (assoc right :shape []))
+    (when (and (= (-> left (assoc :shape []) (update :attributes dissoc :scalar-domain))
+                   (-> right (assoc :shape []) (update :attributes dissoc :scalar-domain)))
                (= (count (:shape left)) (count (:shape right))))
       (let [shape (mapv (fn [left-dimension right-dimension]
                           (cond
@@ -122,6 +153,13 @@
                             (unknown-dimension? left-dimension) right-dimension
                             (unknown-dimension? right-dimension) left-dimension
                             :else ::conflict))
-                        (:shape left) (:shape right))]
-        (when-not (some #{::conflict} shape)
-          (assoc left :shape shape))))))
+                        (:shape left) (:shape right))
+            a (get-in left [:attributes :scalar-domain])
+            b (get-in right [:attributes :scalar-domain])
+            domain (if (and a b)
+                     {:lower (max (:lower a) (:lower b)) :upper (min (:upper a) (:upper b))}
+                     (or a b))]
+        (when (and (not (some #{::conflict} shape))
+                   (or (nil? domain) (<= (:lower domain) (:upper domain))))
+          (cond-> (assoc left :shape shape)
+            domain (assoc-in [:attributes :scalar-domain] domain)))))))

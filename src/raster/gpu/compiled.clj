@@ -28,6 +28,8 @@
             [raster.compiler.build-manifest :as build-manifest]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
@@ -1032,6 +1034,31 @@
      :projection {:in-tree in-tree :out-tree out-tree
                   :donated (donated-output-keys request)}}))
 
+(defn- guarded-integral-input-options
+  "Select reusable guarded domains from captured, declared integral inputs.
+   Explicit caller value contracts remain authoritative. No numerical body or
+   array contents are evaluated and no scalar is replaced by a source literal."
+  [fn-var arguments dtype options]
+  (let [{:keys [params projection]} (equation-first/parameter-representation fn-var dtype)
+        parameters (mapv :sym params)
+        leaves (or (:physical-parameters projection)
+                   (mapv (fn [{:keys [sym tag]}] {:symbol sym :tag tag}) params))
+        tags (into {} (map (juxt :sym :tag)) params)
+        arguments (materialization/project-arguments parameters projection arguments)
+        values (reduce
+                (fn [values [{:keys [symbol tag]} argument]]
+                  (let [type (dtype/dtype-for-scalar-tag (or tag (get tags symbol)))]
+                    (if (and type (scalar-range/for-dtype type)
+                             (not (contains? values symbol)))
+                      (let [value (av/tensor {:dtype type :shape []})
+                            actual (:value (materialization/checked-scalar-value symbol value argument))]
+                        (assoc values symbol
+                               (assoc-in value [:attributes :scalar-domain]
+                                         (scalar-range/dyadic-domain actual type))))
+                      values)))
+                (or (:values options) {}) (map vector leaves arguments))]
+    (cond-> options (seq values) (assoc :values values))))
+
 (defn- lower-equation-first
   [fn-var args {:keys [target dtype donate constants outputs taps roles]
                 :or {target :ze:0 dtype :float}
@@ -1048,6 +1075,7 @@
                                    [:compiler :donate :constants :outputs :taps :roles
                                     :profile? :on-non-resident])
         compilation-options (merge compilation-options caller-math-options {:target target :dtype dtype})
+        compilation-options (guarded-integral-input-options fn-var args dtype compilation-options)
         compilation-options (cond-> compilation-options
                               (contains? compilation-options :schedule)
                               (update :schedule gpu-schedule/normalize-override))
@@ -1135,6 +1163,10 @@
    `:compiler :equation-first` selects the typed SOAC→scheduled KernelBody→LinkPlan vertical.
    `:resident-descriptor` remains the default during migration. Selection is explicit: the
    equation-first compiler never falls back to a resident descriptor after a coverage failure.
+
+   Equation-first preparation selects reusable, guarded power-of-two domains for captured
+   integral scalar inputs. Scalars remain runtime values; explicit `:values` contracts take
+   precedence. Low-level compilation without arguments cannot infer these entry domains.
 
    Equation-first aggregate roles/constants may name a logical root or an exact vector field path.
    Written aggregate leaves require explicit `:state` intent. `:outputs` accepts exact vector paths

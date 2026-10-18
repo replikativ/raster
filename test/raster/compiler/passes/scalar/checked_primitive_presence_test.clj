@@ -3,6 +3,7 @@
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
             [raster.compiler.passes.scalar.local-products :as products]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.value-completion :as completion]
             [raster.core :refer [deftm]]
             [raster.numeric :as n]))
 
@@ -56,5 +57,6 @@
                       '[v0 1.0] (range 1 10))
         source (list 'let* pairs 'v9)
         lowered (products/lower-local-products source)]
-    (is (= -1.0 ((eval (list 'fn* [] source))) ((eval (list 'fn* [] lowered)))))
+    (is (= -1.0 ((eval (list 'fn* [] source)))
+           ((eval (list 'fn* [] (completion/project-to-jvm-source lowered))))))
     (is (not-any? #{'if 'clojure.core/nil? 'clojure.core/nth} (tree-seq coll? seq lowered)))))

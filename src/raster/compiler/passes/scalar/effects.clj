@@ -6,10 +6,11 @@
    effectful (:io). Only expressions beichte proves pure get :pure.
 
    Source operations may additionally carry semantic obligations which are not
-   external effects. In particular, op-descriptor's checked integral casts can
-   throw. Such expressions retain Beichte's effect level but carry a flag so
+   external effects. Checked integral casts/arithmetic and allocation extent
+   validation can throw. Such expressions retain Beichte's effect level but carry a flag so
    DCE, CSE and algebraic simplification cannot erase or duplicate the possible
-   exceptional control transfer.
+   exceptional control transfer. These denial flags are not a complete
+   totality analysis for arbitrary helpers or control flow.
 
    The raster context pre-registers raster.numeric and raster.math vars
    as :pure so beichte doesn't need to analyze their source each time."
@@ -17,12 +18,15 @@
             [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ir.form :as form]))
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.scalar-range :as scalar-range]))
 
 (defonce ^:private raster-context
   (delay
@@ -196,6 +200,66 @@
                         (conj :source-reference-cast))))))
          (tree-seq coll? seq expr))))
 
+(defn- source-evaluation-flags
+  "Known exceptional evaluation obligations, independent of external purity.
+   Read retained producer dtypes, source overflow policy and the same scalar
+   range/constructor authorities as lowering. These are denial flags, not a
+   totality certificate for arbitrary helpers, accesses or control flow."
+  [expr]
+  (into #{}
+        (mapcat
+         (fn [node]
+           (when (seq? node)
+             (let [operation (descriptor/semantic-op node)
+                   arguments (vec (descriptor/call-args node))
+                   source-type (or (some-> (types/sym-type-tag node) dtype/dtype-for-scalar-tag)
+                                   (when (and (seq arguments)
+                                              (every? #(= 'long (types/literal-tag %)) arguments))
+                                     :long))
+                   integral? (intrinsics/integral-arithmetic? operation source-type)
+                   division? (intrinsics/source-divisor-check? operation source-type)
+                   divisor (when (and division? (= 2 (count arguments)))
+                             (numeric-constant/value (second arguments)))
+                   divisor-range (when (and divisor (integer? (:value divisor)))
+                                   (scalar-range/literal (:value divisor) source-type))
+                   literal-range
+                   (when (and integral? (= 2 (count arguments)))
+                     (scalar-range/arithmetic
+                      (intrinsics/canonical operation)
+                      (mapv (fn [argument]
+                              (when-let [{:keys [value]} (numeric-constant/value argument)]
+                                (when (integer? value) (scalar-range/literal value source-type))))
+                            arguments)))
+                   extent (descriptor/array-alloc-size node)
+                   constant-extent (when (some? extent) (numeric-constant/value extent))]
+               (cond-> []
+                 (and integral?
+                      (not= :wrap (intrinsics/source-overflow-policy operation))
+                      (not (scalar-range/contained-in-dtype? literal-range source-type)))
+                 (conj :checked-source-arithmetic)
+                 (and division?
+                      (not (and (intrinsics/integral-division? operation source-type)
+                                (scalar-range/strictly-positive-integral-divisor? divisor-range))))
+                 (conj :checked-source-division)
+                 ;; Clojure's Number-size constructors use Number.intValue,
+                 ;; not a checked long->int cast. Match that actual narrowing:
+                 ;; e.g. 2^32 requests zero elements, not a negative-size error.
+                 ;; Unknown extents retain validation; positive literal extents
+                 ;; remain removable (resource exhaustion is not modeled here).
+                 (and (some? extent)
+                      (not (and constant-extent (number? (:value constant-extent))
+                                (not (neg? (.intValue ^Number (:value constant-extent)))))))
+                 (conj :source-array-extent)
+                 ;; A storage/allocation facet is not a totality promise for
+                 ;; an allocator helper (or another constructor overload).
+                 ;; Preserve its checks until a source/entry-domain proof can
+                 ;; expose and discharge them, rather than guessing by a name.
+                 (and (descriptor/alloc-op? operation) (nil? extent))
+                 (conj :source-allocation-evaluation)))))
+         (tree-seq #(and (coll? %)
+                         (not (and (seq? %) (contains? '#{quote clojure.core/quote} (first %)))))
+                   seq expr))))
+
 (def ^:private descriptor-cache-capacity 65536)
 
 (def ^:private descriptor-cache
@@ -256,12 +320,28 @@
    Conservative default: if beichte fails, returns {:effect :io :flags #{}}
    (assumed effectful). Only proven-pure expressions get :pure. Results are
    memoized only for closed declared-registry expressions, by metadata and
-   exact resolved operation identities. Open expressions use a fresh Beichte
-   context; cached source analysis must not survive helper redefinition."
+   exact resolved operation identities. Source evaluation obligations are
+   recomputed from current policies outside that cache. Open expressions use
+   a fresh Beichte context; cached source analysis must not survive helper
+   redefinition."
   [expr]
-  (if (not (seq? expr))
-    {:effect :pure :flags #{}}
-    (if-let [k (try
+  (cond
+    (not (seq? expr)) {:effect :pure :flags #{}}
+    ;; A validated Object context returns the original object (including nil),
+    ;; after evaluating its operand once. It adds no source conversion check.
+    ;; This is effect analysis only, not permission to strip live materialization
+    ;; or merge separate boxing contexts. Other completion contracts retain their
+    ;; checks and malformed reserved terms remain conservative unknown calls.
+    (= completion/object-input-contract (:contract (completion/canonical-parts expr)))
+    (descriptor (:operand (completion/canonical-parts expr)))
+    :else
+    (let [semantic-expr (semantic-calls expr)
+          ;; Cache expensive Beichte analysis, not source evaluation policy.
+          ;; Re-read the current shared policies without clearing any cache.
+          source-flags (into (source-cast-flags semantic-expr)
+                             (source-evaluation-flags semantic-expr))
+          result
+          (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
                    [(descriptor-key expr) proof])
                  (catch Exception _ nil)
@@ -270,7 +350,8 @@
           (let [result (analyze-descriptor expr)]
             (.put ^java.util.Map descriptor-cache k result)
             result))
-      (analyze-descriptor expr))))
+      (analyze-descriptor expr))]
+      (update result :flags into source-flags))))
 
 (defn- analyze-descriptor
   [expr]
@@ -282,13 +363,22 @@
           result (if (map? result)
                    (update result :flags #(or % #{}))
                    {:effect (or result :io) :flags #{}})]
-      (update result :flags into (source-cast-flags semantic-expr)))
+      result)
     (catch Exception _
       ;; Conservative: unknown = effectful
       {:effect :io :flags #{}})
     (catch StackOverflowError _
       ;; Deep expressions overflow tools.analyzer — assume effectful
       {:effect :io :flags #{}})))
+
+(defn ordered-scalar-evaluation-required?
+  "Whether a scalar conversion/arithmetic check must execute even if its value is dead.
+   Allocation obligations remain on their storage evaluation boundary, not a
+   scalar ABI port. This proves neither hoistability nor immutable operands."
+  [expr]
+  (boolean (some #{:checked-source-cast :source-reference-cast
+                   :checked-source-arithmetic :checked-source-division}
+                 (:flags (descriptor expr)))))
 
 (defn removable-expr?
   "True if an unused expression can be dropped without changing semantics."
@@ -309,6 +399,7 @@
    their absence never substitutes for Beichte's purity proof."
   [expr]
   (and (seq? expr)
+       (not (completion/contains-completion? expr))
        (symbol? (first expr))
        (not (descriptor/alloc-op? (form/effective-op expr)))
        (not (when-let [op (descriptor/semantic-op expr)]
