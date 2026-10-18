@@ -518,11 +518,22 @@
              {:value id :role role}))
     roles))
 
+(defn- validate-ordered-entry-aliases! [buffers roles]
+  (when-let [[left right]
+             (materialization/conflicting-source-alias
+              (map (fn [[id buffer]]
+                     {:source (:source buffer) :storage (:id buffer) :value id
+                      :mutable? (not (link/read-only-node-role? (get roles id)))}) buffers))]
+    (fail! :invocation-ordered-source-alias
+           "mutable host aliases require one explicit resident storage identity, not independent copies"
+           {:values #{(:value left) (:value right)}})))
+
 (defn ^:no-doc ordered-entry-layout
   "Describe captured entry buffers without evaluating a source action or granting completion.
    Dynamic inputs remain unacquired; source-created arrays are not captured entry storage."
   [state roles]
   (let [available (materialization/prefix-bindings (:materialization state))
+        _ (validate-ordered-entry-aliases! (:program-buffers available) roles)
         captured (into #{} (keep (fn [[id role]] (when (not= :input role) id))) roles)
         realized (add-materialized-inputs {:buffers {} :storage {} :loop-scratch {}}
                                           available (get-in state [:program :values]) #{} captured)
@@ -569,6 +580,43 @@
                               (get-in semantic-program [:attributes :allocations]))
      :projections (:projections checked) :target (:target compilation)
      :caller-options caller-options}))
+
+(defn ^:no-doc ordered-input-arguments
+  "Preflight primitive host-array replacements without evaluating source steps or mutating an
+   owner. Only dynamic entry inputs may change, and the prepared storage specialization is fixed.
+   Aggregate and resident-device replacement require their own ownership-aware adapter."
+  [state arguments roles replacements]
+  (when-not (map? replacements)
+    (fail! :invocation-ordered-inputs "ordered input replacement requires a map" {}))
+  (let [plan (get-in state [:materialization :plan])
+        _ (when (get-in plan [:attributes :parameter-projection])
+            (fail! :invocation-ordered-input-projection
+                   "aggregate input replacement requires an ownership-aware field adapter" {}))
+        available (materialization/prefix-bindings (:materialization state))
+        buffers (:program-buffers available)
+        input-ids (into #{} (keep (fn [[id role]] (when (= :input role) id))) roles)
+        _ (when-not (set/subset? (set (keys replacements)) input-ids)
+            (fail! :invocation-ordered-input-role
+                   "only dynamic public inputs may be replaced; state and constants are captured"
+                   {:inputs input-ids :supplied (set (keys replacements))}))
+        slots (into {} (map-indexed (fn [index parameter] [(:id parameter) index])) (:parameters plan))
+        arguments (reduce-kv
+                   (fn [arguments id source]
+                     (let [slot (get slots (get-in buffers [id :id]))]
+                       (when-not (some? slot)
+                         (fail! :invocation-ordered-input-slot
+                                "dynamic input requires an exact public parameter slot" {:value id}))
+                       (assoc arguments slot source)))
+                   (vec arguments) replacements)
+        checked (materialization/prefix-bindings (materialization/begin-materialization plan arguments))]
+    (validate-ordered-entry-aliases! (:program-buffers checked) roles)
+    (doseq [[id buffer] buffers
+            :let [actual (get-in checked [:program-buffers id])]]
+      (when-not (and (= (:id buffer) (:id actual)) (= (:shape buffer) (:shape actual))
+                     (av/storage-contract-compatible? (:value buffer) (:value actual)))
+        (fail! :invocation-ordered-input-specialization
+               "input replacement cannot change the prepared storage specialization" {:value id})))
+    arguments))
 
 (defn ^:no-doc advance-host-source
   "Evaluate the next host source definition once, including shared invocation/equation producers.

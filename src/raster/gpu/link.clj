@@ -1003,6 +1003,20 @@
           (map (fn [value-id] [value-id (resident-link-value plan node-views value-id)]))
           value-ids)))
 
+(defn ^:no-doc invocation-output-views
+  "Resolve retained semantic invocation results through the completed checked boundary. No ABI
+   name heuristic, host download, or pre-execution storage identity is supplied to the caller."
+  [executable]
+  (let [executable (ensure-live! executable :invocation-output-views)
+        {:keys [plan] :as boundary} (resident-boundary! executable :invocation-output-views)
+        outputs (get-in plan [:attributes :semantic-outputs])
+        public (set (:outputs plan))]
+    (when-not (and (= :typed-invocation (get-in plan [:attributes :source]))
+                   (vector? outputs) (every? #(contains? public (second %)) outputs))
+      (throw (ex-info "semantic output views require a completed typed invocation boundary"
+                      {:reason :link-invocation-output-boundary})))
+    (into {} (map (fn [[id token]] [id (boundary-node-view! boundary token)])) outputs)))
+
 (defn- require-owned-output-boundary! [executable]
   (when (some-> executable :execution-state deref :exclusive-mutation?)
     (throw (ex-info "output leases cannot escape an exclusive mutation scope"
@@ -1321,6 +1335,36 @@
                   :else (update state :source-cursor inc))]
             (recur next-state))
           (finish-ordered-invocation! executable state))))))
+
+(defn ^:no-doc run-ordered-with-inputs!
+  "Internal host-array handoff under the existing execution guard. Complete preflight precedes
+   wrapper retirement or argument mutation; the source executor performs uploads in order.
+   before-mutation! is an owner-local output-wrapper retirement callback, not proof authority."
+  [executable replacements before-mutation!]
+  (with-unleased-execution!
+   executable :run-ordered-with-inputs!
+   (fn []
+     (let [execution-state (:execution-state executable)
+           {:keys [compilation arguments caller-options entry-roles] :as ordered}
+           (:ordered @execution-state)]
+       (when-not ordered
+         (throw (ex-info "ordered input handoff requires an ordered owned root"
+                         {:reason :link-ordered-input-root})))
+       (when-not (or (nil? before-mutation!) (ifn? before-mutation!))
+         (throw (ex-info "ordered handoff callback must be callable"
+                         {:reason :link-ordered-input-callback})))
+       (let [epoch (:value-epoch @execution-state)
+             initial (invocation-link/begin-ordered-realization compilation arguments caller-options)
+             checked (invocation-link/ordered-input-arguments initial arguments entry-roles replacements)]
+         (when before-mutation! (before-mutation!))
+         (ensure-live! executable :run-ordered-with-inputs!)
+         (ensure-no-output-leases! executable :run-ordered-with-inputs!)
+         (when-not (and (= epoch (:value-epoch @execution-state))
+                        (identical? arguments (get-in @execution-state [:ordered :arguments])))
+           (throw (ex-info "ordered input preflight was invalidated by reentrant owner activity"
+                           {:reason :link-ordered-input-reentrancy})))
+         (swap! execution-state assoc-in [:ordered :arguments] checked)
+         (run! executable))))))
 
 (defn- failed-write!
   "A failed backend transfer can have changed any byte in its destination. Keep every overlapping

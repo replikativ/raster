@@ -1366,6 +1366,22 @@ composition and frontier contracts remain separate gates. Host scalar element re
 device entries remain unsupported; validated shape descriptors are not content snapshots.
 Completion certificates remain unavailable until execution.
 
+The next internal phase retains that same compiled template in the existing sealed `Prepared`
+and `Compiled` types: preparation carries semantic entry/output identities and explicitly no
+concrete lowering certificate. Owned instantiation captures entries, ordinary invocation validates
+all host-array replacements before retiring outputs, and completed output views resolve through
+the actual checked semantic boundary. Omitted inputs still use the original prepared defaults;
+successful replay retires earlier output wrappers. Static plan/certificate/composition/byte-history
+and leased-invocation APIs explicitly decline this deferred phase rather than fabricate evidence.
+Distinct parameter storage cannot silently split a mutable host alias: the shared host-identity
+checker rejects this before capture or replacement commitment, while read-only sharing remains
+legal. Native ranges and device inputs still need their own overlap/ownership contracts.
+Local OpenCL/Level Zero controls qualify this constructor-to-callable slice, not automatic
+frontend selection. Enabling ordinary lowering must separately derive ordering obligations and
+check capability coverage, including existing model, contraction and scientific workloads; an
+unsupported ordering obligation cannot fall back eagerly. No new compiler cache, record family,
+backend executor or performance claim follows from this phase.
+
 JAX pytrees are the model for separating user structure from flat leaves, but
 Raster trees should retain stable keyed paths and type/shape information. JAX
 donation and sharding contracts are also useful references; Raster's existing
