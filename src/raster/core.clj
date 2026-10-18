@@ -376,7 +376,7 @@
    static bytecode production. No numeric body executes here."
   [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym]
   (loop [attempt 0]
-    (let [{owned-body :body invocation-catalog :catalog}
+    (let [{owned-body :body invocation-catalog :catalog binding-catalog :binding-catalog}
           ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retain-invocation-occurrences) body)
           dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/emission-input-snapshots)
                         body source-ns)
@@ -389,6 +389,8 @@
           emission {:backend :jvm-bytecode :implementation implementation
                     :params params :tags tags :return-tag return-tag :body owned-body :source-ns source-ns
                     :invocation-catalog invocation-catalog
+                    :binding-catalog binding-catalog :binding-contexts (:binding-contexts @inputs)
+                    :body-contexts (:body-contexts @inputs)
                     :invocation-contexts (:invocation-contexts @inputs)
                     :typed-interface typed-interface
                     :dependency-snapshots (into dependencies (:values @inputs))
@@ -536,6 +538,57 @@
          (:walked-body spec) (the-ns (:source-ns-name spec)) (:typed-iface-name spec)
          :annotations (:annotations spec) :source-body (:source-body spec))
         (alter-meta! impl-var dissoc ::jit-spec)))))
+
+(clojure.core/defn ^:no-doc ensure-current-owned-bytecode!
+  "Realize or renew an owned implementation without executing numerical code.
+   Renewal emits NEW code from still-current frozen source; it never refreshes
+   an old artifact's observations. Enclosing owners must discard/retry after
+   any dependency change, and previously returned executables remain stale."
+  [impl-var]
+  (locking impl-var
+    (binding [me/*emission-inputs* nil *jit-silent-fallback?* false]
+      (ensure-bytecode-implementation! impl-var))
+    (let [emission (::bytecode-emission (meta impl-var))
+          _ (when-not (and (= :jvm-bytecode (:backend emission))
+                           (identical? (:implementation emission) (var-get impl-var)))
+              (throw (ex-info "Current bytecode requires its actual owning implementation"
+                              {:reason :unowned-bytecode-implementation :var impl-var})))
+          failure (try (me/assert-emission-inputs-current! emission) nil
+                       (catch clojure.lang.ExceptionInfo error error))]
+      (if-not failure
+        emission
+        (do
+          (when-not (me/retryable-emission-change? failure) (throw failure))
+          (let [{:keys [source-name params tags return-tag source-ns typed-interface
+                        annotations source-body] :as lineage} (:source-entry emission)]
+            (me/assert-source-entry-current! lineage)
+            (when-not (and (sequential? source-body) (seq source-body)
+                           (sequential? annotations) (= (count params) (count annotations)))
+              (throw (ex-info "Bytecode renewal requires its complete original source plan"
+                              {:reason :unusable-bytecode-renewal-source :var impl-var})))
+            (when-not (and (identical? source-ns (.ns ^clojure.lang.Var impl-var))
+                           (= (.sym ^clojure.lang.Var impl-var) (symbol (str source-name "-impl")))
+                           (= params (:params emission)) (= tags (:tags emission))
+                           (= return-tag (:return-tag emission))
+                           (= typed-interface (:typed-interface emission)))
+              (throw (ex-info "Bytecode renewal lost its original source correspondence"
+                              {:reason :unowned-bytecode-renewal :var impl-var})))
+            ;; Do not lend an enclosing stale proof owner to dependency
+            ;; compilation, and do not synthesize source from transformed body.
+            (binding [me/*emission-inputs* nil
+                      me/*compilation-classloader* (.getClassLoader (class (:implementation emission)))
+                      *jit-silent-fallback?* false]
+              (do-bytecode-upgrade! impl-var source-name params tags return-tag nil
+                                    source-ns typed-interface
+                                    :annotations annotations :source-body source-body))
+            (let [fresh (::bytecode-emission (meta impl-var))]
+              (when-not (and (not (identical? fresh emission))
+                             (not (identical? (:implementation fresh) (:implementation emission)))
+                             (identical? (:implementation fresh) (var-get impl-var)))
+                (throw (ex-info "Bytecode renewal did not publish a new owned implementation"
+                                {:reason :failed-bytecode-renewal :var impl-var})))
+              (me/assert-emission-inputs-current! fresh)
+              fresh)))))))
 
 ;; ================================================================
 ;; Walked body registry — avoids quoting large walked bodies into

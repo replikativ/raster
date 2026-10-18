@@ -64,6 +64,7 @@
             [raster.compiler.core.closure :as closure]
             [raster.compiler.core.hoist :as hoist]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as value-completion]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.inference :as inf]
@@ -406,6 +407,9 @@
   "Check if a form contains qualified raster.* dispatch calls that could be devirtualized."
   [form]
   (cond
+    (and (seq? form) (= 'quote (first form))) false
+    (value-completion/canonical-form? form)
+    (has-undevirtualized-calls? (:operand (value-completion/canonical-parts form)))
     (seq? form)
     (or (op/undevirtualized-call? (first form))
         (some has-undevirtualized-calls? form))
@@ -575,6 +579,9 @@
   "Count remaining undevirtualized dispatch calls in a form."
   [form]
   (cond
+    (and (seq? form) (= 'quote (first form))) 0
+    (value-completion/canonical-form? form)
+    (count-undevirtualized (:operand (value-completion/canonical-parts form)))
     (seq? form)
     (+ (if (undevirtualized-dispatch-call? (first form)) 1 0)
        (reduce + 0 (map count-undevirtualized form)))
@@ -587,6 +594,9 @@
   identifiable, not just the op name)."
   [form]
   (cond
+    (and (seq? form) (= 'quote (first form))) nil
+    (value-completion/canonical-form? form)
+    (collect-undevirtualized (:operand (value-completion/canonical-parts form)))
     (seq? form)
     (concat (when (undevirtualized-dispatch-call? (first form)) [form])
             (mapcat collect-undevirtualized form))
@@ -1225,7 +1235,8 @@
                     _ (assert (or (= :* from) (= dialect from))
                               (str "Pass :" pass-key " expects :" from " but pipeline is at :" dialect
                                    ". Check pass ordering."))
-                    result (binding [inline/*inline-scalar-bodies?*
+                    result (binding [inline/*owned-jvm-calls?* (boolean (:owned-jvm-calls? opts))
+                                     inline/*inline-scalar-bodies?*
                                      (or inline/*inline-scalar-bodies?*
                                          (device/gpu-target? (:target-device opts)))]
                              (pass-fn f opts))
@@ -1343,7 +1354,8 @@
                    _ (assert (or (= :* from) (= current-dialect from))
                              (str "Pass :" pass-key " expects :" from " but pipeline is at :"
                                   current-dialect))
-                   result (binding [inline/*inline-scalar-bodies?*
+                   result (binding [inline/*owned-jvm-calls?* (boolean (:owned-jvm-calls? opts))
+                                    inline/*inline-scalar-bodies?*
                                     (or inline/*inline-scalar-bodies?*
                                         (device/gpu-target? (:target-device opts)))]
                             (pass-fn (:form acc) opts))
@@ -1534,6 +1546,7 @@
                              effective-dtype
                              {:preserve-declared-array-storage? preserve-declared-array-storage?})
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
+                          :owned-jvm-calls? (nil? target-device)
                           :active-params active-params :dtype effective-dtype
                           :preserve-declared-array-storage? preserve-declared-array-storage?}
                    param-env (assoc :param-env param-env)

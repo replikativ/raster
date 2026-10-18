@@ -621,7 +621,7 @@
    catalog is private to the owning emission, not a source/cache identity or
    authority reconstructed by comparing expressions. Quoted values stay opaque."
   [body]
-  (let [catalog (atom {})]
+  (let [catalog (atom {}) scopes (atom {})]
     (letfn [(visit [expression]
               (if (and (seq? expression)
                        (contains? #{'quote 'clojure.core/quote} (first expression)))
@@ -629,15 +629,63 @@
                 (let [node (mex/walk-preserving-meta
                             visit identity
                             (if (instance? clojure.lang.IObj expression)
-                              (vary-meta expression dissoc ::call-occurrence)
+                              (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence)
                               expression))]
-                  (if-not (form-ir/call-form? node) node
+                  (cond
+                    (form-ir/binding-form? node)
+                    (let [token (Object.)
+                          owned (vary-meta node assoc ::binding-scope-occurrence token)]
+                      (swap! scopes assoc token owned)
+                      owned)
+                    (not (form-ir/call-form? node)) node
+                    :else
                     (let [token (Object.)
                           owned (vary-meta node assoc ::call-occurrence token)]
                       (swap! catalog assoc token owned)
                       owned)))))]
-      (let [owned (mapv visit body)]
-        {:body owned :catalog @catalog}))))
+      (let [owned (with-meta (mapv visit body) {::body-occurrence (Object.)})]
+        {:body owned :catalog @catalog :binding-catalog @scopes}))))
+
+(defn- retain-binding-context! [ctx binding-count index binder initializer before after]
+  (when-let [token (::binding-scope-occurrence ctx)]
+    (when-let [inputs me/*emission-inputs*]
+      (let [key [token index]
+            record {:status :known :binding-count binding-count :binder binder :initializer initializer
+                    :before before :after after}]
+        (swap! inputs update :binding-contexts
+               (fn [contexts]
+                 (if (contains? contexts key)
+                   (assoc contexts key {:status :ambiguous})
+                   (assoc contexts key record))))))))
+
+(defn ^:no-doc retained-binding-context
+  "Query a sequential binding of an exact original owned lexical scope.
+   Slot/carrier facts come from actual emission, not inferred source syntax."
+  [emission scope index]
+  (let [token (::binding-scope-occurrence (meta scope))
+        record (get (:binding-contexts emission) [token index])]
+    (when (and (= :jvm-bytecode (:backend emission)) token
+               (identical? scope (get (:binding-catalog emission) token))
+               (= :known (:status record))
+               ;; Backend macroexpansion may retag a binder. Its identity is
+               ;; the exact owned scope plus its ordinal, not the newly tagged
+               ;; Symbol object. Refuse expansions that change binding layout.
+               (= (:binding-count record) (quot (count (second scope)) 2))
+               (<= 0 index) (< index (:binding-count record))
+               (= (:binder record) (nth (second scope) (* 2 index))))
+      (me/assert-emission-inputs-current! emission)
+      record)))
+
+(defn ^:no-doc retained-body-context
+  "Original parameter locals of this emission's actual whole numerical body."
+  [emission]
+  (let [token (::body-occurrence (meta (:body emission)))
+        record (get (:body-contexts emission) token)]
+    (when (and (= :jvm-bytecode (:backend emission)) token
+               (= :known (:status record))
+               (identical? (:body emission) (:body record)))
+      (me/assert-emission-inputs-current! emission)
+      record)))
 
 (defn- retain-invocation-context!
   [method receiver arguments mode return-carrier locals ctx]
@@ -697,6 +745,30 @@
         (when (and (= :known (:status child)) (identical? operand (:expression child)))
           (assoc child :source-original
                  (get (:invocation-catalog emission) (::call-occurrence (meta operand)))))))))
+
+(defn ^:no-doc retained-input-source-context
+  "Associate a compound input with its ORIGINAL owned source occurrence.
+   This proves correspondence, not semantic equivalence of arbitrary expanded
+   syntax. Consumers must still close the admitted lexical/read/call region.
+   A transformed wrapper without the same immediate occurrence refuses."
+  [emission original input-index]
+  (when-let [parent (retained-invocation-context emission original)]
+    (let [arguments (vec (util/call-args original))]
+      (when (and (integer? input-index) (<= 0 input-index)
+                 (= (count arguments) (count (:inputs parent)))
+                 (< input-index (count arguments)))
+        (let [source (nth arguments input-index)
+              input (nth (:inputs parent) input-index)
+              actual (:operand input)
+              scope-token (::binding-scope-occurrence (meta source))
+              call-token (::call-occurrence (meta source))]
+          (when (or (and scope-token
+                         (identical? source (get (:binding-catalog emission) scope-token))
+                         (identical? scope-token (::binding-scope-occurrence (meta actual))))
+                    (and call-token
+                         (identical? source (get (:invocation-catalog emission) call-token))
+                         (identical? call-token (::call-occurrence (meta actual)))))
+            (assoc input :source-original source)))))))
 
 (defn- comparison-form?
   "True if form is a comparison call: (< a b), (>= a b), (== a b), etc."
@@ -3314,6 +3386,7 @@
                           (let [new-locs (assoc locs sym (cond-> {:slot slot :type t :hint tag
                                                           :verified (boolean (and tag (not= tag 'Object)))}
                                                          (= :ref t) (assoc :reference-class (or reference-class Object))))]
+                            (retain-binding-context! ctx (count pairs) (dec @binding-idx) sym init locs (get new-locs sym))
                             (when (and (System/getProperty "raster.debug.locals")
                                        (or (.startsWith (str sym) "K_")
                                            (.startsWith (str sym) "V_")
@@ -4780,6 +4853,7 @@
                form)
         ;; This node's occurrence never leaks into an unannotated child.
         ctx (assoc ctx ::call-occurrence (::call-occurrence (meta form))
+                       ::binding-scope-occurrence (::binding-scope-occurrence (meta form))
                        ::call-expression form)]
     (cond
       ;; --- Atoms ---
@@ -5345,6 +5419,16 @@
                                                             :source-ns        source-ns}
                                                        expanded-body (binding [*ns* source-ns]
                                                                        (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                       _ (when-let [token (::body-occurrence (meta walked-body))]
+                                                           (when me/*emission-inputs*
+                                                             (swap! me/*emission-inputs* update :body-contexts
+                                                                    (fn [contexts]
+                                                                      (if (contains? contexts token)
+                                                                        (assoc contexts token {:status :ambiguous})
+                                                                        (assoc contexts token {:status :known :body walked-body
+                                                                                              :locals locals
+                                                                                              :return-stack-type return-stack-type
+                                                                                              :result-context (completion/bytecode-operand-context ctx)}))))))
                                                        ret-type (emit-body code expanded-body locals ctx)]
                               ;; Return according to method signature type
                                                    (when-not (#{:void :diverge} ret-type)
