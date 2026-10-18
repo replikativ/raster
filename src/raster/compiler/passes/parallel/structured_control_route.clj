@@ -9,13 +9,11 @@
             [raster.compiler.core.callee-identity :as callee-identity]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.core.scalar-conversion :as scalar-conversion]
-            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
-            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -178,133 +176,14 @@
              "public parameter has no retained or declared AbstractValue"
              {:parameter parameter :available (set (keys program-values))}))))
 
-(defn- shape-projection-source
-  [expression]
-  (loop [expression expression]
-    (if (and (seq? expression)
-             (descriptor/cast-op? (descriptor/semantic-op expression))
-             (not= :wrap (descriptor/cast-integral-narrowing (descriptor/semantic-op expression)))
-             (= 1 (count (descriptor/call-args expression))))
-      (recur (first (descriptor/call-args expression)))
-      (when (and (seq? expression)
-                 (descriptor/alength-op? (descriptor/semantic-op expression))
-                 (= 1 (count (descriptor/call-args expression)))
-                 (symbol? (first (descriptor/call-args expression))))
-        (first (descriptor/call-args expression))))))
-
 (defn- scalar-value?
   [value]
   (and (= :tensor (:kind value)) (empty? (:shape value))))
 
-(defn- dimension-expression
-  [dimension]
-  (if (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension)))
-    (second dimension)
-    dimension))
-
-(defn- host-computable-dimension?
-  [program-values dimension]
-  (let [dimension (dimension-expression dimension)
-        references (util/free-syms dimension)]
-    (or (integer? dimension)
-        (and (symbol? dimension) (scalar-value? (get program-values dimension)))
-        (and (seq? dimension)
-             (= :pure (effects/analyze-effect dimension))
-             (every? #(scalar-value? (get program-values %)) references)))))
-
-(defn- certified-shape-dimension
-  [program-values source]
-  (let [shape (:shape (get program-values source))
-        dimension (when (= 1 (count shape)) (first shape))]
-    (when (and dimension (host-computable-dimension? program-values dimension))
-      (dimension-expression dimension))))
-
-(defn- project-scalar-metadata
-  "Project retained, exactly typed length leaves, not the enclosing scalar computation.
-   Unknown widths, layouts and lexical regions remain unchanged. In particular a long storage
-   dimension cannot silently replace an int length result without a separate range proof."
-  [program-values public-inputs expression]
-  (letfn [(project [expression]
-            (if (or (not (seq? expression))
-                    (contains? program-values (first expression))
-                    (:raster.op/lexical-callee (meta expression))
-                    (contains? '#{quote clojure.core/quote var clojure.core/var}
-                               (first expression))
-                    (completion/canonical-parts expression)
-                    (form/scope-info expression))
-              expression
-              (let [operation (descriptor/semantic-op expression)
-                    source (when (and (descriptor/alength-op? operation)
-                                      (= 1 (count (descriptor/call-args expression))))
-                             (first (descriptor/call-args expression)))
-                    value (get program-values source)
-                    dimension (when (and (symbol? source)
-                                         (not (contains? public-inputs source))
-                                         (= {:kind :plain} (:representation value))
-                                         (nil? (:logical-layout value)))
-                                (certified-shape-dimension program-values source))
-                    leaf-dtype (some-> (types/sym-type-tag expression)
-                                       dtype/dtype-for-scalar-tag dtype/canon)
-                    dimension-dtype (when (symbol? dimension)
-                                      (:dtype (get program-values dimension)))
-                    dimension (if (and (symbol? dimension) dimension-dtype)
-                                (vary-meta dimension assoc :raster.type/tag
-                                           (dtype/scalar-tag-for-dtype dimension-dtype))
-                                dimension)]
-                (cond
-                  (and (contains? #{:int :long} leaf-dtype)
-                       (contains? #{:int :long} dimension-dtype)
-                       (= [:exact :exact]
-                          (scalar-conversion/policy dimension-dtype leaf-dtype)))
-                  (if (= leaf-dtype dimension-dtype) dimension
-                      (with-meta (list (symbol "clojure.core"
-                                               (name (dtype/scalar-tag-for-dtype leaf-dtype)))
-                                       dimension)
-                        (meta expression)))
-
-                  ;; Do not inspect binding bodies under a different lexical environment, quote
-                  ;; data, or computed callees. Call argument order and original metadata survive.
-                  (not (symbol? (first expression))) expression
-
-                  :else (with-meta (apply list (first expression)
-                                          (map project (rest expression)))
-                          (meta expression))))))]
-    (project expression)))
-
-(defn- canonicalize-shape-projection
-  [program-values public-inputs symbol expression]
-  (let [source (shape-projection-source expression)
-        dimension (when (and source (not (contains? public-inputs source)))
-                    (certified-shape-dimension program-values source))]
-    (if-not dimension
-      (project-scalar-metadata program-values public-inputs expression)
-      (let [result-dtype (:dtype (get program-values symbol))
-            dimension-dtype (when (symbol? dimension)
-                              (:dtype (get program-values dimension)))]
-        (if (or (nil? dimension-dtype) (= result-dtype dimension-dtype))
-          dimension
-          (list (dtype/scalar-tag-for-dtype result-dtype) dimension))))))
-
-(defn- scalar-equation-expression
-  [equation]
-  (let [algorithm (:algorithm equation)]
-    (when (and (soac/program-form? algorithm)
-               (empty? (:effects equation))
-               (= 1 (count (:results equation)))
-               (= 1 (count (soac/equations algorithm))))
-      (let [algorithm-equation (first (soac/equations algorithm))
-            {:keys [kind captures lambda]} (soac/operation-parts algorithm-equation)
-            {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
-            expression (when (and (= 'scalar kind) (empty? locals)
-                                  (= 1 (count body-results)))
-                         (util/subst-syms (zipmap parameters captures)
-                                          (first body-results)))]
-        expression))))
-
 (defn- project-scalar-equation-metadata
   [program-values public-inputs equation]
-  (if-let [expression (scalar-equation-expression equation)]
-    (let [projected (project-scalar-metadata program-values public-inputs expression)]
+  (if-let [expression (invocation-source/scalar-equation-expression equation)]
+    (let [projected (invocation-source/project-scalar-metadata program-values public-inputs expression)]
       (if (semantic/equivalent? expression projected)
         equation
         (let [result (first (:results equation))
@@ -323,7 +202,7 @@
 
 (defn- host-invocation-equation?
   [available program-outputs required-shape-scalars source-prefix? equation]
-  (let [expression (scalar-equation-expression equation)]
+  (let [expression (invocation-source/scalar-equation-expression equation)]
     (and expression
          (not-any? (set (:results equation)) program-outputs)
          (set/subset? (set (:operands equation)) available)
@@ -348,7 +227,7 @@
         definitions
         (into {}
               (mapcat (fn [equation]
-                        (when (scalar-equation-expression equation)
+                        (when (invocation-source/scalar-equation-expression equation)
                           (map (fn [result] [result equation]) (:results equation)))))
               (:equations parallel-program))]
     (loop [required (set/intersection shape-symbols (set (keys definitions)))]
@@ -368,7 +247,7 @@
                   (let [original-equation equation
                         equation (project-scalar-equation-metadata (:values parallel-program)
                                                                   public-inputs equation)
-                        expression (scalar-equation-expression equation)
+                        expression (invocation-source/scalar-equation-expression equation)
                         scalar? (some? expression)
                         required-shape? (some shape-scalars (:results equation))
                         exceptional-shape? (and required-shape?
@@ -424,8 +303,8 @@
     (if (and (empty? hoisted) (= retained (:equations parallel-program)))
       parallel-program
       (let [inputs (program/infer-inputs retained)
-            shape-equations (count (filter (comp shape-projection-source
-                                                 scalar-equation-expression)
+            shape-equations (count (filter (comp invocation-source/shape-projection-source
+                                                 invocation-source/scalar-equation-expression)
                                            hoisted))]
         (-> parallel-program
             (assoc :equations retained
@@ -458,7 +337,7 @@
           prefix-values (merge prefix-values program-values)
           public-inputs (set public-parameters)
           source-pairs (mapv (fn [[symbol expression]]
-                               [symbol (canonicalize-shape-projection
+                               [symbol (invocation-source/canonicalize-shape-projection
                                         prefix-values public-inputs symbol expression)])
                              (partition 2 (second source)))
           equation-sites (into #{} (keep (fn [equation]
@@ -860,13 +739,13 @@
     (doseq [[symbol expression] (partition 2 (second (:source parallel-program)))
             :when (and (not (and (contains? prefix-bindings symbol)
                                  (semantic/equivalent?
-                                  (canonicalize-shape-projection
+                                  (invocation-source/canonicalize-shape-projection
                                    (:values parallel-program)
                                    public-inputs
                                    symbol expression)
                                   (get prefix-bindings symbol))))
                        (not (program/equation-for-binding parallel-program symbol expression))
-                       (not (typed-route/realization-binding? parallel-program symbol expression))
+                       (not (invocation-source/realization-binding? parallel-program symbol expression))
                        (not (and (contains? allocations symbol)
                                  (semantic/equivalent? expression (get allocations symbol))))
                        ;; A changed claimed binding invalidates its executor even when the new

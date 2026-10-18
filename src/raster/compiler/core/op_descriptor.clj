@@ -67,6 +67,12 @@
              (not (contains? '#{make-array clojure.core/make-array} (first form))))
     (second form)))
 
+(defn array-allocation-size
+  "The size expression of an exact core size-only array constructor, or nil.
+   Shares the allocator-splitting authority; initializer and copy overloads are not admitted."
+  [expression]
+  (array-alloc-size expression))
+
 (defn- param-derived?
   "True if expr depends only on param-set symbols (transitively through bindings)."
   [expr param-set binding-map environment]

@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.auxiliary-semantic-witness-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.compiler.ir.invocation-source :as invocation-source]
+            [clojure.test :refer [deftest is]]
             [raster.compiler.passes.parallel.typed-soac-route :as typed]
             [raster.compiler.passes.parallel.structured-control-route :as structured]
             [raster.compiler.passes.parallel.segop-lower-pass :as lowering]))
@@ -49,14 +50,14 @@
     (doseq [program programs
             :let [witnesses (vec (mapcat #(get-in % [:attributes :realization-bindings]) (:equations program)))]]
     (doseq [{:keys [binding expression]} witnesses]
-      (is (typed/realization-binding? program binding expression))
+      (is (invocation-source/realization-binding? program binding expression))
       (let [moved (relocated expression)]
-        (is (typed/realization-binding? program binding moved))
-        (is (typed/realization-binding? (replace-binding program binding moved) binding expression)))
+        (is (invocation-source/realization-binding? program binding moved))
+        (is (invocation-source/realization-binding? (replace-binding program binding moved) binding expression)))
       (doseq [changed (semantic-variants expression)]
         (is (= expression changed) "ordinary equality hides the semantic metadata mutation")
-        (is (false? (typed/realization-binding? program binding changed)))
-        (is (false? (typed/realization-binding? (replace-binding program binding changed)
+        (is (false? (invocation-source/realization-binding? program binding changed)))
+        (is (false? (invocation-source/realization-binding? (replace-binding program binding changed)
                                                binding expression)))))
     ;; Updating both the source and advisory allocation witness cannot override its independently
     ;; reconstructed typed allocation. Alias destination membership remains its separate owner check.
@@ -70,7 +71,7 @@
                                                      (mapv (fn [entry]
                                                              (cond-> entry (= binding (:binding entry))
                                                                (assoc :expression changed))) entries)))) %)))]
-        (is (false? (typed/realization-binding? forged binding changed))))))))
+        (is (false? (invocation-source/realization-binding? forged binding changed))))))))
 
 (deftest host-prefix-and-allocation-executors-retain-semantic-expression-witnesses
   (let [check (ns-resolve 'raster.compiler.passes.parallel.structured-control-route 'validate-host-coverage!)

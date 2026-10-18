@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as witness]
-            [raster.compiler.passes.parallel.typed-soac-route :as route]))
+            [raster.compiler.ir.invocation-source :as invocation-source]))
 
 (defn- fixture []
   (let [program (#'witness/functional-program)
@@ -28,7 +28,7 @@
                                (symbol? (first left)) (symbol? (first right)))
                       (swap! pairs conj [(first left) (first right)]))
                     (original left right))]
-      (is (route/realization-binding? program binding expression)))
+      (is (invocation-source/realization-binding? program binding expression)))
     (is (seq @pairs))
     (is (every? (fn [[left right]] (= left right)) @pairs))
     (is (not-any? (fn [[left right]]
@@ -42,10 +42,10 @@
     (testing "an unsupported value under the matching binder still fails loudly"
       (let [changed (#'witness/replace-binding program binding (Object.))]
         (is (= :semantic-fingerprint-unsupported
-               (try (route/realization-binding? changed binding expression) nil
+               (try (invocation-source/realization-binding? changed binding expression) nil
                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
     (testing "all exact same-binding pairs count, not merely the first"
-      (is (false? (route/realization-binding?
+      (is (false? (invocation-source/realization-binding?
                    (append-pairs program [[binding expression]]) binding expression))))
     (testing "ordinary binder equality cannot authorize changed type metadata"
       (let [forged (with-meta binding (assoc (meta binding) :raster.type/tag 'float))
@@ -56,4 +56,4 @@
                                                     [(if (= binding id) forged id) value])
                                                   (partition 2 bindings))) body)))]
         (is (= binding forged))
-        (is (false? (route/realization-binding? changed binding expression)))))))
+        (is (false? (invocation-source/realization-binding? changed binding expression)))))))

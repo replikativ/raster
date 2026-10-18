@@ -2,14 +2,15 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.ir.abstract-value :as av]
-            [raster.compiler.ir.invocation-plan :as invocation]))
+            [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-source :as invocation-source]))
 
 (defn- scalar [dtype]
   (av/tensor {:dtype dtype :shape []}))
 
 (deftest wrapping-casts-are-not-shape-identities
-  (is (= 'xs (#'invocation/shape-source '(clojure.core/long (alength xs)))))
-  (is (nil? (#'invocation/shape-source '(clojure.core/unchecked-int (alength xs))))))
+  (is (= 'xs (invocation-source/shape-projection-source '(clojure.core/long (alength xs)))))
+  (is (nil? (invocation-source/shape-projection-source '(clojure.core/unchecked-int (alength xs))))))
 
 (defn- array-value [dtype extent]
   (av/tensor {:dtype dtype :shape [extent] :representation {:kind :plain}}))
