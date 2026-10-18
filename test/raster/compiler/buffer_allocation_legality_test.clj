@@ -33,6 +33,52 @@
                          (with-meta % (assoc (meta %) :raster.type/tag 'long)) %) arguments)]
     (list 'let* ['result (apply list op arguments)] 'result)))
 
+(deftest direct-allocation-projection-is-derived-from-the-selected-definition
+  (with-source
+    (fn [source]
+      (define-allocator 'pure-like '[ref :- (Array double) n :- Long] '(double-array n))
+      (let [op (operation source "pure-like" "doubles_long")
+            implementation (symbol (namespace op) (str (name op) "-impl"))
+            make-call (fn [arguments]
+                        (with-meta (apply list '.invk implementation arguments)
+                          {:raster.op/original (symbol (namespace op) "pure-like")}))
+            call (make-call '[x cnt])
+            values {'x {:dtype :double :shape ['m]} 'cnt {:dtype :long :shape []}}
+            projection (descriptor/direct-allocation-projection call values)]
+        (is (= '(clojure.core/double-array (clojure.core/long cnt)) (:constructor projection))
+            "projection retains the helper's explicit parameter conversion")
+        (is (= implementation (get-in projection [:helper :implementation])))
+        (is (= ['x 'cnt] (get-in projection [:helper :arguments])))
+        (doseq [selected [(ns-resolve source (symbol (name implementation)))
+                          (ns-resolve source (symbol (name op)))]]
+          (with-redefs-fn {selected (fn [& _] (double-array 0))}
+            #(is (nil? (descriptor/direct-allocation-projection call values))
+                 "a replaced receiver or delegated source is not the registered helper definition")))
+        (is (nil? (descriptor/direct-allocation-projection (make-call '[(do (tick 1) x) cnt]) values))
+            "an unused argument's effects cannot disappear during constructor projection")
+        (is (nil? (descriptor/direct-allocation-projection (make-call '[x (tick cnt)]) values))
+            "size argument checks must be evaluated once in an explicit prefix first")
+        (is (nil? (descriptor/direct-allocation-projection call (assoc-in values ['x :dtype] :float))))
+        (is (nil? (descriptor/direct-allocation-projection call (assoc-in values ['cnt :dtype] :double))))
+        (is (nil? (descriptor/direct-allocation-projection call (dissoc values 'x))))
+        (is (nil? (descriptor/direct-allocation-projection (with-meta call {:raster.op/lexical-callee true}) values)))
+        (define-allocator 'pure-like '[ref :- (Array double) n :- Long]
+          '(let [out (double-array n)] (aset out 0 9.0) out))
+        (is (nil? (descriptor/direct-allocation-projection call values))
+            "an alloc/compute helper is not a pure constructor, even after a previous projection"))
+      (let [op (symbol (str (ns-name source)) "tick")
+            fake {:allocates? true :auto-detected? true
+                  :direct-allocation {:parameters '[n] :parameter-tags '[long]
+                                      :constructor '(clojure.core/double-array n)}}]
+        (with-redefs [descriptor/resolve-buffer-semantics (fn [_] [fake op])]
+          (is (nil? (descriptor/direct-allocation-projection (list op 'cnt) {'cnt {:dtype :long :shape []}})))))
+      (is (= {:constructor '(clojure.core/double-array cnt)}
+             (descriptor/direct-allocation-projection '(clojure.core/double-array cnt) {})))
+      (doseq [call ['(double-array cnt) '(clojure.core/double-array cnt)]
+              :let [lexical (with-meta call {:raster.op/lexical-callee true})]]
+        (is (nil? (descriptor/array-allocation-size lexical)))
+        (is (nil? (descriptor/direct-allocation-projection lexical {})))))))
+
 (deftest specialization-carrier-admission-is-not-removed
   (with-source
     (fn [source]

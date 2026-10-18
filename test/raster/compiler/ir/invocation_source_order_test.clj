@@ -8,6 +8,7 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as auxiliary]
             [raster.core :refer [deftm]]
+            [raster.arrays :as arrays]
             [raster.par :as par]))
 
 (deftm write-before-shape
@@ -18,12 +19,35 @@
     (par/map! out i square double 1.0)
     out))
 
+(deftm helper-source-zero-observed
+  [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
+        out (arrays/zeros-like x n)
+        result (par/map! out i n double (+ (aget out i) 1.0))]
+    result))
+
 (defn- compilation [v dtype]
   (let [program (:semantic (equation-first/compile v {:target :ocl:0 :dtype dtype}))]
     [program (get-in program [:attributes :invocation-plan])]))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest helper-allocation-correspondence-is-retained-and-independently-rederived
+  (let [[program plan] (compilation #'helper-source-zero-observed :double)
+        order (invocation/source-order plan program)
+        step-index (first (keep-indexed (fn [index step] (when (:source-projection step) index)) (:steps plan)))
+        projection (get-in plan [:steps step-index :source-projection])]
+    (is (vector? order))
+    (is (some? step-index))
+    (is (= 'raster.arrays/zeros-like (get-in projection [:helper :operation])))
+    (is (= 'clojure.core/double-array (first (:constructor projection))))
+    (doseq [changed [(update-in plan [:steps step-index] dissoc :source-projection)
+                     (assoc-in plan [:steps step-index :source-projection :constructor]
+                               '(clojure.core/double-array 0))
+                     (assoc-in plan [:steps step-index :source-projection :helper :implementation]
+                               'unrelated/constructor)]]
+      (is (= :invocation-source-step-mismatch (reason #(invocation/source-order changed program)))))))
 
 (deftest source-position-is-not-the-dependency-pruned-prefix-ordinal
   (let [[program plan] (compilation #'write-before-shape :double)

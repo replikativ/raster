@@ -9,6 +9,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -264,17 +265,40 @@
           tag (dtype/scalar-tag-for-dtype dtype)]
       (typed-store-value (symbol "clojure.core" (name tag)) expression))))
 
+(defn allocation-source
+  "Project one definition-derived allocation to its exact source constructor. The caller must
+   retain and compare helper correspondence with its compilation; this is not a check-hoisting
+   or definition-lifetime witness. Constructor conversions remain executable source operations."
+  [expression values]
+  (when-let [{:keys [constructor] :as projection}
+             (descriptor/direct-allocation-projection expression values)]
+    (let [operation (descriptor/semantic-op constructor)
+          tag (get descriptor/alloc-sym->array-tag operation)]
+      (when tag
+        (assoc projection :extent (descriptor/array-allocation-size constructor)
+                          :dtype (some-> tag dtype/dtype-for-array-tag dtype/canon)
+                          :initialization (descriptor/allocation-initialization operation))))))
+
+(defn- same-integral-extent? [source dimension values]
+  (or (semantic/equivalent? source dimension)
+      (try
+        (let [decline! (fn [& _] (throw (ex-info "not an exact typed extent" {:reason ::extent})))
+              project #(index-expression/lower-typed % (set (keys values))
+                                                    (fn [id] (:dtype (get values id))) :long decline!)]
+          (semantic/equivalent? (project source) (project dimension)))
+        (catch clojure.lang.ExceptionInfo error
+          (if (= ::extent (:reason (ex-data error))) false (throw error))))))
+
 (defn allocation-corresponds?
   "Check the bounded size-only allocation contract, without deriving shape from a dtype.
    Copy/initializer overloads and custom allocators require their own retained correspondence."
-  [expression value initialization]
-  (let [operation (descriptor/semantic-op expression)
-        extent (descriptor/array-allocation-size expression)
-        tag (get descriptor/alloc-sym->array-tag operation)]
-    (and (some? extent)
-         (= (dtype/canon (:dtype value)) (some-> tag dtype/dtype-for-array-tag dtype/canon))
-         (= initialization (descriptor/allocation-initialization operation))
-         (semantic/equivalent? [extent] (:shape value)))))
+  ([expression value initialization] (allocation-corresponds? expression value initialization {}))
+  ([expression value initialization values]
+   (when-let [source (allocation-source expression values)]
+     (and (some? (:extent source)) (= 1 (count (:shape value)))
+          (= (dtype/canon (:dtype value)) (:dtype source))
+          (= initialization (:initialization source))
+          (same-integral-extent? (:extent source) (first (:shape value)) values)))))
 
 (defn clone-corresponds?
   "A bounded clone correspondence requires the exact unary core operation and a direct

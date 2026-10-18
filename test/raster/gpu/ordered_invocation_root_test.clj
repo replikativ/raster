@@ -42,7 +42,8 @@
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
 (defn- check-owned-root! [target]
-  (let [compilation (equation-first/compile #'source-zero-observed {:target target :dtype :double})]
+  (doseq [source [#'source-zero-observed #'fixture/helper-source-zero-observed]
+          :let [compilation (equation-first/compile source {:target target :dtype :double})]]
     (doseq [n [0 3]]
       (let [x (double-array [7.0])
             executable (link/instantiate-ordered-invocation! compilation [x (double-array 1) n] {})
@@ -76,7 +77,9 @@
 
 (defn- check-failed-root! [target]
   (doseq [[v n expected] [[#'fixture/write-before-shape Long/MAX_VALUE ArithmeticException]
-                          [#'source-zero-observed -1 NegativeArraySizeException]]]
+                          [#'source-zero-observed -1 NegativeArraySizeException]
+                          [#'fixture/helper-source-zero-observed -1 NegativeArraySizeException]
+                          [#'fixture/helper-source-zero-observed Long/MAX_VALUE NegativeArraySizeException]]]
     (let [compilation (equation-first/compile v {:target target :dtype :double})
           executable (link/instantiate-ordered-invocation!
                       compilation [(double-array [7.0]) (double-array 1) n] {})

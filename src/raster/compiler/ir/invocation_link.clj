@@ -693,11 +693,21 @@
         destination (:storage entry)
         expression (get (:source-allocations state) destination)
         abstract (get-in state [:program :values destination])
-        initialization (descriptor/allocation-initialization (descriptor/semantic-op expression))]
+        values (get-in state [:program :values])
+        projection (invocation-source/allocation-source expression values)
+        step (some #(when (= (:invocation-step entry) (:id %)) %)
+                   (get-in state [:materialization :plan :steps]))
+        initialization (:initialization projection)]
     (when-not (and destination (= :zero initialization)
-                   (invocation-source/allocation-corresponds? expression abstract initialization))
+                   (invocation-source/allocation-corresponds? expression abstract initialization values))
       (fail! :invocation-ordered-next-allocation
              "the next source entry is not an admitted size-only zero allocation" {:entry entry}))
+    (when (and (:helper projection)
+               (not (semantic/equivalent? (select-keys projection [:constructor :helper])
+                                         (:source-projection step))))
+      (fail! :invocation-ordered-allocation-definition
+             "allocation helper differs from this invocation's retained constructor definition"
+             {:entry entry}))
     (when-not (ifn? evaluate-size)
       (fail! :invocation-ordered-size-evaluator
              "source allocation requires the typed source-size evaluator" {:entry entry}))
@@ -705,7 +715,15 @@
           available (materialization/prefix-bindings materialization)
           scalars (merge (invocation-shape-scalars materialization)
                          (:program-scalars available) (:host-scalars state))
-          extent (descriptor/array-allocation-size expression)
+          _ (doseq [argument (get-in projection [:helper :arguments])]
+              (when-not (or (contains? scalars argument)
+                            (contains? (:program-buffers available) argument)
+                            (contains? (:acquired-storage state)
+                                       (get-in state [:realized :buffers argument])))
+                (fail! :invocation-ordered-allocation-argument
+                       "allocation helper arguments must already have checked source values or acquired storage"
+                       {:argument argument :entry entry})))
+          extent (:extent projection)
           {:keys [source-value elements]} (link/without-validation-context #(evaluate-size extent scalars))]
       (when-not (and (integer? elements) (<= 0 elements Integer/MAX_VALUE))
         (fail! :invocation-ordered-allocation-count

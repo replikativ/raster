@@ -3,6 +3,7 @@
    A tiny capability witness, not real-weight model or large-vocabulary performance acceptance."
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.fixtures.sft-head :as fixture]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
@@ -100,3 +101,28 @@
   (if @ze/gpu-available?
     (check-public-head! :ze:0)
     (ze/gpu-skip! "public SFT head")))
+
+(deftest ordered-head-source-allocations-compose-across-changed-training-batches
+  (doseq [[target available? skip!] [[:ocl:0 opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 ze/gpu-available? ze/gpu-skip!]]]
+    (if-not @available?
+      (skip! (str "ordered SFT head source allocations on " target))
+      (let [inputs (fixture/inputs)
+            compilation (equation-first/compile #'fixture/head-step! {:target target :dtype :float})
+            executable (link/instantiate-ordered-invocation!
+                        compilation (fixture/arguments inputs)
+                        {:entry-roles '{E :constant wf :constant lse :state nll :output g :output}})]
+        (try
+          (doseq [batch (range 3)
+                  :let [current (fixture/inputs batch)
+                        expected (fixture/oracle current)
+                        replacements (into {} (map (fn [key] [(symbol (name key)) (get current key)]))
+                                           [:y :rows :targets :w])]]
+            (link/run-ordered-with-inputs! executable replacements nil)
+            (let [bindings (get-in @(:execution-state executable)
+                                   [:resident-boundary :plan :attributes :public-buffer-bindings])]
+              (doseq [key [:nll :g]]
+                (check-close (get expected key)
+                             (link/download executable (get bindings (symbol (name key)))) 1.0e-5)))
+            (is (= (inc batch) @(:completed-replays executable))))
+          (finally (link/close! executable)))))))
