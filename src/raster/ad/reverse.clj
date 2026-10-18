@@ -5190,11 +5190,23 @@
   This is the key primitive for:
   - Newton's method (solve H*d = -g for direction d)
   - Conjugate gradient on the Hessian
-  - Trust region methods"
+  - Trust region methods
+
+  Construction owns definition-dependent normalization; the returned function
+  rejects changed proof inputs before executing the retained higher-order program."
   [f-var]
   ;; Bind a shared counter for all AD passes (reify-pullback + transform-body)
-  (binding [*gensym-counter* (atom 0)]
-    (let [resolved (resolve-deftm-var f-var)
+  (method-entry/call-with-definition-inputs
+   (fn []
+    (binding [*gensym-counter* (atom 0)]
+    (let [initial (resolve-deftm-var f-var)
+          _ (doseq [v (distinct [f-var initial]) :when (var? v)]
+              (method-entry/observe-definition-input!
+               v (:ns (meta v)) (symbol (str (:ns (meta v))) (str (:name (meta v))))))
+          resolved (resolve-deftm-var f-var)
+          _ (when-not (identical? initial resolved)
+              (throw (ex-info "HVP source specialization changed during observation"
+                              {:reason :unstable-definition-proof-input :source f-var})))
           m (meta resolved)
           params (or (:raster.core/deftm-params m)
                      (throw (ex-info "compile-hvp-fn requires a deftm var" {:var f-var})))
@@ -5298,18 +5310,20 @@
         ;; Parameters: [p1 p2 ... v_a v_b ...] — ALL original params (⊥ dims
         ;; are still needed to evaluate) + one v per differentiable param.
           fn-params (vec (concat all-params v-syms))
-          compiled-fn (eval (list 'fn fn-params hvp-transformed))]
+          compiled-fn (eval (list 'fn fn-params hvp-transformed))
+          proof-inputs @method-entry/*emission-inputs*]
 
     ;; Return a function that takes [args-vec v-vec] -> [value Hv-vec]
     ;; (args-vec: all params; v-vec: one entry per DIFFERENTIABLE param;
     ;;  Hv rows align with the differentiable params.)
       (fn [args-vec v-vec]
+        (method-entry/assert-definition-inputs-current! proof-inputs)
         (let [all-args (vec (concat args-vec v-vec))
               [_vdg_value pullback] (apply compiled-fn all-args)
             ;; pullback(1.0) gives us [d/dx1, d/dx2, ..., d/dv1, d/dv2, ...]
             ;; We only want the first n entries (derivatives w.r.t. x, not v)
               all-grads (pullback 1.0)]
-          (vec (take n all-grads)))))))
+          (vec (take n all-grads)))))))))
 
 (defn compile-hessian-fn
   "Compile a full Hessian matrix function for a scalar deftm var.

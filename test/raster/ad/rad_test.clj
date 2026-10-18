@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest testing is are]]
             [raster.ad.reverse :as rad]
             [raster.ad.forward :as ad]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.core :refer [deftm]]))
 
 ;; ================================================================
@@ -559,6 +560,23 @@
           hv2 (hvp-fn [3.0 2.0] [0.0 1.0])
           hv12 (hvp-fn [3.0 2.0] [1.0 1.0])]
       (is (= (mapv + hv1 hv2) hv12)))))
+
+(deftest compiled-hvp-retains-its-definition-owner
+  (let [hvp (rad/compile-hvp-fn #'hvp-quadratic)
+        source (raster.core/resolve-deftm-var #'hvp-quadratic {:dtype :double})]
+    (is (= [2.0 1.0] (hvp [3.0 2.0] [1.0 0.0])))
+    (doseq [v (distinct [#'hvp-quadratic source])]
+      (with-redefs-fn {v (fn [& _] nil)}
+        #(is (= :stale-definition-proof-input
+                (try (hvp [3.0 2.0] [1.0 0.0]) nil
+                     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+    (is (= [1.0 0.0] (hvp [3.0 2.0] [0.0 1.0]))))
+  (let [inputs (atom {:static [] :values []})
+        hvp (binding [method-entry/*emission-inputs* inputs]
+              (rad/compile-hvp-fn #'hvp-quadratic))]
+    (is (contains? (:definition-proofs @inputs) #'hvp-quadratic))
+    (is (true? (method-entry/assert-definition-inputs-current! @inputs)))
+    (is (= [2.0 1.0] (hvp [3.0 2.0] [1.0 0.0])))))
 
 (deftest compile-hessian-fn-test
   (testing "Hessian of x^2+xy"
