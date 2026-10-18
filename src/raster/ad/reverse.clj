@@ -5977,13 +5977,12 @@
    The producer owns the actual original call and its selected companion;
    this hook does no source discovery or descriptor/type reconstruction."
   [sym expression activity]
-  (let [{:keys [call input-values helper]} (:owned-helper-call *generated-product-context*)]
+  (let [{:keys [call input-values helper companion result-context]}
+        (.get ^java.util.IdentityHashMap (:owned-helper-calls *generated-product-context*) expression)]
     (when-not (identical? call expression)
       (throw (ex-info "Bytecode helper edge is outside its owning input region"
                       {:reason :ad-unowned-bytecode-helper-edge})))
-    (let [companion (:companion-port *generated-product-context*)
-          result-context (:result-context *generated-product-context*)
-          tape (ad-gensym "helper_tape")
+    (let [tape (ad-gensym "helper_tape")
           pullback (ad-gensym "helper_pullback")
           result-tag (:return-tag helper)
           inputs (mapv (fn [index]
@@ -6215,12 +6214,75 @@
                 :source-owner owner :call-regions (vec (:call-regions product-program))}
          product? (assoc :paired-result-tag (:result-tag product-program))))))
 
+(defn- ordered-bytecode-input-program
+  "Close an actual emitted FP call tree into ordered completed-value bindings.
+   Each child comes from its parent's exact emitted input edge. Completion of
+   one input precedes evaluation of the next; this is not source ANF. Lexical
+   scopes, arbitrary expressions, and new local ports require their own region
+   producers and are refused here."
+  [emission region original input-index params active]
+  (let [retained (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-invocation-context)
+        nested (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-call-context)
+        parameters (zipmap params params)
+        ports (:physical-ports region)
+        active? (set active)
+        bindings (atom [])
+        helpers (atom [])
+        calls (java.util.IdentityHashMap.)
+        fail! #(throw (ex-info "Bytecode input tree has an unclosed call, operand or lexical scope"
+                              {:reason :ad-unclosed-bytecode-input-region}))]
+    (letfn [(lower-input [parent index]
+              (let [context (retained emission parent)
+                    input (get-in context [:inputs index])
+                    ^java.lang.reflect.Method method (:method context)
+                    _ (when-not (and input method
+                                     (every? (fn [[id facts]] (= facts (get ports id))) (:ports input)))
+                        (fail!))
+                    carrier (nth (vec (.getParameterTypes method)) index)
+                    contract (value-completion/bytecode-floating-input-contract carrier (:context input))
+                    operand (:operand input)
+                    source
+                    (if (trivial-expr? operand)
+                      (do (when (and (symbol? operand) (not (contains? parameters operand))) (fail!))
+                          {:value (get parameters operand operand) :active? (boolean (active? operand))})
+                      (let [child (nested emission parent index)
+                            child-original (:source-original child)
+                            {:keys [dispatch? lexical-callee operation implementation-op]}
+                            (op/call-description child-original)]
+                        (when-not (and child child-original dispatch? (nil? lexical-callee)) (fail!))
+                        (let [;; mapv is ordered and eager. Every recursive input
+                              ;; appends its completion before the next starts.
+                              inputs (mapv #(lower-input child-original %) (range (count (:inputs child))))
+                              selected (capture-selected-helper-emission
+                                        operation implementation-op (count inputs) (:method child))
+                              indices (vec (keep-indexed #(when (:active? %2) %1) inputs))
+                              helper (get-paired-helper-program (:emission selected) indices)
+                              companion (vary-meta (ad-gensym "input_helper") assoc
+                                                   :tag (symbol (.getName ^Class (:interface-class helper))))
+                              input-values (mapv :value inputs)
+                              raw (ad-gensym "helper_value" (:return-tag helper))
+                              call (with-meta (list* '.invk (:receiver child) input-values)
+                                              (meta child-original))
+                              entry {:call call :input-values input-values :helper helper
+                                     :companion companion :result-context (:context input)
+                                     :guard (:guard selected)}]
+                          (.put calls call entry)
+                          (swap! helpers conj entry)
+                          (swap! bindings into [raw call])
+                          {:value raw :active? (boolean (seq indices))})))
+                    tag (if (= carrier Float/TYPE) 'float 'double)
+                    result (ad-gensym "completed_input" tag)]
+                (swap! bindings into [result (value-completion/complete-value contract (:value source))])
+                {:value result :active? (:active? source)}))]
+      (let [result (lower-input original input-index)]
+        {:bindings @bindings :result (:value result) :calls calls :helpers @helpers}))))
+
 (defn ^:no-doc prepare-bytecode-input-pullback
-  "Linearize an owned FP input whose original operand is a closed typed call.
+  "Linearize an owned FP input whose operand is an emitted typed call tree.
    This private region producer reuses the ordinary AD binding engine. It is
    not default public-source admission: the enclosing producer still owns
-   selected-parent correspondence and lexical/tangent-port projection. More
-   deeply nested operands require recursive region composition, not early ANF.
+   selected-parent correspondence and lexical/tangent-port projection. Nested
+   typed inputs compose recursively with their original completion boundaries.
 
    `declarations` is the caller's retained tangent declaration for every free
    port, separately from the original physical ABI. Selected ports are ordered
@@ -6233,11 +6295,8 @@
         region (outline emission original input-index)
         operand (get-in region [:input :operand])
         child (nested emission original input-index)
-        {:keys [dispatch? lexical-callee operation implementation-op]}
-        (op/call-description (:source-original child))
-        arguments (mapv :operand (:inputs child))
         ports (:physical-ports region)]
-    (when-not (and child dispatch? (nil? lexical-callee) (anf/closed-call? operand)
+    (when-not (and child
                    (map? declarations) (= (set (keys ports)) (set (keys declarations)))
                    (vector? active-ports) (= (count active-ports) (count (distinct active-ports)))
                    (every? #(contains? ports %) active-ports)
@@ -6252,72 +6311,56 @@
                 (not (contains? #{:double :float :ref} physical)))
         (throw (ex-info "Bytecode input tangent declaration conflicts with its physical port"
                         {:reason :ad-paired-helper-active-space :port port}))))
-    (let [selected (capture-selected-helper-emission operation implementation-op (count arguments) (:method child))
-          indices (vec (keep-indexed #(when (contains? (set active-ports) %2) %1) arguments))
-          helper (get-paired-helper-program (:emission selected) indices)
-          revisions (requiring-resolve 'raster.ad.normalized-scalar/revisions)
+    (let [revisions (requiring-resolve 'raster.ad.normalized-scalar/revisions)
+          ;; Capture before recursive derivation, never re-certify a program
+          ;; with a later template/compiler epoch after it has been built.
           expected (revisions)
           proof-inputs (atom {:static [] :values []})
           params (mapv #(vary-meta % assoc :raster.type/tag (get declarations %))
                        (get-in region [:spec :params]))
-          parameters (zipmap params params)
-          active (mapv parameters active-ports)
-          context (get-in region [:input :context])
+          active (mapv (zipmap params params) active-ports)
           used (atom (util/free-syms-flat [params operand]))
           built
           (with-ad-gensym
             (binding [*generated-product-context* {:used-identifiers used}]
-              (let [companion (vary-meta (ad-gensym "input_helper") assoc
-                                         :tag (symbol (.getName ^Class (:interface-class helper))))
-                    input-values (mapv (fn [tag] (ad-gensym "completed_input" tag))
-                                       (get-in helper [:emission :tags]))
-                    contracts (mapv (fn [input ^Class carrier]
-                                      (value-completion/bytecode-floating-input-contract carrier (:context input)))
-                                    (:inputs child)
-                                    (.getParameterTypes ^java.lang.reflect.Method (:method child)))
-                    raw (ad-gensym "helper_value" (:return-tag helper))
-                    result-tag (if (= Float/TYPE (get-in region [:input-contract :target-carrier])) 'float 'double)
-                    result (ad-gensym "completed_result" result-tag)
-                    call (with-meta (list* '.invk (:receiver child) input-values) (meta operand))
-                    bindings (into (vec (mapcat (fn [id contract argument]
-                                                  [id (value-completion/complete-value contract
-                                                       (get parameters argument argument))])
-                                                input-values contracts arguments))
-                                   [raw call result (value-completion/complete-value (:input-contract region) raw)])
+              (let [{:keys [bindings result calls helpers] :as ordered}
+                    (ordered-bytecode-input-program emission region original input-index params active)
                     program
                     (binding [*generated-product-context*
                               {:backend :jvm-bytecode :used-identifiers used
-                               :companion-port companion :result-context context
-                               :owned-helper-call {:call call :input-values input-values :helper helper}}
+                               :owned-helper-calls calls}
                               method-entry/*emission-inputs* proof-inputs
                               *source-memory-context* {:values params :internal-region? true
                                                        :value-facts {} :aliases {} :replayed {} :unprojectable {}}
                               util/*shadowing-locals* (set params)]
                       (derive-flat-product-program bindings result active))]
-                {:program program :companion companion})))
+                (assoc ordered :program program))))
           program (:program built)
-          companion (:companion built)
-          body (list 'let* [companion
-                            (list 'clojure.core/nth
-                                  (value-completion/complete-value
-                                   value-completion/object-input-contract
-                                   (list 'quote [(:companion helper)])) 0)]
+          helpers (:helpers built)
+          companion-ports (mapv :companion helpers)
+          body (list 'let* (vec (mapcat (fn [{:keys [companion helper]}]
+                                         [companion
+                                          (list 'clojure.core/nth
+                                                (value-completion/complete-value
+                                                 value-completion/object-input-contract
+                                                 (list 'quote [(:companion helper)])) 0)]) helpers))
                      (:form program))
           walked-body [body]
           spec (assoc (:spec region) :params params :return-tag 'Object :walked-body walked-body)
           source-ns (:source-ns emission)
           execution-guard ((requiring-resolve 'raster.ad.normalized-scalar/execution-guard)
                            source-ns expected
-                           [{:parameters (conj params companion) :body (:form program)}])
+                           [{:parameters (into params companion-ports) :body (:form program)}])
           guard (fn []
-                  ((:guard region)) ((:guard selected)) ((:guard helper))
+                  ((:guard region))
+                  (doseq [{:keys [guard helper]} helpers] (guard) ((:guard helper)))
                   (method-entry/assert-definition-inputs-current! @proof-inputs)
                   (execution-guard))
           _ (guard)]
       {:params params :walked-body walked-body :source-ns source-ns
        :source-owner {:backend :jvm-bytecode :spec spec :input-region region :guard guard}
        :paired-result-tag (:result-tag program) :absent-seed? true
-       :call-regions [region] :helper helper :program program})))
+       :call-regions [region] :helpers helpers :program program})))
 
 (defn- compile-bytecode-preparation
   "Consume a private prepared bytecode program without source re-projection."
