@@ -323,11 +323,13 @@
 (declare direct-selected-definition)
 
 (defn capture-source-entry
-  "Capture the ORIGINAL source inputs consumed by a typed JIT, before walking.
+  "Capture ORIGINAL inputs at the actual compiler producer, before publication.
    This owner-private lineage is not a portable certificate or a type registry.
-   Derived walked bodies/cache metadata are deliberately not source identity.
+   Mutable walked metadata/cache output are deliberately not source identity.
+   A plain Clojure producer may additionally freeze its exact compiled body.
    Nil means the supplied plan does not correspond to this retained definition."
-  [source-var {:keys [params tags annotations source-body source-ns typed-interface return-tag]}]
+  [source-var {:keys [params tags annotations source-body source-ns typed-interface return-tag
+                     clojure-body]}]
   (when (and (var? source-var) (bound? source-var)
              (instance? clojure.lang.Namespace source-ns))
     (let [{:keys [value metadata]} (var-snapshot source-var)]
@@ -340,10 +342,11 @@
                  (= return-tag (or (:raster.core/return-tag metadata) 'Object))
                  (some? source-body)
                  (identical? source-body (:raster.core/deftm-source-body metadata))
-                 (some? typed-interface))
-        {:source-var source-var :source-root value :source-name (:name metadata)
-         :params params :tags tags :annotations annotations :source-body source-body
-         :source-ns source-ns :typed-interface typed-interface :return-tag return-tag}))))
+                 (or (some? typed-interface) (vector? clojure-body)))
+        (cond-> {:source-var source-var :source-root value :source-name (:name metadata)
+                 :params params :tags tags :annotations annotations :source-body source-body
+                 :source-ns source-ns :typed-interface typed-interface :return-tag return-tag}
+          (vector? clojure-body) (assoc :clojure-body clojure-body))))))
 
 (defn source-entry-current?
   "Validate historical source-entry lineage, not a fresh proof around old code.
@@ -433,6 +436,19 @@
                      :parameters parameters :parameter-carriers carriers
                      :result-carrier (.getReturnType method)}))))))))))
 
+(defn- usable-emission?
+  "Optional analyses may abstain on unavailable historical evidence. Execution
+   and publication still use the throwing guards; invariant failures propagate."
+  [emission]
+  (try
+    (assert-emission-inputs-current! emission)
+    true
+    (catch clojure.lang.ExceptionInfo failure
+      (if (or (retryable-emission-change? failure)
+              (= :missing-emission-input-observations (:reason (ex-data failure))))
+        false
+        (throw failure)))))
+
 (defn selected-source-entry-carriers
   "Project primitive formal facts INSIDE an exact retained typed source entry.
    Cold jit-spec and warm owned emission must correspond to the same source Var
@@ -461,19 +477,76 @@
                          (identical? (:typed-impl entry) (:implementation emission))
                          (= parameters (:params emission)) (= tags (:tags emission))
                          (= (str (:typed-iface entry)) (str (:typed-interface emission))))
-                (when (source-entry-current? (:source-entry emission))
-                  (assert-emission-inputs-current! emission)
+                (when (and (source-entry-current? (:source-entry emission))
+                           (usable-emission? emission))
                   (:source-entry emission)))))]
       (when (and lineage (identical? source-var (:source-var lineage))
                  (= parameters (:params lineage)) (= tags (:tags lineage))
                  (= (str (:typed-iface entry)) (str (:typed-interface lineage))))
         (assert-definition-inputs-current! @*emission-inputs*)
-        (assoc projection :scope :typed-source-body-entry
+        (assoc projection :scope :typed-source-body-entry :source-entry lineage
+               :pending-source? (boolean spec) :emission (when-not spec emission)
                :parameter-facts
                (zipmap parameters
                        (mapv (fn [^Class carrier]
                                {:carrier carrier :presence (if (.isPrimitive carrier) :present :unknown)})
                              parameter-carriers)))))))
+
+(defn selected-definition-body
+  "Historical body for an already observed selected definition, never current
+   walked metadata. Typed methods retain actual receiver/emission correspondence.
+   Plain deftm declarations freeze the exact Clojure body at their producer.
+   Missing historical evidence abstains without compiling or invoking anything."
+  [{:keys [source-var receiver-var operation implementation-op parameters] :as definition}]
+  (when (and *emission-inputs* definition)
+    (let [projection (when receiver-var
+                       (selected-source-entry-carriers operation implementation-op
+                                                       (count parameters) source-var))
+          lineage (if receiver-var
+                    (:source-entry projection)
+                    (:raster.core/clojure-source-entry (meta source-var)))
+          body (when (and (identical? source-var (:source-var lineage))
+                          (identical? (:source-body definition) (:source-body lineage))
+                          (source-entry-current? lineage))
+                 (if receiver-var
+                   (if (:pending-source? projection)
+                     (:source-body lineage)
+                     (get-in projection [:emission :body]))
+                   (:clojure-body lineage)))]
+      (when (seq body)
+        (assert-definition-inputs-current! @*emission-inputs*)
+        {:body body :parameters (:params lineage) :tags (:tags lineage)
+         :source-var source-var :source-ns (:source-ns lineage)
+         :pending-source? (boolean (:pending-source? projection))
+         :dependency-snapshots (get-in projection [:emission :dependency-snapshots])}))))
+
+(defn observed-body-operation
+  "Resolve a nonlexical call only with the selected body's lookup authority.
+   Pending source may observe current resolution before its eventual compilation.
+   An already compiled body needs its ORIGINAL lookup edge; a current namespace
+   mapping cannot certify old code. Retain accepted historical inputs in the new
+   artifact's existing owner. Missing legacy or plain-Clojure edges abstain."
+  [{:keys [source-ns pending-source? dependency-snapshots]} operation locals]
+  (when (and *emission-inputs* (instance? clojure.lang.Namespace source-ns)
+             (symbol? operation) (not (special-symbol? operation))
+             (not= '.invk operation) (not (contains? locals operation)))
+    (let [lookup [source-ns operation]
+          historical (when-not pending-source?
+                       (some #(when (contains? (:lookups %) lookup) %) dependency-snapshots))
+          v (if pending-source?
+              (ns-resolve source-ns operation)
+              (:var historical))]
+      (when (and (var? v)
+                 (or pending-source? (var-snapshot-current? historical)))
+        (observe-definition-input! v source-ns operation)
+        ;; Never refresh an old snapshot merely because a new observation was
+        ;; possible. Both owners must describe the same historical lookup.
+        (when (or pending-source? (var-snapshot-current? historical))
+          (assert-definition-inputs-current! @*emission-inputs*)
+          (let [metadata (if pending-source?
+                           (get-in @*emission-inputs* [:definition-proofs v :metadata])
+                           (:metadata historical))]
+            (symbol (str (ns-name (:ns metadata))) (str (:name metadata)))))))))
 
 (defn direct-selected-definition
   "Correspondence for an already selected plain mangled function call.

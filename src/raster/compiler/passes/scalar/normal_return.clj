@@ -28,7 +28,7 @@
 
 (declare summary)
 
-(defn- materialized-result [expression env visited]
+(defn- materialized-result [expression env visited body-context]
   (let [key [:materialized-map expression]]
     (if (contains? visited key)
       unknown
@@ -41,10 +41,10 @@
                          nil
                          (throw e))))]
         (if (and (contains? result :form) (not= expression (:form result)))
-          (summary (:form result) env (conj visited key))
+          (summary (:form result) env (conj visited key) body-context)
           unknown)))))
 
-(defn- selected-result* [expression env visited]
+(defn- selected-result* [expression env visited body-context]
   (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
         (descriptor/call-description expression)
         definition (when (and method-entry/*emission-inputs*
@@ -59,7 +59,7 @@
                         ;; never desired result/formal annotations or fake values.
                         (when (and (qualified-symbol? implementation-op)
                                    (find-ns (symbol (namespace implementation-op))))
-                          (let [tags (mapv #(:array-tag (summary % env visited)) arguments)
+                          (let [tags (mapv #(:array-tag (summary % env visited body-context)) arguments)
                                 signature (when (and (seq tags) (every? some? tags))
                                             (inference/registered-call-signature implementation-op tags))]
                             (when (and signature (= tags (:tags signature))
@@ -67,50 +67,65 @@
                               (method-entry/observed-selected-definition
                                :direct implementation-op (:mangled-sym signature) (count arguments))))))))]
     (if definition
-      (if-let [{:keys [source-var parameters source-body walked-body tags]}
-               definition]
+      (if-let [{:keys [source-var parameters body tags] :as selected-body}
+               (method-entry/selected-definition-body definition)]
         (if (contains? visited source-var)
           unknown
-          (let [;; Raw source can prove closed constructors/aliases too, but
-                ;; never resolve its operation aliases in the caller's namespace.
-                body (or (seq walked-body) (seq source-body))]
+          (let [;; Only historical producer-owned bodies may prove constructors
+                ;; or aliases. Current walked metadata is not code evidence.
+                body (seq body)]
             ;; Transport actual producer facts, never presence from formal tags.
             ;; A changed input carrier cannot certify a callee's array result.
             (if (seq body)
               (summary (apply list 'do body)
                        (zipmap parameters
                                (map (fn [argument tag]
-                                      (let [fact (summary argument env visited)]
+                                      (let [fact (summary argument env visited body-context)]
                                         (if (= tag (:array-tag fact)) fact
                                             (dissoc fact :array-tag))))
                                     arguments tags))
-                       (conj visited source-var))
+                       (conj visited source-var) selected-body)
               unknown)))
         unknown)
       unknown)))
 
-(defn- selected-result [expression env visited]
+(defn- selected-result [expression env visited body-context]
   (or (method-entry/call-with-optional-definition-inputs
-       #(let [result (selected-result* expression env visited)]
+       #(let [result (selected-result* expression env visited body-context)]
           (when (or (not= :unknown (:presence result)) (:array-tag result)) result)))
       unknown))
 
-(defn- conditional-result [expression env visited]
+(defn- source-call [expression env body-context]
+  (let [head (when (seq? expression) (first expression))]
+    (if-let [operation (when (and body-context (symbol? head)
+                                 (nil? (namespace head))
+                                 (not (special-symbol? head))
+                                 (not (or (:dispatch? (descriptor/call-description expression))
+                                          (:lexical-callee (descriptor/call-description expression)))))
+                        (method-entry/observed-body-operation body-context head env))]
+      (with-meta (cons operation (rest expression)) (meta expression))
+      expression)))
+
+(defn- conditional-result [expression env visited body-context]
   (let [[_ test then else] expression
+        test (source-call test env body-context)
         argument (when (and (seq? test) (= 2 (count test))
                              (= 'clojure.core/nil? (descriptor/semantic-op test))
                              (not (contains? env (first test))))
                    (second test))
-        known (when argument (summary argument env visited))]
+        known (when argument (summary argument env visited body-context))]
     (case (:presence known)
-      :present (summary else env visited)
-      :absent (summary then env visited)
+      :present (summary else env visited body-context)
+      :absent (summary then env visited body-context)
       (let [local? (symbol? argument)
             then-env (if local? (assoc env argument {:presence :absent}) env)
             else-env (if local? (assoc env argument (assoc known :presence :present)) env)]
-        (join (summary then then-env visited) (summary else else-env visited))))))
+        (join (summary then then-env visited body-context)
+              (summary else else-env visited body-context))))))
 
-(defn- summary [expression env visited]
+(defn- summary
+  ([expression env visited] (summary expression env visited nil))
+  ([expression env visited body-context]
   (cond
     (nil? expression) {:presence :absent}
     (symbol? expression) (merge unknown (select-keys (get env expression) [:presence :array-tag]))
@@ -118,20 +133,21 @@
     (contains? #{'quote 'clojure.core/quote} (first expression))
     {:presence (if (nil? (second expression)) :absent :present)}
     (= 'throw (first expression)) {:presence :no-return}
-    (= 'do (first expression)) (summary (last (rest expression)) env visited)
+    (= 'do (first expression)) (summary (last (rest expression)) env visited body-context)
     (form/binding-form? expression)
     (let [{:keys [sequential? scopes]} (form/scope-info expression)
           {:keys [binders inits body]} (first scopes)]
       (if (and sequential? (= 1 (count scopes)) (every? symbol? binders))
         (let [local (reduce (fn [local [id init]]
-                              (assoc local id (summary init local visited)))
+                              (assoc local id (summary init local visited body-context)))
                             env (map vector binders inits))]
-          (summary (last body) local visited))
+          (summary (last body) local visited body-context))
         unknown))
     (= 'if (first expression))
-    (conditional-result expression env visited)
+    (conditional-result expression env visited body-context)
     :else
-    (let [operation (descriptor/semantic-op expression)]
+    (let [expression (source-call expression env body-context)
+          operation (descriptor/semantic-op expression)]
       (cond
         ;; Exact qualified language constructors, not alloc-op?'s compatibility
         ;; lookup or buffer metadata which may only describe a call argument.
@@ -145,7 +161,7 @@
         ;; Use the existing pure-map materializer to expose its actual
         ;; constructor and returned local; do not duplicate SOAC lowering.
         (and (= 'raster.par/pmap operation) (par/par-map-pure-form? expression))
-        (materialized-result expression env visited)
+        (materialized-result expression env visited body-context)
         ;; Only explicit destination identity contracts may forward a fact.
         (and (symbol? operation) (= operation (first expression))
              ;; form-info accepts surface aliases such as par/scan. Such a
@@ -153,8 +169,8 @@
              (= "raster.par" (namespace operation))
              (some? (:return-alias-arg (form/form-info expression))))
         (let [index (:return-alias-arg (form/form-info expression))]
-          (summary (nth (descriptor/call-args expression) index nil) env visited))
-        :else (selected-result expression env visited)))))
+          (summary (nth (descriptor/call-args expression) index nil) env visited body-context))
+        :else (selected-result expression env visited body-context))))))
 
 (defn result-fact
   "Normal-return presence plus an independently derived primitive-array carrier.

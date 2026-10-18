@@ -843,6 +843,10 @@
                     generate-typed? typed-iface-name prim-hinted-params]} prep
             simple-name (if (qualified-symbol? fn-name) (symbol (name fn-name)) fn-name)
             mangled (types/mangle simple-name tags)
+            ;; A macro expansion may be evaluated after another expansion of the
+            ;; same name. Both emitted code and producer evidence must retain
+            ;; THIS declaration's bodies, not a name-keyed replacement.
+            body-registry-key (str (ns-name *ns*) "/" (gensym (str mangled "__")))
         ;; Add prim return hint to prim-hinted-params metadata
             prim-hinted-params (when (and prim-hinted-params ret-tag)
                                  (vary-meta prim-hinted-params assoc :tag
@@ -863,7 +867,7 @@
     ;; This avoids quoting large walked bodies into the compiled output,
     ;; which would hit Clojure's 64KB method limit for functions with
     ;; many expanded par forms (e.g. vern7-step! with 10 broadcast stages).
-        (swap! walked-body-registry assoc (str mangled)
+        (swap! walked-body-registry assoc body-registry-key
                {:walked-body (when walked-body (vec walked-body))
                 :walked-body-typed (when walked-body-typed (vec walked-body-typed))
                 :source-body (vec body)})
@@ -890,7 +894,7 @@
        ;; Populate metadata from walked-body-registry (stored at macro time).
        ;; This avoids quoting large walked bodies as literals, which would
        ;; hit Clojure's 64KB method limit for functions with many par forms.
-           (let [reg# (walked-body-for ~(str mangled))]
+           (let [reg# (walked-body-for ~body-registry-key)]
              (alter-meta! (var ~mangled) assoc
                           ::deftm true
                           ::deftm-params '~params
@@ -904,6 +908,17 @@
                           ~(boolean (:raster.compiler/host-only (meta fn-name)))))
            ~(when ret-tag
               `(alter-meta! (var ~mangled) assoc ::return-tag '~ret-tag))
+           ~(when-not generate-typed?
+              `(let [reg# (walked-body-for ~body-registry-key)
+                     source# (var ~mangled)
+                     lineage# (me/capture-source-entry
+                               source# {:params '~params :tags '~tags
+                                        :annotations '~annotations
+                                        :return-tag '~(or ret-tag 'Object)
+                                        :source-body (:source-body reg#)
+                                        :source-ns *ns* :typed-interface nil
+                                        :clojure-body (:walked-body reg#)})]
+                 (alter-meta! source# assoc ::clojure-source-entry lineage#)))
            ~(when (seq fn-param-checks)
               `(alter-meta! (var ~mangled) assoc ::has-fn-params true))
            ~@(when generate-typed?
@@ -930,7 +945,7 @@
                   `(def ~(vary-meta mangled-impl-var assoc :tag typed-iface-name)
                      (new ~mangled-impl-type))
               ;; Mark for JIT compilation — walked body retrieved from registry
-                  `(let [reg# (walked-body-for ~(str mangled))]
+                  `(let [reg# (walked-body-for ~body-registry-key)]
                      (when *compile-deftm-bytecode?*
                        (alter-meta! (var ~mangled-impl-var) assoc
                                     ::jit-spec {:mangled-sym '~mangled
