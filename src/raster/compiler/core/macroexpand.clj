@@ -71,7 +71,7 @@
    ;; (quote ...) as a :leaf and never descends; we must match that contract here, or
    ;; macroexpand would rewrite macros/classes sitting in head position INSIDE quoted
    ;; data (e.g. '(let [a 1] a) -> '(let* [a 1] a)), silently corrupting it.
-   (if (and (seq? form) (= 'quote (first form)))
+   (if (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form)))
      form
      (let [expanded (if (and (seq? form)
                              (not (and (symbol? (first form)) (skip-head? (first form)))))

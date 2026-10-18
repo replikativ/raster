@@ -8,6 +8,7 @@
   (:require [raster.compiler.ir.par :as par]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.method-entry :as me]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.macroexpand :as mex]
@@ -602,6 +603,7 @@
   to IFn.invoke via var lookup."
   [form]
   (cond
+    (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) form
     (seq? form) (with-meta (apply list (map desugar-invk form)) (meta form))
     (vector? form) (with-meta (mapv desugar-invk form) (meta form))
     :else form))
@@ -622,6 +624,8 @@
   bytecode compiler needs int counters for IF_ICMPGE."
   [form]
   (cond
+    ;; Quoted values are owned data, never executable syntax to rebuild.
+    (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) form
     ;; and/or + comparison fusion:
     ;; (let* [t (cmp)] (if t expr t)) → (if (cmp) expr false)   [and pattern]
     ;; (let* [t (cmp)] (if t t expr)) → (if (cmp) true expr)    [or pattern]
@@ -693,7 +697,12 @@
   (:form (materialize/materialize-pass form nil)))
 
 ;; Forward declarations for mutual recursion
-(declare emit-form)
+(declare emit-form emit-object-value)
+
+(defn- emit-result-form [code expression locals ctx]
+  (if (:object-result? ctx)
+    (emit-object-value code expression locals (dissoc ctx :object-result? :void-context))
+    (emit-form code expression locals ctx)))
 (declare compile-and-cache-deftm!)
 (declare no-inline-deftm?)
 
@@ -706,7 +715,7 @@
   [code forms locals ctx]
   (let [stmts (butlast forms)
         last-form (last forms)
-        void-ctx (assoc ctx :void-context true)]
+        void-ctx (assoc (dissoc ctx :object-result?) :void-context true)]
     (doseq [s stmts]
       (let [t (emit-form code s locals void-ctx)]
         (when-not (#{:void :diverge} t)
@@ -714,7 +723,7 @@
     (if (seq forms)
       ;; Preserve void-context if the enclosing form is already in void context.
       ;; Otherwise dissoc so the last form's value is kept on the stack.
-      (emit-form code last-form locals
+      (emit-result-form code last-form locals
                  (if (:void-context ctx) ctx (dissoc ctx :void-context)))
       :void)))
 
@@ -948,6 +957,8 @@
                                                           captured-locals
                                                           (map-indexed vector params))
                                                          inner-ctx {:class-desc class-desc
+                                                                    :literal-owner (:literal-owner ctx)
+                                                                    :object-result? true
                                                                     :next-slot  next-slot
                                                                     :source-ns  (:source-ns ctx)
                                                                     ;; Propagate typing/sibling context from the enclosing
@@ -1235,6 +1246,8 @@
                                                               captured-locals
                                                               (map-indexed vector method-params))
                                                              inner-ctx {:class-desc class-desc
+                                                                        :literal-owner (:literal-owner ctx)
+                                                                        :object-result? true
                                                                         :next-slot  next-slot
                                                                         :source-ns  source-ns}
                                                              expanded-body (map macroexpand-all-preserving body)
@@ -1323,6 +1336,8 @@
                                                               captured-locals
                                                               (map-indexed vector method-params))
                                                              inner-ctx {:class-desc class-desc
+                                                                        :literal-owner (:literal-owner ctx)
+                                                                        :object-result? (= :ref ret-st)
                                                                         :next-slot  next-slot
                                                                         :source-ns  source-ns}
                                                              expanded-body (map macroexpand-all-preserving body)
@@ -1384,10 +1399,9 @@
       (.labelBinding code end-label) :bool)
 
     "identical?"
-    (let [t1 (emit-form code (first args) locals ctx)]
-      (when (primitive? t1) (emit-box-to-ref code t1))
-      (let [t2 (emit-form code (second args) locals ctx)]
-        (when (primitive? t2) (emit-box-to-ref code t2)))
+    (do
+      (emit-object-value code (first args) locals ctx)
+      (emit-object-value code (second args) locals ctx)
       (let [eq-label  (.newLabel code)
             end-label (.newLabel code)]
         (.if_acmpeq code eq-label)
@@ -1401,7 +1415,7 @@
           cls (or (try (Class/forName (str cls-form)) (catch Exception _ nil))
                   (when-let [r (ns-resolve src-ns (symbol (str cls-form)))]
                     (when (class? r) r)))
-          t (emit-form code val-form locals ctx)]
+          t (emit-object-value code val-form locals ctx)]
       (when (primitive? t) (emit-box-to-ref code t))
       (.instanceOf code (class-desc-of cls))
       :bool)
@@ -2034,9 +2048,7 @@
                      (swap! (:next-slot ctx) inc)
                      (.istore code tmp) (.iload code tmp)
                      (.sastore code) (.iload code tmp) :int)))
-        (let [val-type (emit-form code val locals ctx)]
-              (when (not= val-type :ref)
-                (emit-coerce code val-type :ref))
+        (do (emit-object-value code val locals ctx)
               (if void?
                 (do (.aastore code) :void)
                 ;; dup_x2: [arr, idx, val] → [val, arr, idx, val]
@@ -2140,9 +2152,7 @@
                          (doseq [[i elem] (map-indexed vector arg)]
                            (.dup code)
                            (.ldc code (int i))
-                           (let [t (emit-form code elem locals ctx)]
-                             (when (#{:double :float :int :long} t)
-                               (emit-box-to-ref code t)))
+                           (emit-object-value code elem locals ctx)
                            (.aastore code))
                          :ref)
                        ;; (object-array n) — create empty array of size n
@@ -2449,8 +2459,10 @@
   [code bc-info caller-args locals ctx]
   (let [{:keys [class-desc method-type return-stack-type]} bc-info]
     (doseq [[arg i] (map vector caller-args (range (.parameterCount method-type)))]
-      (let [t         (emit-form code arg locals ctx)
-            target-cd (.parameterType method-type i)
+      (let [target-cd (.parameterType method-type i)
+            t         (if (.equals target-cd obj-cd)
+                        (emit-object-value code arg locals ctx)
+                        (emit-form code arg locals ctx))
             target-st (cond
                         (.equals target-cd D-cd) :double
                         (.equals target-cd J-cd) :long
@@ -2491,6 +2503,13 @@
                            [(reduce + pranks) m])))
                      candidates)]
     (when (seq ranked) (second (apply min-key first ranked)))))
+
+(defn- emit-argument-value
+  "Honor the resolved JVM input carrier, not a logical scalar result hint."
+  [code expression ^Class carrier locals ctx]
+  (if (= Object carrier)
+    (emit-object-value code expression locals ctx)
+    (emit-form code expression locals ctx)))
 
 (defn- emit-java-static-call
   "Emit bytecode for Java static method calls (e.g. Math/sin, System/arraycopy).
@@ -2579,7 +2598,7 @@
                           {:class (.getName cls) :method meth-name :arity (count args)})))
         (let [param-types (.getParameterTypes method)]
           (doseq [[arg ^Class pt] (map vector args param-types)]
-            (let [t      (emit-form code arg locals ctx)
+            (let [t      (emit-argument-value code arg pt locals ctx)
                   target (class-type->stack pt)]
               (if (and (= t :ref) (= target :ref) (not (.equals pt Object)))
                 (.checkcast code (class-desc-of pt))
@@ -2669,8 +2688,7 @@
   (if (<= (count args) 20)
     (do
       (doseq [arg args]
-        (let [t (emit-form code arg locals ctx)]
-          (when (primitive? t) (emit-box-to-ref code t))))
+        (emit-object-value code arg locals ctx))
       (.invokeinterface code ifn-cd "invoke"
                         (MethodTypeDesc/of obj-cd
                                            (into-array ClassDesc (repeat (count args) obj-cd)))))
@@ -2680,8 +2698,7 @@
       (doseq [[index arg] (map-indexed vector args)]
         (.dup code)
         (.ldc code (int index))
-        (let [t (emit-form code arg locals ctx)]
-          (when (primitive? t) (emit-box-to-ref code t)))
+        (emit-object-value code arg locals ctx)
         (.aastore code))
       (.invokestatic code rt-cd "seq"
                      (MethodTypeDesc/of iseq-cd (into-array ClassDesc [obj-cd])))
@@ -2692,6 +2709,8 @@
 (defn- emit-fn-call
   "Emit bytecode for function calls (Java static, deftm, sibling, var, local IFn)."
   [code head head-name args locals ctx]
+  (let [object-call-result? (:object-call-result? ctx)
+        ctx (dissoc ctx :object-call-result?)]
   ;; Try clojure.core intrinsic first (returns nil for unhandled fns → fallthrough)
   (or (when (and (not (contains? locals head)) (is-clojure-core? head ctx))
         (emit-core-intrinsic code head-name args locals ctx))
@@ -2703,11 +2722,24 @@
           (.checkcast code ifn-cd)
           (emit-boxed-ifn-call code args locals ctx))
 
+        ;; In Object result context the source Var is authoritative. A typed
+        ;; sibling/static replacement may return a primitive and destroy the
+        ;; identity of an actual boxed result. Lexical callees still win above.
+        (and object-call-result? (symbol? head)
+             (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) head)]
+               (and (var? v) (:raster.core/deftm (meta v)))))
+        (let [^clojure.lang.Var v (ns-resolve (or (:source-ns ctx) *ns*) head)]
+          (emit-var-constant! code (str (.name (.ns v))) (str (.sym v)))
+          (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
+          (.checkcast code ifn-cd)
+          (emit-boxed-ifn-call code args locals ctx))
+
     ;; .method sugar → rewrite to (. obj method args...) and recurse
         (and (symbol? head) (.startsWith (str head) ".") (not= (str head) "."))
         (let [meth-sym (symbol (subs (str head) 1))
               [obj & margs] args]
-          (emit-form code (apply list '. obj meth-sym margs) locals ctx))
+          (emit-form code (apply list '. obj meth-sym margs) locals
+                     (cond-> ctx object-call-result? (assoc :object-call-result? true))))
 
     ;; ---- Java static method: ClassName/method ----
     ;; Skip if it resolves to a Clojure var (e.g. raster.nn/dense_m_doubles_doubles_doubles)
@@ -2728,9 +2760,11 @@
         (let [{:keys [method-name method-type return-stack-type param-infos]}
               (get (:typed-sibling-methods ctx) (name head))]
           (doseq [[arg info] (map vector args param-infos)]
-            (let [t (emit-form code arg locals ctx)
-                  target-st (:stack-type info)
-                  target-cd (:class-desc info)]
+            (let [target-cd (:class-desc info)
+                  t (if (.equals target-cd obj-cd)
+                      (emit-object-value code arg locals ctx)
+                      (emit-form code arg locals ctx))
+                  target-st (:stack-type info)]
               (if (and (= t :ref) (= target-st :ref) (not (.equals target-cd obj-cd)))
                 (.checkcast code target-cd)
                 (when (not= t target-st)
@@ -2750,7 +2784,9 @@
         (and (symbol? head) (get (:sibling-methods ctx) (str head)))
         (let [{:keys [method-name method-type param-descs]} (get (:sibling-methods ctx) (str head))]
           (doseq [[a pd] (map vector args (concat param-descs (repeat obj-cd)))]
-            (let [t (emit-form code a locals ctx)
+            (let [t (if (.equals ^ClassDesc pd obj-cd)
+                      (emit-object-value code a locals ctx)
+                      (emit-form code a locals ctx))
                   target-st (cond (.equals ^ClassDesc pd D-cd) :double
                                   (.equals ^ClassDesc pd J-cd) :long
                                   (.equals ^ClassDesc pd I-cd) :int
@@ -2787,7 +2823,9 @@
               ret-cd-actual (class-desc-of (.getReturnType bc-method))
               bc-mt (MethodTypeDesc/of ret-cd-actual (into-array ClassDesc param-cds))]
           (doseq [[a pd] (map vector args param-cds)]
-            (let [t (emit-form code a locals ctx)
+            (let [t (if (.equals ^ClassDesc pd obj-cd)
+                      (emit-object-value code a locals ctx)
+                      (emit-form code a locals ctx))
                   target-st (cond (.equals ^ClassDesc pd D-cd) :double
                                   (.equals ^ClassDesc pd J-cd) :long
                                   (.equals ^ClassDesc pd I-cd) :int
@@ -2860,7 +2898,7 @@
                                     (.getConstructors cls)))
                 param-types (.getParameterTypes ctor)]
             (doseq [[arg ^Class pt] (map vector args param-types)]
-              (let [t      (emit-form code arg locals ctx)
+              (let [t      (emit-argument-value code arg pt locals ctx)
                     target (class-type->stack pt)]
                 (when (not= t target) (emit-coerce code t target))))
             (.invokespecial code cls-cd "<init>"
@@ -2890,7 +2928,7 @@
         (let [ht (emit-form code head locals ctx)]
           (when (primitive? ht) (emit-box-to-ref code ht))
           (.checkcast code ifn-cd)
-          (emit-boxed-ifn-call code args locals ctx)))))
+          (emit-boxed-ifn-call code args locals ctx))))))
 
 ;; ================================================================
 ;; emit-form — the core bytecode emitter
@@ -2938,7 +2976,7 @@
                              (catch Exception _)))
                       ;; Binding inits must always produce a value (for the local
                       ;; variable slot), so strip :void-context from ctx.
-                      (let [t (emit-form code init locs (dissoc ctx :void-context))
+                      (let [t (emit-form code init locs (dissoc ctx :void-context :object-result?))
                              ;; Handle type hints on let bindings
                              ;; ^objects → checkcast [Ljava/lang/Object;
                              ;; ^doubles → checkcast [D
@@ -3171,7 +3209,7 @@
         (when cmp-parts
           (let [pn (nth cmp-parts 0)
                 a1 (nth cmp-parts 1) a2 (nth cmp-parts 2)
-                val-ctx (dissoc ctx :void-context)
+                val-ctx (dissoc ctx :void-context :object-result?)
                 t1 (emit-form code a1 locals val-ctx)
                 t2 (emit-form code a2 locals val-ctx)]
             (cond
@@ -3221,7 +3259,7 @@
         ;; Predicate must always produce a value (to branch on),
         ;; so strip :void-context from ctx.
         pred-type (when-not branch-folded?
-                    (emit-form code pred locals (dissoc ctx :void-context)))]
+                    (emit-form code pred locals (dissoc ctx :void-context :object-result?)))]
     (when-not branch-folded?
       (case pred-type
         (:int :bool) (.ifeq code else-label)
@@ -3240,14 +3278,14 @@
         :double (do (.ldc code 0.0) (.dcmpl code) (.ifeq code else-label))
         :float  (do (.ldc code (float 0.0)) (.fcmpl code) (.ifeq code else-label))
         :long   (do (.ldc code (long 0)) (.lcmp code) (.ifeq code else-label))))
-    (let [then-type (emit-form code then locals ctx)]
+    (let [then-type (emit-result-form code then locals ctx)]
       (cond
         (diverge? then-type)
         ;; Then branch diverges (throw/recur) — never falls through.
         ;; No goto needed. Else branch is the only value-producing path.
         (do (.labelBinding code else-label)
             (let [else-type (if has-else?
-                              (emit-form code else locals ctx)
+                              (emit-result-form code else locals ctx)
                               (do (.aconst_null code) :ref))]
               (when (primitive? else-type)
                 (emit-box-to-ref code else-type))
@@ -3262,6 +3300,7 @@
         ;; (Integer(0) is truthy, but int 0 with ifeq is correctly falsy).
         :else
         (let [else-type-pred (cond
+                               (:object-result? ctx) :ref
                                (not has-else?) :ref
                                (symbol? else) (:type (get locals else))
                                :else (infer-arg-stack-type else locals))
@@ -3276,7 +3315,7 @@
           (.goto_ code end-label)
           (.labelBinding code else-label)
           (let [else-type (if has-else?
-                            (emit-form code else locals ctx)
+                            (emit-result-form code else locals ctx)
                             (do (.aconst_null code) :ref))]
             (cond
               ;; Else diverges (recur/throw) — then is the only value path
@@ -3341,6 +3380,8 @@
   - Regular path: invokeinterface/invokevirtual with optional instanceof guard"
   [code args locals ctx]
   (let [[obj member & margs] args
+        object-call-result? (:object-call-result? ctx)
+        ctx (dissoc ctx :object-call-result?)
         [meth-name method-args] (if (seq? member)
                                   [(first member) (rest member)]
                                   [member margs])
@@ -3378,7 +3419,8 @@
             ;; Primitive return type from walker (for invokedynamic zero-boxing).
             ;; Only used for the var-reference path; local path keeps Object return.
             ret-tag-meta (:raster.type/ret-tag (meta obj))
-            ^Class prim-ret-class (case ret-tag-meta
+            ^Class prim-ret-class (when-not object-call-result?
+                                   (case ret-tag-meta
                                     (double Double)   Double/TYPE
                                     (long Long)       Long/TYPE
                                     (int Integer)     Integer/TYPE
@@ -3388,7 +3430,7 @@
                                     ;; of falling back to the boxed invk → Object path.
                                     (boolean Boolean) Boolean/TYPE
                                     (void Void)       Void/TYPE
-                                    nil)
+                                    nil))
             is-var? (and (namespace obj) (not (get locals obj)))]
         (if is-var?
           ;; Var reference (e.g. raster.numeric/_plus__m_double_double-impl)
@@ -3397,7 +3439,7 @@
           ;; for zero-boxing cross-function calls.
           (let [^Class indy-ret-class (or prim-ret-class ret-class)]
             (doseq [[arg ^Class pt] (map vector method-args param-types)]
-              (let [t (emit-form code arg locals ctx)
+              (let [t (emit-argument-value code arg pt locals ctx)
                     target (class-type->stack pt)]
                 (if (not= t target)
                   (emit-coerce code t target)
@@ -3430,7 +3472,7 @@
               ;; via type profiling — zero instanceof overhead.
               (do (emit-form code obj locals ctx)
                   (doseq [[arg ^Class pt] (map vector method-args param-types)]
-                    (let [t (emit-form code arg locals ctx)
+                    (let [t (emit-argument-value code arg pt locals ctx)
                           target (class-type->stack pt)]
                       (if (not= t target)
                         (emit-coerce code t target)
@@ -3446,8 +3488,7 @@
                 (.ifne code fast-label)
                 ;; SLOW PATH: plain IFn.invoke with boxing
                 (doseq [arg method-args]
-                  (let [t (emit-form code arg locals ctx)]
-                    (when (primitive? t) (emit-box-to-ref code t))))
+                  (emit-object-value code arg locals ctx))
                 (let [n-args (count method-args)
                       invoke-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc (repeat n-args obj-cd)))]
                   (.invokeinterface code ifn-cd "invoke" invoke-mt))
@@ -3459,7 +3500,7 @@
                 (.labelBinding code fast-label)
                 (.checkcast code iface-cd)
                 (doseq [[arg ^Class pt] (map vector method-args param-types)]
-                  (let [t (emit-form code arg locals ctx)
+                  (let [t (emit-argument-value code arg pt locals ctx)
                         target (class-type->stack pt)]
                     (if (not= t target)
                       (emit-coerce code t target)
@@ -3640,7 +3681,7 @@
                   ;; === Typed path ===
                     (.checkcast code cls-cd)
                     (doseq [[arg ^Class pt] (map vector method-args param-types)]
-                      (let [t (emit-form code arg locals ctx)
+                      (let [t (emit-argument-value code arg pt locals ctx)
                             target (class-type->stack pt)]
                         (when (not= t target) (emit-coerce code t target))))
                     (let [mt (MethodTypeDesc/of (class-desc-of ret-class)
@@ -3657,9 +3698,7 @@
                   ;; obj ref is still on stack
                     (.checkcast code ifn-cd)
                     (doseq [a method-args]
-                      (let [t (emit-form code a locals ctx)]
-                        (when (#{:double :float :int :long} t)
-                          (emit-box-to-ref code t))))
+                      (emit-object-value code a locals ctx))
                     (let [n (count method-args)
                           invoke-mt (MethodTypeDesc/of obj-cd
                                                        (into-array ClassDesc (repeat n obj-cd)))]
@@ -3676,7 +3715,7 @@
                     (when (and (= obj-type :ref) (not type-verified?))
                       (.checkcast code cls-cd))
                     (doseq [[arg ^Class pt] (map vector method-args param-types)]
-                      (let [t      (emit-form code arg locals ctx)
+                      (let [t      (emit-argument-value code arg pt locals ctx)
                             target (class-type->stack pt)]
                         (when (not= t target) (emit-coerce code t target))))
                     (let [mt (MethodTypeDesc/of (class-desc-of ret-class)
@@ -3958,7 +3997,7 @@
         recur-types (loop-recur-types-in-scope pairs body locals)
         loop-locals (reduce
                      (fn [locs [[sym init] rt]]
-                       (let [t (emit-form code init locs (dissoc ctx :void-context))
+                       (let [t (emit-form code init locs (dissoc ctx :void-context :object-result?))
                              ;; Trust the stamp over a boxed init: when the
                              ;; walker stamped this var primitive but the init
                              ;; emitted :ref (e.g. an if-branch merge boxed it),
@@ -4050,7 +4089,7 @@
         (.goto_ code loop-label)
         :diverge)
       (let [vals (mapv (fn [arg loop-var]
-                         (let [t (emit-form code arg locals ctx)
+                         (let [t (emit-form code arg locals (dissoc ctx :object-result?))
                                target (:type loop-var)]
                            (when (not= t target)
                              (emit-coerce code t target))
@@ -4083,7 +4122,7 @@
                               (.getConstructors cls)))
           param-types (.getParameterTypes ctor)]
       (doseq [[arg ^Class pt] (map vector ctor-args param-types)]
-        (let [t      (emit-form code arg locals ctx)
+        (let [t      (emit-argument-value code arg pt locals ctx)
               target (class-type->stack pt)]
           (if (not= t target)
             (emit-coerce code t target)
@@ -4110,7 +4149,7 @@
     (.labelBinding code try-end)
     (when finally-forms
       (doseq [f finally-forms]
-        (let [t (emit-form code f locals ctx)]
+        (let [t (emit-form code f locals (dissoc ctx :object-result?))]
           (when-not (#{:void :diverge} t) (if (two-slot? t) (.pop2 code) (.pop code))))))
     (.goto_ code after-try)
     (doseq [[_ ex-class ex-sym & catch-body] catches]
@@ -4131,7 +4170,7 @@
             (when (primitive? ct) (emit-box-to-ref code ct))))
         (when finally-forms
           (doseq [f finally-forms]
-            (let [t (emit-form code f locals ctx)]
+            (let [t (emit-form code f locals (dissoc ctx :object-result?))]
               (when-not (#{:void :diverge} t) (if (two-slot? t) (.pop2 code) (.pop code))))))
         (.goto_ code after-try)))
     (when finally-forms
@@ -4141,7 +4180,7 @@
         (let [ex-slot (let [s @(:next-slot ctx)] (swap! (:next-slot ctx) inc) s)]
           (.astore code ex-slot)
           (doseq [f finally-forms]
-            (let [t (emit-form code f locals ctx)]
+            (let [t (emit-form code f locals (dissoc ctx :object-result?))]
               (when-not (#{:void :diverge} t) (if (two-slot? t) (.pop2 code) (.pop code)))))
           (.aload code ex-slot)
           (.athrow code))))
@@ -4162,7 +4201,7 @@
   [code args locals ctx]
   (let [[ge shift mask default-expr imap & _rest] args
         after-label (.newLabel code)]
-    (let [t (emit-form code ge locals ctx)]
+    (let [t (emit-form code ge locals (dissoc ctx :object-result?))]
       (when (not= t :int)
         (if (= t :ref)
           ;; case* dispatches on hashCode, not intValue — keywords, strings, etc.
@@ -4192,7 +4231,7 @@
             ;; "stack size mismatch".)
             value-exprs (remove statically-diverges? all-exprs)
             inferred-types (mapv #(infer-arg-stack-type % locals) value-exprs)
-            uniform-prim? (and (seq inferred-types)
+            uniform-prim? (and (not (:object-result? ctx)) (seq inferred-types)
                                (every? some? inferred-types)
                                (apply = inferred-types)
                                (primitive? (first inferred-types)))
@@ -4218,7 +4257,7 @@
                                                :actual t :expected result-type})))))]
         (doseq [[[_ [test-val result-expr]] label] (map vector sorted-entries case-labels)]
           (.labelBinding code label)
-          (let [t (emit-form code result-expr locals ctx)]
+          (let [t (emit-result-form code result-expr locals ctx)]
             ;; Prediction selects the merge type, not the actual stack shape.
             ;; A loop may still emit a boxed primitive; reconcile every reaching
             ;; branch (including the default) with the chosen merge type.
@@ -4226,7 +4265,7 @@
             (when-not (diverge? t)
               (.goto_ code after-label))))
         (.labelBinding code default-label)
-        (let [t (emit-form code default-expr locals ctx)]
+        (let [t (emit-result-form code default-expr locals ctx)]
           (emit-result t)
           (when-not (diverge? t)
             (.goto_ code after-label)))
@@ -4339,7 +4378,7 @@
             ft       (when field (.getType field))]
         (when cls-cd
           (when (= obj-type :ref) (.checkcast code cls-cd)))
-        (let [vt (emit-form code val-form locals ctx)]
+        (let [vt (emit-argument-value code val-form ft locals ctx)]
           (if (and ft cls-cd)
             (let [target-st (class-type->stack ft)]
               (when (not= vt target-st) (emit-coerce code vt target-st))
@@ -4409,19 +4448,113 @@
     (doseq [[i [k v]] (map-indexed vector entries)]
       (.dup code)
       (.ldc code (int (* 2 i)))
-      (let [t (emit-form code k locals ctx)]
-        (when (primitive? t) (emit-box-to-ref code t)))
+      (emit-object-value code k locals ctx)
       (.aastore code)
       (.dup code)
       (.ldc code (int (inc (* 2 i))))
-      (let [t (emit-form code v locals ctx)]
-        (when (primitive? t) (emit-box-to-ref code t)))
+      (emit-object-value code v locals ctx)
       (.aastore code))
     (.invokestatic code rt-cd "mapUniqueKeys"
                    (MethodTypeDesc/of
                     (ClassDesc/ofDescriptor "Lclojure/lang/IPersistentMap;")
                     (into-array ClassDesc [objarr-cd])))
     :ref))
+
+(def ^:private literal-field "__raster_literals")
+(def ^:private literal-getter "__raster_literal")
+
+(defn- emit-literal-pool-accessor! [cb owner]
+  (.withField cb literal-field objarr-cd (int 0x004A)) ; private static volatile
+  (.withMethodBody
+   cb literal-getter (MethodTypeDesc/of obj-cd (into-array ClassDesc [I-cd])) (int 0x0009)
+   (reify java.util.function.Consumer
+     (accept [_ code]
+       (let [ready (.newLabel code)]
+         (.getstatic code owner literal-field objarr-cd)
+         (.dup code)
+         (.ifnonnull code ready)
+         (.pop code)
+         (.new_ code (ClassDesc/of "java.lang.IllegalStateException"))
+         (.dup code)
+         (.ldc code "JVM literal owner is not initialized")
+         (.invokespecial code (ClassDesc/of "java.lang.IllegalStateException") "<init>"
+                         (MethodTypeDesc/of V-cd (into-array ClassDesc [string-cd])))
+         (.athrow code)
+         (.labelBinding code ready)
+         (.iload code 0)
+         (.aaload code)
+         (.areturn code))))))
+
+(defn- object-literal? [value]
+  ;; Only source literal categories; never capture an arbitrary mutable Number
+  ;; or an executable as a compiler constant. The pool has artifact lifetime.
+  (or (nil? value) (boolean? value) (char? value) (string? value) (keyword? value)
+      (contains? #{Long Integer Short Byte Float Double java.math.BigInteger
+                   java.math.BigDecimal clojure.lang.BigInt clojure.lang.Ratio}
+                 (class value))))
+
+(defn- quoted-object-literal? [value]
+  ;; Quote is opaque data, not a serialization request. The owning identity
+  ;; pool retains the original collection itself; traversing its contents is
+  ;; unnecessary and could execute a lazy producer during compilation.
+  (or (object-literal? value) (symbol? value) (coll? value)))
+
+(defn- emit-literal-reference [code value ctx]
+  (let [{:keys [owner indices values]} (:literal-owner ctx)]
+    (when-not (and owner (instance? java.util.IdentityHashMap indices) values)
+      (throw (ex-info "Object literal has no owning compilation"
+                      {:reason :unclosed-jvm-literal-owner})))
+    (let [index (if (.containsKey ^java.util.IdentityHashMap indices value)
+                  (.get ^java.util.IdentityHashMap indices value)
+                  (let [index (count @values)]
+                    (.put ^java.util.IdentityHashMap indices value index)
+                    (swap! values conj value)
+                    index))]
+      (.ldc code (int index))
+      (.invokestatic code owner literal-getter
+                     (MethodTypeDesc/of obj-cd (into-array ClassDesc [I-cd])))
+      :ref)))
+
+(defn- initialize-literals! [^Class owner values]
+  ;; Only the compiler owns this write. A volatile private field publishes the
+  ;; complete array; no callable artifact is returned before this succeeds.
+  (locking owner
+    (let [field (.getDeclaredField owner literal-field)]
+      (.setAccessible field true)
+      (when (some? (.get field nil))
+        (throw (ex-info "JVM literal owner is already initialized"
+                        {:reason :jvm-literal-owner-initialized})))
+      (.set field nil (object-array values)))))
+
+(defn- emit-object-value
+  "Consume the ORIGINAL operand in Object context. Result-position regions
+   retain that context; their tests, initializers and call arguments do not.
+   Logical scalar tags do not authorize primitive-return substitution here."
+  [code expression locals ctx]
+  (let [ctx (dissoc ctx :object-result? :void-context :object-call-result?)
+        parts (completion/canonical-parts expression)
+        head (when (seq? expression) (first expression))
+        t (cond
+            (object-literal? expression) (emit-literal-reference code expression ctx)
+            (contains? #{'quote 'clojure.core/quote} head)
+            (if (and (= 2 (count expression)) (quoted-object-literal? (second expression)))
+              (emit-literal-reference code (second expression) ctx)
+              (throw (ex-info "Object completion has an unsupported quoted literal"
+                              {:reason :unsupported-jvm-object-literal})))
+            parts (if (= completion/object-input-contract (:contract parts))
+                    (emit-object-value code (:operand parts) locals ctx)
+                    (throw (ex-info "JVM completion consumer has no input-conversion authority"
+                                    {:reason :unsupported-jvm-value-completion :contract (:contract parts)})))
+            (contains? #{'let 'let* 'letfn* 'loop* 'do 'if 'try 'case*} head)
+            (emit-form code expression locals (assoc ctx :object-result? true))
+            (seq? expression)
+            (emit-form code expression locals (assoc ctx :object-call-result? true))
+            :else (emit-form code expression locals ctx))]
+    (cond
+      (= :diverge t) :diverge
+      (= :void t) (do (.aconst_null code) :ref)
+      (primitive? t) (do (emit-box-to-ref code t) :ref)
+      :else t)))
 
 (defn- emit-form
   "Emit bytecode for a macroexpanded, walked Clojure form.
@@ -4459,6 +4592,13 @@
 
       (symbol? form) (emit-symbol code form locals ctx)
 
+      ;; Reserved contexts are interpreted, never called as runtime functions.
+      (and (seq? form) (= completion/completion-symbol (first form)))
+      (if (completion/canonical-form? form)
+        (emit-object-value code form locals ctx)
+        (throw (ex-info "Malformed reserved JVM value completion"
+                        {:reason :invalid-value-completion :expression form})))
+
       ;; --- List (special form or function call) ---
       (seq? form)
       (let [[head & args] form
@@ -4488,13 +4628,13 @@
               do
               (let [stmts (butlast args)
                     last-form (last args)
-                    void-ctx (assoc ctx :void-context true)]
+                    void-ctx (assoc (dissoc ctx :object-result?) :void-context true)]
                 (doseq [s stmts]
                   (let [t (emit-form code s locals void-ctx)]
                     (when-not (#{:void :diverge} t)
                       (if (two-slot? t) (.pop2 code) (.pop code)))))
-                (if last-form
-                  (emit-form code last-form locals
+                (if (seq args)
+                  (emit-result-form code last-form locals
                              (if (:void-context ctx) ctx (dissoc ctx :void-context)))
                   :void))
 
@@ -4576,8 +4716,7 @@
         (doseq [[i elem] (map-indexed vector form)]
           (.dup code)
           (.ldc code (int i))
-          (let [t (emit-form code elem locals ctx)]
-            (when (primitive? t) (emit-box-to-ref code t)))
+          (emit-object-value code elem locals ctx)
           (.aastore code))
         (.invokestatic code rt-cd "vector"
                        (MethodTypeDesc/of
@@ -4596,8 +4735,7 @@
         (doseq [[i elem] (map-indexed vector elems)]
           (.dup code)
           (.ldc code (int i))
-          (let [t (emit-form code elem locals ctx)]
-            (when (primitive? t) (emit-box-to-ref code t)))
+          (emit-object-value code elem locals ctx)
           (.aastore code))
         (.invokestatic code rt-cd "set"
                        (MethodTypeDesc/of
@@ -4628,6 +4766,9 @@
   (let [refs (atom #{})]
     (letfn [(scan [form]
               (cond
+                ;; Quoted bodies are data, not additional compilation inputs.
+                ;; Traversing them can even realize a quoted lazy sequence.
+                (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) nil
                 (and (seq? form) (symbol? (first form)))
                 (let [h (first form)]
                   (if (= h '.invk)
@@ -4783,13 +4924,22 @@
   fn-specs: [{:name sym, :params [...], :walked-body [...], :element-type sym,
               :source-ns Namespace (for symbol resolution)}]
 
-  Returns {:class Class, :methods {fn-name -> Method}}"
+  Returns {:class Class, :methods {fn-name -> Method}}. The requested class name
+  is a diagnostic prefix: each actual owner has a fresh binary name. Runtime
+  literal references are owner-private captures, not reconstructible from bytes
+  alone. All emitted children share that owner's actual compilation loader."
   [class-name fn-specs]
-  (let [cf         (clojure-classfile)
+  (when (some #(= literal-getter (str (:name %))) fn-specs)
+    (throw (ex-info "JVM method name is reserved for literal ownership"
+                    {:reason :reserved-jvm-method-name :method literal-getter})))
+  (binding [me/*compilation-classloader* (compilation-loader)]
+  (let [class-name (str class-name "$Owner_" (clojure.lang.RT/nextID))
+        cf         (clojure-classfile)
         dot-idx    (.lastIndexOf ^String class-name (int \.))
         pkg        (subs class-name 0 dot-idx)
         simple     (subs class-name (inc dot-idx))
         class-desc (ClassDesc/of pkg simple)
+        literal-owner {:owner class-desc :indices (java.util.IdentityHashMap.) :values (atom [])}
         ;; Build method type descriptors for fn-specs
         ;; Handle both symbol params and destructuring vectors
         ;; Detect ^double/^long hints to generate primitive param types
@@ -4863,6 +5013,7 @@
                         (accept [_ cb]
                           (.withFlags cb (int 0x0011))  ;; PUBLIC + FINAL
                           (.withVersion cb (ClassFile/latestMajorVersion) (ClassFile/latestMinorVersion))
+                          (emit-literal-pool-accessor! cb class-desc)
                           ;; SourceFile — shows filename in stack traces
                           (let [^java.lang.classfile.ClassBuilder cb cb]
                             (.with cb ^java.lang.classfile.ClassElement
@@ -4939,6 +5090,8 @@
                                                                       (map-indexed vector p)))))
                                                                {} (map-indexed vector params))
                                                        ctx {:class-desc       class-desc
+                                                            :literal-owner literal-owner
+                                                            :object-result? (= :ref return-stack-type)
                                                             :element-type     element-type
                                                             :sibling-methods  sibling-methods
                                                             :typed-sibling-methods typed-sibling-methods
@@ -5027,6 +5180,8 @@
                                                                                                           (not (typed-interface? tag))))})))
                                                                {} (map vector params param-infos tags))
                                                        ctx {:class-desc class-desc
+                                                            :literal-owner literal-owner
+                                                            :object-result? (= :ref (:stack-type return-info))
                                                             :next-slot  next-slot
                                                             :source-ns  source-ns
                                                             :typed-sibling-methods typed-sibling-methods}
@@ -5066,14 +5221,15 @@
               (binding [*out* *err*]
                 (println "[dump-class]" class-name "->" path))))
         loader (compilation-loader)
-        cls (.defineClass loader class-name bytes nil)]
+        cls (.defineClass loader class-name bytes nil)
+        _ (initialize-literals! cls @(:values literal-owner))]
     {:class cls
      :bytes bytes
      :methods (into {} (map (fn [ms]
                               [(:name ms)
                                (first (filter #(= (.getName %) (:method-name ms))
                                               (.getMethods cls)))])
-                            method-specs))}))
+                            method-specs))})))
 
 ;; ================================================================
 ;; deftm bytecode compilation
@@ -5107,8 +5263,7 @@
                               (into-array ClassDesc (mapv :class-desc param-jvm-infos)))]
     {:class (:class result)
      :method method
-     :class-desc (let [dot (.lastIndexOf ^String class-name (int \.))]
-                   (ClassDesc/of (subs class-name 0 dot) (subs class-name (inc dot))))
+     :class-desc (class-desc-of (:class result))
      :method-type mt
      :return-stack-type (:stack-type ret-jvm)
      :bytes (:bytes result)}))
@@ -5609,7 +5764,7 @@
                                 reflector-cd (ClassDesc/of "clojure.lang" "Reflector")
                                 obj-arr-cd (ClassDesc/ofDescriptor "[Ljava/lang/Object;")
                                 apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))
-                                reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [string-cd string-cd obj-arr-cd]))
+                                reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [(ClassDesc/of "java.lang.Class") string-cd obj-arr-cd]))
                                 small? (<= (count param-cds) 20)
                                 load-int (fn [code n]
                                            (cond (<= -128 n 127) (.bipush code (int n))
@@ -5642,7 +5797,10 @@
                                                        (.invokeinterface code iseq-cd "next"
                                                                          (MethodTypeDesc/of iseq-cd no-cd))
                                                        (.astore code 3))
-                                                     (.ldc code class-name)
+                                                     ;; Use the actual emitted owner, including its unique
+                                                     ;; literal-capture suffix, in this wrapper's loader.
+                                                     ;; The requested source name is not a loadable class.
+                                                     (.ldc code statics-cd)
                                                      (.ldc code "compute_static")
                                                      (.aload code 2)
                                                      (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)

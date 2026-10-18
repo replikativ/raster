@@ -70,6 +70,8 @@
   For non-let-bound pure par/maps, wraps in let*."
   [expr]
   (cond
+    (and (seq? expr) (contains? #{'quote 'clojure.core/quote} (first expr))) expr
+
     (par/par-map-pure-form? expr)
     (let [result-sym (gensym "result__")
           ;; buf-sym IS result-sym now (the buffer); eff-sym is the in-place map! write
@@ -118,7 +120,8 @@
           count-pure (atom 0)]
       ;; Count original pure forms
       (letfn [(count-forms [f]
-                (when (seq? f)
+                (when (and (seq? f)
+                           (not (contains? #{'quote 'clojure.core/quote} (first f))))
                   (when (par/par-map-pure-form? f)
                     (swap! count-pure inc))
                   (doseq [child (rest f)]
