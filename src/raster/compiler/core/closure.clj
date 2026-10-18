@@ -299,19 +299,12 @@
          primitive-tags (set (keys types/primitive-info))
          result-facts (atom (into {}
                                  (map (fn [parameter]
-                                        (let [carrier-tag (:tag (meta parameter))]
-                                          [parameter
-                                           (cond-> {:presence
+                                        [parameter {:presence
                                                     (if (or (contains? safe-syms-set parameter)
-                                                            (contains? primitive-tags carrier-tag))
-                                                      :present :unknown)}
-                                             ;; This is the actual compute descriptor,
-                                             ;; not an annotation on an internal value.
-                                             ;; Its array Class admits null: keep presence
-                                             ;; unknown while retaining the carrier constraint.
-                                             (contains? types/primitive-array-info carrier-tag)
-                                             (assoc :array-tag carrier-tag))])))
-                                 bc-params))
+                                                            (contains? primitive-tags
+                                                                       (tag-for-param parameter)))
+                                                      :present :unknown)}]))
+                                 all-compute-params))
          physical-tag (fn [parameter logical-tag]
                         (if (and (contains? primitive-tags logical-tag)
                                  (not= :present (:presence (get @result-facts parameter))))

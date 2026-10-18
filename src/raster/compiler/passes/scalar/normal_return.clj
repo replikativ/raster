@@ -143,16 +143,6 @@
         (let [tag (get descriptor/alloc-sym->array-tag operation)]
           (cond-> {:presence :present}
             (contains? types/primitive-array-info tag) (assoc :array-tag tag)))
-        ;; A physical primitive-array carrier can itself be null. A successful
-        ;; scalar element read nevertheless produces a non-null primitive. Keep
-        ;; the read and all of its null/index failures at their source position.
-        ;; Object arrays, metadata-only hints and multi-index reads do not prove it.
-        (and (= operation 'clojure.core/aget) (= operation (first expression))
-             (not (contains? env operation))
-             (= 2 (count (descriptor/call-args expression)))
-             (contains? types/primitive-array-info
-                        (:array-tag (summary (second expression) env visited))))
-        {:presence :present}
         ;; An explicit closed-core scalar conversion produces a primitive on
         ;; normal return. Its operand can still throw (including nil unboxing).
         ;; This is producer evidence, never presence inferred from a result tag.
