@@ -21,6 +21,7 @@
   (:require [raster.ad.reverse :as rev]
             [raster.ad.templates :as tmpl]
             [raster.ad.tangent :as tangent]
+            [raster.ad.purity :as purity]
             [raster.ad.reverse.normalize :as anf]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.util :as util]
@@ -332,7 +333,7 @@
     (when (and (= 'double tag)
                (= 'double (:raster.type/tag (meta acc-sym)))
                (= 'double (:raster.type/tag (meta update-expr)))
-               (patterns/acc-ref? else-expr acc-sym)
+               (purity/pure-object-result-region? else-expr)
                (not (any-active? tenv index-init))
                (not (patterns/contains-sym? index-init acc-sym))
                (not (patterns/contains-sym? acc-init index-sym))
@@ -343,6 +344,7 @@
                (= :pure (effects/analyze-effect acc-init))
                (= :pure (effects/analyze-effect scoped-update-expr)))
       (let [dacc (jvp-gensym "ordered_carry_tangent" 'double)
+            loop-tenv (assoc (dissoc tenv index-sym acc-sym) acc-sym dacc)
             init-pair (jvp-gensym "ordered_init_pair")
             step-pair (jvp-gensym "ordered_step_pair")
             origin (jvp-gensym "ordered_origin")
@@ -370,7 +372,7 @@
             prelude (if (form/binding-form? then-branch) (second then-branch) [])
             [normalized-prelude _] (anf/normalize-for-ad prelude [acc-sym] jvp-gensym)
             {prelude-bindings :bindings step-tenv :tenv}
-            (jvp-fold normalized-prelude (assoc tenv acc-sym dacc))
+            (jvp-fold normalized-prelude loop-tenv)
             step (linearize-region update-expr step-tenv)
             step-bindings (into (vec prelude-bindings)
                                 (mapcat (fn [[id _]]
@@ -381,7 +383,7 @@
                                     (list 'let* step-bindings
                                           (list* 'recur (conj recur-args
                                                              (list 'clojure.core/nth step-pair 1))))
-                                    [acc-sym dacc]))]
+                                    (linearize-region else-expr loop-tenv)))]
         [result (into init-bindings
                       [pair paired-loop
                        sym (list 'clojure.core/nth pair 0)
@@ -421,12 +423,29 @@
              (= completion/completion-symbol head)
              (let [{:keys [contract operand]} (completion/canonical-parts init)]
                (when-not (and (= completion/object-input-contract contract)
-                              (symbol? operand))
+                              (or (anf/trivial-expr? operand)
+                                  (and (anf/closed-call? operand)
+                                       (= :scalar (:kind (tangent/tangent-kind tag)))
+                                       (= :pure (effects/analyze-effect operand)))))
                  (throw (ex-info "jvp: completion requires a closed Object input operand"
                                  {:reason :jvp-unclosed-value-completion :form init :sym sym})))
-               ;; The original primal completion remains in `bindings`. Its
-               ;; tangent is an identity, not a conversion of that tangent.
-               (done (alias-tangent tenv sym operand) []))
+               (if (anf/trivial-expr? operand)
+                 ;; The original primal completion remains in `bindings`.
+                 ;; Its tangent is an identity, not a conversion of it.
+                 (done (if (symbol? operand)
+                         (alias-tangent tenv sym operand)
+                         (dissoc tenv sym)) [])
+                 (let [{local-tenv :tenv local-bindings :bindings}
+                       (jvp-fold [sym operand] tenv)]
+                   ;; Reuse the existing scalar call rule, but never its raw
+                   ;; result initializer. A region-producing patch must own
+                   ;; completion before it may change this binding layout.
+                   (when-not (= [sym operand] (subvec (vec local-bindings) 0
+                                                                  (min 2 (count local-bindings))))
+                     (throw (ex-info "jvp: completion cannot discard a forward region patch"
+                                     {:reason :jvp-unclosed-value-completion :form init :sym sym})))
+                   {:tenv local-tenv
+                    :bindings (into prior-bindings (assoc (vec local-bindings) 1 init))})))
 
              ;; Predicate snapshots retain their semantic operator; they are discrete,
              ;; not a differentiable call merely because their operands have tangents.

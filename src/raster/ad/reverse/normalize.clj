@@ -9,6 +9,7 @@
    This is required before the reverse pass can track operations."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.types :as types]))
 
@@ -16,6 +17,14 @@
   "True if expr is simple enough to not need its own binding."
   [x]
   (or (symbol? x) (number? x) (nil? x) (boolean? x) (string? x) (keyword? x)))
+
+(defn closed-call?
+  "A call whose original arguments already need no ANF snapshots. This is a
+   syntax boundary only, not a purity, derivative-rule or return-carrier proof."
+  [expression]
+  (and (form/call-form? expression)
+       (not (form/introduces-scope? expression))
+       (every? trivial-expr? (:arguments (op/call-description expression)))))
 
 (defn- lifted-value-symbol
   "A lifted argument denotes the already-typed expression's value. Preserve
@@ -44,6 +53,19 @@
         ;; Quoted syntax is data, including apparent binders and effects.
         (contains? #{'quote 'clojure.core/quote} head)
         [[] expr]
+
+        ;; Object completion commutes with these normal result exits, not
+        ;; with arbitrary inputs. Complete each ORIGINAL leaf before ANF can
+        ;; introduce a raw temporary. Primitive/checkcast contexts retain
+        ;; their source-owner policy and are deliberately opaque here.
+        (and (= completion/object-input-contract
+                (:contract (completion/canonical-parts expr)))
+             (form/normal-exit-region?
+              (:operand (completion/canonical-parts expr))))
+        (let [{:keys [contract operand]} (completion/canonical-parts expr)]
+          (anf-normalize-expr
+           (form/map-normal-exits #(completion/complete-value contract %) operand)
+           gensym-fn))
 
         ;; Completion consumes its ORIGINAL operand in an exact JVM context.
         ;; Lifting that operand first can box a primitive result, changing its

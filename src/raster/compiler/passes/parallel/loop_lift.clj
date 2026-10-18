@@ -20,6 +20,7 @@
   (:require [clojure.walk]
             [raster.ad.purity :as purity]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
 ;; ================================================================
@@ -286,6 +287,12 @@
                ;; (6) the exit value depends only on acc + invariants, never the
                ;;     index (which would otherwise escape its loop scope).
                (not (contains-sym? else-expr index-sym))
+               ;; Substituting a new parallel reduction producer into an
+               ;; original exit context also needs a physical representation
+               ;; proof. Numeric element type alone cannot preserve Object
+               ;; identity, zero-trip carry presence or checked conversions.
+               ;; Keep the ordered source loop until that proof is available.
+               (not (completion/contains-completion? else-expr))
                ;; (7) the accumulator element type is provable AND consistent
                ;;     across body tag / acc cast / init (reduce-elem-type) —
                ;;     emission needs it for the par/reduce elem-type metadata,

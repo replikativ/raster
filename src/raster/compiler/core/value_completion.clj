@@ -93,6 +93,21 @@
   (when (canonical-form? expression)
     {:contract (second expression) :operand (nth expression 2)}))
 
+(defn contains-completion?
+  "Whether executable syntax contains a retained input/result context. Quoted
+   data is opaque. Include malformed reserved terms so an optimization cannot
+   silently erase the validation error they still owe.
+
+   This is a conservative transformation barrier, not a representation proof:
+   consumers may discharge one only with their own exact context evidence."
+  [expression]
+  (boolean
+   (some #(and (seq? %) (= completion-symbol (first %)))
+         (tree-seq #(and (coll? %)
+                         (not (and (seq? %)
+                                   (contains? '#{quote clojure.core/quote} (first %)))))
+                   seq expression))))
+
 (defn- project-primitive-input [contract operand compilation-policy]
   (when-not (source-policy? compilation-policy)
     (throw (ex-info "primitive completion requires an explicit source compilation policy"

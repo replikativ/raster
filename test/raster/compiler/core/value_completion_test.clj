@@ -5,6 +5,16 @@
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
 
+(deftest retained-context-barrier-is-quote-opaque-and-includes-invalid-terms
+  (let [term (completed 'x)
+        malformed (list completion/completion-symbol {:source-context :unknown} 'x)]
+    (doseq [expression [term malformed (list 'f term) (list 'if 'p term 'y)]]
+      (is (completion/contains-completion? expression)))
+    (doseq [head '[quote clojure.core/quote]
+            expression [term malformed]]
+      (is (not (completion/contains-completion? (list head expression)))))
+    (is (not (completion/contains-completion? '(raster.numeric/* x y))))))
+
 (defn- snapshot-product [fields]
   ;; Each field is consumed by its OWN original Object context. No CSE or
   ;; primitive-local inference may merge or rebox two materializations.

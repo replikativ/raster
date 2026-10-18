@@ -56,6 +56,32 @@
       (let [ignored (aset out i x)] (recur (inc i) (n/+ acc x)))
       acc)))
 
+(deftm effectful-terminal [x :- Double, out :- (Array double)] :- Double
+  (loop [i 1 acc x]
+    (if (< i 3) (recur (inc i) (n/* acc acc))
+        (do (aset out 0 acc) acc))))
+
+(deftm private-array-terminal [x :- Double] :- Double
+  (loop [i 1 acc x]
+    (if (< i 3) (recur (inc i) (n/* acc acc))
+        (let [out (double-array 1)] (aset out 0 acc) (aget out 0)))))
+
+(deftest terminal-regions-do-not-leak-a-shadowed-index-tangent
+  ;; Exercise the existing builder directly: public AD alpha-renames binders,
+  ;; but the builder must still respect the scope of its supplied loop IR.
+  (let [x (with-meta 'x {:raster.type/tag 'double})
+        acc (with-meta 'acc {:raster.type/tag 'double})
+        idx (with-meta 'i {:raster.type/tag 'long})
+        result (with-meta 'result {:raster.type/tag 'double})
+        expression (with-meta '(raster.numeric/+ acc (clojure.core/double i))
+                              {:raster.type/tag 'double})
+        loop-form (list 'loop* [idx 0 acc x]
+                        (list 'if '(< i 2) (list 'recur '(inc i) expression) expression))
+        [dt bindings] (#'jvp/fold-double-ordered-loop {'x 'dx 'i 'di} result loop-form 'double)
+        run (eval (list 'fn '[x dx di] (list 'let* bindings [result dt])))]
+    (is (= [13.0 2.0] (run 10.0 2.0 1000.0)))
+    (is (= [13.0 2.0] (run 10.0 2.0 -500.0)))))
+
 (deftest public-ordered-recurrence-jvp-keeps-domain-and-active-init
   (doseq [[v cases]
           [[#'nonzero-nonlinear [[0 2.0 0.5] [1 2.0 0.5] [3 16.0 16.0]]]
@@ -85,7 +111,8 @@
         (is (= [nil nil] (vec (drop 2 (reverse 1.0 ys cnt)))))))))
 
 (deftest unsupported-ordered-loops-remain-explicit-refusals
-  (doseq [v [#'active-bound #'active-origin #'effectful-step]]
+  (doseq [v [#'active-bound #'active-origin #'effectful-step
+             #'effectful-terminal #'private-array-terminal]]
     (is (= :jvp-ordered-loop-unsupported
            (try (jvp/jvp v :wrt [0]) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))

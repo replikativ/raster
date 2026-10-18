@@ -388,8 +388,7 @@
     (boolean (some #(get activity % false) (util/free-syms init-expr)))
 
     (structural-completion? init-expr)
-    (boolean (some #(get activity % false)
-                   (util/free-syms (:operand (value-completion/canonical-parts init-expr)))))
+    (init-active? (:operand (value-completion/canonical-parts init-expr)) activity)
 
     (product-ports/projection-plan 'activity init-expr (:value-facts *source-memory-context*))
     (boolean (seq (:active-paths
@@ -600,7 +599,28 @@
 
 (defmethod ad-record :completion [_ sym init activity]
   (let [{:keys [contract operand]} (value-completion/canonical-parts init)]
-    (when-not (symbol? operand)
+   (if (and (= value-completion/object-input-contract contract)
+            (not (trivial-expr? operand)))
+    (do
+      (when-not (and (anf/closed-call? operand)
+                     (= :scalar (:kind (tangent/tangent-kind (types/sym-type-tag sym))))
+                     (= :pure (effects/analyze-effect operand)))
+        (throw (ex-info "completion operand has no closed structural transpose"
+                        {:reason :ad-unclosed-completion-transpose :init init})))
+      ;; Derive only the tangent through the existing binding engine. The
+      ;; forward binding remains completion of the ORIGINAL invocation, not a
+      ;; raw call followed by completion of an ANF temporary. Region-producing
+      ;; helper patches need an explicit result-context owner before admission.
+      (let [result (ad-record (ad-form-kind operand (init-active? operand activity) sym)
+                              sym operand activity)]
+        (when (:fwd-patch result)
+          (throw (ex-info "completion cannot discard a forward region patch"
+                          {:reason :ad-unclosed-completion-transpose :init init})))
+        result))
+    (do
+    (when-not (or (symbol? operand)
+                  (and (= value-completion/object-input-contract contract)
+                       (trivial-expr? operand)))
       (throw (ex-info "completion operand has no closed structural transpose"
                       {:reason :ad-unclosed-completion-transpose :init init})))
     (case (:source-context contract)
@@ -609,7 +629,9 @@
       ;; primal value. Both contexts consume an Object and may first box a
       ;; primitive operand. Preserve possible borrowed-reference aliases, but
       ;; do not publish an exact replay-root substitution from a logical dtype.
-      {:record {:type :alias :sym sym :source operand :result-aliases #{operand}}}
+      (if (symbol? operand)
+        {:record {:type :alias :sym sym :source operand :result-aliases #{operand}}}
+        {:record nil})
 
       :jvm-primitive-input
       (do
@@ -624,7 +646,7 @@
             {:record (merge {:type :floating-completion :sym sym :source operand}
                             (floating-completion-tangent-plan
                              contract operand source-tag result-tag
-                             (:source-policy *generated-product-context*)))}))))))
+                             (:source-policy *generated-product-context*)))}))))))))
 
 ;; out[e] = src[index[e]] (strided: blocks of `stride`). The forward runs as
 ;; written; the pullback is its transpose, a scatter-add into d_src.
