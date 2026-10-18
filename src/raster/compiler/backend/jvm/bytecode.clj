@@ -3208,7 +3208,10 @@
                                                          (catch Exception _ nil))
                                                     (when-let [r (ns-resolve src-ns (symbol tag-str))]
                                                       (when (class? r) r))))))]
-                                  (when cls
+                                  ;; Object is the existing verifier carrier, not a
+                                  ;; narrower type proof. Keep all real array/record
+                                  ;; casts, but do not emit this no-op instruction.
+                                  (when (and cls (not= cls Object))
                                     (.checkcast code (class-desc-of cls)))))
                             ;; Skip store for void results (effectful calls like Arrays.fill)
                             slot (when-not (#{:void :diverge} t) (alloc-slot! ctx t))]

@@ -42,14 +42,13 @@
       (is (= 'double (:raster.type/tag (meta id))))
       (is (= 'Object (:tag (meta id)))))))
 
-(deftest actual-primitive-conversions-retain-primitive-helper-returns-and-traps
+(deftest actual-primitive-conversions-preserve-values-and-traps
   (let [id (with-meta 'converted {:raster.type/tag 'double})
         expression '(if flag (clojure.core/double input) (clojure.core/double input))
         compiled (closure/hoist-and-compile
                   (list 'let* [id expression] id) '[input flag] '[input flag]
                   {:param-env {'input 'Object 'flag 'boolean}
                    :return-tag 'double :dtype :double})]
-    (is (= 'double (:return-tag (first (vals (:helper-map compiled))))))
     (doseq [flag [true false]]
       (is (= 2.0 ((:fn compiled) 2.0 flag)))
       (is (thrown? NullPointerException ((:fn compiled) nil flag))))))

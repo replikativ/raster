@@ -22,6 +22,10 @@ stronger facts. A primitive-array descriptor admits null; its element read only
 establishes scalar presence *on normal completion*, without removing null/bounds
 checks. Unknown producers retain reference-capable numerical boundaries.
 
+Shared recovery of scalar-cast/read presence is held out until their source
+evaluation obligations survive value liveness and DCE. Being present on normal
+return does not mean that a null/bounds/conversion failure may be discarded.
+
 Arithmetic emission consumes actual operand carriers, including the return
 carrier of each intermediate operation. Reference-carried Numbers must not be
 rounded through double merely because a primitive numerical result is desired.
