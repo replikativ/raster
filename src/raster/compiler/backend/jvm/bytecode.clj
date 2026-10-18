@@ -2706,11 +2706,40 @@
                         (MethodTypeDesc/of obj-cd (into-array ClassDesc [iseq-cd])))))
   :ref)
 
+(def ^:private source-call-validator "__raster_source_callable")
+
+(defn- owned-source-call
+  "Use the actual source callable, never its retained body.
+   Preserve its erased Object inputs/result while giving C2 the concrete
+   callable class, guarded at execution. The collector limits rollout scope,
+   not soundness: no definition/type/dispatch proof is used by this route."
+  [head args locals ctx]
+  (when (and me/*emission-inputs* (symbol? head) (not (contains? locals head)))
+    (let [source-ns (or (:source-ns ctx) *ns*)
+          v (ns-resolve source-ns head)
+          metadata (when (var? v) (meta v))
+          target (when (and (var? v) (bound? v)) (var-get v))]
+      (when (and (:raster.core/deftm metadata) (instance? clojure.lang.IFn target))
+        (let [^Class callable-class (class target)
+              visible (try (.loadClass ^ClassLoader (compilation-loader) (.getName callable-class))
+                           (catch ClassNotFoundException _ nil))
+              methods (filter (fn [^java.lang.reflect.Method method]
+                                (and (= "invoke" (.getName method))
+                                     (not (java.lang.reflect.Modifier/isStatic (.getModifiers method)))
+                                     (= Object (.getReturnType method))
+                                     (= (vec (.getParameterTypes method)) (vec (repeat (count args) Object)))))
+                              (.getMethods callable-class))]
+          (when (and (identical? callable-class visible) (= 1 (count methods))
+                     (java.lang.reflect.Modifier/isPublic (.getModifiers callable-class)))
+            {:source v :callable-class (class-desc-of callable-class)
+             :method-type (MethodTypeDesc/of obj-cd (into-array ClassDesc (repeat (count args) obj-cd)))}))))))
+
 (defn- emit-fn-call
   "Emit bytecode for function calls (Java static, deftm, sibling, var, local IFn)."
   [code head head-name args locals ctx]
-  (let [object-call-result? (:object-call-result? ctx)
-        ctx (dissoc ctx :object-call-result?)]
+  (let [object-call-result? (or (:object-call-result? ctx) (:preserve-source-call-results? ctx))
+        ctx (dissoc ctx :object-call-result?)
+        source-call (when object-call-result? (owned-source-call head args locals ctx))]
   ;; Try clojure.core intrinsic first (returns nil for unhandled fns → fallthrough)
   (or (when (and (not (contains? locals head)) (is-clojure-core? head ctx))
         (emit-core-intrinsic code head-name args locals ctx))
@@ -2721,6 +2750,51 @@
           (.aload code slot)
           (.checkcast code ifn-cd)
           (emit-boxed-ifn-call code args locals ctx))
+
+        source-call
+        (let [{:keys [source callable-class method-type]} source-call
+              reserve! #(let [slot @(:next-slot ctx)] (swap! (:next-slot ctx) inc) slot)
+              receiver-slot (reserve!) fast-slot (reserve!) checked-slot (reserve!)
+              argument-slots (mapv (fn [_] (reserve!)) args)
+              validated (.newLabel code) slow (.newLabel code) done (.newLabel code)
+              validator-owner (:literal-owner ctx)]
+          (reset! (:needs-source-call-validator? validator-owner) true)
+          ;; Capture once BEFORE operands. A replacement made by an operand
+          ;; must not change which callable this invocation selected.
+          (emit-var-constant! code (str (.name (.ns ^clojure.lang.Var source))) (str (.sym ^clojure.lang.Var source)))
+          (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
+          (.astore code receiver-slot)
+          (.aconst_null code)
+          (.astore code checked-slot)
+          (.aload code receiver-slot)
+          (.instanceOf code callable-class)
+          (.istore code fast-slot)
+          (.iload code fast-slot)
+          (.ifne code validated)
+          ;; The sole cold helper does only the original receiver cast. It
+          ;; preserves invalid-callee traps before operands, and nil's later
+          ;; invocation trap, without hiding generic invocation on the hot path.
+          (.aload code receiver-slot)
+          (.invokestatic code (:owner validator-owner) source-call-validator
+                         (MethodTypeDesc/of ifn-cd (into-array ClassDesc [obj-cd])))
+          (.astore code checked-slot)
+          (.labelBinding code validated)
+          (doseq [[argument slot] (map vector args argument-slots)]
+            (emit-object-value code argument locals ctx)
+            (.astore code slot))
+          (.iload code fast-slot)
+          (.ifeq code slow)
+          (.aload code receiver-slot)
+          (.checkcast code callable-class)
+          (doseq [slot argument-slots] (.aload code slot))
+          (.invokevirtual code callable-class "invoke" method-type)
+          (.goto_ code done)
+          (.labelBinding code slow)
+          (.aload code checked-slot)
+          (doseq [slot argument-slots] (.aload code slot))
+          (.invokeinterface code ifn-cd "invoke" method-type)
+          (.labelBinding code done)
+          :ref)
 
         ;; In Object result context the source Var is authoritative. A typed
         ;; sibling/static replacement may return a primitive and destroy the
@@ -2976,7 +3050,9 @@
                              (catch Exception _)))
                       ;; Binding inits must always produce a value (for the local
                       ;; variable slot), so strip :void-context from ctx.
-                      (let [t (emit-form code init locs (dissoc ctx :void-context :object-result?))
+                      (let [t (emit-form code init locs
+                                         (assoc (dissoc ctx :void-context :object-result?)
+                                                :preserve-source-call-results? true))
                              ;; Handle type hints on let bindings
                              ;; ^objects → checkcast [Ljava/lang/Object;
                              ;; ^doubles → checkcast [D
@@ -3380,7 +3456,7 @@
   - Regular path: invokeinterface/invokevirtual with optional instanceof guard"
   [code args locals ctx]
   (let [[obj member & margs] args
-        object-call-result? (:object-call-result? ctx)
+        object-call-result? (or (:object-call-result? ctx) (:preserve-source-call-results? ctx))
         ctx (dissoc ctx :object-call-result?)
         [meth-name method-args] (if (seq? member)
                                   [(first member) (rest member)]
@@ -3997,12 +4073,9 @@
         recur-types (loop-recur-types-in-scope pairs body locals)
         loop-locals (reduce
                      (fn [locs [[sym init] rt]]
-                       (let [t (emit-form code init locs (dissoc ctx :void-context :object-result?))
-                             ;; Trust the stamp over a boxed init: when the
-                             ;; walker stamped this var primitive but the init
-                             ;; emitted :ref (e.g. an if-branch merge boxed it),
-                             ;; unbox at loop entry so the LOOP runs primitively
-                             ;; — recur values are typed and coerce to the slot.
+                       (let [t (emit-form code init locs
+                                          (assoc (dissoc ctx :void-context :object-result?)
+                                                 :preserve-source-call-results? true))
                              stamp-t (some->> (:raster.type/tag (meta sym))
                                               (get {'double :double 'float :float
                                                     'long :long 'int :int}))
@@ -4017,11 +4090,10 @@
                                         (= rt :float))
                                  (do (emit-coerce code :double :float) :float)
                                  t)
-                             t (if (and (= t :ref) stamp-t
-                                        (or (nil? rt) (= rt stamp-t)
-                                            (contains? #{:int :long :float :double} rt)))
-                                 (do (emit-unbox-to-prim code stamp-t) stamp-t)
-                                 t)
+                             ;; A scalar declaration does not prove a boxed
+                             ;; source initializer has primitive slot semantics.
+                             ;; Preserve its reference; conversions remain at
+                             ;; actual consumers and explicit source casts.
                              slot-t (widen-loop-type t rt)]
                          ;; A2 differential: the walker stamps loop-var types
                          ;; (TC-fed); this backend still derives its own via
@@ -4034,6 +4106,7 @@
                                            'long :long 'int :int
                                            'boolean :bool} stag)]
                              (when (and stamp-t
+                                        (contains? #{:double :float :long :int :bool} slot-t)
                                         ;; only CLASS mismatches (float vs int)
                                         ;; are miscompile signals — width picks
                                         ;; (int↔long, f32↔f64) are backend-legit
@@ -4059,7 +4132,8 @@
         loop-var-syms (mapv first pairs)]
     (.labelBinding code loop-label)
     (let [ctx (assoc ctx :loop-label loop-label
-                     :loop-vars (mapv #(get loop-locals %) loop-var-syms))]
+                     :loop-vars (mapv #(get loop-locals %) loop-var-syms)
+                     :preserve-source-call-results? true)]
       (emit-body code body loop-locals ctx))))
 
 (defn- emit-recur
@@ -4463,6 +4537,17 @@
 (def ^:private literal-field "__raster_literals")
 (def ^:private literal-getter "__raster_literal")
 
+(defn- emit-source-call-validator! [cb]
+  ;; Exactly one checked reference return. Only a failed concrete-class guard
+  ;; calls this; no Var lookup, allocation, operand evaluation or invocation.
+  (.withMethodBody
+   cb source-call-validator (MethodTypeDesc/of ifn-cd (into-array ClassDesc [obj-cd])) (int 0x0009)
+   (reify java.util.function.Consumer
+     (accept [_ code]
+       (.aload code 0)
+       (.checkcast code ifn-cd)
+       (.areturn code)))))
+
 (defn- emit-literal-pool-accessor! [cb owner]
   (.withField cb literal-field objarr-cd (int 0x004A)) ; private static volatile
   (.withMethodBody
@@ -4531,7 +4616,13 @@
    retain that context; their tests, initializers and call arguments do not.
    Logical scalar tags do not authorize primitive-return substitution here."
   [code expression locals ctx]
-  (let [ctx (dissoc ctx :object-result? :void-context :object-call-result?)
+  (let [;; Intermediate Object-return calls can escape through lexical aliases,
+        ;; not only at the last expression. Keep their physical source ABI
+        ;; throughout this region; logical scalar tags alone do not prove
+        ;; those references unobservable. Primitive input conversions still
+        ;; belong to their resolved consumers, not this result context.
+        ctx (assoc (dissoc ctx :object-result? :void-context :object-call-result?)
+                   :preserve-source-call-results? true)
         parts (completion/canonical-parts expression)
         head (when (seq? expression) (first expression))
         t (cond
@@ -4929,9 +5020,10 @@
   literal references are owner-private captures, not reconstructible from bytes
   alone. All emitted children share that owner's actual compilation loader."
   [class-name fn-specs]
-  (when (some #(= literal-getter (str (:name %))) fn-specs)
-    (throw (ex-info "JVM method name is reserved for literal ownership"
-                    {:reason :reserved-jvm-method-name :method literal-getter})))
+  (when-let [reserved (some #(when (contains? #{literal-getter source-call-validator} (str (:name %)))
+                              (str (:name %))) fn-specs)]
+    (throw (ex-info "JVM method name is reserved for compiler-owned reference support"
+                    {:reason :reserved-jvm-method-name :method reserved})))
   (binding [me/*compilation-classloader* (compilation-loader)]
   (let [class-name (str class-name "$Owner_" (clojure.lang.RT/nextID))
         cf         (clojure-classfile)
@@ -4939,7 +5031,8 @@
         pkg        (subs class-name 0 dot-idx)
         simple     (subs class-name (inc dot-idx))
         class-desc (ClassDesc/of pkg simple)
-        literal-owner {:owner class-desc :indices (java.util.IdentityHashMap.) :values (atom [])}
+        literal-owner {:owner class-desc :indices (java.util.IdentityHashMap.) :values (atom [])
+                       :needs-source-call-validator? (atom false)}
         ;; Build method type descriptors for fn-specs
         ;; Handle both symbol params and destructuring vectors
         ;; Detect ^double/^long hints to generate primitive param types
@@ -5206,7 +5299,9 @@
                                                        :void (.return_ code)
                                                        :ref (.areturn code)))
                                                    (when (= ret-type :void)
-                                                     (.return_ code))))))))))
+                                                     (.return_ code)))))))
+                          (when @(:needs-source-call-validator? literal-owner)
+                            (emit-source-call-validator! cb)))))
         ;; Verify bytecode before loading
         _ (try (.verify (java.lang.classfile.ClassFile/of) bytes)
                (catch Exception e
