@@ -92,3 +92,12 @@
     (is (= :value-completion-policy-mismatch
            (try (compile-program [x] [result term] result [x]) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest bytecode-completion-cannot-import-a-clojure-source-owner
+  (let [x (typed 'x 'double) result (typed 'result 'double)
+        term (completion/complete-value
+              (completion/bytecode-floating-input-contract
+               Double/TYPE (completion/bytecode-operand-context {})) x)]
+    (is (= :ad-unclosed-completion-transpose
+           (try (compile-program [x] [result term] result [x])
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))

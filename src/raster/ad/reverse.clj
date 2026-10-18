@@ -369,6 +369,7 @@
 (declare ^:private extract-let-parts)
 (declare ^:private product-expression)
 (declare ^:private generated-helper-record)
+(declare ^:private generated-bytecode-helper-record)
 
 (defn- structural-completion?
   "Object input completion needs no generated compilation policy. Primitive
@@ -586,9 +587,17 @@
   "Transpose one owner-validated floating conversion edge. Both explicit
    completion records and paired helper inputs consume this same contract."
   [contract operand source-tag result-tag source-policy]
-  (value-completion/project-to-jvm-source
-   (value-completion/complete-value contract operand) source-policy)
-  (when-not (and (= :jvm-primitive-input (:source-context contract))
+  (case (:source-context contract)
+    :jvm-primitive-input
+    (value-completion/project-to-jvm-source
+     (value-completion/complete-value contract operand) source-policy)
+    :jvm-bytecode-floating-input
+    (when-not (= :jvm-bytecode (:backend *generated-product-context*))
+      (throw (ex-info "Bytecode completion transpose requires its bytecode program owner"
+                      {:reason :ad-unclosed-completion-transpose})))
+    (throw (ex-info "Floating completion has no owned transpose context"
+                    {:reason :ad-unclosed-completion-transpose})))
+  (when-not (and (value-completion/canonical-contract? contract)
                  (= :scalar (:kind (tangent/tangent-kind source-tag)))
                  (= :scalar (:kind (tangent/tangent-kind result-tag)))
                  (identical? (:target-carrier contract) (get types/tag->java-class result-tag)))
@@ -619,6 +628,9 @@
         result))
     (do
     (when-not (or (symbol? operand)
+                  (and (= :jvm-bytecode-floating-input (:source-context contract))
+                       (= :jvm-bytecode (:backend *generated-product-context*))
+                       (trivial-expr? operand))
                   (and (= value-completion/object-input-contract contract)
                        (trivial-expr? operand)))
       (throw (ex-info "completion operand has no closed structural transpose"
@@ -633,11 +645,15 @@
         {:record {:type :alias :sym sym :source operand :result-aliases #{operand}}}
         {:record nil})
 
-      :jvm-primitive-input
+      (:jvm-primitive-input :jvm-bytecode-floating-input)
       (do
         ;; Validate through the source projection authority. This is the actual
         ;; GENERATED source owner's policy, never an inferred deftm policy.
-        (value-completion/project-to-jvm-source init (:source-policy *generated-product-context*))
+        (if (= :jvm-bytecode-floating-input (:source-context contract))
+          (when-not (= :jvm-bytecode (:backend *generated-product-context*))
+            (throw (ex-info "Bytecode input completion has no owned AD program"
+                            {:reason :ad-unclosed-completion-transpose})))
+          (value-completion/project-to-jvm-source init (:source-policy *generated-product-context*)))
         (if-not (get activity operand)
           {:record {:type :primal :sym sym}}
           (let [source-tag (types/sym-type-tag
@@ -5909,7 +5925,9 @@
 
 (defn- generated-helper-record
   [sym expression activity]
-  (when-let [{:keys [emission] :as owner} (generated-helper-owner expression)]
+  (if (= :jvm-bytecode (:backend *generated-product-context*))
+    (generated-bytecode-helper-record sym expression activity)
+    (when-let [{:keys [emission] :as owner} (generated-helper-owner expression)]
     (let [{:keys [arguments]} (op/call-description expression)
           indices (vec (keep-indexed (fn [i argument]
                                       (when (and (symbol? argument) (get activity argument)) i)) arguments))
@@ -5952,7 +5970,44 @@
                     (into (vec (drop-last 2 bindings))
                           [tape (list 'let* (:bindings normalized) (list* companion input-values))
                            sym (list 'clojure.core/nth tape 0)
-                           pullback (list 'clojure.core/nth tape 1)]))})))
+                           pullback (list 'clojure.core/nth tape 1)]))}))))
+
+(defn- generated-bytecode-helper-record
+  "Consume one already-closed helper edge in a private bytecode region.
+   The producer owns the actual original call and its selected companion;
+   this hook does no source discovery or descriptor/type reconstruction."
+  [sym expression activity]
+  (let [{:keys [call input-values helper]} (:owned-helper-call *generated-product-context*)]
+    (when-not (identical? call expression)
+      (throw (ex-info "Bytecode helper edge is outside its owning input region"
+                      {:reason :ad-unowned-bytecode-helper-edge})))
+    (let [companion (:companion-port *generated-product-context*)
+          result-context (:result-context *generated-product-context*)
+          tape (ad-gensym "helper_tape")
+          pullback (ad-gensym "helper_pullback")
+          result-tag (:return-tag helper)
+          inputs (mapv (fn [index]
+                         (let [source (nth input-values index)]
+                           (when-not (get activity source)
+                             (throw (ex-info "Paired helper active port lost its input activity"
+                                             {:reason :ad-paired-helper-active-space})))
+                           {:source source :source-tag (types/sym-type-tag source)}))
+                       (:active-indices helper))]
+      {:record {:type :paired-helper :sym sym :pullback pullback :inputs inputs
+                :result-tag result-tag
+                :effects (paired-helper-memory-region helper input-values (set (:values *source-memory-context*)))}
+       :fwd-patch
+       (fn [bindings]
+         (into (vec (drop-last 2 bindings))
+               [tape (list* '.invk companion input-values)
+                ;; The companion returns an Object pair. Complete its primal
+                ;; before binding it in the original primitive result carrier.
+                sym (value-completion/complete-value
+                     (value-completion/bytecode-floating-input-contract
+                      (get types/tag->java-class result-tag)
+                      result-context)
+                     (list 'clojure.core/nth tape 0))
+                pullback (list 'clojure.core/nth tape 1)]))})))
 
 (defn- assert-generated-region!
   "Check the already ordered source region. This does not normalize operands;
@@ -6004,6 +6059,27 @@
                              :values (set/difference identifiers visible)})))))))
   expression)
 
+(defn- derive-flat-product-program
+  "One binding-engine assembly for owner-produced, already ordered SSA.
+   Source and bytecode producers supply their own contexts and input regions."
+  [bindings result selected-inputs]
+  (let [{:keys [fwd-bindings value-facts] :as forward} (forward-pass bindings selected-inputs)
+        _ (when (get-in value-facts [result :product])
+            (throw (ex-info "structured result requires an explicit seed-port interface"
+                            {:reason :ad-generated-product-result})))
+        result-tag (or (types/sym-type-tag result)
+                       (some-> (get-in value-facts [result :value]) types/sym-type-tag))
+        _ (when-not (= :scalar (:kind (tangent/tangent-kind result-tag)))
+            (throw (ex-info "generated product result requires a scalar tangent declaration"
+                            {:reason :ad-generated-product-result :tag result-tag})))
+        dy (ad-gensym "generated_seed")
+        {:keys [rev-ctx param-adj-syms]} (reverse-program-projection forward selected-inputs {result [dy]})]
+    {:result-tag result-tag
+     :form (:standard-form (reverse-program-forms
+                            {:body-sym result :dy dy :fwd-bindings fwd-bindings
+                             :rev-bindings (vec (:bindings rev-ctx))
+                             :param-adj-syms param-adj-syms}))}))
+
 (defn- generated-product-form
   [program params]
   (let [{:keys [bindings result active-inputs source-policy]} program
@@ -6051,23 +6127,9 @@
              (assert-generated-region! visible expression)
              (conj visible name))
            (set params) (partition 2 bindings))
-          (let [{:keys [fwd-bindings value-facts] :as forward} (forward-pass bindings selected-inputs)
-                _ (when (get-in value-facts [result :product])
-                    (throw (ex-info "structured result requires an explicit seed-port interface"
-                                    {:reason :ad-generated-product-result})))
-                result-tag (or (types/sym-type-tag result)
-                               (some-> (get-in value-facts [result :value]) types/sym-type-tag))
-                _ (when-not (= :scalar (:kind (tangent/tangent-kind result-tag)))
-                    (throw (ex-info "generated product result requires a scalar tangent declaration"
-                                    {:reason :ad-generated-product-result :tag result-tag})))
-                dy (ad-gensym "generated_seed")
-                {:keys [rev-ctx param-adj-syms]} (reverse-program-projection forward selected-inputs {result [dy]})]
-            {:result-tag result-tag :captures @captures :guards @guards :methods @methods
-             :call-regions @call-regions
-             :form (:standard-form (reverse-program-forms
-                                    {:body-sym result :dy dy :fwd-bindings fwd-bindings
-                                     :rev-bindings (vec (:bindings rev-ctx))
-                                     :param-adj-syms param-adj-syms}))}))))))
+          (assoc (derive-flat-product-program bindings result selected-inputs)
+                 :captures @captures :guards @guards :methods @methods
+                 :call-regions @call-regions))))))
 
 (defn- prepare-generated-value+grad
   "Prepare the existing generated program without executing or compiling it.
@@ -6153,17 +6215,149 @@
                 :source-owner owner :call-regions (vec (:call-regions product-program))}
          product? (assoc :paired-result-tag (:result-tag product-program))))))
 
+(defn ^:no-doc prepare-bytecode-input-pullback
+  "Linearize an owned FP input whose original operand is a closed typed call.
+   This private region producer reuses the ordinary AD binding engine. It is
+   not default public-source admission: the enclosing producer still owns
+   selected-parent correspondence and lexical/tangent-port projection. More
+   deeply nested operands require recursive region composition, not early ANF.
+
+   `declarations` is the caller's retained tangent declaration for every free
+   port, separately from the original physical ABI. Selected ports are ordered
+   explicitly. The result retains its bytecode owner; source extraction must
+   not discard it. Preparation may compile the original input and the selected
+   helper companion, but does not compile the resulting paired outer program."
+  [emission original input-index declarations active-ports]
+  (let [outline (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-invocation-input-region)
+        nested (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-call-context)
+        region (outline emission original input-index)
+        operand (get-in region [:input :operand])
+        child (nested emission original input-index)
+        {:keys [dispatch? lexical-callee operation implementation-op]}
+        (op/call-description (:source-original child))
+        arguments (mapv :operand (:inputs child))
+        ports (:physical-ports region)]
+    (when-not (and child dispatch? (nil? lexical-callee) (anf/closed-call? operand)
+                   (map? declarations) (= (set (keys ports)) (set (keys declarations)))
+                   (vector? active-ports) (= (count active-ports) (count (distinct active-ports)))
+                   (every? #(contains? ports %) active-ports)
+                   (every? #(contains? '#{float double} (get declarations %)) active-ports))
+      (throw (ex-info "Bytecode input needs a closed owned call and retained tangent ports"
+                      {:reason :ad-unclosed-bytecode-input-region})))
+    (doseq [port active-ports
+            :let [physical (get-in ports [port :type])
+                  declared (get declarations port)]]
+      (when (or (and (= :double physical) (not= 'double declared))
+                (and (= :float physical) (not= 'float declared))
+                (not (contains? #{:double :float :ref} physical)))
+        (throw (ex-info "Bytecode input tangent declaration conflicts with its physical port"
+                        {:reason :ad-paired-helper-active-space :port port}))))
+    (let [selected (capture-selected-helper-emission operation implementation-op (count arguments) (:method child))
+          indices (vec (keep-indexed #(when (contains? (set active-ports) %2) %1) arguments))
+          helper (get-paired-helper-program (:emission selected) indices)
+          revisions (requiring-resolve 'raster.ad.normalized-scalar/revisions)
+          expected (revisions)
+          proof-inputs (atom {:static [] :values []})
+          params (mapv #(vary-meta % assoc :raster.type/tag (get declarations %))
+                       (get-in region [:spec :params]))
+          parameters (zipmap params params)
+          active (mapv parameters active-ports)
+          context (get-in region [:input :context])
+          used (atom (util/free-syms-flat [params operand]))
+          built
+          (with-ad-gensym
+            (binding [*generated-product-context* {:used-identifiers used}]
+              (let [companion (vary-meta (ad-gensym "input_helper") assoc
+                                         :tag (symbol (.getName ^Class (:interface-class helper))))
+                    input-values (mapv (fn [tag] (ad-gensym "completed_input" tag))
+                                       (get-in helper [:emission :tags]))
+                    contracts (mapv (fn [input ^Class carrier]
+                                      (value-completion/bytecode-floating-input-contract carrier (:context input)))
+                                    (:inputs child)
+                                    (.getParameterTypes ^java.lang.reflect.Method (:method child)))
+                    raw (ad-gensym "helper_value" (:return-tag helper))
+                    result-tag (if (= Float/TYPE (get-in region [:input-contract :target-carrier])) 'float 'double)
+                    result (ad-gensym "completed_result" result-tag)
+                    call (with-meta (list* '.invk (:receiver child) input-values) (meta operand))
+                    bindings (into (vec (mapcat (fn [id contract argument]
+                                                  [id (value-completion/complete-value contract
+                                                       (get parameters argument argument))])
+                                                input-values contracts arguments))
+                                   [raw call result (value-completion/complete-value (:input-contract region) raw)])
+                    program
+                    (binding [*generated-product-context*
+                              {:backend :jvm-bytecode :used-identifiers used
+                               :companion-port companion :result-context context
+                               :owned-helper-call {:call call :input-values input-values :helper helper}}
+                              method-entry/*emission-inputs* proof-inputs
+                              *source-memory-context* {:values params :internal-region? true
+                                                       :value-facts {} :aliases {} :replayed {} :unprojectable {}}
+                              util/*shadowing-locals* (set params)]
+                      (derive-flat-product-program bindings result active))]
+                {:program program :companion companion})))
+          program (:program built)
+          companion (:companion built)
+          body (list 'let* [companion
+                            (list 'clojure.core/nth
+                                  (value-completion/complete-value
+                                   value-completion/object-input-contract
+                                   (list 'quote [(:companion helper)])) 0)]
+                     (:form program))
+          walked-body [body]
+          spec (assoc (:spec region) :params params :return-tag 'Object :walked-body walked-body)
+          source-ns (:source-ns emission)
+          execution-guard ((requiring-resolve 'raster.ad.normalized-scalar/execution-guard)
+                           source-ns expected
+                           [{:parameters (conj params companion) :body (:form program)}])
+          guard (fn []
+                  ((:guard region)) ((:guard selected)) ((:guard helper))
+                  (method-entry/assert-definition-inputs-current! @proof-inputs)
+                  (execution-guard))
+          _ (guard)]
+      {:params params :walked-body walked-body :source-ns source-ns
+       :source-owner {:backend :jvm-bytecode :spec spec :input-region region :guard guard}
+       :paired-result-tag (:result-tag program) :absent-seed? true
+       :call-regions [region] :helper helper :program program})))
+
+(defn- compile-bytecode-preparation
+  "Consume a private prepared bytecode program without source re-projection."
+  [{:keys [params walked-body source-owner]}]
+  (let [{:keys [spec input-region guard]} source-owner]
+    (when-not (and (identical? params (:params spec))
+                   (identical? walked-body (:walked-body spec))
+                   (= 'Object (:return-tag spec))
+                   (ifn? guard))
+      (throw (ex-info "Bytecode AD preparation lost its owner-local program"
+                      {:reason :ad-unclosed-bytecode-preparation})))
+    (guard)
+    (let [original-method ^java.lang.reflect.Method (:method input-region)
+          compiled (binding [method-entry/*compilation-classloader* (.getClassLoader (.getDeclaringClass original-method))]
+                     ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-specialized-class!)
+                      "raster.compiled.PairedInputRegion" [spec]))
+          method ^java.lang.reflect.Method (get-in compiled [:methods (:name spec)])]
+      (when-not (and (= Object (.getReturnType method))
+                     (= (count params) (.getParameterCount method))
+                     (every? true? (map identical? (.getParameterTypes original-method) (.getParameterTypes method))))
+        (throw (ex-info "Bytecode paired input resolved a different physical interface"
+                        {:reason :ad-bytecode-preparation-carrier})))
+      (guard)
+      (fn [& arguments]
+        (try (.invoke method nil (object-array arguments))
+             (catch java.lang.reflect.InvocationTargetException e (throw (.getCause e))))))))
+
 (defn- compile-prepared-value+grad
   "Consume a whole preparation without dropping its private source owner."
-  [{:keys [walked-body params source-owner paired-result-tag] :as prepared}]
+  [{:keys [walked-body params source-owner paired-result-tag absent-seed?] :as prepared}]
   (if-not (contains? prepared :source-owner)
     ;; Legacy public source projection only. Never rewrite an owned program:
     ;; its original operations and completion order belong to its producer.
     (let [body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
                                      (first walked-body))]
       (eval (value-completion/project-to-jvm-source (runtime-function-form params body))))
-    (let [execute (source-owner/compile-function
-                   params (first walked-body) runtime-function-form source-owner)
+    (let [execute (if (= :jvm-bytecode (:backend source-owner))
+                    (compile-bytecode-preparation prepared)
+                    (source-owner/compile-function
+                     params (first walked-body) runtime-function-form source-owner))
           guard (:guard source-owner)]
       (if-not paired-result-tag
         (if-not guard execute
@@ -6179,7 +6373,8 @@
                                  {:reason :ad-generated-result-carrier})))
                [primal (fn [seed]
                          (guard)
-                         (when-not (.isInstance ^Class (get types/primitive-info paired-result-tag) seed)
+                         (when-not (or (and absent-seed? (nil? seed))
+                                       (.isInstance ^Class (get types/primitive-info paired-result-tag) seed))
                            (throw (ex-info "generated scalar seed has the wrong carrier"
                                            {:reason :ad-generated-seed-carrier})))
                          (let [gradient (pullback seed)] (guard) gradient))]))))))

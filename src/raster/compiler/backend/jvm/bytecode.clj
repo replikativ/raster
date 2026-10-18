@@ -654,7 +654,7 @@
                        :ports (select-keys locals (filter visible free))}))
             guarded? (= mode :guarded-local-typed-interface)
             record (cond-> {:status (if guarded? :unsupported :known)
-                    :method method :receiver receiver
+                    :method method :receiver receiver :expression (::call-expression ctx)
                     :receiver-input (input receiver)
                     :invocation-mode mode :return-carrier return-carrier
                     :element-type (:element-type ctx)
@@ -683,6 +683,20 @@
                token (identical? original expression) (= :known (:status record)))
       (me/assert-emission-inputs-current! emission)
       record)))
+
+(defn ^:no-doc retained-input-call-context
+  "Follow an actual emitted input edge to its nested invocation context.
+   Expanded operands are not the source catalog's original objects. Their
+   authority comes from exact parent-input/child-emission identity, never a
+   copied occurrence annotation or structural expression equality."
+  [emission original input-index]
+  (when-let [parent (retained-invocation-context emission original)]
+    (when (and (integer? input-index) (<= 0 input-index) (< input-index (count (:inputs parent))))
+      (let [operand (get-in parent [:inputs input-index :operand])
+            child (get (:invocation-contexts emission) (::call-occurrence (meta operand)))]
+        (when (and (= :known (:status child)) (identical? operand (:expression child)))
+          (assoc child :source-original
+                 (get (:invocation-catalog emission) (::call-occurrence (meta operand)))))))))
 
 (defn- comparison-form?
   "True if form is a comparison call: (< a b), (>= a b), (== a b), etc."
@@ -4765,7 +4779,8 @@
                (with-meta (apply list form) (meta form))
                form)
         ;; This node's occurrence never leaks into an unannotated child.
-        ctx (assoc ctx ::call-occurrence (::call-occurrence (meta form)))]
+        ctx (assoc ctx ::call-occurrence (::call-occurrence (meta form))
+                       ::call-expression form)]
     (cond
       ;; --- Atoms ---
       (nil? form)     (do (.aconst_null code) :ref)
