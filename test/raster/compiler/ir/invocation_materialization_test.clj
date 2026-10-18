@@ -9,6 +9,53 @@
 (defn- array-value [dtype extent]
   (av/tensor {:dtype dtype :shape [extent] :representation {:kind :plain}}))
 
+(deftest integral-scalar-admission-is-not-an-implicit-conversion
+  (doseq [[dtype values] [[:byte [Byte/MIN_VALUE 0 Byte/MAX_VALUE]]
+                         [:int [Integer/MIN_VALUE 0 Integer/MAX_VALUE]]
+                         [:long [Long/MIN_VALUE 0 Long/MAX_VALUE]]]
+          value values
+          argument [value {:type dtype :value value}]]
+    (is (= {:type dtype :value value}
+           (materialization/checked-scalar-value 'n (scalar dtype) argument))))
+  (doseq [[dtype values] [[:byte [-129 128 1.5 Double/NaN Double/POSITIVE_INFINITY]]
+                         [:int [-2147483649 2147483648 1.5]]
+                         [:long [-9223372036854775809N 9223372036854775808N 1.5]]]
+          value values
+          argument [value {:type dtype :value value}]]
+    (is (= :invocation-materialization-scalar
+           (try (materialization/checked-scalar-value 'n (scalar dtype) argument)
+                nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+  (doseq [value [Double/NEGATIVE_INFINITY Double/POSITIVE_INFINITY Double/NaN]]
+    (let [actual (materialization/checked-scalar-value 'x (scalar :double) value)]
+      (is (= :double (:type actual)))
+      (is (= (Double/doubleToRawLongBits value)
+             (Double/doubleToRawLongBits (:value actual)))))))
+
+(deftest invalid-integral-parameter-refuses-before-the-scalar-evaluator
+  (let [plan (invocation/from-prefix
+              {:id :checked-integral-entry
+               :parameters '[n] :parameter-values {'n (scalar :long)}
+               :bindings '[[m (inc n)]] :binding-values {'m (scalar :long)}
+               :program-values {'m (scalar :long)}
+               :program-inputs '[m] :program-outputs '[m]})
+        calls (atom 0)
+        evaluate (fn [_ _] (swap! calls inc) {:type :long :value 2})]
+    (doseq [value [1.5 9223372036854775808N {:type :long :value 1.5}]]
+      (is (= :invocation-materialization-scalar
+             (try (materialization/materialize plan [value] evaluate)
+                  nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (is (zero? @calls))
+    (let [result (materialization/materialize plan [1] evaluate)
+          parameter-id (:id (first (:parameters plan)))]
+      (is (= {:type :long :value 2} (get-in result [:program-scalars 'm])))
+      (doseq [value [1.5 9223372036854775808N]]
+        (is (= :invocation-materialization-scalar
+               (try (materialization/validate!
+                     (assoc-in result [:values parameter-id :value] value))
+                    nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            "a retained parameter's domain still holds when it is not a program input")))
+    (is (= 1 @calls))))
+
 (defn- fixture-plan []
   (let [public-array (array-value :double '(extent u0))
         internal-array (array-value :double 'n)]

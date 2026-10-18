@@ -13,6 +13,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.invocation-plan :as invocation]))
 
 (defrecord MaterializedBuffer [id value shape source initialization])
@@ -75,7 +76,14 @@
         value (if (typed-scalar? value) value {:type expected :value value})]
     (when-not (and (scalar-value? abstract)
                    (= expected (dtype/canon (:type value)))
-                   (number? (:value value)))
+                   (number? (:value value))
+                   ;; A retained integral ABI is not a request to truncate or
+                   ;; wrap an arbitrary Number. Validate the actual admitted
+                   ;; value before shape resolution or numerical evaluation.
+                   ;; Floating NaNs/infinities keep their existing IEEE contract.
+                   (or (nil? (scalar-range/for-dtype expected))
+                       (and (integer? (:value value))
+                            (some? (scalar-range/literal (:value value) expected)))))
       (fail! :invocation-materialization-scalar
              "public or computed scalar differs from its retained rank-zero contract"
              {:value-id id :expected abstract :actual value}))
@@ -248,6 +256,12 @@
       (fail! :invocation-materialization-values
              "materialization must retain every public parameter and invocation SSA result"
              {:expected invocation-ids :actual (set (keys values))}))
+    ;; Retained parameters/steps can feed shape computations without being
+    ;; final program inputs. Their declared scalar domains still apply when a
+    ;; materialization is validated again at a later boundary.
+    (doseq [{:keys [id value]} (concat (:parameters plan) (:steps plan))
+            :when (scalar-value? value)]
+      (checked-scalar id value (get values id)))
     (let [storage-values (set (map :program-value (:storage-bindings plan)))
           materialized-values (set/union (set (:program-inputs plan)) storage-values)]
       (when-not (= materialized-values
