@@ -9,7 +9,8 @@
             [raster.compiler.ir.emitted-parallel-program-call :as call]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
-            [raster.dl.attention :as attention]))
+            [raster.dl.attention :as attention]
+            [raster.runtime.hardware :as hardware]))
 
 (defn- host-equation [values id operands result expression & [parameters]]
   (let [algorithm (soac/make
@@ -144,8 +145,16 @@
                (reason #(validate fabricated))))))))
 
 (deftest entry-storage-shape-can-be-read-before-a-later-in-place-write
-  (let [compiled (equation-first/compile #'attention/softmax-rows!
-                                        {:target :ocl:0 :dtype :float})
+  ;; This is a hardware-free binding test. Use an explicit source target with checked
+  ;; integer arithmetic, not whichever OpenCL device happens to be installed locally.
+  (let [target :cuda:host-binding-order-test
+        _ (hardware/register-target-device!
+           target {:type :cuda :name "Synthetic host-binding order target"
+                   :capabilities {:compute-capability [8 0] :warp-size 32
+                                  :subgroup-sizes [32] :max-workgroup-size 1024
+                                  :shared-local-memory 65536 :total-eus 108}})
+        compiled (equation-first/compile #'attention/softmax-rows!
+                                        {:target target :dtype :float})
         linked (equation-first/lower compiled [(float-array 6) 2 3])
         original (get-in linked [:instances 0 :call])
         p (:program original)
