@@ -4237,6 +4237,59 @@
     (paired-guard)
     (assoc artifact :guard paired-guard :signature signature)))
 
+(defn ^:no-doc prepare-helper-call-region
+  "Close an original global typed helper invocation before generic ANF.
+
+   `owner` is the existing selected-emission capture, not reconstructed walked
+   metadata. Its actual Method must match the retained receiver descriptor.
+   `source-policy` belongs to the GENERATED source owner which will compile
+   this call; it is never inferred from the helper's mathematical dtype.
+
+   The result is owner-private compiler data: original ordered operands, Class
+   ports, paired executable AND transparent program, plus the combined guard.
+   It is not portable evidence or permission to flatten argument expressions.
+   Consumers must compile under that policy, bind the actual Class ports,
+   preserve receiver evaluation and fence forward execution/delayed pullbacks."
+  [expression owner active-indices source-policy fresh lexical-identifiers]
+  (let [{:keys [dispatch? lexical-callee operation implementation-op arguments]}
+        (op/call-description expression)
+        {:keys [emission method guard signature]} owner
+        definition (:definition signature)
+        hint (:tag (meta implementation-op))
+        descriptor-class (if (class? hint) hint
+                             (:iface-class (get @types/fn-interface-by-name hint)))]
+    (when-not (and dispatch? (not lexical-callee)
+                   (set? lexical-identifiers) (every? symbol? lexical-identifiers)
+                   (not (contains? lexical-identifiers implementation-op))
+                   (qualified-symbol? operation) (qualified-symbol? implementation-op)
+                   (= operation (:operation definition))
+                   (= implementation-op (:implementation-op definition))
+                   (identical? method (:method signature))
+                   (instance? java.lang.reflect.Method method)
+                   (identical? descriptor-class (.getDeclaringClass ^java.lang.reflect.Method method))
+                   (ifn? guard) (value-completion/source-policy? source-policy))
+      (throw (ex-info "helper call region requires its selected source descriptor and lexical scope"
+                      {:reason :ad-unclosed-helper-call-region :expression expression})))
+    (guard)
+    (let [current (call-boundary/selected-typed-signature
+                   operation implementation-op (count arguments) method)]
+      (when-not (and (= :known (:status current))
+                     (identical? (:source-var definition) (get-in current [:definition :source-var]))
+                     (identical? (:implementation emission)
+                                 (get-in current [:definition :entry :typed-impl]))
+                     (every? #(= :pure (effects/analyze-effect %)) (:body emission)))
+        (throw (ex-info "helper call region lost its selected read-only emission"
+                        {:reason :ad-unclosed-helper-call-region :expression expression}))))
+    (let [artifact (get-paired-helper-program emission active-indices)
+          plan (ordered-call/plan-resolved-call method implementation-op arguments source-policy)
+          call (ordered-call/normalize-resolved-call plan fresh lexical-identifiers)
+          check! (fn [] (guard) ((:guard artifact)))]
+      (check!)
+      {:kind :owned-helper-call-region :original expression
+       :call call :helper artifact :method method :source-policy source-policy
+       :input-contracts (:input-contracts plan)
+       :guard check!})))
+
 (defn- paired-helper-memory-region
   "Project a paired scalar helper's retained replay roots onto caller values.
    Primitive inputs are copied values, not borrowed storage. Array roots must
@@ -5846,26 +5899,25 @@
 
 (defn- generated-helper-record
   [sym expression activity]
-  (when-let [{:keys [emission method]} (generated-helper-owner expression)]
+  (when-let [{:keys [emission] :as owner} (generated-helper-owner expression)]
     (let [{:keys [arguments]} (op/call-description expression)
           indices (vec (keep-indexed (fn [i argument]
                                       (when (and (symbol? argument) (get activity argument)) i)) arguments))
-          artifact (get-paired-helper-program emission indices)
+          region (prepare-helper-call-region expression owner indices
+                                             (:source-policy *generated-product-context*)
+                                             ad-gensym @(:used-identifiers *generated-product-context*))
+          artifact (:helper region)
           _ (when-not (= (types/sym-type-tag sym) (:return-tag emission))
               (throw (ex-info "generated helper result must retain its emitted scalar carrier"
                               {:reason :ad-generated-helper-result :sym sym})))
-          plan (ordered-call/plan-resolved-call method
-                                               (:implementation-op (op/call-description expression))
-                                               arguments (:source-policy *generated-product-context*))
-          normalized (ordered-call/normalize-resolved-call plan ad-gensym
-                                                          @(:used-identifiers *generated-product-context*))
+          normalized (:call region)
           input-values (:input-values normalized)
           inputs (mapv (fn [index]
                          (let [source (nth arguments index)
                                source-tag (types/sym-type-tag
                                            (exact-replay-root source (:value-facts *source-memory-context*)))
                                target-tag (nth (:tags emission) index)
-                               contract (nth (:input-contracts plan) index)]
+                               contract (nth (:input-contracts region) index)]
                            (if (= :jvm-primitive-input (:source-context contract))
                              (assoc (floating-completion-tangent-plan
                                      contract source source-tag target-tag (:source-policy *generated-product-context*))
@@ -5876,14 +5928,14 @@
                                  (throw (ex-info "helper reference tangent requires its retained array carrier"
                                                  {:reason :ad-paired-helper-active-space :source source})))
                                {:source source :source-tag source-tag})))) indices)
-          region (paired-helper-memory-region artifact arguments (set (:values *source-memory-context*)))
+          memory-region (paired-helper-memory-region artifact arguments (set (:values *source-memory-context*)))
           companion (ad-gensym "helper_companion")
           tape (ad-gensym "helper_tape")
           pullback (ad-gensym "helper_pullback")]
       (swap! (:captures *generated-product-context*) conj {:port companion :value (:companion artifact)})
-      (swap! (:guards *generated-product-context*) conj (:guard artifact))
+      (swap! (:guards *generated-product-context*) conj (:guard region))
       {:record {:type :paired-helper :sym sym :pullback pullback :inputs inputs
-                :result-tag (:return-tag emission) :effects region}
+                :result-tag (:return-tag emission) :effects memory-region}
        :fwd-patch (fn [bindings]
                     (into (vec (drop-last 2 bindings))
                           [tape (list 'let* (:bindings normalized) (list* companion input-values))

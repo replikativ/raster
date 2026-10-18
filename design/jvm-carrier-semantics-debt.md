@@ -4,6 +4,37 @@ Numeric declarations, JVM stack categories and source boxing carriers are not
 interchangeable. Fixes must preserve conversions, reference identity and input
 evaluation order, not merely numerical values on valid inputs.
 
+## Helper composition and owned call regions
+
+The helper-based marketing density exposes a source-AD preparation gap: a
+nested helper in a lexical `let` tail can reach the reverse pass after composite
+expansion has finished. The bare expression and an explicitly let-bound helper
+can work while that enclosing-let spelling fails with
+`:ad-unowned-derived-pullback`. Passing those narrower spellings is not complete
+helper-composition coverage.
+
+Moving generic ANF earlier is insufficient. For a typed invocation whose first
+input needs null/unboxing checks, lifting a later argument's array read can
+change both the first exception and observable effects. Normalization must own
+the original receiver, exact Method, original input contexts and actual source
+compilation policy before flattening the call. Trivial ANF arguments are not
+evidence that their original conversions completed.
+
+`prepare-helper-call-region` assembles that existing selected-emission and
+ordered-call boundary for generated owners. Its owner-private result keeps
+Class ports, the original operands, a combined definition guard, and the paired
+helper's executable **and transparent program** together. This is preparation,
+not a new runtime, registry, AD rule or default source-AD admission path.
+
+Remaining work is to transport the same prepared owner through public
+`prepare-value+grad`, runtime source compilation and capture-aware AOT
+projection, and compose differentiable argument regions without discarding
+their original input contexts. Native backends must discharge completion
+contracts or refuse them explicitly. Qualification requires the actual marketing
+density with changed parameters/data, invoked public JVM AOT, typed conversion
+and receiver-order oracles, and existing higher-order/absent-cotangent laws.
+The unsafe early-ANF prototype is not enabled by this boundary.
+
 ## Nullable numerical values and boxing
 
 Four properties are independent:
