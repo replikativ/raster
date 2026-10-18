@@ -29,7 +29,7 @@
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.value :as value]))
 
-(declare close! run! run-ordered-invocation!)
+(declare close! run! run-ordered-invocation! capture-ordered-entries!)
 
 (defrecord LinkedExecutable
            [plan session owns-session? graph-key phases prepared-program allocation-keys node-views
@@ -1113,16 +1113,19 @@
   (swap! execution-state update-in [:ordered :prepared] dissoc position))
 
 (defn ^:no-doc instantiate-ordered-invocation!
-  "Internal owned-root vertical for source-ordered invocation execution. No numerical storage
-   or suffix graph is acquired here. Attached sessions and profiling need their own activation
+  "Internal owned-root vertical for source-ordered invocation execution. No source-created
+   storage or suffix graph is acquired here. Captured public entries are initialized at binding; dynamic
+   inputs refresh on replay. Attached sessions and profiling need their own activation
    tests before this path is exposed by Compiled; the ordinary eager instantiator is unchanged."
   [compilation arguments opts]
   (when (or (:session opts) (:profile? opts)
-            (seq (set/difference (set (keys opts)) #{:scalar-math :profile?})))
+            (seq (set/difference (set (keys opts)) #{:scalar-math :profile? :entry-roles})))
     (throw (ex-info "ordered invocation activation currently requires an owned unprofiled session"
                     {:reason :link-ordered-options})))
   (let [caller-options (caller-math-options opts)
         initial (invocation-link/begin-ordered-realization compilation arguments caller-options)
+        entry-roles (invocation-link/ordered-entry-roles initial (:entry-roles opts))
+        entry-layout (invocation-link/ordered-entry-layout initial entry-roles)
         _ (doseq [entry (:source-order initial)
                   :let [step (when-let [id (:invocation-step entry)]
                                (some #(when (= id (:id %)) %)
@@ -1137,6 +1140,9 @@
         execution-state (atom {:value-epoch 0
                                :ordered {:compilation compilation :arguments (vec arguments)
                                          :caller-options caller-options
+                                         :entry-roles entry-roles
+                                         :entry-refresh (:entry-refresh entry-layout)
+                                         :initialized []
                                          :leaseable-output?
                                          (boolean
                                           (some (fn [id]
@@ -1155,12 +1161,15 @@
                 {:id :session :after #{:programs} :release #(gpu/close-session! session)}])]
     (cleanup/build!
      owner
-     #(own-linked-executable
-       (->LinkedExecutable nil session true nil [] nil [] {}
-                           {:source :ordered-invocation :owned-allocations 0}
+     #(let [executable (own-linked-executable
+                       (->LinkedExecutable nil session true nil [] nil [] {}
+                           {:source :ordered-invocation
+                            :owned-allocations (count (:nodes entry-layout))}
                            (atom #{}) (atom #{}) false (atom false) (Object.)
                            (atom 0) (atom 0) (atom false) execution-state)
-       owner)
+                       owner)]
+        (capture-ordered-entries! executable entry-layout)
+        executable)
      nil)))
 
 (defn- ordered-require-initialized! [nodes initialized ids]
@@ -1172,14 +1181,15 @@
 
 (defn- acquire-ordered-storage! [executable nodes aliases]
   (let [execution-state (:execution-state executable)
-        {:keys [execution-id ledger timings roots]} (:ordered @execution-state)
+        {:keys [execution-id ledger timings roots entry-refresh]} (:ordered @execution-state)
         storage (realize-storage-nodes! nodes aliases (:session executable) execution-id {}
                                        ledger timings roots)
         by-id (if (map? nodes) nodes (into {} (map (juxt :id identity)) nodes))]
-    ;; An owner-retained root is reused across invocations, but each current public source must
-    ;; be uploaded once again. Within this invocation acquired nodes carry no stale initializer.
+    ;; Only dynamic inputs refresh. Captured entries retain their resident value even when the
+    ;; borrowed host source changes. Within one invocation acquired nodes have no initializer.
     (doseq [[id node] by-id
-            :when (and (:source node) (contains? roots (get-in node [:view :allocation :id])))]
+            :when (and (:source node) (= :input (get entry-refresh id))
+                       (contains? roots (get-in node [:view :allocation :id])))]
       (gpu/upload-range! (:session executable) (get-in storage [:node-views id]) (:source node)
                          {:elements (reduce *' 1 (get-in node [:view :shape]))}))
     (swap! execution-state
@@ -1188,8 +1198,20 @@
                  (assoc-in [:ordered :roots] (:roots storage))
                  (update-in [:ordered :node-views] merge (:node-views storage))
                  (update-in [:ordered :initialized] into
-                            (keep #(when (:source %) (:view %)) (vals by-id))))))
+                            (keep #(when (and (:source %)
+                                              (or (not (contains? roots (get-in % [:view :allocation :id])))
+                                                  (= :input (get entry-refresh (:id %)))))
+                                     (:view %)) (vals by-id))))))
     storage))
+
+(defn- capture-ordered-entries! [executable layout]
+  ;; Called only inside the same Cleanup construction transaction as the owned session. This
+  ;; acquires entry storage, not a source action or a completed public output boundary.
+  (when (seq (:nodes layout))
+    (acquire-ordered-storage! executable (:nodes layout)
+                              (into #{} (map set)
+                                    (bview/overlapping-id-pairs
+                                     (map (juxt :id :view) (:nodes layout)))))))
 
 (defn- run-ordered-stage! [executable ready]
   (let [execution-state (:execution-state executable)
@@ -1269,12 +1291,17 @@
 
 (defn- run-ordered-invocation! [executable]
   (let [execution-state (:execution-state executable)
-        {:keys [compilation arguments caller-options prepared]} (:ordered @execution-state)]
+        {:keys [compilation arguments caller-options prepared entry-roles entry-refresh initialized]}
+        (:ordered @execution-state)]
     (when (seq prepared)
       (throw (ex-info "ordered invocation still owns an unfinished prepared stage"
                       {:reason :link-ordered-prepared-stage})))
-    (let [initial (invocation-link/begin-ordered-realization compilation arguments caller-options)]
-      (swap! execution-state update :ordered assoc :current initial :initialized [])
+    (let [initial (assoc (invocation-link/begin-ordered-realization compilation arguments caller-options)
+                         :entry-roles entry-roles :entry-refresh entry-refresh)
+          captured (into #{} (keep (fn [[id role]] (when (not= :input role) id))) entry-refresh)
+          initialized (vec (distinct (filter #(contains? captured (get-in % [:allocation :id]))
+                                             initialized)))]
+      (swap! execution-state update :ordered assoc :current initial :initialized initialized)
       (loop [state initial]
         (swap! execution-state assoc-in [:ordered :current] state)
         (if-let [entry (nth (:source-order state) (:source-cursor state) nil)]

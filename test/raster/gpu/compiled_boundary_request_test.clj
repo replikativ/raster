@@ -80,3 +80,41 @@
                    (catch clojure.lang.ExceptionInfo e e))]
     (is (= :compiled-equation-first-role-symbols (:reason (ex-data error))))
     (is (= #{'missing} (:symbols (ex-data error))))))
+
+(deftest semantic-port-intent-does-not-require-concrete-storage
+  (let [invocation {:parameters [{:symbol 'x} {:symbol 'weights} {:symbol 'state}]}
+        intent (#'compiled/equation-first-port-intent
+                invocation '#{x weights state}
+                {'x :input 'weights :input 'state :state}
+                {:constants '[weights] :outputs '[state]})]
+    (is (= {'x :input 'weights :constant 'state :state} (:effective-roles intent)))
+    (is (= [{:key :state :sym 'state :from :output}]
+           (vec (get-in intent [:request :output-entries]))))
+    (is (empty? (get-in intent [:request :donate-set])))
+    (is (empty? (:field-output-entries intent)))
+    (is (nil? (:parameter-projection intent)))
+    (is (not-any? #(contains? intent %) [:plan :nodes :values :arguments :certificate]))
+    (is (= :state (get-in intent [:effective-roles 'state]))
+        "persistent entry state is distinct from dynamic input refresh and source temporaries")))
+
+(deftest semantic-aggregate-intent-resolves-fields-without-allocation-tokens
+  (let [projection {:physical-parameters
+                    [{:symbol 'state_values :binding 'state :field :values :tag 'floats}
+                     {:symbol 'state_width :binding 'state :field :width :tag 'long}
+                     {:symbol 'weights_values :binding 'weights :field :values :tag 'floats}]}
+        invocation {:attributes {:parameter-projection projection}}
+        symbols '#{state_values weights_values}
+        defaults {'state_values :state 'weights_values :input}
+        options {:constants '[weights] :roles {[:state :values] :state}
+                 :outputs [[:state :values]]}
+        intent (#'compiled/equation-first-port-intent invocation symbols defaults options)]
+    (is (= projection (:parameter-projection intent)))
+    (is (= {'state_values :state 'weights_values :constant} (:effective-roles intent)))
+    (is (= [{:key [:state :values] :sym 'state_values :from :output}]
+           (:field-output-entries intent)))
+    (is (empty? (get-in intent [:request :output-entries])))
+    (let [error (try (#'compiled/equation-first-port-intent
+                     invocation symbols defaults (dissoc options :roles))
+                     (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :compiled-aggregate-write (:reason (ex-data error))))
+      (is (= :state (:default-role (ex-data error)))))))

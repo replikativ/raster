@@ -488,6 +488,58 @@
                                                     (concrete-shape token abstract scalars buffers storage))
                           :leaves [{:name :value :node token}]}))) tokens)})
 
+(defn ^:no-doc ordered-entry-roles
+  "Derive conservative semantic entry roles from checked graph accesses plus caller intent.
+   This establishes no storage placement, initialization or completion. Written public buffers
+   default to resident state; complete-overwrite specialization may refine them separately."
+  [state requested-roles]
+  (let [requested-roles (or requested-roles {})
+        available (materialization/prefix-bindings (:materialization state))
+        public (set (keys (:program-buffers available)))
+        allowed (disj link/binder-roles :scratch)
+        _ (when-not (and (map? requested-roles) (every? allowed (vals requested-roles))
+                         (set/subset? (set (keys requested-roles)) public))
+            (fail! :invocation-ordered-entry-roles "entry intent must name public buffers with public roles"
+                   {:available public :roles requested-roles}))
+        _ (when (some #(emitted-loop/emitted-loop? (first (:operations %)))
+                       (get-in state [:program :equations]))
+            (fail! :invocation-ordered-entry-control
+                   "structured control needs its own complete entry-access projection" {}))
+        boundaries (equation-boundaries (:program state) (:projections state))
+        written (into #{}
+                      (filter (fn [id]
+                                (some #(contains? #{:write :read-write}
+                                                  (graph-buffer-access (:graph %) id)) boundaries)))
+                      public)
+        roles (merge (into {} (map (fn [id] [id (if (contains? written id) :state :input)])) public)
+                     requested-roles)]
+    (doseq [id written :let [role (get roles id)] :when (link/read-only-node-role? role)]
+      (fail! :link-write-read-only "a program cannot write a read-only public entry"
+             {:value id :role role}))
+    roles))
+
+(defn ^:no-doc ordered-entry-layout
+  "Describe captured entry buffers without evaluating a source action or granting completion.
+   Dynamic inputs remain unacquired; source-created arrays are not captured entry storage."
+  [state roles]
+  (let [available (materialization/prefix-bindings (:materialization state))
+        captured (into #{} (keep (fn [[id role]] (when (not= :input role) id))) roles)
+        realized (add-materialized-inputs {:buffers {} :storage {} :loop-scratch {}}
+                                          available (get-in state [:program :values]) #{} captured)
+        scalars (merge (invocation-shape-scalars (:materialization state)) (:program-scalars available))
+        refresh (reduce-kv
+                 (fn [result id buffer]
+                   (let [token (:id buffer) role (get roles id)]
+                     (when (or (nil? role)
+                               (and (contains? result token) (not= role (get result token))))
+                       (fail! :invocation-public-role-alias
+                              "entry storage requires one consistent role for all its public aliases"
+                              {:value id :storage token}))
+                     (assoc result token role))) {} (:program-buffers available))
+        layout (storage-link-layout realized scalars (:target state) #{} (keys (:storage realized)))]
+    (assoc layout :nodes (mapv #(assoc % :role (get refresh (:id %))) (:nodes layout))
+                  :entry-refresh refresh)))
+
 (defn ^:no-doc begin-ordered-realization
   "Begin owner-local realization without evaluating invocation steps or acquiring resources.
    The returned map is runtime construction state, not a portable completion certificate."
@@ -1121,6 +1173,31 @@
   ([materialized parallel-program target evaluate-host project retained-validation caller-options]
    (lower-for-request materialized parallel-program target evaluate-host project retained-validation caller-options)))
 
+(defn ^:no-doc project-public-roles
+  "Project semantic public roles onto one typed invocation candidate. This is a transformation,
+   not a validation witness: the ordinary final LinkPlan proof must check the resulting boundary."
+  [candidate roles]
+  (let [bindings (get-in candidate [:attributes :public-buffer-bindings])
+        compiler-bindings (get-in candidate [:attributes :compiler-buffer-bindings])]
+    (when-not (and (map? bindings) (map? compiler-bindings) (map? roles)
+                   (= 1 (count (:instances candidate)))
+                   (set/subset? (set (keys roles)) (set (keys bindings))))
+      (fail! :invocation-public-role-boundary "public roles require one exact typed invocation boundary" {}))
+    (let [token-roles (reduce-kv (fn [result id role]
+                                   (let [token (get bindings id)]
+                                     (when (and (contains? result token) (not= role (get result token)))
+                                       (fail! :invocation-public-role-alias
+                                              "aliased public ports cannot have different roles"
+                                              {:node token}))
+                                     (assoc result token role))) {} roles)
+          compiler-roles (into {} (keep (fn [[id token]]
+                                         (when-let [role (get token-roles token)] [id role])))
+                               compiler-bindings)]
+      (-> (reduce-kv (fn [plan token role] (assoc-in plan [:nodes token :role] role))
+                     candidate token-roles)
+          (assoc-in [:instances 0 :roles] compiler-roles)
+          (assoc-in [:attributes :public-buffer-roles] roles)))))
+
 (defn ^:no-doc finish-ordered-realization
   "Construct and independently validate the ordinary whole-program boundary after source work.
    Cached host results are looked up, not recomputed. Zeroed source allocations remain conditional
@@ -1143,16 +1220,28 @@
                                    "completed source work lacks this exact host definition"
                                    {:equation (:id equation)}))
                           (:results step)))
+        entry-refresh (:entry-refresh state)
+        captured (into #{} (keep (fn [[token role]] (when (not= :input role) token))) entry-refresh)
         project (fn [candidate]
-                  {:plan (update candidate :nodes
+                  {:plan (cond-> (update candidate :nodes
                                  (fn [nodes]
-                                   (reduce (fn [nodes token]
-                                             (when-not (contains? nodes token)
-                                               (fail! :invocation-ordered-storage
-                                                      "source allocation is absent from final storage"
-                                                      {:storage token}))
-                                             (assoc-in nodes [token :role] :state))
-                                           nodes initialized-tokens)))})]
+                                   (let [nodes (reduce (fn [nodes token]
+                                                        (if (contains? nodes token)
+                                                          (assoc-in nodes [token :source] nil)
+                                                          nodes))
+                                                       nodes captured)]
+                                     (reduce (fn [nodes token]
+                                               (when-not (contains? nodes token)
+                                                 (fail! :invocation-ordered-storage
+                                                        "source allocation is absent from final storage"
+                                                        {:storage token}))
+                                               (assoc-in nodes [token :role] :state))
+                                             nodes initialized-tokens))))
+                           entry-refresh
+                           (project-public-roles
+                            (into {} (keep (fn [[symbol token]]
+                                             (when-let [role (get entry-refresh token)] [symbol role])))
+                                  (get-in candidate [:attributes :public-buffer-bindings]))))})]
     (link/without-validation-context
      #(lower-in-context materialized (:program state) (:target state) evaluate-host project nil
                         caller-options state))))

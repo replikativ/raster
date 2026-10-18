@@ -26,6 +26,8 @@
             [raster.compiler.ir.structured-loop-call :as loop-call]))
 
 (def node-roles #{:input :constant :state :output :internal :scratch})
+(defn ^:no-doc read-only-node-role? [role]
+  (contains? #{:input :constant} role))
 (def binder-roles #{:input :constant :state :output :scratch})
 
 (defn- field-id [field]
@@ -1416,7 +1418,7 @@
                             {:reason :link-read-before-write :instance instance :step step
                              :phase phase :node node-id})))
           (when (and (contains? #{:write :read-write} access)
-                     (contains? #{:input :constant} role))
+                     (read-only-node-role? role))
             (throw (ex-info "link plan writes a read-only node"
                             {:reason :link-write-read-only :instance instance :step step
                              :phase phase :node node-id :role role})))
