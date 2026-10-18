@@ -885,11 +885,12 @@
                                :symbols #{(:symbol previous) symbol}})))
             (.put seen value {:symbol symbol :path path})))))))
 
-(defn- project-equation-first-boundary
-  "Choose public roles and escaped outputs on the normalized candidate, before its sole proof."
-  [raw-plan compilation args {:keys [donate constants outputs taps roles]}]
-  (let [invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
-        projection (get-in invocation-plan [:attributes :parameter-projection])
+(defn- equation-first-port-intent
+  "Normalize public semantic port intent without choosing physical nodes or evaluating arguments.
+   Supplied defaults describe the compiler's port roles; they are not ownership or completion
+   evidence. Concrete projection and final LinkPlan validation remain separate obligations."
+  [invocation-plan public-symbols public-defaults {:keys [donate constants outputs taps roles]}]
+  (let [projection (get-in invocation-plan [:attributes :parameter-projection])
         aggregate-leaves (group-by :binding (filter materialization/projection-path
                                                    (:physical-parameters projection)))
         aggregate-bindings (set (keys aggregate-leaves))
@@ -904,19 +905,16 @@
             (throw (ex-info "aggregate donation, whole aggregate outputs, and taps require additional ownership support"
                             {:reason :compiled-aggregate-output :selector selector
                              :aggregates aggregate-bindings})))
-        public-bindings (get-in raw-plan [:attributes :public-buffer-bindings])
         field-intent (resolve-equation-first-field-intent
-                      projection public-bindings constants roles)
+                      projection public-symbols constants roles)
         constants (:constants field-intent)
         roles (:roles field-intent)
         field-output-entries (equation-first-field-output-entries
-                              projection public-bindings outputs)
+                              projection public-symbols outputs)
         ordinary-outputs (remove vector? outputs)
-        attributes (:attributes raw-plan)
-        public-defaults (:public-buffer-roles attributes)
         _ (doseq [[binding leaves] aggregate-leaves
                   leaf leaves
-                  :when (contains? public-bindings (:symbol leaf))
+                  :when (contains? public-symbols (:symbol leaf))
                   :let [requested-role (get roles (:symbol leaf))
                         role (or requested-role
                                  (when (some #{(:symbol leaf)} constants) :constant)
@@ -930,7 +928,6 @@
                                :path (materialization/projection-path leaf)
                                :role role :requested-role requested-role
                                :default-role (get public-defaults (:symbol leaf))}))))
-        public-symbols (set (keys public-bindings))
         requested-symbols (set (concat donate constants (keys roles)))
         unknown (set/difference requested-symbols public-symbols)
         _ (when (seq unknown)
@@ -938,20 +935,22 @@
                             {:reason :compiled-equation-first-role-symbols
                              :symbols unknown :available public-symbols})))
         request (boundary-request donate constants ordinary-outputs taps roles)
-        effective-roles (merge public-defaults (:effective-roles request))
-        token-roles (into {} (map (fn [[symbol role]]
-                                    [(get public-bindings symbol) role]))
-                          effective-roles)
+        effective-roles (merge public-defaults (:effective-roles request))]
+    {:parameter-projection projection :aggregate-leaves aggregate-leaves :roles roles
+     :request request :effective-roles effective-roles :field-output-entries field-output-entries}))
+
+(defn- project-equation-first-boundary
+  "Choose physical public nodes and escaped outputs from semantic intent before the final proof."
+  [raw-plan compilation args options]
+  (let [invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
+        attributes (:attributes raw-plan)
+        public-bindings (:public-buffer-bindings attributes)
+        {:keys [aggregate-leaves roles request effective-roles field-output-entries]
+         projection :parameter-projection}
+        (equation-first-port-intent invocation-plan (set (keys public-bindings))
+                                   (:public-buffer-roles attributes) options)
         compiler-bindings (:compiler-buffer-bindings attributes)
-        compiler-roles (into {} (keep (fn [[compiler-value token]]
-                                        (when-let [role (get token-roles token)]
-                                          [compiler-value role])))
-                             compiler-bindings)
-        plan (-> (reduce-kv (fn [plan token role]
-                              (assoc-in plan [:nodes token :role] role))
-                            raw-plan token-roles)
-                 (assoc-in [:instances 0 :roles] compiler-roles)
-                 (assoc-in [:attributes :public-buffer-roles] effective-roles))
+        plan (invocation-link/project-public-roles raw-plan effective-roles)
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
         argument-map (when-not projection (zipmap (map :symbol parameters) args))
         projected-arguments (when projection

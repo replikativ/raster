@@ -28,6 +28,16 @@
   (let [out (float-array n)]
     (par/map! out i n float (math/tanh (aget x i)))))
 
+(deftm captured-entry-replay
+  [x :- (Array double), weights :- (Array double), state :- (Array double),
+   out :- (Array double)] :- (Array double)
+  (let [updated (par/map! state i 1 double (+ (aget state i) 1.0))]
+    (par/map! out i 1 double (+ (aget x i) (aget weights i)))))
+
+(deftm unused-captured-entry
+  [x :- (Array double), unused :- (Array double), out :- (Array double)] :- (Array double)
+  (par/map! out i 1 double (aget x i)))
+
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
@@ -38,7 +48,7 @@
             executable (link/instantiate-ordered-invocation! compilation [x (double-array 1) n] {})
             session (:session executable)]
         (try
-          (is (empty? (:buffers @session)) "construction cannot allocate a suffix early")
+          (is (= 1 (count (:buffers @session))) "only the captured early entry is allocated at binding")
           (is (= :link-runtime-boundary-unavailable (reason #(link/outputs executable))))
           (is (= :link-runtime-boundary-unavailable (reason #(link/output-lease! executable))))
           (let [lease (link/run-and-lease! executable)
@@ -108,9 +118,46 @@
     (try
       (is (= :link-output-lease-ownership (reason #(link/run-and-lease! executable))))
       (is (zero? @(:completed-replays executable)))
-      (is (empty? (:buffers @(:session executable))) "rejected leased execution performs no upload/graph")
+      (is (= 1 (count (:buffers @(:session executable)))) "rejected leased execution acquires no suffix")
       (is (= [0.0] (vec out)))
       (finally (link/close! executable)))))
+
+(defn- check-captured-entry-replay! [target]
+  (let [compilation (equation-first/compile #'captured-entry-replay {:target target :dtype :double})
+        x (double-array [7.0]) weights (double-array [3.0])
+        state (double-array [0.0]) out (double-array 1)
+        executable (link/instantiate-ordered-invocation!
+                    compilation [x weights state out] {:entry-roles {'weights :constant}})]
+    (try
+      (is (= 3 (count (:buffers @(:session executable)))))
+      (aset x 0 11.0) (aset weights 0 50.0) (aset state 0 100.0)
+      (doseq [[input expected counter] [[11.0 14.0 1.0] [21.0 24.0 2.0]]]
+        (aset x 0 input)
+        (link/run! executable)
+        (let [plan (get-in @(:execution-state executable) [:resident-boundary :plan])
+              bindings (get-in plan [:attributes :public-buffer-bindings])]
+          (is (= [expected] (vec (link/download executable (get bindings 'out)))))
+          (is (= [counter] (vec (link/download executable (get bindings 'state)))))
+          (is (= :constant (get-in plan [:nodes (get bindings 'weights) :role])))
+          (is (nil? (get-in plan [:nodes (get bindings 'weights) :source])))
+          (is (= :state (get-in plan [:nodes (get bindings 'state) :role])))))
+      (is (= [100.0] (vec state)) "resident state does not silently mutate the borrowed host array")
+      (is (= [50.0] (vec weights)))
+      (finally (link/close! executable))))
+  (let [compilation (equation-first/compile #'captured-entry-replay {:target target :dtype :double})
+        sessions (atom 0)]
+    (with-redefs [gpu/make-session (fn [& _] (swap! sessions inc) (throw (Exception. "unexpected session")))]
+      (doseq [role [:input :constant]]
+        (is (= :link-write-read-only
+               (reason #(link/instantiate-ordered-invocation!
+                         compilation (repeatedly 4 (fn [] (double-array 1))) {:entry-roles {'state role}})))))
+      (is (zero? @sessions) "contradictory entry intent refuses before native acquisition")))
+  (let [compilation (equation-first/compile #'unused-captured-entry {:target target :dtype :double})]
+    (is (= :invocation-ordered-entry-roles
+           (reason #(link/instantiate-ordered-invocation!
+                     compilation [(double-array [9.0]) (double-array 1) (double-array 1)]
+                     {:entry-roles {'unused :constant}})))
+        "an erased parameter is not a resident entry; intent cannot invent storage")))
 
 (defn- check-math-request! [target]
   (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
@@ -151,16 +198,41 @@
       (is (empty? (get-in @(:execution-state executable) [:ordered :prepared])))
       (is (true? (:closed? @(:session executable)))))))
 
+(defn- check-capture-failure! [target]
+  (let [compilation (equation-first/compile #'captured-entry-replay {:target target :dtype :double})
+        make-session gpu/make-session upload gpu/upload-range! close-session gpu/close-session!
+        session (atom nil) uploads (atom 0) closes (atom 0)
+        failure (ex-info "injected later captured entry upload failure" {})
+        escaped (atom nil)]
+    (with-redefs [gpu/make-session (fn [& args] (let [result (apply make-session args)]
+                                                (reset! session result) result))
+                  gpu/upload-range! (fn [& args]
+                                      (if (= 2 (swap! uploads inc)) (throw failure) (apply upload args)))
+                  gpu/close-session! (fn [& args] (swap! closes inc) (apply close-session args))]
+      (is (identical? failure
+                      (try (reset! escaped
+                                   (link/instantiate-ordered-invocation!
+                                    compilation (repeatedly 4 (fn [] (double-array 1)))
+                                    {:entry-roles {'weights :constant}}))
+                           nil (catch Throwable error error))))
+      (is (= 2 @uploads) "the failure follows a completed earlier entry upload")
+      (is (= 1 @closes))
+      (is (true? (:closed? @@session)))
+      (is (empty? (:buffers @@session)) "captured entry roots are released by the same owner")
+      (is (nil? @escaped) "no executable or completed output boundary escapes failed capture"))))
+
 (deftest opencl-owned-root-obeys-source-order-and-replay
   (if @ocl-probe/opencl-available?
     (do (check-owned-root! :ocl:0) (check-failed-root! :ocl:0)
         (check-shared-check-and-admission! :ocl:0) (check-math-request! :ocl:0)
-        (check-release-failure! :ocl:0))
+        (check-release-failure! :ocl:0) (check-captured-entry-replay! :ocl:0)
+        (check-capture-failure! :ocl:0))
     (ocl-probe/opencl-skip! "owned source-ordered invocation root")))
 
 (deftest level-zero-owned-root-obeys-source-order-and-replay
   (if @ze-probe/gpu-available?
     (do (check-owned-root! :ze:0) (check-failed-root! :ze:0)
         (check-shared-check-and-admission! :ze:0) (check-math-request! :ze:0)
-        (check-release-failure! :ze:0))
+        (check-release-failure! :ze:0) (check-captured-entry-replay! :ze:0)
+        (check-capture-failure! :ze:0))
     (ze-probe/gpu-skip! "owned source-ordered invocation root")))

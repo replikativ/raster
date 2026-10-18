@@ -1354,6 +1354,17 @@ void leased-call rejection before effects, and retained cleanup after a retry-sa
 failure. These are restricted internal runtime results, not public `Compiled` activation or a
 performance improvement. Public preparation/composition/frontier projection, attached roots,
 entry replacement, profiling, structured-loop fragments and prefix-result views remain gates.
+The internal owned root now distinguishes dynamic input refresh from binding-time capture of
+constants and resident state. On local OpenCL and Level Zero, changed-input/two-replay controls
+retain the original captured weights and advance a resident counter from one to two, while
+source-created temporaries are zeroed again. Capture uses the existing Cleanup transaction;
+a later entry-upload failure releases the earlier acquired roots and session without publishing
+an executable. Contradictory read-only intent is rejected before native acquisition. Semantic
+port-intent normalization and concrete public-role projection are shared with the eager path,
+but this does not yet activate deferred public `Compiled`: donation, input replacement,
+composition and frontier contracts remain separate gates. Host scalar element reads of captured
+device entries remain unsupported; validated shape descriptors are not content snapshots.
+Completion certificates remain unavailable until execution.
 
 JAX pytrees are the model for separating user structure from flat leaves, but
 Raster trees should retain stable keyed paths and type/shape information. JAX
