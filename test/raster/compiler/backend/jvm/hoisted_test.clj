@@ -80,6 +80,35 @@
     (is (= 9007199254740994 ((:fn compiled) 9007199254740995)))
     (is (= -1 ((:fn compiled) nil)))))
 
+(deftest primitive-array-abi-proves-element-carrier-without-proving-array-presence
+  (let [value (with-meta 'value {:raster.type/tag 'double})
+        read-and-project '(let* [element (clojure.core/aget input index)]
+                            (if (clojure.core/nil? element) nil (clojure.core/double element)))
+        guarded-read '(if (clojure.core/nil? input) nil (clojure.core/aget input index))
+        options {:param-env {'input 'doubles 'index 'long 'effects 'ints}
+                 :return-tag 'Object :dtype :double}
+        compile! (fn [expression]
+                   (closure/hoist-and-compile
+                    (list 'let* [value expression 'changed '(clojure.core/aset effects 0 99)] value)
+                    '[input index effects] '[input index effects] options))
+        present (compile! read-and-project)
+        nullable (compile! guarded-read)
+        helper-tag #(-> % :helper-map vals first :return-tag)]
+    (is (= 'double (helper-tag present)))
+    (is (= 'Object (helper-tag nullable)))
+    (doseq [input [2.5 -0.0]]
+      (let [effects (int-array [0])]
+        (is (= (Double/doubleToRawLongBits input)
+               (Double/doubleToRawLongBits ((:fn present) (double-array [input]) 0 effects))))
+        (is (= [99] (vec effects)))))
+    (let [effects (int-array [0])]
+      (is (thrown? NullPointerException ((:fn present) nil 0 effects)))
+      (is (= [0] (vec effects)))
+      (is (thrown? ArrayIndexOutOfBoundsException ((:fn present) (double-array 0) 0 effects)))
+      (is (= [0] (vec effects)))
+      (is (nil? ((:fn nullable) nil 0 effects)))
+      (is (= [99] (vec effects))))))
+
 (defn- wrapper [initialize]
   (let [result (hoisted/compile-hoisted-class!
                 (str (gensym "raster.compiled.Publication_"))

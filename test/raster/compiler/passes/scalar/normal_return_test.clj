@@ -24,6 +24,26 @@
   (is (= {:presence :unknown}
          (normal/result-fact '(if (clojure.core/nil? input) nil (clojure.core/double input))))))
 
+(deftest primitive-element-presence-needs-a-producer-carrier-not-an-array-hint
+  (doseq [tag (keys types/primitive-array-info)]
+    (is (= {:presence :present}
+           (normal/result-fact '(clojure.core/aget input index)
+                               {'input {:presence :unknown :array-tag tag}}))))
+  (is (= {:presence :unknown}
+         (normal/result-fact (list 'clojure.core/aget
+                                  (with-meta 'input {:raster.type/tag 'doubles}) 0))))
+  (doseq [expression ['(aget input index) '(other/aget input index)
+                      '(clojure.core/aget input index 0)]]
+    (is (= {:presence :unknown}
+           (normal/result-fact expression {'input {:presence :unknown :array-tag 'doubles}}))))
+  (is (= {:presence :unknown}
+         (normal/result-fact '(clojure.core/aget input 0)
+                             {'input {:presence :present :array-tag 'objects}})))
+  (is (= {:presence :unknown}
+         (normal/result-fact '(clojure.core/aget input 0)
+                             {'input {:presence :unknown :array-tag 'doubles}
+                              'clojure.core/aget {:presence :present}}))))
+
 (deftest definition-dependent-analysis-needs-an-owning-collector
   (binding [method-entry/*emission-inputs* nil]
     (is (= {:presence :present :array-tag 'floats}
