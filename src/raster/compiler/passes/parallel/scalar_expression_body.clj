@@ -9,6 +9,7 @@
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
+            [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
@@ -1382,13 +1383,57 @@
     (let [operation (descriptor/semantic-op expression)
           arguments (descriptor/call-args expression)]
       (and (not= '.invk (first expression))
+           (not (:lexical-callee (descriptor/call-description expression)))
            (symbol? operation)
            (contains? #{"clojure.core" "Math" "java.lang.Math"} (namespace operation))
            (or (and (descriptor/cast-result-tag operation) (= 1 (count arguments)))
-               (and (descriptor/scalar-op? operation)
+               (and (or (descriptor/scalar-op? operation)
+                        (descriptor/comparison-kind operation))
                     (some-> operation intrinsics/canonical intrinsics/descriptor)))
            (every? #(strict-core-expression? % params) arguments)))
     :else false))
+
+(defn- qualify-source-casts
+  "Resolve only existing bare cast spellings in the observed source namespace.
+   A local or user Var named float must not borrow the core conversion contract."
+  [body parameters source-ns]
+  (util/postwalk-preserving-meta
+   (fn [node]
+     (let [head (when (seq? node) (first node))]
+       (if (and (symbol? head) (nil? (namespace head))
+                (not (contains? parameters head)) (descriptor/cast-op? head))
+         (let [v (ns-resolve source-ns head)]
+           (if (and (var? v) (identical? (:ns (meta v)) (find-ns 'clojure.core)))
+             (do (method-entry/observe-definition-input! v source-ns head)
+                 (util/remake-from node
+                                   (cons (symbol "clojure.core" (str (:name (meta v))))
+                                         (rest node))))
+             node))
+         node)))
+   body))
+
+(defn- selected-strict-scalar-source
+  [expression]
+  (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+        (descriptor/call-description expression)]
+    (when (and dispatch? (not lexical-callee)
+               (or (descriptor/scalar-op? semantic-op)
+                   (descriptor/comparison-kind semantic-op))
+               (some-> semantic-op intrinsics/canonical intrinsics/descriptor))
+      ;; Discover only the candidate identity. Current metadata is not proof
+      ;; that an existing implementation was emitted from that metadata.
+      (when-let [candidate (method-entry/selected-definition
+                            semantic-op implementation-op (count arguments))]
+        (when-let [entry (method-entry/selected-source-entry-carriers
+                         semantic-op implementation-op (count arguments) (:source-var candidate))]
+          (let [{:keys [parameters source-body source-var] :as definition} (:definition entry)
+                body (when (and (= 1 (count source-body))
+                                 (instance? clojure.lang.Namespace (:ns (meta source-var))))
+                       (qualify-source-casts (first source-body) (set parameters)
+                                             (:ns (meta source-var))))]
+            (when (and (seq? body) (strict-core-expression? body (set parameters)))
+              {:definition definition :entry entry :body body :arguments arguments
+               :operation semantic-op :implementation-op implementation-op})))))))
 
 (defn checked-selected-primitive-result
   "Prove OUTPUT presence from the current selected implementation's closed
@@ -1396,21 +1441,110 @@
    match a live registered method, including its scalar signature and source.
    This never invokes a method, invents a registry, or authorizes moving/removing
    the original call. Requires an owning definition collector and its final
-   guard. Generic calls and opaque/user helper bodies stay unknown."
+   guard. Current metadata must match the historical source entry consumed by
+   the selected implementation. Missing/legacy lineage, generic calls and
+   opaque/user helper bodies stay unknown; this query never forces a JIT."
   [expression]
-  (let [{:keys [dispatch? semantic-op implementation-op arguments]}
-        (descriptor/call-description expression)]
-    (when (and dispatch?
-               (descriptor/scalar-op? semantic-op)
-               (some-> semantic-op intrinsics/canonical intrinsics/descriptor))
-      (when-let [{:keys [tags parameters source-body return-tag]}
-                 (method-entry/observed-selected-definition :typed semantic-op implementation-op (count arguments))]
-        (let [body (when (= 1 (count source-body)) (first source-body))
-              scalar-types (mapv dtype/dtype-for-scalar-tag tags)
-              result-type (dtype/dtype-for-scalar-tag return-tag)]
-          (when (and (every? some? scalar-types) result-type
-                     ;; A declaration returning an argument directly says nothing
-                     ;; about presence, even if its annotation says Double.
-                     (seq? body) (strict-core-expression? body (set parameters)))
-            (let [proof (checked-scalar-result body (zipmap parameters scalar-types))]
-              (when (= result-type (:type proof)) proof))))))))
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+    (when-let [{:keys [definition body]} (selected-strict-scalar-source expression)]
+    (let [{:keys [tags parameters return-tag]} definition
+          scalar-types (mapv dtype/dtype-for-scalar-tag tags)
+          result-type (dtype/dtype-for-scalar-tag return-tag)]
+      (when (and (every? some? scalar-types) result-type)
+        (let [proof (checked-scalar-result body (zipmap parameters scalar-types))]
+          (when (= result-type (:type proof)) proof))))))))
+
+(defn- completed-fp-body-carrier
+  "Bounded completion summary INSIDE a selected primitive entry, not source inference.
+   Only exact core binary FP operations and FP conversions are admitted. Reuse the
+   emitter's arithmetic plan and the intrinsic table's independent totality facet."
+  [expression parameters]
+  (cond
+    (symbol? expression) (get parameters expression)
+    (instance? Double expression) Double/TYPE
+    (instance? Float expression) Float/TYPE
+    (seq? expression)
+    (let [operation (descriptor/semantic-op expression)
+          arguments (vec (descriptor/call-args expression))
+          carriers (mapv #(completed-fp-body-carrier % parameters) arguments)
+          intrinsic (intrinsics/descriptor operation)]
+      (when (and (= operation (first expression))
+                 (= "clojure.core" (namespace operation))
+                 (not (contains? parameters operation))
+                 (every? #{Float/TYPE Double/TYPE} carriers))
+        (cond
+          (and (= 1 (count arguments)) (descriptor/cast-op? operation))
+          (let [target (types/tag->java-class (descriptor/cast-result-tag operation))
+                source (first carriers)]
+            ;; Do not borrow unchecked JVM narrowing for a checked source cast.
+            ;; Identity and Float->Double share the exact conversion contract.
+            (when (and (contains? #{Float/TYPE Double/TYPE} target)
+                       (= [:exact :exact]
+                          (scalar-conversion/policy
+                           (if (= source Float/TYPE) :float :double)
+                           (if (= target Float/TYPE) :float :double))))
+              target))
+
+          (intrinsics/primitive-fp-total? operation carriers)
+          (if (= :cmp (:kind intrinsic))
+            Boolean/TYPE
+            (let [plan (source-arithmetic/binary-plan
+                        (:c intrinsic)
+                        (if (= Float/TYPE (first carriers)) :float :double)
+                        (if (= Float/TYPE (second carriers)) :float :double))]
+              (when (= :primitive (:kind plan))
+                (case (:result-carrier plan) :float Float/TYPE :double Double/TYPE nil)))))))
+    :else nil))
+
+(defn- completed-fp-argument?
+  "A logical dtype or nullable reference class cannot discharge entry unboxing."
+  [{:keys [carrier presence builtin-class]} target]
+  (and (= :present presence)
+       (or (and (contains? #{Float/TYPE Double/TYPE} carrier)
+                (or (= target Double/TYPE) (= carrier Float/TYPE)))
+           (and (class? carrier) (not (.isPrimitive ^Class carrier))
+                (contains? #{Float Double} builtin-class)
+                (or (= target Double/TYPE) (= builtin-class Float))
+                (.isAssignableFrom ^Class carrier ^Class builtin-class)))))
+
+(defn checked-selected-primitive-evaluation
+  "Prove a bounded selected scalar call has no source arithmetic/conversion failure.
+   Argument facts describe independently proved, ALREADY completed operands in call
+   order: actual :carrier Class, :presence, and optional present :builtin-class.
+   They are owner-private evidence, not consumer dtype annotations. Argument evaluation
+   itself is never discharged. Requires the existing definition owner/final guard.
+
+   The method's actual primitive entry, original source lineage, strict scalar body,
+   result dtype, and FP completion must all agree. Object returns remain Object;
+   builtin numeric result presence is distinct. Unknown/nullable/generic/integral
+   calls abstain, as do narrowing argument conversions. This query neither
+   executes code nor grants external purity. Its :completed-fp-scalar scope is
+   arithmetic/conversion completion only: it is not proof against cold JIT or
+   VM allocation failure and must never feed global removability directly."
+  [expression argument-facts]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+    (when-let [{:keys [definition entry body arguments]}
+             (selected-strict-scalar-source expression)]
+    (let [{:keys [parameters tags return-tag]} definition
+          carriers (:parameter-carriers entry)]
+      (when (and entry (vector? argument-facts)
+                 (= (count arguments) (count argument-facts))
+                 (every? #{Float/TYPE Double/TYPE} carriers)
+                 (every? true? (map completed-fp-argument? argument-facts carriers)))
+        (let [actual (completed-fp-body-carrier body (zipmap parameters carriers))
+              result-type (if (= return-tag 'boolean) :predicate
+                              (dtype/dtype-for-scalar-tag return-tag))
+              proof (when actual
+                      (checked-scalar-result body
+                                             (zipmap parameters (map dtype/dtype-for-scalar-tag tags))))
+              expected (when result-type
+                         (if (= :predicate result-type) Boolean/TYPE
+                             (types/tag->java-class (dtype/scalar-tag-for-dtype result-type))))]
+          (when (and actual (= actual expected) (= result-type (:type proof)))
+            {:type result-type :result-carrier (:result-carrier entry)
+             :scope :completed-fp-scalar
+             :presence :present :builtin-class (case result-type
+                                                :float Float :double Double :predicate Boolean)
+             :nonthrowing? true}))))))))

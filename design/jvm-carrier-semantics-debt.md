@@ -46,6 +46,37 @@ dominating successful check on the same immutable array identity. Zero-trip and
 false-guard behavior must survive optimization. No serial one-work-item wrapper
 substitutes for proving parallel ownership.
 
+Selected scalar producer proofs also require historical source-entry lineage.
+A current receiver/source snapshot does not prove that newly edited metadata
+describes an already emitted method. The shared strict scalar selector therefore
+checks the cold `jit-spec` or warm owned emission against the original source
+entry before deriving either presence or arithmetic/conversion completion.
+Missing or legacy lineage abstains without forcing JIT compilation.
+
+`checked-selected-primitive-evaluation` has a deliberately bounded
+`:completed-fp-scalar` scope. It composes independently completed argument facts
+with actual primitive formals and the strict selected body, using the shared
+source arithmetic planner and intrinsic totality facets. Nullable/arbitrary
+Number inputs and narrowing conversions abstain. Physical Object returns stay
+Object even when builtin Float/Double/Boolean presence is established. This is
+not global removability, external purity, or a promise against compiler/VM
+resource failures, and enables no guarded rewrite on its own.
+
+Optional proof observations are transactional: an accepted fact contributes to
+the existing owner, while a refused query does not create an executable
+dependency. Child queries inherit historical observations rather than taking a
+fresh snapshot around old output. HVP publication prepares observed pending JIT
+receivers through the existing non-evaluating compiler entry under separate
+ownership. It then checks the ORIGINAL observations, causing whole-construction
+retry after promotion; it never restamps the old closure. Real definition
+replacement still invalidates the published derivative.
+
+The separate `normal-return` recursive producer summary still needs a historical
+body-correspondence audit; making its refused queries transactional does not
+establish that broader guarantee. Internal resident scalar staging also remains
+distinct work: nonterminal producer certification, explicit singleton capture
+loads and predicate storage encoding must be proved before using that route.
+
 Shared recovery of scalar-cast/read presence is held out until their source
 evaluation obligations survive value liveness and DCE. Being present on normal
 return does not mean that a null/bounds/conversion failure may be discarded.

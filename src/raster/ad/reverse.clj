@@ -5311,6 +5311,14 @@
         ;; are still needed to evaluate) + one v per differentiable param.
           fn-params (vec (concat all-params v-syms))
           compiled-fn (eval (list 'fn fn-params hvp-transformed))
+          ;; A retained cold receiver would invalidate this closure when its
+          ;; first numerical call performs ordinary JIT promotion. Compile the
+          ;; observed dependencies WITHOUT evaluating their bodies, then let
+          ;; the existing owner reject/rebuild the whole construction if its
+          ;; historical observations changed. Never restamp the old closure.
+          _ (binding [rcore/*jit-silent-fallback?* false]
+              (method-entry/prepare-pending-definition-inputs!
+               rcore/ensure-bytecode-implementation!))
           proof-inputs @method-entry/*emission-inputs*]
 
     ;; Return a function that takes [args-vec v-vec] -> [value Hv-vec]
