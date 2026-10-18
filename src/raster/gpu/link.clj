@@ -612,21 +612,34 @@
        (catch Throwable error (poison-execution! executable error))
        (finally (swap! (:execution-state executable) dissoc :exclusive-mutation?))))))
 
+(defn- resident-boundary!
+  "Resolve the concrete resident boundary in one place. An absent plan is not an empty
+   successful output set; deferred execution must publish its real boundary before access."
+  [executable operation]
+  (when-not (map? (:plan executable))
+    (throw (ex-info "linked executable has no concrete resident boundary"
+                    {:reason :link-runtime-boundary-unavailable :operation operation})))
+  {:plan (:plan executable) :node-views (:node-views executable)})
+
+(defn- boundary-node-view! [{:keys [node-views]} node-id]
+  (or (get node-views node-id)
+      (throw (ex-info "linked executable has no such node"
+                      {:reason :link-runtime-node :node node-id
+                       :nodes (set (keys node-views))}))))
+
 (defn node-view
   "Return a stable ResidentBufferView for one public or internal LinkNode."
   [executable node-id]
   (let [executable (ensure-live! executable :node-view)]
-    (or (get (:node-views executable) node-id)
-        (throw (ex-info "linked executable has no such node"
-                        {:reason :link-runtime-node :node node-id
-                         :nodes (set (keys (:node-views executable)))})))))
+    (boundary-node-view! (resident-boundary! executable :node-view) node-id)))
 
 (defn value-view
   "Return one logical resident value. Dense values return their ResidentBufferView; composite
    values return an ordered ResidentComposite whose field identities match the certified ABI."
   [executable value-id]
-  (let [executable (ensure-live! executable :value-view)]
-    (resident-link-value (:plan executable) (:node-views executable) value-id)))
+  (let [executable (ensure-live! executable :value-view)
+        {:keys [plan node-views]} (resident-boundary! executable :value-view)]
+    (resident-link-value plan node-views value-id)))
 
 (defn- select-instance
   [plan selector]
@@ -911,7 +924,8 @@
   "Return the plan's ordered output node identities mapped to resident views."
   [executable]
   (let [executable (ensure-live! executable :outputs)
-        output-ids (get-in executable [:plan :outputs])
+        {:keys [plan] :as boundary} (resident-boundary! executable :outputs)
+        output-ids (:outputs plan)
         rank (zipmap output-ids (range))]
     ;; Array maps lose insertion order after their small-map threshold. A plan-ranked sorted map
     ;; keeps the declared order for model boundaries with arbitrarily many outputs.
@@ -921,14 +935,15 @@
                              (if (zero? position-order)
                                (compare (pr-str left) (pr-str right))
                                position-order))))
-          (map (fn [node-id] [node-id (node-view executable node-id)]))
+          (map (fn [node-id] [node-id (boundary-node-view! boundary node-id)]))
           output-ids)))
 
 (defn output-values
   "Return the plan's public logical values in declared output order without copying to the host."
   [executable]
   (let [executable (ensure-live! executable :output-values)
-        value-ids (link-plan/output-value-ids (:plan executable))
+        {:keys [plan node-views]} (resident-boundary! executable :output-values)
+        value-ids (link-plan/output-value-ids plan)
         rank (zipmap value-ids (range))]
     (into (sorted-map-by (fn [left right]
                            (let [position-order (compare (get rank left Long/MAX_VALUE)
@@ -936,7 +951,7 @@
                              (if (zero? position-order)
                                (compare (pr-str left) (pr-str right))
                                position-order))))
-          (map (fn [value-id] [value-id (value-view executable value-id)]))
+          (map (fn [value-id] [value-id (resident-link-value plan node-views value-id)]))
           value-ids)))
 
 (defn- require-owned-output-boundary! [executable]
