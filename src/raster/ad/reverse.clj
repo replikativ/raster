@@ -370,6 +370,14 @@
 (declare ^:private product-expression)
 (declare ^:private generated-helper-record)
 
+(defn- structural-completion?
+  "Object input completion needs no generated compilation policy. Primitive
+   inputs and checked references still belong to their explicit source owner."
+  [expression]
+  (when-let [{:keys [contract]} (value-completion/canonical-parts expression)]
+    (or (= value-completion/object-input-contract contract)
+        (some? *generated-product-context*))))
+
 (defn- init-active?
   "Decide whether a binding init carries gradient (is active), given the current
   `activity` map {sym -> bool}. Shared by the AD binding engine and all reverse
@@ -379,7 +387,7 @@
     (vector? init-expr)
     (boolean (some #(get activity % false) (util/free-syms init-expr)))
 
-    (and *generated-product-context* (value-completion/canonical-parts init-expr))
+    (structural-completion? init-expr)
     (boolean (some #(get activity % false)
                    (util/free-syms (:operand (value-completion/canonical-parts init-expr)))))
 
@@ -490,7 +498,7 @@
     (vector? init-expr) :product
     (and (symbol? init-expr)
          (get-in *source-memory-context* [:value-facts init-expr :product])) :product-alias
-    (and *generated-product-context* (value-completion/canonical-parts init-expr)) :completion
+    (structural-completion? init-expr) :completion
     (product-ports/projection-plan sym init-expr (:value-facts *source-memory-context*)) :product-projection
     ;; Structural interfaces survive inactive choices too. Otherwise a later
     ;; active join forgets the shape of an already known constant product.
@@ -593,7 +601,7 @@
 (defmethod ad-record :completion [_ sym init activity]
   (let [{:keys [contract operand]} (value-completion/canonical-parts init)]
     (when-not (symbol? operand)
-      (throw (ex-info "generated completion does not have a structural identity transpose"
+      (throw (ex-info "completion operand has no closed structural transpose"
                       {:reason :ad-unclosed-completion-transpose :init init})))
     (case (:source-context contract)
       (:jvm-object-input :jvm-checkcast)
@@ -4306,7 +4314,7 @@
                                       (list 'let* [raw-grads-sym
                                                    (list pullback-sym dy-sym)]
                                             padded-grads-form)))))
-                compiled-fn (eval fn-form)]
+                compiled-fn (eval (value-completion/project-to-jvm-source fn-form))]
             ;; A mutation during transformation may otherwise produce a closure
             ;; assembled from more than one registry snapshot. Do not publish or
             ;; return it: retry against the new monotonic revision instead.
@@ -5943,7 +5951,10 @@
   ;; reflection, and params (already typed) keep working.
   (let [body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
                                     (first walked-body))]
-    (eval (runtime-function-form params body))))
+    ;; Keep canonical terms in retained derivative bodies for re-entry. Only
+    ;; the executable source owner projects policy-independent Object inputs;
+    ;; primitive/checkcast contexts without an owner still refuse here.
+    (eval (value-completion/project-to-jvm-source (runtime-function-form params body)))))
   ([generated-call params {:keys [generated-source-policy] :as context}]
    ;; Explicit internal generated-program entry, not source-facing AD support.
    ;; The old two-argument path above neither discovers calls nor gains rules.

@@ -82,13 +82,14 @@
         reduction (list 'raster.par/reduce acc 0.0 index 2
                         (list 'raster.numeric/+ acc
                               (list 'raster.numeric/* h (list 'clojure.core/aget view index))))]
-    (with-bindings {#'reverse/*gensym-counter* (atom 0)
+    (doseq [owner [nil {:source-policy {:unchecked-math false}}]]
+     (with-bindings {#'reverse/*gensym-counter* (atom 0)
                     #'reverse/*source-memory-context*
                     {:values [input h] :value-facts {} :replayed {} :unprojectable {} :aliases {}}
-                    #'reverse/*generated-product-context* {:source-policy {:unchecked-math false}}}
+                    #'reverse/*generated-product-context* owner}
       (is (= :replayed-array-overwritten
              (try (#'reverse/forward-pass
                    [view (completion/complete-value completion/object-input-contract input)
                     result reduction 'write (list 'clojure.core/aset input 0 9.0)] [h])
                   :incorrectly-accepted
-                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))

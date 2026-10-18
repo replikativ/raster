@@ -25,6 +25,7 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as opdesc]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.patterns :as patterns]
@@ -140,6 +141,14 @@
                  :active-args (filterv identity tangent-args)}))))))
 
 (declare jvp-fold)
+
+(defn- alias-tangent
+  "A binding masks its old tangent even when its initializer is inactive.
+   Read before masking so a self-alias keeps its incoming tangent."
+  [tenv sym source]
+  (let [tangent (get tenv source)]
+    (cond-> (dissoc tenv sym)
+      (some? tangent) (assoc sym tangent))))
 
 (defn- linearize-region
   "Keep primal and tangent work in one lexical region and evaluate it once."
@@ -404,11 +413,21 @@
 
          ;; alias — tangent alias
          (symbol? init)
-         (done (if-let [t (get tenv init)] (assoc tenv sym t) tenv) [])
+         (done (alias-tangent tenv sym init) [])
 
          (seq? init)
          (let [head (first init)]
            (cond
+             (= completion/completion-symbol head)
+             (let [{:keys [contract operand]} (completion/canonical-parts init)]
+               (when-not (and (= completion/object-input-contract contract)
+                              (symbol? operand))
+                 (throw (ex-info "jvp: completion requires a closed Object input operand"
+                                 {:reason :jvp-unclosed-value-completion :form init :sym sym})))
+               ;; The original primal completion remains in `bindings`. Its
+               ;; tangent is an identity, not a conversion of that tangent.
+               (done (alias-tangent tenv sym operand) []))
+
              ;; Predicate snapshots retain their semantic operator; they are discrete,
              ;; not a differentiable call merely because their operands have tangents.
              (or (opdesc/comparison-op? (opdesc/semantic-op init))
@@ -632,7 +651,7 @@
   don't reflect ambiguously."
   [form params]
   (let [body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
-                                    form)]
+                                    (completion/project-to-jvm-source form))]
     (if (<= (count params) 20)
       (eval (list 'fn (vec params) body))
       (let [args-sym (gensym "jvp_args__")
