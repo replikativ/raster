@@ -817,6 +817,18 @@
                       {:reason :link-alias-pair :alias pair})))
     pair))
 
+(defn- validate-node-device!
+  [target node-id link-node exact-device?]
+  (validate-node! link-node)
+  (when-not (= node-id (:id link-node))
+    (throw (ex-info "link node map key differs from the node identity"
+                    {:reason :link-node-map-key :key node-id :node (:id link-node)})))
+  (let [device (get-in link-node [:view :allocation :device])]
+    (when-not (if exact-device? (= target device) (or (nil? device) (= target device)))
+      (throw (ex-info "link node allocation belongs to a different device"
+                      {:reason :link-node-device :node node-id
+                       :target target :device device})))))
+
 (defn- validate-storage-structure!
   "Validate the complete target-local physical/logical storage relation without treating
    sources or roles as initialization evidence. Effect ordering remains a LinkPlan concern."
@@ -828,15 +840,7 @@
     (throw (ex-info "a link plan requires a non-empty node map"
                     {:reason :link-nodes :nodes nodes})))
   (doseq [[node-id link-node] nodes]
-    (validate-node! link-node)
-    (when-not (= node-id (:id link-node))
-      (throw (ex-info "link node map key differs from the node identity"
-                      {:reason :link-node-map-key :key node-id :node (:id link-node)})))
-    (let [device (get-in link-node [:view :allocation :device])]
-      (when-not (if exact-device? (= target device) (or (nil? device) (= target device)))
-        (throw (ex-info "link node allocation belongs to a different device"
-                        {:reason :link-node-device :node node-id
-                         :target target :device device})))))
+    (validate-node-device! target node-id link-node exact-device?))
   (when-not (and (map? values) (seq values))
     (throw (ex-info "a link plan requires a non-empty logical value map"
                     {:reason :link-values :values values})))
@@ -980,6 +984,24 @@
         (throw (ex-info "link alias declaration names disjoint views"
                         {:reason :link-spurious-alias :alias pair}))))
     plan))
+
+(defn ^:no-doc validate-storage-nodes!
+  "Validate physical nodes and explicit aliases without asserting an executable plan or initialized
+   values. Source-position allocation uses the same root, dtype and initializer authority as plans."
+  [target nodes aliases]
+  (when-not (keyword? target)
+    (throw (ex-info "physical storage requires a concrete session target"
+                    {:reason :link-target :target target})))
+  (let [by-id (if (map? nodes) nodes (into {} (map (juxt :id identity)) nodes))]
+    (when-not (= (count nodes) (count by-id))
+      (throw (ex-info "storage nodes require unique identities"
+                      {:reason :link-storage-node-identities})))
+    (doseq [[id node] by-id]
+      (when-not (and (some? id) (= id (:id node)))
+        (throw (ex-info "storage nodes must retain their declared identities"
+                        {:reason :link-storage-node-identities :node id})))
+      (validate-node-device! target id node true))
+    (validate-allocations-and-aliases! {:nodes by-id :aliases (set aliases)})))
 
 (defn- validate-instance-bindings! [nodes values instance]
   (let [{:keys [id descriptor bindings roles]} instance

@@ -21,6 +21,17 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(deftest absent-resident-boundary-is-not-an-empty-successful-output
+  (let [executable (assoc (executable) :plan nil)]
+    (doseq [access [#(link/node-view executable :out)
+                    #(link/value-view executable :out)
+                    #(link/outputs executable)
+                    #(link/output-values executable)]]
+      (is (= :link-runtime-boundary-unavailable (reason access))))
+    (is (zero? @(:completed-replays executable)))
+    (is (false? @(:output-ready? executable)))
+    (is (zero? @(:output-leases executable)))))
+
 (deftest output-lease-pins-a-completed-replay-until-every-holder-releases
   (let [executable (executable)
         replays (atom 0)

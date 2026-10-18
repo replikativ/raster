@@ -1400,6 +1400,34 @@
                        :view-elements capacity})))
     (assoc spec buffer-field (+ (quot (:byte-offset view) element-bytes) relative))))
 
+(defn zero-buffer!
+  "Synchronously zero all bytes of a live resident root. A partial/strided view is refused;
+   this is an explicit mutation, not initialization or completion evidence for a compiler plan.
+   Unresolved overlapping (or footprint-unknown) events must first be awaited and retired."
+  [sess key-or-view]
+  (with-session-use sess
+    (let [{:keys [buffer view] :as binding} (resolve-resident-binding sess key-or-view)
+          footprint (binding-footprint sess {:root binding})
+          pending (into []
+                        (keep (fn [[id entry]]
+                                (when (and (unresolved-event? entry)
+                                           (or (not (and (set? (:buffer-keys entry))
+                                                         (set? (:allocation-ids entry))
+                                                         (vector? (:resident-buffers entry))))
+                                               (resident-footprints-overlap? footprint entry)))
+                                  id)))
+                        (:events @sess))]
+      (when-not (and (zero? (:byte-offset view))
+                     (= (:byte-length view) (:byte-size buffer))
+                     (bview/contiguous? view))
+        (throw (ex-info "whole-buffer zeroing requires a contiguous full-root view"
+                        {:reason :gpu-zero-partial-view :view (:id view)})))
+      (when (seq pending)
+        (throw (ex-info "buffer zeroing overlaps unresolved asynchronous work"
+                        {:reason :gpu-zero-pending-events :events pending})))
+      ((rt-resolve (:device-id @sess) "zero-buffer!") buffer)
+      key-or-view)))
+
 (defn upload-range!
   "Copy a SUB-RANGE of a host array or MemorySegment into a session buffer.
 

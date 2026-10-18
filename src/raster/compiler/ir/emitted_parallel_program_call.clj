@@ -346,6 +346,32 @@
                                  (checked-operation-projection operation caller-options))))]
       (into (set (:results equation)) (vals physical-results)))))
 
+(defn- validate-scalar-origins!
+  [parallel-program projections scalar-values caller-options]
+  (let [device-results (into #{} (mapcat #(device-equation-results % projections caller-options))
+                             (:equations parallel-program))]
+    (when-let [shadowed (seq (set/intersection device-results (set (keys scalar-values))))]
+      (fail! :emitted-program-device-result-scalar
+             "device-produced storage cannot be supplied as an evaluated host scalar"
+             {:values (set shadowed)}))))
+
+(defn- validate-host-device-dependencies! [equation device-results]
+  (let [dependencies (set/intersection device-results (set (:operands equation)))]
+    (when (seq dependencies)
+      (fail! :emitted-program-host-device-dependency
+             "a host scalar equation cannot be staged before a device result"
+             {:equation (:id equation) :values dependencies}))))
+
+(defn- merge-host-results [scalars equation results]
+  (reduce-kv (fn [environment id value]
+               (when-let [supplied (get environment id)]
+                 (when-not (semantic-fingerprint/equivalent? supplied value)
+                   (fail! :emitted-program-host-result-conflict
+                          "supplied and evaluated host scalars disagree"
+                          {:equation (:id equation) :value id})))
+               (assoc environment id value))
+             scalars results))
+
 (defn- evaluate-host-equations
   [parallel-program projections buffers scalars evaluate-host]
   (let [values (:values parallel-program)]
@@ -354,24 +380,11 @@
        (if-not (true? (get-in equation [:attributes :host-only]))
          (update state :device-results into (device-equation-results equation projections))
          (do
-           (let [device-dependencies (set/intersection device-results
-                                                       (set (:operands equation)))]
-             (when (seq device-dependencies)
-               (fail! :emitted-program-host-device-dependency
-                      "a host scalar equation cannot be staged before a device result"
-                      {:equation (:id equation) :values device-dependencies})))
+           (validate-host-device-dependencies! equation device-results)
            (let [step (evaluate-host-step equation values buffers scalars evaluate-host)
                  results (:results step)]
              (-> state
-                 (assoc :scalars
-                        (reduce-kv (fn [environment id value]
-                                     (when-let [supplied (get environment id)]
-                                       (when-not (semantic-fingerprint/equivalent? supplied value)
-                                         (fail! :emitted-program-host-result-conflict
-                                                "supplied and evaluated host scalars disagree"
-                                                {:equation (:id equation) :value id})))
-                                     (assoc environment id value))
-                                   scalars results))
+                 (assoc :scalars (merge-host-results scalars equation results))
                  (assoc-in [:host-steps (:id equation)] step))))))
      {:scalars scalars :device-results #{} :host-steps {}}
      (:equations parallel-program))))
@@ -387,10 +400,6 @@
     (fail! :emitted-program-call-program-identity
            "validated program is not the program contained in its call" {}))
   (let [{:keys [steps entry-buffers buffers scalar-values loop-scratch outputs attributes]} call
-        device-results (into #{} (mapcat #(device-equation-results
-                                           % (or constructor-projections
-                                                 *validated-boundary-projections*) caller-options))
-                             (:equations parallel-program))
         current-buffers (volatile! entry-buffers)
         prior-device-results (volatile! #{})
         current-scalars (volatile! scalar-values)]
@@ -400,10 +409,9 @@
       (when-not (map? value)
         (fail! :emitted-program-call-field "emitted program call fields must be maps"
                {:field field :value value})))
-    (when-let [shadowed (seq (set/intersection device-results (set (keys scalar-values))))]
-      (fail! :emitted-program-device-result-scalar
-             "device-produced storage cannot be supplied as an evaluated host scalar"
-             {:values (set shadowed)}))
+    (validate-scalar-origins! parallel-program
+                              (or constructor-projections *validated-boundary-projections*)
+                              scalar-values caller-options)
     ;; Results become available only at their producing equation. Their
     ;; presence in the final scalar table is not an entry-value certificate.
     (vswap! current-scalars
@@ -423,12 +431,7 @@
             (when-not (= equation (:equation step))
               (fail! :emitted-program-call-step-equation
                      "evaluated host step changed equation identity" {:equation (:id equation)}))
-            (let [dependencies (set/intersection @prior-device-results
-                                                 (set (:operands equation)))]
-              (when (seq dependencies)
-                (fail! :emitted-program-host-device-dependency
-                       "a host scalar equation cannot be staged before a device result"
-                       {:equation (:id equation) :values dependencies})))
+            (validate-host-device-dependencies! equation @prior-device-results)
             (let [expected (host-operand-bindings equation (:values parallel-program)
                                                 @current-buffers @current-scalars)]
               (doseq [[id value] expected]
@@ -781,10 +784,9 @@
   ([call f] (map-buffers-for-request call f nil))
   ([call f caller-options] (map-buffers-for-request call f caller-options)))
 
-(defn- stage-inputs
-  "Fresh checked inputs and host results for this construction only. The evaluator is neither
-   returned nor retained. This private value is not an externally reusable validation proof."
-  [parallel-program buffers scalar-values loop-scratch evaluate-host result-views retained-validation caller-options]
+(defn- checked-stage-inputs
+  "Check runtime bindings against the exact program without evaluating host equations."
+  [parallel-program buffers scalar-values loop-scratch result-views retained-validation caller-options]
   (let [{parallel-program :program projections :projections}
         (if retained-validation
           (if (nil? caller-options)
@@ -803,6 +805,7 @@
                    "result-view declarations must name emitted numerical results"
                    {:result-views result-views}))
         values (:values parallel-program)
+        _ (validate-scalar-origins! parallel-program projections scalar-values caller-options)
         overlapping-runtime-values (set/intersection (set (keys buffers))
                                                      (set (keys scalar-values)))
         _ (when (seq overlapping-runtime-values)
@@ -831,14 +834,56 @@
                      "loop scratch must name a structured loop output" {:value id}))
             (when (nil? value)
               (fail! :emitted-program-loop-scratch
-                     "loop scratch binding cannot be nil" {:value id})))
+                     "loop scratch binding cannot be nil" {:value id})))]
+    {:program parallel-program :projections projections :buffers buffers :scalars scalar-values
+     :loop-scratch loop-scratch :result-views result-views :caller-options caller-options}))
+
+(defn- stage-inputs
+  "Fresh checked inputs and host results for this construction only. The evaluator is neither
+   returned nor retained. This private value is not an externally reusable validation proof."
+  [parallel-program buffers scalar-values loop-scratch evaluate-host result-views retained-validation caller-options]
+  (let [{:keys [program projections buffers scalars] :as inputs}
+        (checked-stage-inputs parallel-program buffers scalar-values loop-scratch
+                              result-views retained-validation caller-options)
         {:keys [scalars host-steps]}
         (binding [*validated-boundary-projections* nil
                   *validated-projection-policy* nil]
-          (evaluate-host-equations parallel-program projections buffers scalar-values evaluate-host))]
-    {:program parallel-program :projections projections :buffers buffers :scalars scalars
-     :loop-scratch loop-scratch :host-steps host-steps :result-views result-views
-     :caller-options caller-options}))
+          (evaluate-host-equations program projections buffers scalars evaluate-host))]
+    (assoc inputs :scalars scalars :host-steps host-steps)))
+
+(defn ^:no-doc make-equation-call
+  "Bind one retained numerical equation using the ordinary checked ABI/dispatch path.
+   No host equation is evaluated and no driver resource is acquired. This proves the selected
+   call, not that preceding source work completed: the enclosing invocation cursor owns order,
+   storage initialization and lifetime. Structured loops retain their bounded call constructor."
+  [parallel-program equation-id buffers scalar-values result-views caller-options]
+  (let [{:keys [program projections buffers scalars]}
+        (checked-stage-inputs parallel-program buffers scalar-values {} result-views nil caller-options)
+        equation (some #(when (= equation-id (:id %)) %) (:equations program))]
+    (when-not (and equation
+                   (not (true? (get-in equation [:attributes :host-only])))
+                   (not (emitted-loop/emitted-loop? (first (:operations equation)))))
+      (fail! :emitted-program-ready-equation
+             "one numerical equation call requires an existing non-loop numerical equation"
+             {:equation equation-id}))
+    (prepare-equation-call equation (:values program) buffers scalars result-views projections)))
+
+(defn ^:no-doc make-host-equation-step
+  "Evaluate only the selected retained host equation through the ordinary checked binding path.
+   Source order and device completion remain obligations of the enclosing invocation owner."
+  [parallel-program equation-id buffers scalar-values evaluate-host caller-options]
+  (let [{:keys [program projections buffers scalars]}
+        (checked-stage-inputs parallel-program buffers scalar-values {} {} nil caller-options)
+        equation (some #(when (= equation-id (:id %)) %) (:equations program))]
+    (when-not equation
+      (fail! :emitted-program-ready-host-equation "host equation does not exist"
+             {:equation equation-id}))
+    (validate-host-device-dependencies!
+     equation (into #{} (mapcat #(device-equation-results % projections caller-options))
+                    (take-while #(not= equation-id (:id %)) (:equations program))))
+    (let [step (evaluate-host-step equation (:values program) buffers scalars evaluate-host)]
+      (merge-host-results scalars equation (:results step))
+      step)))
 
 (defn- construct-staged-call
   "Construct only from inputs just staged by this namespace. Host evaluation remains outside

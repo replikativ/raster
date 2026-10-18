@@ -174,10 +174,22 @@
 (defn- caller-math-options [opts]
   (when (contains? opts :scalar-math) (select-keys opts [:scalar-math])))
 
-(defn ^:no-doc realize-plan-storage!
-  "Realize one validated plan's physical storage into an existing session transaction ledger."
-  [plan session execution-id groups external-buffers allocation-keys timings]
-  (let [key-by-allocation
+(defn- realize-storage-in-context!
+  [nodes session execution-id groups external-buffers allocation-keys timings existing-roots]
+  (when-not (map? existing-roots)
+    (throw (ex-info "existing allocation roots must be owner-local root descriptions"
+                    {:reason :link-existing-roots})))
+  (let [ledgered (set @allocation-keys)
+        _ (doseq [[allocation-id nodes] groups
+                  :let [prior (get existing-roots allocation-id)]
+                  :when (contains? existing-roots allocation-id)]
+            (when-not (and (= (allocation-key execution-id allocation-id) (:key prior))
+                           (contains? ledgered (:key prior))
+                           (= (into {} (get-in (first nodes) [:view :allocation]))
+                              (into {} (:allocation prior))))
+              (throw (ex-info "existing root differs from this owner's acquired allocation contract"
+                              {:reason :link-existing-root-contract :allocation allocation-id}))))
+        key-by-allocation
         (into {}
               (map (fn [[allocation-id _]]
                      [allocation-id (allocation-key execution-id allocation-id)]))
@@ -185,7 +197,8 @@
         owned-specs
         (into {}
               (keep (fn [[allocation-id nodes]]
-                      (when (= :owned (get-in (first nodes) [:view :allocation :ownership]))
+                      (when (and (not (contains? existing-roots allocation-id))
+                                 (= :owned (get-in (first nodes) [:view :allocation :ownership])))
                         (let [key (get key-by-allocation allocation-id)]
                           ;; Two instantiations allocate distinct physical roots even when their
                           ;; compiler-local allocation names are equal. Borrowed/external storage
@@ -201,7 +214,8 @@
      #(doseq [[allocation-id nodes] groups
               :let [allocation (get-in (first nodes) [:view :allocation])
                     ownership (:ownership allocation)]
-              :when (contains? #{:borrowed :external} ownership)]
+              :when (and (not (contains? existing-roots allocation-id))
+                         (contains? #{:borrowed :external} ownership))]
         (let [key (get key-by-allocation allocation-id)]
           (gpu/register-buffer! session key (get external-buffers allocation-id)
                                 {:ownership ownership
@@ -222,16 +236,43 @@
                            {:id (:id view) :byte-offset (:byte-offset view)
                             :dtype (:dtype view) :shape (:shape view)
                             :strides (:strides view)})]))
-                  (:nodes plan)))]
+                  nodes))]
       (timed-phase!
        timings :initial-upload
-       #(doseq [[node-id {:keys [source view]}] (:nodes plan)
-                :when source]
+       #(doseq [[node-id {:keys [source view]}] nodes
+                :when (and source (not (contains? existing-roots (get-in view [:allocation :id]))))]
           (gpu/upload-range! session (get node-views node-id) source
                              {:elements (reduce * 1 (:shape view))})))
       {:key-by-allocation key-by-allocation
        :owned-specs owned-specs
-       :node-views node-views})))
+       :node-views node-views
+       :roots (into existing-roots
+                    (map (fn [[allocation-id nodes]]
+                           [allocation-id {:key (get key-by-allocation allocation-id)
+                                           :allocation (get-in (first nodes) [:view :allocation])}]))
+                    groups)})))
+
+(defn ^:no-doc realize-plan-storage!
+  "Realize one validated plan's physical storage into an existing session transaction ledger.
+   Optional owner-local roots permit later stages to reuse exact acquired allocations. Reuse
+   never uploads an old host initializer again, nor establishes initialized/completed bytes."
+  ([plan session execution-id groups external-buffers allocation-keys timings]
+   (realize-plan-storage! plan session execution-id groups external-buffers allocation-keys timings {}))
+  ([plan session execution-id groups external-buffers allocation-keys timings existing-roots]
+   (realize-storage-in-context! (:nodes plan) session execution-id groups external-buffers
+                                allocation-keys timings existing-roots)))
+
+(defn ^:no-doc realize-storage-nodes!
+  "Acquire checked physical storage nodes at a source allocation boundary, without inventing
+   an executable LinkPlan. No graph, initialized-value or completion evidence is produced."
+  ([nodes session execution-id external-buffers allocation-keys timings existing-roots]
+   (realize-storage-nodes! nodes #{} session execution-id external-buffers allocation-keys timings
+                           existing-roots))
+  ([nodes aliases session execution-id external-buffers allocation-keys timings existing-roots]
+  (let [by-id (:nodes (link-plan/validate-storage-nodes! (:device-id @session) nodes aliases))]
+    (realize-storage-in-context!
+     by-id session execution-id (group-by #(get-in % [:view :allocation :id]) (vals by-id))
+     external-buffers allocation-keys timings existing-roots))))
 
 (defn ^:no-doc resident-program-executor
   "Build the existing emitted-program callback boundary over already realized plan storage."
@@ -612,21 +653,34 @@
        (catch Throwable error (poison-execution! executable error))
        (finally (swap! (:execution-state executable) dissoc :exclusive-mutation?))))))
 
+(defn- resident-boundary!
+  "Resolve the concrete resident boundary in one place. An absent plan is not an empty
+   successful output set; deferred execution must publish its real boundary before access."
+  [executable operation]
+  (when-not (map? (:plan executable))
+    (throw (ex-info "linked executable has no concrete resident boundary"
+                    {:reason :link-runtime-boundary-unavailable :operation operation})))
+  {:plan (:plan executable) :node-views (:node-views executable)})
+
+(defn- boundary-node-view! [{:keys [node-views]} node-id]
+  (or (get node-views node-id)
+      (throw (ex-info "linked executable has no such node"
+                      {:reason :link-runtime-node :node node-id
+                       :nodes (set (keys node-views))}))))
+
 (defn node-view
   "Return a stable ResidentBufferView for one public or internal LinkNode."
   [executable node-id]
   (let [executable (ensure-live! executable :node-view)]
-    (or (get (:node-views executable) node-id)
-        (throw (ex-info "linked executable has no such node"
-                        {:reason :link-runtime-node :node node-id
-                         :nodes (set (keys (:node-views executable)))})))))
+    (boundary-node-view! (resident-boundary! executable :node-view) node-id)))
 
 (defn value-view
   "Return one logical resident value. Dense values return their ResidentBufferView; composite
    values return an ordered ResidentComposite whose field identities match the certified ABI."
   [executable value-id]
-  (let [executable (ensure-live! executable :value-view)]
-    (resident-link-value (:plan executable) (:node-views executable) value-id)))
+  (let [executable (ensure-live! executable :value-view)
+        {:keys [plan node-views]} (resident-boundary! executable :value-view)]
+    (resident-link-value plan node-views value-id)))
 
 (defn- select-instance
   [plan selector]
@@ -911,7 +965,8 @@
   "Return the plan's ordered output node identities mapped to resident views."
   [executable]
   (let [executable (ensure-live! executable :outputs)
-        output-ids (get-in executable [:plan :outputs])
+        {:keys [plan] :as boundary} (resident-boundary! executable :outputs)
+        output-ids (:outputs plan)
         rank (zipmap output-ids (range))]
     ;; Array maps lose insertion order after their small-map threshold. A plan-ranked sorted map
     ;; keeps the declared order for model boundaries with arbitrarily many outputs.
@@ -921,14 +976,15 @@
                              (if (zero? position-order)
                                (compare (pr-str left) (pr-str right))
                                position-order))))
-          (map (fn [node-id] [node-id (node-view executable node-id)]))
+          (map (fn [node-id] [node-id (boundary-node-view! boundary node-id)]))
           output-ids)))
 
 (defn output-values
   "Return the plan's public logical values in declared output order without copying to the host."
   [executable]
   (let [executable (ensure-live! executable :output-values)
-        value-ids (link-plan/output-value-ids (:plan executable))
+        {:keys [plan node-views]} (resident-boundary! executable :output-values)
+        value-ids (link-plan/output-value-ids plan)
         rank (zipmap value-ids (range))]
     (into (sorted-map-by (fn [left right]
                            (let [position-order (compare (get rank left Long/MAX_VALUE)
@@ -936,7 +992,7 @@
                              (if (zero? position-order)
                                (compare (pr-str left) (pr-str right))
                                position-order))))
-          (map (fn [value-id] [value-id (value-view executable value-id)]))
+          (map (fn [value-id] [value-id (resident-link-value plan node-views value-id)]))
           value-ids)))
 
 (defn- require-owned-output-boundary! [executable]
