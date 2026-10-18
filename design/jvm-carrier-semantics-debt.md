@@ -26,10 +26,19 @@ Class ports, the original operands, a combined definition guard, and the paired
 helper's executable **and transparent program** together. This is preparation,
 not a new runtime, registry, AD rule or default source-AD admission path.
 
-Remaining work is to transport the same prepared owner through public
-`prepare-value+grad`, runtime source compilation and capture-aware AOT
-projection, and compose differentiable argument regions without discarding
-their original input contexts. Native backends must discharge completion
+Generated preparation now returns the existing prepared-body/parameter boundary
+with a private source-owner sidecar and occurrence-local call regions. Runtime
+construction consumes the whole preparation, retaining its actual Class and
+executable captures, policy and pre/post-call guards; paired results additionally
+guard delayed pullbacks and seed/result carriers. Public runtime construction can
+transport such an owner, but the public producer does not yet supply one.
+Ordinary inlining, re-differentiation and AOT extraction explicitly refuse an
+unprojected owner rather than silently copying its body without the captures.
+These private sidecars are not portable IR or cache fingerprints.
+
+Remaining work is to produce the same owner through public `prepare-value+grad`,
+implement capture-aware AOT projection, and compose differentiable argument
+regions without discarding their original input contexts. Native backends must discharge completion
 contracts or refuse them explicitly. Qualification requires the actual marketing
 density with changed parameters/data, invoked public JVM AOT, typed conversion
 and receiver-order oracles, and existing higher-order/absent-cotangent laws.

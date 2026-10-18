@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [raster.ad.templates :as rt]
             [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.op-descriptor :as op]
@@ -206,6 +207,9 @@
   (for value+grad/grad results stored in vars).
   :tags is the vector of deftm parameter type tags (e.g. ['doubles 'double ...])."
   [v]
+  (source-owner/assert-portable-source! (meta v))
+  (when (var? v)
+    (source-owner/assert-portable-source! (try (meta @v) (catch Exception _ nil))))
   (let [;; Materialize the walked body FIRST: ensure-walked-body! lazily walks the
         ;; deftm and stamps deftm-params/deftm-tags/return-tag/typed-body onto the
         ;; var. Reading (meta v) before this returns stale meta with no params, so
@@ -217,6 +221,8 @@
         ;; Also check the fn object's metadata (for value+grad results)
         val-metadata (when (instance? clojure.lang.Var v)
                        (try (meta @v) (catch Exception _ nil)))
+        _ (source-owner/assert-portable-source! metadata)
+        _ (source-owner/assert-portable-source! val-metadata)
         walked-body (or (:raster.core/deftm-walked-body-typed metadata)
                         (:raster.core/deftm-walked-body metadata)
                         (:raster.core/deftm-walked-body-typed val-metadata)
@@ -895,6 +901,8 @@
      (when v
        (let [;; Try direct metadata, deref'd value metadata, then dispatch table
              val-meta (when (var? v) (try (meta @v) (catch Exception _ nil)))
+             _ (source-owner/assert-portable-source! (meta v))
+             _ (source-owner/assert-portable-source! val-meta)
              resolved (cond
                         (:raster.core/deftm (meta v)) v
                         (:raster.core/deftm val-meta) @v
@@ -921,6 +929,7 @@
                                     (try (ns-resolve ns-obj mangled) (catch Exception _ nil))))))]
          (when resolved
            (let [m (meta resolved)
+                 _ (source-owner/assert-portable-source! m)
                  walked-body (rcore/ensure-walked-body! resolved)
                  params (:raster.core/deftm-params m)
                  tags   (:raster.core/deftm-tags m)]
@@ -955,6 +964,7 @@
             ;; transform AD again or infer the gradient types from its consumers.
             prepared-body ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
                            (:var deftm-info) (:wrt (apply hash-map options)))
+            _ (source-owner/assert-portable-source! prepared-body)
             params (:params prepared-body)
             prepared-form (inf/qualify-body-symbols
                            (first (:walked-body prepared-body))

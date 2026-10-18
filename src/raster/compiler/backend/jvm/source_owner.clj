@@ -12,6 +12,16 @@
             [raster.compiler.ir.form :as form])
   (:import [java.lang.reflect Method]))
 
+(defn assert-portable-source!
+  "Refuse source extraction that would discard an unprojected private owner.
+   Prepared programs and callable metadata use separate, explicit owner slots."
+  [program]
+  (when (or (contains? program :source-owner)
+            (contains? program :raster.compiler/source-owner))
+    (throw (ex-info "Private JVM source ownership requires a capture-aware projection"
+                    {:reason :unprojected-jvm-source-owner})))
+  program)
+
 (defn- bound-identifiers [source]
   (let [identifiers (volatile! #{})]
     ;; Binder knowledge remains exclusively in scope-info, also for closures,

@@ -3994,10 +3994,15 @@
   throw on ambiguous dispatch, and return f-var unchanged when it is not a
   dispatch var (:on-miss :self)."
   [f-var]
-  (rcore/resolve-deftm-var
-   f-var {:deref-value? true
+  (source-owner/assert-portable-source! (meta f-var))
+  (when (var? f-var)
+    (source-owner/assert-portable-source! (try (meta @f-var) (catch Exception _ nil))))
+  (let [resolved (rcore/resolve-deftm-var
+                  f-var {:deref-value? true
           :on-miss :self
-          :ambiguity-hint "Use the mangled var directly, e.g. #'ns/name_m_<tags>."}))
+          :ambiguity-hint "Use the mangled var directly, e.g. #'ns/name_m_<tags>."})]
+    (source-owner/assert-portable-source! (meta resolved))
+    resolved))
 
 (defn- deftm-params-or-throw
   "The resolved deftm's param vector, or a throw that tells the user HOW to fix
@@ -5933,6 +5938,8 @@
           tape (ad-gensym "helper_tape")
           pullback (ad-gensym "helper_pullback")]
       (swap! (:captures *generated-product-context*) conj {:port companion :value (:companion artifact)})
+      (swap! (:call-regions *generated-product-context*) conj
+             {:region region :companion-port companion})
       (swap! (:guards *generated-product-context*) conj (:guard region))
       {:record {:type :paired-helper :sym sym :pullback pullback :inputs inputs
                 :result-tag (:return-tag emission) :effects memory-region}
@@ -6023,10 +6030,12 @@
     ;; The structural interpreter is read-only. Lexical branch regions are
     ;; checked before the existing conditional AD producer consumes them.
     (let [used (atom (util/free-syms-flat [params bindings]))
-          captures (atom []) guards (atom []) methods (atom []) helpers (atom {})]
+          captures (atom []) guards (atom []) methods (atom []) helpers (atom {})
+          call-regions (atom [])]
       (with-ad-gensym
         (binding [*generated-product-context* {:source-policy source-policy :used-identifiers used
-                                              :captures captures :guards guards :methods methods :helpers helpers}
+                                              :captures captures :guards guards :methods methods :helpers helpers
+                                              :call-regions call-regions}
                   *source-memory-context* {:values params
                                           :value-facts (into {} (map (fn [p] [p {:value p}])) params)
                                           :aliases {} :activity (zipmap selected-inputs (repeat true))
@@ -6049,34 +6058,17 @@
                 dy (ad-gensym "generated_seed")
                 {:keys [rev-ctx param-adj-syms]} (reverse-program-projection forward selected-inputs {result [dy]})]
             {:result-tag result-tag :captures @captures :guards @guards :methods @methods
+             :call-regions @call-regions
              :form (:standard-form (reverse-program-forms
                                     {:body-sym result :dy dy :fwd-bindings fwd-bindings
                                      :rev-bindings (vec (:bindings rev-ctx))
                                      :param-adj-syms param-adj-syms}))}))))))
 
-(defn- make-runtime-value+grad-fn
-  "Build a runtime IFn from the AD-transformed walked body.
-  Uses (& args) + indexed unpack so deftms with >20 params (Clojure's fn
-  positional-arg limit) still work. The unpacking lets are trivially
-  eliminated by the JVM JIT for the common ≤20-param case.
-
-  Three-argument INTERNAL entry compiles an explicit generated ordered-call
-  program under its OWN supplied policy, capturing actual Classes in private
-  factory parameters. It does not derive an original deftm policy or enable
-  completion AD rules/source-call normalization on the default path."
-  ([walked-body params]
-  ;; The body is eval'd WITHOUT type hints, so `clojure.core/alength` on an
-  ;; untyped INTERMEDIATE array (e.g. a broadcast result `y`) reflects ambiguously
-  ;; ("more than one matching method: alength"). Rewrite to the polymorphic
-  ;; `raster.arrays/alength`, which dispatches on the runtime array type — no
-  ;; reflection, and params (already typed) keep working.
-  (let [body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
-                                    (first walked-body))]
-    ;; Keep canonical terms in retained derivative bodies for re-entry. Only
-    ;; the executable source owner projects policy-independent Object inputs;
-    ;; primitive/checkcast contexts without an owner still refuse here.
-    (eval (value-completion/project-to-jvm-source (runtime-function-form params body)))))
-  ([generated-call params {:keys [generated-source-policy] :as context}]
+(defn- prepare-generated-value+grad
+  "Prepare the existing generated program without executing or compiling it.
+   Source ownership and call-region captures remain private sidecars, never
+   portable body metadata. This does not admit unowned public source calls."
+  [generated-call params {:keys [generated-source-policy] :as context}]
    ;; Explicit internal generated-program entry, not source-facing AD support.
    ;; The old two-argument path above neither discovers calls nor gains rules.
    (when-not (and (= #{:generated-source-policy} (set (keys context)))
@@ -6148,26 +6140,51 @@
                            (method-entry/assert-definition-inputs-current! @proof-inputs)
                            (program-guard)
                            (doseq [helper-guard (:guards product-program)] (helper-guard))))))
-             execute (source-owner/compile-function
-                      params source runtime-function-form
-                      {:source-policy generated-source-policy :source-ns *ns*
+             owner {:source-policy generated-source-policy :source-ns *ns*
                        :captures captures
                        :reference-bindings reference-bindings
-                       :methods (if normalized [(:method normalized)] (vec (:methods product-program))) :guard guard})]
-         (if-not product? execute
+                       :methods (if normalized [(:method normalized)] (vec (:methods product-program))) :guard guard}]
+       (cond-> {:walked-body [source] :params params :source-ns *ns*
+                :source-owner owner :call-regions (vec (:call-regions product-program))}
+         product? (assoc :paired-result-tag (:result-tag product-program))))))
+
+(defn- compile-prepared-value+grad
+  "Consume a whole preparation without dropping its private source owner."
+  [{:keys [walked-body params source-owner paired-result-tag] :as prepared}]
+  (if-not (contains? prepared :source-owner)
+    ;; Legacy public source projection only. Never rewrite an owned program:
+    ;; its original operations and completion order belong to its producer.
+    (let [body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
+                                     (first walked-body))]
+      (eval (value-completion/project-to-jvm-source (runtime-function-form params body))))
+    (let [execute (source-owner/compile-function
+                   params (first walked-body) runtime-function-form source-owner)
+          guard (:guard source-owner)]
+      (if-not paired-result-tag
+        (if-not guard execute
+          (fn [& arguments]
+            (guard)
+            (let [result (apply execute arguments)] (guard) result)))
            (fn [& arguments]
              (guard)
              (let [[primal pullback] (apply execute arguments)]
                (guard)
-               (when-not (.isInstance ^Class (get types/primitive-info (:result-tag product-program)) primal)
+               (when-not (.isInstance ^Class (get types/primitive-info paired-result-tag) primal)
                  (throw (ex-info "generated scalar result has the wrong carrier"
                                  {:reason :ad-generated-result-carrier})))
                [primal (fn [seed]
                          (guard)
-                         (when-not (.isInstance ^Class (get types/primitive-info (:result-tag product-program)) seed)
+                         (when-not (.isInstance ^Class (get types/primitive-info paired-result-tag) seed)
                            (throw (ex-info "generated scalar seed has the wrong carrier"
                                            {:reason :ad-generated-seed-carrier})))
-                         (let [gradient (pullback seed)] (guard) gradient))])))))))
+                         (let [gradient (pullback seed)] (guard) gradient))]))))))
+
+(defn- make-runtime-value+grad-fn
+  "Compile public source or an explicitly owned generated preparation."
+  ([walked-body params]
+   (compile-prepared-value+grad {:walked-body walked-body :params params}))
+  ([generated-call params context]
+   (compile-prepared-value+grad (prepare-generated-value+grad generated-call params context))))
 
 ;; ================================================================
 ;; Forward-mode admissibility (framework §11): mode selection is
@@ -6685,8 +6702,11 @@
      :reverse
      (let [bgw (prepare-value+grad f-var wrt)
            {:keys [walked-body params tags source-ns]} bgw
-           {compiled-fn :fn compile-failure :failure} (when compile? (compiled-value+grad-fn f-var wrt))
-           runtime-fn (or compiled-fn (make-runtime-value+grad-fn walked-body params))
+           {compiled-fn :fn compile-failure :failure}
+           (when compile?
+             (source-owner/assert-portable-source! bgw)
+             (compiled-value+grad-fn f-var wrt))
+           runtime-fn (or compiled-fn (compile-prepared-value+grad bgw))
            ;; Qualify symbols in walked body for inlining from other namespaces
            inline-ns inf/qualify-body-symbols
            param-set (set params)
@@ -6701,6 +6721,8 @@
                     :raster.core/deftm-params params
                     :raster.core/deftm-tags tags}
              ;; why :compile? fell back to the evaluated body
+             (contains? bgw :source-owner)
+             (assoc :raster.compiler/source-owner (:source-owner bgw))
              compile-failure (assoc ::compile-failure compile-failure)))))
 
      :forward
