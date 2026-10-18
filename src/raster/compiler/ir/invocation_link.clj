@@ -584,6 +584,49 @@
      :projections (:projections checked) :target (:target compilation)
      :caller-options caller-options}))
 
+(defn- validate-source-result-allocation! [state entry action]
+  (let [destination (:binding action)
+        equation (some #(when (= (:equation action) (:id %)) %) (get-in state [:program :equations]))
+        operation (first (:operations equation))
+        projection (when operation
+                     (emitted-program/operation-projection (:projections state) operation))]
+    ;; Prefix-result views and distinct logical/physical storage need their own reconciliation.
+    (when-not (and (symbol? destination)
+                   (contains? (:physical-results projection) destination)
+                   (= destination (get-in projection [:physical-results destination])))
+      (fail! :invocation-ordered-realization-storage
+             "source allocation must be the equation's exact physical result"
+             {:entry entry :destination destination}))))
+
+(defn ^:no-doc validate-ordered-source-actions!
+  "Check structural executor coverage after begin-ordered-realization, before capture or source
+   effects. This evaluates no source operand, acquires no storage and grants no completion proof.
+   Runtime counts, initialization, input ownership and logical-view checks remain separate."
+  [state]
+  (when-let [providers (seq (get-in state [:program :attributes :native-initialization-providers]))]
+    (fail! :invocation-link-native-initialization
+           "ordered linking requires an explicit native-content provider"
+           {:destinations (vec providers)}))
+  (let [steps (into {} (map (juxt :id identity)) (get-in state [:materialization :plan :steps]))
+        equations (into {} (map (juxt :id identity)) (get-in state [:program :equations]))]
+    (doseq [entry (:source-order state)
+            :let [step (get steps (:invocation-step entry))
+                  equation (get equations (:equation entry))
+                  action (get (:source-realizations state) (:position entry))]]
+      (when (or (and (:realization entry)
+                     (not (contains? #{:result-allocation :storage-alias} (:kind action))))
+                (and step (not (or (invocation/scalar-compute? step)
+                                         (invocation/shape-projection? step)
+                                         (and (:storage entry) (invocation/buffer-allocation? step))))))
+        (fail! :invocation-ordered-source-action
+               "ordered source entry requires an unimplemented realization action" {:entry entry}))
+      (when (some emitted-loop/emitted-loop? (:operations equation))
+        (fail! :invocation-ordered-source-action
+               "ordered execution does not yet admit structured-loop fragments" {:entry entry}))
+      (when (= :result-allocation (:kind action))
+        (validate-source-result-allocation! state entry action))))
+  state)
+
 (defn ^:no-doc ordered-input-arguments
   "Preflight primitive host-array replacements without evaluating source steps or mutating an
    owner. Only dynamic entry inputs may change, and the prepared storage specialization is fixed.
@@ -707,17 +750,7 @@
                    (invocation-source/allocation-corresponds? expression abstract initialization values))
       (fail! :invocation-ordered-next-allocation
              "the next source entry is not an admitted size-only zero allocation" {:entry entry}))
-    (when auxiliary?
-      (let [equation (some #(when (= (:equation action) (:id %)) %) (get-in state [:program :equations]))
-            operation (first (:operations equation))
-            projection (when operation
-                         (emitted-program/operation-projection (:projections state) operation))]
-        ;; Prefix-result views and logical-to-distinct-physical allocations require their own
-        ;; source-constructor/storage reconciliation. Never allocate a second hidden root here.
-        (when-not (= destination (get-in projection [:physical-results destination]))
-          (fail! :invocation-ordered-realization-storage
-                 "source allocation must be the equation's exact physical result"
-                 {:entry entry :destination destination}))))
+    (when auxiliary? (validate-source-result-allocation! state entry action))
     (when (and (:helper projection)
                (not (semantic/equivalent? (select-keys projection [:constructor :helper])
                                          (:source-projection step))))

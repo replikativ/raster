@@ -1137,22 +1137,10 @@
     (throw (ex-info "ordered invocation activation currently requires an owned unprofiled session"
                     {:reason :link-ordered-options})))
   (let [caller-options (caller-math-options opts)
-        initial (invocation-link/begin-ordered-realization compilation arguments caller-options)
+        initial (invocation-link/validate-ordered-source-actions!
+                 (invocation-link/begin-ordered-realization compilation arguments caller-options))
         entry-roles (invocation-link/ordered-entry-roles initial (:entry-roles opts))
         entry-layout (invocation-link/ordered-entry-layout initial entry-roles)
-        _ (doseq [entry (:source-order initial)
-                  :let [step (when-let [id (:invocation-step entry)]
-                               (some #(when (= id (:id %)) %)
-                                     (get-in initial [:materialization :plan :steps])))]]
-            (when (or (and (:realization entry)
-                           (not (contains? #{:result-allocation :storage-alias}
-                                           (get-in initial [:source-realizations (:position entry) :kind]))))
-                      (and step (not (or (invocation/scalar-compute? step)
-                                                        (invocation/shape-projection? step)
-                                                        (and (:storage entry)
-                                                             (invocation/buffer-allocation? step))))))
-              (throw (ex-info "ordered source entry requires an unimplemented realization action"
-                              {:reason :link-ordered-source-action :entry entry}))))
         execution-state (atom {:value-epoch 0
                                :ordered {:compilation compilation :arguments (vec arguments)
                                          :caller-options caller-options
