@@ -412,7 +412,12 @@
                (clojure.lang.DynamicClassLoader.
                 (.getContextClassLoader (Thread/currentThread))))]
     (binding [me/*compilation-classloader* (or me/*compilation-classloader* cl)]
-      (let [fresh-body (if (and source-body annotations)
+      (let [source-var (ns-resolve source-ns mangled-sym)
+            source-entry (me/capture-source-entry
+                          source-var {:params params :tags tags :annotations annotations
+                                      :source-body source-body :source-ns source-ns
+                                      :typed-interface typed-iface-name :return-tag return-tag})
+            fresh-body (if (and source-body annotations)
                          (jit-walk-with-tc (vec source-body) params tags annotations source-ns)
                          walked-body)]
         (try
@@ -438,6 +443,9 @@
                                     effective-body source-ns typed-iface-name mangled-sym)
               impl implementation]
           (when impl
+            ;; Original source lineage was captured BEFORE walking. The emitted
+            ;; :body is transformed code and cannot reconstruct this evidence.
+            (when source-entry (me/assert-source-entry-current! source-entry))
             (let [old-impl (.getRawRoot ^clojure.lang.Var impl-var)]
               (alter-var-root impl-var (constantly impl))
               (try
@@ -474,7 +482,8 @@
                 ;; assertion. Consumers must match the implementation by identity
                 ;; and retain the ordinary selected-definition/dependency guards.
                 ;; Attach only after successful dispatch/callsite publication.
-                (alter-meta! impl-var assoc ::bytecode-emission emission)
+                (alter-meta! impl-var assoc ::bytecode-emission
+                             (cond-> emission source-entry (assoc :source-entry source-entry)))
                 impl
                 (catch Exception e
               ;; Rollback var to old impl on dispatch table or callsite failure
@@ -1780,43 +1789,32 @@
                   (when cls
                     (.importClass ^clojure.lang.Namespace source-ns cls)
                     (swap! types/tag-class-registry assoc specialized-name cls)))))
-            ;; Create the mangled defn var (minimal — just a placeholder for metadata).
-            ;; Variadic [& args]: the real params are carried in ::deftm-params metadata
-            ;; below, and the placeholder is replaced by a delegating variadic fn after
-            ;; do-bytecode-upgrade! anyway. A positional param vector here would hit
-            ;; Clojure's 20-positional-param limit for wide deftms (e.g. a 37-param
-            ;; transformer block): "Can't specify more than 20 params".
-            (binding [*ns* source-ns]
-              (eval (list 'defn mangled-sym '[& args]
-                          (list 'throw (list 'UnsupportedOperationException.
-                                             "bytecode-compiled — should not reach here")))))
-            ;; Set metadata on the mangled var
-            (let [mangled-var (ns-resolve source-ns mangled-sym)]
+            ;; Publish ONE stable delegating source root before emission. A
+            ;; throwing placeholder replaced afterwards cannot describe the
+            ;; original inputs consumed by the owned bytecode emitter. Keep the
+            ;; variadic boundary for wide (>20 parameter) specializations.
+            (let [impl-var-sym (symbol (str mangled-sym "-impl"))
+                  _ (binding [*ns* source-ns] (eval (list 'def impl-var-sym nil)))
+                  impl-var (ns-resolve source-ns impl-var-sym)
+                  source-function (fn [& call-args] (apply @impl-var call-args))
+                  mangled-var (intern source-ns mangled-sym source-function)]
               (alter-meta! mangled-var assoc
+                           ::deftm true
+                           :arglists '([& args])
                            ::deftm-params (vec params)
                            ::deftm-tags tags
                            ::return-tag ret-tag
                            ::deftm-walked-body walked-body
-                           ::deftm-source-body (vec [body-with-types])
+                           ::deftm-source-body body-forms
                            ::deftm-annotations concrete-anns
                            ::deftm-source-ns (ns-name source-ns))
-              ;; Create the -impl var with a stub, then bytecode-upgrade it
-              (let [impl-var-sym (symbol (str mangled-sym "-impl"))
-                    _ (binding [*ns* source-ns]
-                        (eval (list 'def impl-var-sym nil)))
-                    impl-var (ns-resolve source-ns impl-var-sym)]
                 ;; Bytecode compile: creates invk (typed) + invoke(Object) bridge
                 ;; This is the same path as lazy JIT — no Clojure compiler involved
                 (do-bytecode-upgrade!
                  impl-var mangled-sym params tags ret-tag
                  walked-body source-ns typed-iface-name
                  :annotations concrete-anns
-                 :source-body (vec [body-with-types]))
-                ;; Update mangled var to delegate to bytecode-compiled impl.
-                ;; The mangled defn was a throwing placeholder; now that the impl
-                ;; exists, route IFn calls through it so mangled call paths work.
-                (alter-var-root mangled-var
-                                (constantly (fn [& call-args] (apply @impl-var call-args))))
+                 :source-body body-forms)
                 ;; Register in dispatch table
                 ;; Match ordinary deftm registration: MethodEntry contains
                 ;; concrete function/implementation objects, not a name and a
@@ -1832,7 +1830,7 @@
                 ;; Return the compiled -impl var; the caller decides whether to
                 ;; invoke it (runtime dispatch) or just keep the registration
                 ;; (compile-time specialization).
-                impl-var))
+                impl-var)
             (finally
               (.setContextClassLoader (Thread/currentThread) prev-tcl)))))))))
 

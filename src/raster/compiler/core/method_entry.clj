@@ -280,6 +280,53 @@
 
 (declare direct-selected-definition)
 
+(defn capture-source-entry
+  "Capture the ORIGINAL source inputs consumed by a typed JIT, before walking.
+   This owner-private lineage is not a portable certificate or a type registry.
+   Derived walked bodies/cache metadata are deliberately not source identity.
+   Nil means the supplied plan does not correspond to this retained definition."
+  [source-var {:keys [params tags annotations source-body source-ns typed-interface return-tag]}]
+  (when (and (var? source-var) (bound? source-var)
+             (instance? clojure.lang.Namespace source-ns))
+    (let [{:keys [value metadata]} (var-snapshot source-var)]
+      (when (and (:raster.core/deftm metadata)
+                 (identical? source-ns (:ns metadata))
+                 (= (ns-name source-ns) (:raster.core/deftm-source-ns metadata))
+                 (= params (:raster.core/deftm-params metadata))
+                 (= tags (:raster.core/deftm-tags metadata))
+                 (= annotations (:raster.core/deftm-annotations metadata))
+                 (= return-tag (or (:raster.core/return-tag metadata) 'Object))
+                 (some? source-body)
+                 (identical? source-body (:raster.core/deftm-source-body metadata))
+                 (some? typed-interface))
+        {:source-var source-var :source-root value :source-name (:name metadata)
+         :params params :tags tags :annotations annotations :source-body source-body
+         :source-ns source-ns :typed-interface typed-interface :return-tag return-tag}))))
+
+(defn source-entry-current?
+  "Validate historical source-entry lineage, not a fresh proof around old code.
+   Exact raw-body identity preserves its metadata. Body-entry carriers do not
+   grant successful invocation, totality, result presence or conversion motion."
+  [lineage]
+  (boolean
+   (when (map? lineage)
+     (let [{:keys [source-var source-root source-ns source-name]} lineage]
+       (and (var? source-var) (bound? source-var)
+            (instance? clojure.lang.Namespace source-ns)
+            (symbol? source-name) (nil? (namespace source-name))
+            (identical? source-ns (find-ns (ns-name source-ns)))
+            (identical? source-var (.findInternedVar ^clojure.lang.Namespace source-ns source-name))
+            (identical? source-root (var-get source-var))
+            (some? (capture-source-entry source-var lineage)))))))
+
+(defn assert-source-entry-current!
+  "Fence publication of an actual captured source entry; sequential, not ABA-safe."
+  [lineage]
+  (when-not (source-entry-current? lineage)
+    (throw (ex-info "typed source entry changed during compilation"
+                    {:reason :stale-definition-proof-input :source (:source-var lineage)})))
+  true)
+
 (defn observed-selected-definition
   "Optional owner-local definition projection, observed BEFORE deriving facts.
    The first lookup discovers Vars only; never analyze its captured source.
@@ -343,6 +390,48 @@
                     {:definition definition :invocation-method method
                      :parameters parameters :parameter-carriers carriers
                      :result-carrier (.getReturnType method)}))))))))))
+
+(defn selected-source-entry-carriers
+  "Project primitive formal facts INSIDE an exact retained typed source entry.
+   Cold jit-spec and warm owned emission must correspond to the same source Var
+   supplied by the frontend. Never compile/invoke merely to acquire evidence.
+   Original argument completion stays outside these facts; reference formals
+   remain nullable and the interface's Object result remains Object. Requires
+   the existing enclosing definition owner and its final publication guard."
+  [operation implementation-op argument-count expected-source-var]
+  (when-let [{:keys [definition parameters parameter-carriers] :as projection}
+             (selected-parameter-carriers operation implementation-op argument-count)]
+    (let [{:keys [source-var receiver-var entry tags]} definition
+          metadata (meta receiver-var)
+          spec (:raster.core/jit-spec metadata)
+          emission (:raster.core/bytecode-emission metadata)
+          source-ns (:ns (meta source-var))
+          lineage
+          (when (identical? expected-source-var source-var)
+            (if spec
+              (when (and (symbol? (:mangled-sym spec))
+                         (identical? source-var (ns-resolve source-ns (:mangled-sym spec)))
+                         (= (ns-name source-ns) (:source-ns-name spec)))
+                (capture-source-entry
+                 source-var (assoc spec :source-ns source-ns
+                                        :typed-interface (:typed-iface-name spec))))
+              (when (and (= :jvm-bytecode (:backend emission))
+                         (identical? (:typed-impl entry) (:implementation emission))
+                         (= parameters (:params emission)) (= tags (:tags emission))
+                         (= (str (:typed-iface entry)) (str (:typed-interface emission))))
+                (when (source-entry-current? (:source-entry emission))
+                  (assert-emission-inputs-current! emission)
+                  (:source-entry emission)))))]
+      (when (and lineage (identical? source-var (:source-var lineage))
+                 (= parameters (:params lineage)) (= tags (:tags lineage))
+                 (= (str (:typed-iface entry)) (str (:typed-interface lineage))))
+        (assert-definition-inputs-current! @*emission-inputs*)
+        (assoc projection :scope :typed-source-body-entry
+               :parameter-facts
+               (zipmap parameters
+                       (mapv (fn [^Class carrier]
+                               {:carrier carrier :presence (if (.isPrimitive carrier) :present :unknown)})
+                             parameter-carriers)))))))
 
 (defn direct-selected-definition
   "Correspondence for an already selected plain mangled function call.
