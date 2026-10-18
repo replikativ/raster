@@ -141,6 +141,42 @@
           (is (= :constant (get-in plan [:nodes (get bindings 'weights) :role])))
           (is (nil? (get-in plan [:nodes (get bindings 'weights) :source])))
           (is (= :state (get-in plan [:nodes (get bindings 'state) :role])))))
+      (let [retirements (atom 0)
+            retire! #(swap! retirements inc)
+            before @(:completed-replays executable)]
+        (doseq [[replacement expected-reason]
+                [[{'x (float-array 1)} :invocation-materialization-buffer-dtype]
+                 [{'x (Object.)} :invocation-materialization-buffer]
+                 [{'x (double-array 2)} :invocation-ordered-input-specialization]
+                 [{'x (double-array [31.0]) 'weights (double-array [99.0])}
+                  :invocation-ordered-input-role]]]
+          (is (= expected-reason
+                 (reason #(link/run-ordered-with-inputs! executable replacement retire!)))))
+        (is (zero? @retirements) "all replacement admission completes before output retirement")
+        (is (= before @(:completed-replays executable)))
+        (link/run-ordered-with-inputs! executable {'x (double-array [31.0])} retire!)
+        (is (= 1 @retirements))
+        (let [bindings (get-in @(:execution-state executable)
+                               [:resident-boundary :plan :attributes :public-buffer-bindings])]
+          (is (= [34.0] (vec (link/download executable (get bindings 'out)))))
+          (is (= [3.0] (vec (link/download executable (get bindings 'state))))))
+        (let [lease (link/output-lease! executable)]
+          (try
+            (is (= :link-output-lease-active
+                   (reason #(link/run-ordered-with-inputs!
+                             executable {'x (double-array [41.0])} retire!))))
+            (is (= 1 @retirements) "a live lease prevents even the retirement callback")
+            (finally (.close ^java.io.Closeable lease))))
+        (let [held (atom nil)
+              arguments (get-in @(:execution-state executable) [:ordered :arguments])]
+          (try
+            (is (= :link-output-lease-active
+                   (reason #(link/run-ordered-with-inputs!
+                             executable {'x (double-array [41.0])}
+                             (fn [] (reset! held (link/output-lease! executable)))))))
+            (is (identical? arguments (get-in @(:execution-state executable) [:ordered :arguments]))
+                "reentrant lease acquisition cannot commit the preflighted arguments")
+            (finally (when @held (.close ^java.io.Closeable @held))))))
       (is (= [100.0] (vec state)) "resident state does not silently mutate the borrowed host array")
       (is (= [50.0] (vec weights)))
       (finally (link/close! executable))))

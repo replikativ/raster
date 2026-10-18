@@ -9,6 +9,19 @@
 (defn- array-value [dtype extent]
   (av/tensor {:dtype dtype :shape [extent] :representation {:kind :plain}}))
 
+(deftest source-alias-check-retains-every-distinct-storage-in-a-read-only-group
+  (let [source (double-array 1)
+        a {:source source :storage :a :mutable? false}
+        b {:source source :storage :b :mutable? false}
+        mutable-a (assoc a :mutable? true)]
+    (is (nil? (materialization/conflicting-source-alias [a b])))
+    (is (nil? (materialization/conflicting-source-alias [a mutable-a])))
+    (is (nil? (materialization/conflicting-source-alias
+               [mutable-a (assoc b :source (double-array 1))])))
+    (is (= [mutable-a b] (materialization/conflicting-source-alias [mutable-a b])))
+    (is (= [b mutable-a] (materialization/conflicting-source-alias [a b mutable-a])))
+    (is (= [mutable-a b] (materialization/conflicting-source-alias [a mutable-a b])))))
+
 (deftest integral-scalar-admission-is-not-an-implicit-conversion
   (doseq [[dtype values] [[:byte [Byte/MIN_VALUE 0 Byte/MAX_VALUE]]
                          [:int [Integer/MIN_VALUE 0 Integer/MAX_VALUE]]

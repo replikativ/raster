@@ -96,6 +96,11 @@
 (defn- sealed-artifact? [artifact]
   ((:authentic? artifact-issuer) artifact))
 
+(defn- require-concrete-preparation! [artifact operation]
+  (when (or (:ordered-invocation artifact) (get-in artifact [:prepared :ordered-invocation]))
+    (throw (ex-info "this operation requires a concrete prepared plan; ordered source work is deferred"
+                    {:reason :compiled-deferred-phase :operation operation}))))
+
 (defrecord CompletedEvidence [data lease executable epoch values released? provenance-seal]
   java.io.Closeable
   (close [this]
@@ -781,6 +786,18 @@
     (instance? clojure.lang.Named value) (keyword (name value))
     :else (keyword (str "result-" index))))
 
+(defn- require-unique-output-keys! [out-tree]
+  (when-let [duplicates (seq (->> out-tree (map :key) frequencies
+                                  (keep (fn [[key count]] (when (< 1 count) key)))))]
+    (throw (ex-info "equation-first outputs require unique semantic keys"
+                    {:reason :compiled-equation-first-output-keys :keys (set duplicates)}))))
+
+(defn- equation-first-kernel-steps [compilation]
+  (mapv (fn [index kernel]
+          {:convention :kernel-body :phase (keyword (str "kernel-" index))
+           :kernel-name (:kernel-name kernel)})
+        (range) (:kernels compilation)))
+
 (defn- equation-first-field-leaf
   "Resolve one canonical public aggregate selector to its retained buffer leaf."
   [projection public-bindings selector]
@@ -869,21 +886,21 @@
                                           leaves)))
                       aggregate-leaves)]
     (when (seq mutable)
-      (let [seen (java.util.IdentityHashMap.)]
-        (doseq [{:keys [symbol] :as leaf} (:physical-parameters projection)
-                :when (contains? public-bindings symbol)
-                :let [value (get projected-arguments symbol)
-                      path (if-let [projection-path (materialization/projection-path leaf)]
-                             (into [(keyword (:binding leaf))] projection-path)
-                             (keyword (name symbol)))]
-                :when (some? value)]
-          (if-let [previous (.get seen value)]
-            (when (or (contains? mutable symbol) (contains? mutable (:symbol previous)))
-              (throw (ex-info "mutable aggregate leaves cannot alias another public buffer"
-                              {:reason :compiled-aggregate-state-alias
-                               :left (:path previous) :right path
-                               :symbols #{(:symbol previous) symbol}})))
-            (.put seen value {:symbol symbol :path path})))))))
+      (when-let [[previous current]
+                 (materialization/conflicting-source-alias
+                  (for [{:keys [symbol] :as leaf} (:physical-parameters projection)
+                        :when (contains? public-bindings symbol)
+                        :let [value (get projected-arguments symbol)
+                              path (if-let [projection-path (materialization/projection-path leaf)]
+                                     (into [(keyword (:binding leaf))] projection-path)
+                                     (keyword (name symbol)))]
+                        :when (some? value)]
+                    {:source value :storage symbol :mutable? (contains? mutable symbol)
+                     :symbol symbol :path path}))]
+        (throw (ex-info "mutable aggregate leaves cannot alias another public buffer"
+                        {:reason :compiled-aggregate-state-alias
+                         :left (:path previous) :right (:path current)
+                         :symbols #{(:symbol previous) (:symbol current)}}))))))
 
 (defn- equation-first-port-intent
   "Normalize public semantic port intent without choosing physical nodes or evaluating arguments.
@@ -1015,12 +1032,7 @@
                              (conj entries entry)))
                          [] (concat donated-nodes ordinary-explicit-nodes field-explicit-nodes
                                     semantic-nodes tap-nodes))
-        duplicate-keys (->> out-tree (map :key) frequencies
-                            (keep (fn [[key count]] (when (< 1 count) key))) set)
-        _ (when (seq duplicate-keys)
-            (throw (ex-info "equation-first outputs require unique semantic keys"
-                            {:reason :compiled-equation-first-output-keys
-                             :keys duplicate-keys})))
+        _ (require-unique-output-keys! out-tree)
         escaped (mapv :node out-tree)
         missing (set/difference (set (:outputs plan)) (set escaped))
         _ (when (seq missing)
@@ -1030,6 +1042,70 @@
     {:plan (assoc plan :outputs escaped)
      :projection {:in-tree in-tree :out-tree out-tree
                   :donated (donated-output-keys request)}}))
+
+(defn- prepare-ordered-equation-first
+  "Retain semantic ports and the same compiled template without inventing a concrete LinkPlan.
+   This constructor is not automatic route selection. Its public invocation/capability gates
+   must land before ordinary lowering may select it."
+  [compilation args opts template-report]
+  (let [started (System/nanoTime)
+        invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
+        _ (when (or (get-in invocation-plan [:attributes :parameter-projection])
+                    (some seq ((juxt :donate :outputs :taps) opts))
+                    (:session opts) (:profile? opts))
+            (throw (ex-info "ordered preparation requires flat owned unprofiled semantic ports"
+                            {:reason :compiled-ordered-capability})))
+        caller-options (when (contains? opts :scalar-math)
+                         {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math opts))})
+        initial (invocation-link/begin-ordered-realization compilation args caller-options)
+        available (materialization/prefix-bindings (:materialization initial))
+        buffers (:program-buffers available)
+        parameters (:parameters invocation-plan)
+        parameter-order (zipmap (map :id parameters) (range))
+        by-id (into {} (map (juxt :id identity)) parameters)
+        public-symbols (into {} (map (fn [[id buffer]] [id (:symbol (get by-id (:id buffer)))])) buffers)
+        _ (when-not (and (every? symbol? (vals public-symbols))
+                         (= (count public-symbols) (count (distinct (vals public-symbols)))))
+            (throw (ex-info "ordered public entries require unambiguous flat parameter ports"
+                            {:reason :compiled-ordered-parameter-boundary})))
+        defaults (invocation-link/ordered-entry-roles initial nil)
+        intent (equation-first-port-intent invocation-plan (set (vals public-symbols))
+                                           (into {} (map (fn [[id role]] [(get public-symbols id) role])) defaults)
+                                           opts)
+        roles (invocation-link/ordered-entry-roles
+               initial (into {} (map (fn [[id symbol]] [id (get-in intent [:effective-roles symbol])]))
+                             public-symbols))
+        _ (invocation-link/ordered-entry-layout initial roles)
+        in-tree (mapv (fn [[id buffer]]
+                        {:key (keyword (name (get public-symbols id)))
+                         :sym (get public-symbols id) :value id :role (get roles id)
+                         :shape (:shape buffer) :dtype (get-in buffer [:value :dtype])
+                         :default (:source buffer) :donate? false})
+                      (sort-by #(get parameter-order (:id (val %))) buffers))
+        outputs (get-in initial [:program :outputs])
+        _ (when-not (every? #(seq (get-in initial [:program :values % :shape])) outputs)
+            (throw (ex-info "ordered public outputs currently require resident array values"
+                            {:reason :compiled-ordered-output-kind})))
+        out-tree (mapv (fn [index id]
+                         {:key (equation-first-output-key id index (count outputs))
+                          :value id :abstract (get-in initial [:program :values id]) :from :result})
+                       (range) outputs)
+        _ (require-unique-output-keys! out-tree)
+        descriptor {:all-params (mapv :symbol parameters)
+                    :array-params (mapv :sym in-tree) :equation-first? true
+                    :steps (equation-first-kernel-steps compilation)
+                    :execution-phase :ordered-source}
+        report {:kind :ordered-equation-first :phase :semantic-preparation
+                :timing-source :host-monotonic :total-ns (- (System/nanoTime) started)
+                :template template-report :concrete-plan-available? false}]
+    (seal-artifact
+     (cond-> (assoc (->Prepared nil in-tree out-tree {}
+                               (assoc (get-in compilation [:options :schedule])
+                                      :compiler :equation-first :stats (:stats compilation))
+                               (:target compilation)
+                               descriptor (vec args) report nil)
+                    :ordered-invocation {:compilation compilation :entry-roles roles})
+       caller-options (assoc :math-request caller-options)))))
 
 (defn- lower-equation-first
   [fn-var args {:keys [target dtype donate constants outputs taps roles]
@@ -1101,11 +1177,7 @@
                    (invocation-link/certify-final-projection result))
         invocation-certification-ns (- (System/nanoTime) certification-started)
         lowering-ns (- (System/nanoTime) lowering-started)
-        steps (mapv (fn [index kernel]
-                      {:convention :kernel-body
-                       :phase (keyword (str "kernel-" index))
-                       :kernel-name (:kernel-name kernel)})
-                    (range) (:kernels compilation))
+        steps (equation-first-kernel-steps compilation)
         descriptor {:all-params public-parameters
                     :array-params public-arrays
                     :scalar-params (filterv #(not (contains? public-array-set %)) public-parameters)
@@ -1195,8 +1267,9 @@
       (derive-invocation-layout (:in-tree artifact) (:donated artifact))))
 
 (defn instantiate!
-  "Instantiate one pure Prepared artifact as a callable Compiled value. All component plans have
-   already been composed, so this performs one allocation/binding/graph-recording operation."
+  "Instantiate one Prepared as a callable Compiled. Concrete plans bind their composed storage
+   and programs now. Ordered semantic preparations capture entry state now and acquire source
+   stages only when invoked; they do not pretend to contain a completed static LinkPlan."
   ([prepared] (instantiate! prepared {}))
   ([prepared opts]
    (when-not (prepared? prepared)
@@ -1211,12 +1284,22 @@
          ;; exact Compiled seal cannot turn those containers into immutable compiler values.
          invocation-layout (when (sealed-artifact? prepared)
                              (derive-invocation-layout in-tree donated))
-         executable (if (and (sealed-artifact? prepared)
+         executable (if-let [ordered (:ordered-invocation prepared)]
+                      (do
+                        (when-not (sealed-artifact? prepared)
+                          (throw (ex-info "ordered instantiation requires the original prepared semantic boundary"
+                                          {:reason :compiled-ordered-owner})))
+                        (when (contains? opts :entry-roles)
+                          (throw (ex-info "runtime options cannot replace prepared entry intent"
+                                          {:reason :compiled-ordered-entry-intent})))
+                        (gpu-link/instantiate-ordered-invocation!
+                         (:compilation ordered) args (assoc opts :entry-roles (:entry-roles ordered))))
+                      (if (and (sealed-artifact? prepared)
                              (if caller-math-options
                                (link-plan/retained-effect-evidence? (:plan lowering) evidence caller-math-options)
                                (link-plan/retained-effect-evidence? (:plan lowering) evidence)))
                       (gpu-link/instantiate-certified! lowering opts)
-                      (gpu-link/instantiate! (:plan lowering) opts))]
+                      (gpu-link/instantiate! (:plan lowering) opts)))]
      (seal-artifact
       (assoc (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
                          preparation-report
@@ -1284,6 +1367,7 @@
    alpha-equivalence or target-neutral mathematical identity. Caller defaults can be replaced at
    invocation, so the returned identity deliberately does not attest the bytes used in execution."
   [artifact]
+  (require-concrete-preparation! artifact :execution-identity)
   (when-not (and (or (prepared? artifact) (compiled? artifact)) (sealed-artifact? artifact))
     (throw (ex-info "execution-identity requires an original compiler-owned artifact"
                     {:reason :compiled-execution-identity-owner})))
@@ -1362,6 +1446,7 @@
                                      "each compiled component requires :id and a Prepared :program"
                                      {:reason :compiled-composition-component
                                       :component component})))
+                           (require-concrete-preparation! (:program component) :compose)
                            (when (and (some? (:math-request (:program component))) (nil? caller-options))
                              (throw (ex-info "contextual composition requires independent caller math intent"
                                              {:reason :compiled-composition-math-request
@@ -1658,6 +1743,38 @@
           (gpu-link/write! (:executable c) node source)))
       (finally (doseq [read @borrowed] (v/free! read))))))
 
+(defn- invoke-ordered-compiled-unleased
+  [c inputs before-mutation! before-replay!]
+  (when-not (and (sealed-artifact? c) (sealed-artifact? (:prepared c)))
+    (throw (ex-info "ordered invocation requires its original compiled semantic boundary"
+                    {:reason :compiled-ordered-owner})))
+  (when (or before-mutation! before-replay!)
+    (throw (ex-info "ordered invocation does not yet support byte-evidence callbacks"
+                    {:reason :compiled-deferred-evidence})))
+  (when-not (map? inputs)
+    (throw (ex-info "compiled inputs must be a map" {:reason :compiled-input-map})))
+  (let [{:keys [executable target out-tree]} c
+        {:keys [input-nodes input-keys]} (invocation-layout-for c)]
+    (when-not (set/subset? (set (keys inputs)) input-keys)
+      (throw (ex-info "only dynamic input keys may be replaced; constants and state are captured"
+                      {:reason :compiled-ordered-input-role :inputs input-keys :supplied (set (keys inputs))})))
+    ;; Resolve EVERY omitted input from Prepared's original default, not the last replacement.
+    (let [replacements (into {} (map (fn [{:keys [key value default]}]
+                                       [value (get inputs key default)])) input-nodes)]
+      (observation/phase :replay-host
+        (gpu-link/run-ordered-with-inputs! executable replacements #(invalidate-live-outputs! c)))
+      (observation/phase :output-projection
+        (let [views (gpu-link/invocation-output-views executable)]
+          (when-not (= (set (map :value out-tree)) (set (keys views)))
+            (throw (ex-info "completed semantic outputs differ from prepared output intent"
+                            {:reason :compiled-ordered-output-boundary})))
+          (let [outputs (into {} (map (fn [{:keys [key value]}]
+                                        (let [resident (get views value)
+                                              buffer (gpu/buffer (:session executable) (:key resident))]
+                                          [key (v/wrap-external-view buffer target (:view resident))]))) out-tree)]
+            (reset! (:live-outputs c) (vec (vals outputs)))
+            outputs))))))
+
 (defn- invoke-compiled-unleased*
   "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.
      1. preflight all donations before any mutation;
@@ -1669,7 +1786,9 @@
    donated inputs invalidated — never a mutation. Backend failures after preflight consume
    donations too: partially completed device writes cannot be rolled back."
   [^Compiled c inputs before-mutation! before-replay!]
-  (let [{:keys [executable out-tree donated target]} c
+  (if (get-in c [:prepared :ordered-invocation])
+    (invoke-ordered-compiled-unleased c inputs before-mutation! before-replay!)
+    (let [{:keys [executable out-tree donated target]} c
         {:keys [in-nodes input-nodes input-keys donated-keys aggregate-groups]}
         (observation/phase :invocation-layout (invocation-layout-for c))
         inputs (observation/phase :aggregate-input-projection
@@ -1707,7 +1826,7 @@
                       out-tree)]
         (when-let [live-outputs (:live-outputs c)]
           (reset! live-outputs (vec (vals out))))
-        out))))
+        out)))))
 
 (defn- invoke-compiled-unleased [c inputs]
   (invoke-compiled-unleased* c inputs nil nil))
@@ -1746,6 +1865,7 @@
    operation. This is a synchronous output-lifetime contract, not a value-version snapshot or
    authorization for private temporary reuse."
   [^Compiled c inputs]
+  (require-concrete-preparation! c :invoke-leased)
   (let [output-nodes (set (get-in c [:executable :plan :outputs]))
         projected-nodes (mapv :node (:out-tree c))
         _ (when-not (and (seq projected-nodes)
@@ -2082,18 +2202,20 @@
   (gpu-link/execution-info (:executable c)))
 
 (defn ir
-  "Return the descriptor's resident steps (the artifact's lowered IR) for inspection."
+  "Return compiled kernel/descriptor steps for inspection, not a concrete execution receipt."
   [c]
   (mapv #(select-keys % [:convention :phase :variant :kernel-name]) (:steps (:descriptor c))))
 
 (defn plan
   "Return the validated LinkPlan that is the artifact's public executable representation."
   [c]
+  (require-concrete-preparation! c :plan)
   (:plan (:lowering c)))
 
 (defn certificate
   "Return the checkable resident or composition lowering certificate."
   [c]
+  (require-concrete-preparation! c :certificate)
   (:certificate (:lowering c)))
 
 (defn- refresh-captured-inputs!
@@ -2138,6 +2260,7 @@
    schedule, target, and the descriptor's step kinds + concrete shapes. Excludes the non-
    serializable closures (:n-fn/:m-fn/…) and SPIR-V modules."
   [c]
+  (require-concrete-preparation! c :cache-key)
   {:in-tree  (mapv #(select-keys % [:key :role :donate? :shape :dtype]) (:in-tree c))
    :out-tree (mapv #(select-keys % [:key :from :shape :dtype]) (:out-tree c))
    :donated  (:donated c)

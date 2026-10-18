@@ -72,6 +72,23 @@
   (when (primitive-array-dtype value)
     (long (java.lang.reflect.Array/getLength value))))
 
+(defn ^:no-doc conflicting-source-alias
+  "Return the first pair sharing a borrowed host source across different storage identities
+   when either entry is mutable. Entries carry :source, :storage and :mutable? plus caller data.
+   Read-only sharing and already-represented same-storage aliases are not conflicts. This is
+   host object identity only, not an overlap/lifetime proof for resident views or native ranges."
+  [entries]
+  (let [seen (java.util.IdentityHashMap.)]
+    (some (fn [{:keys [source storage mutable?] :as entry}]
+            (when (some? source)
+              (let [previous (or (.get seen source) [])
+                    conflict (some #(when (and (not= storage (:storage %))
+                                                (or mutable? (:mutable? %))) %)
+                                   previous)]
+                (if conflict
+                  [conflict entry]
+                  (do (.put seen source (conj previous entry)) nil))))) entries)))
+
 (defn- checked-scalar [id abstract value]
   (let [expected (dtype/canon (:dtype abstract))
         value (if (typed-scalar? value) value {:type expected :value value})]
