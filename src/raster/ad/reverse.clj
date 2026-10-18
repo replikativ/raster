@@ -3508,15 +3508,20 @@
         ;; par/reduce evaluates (int bound) exactly once before its loop. A
         ;; negative bound runs zero steps, so the tape length clamps at zero.
         count-sym (ad-gensym "red_count")
+        ;; The step's replay proof says nothing about its initializer. Save
+        ;; that value once, after count conversion, including on zero trips;
+        ;; iteration zero's backward replay must not repeat its effects/checks.
+        initial-carry-sym (ad-gensym "red_init" (:raster.type/tag (meta acc-sym)))
         reduce-result-sym (ad-gensym "red_val")
 
         forward-bindings
         (when fwd-loop-body
           [count-sym (list 'clojure.core/int bound-expr)
+           initial-carry-sym init-expr
            tape-sym (list (if typed-double? 'double-array 'object-array)
                           (list 'clojure.core/max 0 count-sym))
            reduce-result-sym
-           (list 'loop* [fwd-idx-sym 0 acc-sym init-expr]
+           (list 'loop* [fwd-idx-sym 0 acc-sym initial-carry-sym]
                  (list 'if (list 'clojure.core/< fwd-idx-sym count-sym)
                        (list 'recur (list 'clojure.core/+ fwd-idx-sym 1) fwd-loop-body)
                        acc-sym))])
@@ -3569,7 +3574,7 @@
               (if typed-double?
                 (concat
                  [acc-sym (list 'if (list 'clojure.core/zero? j-sym)
-                                init-expr
+                                initial-carry-sym
                                 (list 'aget tape-sym (list 'clojure.core/dec j-sym)))]
                  (mapcat (fn [{:keys [sym arr idx]}]
                            [sym (util/subst-syms
