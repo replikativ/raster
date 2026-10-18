@@ -143,6 +143,15 @@
         (let [tag (get descriptor/alloc-sym->array-tag operation)]
           (cond-> {:presence :present}
             (contains? types/primitive-array-info tag) (assoc :array-tag tag)))
+        ;; An explicit closed-core scalar conversion produces a primitive on
+        ;; normal return. Its operand can still throw (including nil unboxing).
+        ;; This is producer evidence, never presence inferred from a result tag.
+        (and (= operation (first expression))
+             (qualified-symbol? operation) (= "clojure.core" (namespace operation))
+             (not (contains? env operation))
+             (= 1 (count (descriptor/call-args expression)))
+             (contains? types/primitive-info (descriptor/cast-result-tag operation)))
+        {:presence :present}
         ;; Use the existing pure-map materializer to expose its actual
         ;; constructor and returned local; do not duplicate SOAC lowering.
         (and (= 'raster.par/pmap operation) (par/par-map-pure-form? expression))

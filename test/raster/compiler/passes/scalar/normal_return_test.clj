@@ -13,6 +13,17 @@
     (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
       (test!))))
 
+(deftest explicit-core-conversion-presence-is-not-a-logical-dtype-claim
+  (doseq [operator '[clojure.core/double clojure.core/float clojure.core/long
+                    clojure.core/int]]
+    (is (= {:presence :present} (normal/result-fact (list operator 'input))))
+    (is (= {:presence :unknown}
+           (normal/result-fact (list operator 'input) {operator {:presence :present}}))))
+  (is (= {:presence :unknown}
+         (normal/result-fact (with-meta 'input {:raster.type/tag 'double}))))
+  (is (= {:presence :unknown}
+         (normal/result-fact '(if (clojure.core/nil? input) nil (clojure.core/double input))))))
+
 (deftest definition-dependent-analysis-needs-an-owning-collector
   (binding [method-entry/*emission-inputs* nil]
     (is (= {:presence :present :array-tag 'floats}

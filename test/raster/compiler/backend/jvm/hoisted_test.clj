@@ -2,10 +2,83 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.hoisted :as hoisted]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.closure :as closure]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]])
   (:import [java.lang.reflect Modifier]
            [java.util.concurrent CountDownLatch TimeUnit]))
+
+(deftest nullable-logical-scalars-keep-reference-capable-helper-boundaries
+  (let [projected (with-meta 'projected {:raster.type/tag 'double})
+        alias (with-meta 'alias {:raster.type/tag 'double})
+        answer (with-meta 'answer {:raster.type/tag 'boolean})
+        projection (with-meta '(if (clojure.core/nil? input) nil
+                                 (clojure.core/double input))
+                     {:raster.type/tag 'double})
+        consumer (list 'if (list 'clojure.core/nil? alias) true
+                       (list 'if (list 'clojure.core/identical? alias alias) false false))
+        compile! (fn [bindings body result-tag]
+                   (closure/hoist-and-compile
+                    (list 'let* bindings body) '[input] '[input]
+                    {:param-env {'input 'Object} :return-tag result-tag :dtype :double}))
+        consumed (compile! [projected projection alias projected answer consumer] answer 'boolean)
+        returned (compile! [projected projection alias projected] alias 'Object)
+        unused (compile! [projected projection] 7.0 'double)]
+    (doseq [input [nil 2.0 -3.0 -0.0]]
+      (is (= (nil? input) ((:fn consumed) input)))
+      (is (= 7.0 ((:fn unused) input)))
+      (let [actual ((:fn returned) input)]
+        (if (nil? input)
+          (is (nil? actual))
+          (is (= (Double/doubleToRawLongBits (double input))
+                 (Double/doubleToRawLongBits (double actual)))))))
+    (let [helpers (vals (:helper-map consumed))
+          producer (first (filter #(= projected (:binding %)) helpers))
+          consumer (first (filter #(= answer (:binding %)) helpers))]
+      (is (= 'Object (:return-tag producer)))
+      (is (= 'Object (:tag (meta (first (:params consumer)))))))
+    (let [bindings (second (:compute-form consumed))
+          id (first (filter #(= alias %) (take-nth 2 bindings)))]
+      (is (= 'double (:raster.type/tag (meta id))))
+      (is (= 'Object (:tag (meta id)))))))
+
+(deftest actual-primitive-conversions-retain-primitive-helper-returns-and-traps
+  (let [id (with-meta 'converted {:raster.type/tag 'double})
+        expression '(if flag (clojure.core/double input) (clojure.core/double input))
+        compiled (closure/hoist-and-compile
+                  (list 'let* [id expression] id) '[input flag] '[input flag]
+                  {:param-env {'input 'Object 'flag 'boolean}
+                   :return-tag 'double :dtype :double})]
+    (is (= 'double (:return-tag (first (vals (:helper-map compiled))))))
+    (doseq [flag [true false]]
+      (is (= 2.0 ((:fn compiled) 2.0 flag)))
+      (is (thrown? NullPointerException ((:fn compiled) nil flag))))))
+
+(deftest helper-carriers-belong-to-lexical-binding-occurrences
+  (let [x (with-meta 'x {:raster.type/tag 'double})
+        saved (with-meta 'saved {:raster.type/tag 'boolean})
+        projection '(if (clojure.core/nil? input) nil (clojure.core/double input))
+        test-x (list 'if (list 'clojure.core/nil? x) true
+                     (list 'if (list 'clojure.core/identical? x x) false false))
+        rebound (list 'let* [x projection saved test-x x '(clojure.core/double 3.0)] saved)
+        nested (list 'let* [x 3.0 saved (list 'let* [x projection] test-x)] saved)]
+    (doseq [source [rebound nested]]
+      (let [compiled (closure/hoist-and-compile
+                      source '[input] '[input]
+                      {:param-env {'input 'Object} :return-tag 'boolean :dtype :double})]
+        (is (true? ((:fn compiled) nil)))
+        (is (false? ((:fn compiled) 2.0)))))))
+
+(deftest nullable-integer-helper-inputs-keep-exact-arithmetic
+  (let [x (with-meta 'x {:raster.type/tag 'long})
+        answer (with-meta 'answer {:raster.type/tag 'long})
+        expression (list 'if (list 'clojure.core/nil? x) -1 (list 'clojure.core/- x 1))
+        compiled (closure/hoist-and-compile
+                  (list 'let* [x '(if (clojure.core/nil? input) nil input) answer expression] answer)
+                  '[input] '[input]
+                  {:param-env {'input 'Object} :return-tag 'long :dtype :double})]
+    (is (= 9007199254740994 ((:fn compiled) 9007199254740995)))
+    (is (= -1 ((:fn compiled) nil)))))
 
 (defn- wrapper [initialize]
   (let [result (hoisted/compile-hoisted-class!

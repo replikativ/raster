@@ -8,7 +8,8 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.hoisted :as hoisted]
-            [raster.compiler.core.inference :as inf])
+            [raster.compiler.core.inference :as inf]
+            [raster.compiler.passes.scalar.normal-return :as normal-return])
   (:import [java.lang.reflect Method]))
 
 ;; ================================================================
@@ -292,6 +293,22 @@
          all-compute-params (vec (concat fn-params safe-buf-syms))
          bc-params (mapv (fn [p] (with-meta p {:tag (tag-for-param p)}))
                          all-compute-params)
+         ;; Logical scalar dtype is not a presence/primitive-carrier proof:
+         ;; generated cotangents can be nil even when their present dtype is
+         ;; Double. Keep producer facts separate through extraction and aliases.
+         primitive-tags (set (keys types/primitive-info))
+         result-facts (atom (into {}
+                                 (map (fn [parameter]
+                                        [parameter {:presence
+                                                    (if (or (contains? safe-syms-set parameter)
+                                                            (contains? primitive-tags
+                                                                       (tag-for-param parameter)))
+                                                      :present :unknown)}]))
+                                 all-compute-params))
+         physical-tag (fn [parameter logical-tag]
+                        (if (and (contains? primitive-tags logical-tag)
+                                 (not= :present (:presence (get @result-facts parameter))))
+                          'Object logical-tag))
          element-type (case dtype :float :float :double)
          desugar-invk bytecode/desugar-invk
          ;; Extract method-worthy bindings into separate fn-specs
@@ -299,16 +316,18 @@
          helper-counter (atom 0)
          rewritten-pairs
          (vec (map (fn [[sym expr]]
+                    (let [result-fact (normal-return/result-fact expr @result-facts)]
                      (if (extractable-binding? expr)
                        ;; Extract to a separate method
                        (let [method-name (symbol (str "helper_" (swap! helper-counter inc)))
-                             ;; Declare the compute params as shadowing-locals so a
-                             ;; param whose name collides with a clojure.core fn (e.g.
+                             ;; Declare all in-scope locals, including earlier bindings,
+                             ;; so a name colliding with a clojure.core fn (e.g.
                              ;; `seq`, `first`, `count`) is still captured into the
                              ;; helper — otherwise free-syms drops it as a core var and
                              ;; the helper body resolves it to the global fn (→ CCE).
                              free (disj (binding [util/*shadowing-locals*
-                                                  (set all-compute-params)]
+                                                  (into util/*shadowing-locals*
+                                                        (keys @result-facts))]
                                           (free-syms expr))
                                         '.invk)
                              ;; Order free vars deterministically, params first
@@ -324,13 +343,15 @@
                                                 (:raster.type/tag (meta sym))
                                                 (inf/infer-arg-tag expr @type-env)
                                                 'Object)
-                             return-tag (if (contains? #{'double 'float 'long 'int 'boolean} raw-return-tag)
+                             return-tag (if (and (contains? primitive-tags raw-return-tag)
+                                                 (= :present (:presence result-fact)))
                                           raw-return-tag
                                           'Object)
                              ;; Build typed params for the helper
                              helper-params (mapv (fn [p]
-                                                   (with-meta p {:tag (or (get @type-env p)
-                                                                          (tag-for-param p))}))
+                                                   (with-meta p {:tag (physical-tag
+                                                                      p (or (get @type-env p)
+                                                                            (tag-for-param p)))}))
                                                  ordered-free)
                              ;; The helper body is the extracted expression
                              helper-body (desugar-invk expr)]
@@ -345,10 +366,13 @@
                          ;; Update type env with the ACTUAL type (not the method
                          ;; return type which is Object for arrays).  Downstream
                          ;; helpers need the real type for their param annotations.
+                         (swap! result-facts assoc sym result-fact)
                          (swap! type-env assoc sym raw-return-tag)
                          ;; Replace the binding with a call to the helper
-                         [sym (apply list method-name ordered-free)])
+                         [(vary-meta sym assoc :tag (physical-tag sym raw-return-tag))
+                          (apply list method-name ordered-free)])
                        (do
+                         (swap! result-facts assoc sym result-fact)
                          ;; Track object-array element types for aget inference
                          (when (and (seq? expr)
                                     (= 'clojure.core/object-array (first expr))
@@ -358,7 +382,7 @@
                              (swap! objarray-eltypes assoc sym elt-types)))
                          ;; Update type env for non-extracted bindings.
                          ;; Check symbol aliases, aget on object-arrays, then inference.
-                         (when-let [tag (or (:tag (meta sym))
+                         (let [tag (or (:tag (meta sym))
                                             (:raster.type/tag (meta sym))
                                             (when (symbol? expr) (get @type-env expr))
                                             ;; aget on object-array: resolve element type
@@ -373,8 +397,9 @@
                                                   (nth elt-types idx))))
                                             (let [infer inf/infer-arg-tag]
                                               (infer expr @type-env)))]
-                           (swap! type-env assoc sym tag))
-                         [sym expr])))
+                           (swap! type-env assoc sym tag)
+                           [(if tag (vary-meta sym assoc :tag (physical-tag sym tag)) sym)
+                            expr])))))
                    inner-pairs))
          inner-bindings (vec (mapcat identity rewritten-pairs))
          ;; Compute form: zero-fills + rewritten inner bindings

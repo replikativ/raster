@@ -696,7 +696,7 @@
   (:form (materialize/materialize-pass form nil)))
 
 ;; Forward declarations for mutual recursion
-(declare emit-form emit-object-value)
+(declare emit-form emit-object-value emit-boxed-ifn-call)
 
 (defn- emit-result-form [code expression locals ctx]
   (if (:object-result? ctx)
@@ -1763,6 +1763,24 @@
    Division (/) always uses float or double (integer division is quot)."
   [code op args locals ctx]
   (cond
+    ;; Only literal/actual local stack carriers justify this primitive leaf.
+    ;; Compound result stamps describe logical dtype, not physical presence:
+    ;; even a Long-tagged conditional can return a reference or nil. Preserve
+    ;; its source Number operation and eager argument order through the existing
+    ;; boxed call boundary. Closed numerical-region lowering may remove it.
+    (or (empty? args)
+        (not (every? (fn [argument]
+                       (contains? #{:double :float :long :int}
+                                  (cond
+                                    (symbol? argument) (:type (get locals argument))
+                                    (types/literal-tag argument) (numeric-literal-stack-type argument))))
+                     args)))
+    (do
+      (emit-var-constant! code "clojure.core" op)
+      (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
+      (.checkcast code ifn-cd)
+      (emit-boxed-ifn-call code args locals ctx))
+
     ;; Unary negation: (- x) → negate, preserving type
     (and (= op "-") (= 1 (count args)))
     (let [t (emit-form code (first args) locals ctx)]
