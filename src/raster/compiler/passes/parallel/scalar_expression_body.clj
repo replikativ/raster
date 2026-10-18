@@ -1355,7 +1355,9 @@
    this same strict source-lowering authority. `present-types` contains ONLY
    independently proved-present lexical scalar values. No source code executes;
    this is neither purity nor nonthrowing evidence. The caller must retain the
-   original initializer, its position, and its conversions/traps."
+   original initializer, its position, and its conversions/traps. Selected
+   invk calls use checked-selected-primitive-result instead: known operands do
+   not establish the selected implementation's result or definition freshness."
   [expression present-types]
   (let [operation (descriptor/semantic-op expression)
         intrinsic (some-> operation intrinsics/canonical intrinsics/descriptor)
@@ -1363,7 +1365,8 @@
         known? (fn [argument]
                  (or (and (symbol? argument) (contains? present-types argument))
                      (and (number? argument) (inference/infer-arg-tag argument {}))))]
-    (when (and (symbol? operation) (namespace operation) (descriptor/scalar-op? operation)
+    (when (and (not (:dispatch? (descriptor/call-description expression)))
+               (symbol? operation) (namespace operation) (descriptor/scalar-op? operation)
                intrinsic
                (every? known? arguments))
       (checked-scalar-result expression present-types))))
@@ -1392,7 +1395,8 @@
    strict scalar body. Inputs remain unknown/nullable. The exact receiver must
    match a live registered method, including its scalar signature and source.
    This never invokes a method, invents a registry, or authorizes moving/removing
-   the original call. Generic calls and opaque/user helper bodies stay unknown."
+   the original call. Requires an owning definition collector and its final
+   guard. Generic calls and opaque/user helper bodies stay unknown."
   [expression]
   (let [{:keys [dispatch? semantic-op implementation-op arguments]}
         (descriptor/call-description expression)]
@@ -1400,7 +1404,7 @@
                (descriptor/scalar-op? semantic-op)
                (some-> semantic-op intrinsics/canonical intrinsics/descriptor))
       (when-let [{:keys [tags parameters source-body return-tag]}
-                 (method-entry/selected-definition semantic-op implementation-op (count arguments))]
+                 (method-entry/observed-selected-definition :typed semantic-op implementation-op (count arguments))]
         (let [body (when (= 1 (count source-body)) (first source-body))
               scalar-types (mapv dtype/dtype-for-scalar-tag tags)
               result-type (dtype/dtype-for-scalar-tag return-tag)]

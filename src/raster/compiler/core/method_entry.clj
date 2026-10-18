@@ -278,6 +278,33 @@
                 :walked-body (:raster.core/deftm-walked-body source-meta)}))))
        (get @table argument-count)))))
 
+(declare direct-selected-definition)
+
+(defn observed-selected-definition
+  "Optional owner-local definition projection, observed BEFORE deriving facts.
+   The first lookup discovers Vars only; never analyze its captured source.
+   Reselect after historical snapshots, validate them, and return only the
+   reselected definition. Consumers retain the enclosing owner's final guard
+   after their analysis. This is a sequential staleness fence, not an ABA proof.
+   Selection is :typed for an invk receiver or :direct for a mangled call."
+  [selection operation implementation-op argument-count]
+  (let [select! (case selection :typed selected-definition :direct direct-selected-definition)]
+    (when *emission-inputs*
+      (when-let [initial (select! operation implementation-op argument-count)]
+        (doseq [[v lookup] [[(:generic-var initial) operation]
+                            [(:receiver-var initial) implementation-op]
+                            [(:source-var initial)
+                             (symbol (str (:ns (meta (:source-var initial))))
+                                     (str (:name (meta (:source-var initial)))))]]
+                :when v]
+          (observe-definition-input! v (:ns (meta v)) lookup))
+        (let [definition (select! operation implementation-op argument-count)]
+          (assert-definition-inputs-current! @*emission-inputs*)
+          (when (and definition
+                     (every? #(identical? (get initial %) (get definition %))
+                             [:generic-var :receiver-var :source-var]))
+            definition))))))
+
 (defn selected-parameter-carriers
   "Observe the actual JVM interface of an already selected, registered invk.
 
@@ -290,44 +317,32 @@
    No interface is generated, method invoked or registry added."
   [operation implementation-op argument-count]
   (when *emission-inputs*
-    (when-let [initial (selected-definition operation implementation-op argument-count)]
-      ;; The first lookup discovers the dependency Vars only. Derive the actual
-      ;; correspondence AFTER their historical observations, never certify an old
-      ;; interface with snapshots taken after analysis/redefinition.
-      (doseq [[v lookup] [[(:generic-var initial) operation]
-                          [(:receiver-var initial) implementation-op]
-                          [(:source-var initial)
-                           (symbol (str (:ns (meta (:source-var initial))))
-                                   (str (:name (meta (:source-var initial)))))]]]
-        (observe-definition-input! v (:ns (meta v)) lookup))
-      (when-let [{:keys [entry tags parameters] :as definition}
-                 (selected-definition operation implementation-op argument-count)]
-        (when (every? #(identical? (get initial %) (get definition %))
-                      [:generic-var :receiver-var :source-var])
-          (let [{:keys [iface-name iface-class param-tags]}
-                (get @types/fn-interface-by-name (:typed-iface entry))
-                expected-tags (mapv types/tag->iface-type tags)
-                expected-carriers (mapv types/tag->java-class expected-tags)]
-            (when (and (= iface-name (:typed-iface entry))
-                       (= expected-tags param-tags)
-                       (class? iface-class) (.isInterface ^Class iface-class)
-                       (.isInstance ^Class iface-class (:typed-impl entry))
-                       (every? class? expected-carriers))
-              (let [methods (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
-                                    (.getDeclaredMethods ^Class iface-class))]
-                (when (= 1 (count methods))
-                  (let [^java.lang.reflect.Method method (first methods)
-                        carriers (vec (.getParameterTypes method))]
-                    (when (and (= expected-carriers carriers)
-                               (= argument-count (count parameters) (count carriers))
-                               (not (.isVarArgs method))
-                               (not (java.lang.reflect.Modifier/isStatic (.getModifiers method))))
-                      (assert-definition-inputs-current! @*emission-inputs*)
-                      (when (identical? entry
-                                        (:entry (selected-definition operation implementation-op argument-count)))
-                        {:definition definition :invocation-method method
-                         :parameters parameters :parameter-carriers carriers
-                         :result-carrier (.getReturnType method)}))))))))))))
+    (when-let [{:keys [entry tags parameters] :as definition}
+               (observed-selected-definition :typed operation implementation-op argument-count)]
+      (let [{:keys [iface-name iface-class param-tags]}
+            (get @types/fn-interface-by-name (:typed-iface entry))
+            expected-tags (mapv types/tag->iface-type tags)
+            expected-carriers (mapv types/tag->java-class expected-tags)]
+        (when (and (= iface-name (:typed-iface entry))
+                   (= expected-tags param-tags)
+                   (class? iface-class) (.isInterface ^Class iface-class)
+                   (.isInstance ^Class iface-class (:typed-impl entry))
+                   (every? class? expected-carriers))
+          (let [methods (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                                (.getDeclaredMethods ^Class iface-class))]
+            (when (= 1 (count methods))
+              (let [^java.lang.reflect.Method method (first methods)
+                    carriers (vec (.getParameterTypes method))]
+                (when (and (= expected-carriers carriers)
+                           (= argument-count (count parameters) (count carriers))
+                           (not (.isVarArgs method))
+                           (not (java.lang.reflect.Modifier/isStatic (.getModifiers method))))
+                  (assert-definition-inputs-current! @*emission-inputs*)
+                  (when (identical? entry
+                                    (:entry (selected-definition operation implementation-op argument-count)))
+                    {:definition definition :invocation-method method
+                     :parameters parameters :parameter-carriers carriers
+                     :result-carrier (.getReturnType method)}))))))))))
 
 (defn direct-selected-definition
   "Correspondence for an already selected plain mangled function call.

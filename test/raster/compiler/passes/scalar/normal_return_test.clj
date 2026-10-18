@@ -3,6 +3,8 @@
             [raster.core :as core :refer [deftm]]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.inference :as inference]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.scalar.local-products :as products]
             [raster.compiler.passes.scalar.dce :as dce]
@@ -66,6 +68,9 @@
 (deftm allocated [n :- Long] :- (Array double)
   (let [out (clojure.core/double-array n)] out))
 
+(deftm direct-allocated [ignored :- Object] :- Object
+  (clojure.core/double-array 0))
+
 (deftm effectful-allocation [counter :- (Array long) n :- Long] :- (Array double)
   (let [out (clojure.core/double-array n)]
     (aset counter 0 (inc (aget counter 0)))
@@ -86,6 +91,65 @@
         name (types/mangle (:name m) (:tags entry))]
     (with-meta (list* '.invk (symbol (str (:mangled-ns entry)) (str name "-impl")) args)
       {:raster.op/original operation})))
+
+(deftest presence-never-uses-source-captured-before-its-observation
+  (doseq [selection [:typed :direct] mutate-on [1 2]]
+    (let [v (if (= selection :typed) #'allocated #'direct-allocated)
+          operation (symbol (str (:ns (meta v))) (str (:name (meta v))))
+          entry (first (get (core/methods-of v) 1))
+          source-name (symbol (str (:mangled-ns entry))
+                              (str (types/mangle (:name (meta v)) (:tags entry))))
+          source (find-var source-name)
+          saved @source
+          implementation (if (= selection :typed) (symbol (str source-name "-impl")) source-name)
+          call (if (= selection :typed) (selected-call v [0]) (list implementation 0))
+          selector-var (if (= selection :typed) #'method-entry/selected-definition
+                           #'method-entry/direct-selected-definition)
+          original @selector-var calls (atom 0)
+          inputs (atom {:static [] :values []})]
+      (is (some? (original operation implementation 1))
+          "both fixtures must reach a real admitted definition")
+      (try
+        (binding [method-entry/*emission-inputs* inputs]
+          (with-redefs-fn
+            {selector-var (fn [& arguments]
+                            (let [selected (apply original arguments)]
+                              (when (and selected (= mutate-on (swap! calls inc)))
+                                (alter-var-root source (constantly (fn [_] nil))))
+                              selected))}
+            #(if (= mutate-on 1)
+               (do (is (= {:presence :unknown} (normal/result-fact call)))
+                   (is (true? (method-entry/assert-definition-inputs-current! @inputs))))
+               (is (= :stale-definition-proof-input
+                      (try (normal/result-fact call) nil
+                           (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+                   (pr-str [selection mutate-on @calls])))))
+        (finally (alter-var-root source (constantly saved)))))))
+
+(deftest selected-scalar-presence-is-owned-and-does-not-bypass-definition-checks
+  (let [operation 'raster.numeric/sqrt
+        signature (inference/registered-call-signature operation '[double])
+        implementation (symbol (str (:mangled-sym signature) "-impl"))
+        call (with-meta (list '.invk implementation 'x) {:raster.op/original operation})
+        definition (method-entry/selected-definition operation implementation 1)
+        source (:source-var definition) saved @source
+        inputs (atom {:static [] :values []})]
+    (is (some? definition))
+    (is (nil? (scalar-body/checked-primitive-result call {'x :double}))
+        "known operands must not bypass the selected producer's definition")
+    (binding [method-entry/*emission-inputs* nil]
+      (is (nil? (scalar-body/checked-selected-primitive-result call))))
+    (binding [method-entry/*emission-inputs* inputs]
+      (is (= {:type :double} (scalar-body/checked-selected-primitive-result call))))
+    (is (contains? (:definition-proofs @inputs) source))
+    (try
+      (alter-var-root source (constantly (fn [_] nil)))
+      (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
+        (is (nil? (scalar-body/checked-selected-primitive-result call))))
+      (is (= :stale-definition-proof-input
+             (try (method-entry/assert-definition-inputs-current! @inputs) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (finally (alter-var-root source (constantly saved))))))
 
 (deftest lexical-producer-facts-cross-selected-formals-without-type-assumptions
   (let [call (selected-call #'borrowed-array-with-count '[0 input])

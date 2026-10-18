@@ -50,11 +50,11 @@
         definition (when (and method-entry/*emission-inputs*
                               (not (or lexical-callee (contains? env implementation-op))))
                      (if dispatch?
-                       (method-entry/selected-definition semantic-op implementation-op (count arguments))
+                       (method-entry/observed-selected-definition :typed semantic-op implementation-op (count arguments))
                        (or
                         (when-let [operation (mangled/impl->op implementation-op)]
-                          (method-entry/direct-selected-definition operation implementation-op
-                                                                   (count arguments)))
+                          (method-entry/observed-selected-definition :direct operation implementation-op
+                                                                    (count arguments)))
                         ;; Generic array selection uses actual producer carriers,
                         ;; never desired result/formal annotations or fake values.
                         (when (and (qualified-symbol? implementation-op)
@@ -64,21 +64,14 @@
                                             (inference/registered-call-signature implementation-op tags))]
                             (when (and signature (= tags (:tags signature))
                                        (not (seq (:promotion-casts signature))))
-                              (method-entry/direct-selected-definition
-                               implementation-op (:mangled-sym signature) (count arguments))))))))]
+                              (method-entry/observed-selected-definition
+                               :direct implementation-op (:mangled-sym signature) (count arguments))))))))]
     (if definition
-      (if-let [{:keys [source-var generic-var receiver-var operation
-                      parameters source-body walked-body tags]}
+      (if-let [{:keys [source-var parameters source-body walked-body tags]}
                definition]
         (if (contains? visited source-var)
           unknown
-          (let [_ (doseq [[v lookup] [[generic-var operation]
-                                      [receiver-var implementation-op]
-                                      [source-var (symbol (str (:ns (meta source-var)))
-                                                          (str (:name (meta source-var))))]]
-                          :when v]
-                    (method-entry/observe-definition-input! v (:ns (meta v)) lookup))
-                ;; Raw source can prove closed constructors/aliases too, but
+          (let [;; Raw source can prove closed constructors/aliases too, but
                 ;; never resolve its operation aliases in the caller's namespace.
                 body (or (seq walked-body) (seq source-body))]
             ;; Transport actual producer facts, never presence from formal tags.
