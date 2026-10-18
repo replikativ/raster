@@ -1372,6 +1372,15 @@
 ;; emit-core-intrinsic — clojure.core function bytecode
 ;; ================================================================
 
+(defn- emit-floating-order
+  "Compare completed floating operands. Choose the unordered result for the
+   ORIGINAL predicate, including when its branch is subsequently inverted."
+  [code type operator]
+  (let [unordered-low? (contains? #{">" ">="} operator)]
+    (case type
+      :float (if unordered-low? (.fcmpl code) (.fcmpg code))
+      :double (if unordered-low? (.dcmpl code) (.dcmpg code)))))
+
 (defn- emit-predicate-intrinsic
   "Emit bytecode for type predicates, boolean logic, coercions, and
    sign/parity predicates."
@@ -1650,15 +1659,15 @@
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
                     (.labelBinding code end-label) :bool)
-        :float  (do (.ldc code (float 0.0)) (.fcmpg code) (.ifgt code true-label)
+        :float  (do (.ldc code (float 0.0)) (emit-floating-order code :float ">") (.ifgt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
                     (.labelBinding code end-label) :bool)
-        :double (do (.ldc code 0.0) (.dcmpg code) (.ifgt code true-label)
+        :double (do (.ldc code 0.0) (emit-floating-order code :double ">") (.ifgt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
                     (.labelBinding code end-label) :bool)
-        (do (emit-unbox-double code) (.ldc code 0.0) (.dcmpg code) (.ifgt code true-label)
+        (do (emit-unbox-double code) (.ldc code 0.0) (emit-floating-order code :double ">") (.ifgt code true-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code true-label) (.ldc code (int 1))
             (.labelBinding code end-label) :bool)))
@@ -1676,15 +1685,15 @@
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
                     (.labelBinding code end-label) :bool)
-        :float  (do (.ldc code (float 0.0)) (.fcmpg code) (.iflt code true-label)
+        :float  (do (.ldc code (float 0.0)) (emit-floating-order code :float "<") (.iflt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
                     (.labelBinding code end-label) :bool)
-        :double (do (.ldc code 0.0) (.dcmpg code) (.iflt code true-label)
+        :double (do (.ldc code 0.0) (emit-floating-order code :double "<") (.iflt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
                     (.labelBinding code end-label) :bool)
-        (do (emit-unbox-double code) (.ldc code 0.0) (.dcmpg code) (.iflt code true-label)
+        (do (emit-unbox-double code) (.ldc code 0.0) (emit-floating-order code :double "<") (.iflt code true-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code true-label) (.ldc code (int 1))
             (.labelBinding code end-label) :bool)))
@@ -1832,7 +1841,7 @@
 (defn- emit-comparison
   "Emit comparison bytecode. Uses int/long comparison when both operands are
    integer types (enables C2 loop optimizations: unrolling, auto-vectorization).
-   Falls back to dcmpg for float/double operands.
+   Floating comparisons choose the NaN direction so ordered predicates are false.
    Only binary comparisons supported; chained comparisons like (< a b c)
    must be desugared to (and (< a b) (< b c)) before reaching bytecode."
   [code op args locals ctx]
@@ -1886,22 +1895,22 @@
             ">"  (.ifgt code true-label) ">=" (.ifge code true-label)
             "==" (.ifeq code true-label) "not=" (.ifne code true-label)))
         (if use-float?
-          ;; Both float: use fcmpg + ifXX (avoids f2d widening)
+          ;; Both float: compare without f2d widening.
           (let [t1 (emit-form code a1 locals ctx)
                 _ (when (not= t1 :float) (emit-coerce code t1 :float))
                 t2 (emit-form code a2 locals ctx)
                 _ (when (not= t2 :float) (emit-coerce code t2 :float))]
-            (.fcmpg code)
+            (emit-floating-order code :float op)
             (case op
               "<"  (.iflt code true-label) "<=" (.ifle code true-label)
               ">"  (.ifgt code true-label) ">=" (.ifge code true-label)
               "==" (.ifeq code true-label) "not=" (.ifne code true-label)))
-          ;; Default: promote both to double, use dcmpg
+          ;; Default: promote both to double, retaining ordered NaN behavior.
           (let [t1 (emit-form code a1 locals ctx)
                 _ (when (not= t1 :double) (emit-coerce code t1 :double))
                 t2 (emit-form code a2 locals ctx)
                 _ (when (not= t2 :double) (emit-coerce code t2 :double))]
-            (.dcmpg code)
+            (emit-floating-order code :double op)
             (case op
               "<"  (.iflt code true-label) "<=" (.ifle code true-label)
               ">"  (.ifgt code true-label) ">=" (.ifge code true-label)
@@ -3286,9 +3295,9 @@
                         ">" (.ifle code else-label) ">=" (.iflt code else-label)
                         "==" (.ifne code else-label) "not=" (.ifeq code else-label))
                   true)
-                  ;; Both double → DCMPG + IFxx
+                  ;; Both double: preserve the original predicate's NaN direction.
               (and (= t1 :double) (= t2 :double))
-              (do (.dcmpg code)
+              (do (emit-floating-order code :double pn)
                   (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
                         ">" (.ifle code else-label) ">=" (.iflt code else-label)
                         "==" (.ifne code else-label) "not=" (.ifeq code else-label))
@@ -3311,7 +3320,7 @@
                       :double (.dload code tmp)
                              ;; :ref — reload Object, unbox to double
                       (do (.aload code tmp) (emit-coerce code :ref :double)))
-                (.dcmpg code)
+                (emit-floating-order code :double pn)
                 (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
                       ">" (.ifle code else-label) ">=" (.iflt code else-label)
                       "==" (.ifne code else-label) "not=" (.ifeq code else-label))
