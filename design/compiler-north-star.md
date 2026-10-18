@@ -1331,6 +1331,19 @@ nor an output lease. Eager static programs remain on their existing path. The ac
 is an early visible write, a late checked scalar, a deferred allocation and a suffix graph, tested
 for success, failure, changed-input replay and cleanup on both local GPU runtimes.
 
+The held implementation now prepares individual numerical graph fragments and host definitions
+from that exact source order. Shared invocation/equation host producers evaluate once through
+the existing typed interpreter and retain the same checked result. Available public buffer
+shapes do not require native acquisition. Source allocation counts retain constructor conversion
+and negative-size failure; native acquisition and synchronous zeroing are separate obligations.
+Storage-only acquisition reuses LinkPlan's node/device, root-contract, alias and initializer
+validation, plus the existing owner-local acquisition ledger. Reused roots are not reuploaded,
+and neither acquisition nor a logical storage description proves initialized contents.
+Local OpenCL and Level Zero tests compose these boundaries through a test harness, including an
+early write followed by a failed count, an empty allocation, completed zeroing and a suffix graph.
+These tests do not yet establish automatic linked-root execution, changed-input replay, final
+output publication or a performance improvement. Those remain the activation gate above.
+
 JAX pytrees are the model for separating user structure from flat leaves, but
 Raster trees should retain stable keyed paths and type/shape information. JAX
 donation and sharding contracts are also useful references; Raster's existing

@@ -492,6 +492,118 @@
           (is (= [(key :owned) (key :external-a) (key :external-b)]
                  @allocation-keys)))))))
 
+(deftest later-storage-stages-reuse-ledgered-roots-without-reinitializing-them
+  (let [node (fn [id source]
+               {:view (bview/view (bview/allocation {:id id :byte-size 4 :memory-space :device
+                                                    :device :ze:0 :ownership :owned})
+                                  {:id id :dtype :float :shape [1]})
+                :source source})
+        first-plan {:nodes {:a (node :a (float-array [1.0]))}}
+        later-plan {:nodes (array-map :a (node :a (float-array [999.0]))
+                                      :b (node :b (float-array [2.0])))}
+        ledger (volatile! [])
+        events (atom [])
+        realize (fn [plan roots]
+                  (gpu-link/realize-plan-storage!
+                   plan ::session :same-owner (gpu-link/allocation-groups plan) {}
+                   ledger (volatile! {}) roots))]
+    (with-redefs [gpu/alloc! (fn [_ specs] (swap! events conj [:allocate (set (keys specs))]))
+                  gpu/buffer-view (fn [_ key {:keys [id]}]
+                                    (swap! events conj [:view id key]) {:id id :key key})
+                  gpu/upload-range! (fn [_ view source _]
+                                      (swap! events conj [:upload (:id view) (vec source)]))]
+      (let [first-result (realize first-plan {})
+            a-key (get-in first-result [:roots :a :key])]
+        (is (= [a-key] @ledger))
+        (is (= [:upload :a [1.0]] (last @events)))
+        (reset! events [])
+        (let [later (realize later-plan (:roots first-result))
+              b-key (get-in later [:roots :b :key])]
+          (is (= [[:allocate #{b-key}]
+                  [:view :a a-key] [:view :b b-key] [:upload :b [2.0]]]
+                 @events))
+          (is (= [a-key b-key] @ledger))
+          (is (= #{:a :b} (set (keys (:roots later)))))
+          (is (= a-key (get-in later [:node-views :a :key]))))
+        (doseq [roots [(assoc-in (:roots first-result) [:a :key] :foreign-owner)
+                       (assoc-in (:roots first-result) [:a :allocation :byte-size] 8)
+                       (assoc-in (:roots first-result) [:a :allocation :ownership] :borrowed)]]
+          (reset! events [])
+          (is (= :link-existing-root-contract
+                 (try (realize later-plan roots) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+          (is (empty? @events) "reject changed root contracts before acquiring any later root"))
+        (vreset! ledger [a-key])
+        (reset! events [])
+        (with-redefs [gpu/buffer-view
+                      (fn [_ _ {:keys [id]}]
+                        (swap! events conj [:view id])
+                        (throw (ex-info "root is no longer live" {:reason :dead-root})))]
+          (is (= :dead-root
+                 (try (realize later-plan (:roots first-result)) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+          (is (= 2 (count @ledger)) "the newly acquired suffix root remains cleanup-owned")
+          (is (= a-key (first @ledger)))
+          (is (= [[:allocate #{(second @ledger)}] [:view :a]] @events)))
+        (vreset! ledger [])
+        (reset! events [])
+        (is (= :link-existing-root-contract
+               (try (realize later-plan (:roots first-result)) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+        (is (empty? @events) "a description without the acquisition ledger is insufficient")))))
+
+(deftest source-storage-validates-shared-contracts-before-native-acquisition
+  (let [allocation (bview/allocation {:id :shared :byte-size 8 :memory-space :device
+                                      :device :ze:0 :ownership :owned})
+        make-node (fn [id root dtype shape offset source]
+                    (link-plan/node
+                     {:id id :view (bview/view root {:id id :dtype dtype :shape shape
+                                                     :byte-offset offset})
+                      :source source}))
+        a (make-node :a allocation :float [1] 0 nil)
+        b (make-node :b allocation :float [1] 4 nil)
+        overlapping (make-node :b allocation :float [1] 0 nil)
+        acquired (atom [])
+        ledger (volatile! [])
+        realize (fn [nodes aliases]
+                  (gpu-link/realize-storage-nodes!
+                   nodes aliases (atom {:device-id :ze:0}) :source-owner {} ledger (volatile! {}) {}))
+        reason (fn [nodes aliases]
+                 (try (realize nodes aliases) nil
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (with-redefs [gpu/alloc! (fn [_ specs] (swap! acquired conj specs))
+                  gpu/buffer-view (fn [_ key view] {:key key :view view})
+                  gpu/upload-range! (fn [& _] (swap! acquired conj :upload))]
+      (doseq [[nodes aliases expected]
+              [[[a (make-node :b (assoc allocation :byte-size 12) :float [1] 4 nil)]
+                #{} :link-allocation-contract]
+               [[a (make-node :b (assoc allocation :ownership :borrowed) :float [1] 4 nil)]
+                #{} :link-allocation-contract]
+               [[a (make-node :b allocation :int [1] 4 nil)]
+                #{} :link-allocation-reinterpret]
+               [[(make-node :a (assoc allocation :device :ocl:0) :float [1] 0 nil)]
+                #{} :link-node-device]
+               [[(make-node :a (assoc allocation :device nil) :float [1] 0 nil)]
+                #{} :link-node-device]
+               [[a overlapping] #{} :link-undeclared-alias]
+               [[(assoc a :source (float-array [1]))
+                 (assoc overlapping :source (float-array [2]))]
+                #{#{:a :b}} :link-alias-initializers]
+               [[a b] #{#{:a :b}} :link-spurious-alias]
+               [[a] #{#{:a :absent}} :link-alias-node]
+               [[a a] #{} :link-storage-node-identities]
+               [{:other a} #{} :link-storage-node-identities]
+               [[(into {} a)] #{} :link-node-type]]]
+        (is (= expected (reason nodes aliases)))
+        (is (empty? @acquired) "all structural obligations precede native effects")
+        (is (empty? @ledger)))
+      (is (= #{:a :b} (set (keys (:node-views (realize [a b] #{}))))))
+      (is (= 1 (count @acquired)) "disjoint views acquire a single root")
+      (reset! acquired [])
+      (is (= #{:a :b}
+             (set (keys (:node-views (realize [a overlapping] #{#{:a :b}}))))))
+      (is (= 1 (count @acquired)) "declared aliases still share the same physical root"))))
+
 (deftest resident-program-executor-preserves-binding-and-callback-contracts
   (let [allocation (bview/allocation {:id :resident :byte-size 16 :memory-space :device
                                       :device :ze:0 :ownership :owned})

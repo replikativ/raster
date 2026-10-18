@@ -153,6 +153,21 @@
       (fail! :typed-scalar-expression "JVM scalar backend cannot execute this typed scalar value"
              {:expression expression :type (type expression)}))))
 
+(defn evaluate-array-size
+  "Evaluate one admitted size-only primitive-array constructor operand exactly once.
+   Core constructors use Number.intValue, not checked `int` or long launch-extent arithmetic.
+   This performs neither allocation nor initialization and grants no native capacity proof."
+  [source-ns environment expression]
+  (let [source-value (evaluate-expression source-ns environment expression)]
+    (when-not (instance? Number source-value)
+      (fail! :typed-scalar-array-size
+             "size-only array realization requires a numeric constructor operand"
+             {:expression expression :type (type source-value)}))
+    (let [elements (.intValue ^Number source-value)]
+      (when (neg? elements)
+        (throw (NegativeArraySizeException. (str elements))))
+      {:source-value source-value :elements elements})))
+
 (defn evaluate-region
   "Execute a canonical TypedSOAC lambda for ordered typed scalar operands.
 

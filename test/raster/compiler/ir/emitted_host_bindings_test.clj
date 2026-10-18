@@ -41,6 +41,27 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(deftest selected-host-step-uses-the-same-scalar-and-conflict-contracts
+  (let [p (scalar-program :long)
+        calls (atom [])
+        evaluator (fn [equation bindings]
+                    (swap! calls conj (:id equation))
+                    (scalar/evaluate-host-equation *ns* equation bindings))
+        inputs {'x {:type :long :value 7} 'y {:type :long :value 10}}
+        first-step (call/make-host-equation-step p :first {} inputs evaluator nil)
+        second-step (call/make-host-equation-step
+                     p :second {} (merge inputs (:results first-step)) evaluator nil)]
+    (is (= [:first :second] @calls))
+    (is (= {'a {:type :long :value 8}} (:results first-step)))
+    (is (= {'b {:type :long :value 18}} (:results second-step)))
+    (is (= :emitted-program-host-result-conflict
+           (reason #(call/make-host-equation-step
+                     p :first {} (assoc inputs 'a {:type :long :value 99}) evaluator nil))))
+    (reset! calls [])
+    (is (= :emitted-program-host-operand
+           (reason #(call/make-host-equation-step p :second {} inputs evaluator nil))))
+    (is (empty? @calls) "missing dependencies decline before invoking a host evaluator")))
+
 (deftest host-steps-retain-source-ordered-input-and-result-bindings
   (let [original (make-call :long 7 10)
         proof (emitted/validate-with-physical-results! (:program original))]
@@ -99,6 +120,10 @@
                             #(scalar/evaluate-host-equation *ns* %1
                                                            (assoc %2 :buffer-shapes {'xs [3]})))]
     (is (= {'n {:type :long :value 3}} (:outputs original)))
+    (is (= (first (:steps original))
+           (call/make-host-equation-step
+            p :shape {'xs :original-storage} {}
+            #(scalar/evaluate-host-equation *ns* %1 (assoc %2 :buffer-shapes {'xs [3]})) nil)))
     (doseq [path [[:steps 0 :operands 'xs] [:entry-buffers 'xs]]]
       (is (= :emitted-program-host-operand-bindings
              (reason #(call/validate! (assoc-in original path :different-storage))))))))
@@ -139,6 +164,12 @@
                                          equation {result (get (:buffers original) result)}
                                          {n output})))
           extended-proof (emitted/validate-with-physical-results! extended)]
+      (let [calls (atom 0)]
+        (is (= :emitted-program-host-device-dependency
+               (reason #(call/make-host-equation-step
+                         extended (:id equation) (:buffers original) (:scalar-values original)
+                         (fn [& _] (swap! calls inc) {n output}) nil))))
+        (is (zero? @calls) "selected construction retains the no-host-read-of-device-result boundary"))
       (doseq [validate [call/validate!
                         #(call/validate-with-retained-program! % extended-proof)]]
         (is (= :emitted-program-host-device-dependency

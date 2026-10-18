@@ -7,6 +7,7 @@
    owned nodes, and the emitted call enters LinkPlan as a ProgramLinkInstance. No driver object,
    kernel name, or legacy resident descriptor participates."
   (:require [clojure.set :as set]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
@@ -15,11 +16,14 @@
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.write-coverage :as coverage]
@@ -483,6 +487,224 @@
              (link/value {:id token :abstract (assoc abstract :shape
                                                     (concrete-shape token abstract scalars buffers storage))
                           :leaves [{:name :value :node token}]}))) tokens)})
+
+(defn ^:no-doc begin-ordered-realization
+  "Begin owner-local realization without evaluating invocation steps or acquiring resources.
+   The returned map is runtime construction state, not a portable completion certificate."
+  [compilation arguments caller-options]
+  (let [semantic-program (:semantic compilation)
+        invocation (get-in semantic-program [:attributes :invocation-plan])
+        invocation (invocation/validate-against! invocation semantic-program)
+        order (invocation/source-order invocation semantic-program)
+        checked (if (nil? caller-options)
+                  (emitted-program/validate-with-physical-results! (:emitted compilation))
+                  (emitted-program/validate-with-physical-results! (:emitted compilation) caller-options))
+        program (:program checked)
+        boundary #(mapv (fn [equation]
+                          (select-keys equation [:id :operands :results :algorithm]))
+                        (:equations %))]
+    (when-not (and (semantic/equivalent? (boundary semantic-program) (boundary program))
+                   (semantic/equivalent? (:values semantic-program)
+                                         (select-keys (:values program)
+                                                      (keys (:values semantic-program)))))
+      (fail! :invocation-ordered-program
+             "ordered realization requires the exact retained semantic and emitted boundary" {}))
+    {:program program :source-order order :source-cursor 0
+     :materialization (materialization/begin-materialization invocation arguments)
+     :realized {:buffers {} :storage {} :loop-scratch {}}
+     :acquired-storage #{}
+     :source-allocations (into {} (map (juxt :destination :source-expression))
+                              (get-in semantic-program [:attributes :allocations]))
+     :projections (:projections checked) :target (:target compilation)
+     :caller-options caller-options}))
+
+(defn ^:no-doc advance-host-source
+  "Evaluate the next host source definition once, including shared invocation/equation producers.
+   This owner-local transition never acquires storage or acknowledges numerical completion."
+  [state evaluate-step evaluate-host caller-options]
+  (when-not (= caller-options (:caller-options state))
+    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
+  (when (:pending state)
+    (fail! :invocation-ordered-pending "the preceding source action has not completed" {}))
+  (let [entry (nth (:source-order state) (:source-cursor state) nil)
+        materialized (materialization/validate-state! (:materialization state))
+        step (when (:invocation-step entry)
+               (nth (get-in materialized [:plan :steps]) (:next-step materialized) nil))
+        equation (when (:equation entry)
+                   (some #(when (= (:equation entry) (:id %)) %) (get-in state [:program :equations])))]
+    (when-not (and entry (not (:storage entry)) (not (:realization entry))
+                   (or (not (:invocation-step entry))
+                       (and (= (:invocation-step entry) (:id step))
+                            (or (invocation/scalar-compute? step)
+                                (invocation/shape-projection? step))))
+                   (or (not (:equation entry))
+                       (and equation (true? (get-in equation [:attributes :host-only]))))
+                   (or step equation))
+      (fail! :invocation-ordered-next-host
+             "the next source entry is not an available scalar host definition" {:entry entry}))
+    (let [advanced (volatile! materialized)
+          run-step! (fn []
+                      (vreset! advanced
+                               (link/without-validation-context
+                                #(materialization/materialize-next materialized evaluate-step))))
+          available (materialization/prefix-bindings materialized)
+          scalars (merge (invocation-shape-scalars materialized) (:program-scalars available)
+                         (:host-scalars state))
+          buffers (reduce-kv
+                   (fn [bindings id buffer]
+                     (let [token (:id buffer)]
+                       (when (and (contains? bindings id) (not= token (get bindings id)))
+                         (fail! :invocation-ordered-host-buffer
+                                "available invocation buffer differs from its realized binding"
+                                {:value id :available token :realized (get bindings id)}))
+                       (assoc bindings id token)))
+                   (get-in state [:realized :buffers]) (:program-buffers available))
+          buffer-shapes (into {} (map (fn [[id buffer]] [id (:shape buffer)]))
+                              (:program-buffers available))
+          ;; A shared producer is evaluated by the invocation interpreter inside the checked
+          ;; host callback. The host constructor validates that same result, not a second eval.
+          host-step (when equation
+                      (program-call/make-host-equation-step
+                       (:program state) (:id equation) buffers scalars
+                       (if step
+                         (fn [_ _] {(first (:results equation))
+                                    (get-in (run-step!) [:values (:id step)])})
+                         (when evaluate-host
+                           (fn [equation context]
+                             (evaluate-host equation (assoc context :buffer-shapes buffer-shapes)))))
+                       caller-options))
+          _ (when (and step (not equation)) (run-step!))]
+      (cond-> (-> state
+                  (assoc :materialization @advanced)
+                  (update :source-cursor inc))
+        host-step (update :host-scalars merge (:results host-step))
+        host-step (assoc-in [:host-steps (:id equation)] host-step)))))
+
+(defn ^:no-doc prepare-source-allocation
+  "Prepare the exact next source allocation, not an unspecified numerical result buffer.
+   evaluate-size is the trusted typed host evaluator returning the source value and its actual
+   constructor count. Acquisition and zero initialization must complete before cursor advance."
+  [state evaluate-size caller-options]
+  (when-not (= caller-options (:caller-options state))
+    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
+  (when (:pending state)
+    (fail! :invocation-ordered-pending "the preceding source action has not completed" {}))
+  (let [entry (nth (:source-order state) (:source-cursor state) nil)
+        destination (:storage entry)
+        expression (get (:source-allocations state) destination)
+        abstract (get-in state [:program :values destination])
+        initialization (descriptor/allocation-initialization (descriptor/semantic-op expression))]
+    (when-not (and destination (= :zero initialization)
+                   (invocation-source/allocation-corresponds? expression abstract initialization))
+      (fail! :invocation-ordered-next-allocation
+             "the next source entry is not an admitted size-only zero allocation" {:entry entry}))
+    (when-not (ifn? evaluate-size)
+      (fail! :invocation-ordered-size-evaluator
+             "source allocation requires the typed source-size evaluator" {:entry entry}))
+    (let [materialization (materialization/validate-state! (:materialization state))
+          available (materialization/prefix-bindings materialization)
+          scalars (merge (invocation-shape-scalars materialization)
+                         (:program-scalars available) (:host-scalars state))
+          extent (descriptor/array-allocation-size expression)
+          {:keys [source-value elements]} (link/without-validation-context #(evaluate-size extent scalars))]
+      (when-not (and (integer? elements) (<= 0 elements Integer/MAX_VALUE))
+        (fail! :invocation-ordered-allocation-count
+               "source allocation evaluator must return a nonnegative constructor count" {}))
+      ;; Retained dimensions currently describe integral mathematical extents. A wrapping
+      ;; Number.intValue conversion cannot silently become that many native elements.
+      (when-not (and (integer? source-value) (= source-value elements))
+        (fail! :invocation-ordered-allocation-shape
+               "source constructor count cannot be reconciled with the retained extent"
+               {:source-value source-value :constructor-count elements :destination destination}))
+      (let [shape (concrete-shape destination abstract scalars
+                                  (get-in state [:realized :buffers]) (get-in state [:realized :storage]))]
+        (when-not (= [elements] shape)
+          (fail! :invocation-ordered-allocation-shape
+                 "retained storage differs from the evaluated source constructor count"
+                 {:shape shape :constructor-count elements :destination destination}))
+        (let [[realized token] (allocate-result (:realized state) (get-in materialization [:plan :id])
+                                                destination abstract scalars :result)
+              _ (when (contains? (:acquired-storage state) token)
+                  (fail! :invocation-ordered-allocation-acquired
+                         "source allocation is already acquired in this invocation" {:storage token}))
+              realized (assoc-in realized [:storage token :initialization] :zero)
+              layout (storage-link-layout realized scalars (:target state) #{token} [token])]
+          {:state (assoc state :realized realized
+                               :pending {:kind :source-allocation :storage token
+                                         :source-cursor (:source-cursor state)})
+           :nodes (:nodes layout) :values (:values layout)
+           :storage token :initialization :zero :elements elements})))))
+
+(defn ^:no-doc realize-ready-equation
+  "Realize only the next numerical source entry into an ordinary concrete graph LinkPlan.
+   This neither executes nor advances the cursor. Its conditional entry contract must be
+   satisfied by the enclosing owner, and produced views become ready only after completion."
+  [state equation-id caller-options]
+  (when-not (= caller-options (:caller-options state))
+    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
+  (when (:pending state)
+    (fail! :invocation-ordered-pending "the preceding numerical stage has not completed" {}))
+  (let [entry (nth (:source-order state) (:source-cursor state) nil)
+        program (:program state)
+        equation (some #(when (= equation-id (:id %)) %) (:equations program))]
+    (when-not (and equation (= equation-id (:equation entry))
+                   (not (true? (get-in equation [:attributes :host-only])))
+                   (not (emitted-loop/emitted-loop? (first (:operations equation)))))
+      (fail! :invocation-ordered-next-equation
+             "only the next numerical source entry may acquire ready storage"
+             {:entry entry :equation equation-id}))
+    (let [materialization (materialization/validate-state! (:materialization state))
+          available (materialization/prefix-bindings materialization)
+          scalars (merge (invocation-shape-scalars materialization)
+                         (:program-scalars available) (:host-scalars state))
+          boundaries (equation-boundaries {:equations [equation]} (:projections state))
+          required (required-materialized-buffers
+                    {:values (:values program) :equations [equation] :outputs (:results equation)}
+                    boundaries)
+          overwrite (write-before-read-inputs boundaries available scalars)
+          acquired (:acquired-storage state)
+          realized (add-materialized-inputs (:realized state) available (:values program)
+                                            overwrite required)
+          realized (lower-equation-storage realized (get-in materialization [:plan :id]) equation
+                                            (:values program) scalars (:projections state))
+          result-views (into {} (keep :result-view) (vals (:storage realized)))
+          {:keys [call buffers]} (program-call/make-equation-call
+                                 program equation-id (:buffers realized) scalars result-views caller-options)
+          _ (when (seq (:result-views call))
+              (fail! :invocation-ordered-result-views
+                     "ready graph stages must retain logical prefix-result contracts before admission"
+                     {:equation equation-id :result-views (:result-views call)}))
+          realized (assoc realized :buffers buffers)
+          outputs (vec (distinct (vals (:outputs call))))
+          tokens (vec (distinct (concat (vals (:buffers call)) outputs)))
+          layout (storage-link-layout realized scalars (:target state) (set outputs) tokens)
+          nodes (mapv (fn [node]
+                        (if (contains? acquired (get-in node [:view :allocation :id]))
+                          ;; Existing roots are conditional inputs to this stage. Retaining
+                          ;; their old host initializer would silently overwrite earlier work.
+                          (assoc node :source nil :role (if (some #{(:id node)} outputs) :state :input))
+                          node))
+                      (:nodes layout))
+          instance-id [:ordered-equation equation-id]
+          instance (link/graph-instance
+                    {:id instance-id :graph (:graph call) :bindings (:buffers call)
+                     :scalar-values (:scalar-values call)})
+          request {:id [(get-in materialization [:plan :id]) :stage equation-id]
+                   :target (:target state) :nodes nodes :values (:values layout)
+                   :instances [instance] :outputs outputs
+                   :aliases (into #{} (map set)
+                                  (bview/overlapping-id-pairs (map (juxt :id :view) nodes)))}
+          {:keys [plan effect-evidence]}
+          (if (nil? caller-options)
+            (link/make-with-effect-evidence request)
+            (link/make-with-effect-evidence request caller-options))
+          contract (first (link/relative-entry-contracts! plan effect-evidence
+                                                         [[instance-id]] caller-options))]
+      {:state (assoc state :realized realized
+                           :pending {:equation equation-id :source-cursor (:source-cursor state)})
+       :call call :stage-plan plan :effect-evidence effect-evidence :entry-contract contract
+       :new-storage (select-keys (:storage realized)
+                                 (remove #(contains? acquired %) tokens))})))
 
 (defn- lower-in-context
   "Lower one specialized invocation and matching emitted program into a validated LinkPlan.

@@ -526,18 +526,31 @@
       (fail! :invocation-materialization-complete "materialization has no remaining step" {}))
     (advance-materialization state evaluate-scalar)))
 
-(defn- complete-materialization
-  [{:keys [plan values next-step]}]
-    (when-not (= next-step (count (:steps plan)))
-      (fail! :invocation-materialization-incomplete "cannot publish an unevaluated invocation suffix"
-             {:next-step next-step :steps (count (:steps plan))}))
-    (let [input-values
+(defn- available-program-bindings
+  [{:keys [plan values]}]
+  (let [input-values
           (into {}
-                (map (fn [{:keys [program-value invocation-value]}]
-                       [program-value (get values invocation-value)]))
+                (keep (fn [{:keys [program-value invocation-value]}]
+                        (when (contains? values invocation-value)
+                          [program-value (get values invocation-value)])))
                 (concat (:bindings plan) (:storage-bindings plan)))
           program-buffers (into {} (filter (comp materialized-buffer? val)) input-values)
           program-scalars (into {} (filter (comp typed-scalar? val)) input-values)]
+    {:program-buffers program-buffers :program-scalars program-scalars}))
+
+(defn prefix-bindings
+  "Project only available values from a checked materialization prefix, without completing it.
+   Missing suffix bindings are absent, never nil placeholders or permission to bind a graph.
+   Concrete storage/call validation must still discharge each ready equation's requirements."
+  [state]
+  (available-program-bindings (validate-state! state)))
+
+(defn- complete-materialization
+  [{:keys [plan values next-step] :as state}]
+    (when-not (= next-step (count (:steps plan)))
+      (fail! :invocation-materialization-incomplete "cannot publish an unevaluated invocation suffix"
+             {:next-step next-step :steps (count (:steps plan))}))
+    (let [{:keys [program-buffers program-scalars]} (available-program-bindings state)]
       (validate!
        (->MaterializedInvocation
         plan values program-buffers program-scalars

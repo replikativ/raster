@@ -931,14 +931,17 @@
   [^OclBuffer buf]
   (assert-buffer-live! buf)
   (ensure-init!)
-  (let [{:keys [queue arena]} @state
-        zero-pattern (.allocate ^Arena arena 4)]
-    (.set zero-pattern I32 0 (int 0))
+  (let [{:keys [queue]} @state]
     (when (pos? (:byte-size buf))
-      (cl-call! "clEnqueueFillBuffer" @h-clEnqueueFillBuffer
-                [queue (:cl-mem buf) zero-pattern (long 4) (long 0) (long (:byte-size buf))
-                 (int 0) MemorySegment/NULL MemorySegment/NULL])
-      (cl-call! "clFinish" @h-clFinish [queue]))
+      (with-open [pattern-arena (Arena/ofConfined)]
+        (let [zero-pattern (.allocate pattern-arena ValueLayout/JAVA_BYTE)]
+          (.set zero-pattern ValueLayout/JAVA_BYTE 0 (byte 0))
+          ;; A four-byte pattern is illegal for one-/two-byte buffers. A one-byte
+          ;; pattern also covers half/byte storage and arbitrary root byte lengths.
+          (cl-call! "clEnqueueFillBuffer" @h-clEnqueueFillBuffer
+                    [queue (:cl-mem buf) zero-pattern (long 1) (long 0) (long (:byte-size buf))
+                     (int 0) MemorySegment/NULL MemorySegment/NULL])
+          (cl-call! "clFinish" @h-clFinish [queue]))))
     buf))
 
 ;; ================================================================

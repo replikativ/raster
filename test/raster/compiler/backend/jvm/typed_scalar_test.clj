@@ -7,6 +7,30 @@
   (try (thunk) nil (catch clojure.lang.ExceptionInfo exception
                      (:reason (ex-data exception)))))
 
+(deftest source-array-size-uses-the-actual-constructor-count-conversion
+  (let [outcome (fn [f]
+                  (try {:elements (f)}
+                       (catch Throwable error {:error (class error)})))]
+    ;; Every nonnegative converted count is at most three: these source oracles never
+    ;; allocate a large host array, including the important 2^32 -> zero case.
+    (doseq [count [0 1 3 -1 2147483648 4294967296 -4294967296 Long/MAX_VALUE
+                  0.5 -0.5 -1.5 1/2 Double/NaN Double/NEGATIVE_INFINITY]]
+      (is (= (outcome #(alength (double-array count)))
+             (outcome #(:elements
+                        (scalar/evaluate-array-size
+                         'raster.compiler.backend.jvm.typed-scalar-test {'count count} 'count))))
+          (str count)))
+    (doseq [value [nil [1.0 2.0]]]
+      (is (= :typed-scalar-array-size
+             (reason-of #(scalar/evaluate-array-size
+                          'raster.compiler.backend.jvm.typed-scalar-test {'count value} 'count)))
+          "sequence overloads require their own retained realization contract")))
+  (let [calls (atom 0)]
+    (with-redefs [scalar/evaluate-expression (fn [& _] (swap! calls inc) 4294967296)]
+      (is (= {:source-value 4294967296 :elements 0}
+             (scalar/evaluate-array-size 'user {} 'extent)))
+      (is (= 1 @calls)))))
+
 (deftest short-circuit-calls-distinguish-falsy-values-from-exhaustion
   (doseq [expression ['(and) '(or)
                       '(and false 7) '(and nil 7)
