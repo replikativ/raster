@@ -22,6 +22,30 @@ stronger facts. A primitive-array descriptor admits null; its element read only
 establishes scalar presence *on normal completion*, without removing null/bounds
 checks. Unknown producers retain reference-capable numerical boundaries.
 
+### Selected entry carriers and primitive evaluation
+
+`method-entry/selected-parameter-carriers` projects the actual registered
+`invk` interface under the existing definition owner. Historical source and
+receiver observations precede analysis and are checked before publication.
+The projection retains real parameter Classes and the Object return; it does
+not generate an interface, infer presence from tags, or invoke user code.
+
+`intrinsics/primitive-fp-total?` queries a separate facet of the existing
+intrinsic table. Its contract covers completed primitive floating arithmetic
+and ordered comparisons, including IEEE zero/NaN/infinity behavior. It does not
+certify source operand completion, reference unboxing or a generic invocation:
+Object/Object division can throw even with boxed Double operands, while the
+primitive Double/Double overload is IEEE. Integer overflow/division and absent
+contracts conservatively abstain.
+
+These are proof inputs, not enabled source rewrites. Guarded-loop normalization
+must additionally establish exact source-entry/call correspondence, lexical
+producer facts and safe movement of the predicate, prefix and count. A reference
+array Class is not nonnull evidence; reuse of a shape evaluation requires a
+dominating successful check on the same immutable array identity. Zero-trip and
+false-guard behavior must survive optimization. No serial one-work-item wrapper
+substitutes for proving parallel ownership.
+
 Shared recovery of scalar-cast/read presence is held out until their source
 evaluation obligations survive value liveness and DCE. Being present on normal
 return does not mean that a null/bounds/conversion failure may be discarded.
