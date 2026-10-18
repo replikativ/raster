@@ -9,6 +9,7 @@
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.macroexpand :as mex]
@@ -1726,23 +1727,6 @@
     ;; Not handled here
     nil))
 
-(defn- widen-arithmetic-type
-  "Determine the widened result type for two arithmetic operands.
-   Preserves integer types: int×int→int, long×long→long, int×long→long.
-   Preserves float: float×float→float. Otherwise→double.
-   Division always uses float/double (integer division is quot, not /)."
-  [t1 t2 division?]
-  (if division?
-    ;; Division: float×float→float, everything else→double
-    (if (and (= t1 :float) (= t2 :float)) :float :double)
-    (case t1
-      (:int :bool) (case t2 (:int :bool) :int, :long :long, :float :float, :double)
-      :long   (case t2 (:int :bool :long) :long, :double)
-      :float  (case t2 :float :float, :double)
-      :double :double
-      ;; :ref — unbox, treat as double
-      :double)))
-
 (defn- emit-arith-op
   "Emit ordinary arithmetic for the given type and op string. Plain long add/subtract/multiply
    preserve Clojure's checked semantics; explicit unchecked forms have separate emitters below."
@@ -1791,8 +1775,7 @@
                  :ref)))
 
     :else
-    (let [division? (= op "/")
-          t1 (emit-form code (first args) locals ctx)]
+    (let [t1 (emit-form code (first args) locals ctx)]
       (loop [remaining (rest args) cur t1]
         (cond
           (diverge? cur) :diverge
@@ -1803,19 +1786,16 @@
 
           :else
           (let [t2 (emit-form code (first remaining) locals ctx)
-                generic? (or (contains? #{:ref :bool} cur) (contains? #{:ref :bool} t2))]
+                plan (when-not (contains? #{:diverge :void} t2)
+                       (source-arithmetic/binary-plan op cur t2))]
             (cond
               (diverge? t2) :diverge
               (= t2 :void) (throw (ex-info "Arithmetic operand has no retained value"
                                           {:reason :void-arithmetic-operand :operator op}))
-              generic?
-              (let [;; Numbers exposes long/double/Object input overloads.
-                    ;; In particular double/Object division is IEEE, whereas
-                    ;; Object/Object division checks zero. Preserve that ABI.
-                    normalize #(case % :int :long :float :double :bool :ref %)
-                    left (normalize cur) right (normalize t2)
+              (= :numbers (:kind plan))
+              (let [[left right] (:input-carriers plan)
                     descriptor #(case % :long J-cd :double D-cd :ref obj-cd)
-                    result (if (or (= left :double) (= right :double)) :double :ref)
+                    result (:result-carrier plan)
                     tmp @(:next-slot ctx)]
                 (if (= t2 :bool) (emit-box-to-ref code t2)
                     (when (not= t2 right) (emit-coerce code t2 right)))
@@ -1825,13 +1805,13 @@
                     (when (not= cur left) (emit-coerce code cur left)))
                 (case right :long (.lload code tmp) :double (.dload code tmp) :ref (.aload code tmp))
                 (.invokestatic code (ClassDesc/of "clojure.lang.Numbers")
-                               (case op "+" "add" "-" "minus" "*" "multiply" "/" "divide")
+                               (:method-name plan)
                                (MethodTypeDesc/of (if (= result :double) D-cd number-cd)
                                                   (into-array ClassDesc [(descriptor left) (descriptor right)])))
                 (recur (rest remaining) result))
 
               :else
-              (let [target (widen-arithmetic-type cur t2 division?)]
+              (let [target (:result-carrier plan)]
                 (when (not= t2 target)
                   (emit-coerce code t2 target))
                 ;; Expose the left value for widening without reevaluation.
