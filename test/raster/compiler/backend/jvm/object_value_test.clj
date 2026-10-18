@@ -21,6 +21,45 @@
              (try (.invoke ^java.lang.reflect.Method method nil (object-array arguments))
                   (catch InvocationTargetException failure (throw (.getCause failure))))))))
 
+(deftest quoted-cons-bodies-remain-owned-data-not-executable-code
+  (let [body (cons 'let* (list ['x 1.0] '(throw (Exception. "quoted only"))))
+        expression (list 'quote {:body [body]})
+        result ((:run (compile-value [] expression)))]
+    (is (= {:body [body]} result))
+    (is (identical? body (get-in result [:body 0]))))
+  (let [realizations (atom 0)
+        tail (lazy-seq (swap! realizations inc) (list :not-source-data))
+        body (cons :head tail)
+        compiled (:run (compile-value [] (list 'quote body)))]
+    (is (identical? body (compiled)))
+    (is (zero? @realizations)))
+  (let [call '(raster.compiler.backend.jvm.object-value-test/object-boundary-helper_m_double 2.0)
+        source (ns-resolve 'raster.compiler.backend.jvm.object-value-test 'object-boundary-helper_m_double)]
+    (doseq [quote-head '[quote clojure.core/quote]]
+      (is (empty? (#'bytecode/scan-deftm-refs [(list quote-head call)] *ns*))))
+    (is (contains? (#'bytecode/scan-deftm-refs [call] *ns*) source))))
+
+(deftest wide-typed-apply-uses-the-actual-emitted-owner
+  (let [tags (vec (repeat 22 'long))
+        params (mapv #(symbol (str "p" %)) (range 22))
+        {:keys [iface-name]} (types/ensure-fn-interface! tags)
+        loader (clojure.lang.DynamicClassLoader. (clojure.lang.RT/baseLoader))
+        compiled (binding [method-entry/*compilation-classloader* loader]
+                   (bytecode/compile-typed-impl!
+                    (str "raster.compiled.WideObjectOwner" (clojure.lang.RT/nextID))
+                    params tags 'long [(last params)] *ns* iface-name))]
+    (is (= 21 (apply compiled (mapv long (range 22)))))
+    (is (= 22 (apply compiled (mapv (comp long inc) (range 22)))))
+    (let [token (Double. 5.125)
+          owned (binding [method-entry/*compilation-classloader* loader]
+                  (bytecode/compile-typed-impl!
+                   (str "raster.compiled.WideCapturedOwner" (clojure.lang.RT/nextID))
+                   params tags 'Object [[token (last params)]] *ns* iface-name))]
+      (doseq [offset [0 1]]
+        (let [[captured last-value] (apply owned (mapv (comp long #(+ offset %)) (range 22)))]
+          (is (identical? token captured))
+          (is (= (+ 21 offset) last-value)))))))
+
 (deftest product-fields-and-identity-observers-share-original-literal-references
   (doseq [value [(Long/valueOf 1000) (Double/valueOf 5.125) (float 1.25) \a]]
     (let [expression (list 'let* ['pair [value '(do nil)]]

@@ -4494,9 +4494,10 @@
                  (class value))))
 
 (defn- quoted-object-literal? [value]
-  (or (object-literal? value) (symbol? value)
-      (and (or (vector? value) (list? value) (map? value) (set? value))
-           (every? quoted-object-literal? (if (map? value) (mapcat identity value) value)))))
+  ;; Quote is opaque data, not a serialization request. The owning identity
+  ;; pool retains the original collection itself; traversing its contents is
+  ;; unnecessary and could execute a lazy producer during compilation.
+  (or (object-literal? value) (symbol? value) (coll? value)))
 
 (defn- emit-literal-reference [code value ctx]
   (let [{:keys [owner indices values]} (:literal-owner ctx)]
@@ -4765,6 +4766,9 @@
   (let [refs (atom #{})]
     (letfn [(scan [form]
               (cond
+                ;; Quoted bodies are data, not additional compilation inputs.
+                ;; Traversing them can even realize a quoted lazy sequence.
+                (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) nil
                 (and (seq? form) (symbol? (first form)))
                 (let [h (first form)]
                   (if (= h '.invk)
@@ -5760,7 +5764,7 @@
                                 reflector-cd (ClassDesc/of "clojure.lang" "Reflector")
                                 obj-arr-cd (ClassDesc/ofDescriptor "[Ljava/lang/Object;")
                                 apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))
-                                reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [string-cd string-cd obj-arr-cd]))
+                                reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [(ClassDesc/of "java.lang.Class") string-cd obj-arr-cd]))
                                 small? (<= (count param-cds) 20)
                                 load-int (fn [code n]
                                            (cond (<= -128 n 127) (.bipush code (int n))
@@ -5793,7 +5797,10 @@
                                                        (.invokeinterface code iseq-cd "next"
                                                                          (MethodTypeDesc/of iseq-cd no-cd))
                                                        (.astore code 3))
-                                                     (.ldc code class-name)
+                                                     ;; Use the actual emitted owner, including its unique
+                                                     ;; literal-capture suffix, in this wrapper's loader.
+                                                     ;; The requested source name is not a loadable class.
+                                                     (.ldc code statics-cd)
                                                      (.ldc code "compute_static")
                                                      (.aload code 2)
                                                      (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
