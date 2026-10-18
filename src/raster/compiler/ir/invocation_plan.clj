@@ -15,7 +15,9 @@
             [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.scalar.effects :as effects]))
 
@@ -560,15 +562,6 @@
       (recur (first (descriptor/call-args expression)))
       expression)))
 
-(defn- shape-source
-  [expression]
-  (let [expression (unwrap-casts expression)]
-    (when (and (seq? expression)
-               (descriptor/alength-op? (descriptor/semantic-op expression))
-               (= 1 (count (descriptor/call-args expression)))
-               (symbol? (first (descriptor/call-args expression))))
-      (first (descriptor/call-args expression)))))
-
 (defn- allocation-operands
   [value environment]
   (->> (:shape value)
@@ -585,9 +578,9 @@
         operation (descriptor/semantic-op expression)
         initialization (descriptor/allocation-initialization operation)]
     (cond
-      (shape-source expression)
+      (invocation-source/shape-projection-source expression)
       (let [operands (referenced-operands expression environment)
-            source-symbol (shape-source expression)]
+            source-symbol (invocation-source/shape-projection-source expression)]
         (->ShapeProjection id symbol operands (get environment source-symbol) 0 value))
 
       (= :copy initialization)
@@ -732,6 +725,8 @@
              {:origin origin :host-control (get-in program [:attributes :host-control])}))
     source-free?))
 
+(declare derive-source-order)
+
 (defn validate-against!
   "Validate that `plan` still matches a program's explicit value/input/output boundary."
   [plan parallel-program]
@@ -793,4 +788,146 @@
               :expected-shape-projections expected-projections
               :external-dimensions declared-dimensions
               :expected-external-dimensions expected-dimensions}))
+    (when (contains? (:attributes plan) :source-order)
+      (let [actual (derive-source-order plan parallel-program)]
+        (when-not (semantic/equivalent? actual (get-in plan [:attributes :source-order]))
+          (fail! :invocation-source-order-mismatch
+                 "retained invocation order differs from its exact source and typed producers"
+                 {:expected actual :actual (get-in plan [:attributes :source-order])}))))
     plan))
+
+(defn- derive-source-order
+  [plan program]
+  (let [[head bindings & body] (:source program)]
+    (when-not (and (contains? '#{let let* clojure.core/let} head)
+                   (vector? bindings) (even? (count bindings)))
+      (fail! :invocation-source-order-boundary
+             "source-ordered invocation requires a retained flat binding boundary"
+             {:source (:source program)}))
+    (let [pairs (mapv vec (partition 2 bindings))
+          symbols (mapv first pairs)
+          _ (when-not (= (count symbols) (count (set symbols)))
+              (fail! :invocation-source-order-shadowing
+                     "source positions require distinct retained binding identities" {}))
+          steps-by-symbol (into {} (map (juxt :symbol identity)) (:steps plan))
+          public (set (map :symbol (:parameters plan)))
+          step-pairs (filterv #(contains? steps-by-symbol (first %)) pairs)
+          expected-steps
+          (:steps
+           (reduce
+            (fn [{:keys [steps environment]} [ordinal [symbol expression]]]
+              (let [canonical (invocation-source/canonicalize-shape-projection
+                               (:values plan) public symbol expression)
+                    actual (get steps-by-symbol symbol)
+                    _ (when (and (buffer-allocation? actual)
+                                 (not (invocation-source/allocation-corresponds?
+                                       canonical (:value actual) (:initialization actual))))
+                        (fail! :invocation-source-allocation
+                               "source constructor differs from the retained allocation contract"
+                               {:binding symbol :source canonical :value (:value actual)}))
+                    _ (when (and (buffer-clone? actual)
+                                 (not (invocation-source/clone-corresponds?
+                                       canonical environment (:source actual))))
+                        (fail! :invocation-source-clone
+                               "source clone differs from the retained direct lexical copy"
+                               {:binding symbol :source canonical}))
+                    _ (when (and (shape-projection? actual)
+                                 (not (invocation-source/projection-corresponds?
+                                       canonical (:value actual))))
+                        (fail! :invocation-source-projection
+                               "source length conversions are not the retained exact projection"
+                               {:binding symbol :source canonical}))
+                    step (prefix-step (:id plan) ordinal symbol canonical
+                                      (:value (get steps-by-symbol symbol)) environment)]
+                {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
+            {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
+            (map-indexed vector step-pairs)))
+          _ (when-not (semantic/equivalent? expected-steps (:steps plan))
+              (fail! :invocation-source-step-mismatch
+                     "invocation steps differ from their canonical source producers"
+                     {:expected expected-steps :actual (:steps plan)}))
+          allocation-claims (get-in program [:attributes :allocations])
+          _ (when-not (= (count allocation-claims)
+                         (count (set (map :destination allocation-claims))))
+              (fail! :invocation-source-allocation-claims
+                     "allocation destinations require unique source producers" {}))
+          allocations (into {} (map (juxt :destination :source-expression)) allocation-claims)
+          binding-order
+          (mapv
+           (fn [position [symbol expression]]
+             (let [step (get steps-by-symbol symbol)
+                   equation (parallel-program/equation-for-binding program symbol expression)
+                   realization (invocation-source/realization-equation program symbol expression)
+                   allocation? (and (contains? allocations symbol)
+                                    (semantic/equivalent? expression (get allocations symbol)))]
+               (when (and equation realization)
+                 (fail! :invocation-source-order-ambiguous
+                        "one source binding cannot be two different equation sites"
+                        {:binding symbol}))
+               (when (and allocation?
+                          (not (invocation-source/allocation-corresponds?
+                                expression (get-in program [:values symbol])
+                                (descriptor/allocation-initialization
+                                 (descriptor/semantic-op expression)))))
+                 (fail! :invocation-source-allocation
+                        "source storage allocation differs from its retained physical contract"
+                        {:binding symbol :source expression}))
+               (when (and step equation)
+                 (let [canonical (invocation-source/canonicalize-shape-projection
+                                  (:values plan) public symbol expression)]
+                   (when-not (and (true? (get-in equation [:attributes :host-only]))
+                                  (= [symbol] (:results equation))
+                                  (semantic/equivalent?
+                                   canonical (invocation-source/scalar-equation-source equation)))
+                     (fail! :invocation-source-order-shared-producer
+                            "shared invocation/equation bindings require one identical host computation"
+                            {:binding symbol :equation (:id equation)}))))
+               (when-not (or step equation realization allocation? (effects/removable-expr? expression))
+                 (fail! :invocation-source-order-uncovered
+                        "retained source binding has no ordered invocation or equation producer"
+                        {:binding symbol :position position}))
+               (cond-> {:position position :binding symbol}
+                 step (assoc :invocation-step (:id step))
+                 equation (assoc :equation (:id equation))
+                 realization (assoc :realization (:id realization))
+                 allocation? (assoc :storage symbol))))
+           (range) pairs)
+          body-order
+          (mapv
+           (fn [index expression]
+             (let [matches (filterv
+                            #(and (or (= [:body index] (:site %))
+                                      (and (= index (dec (count body))) (= [:return] (:site %))))
+                                  (semantic/equivalent? expression (:source %)))
+                            (:equations program))]
+               (when (> (count matches) 1)
+                 (fail! :invocation-source-order-ambiguous
+                        "one body position cannot execute several equations" {:body-index index}))
+               (when-not (or (seq matches) (effects/removable-expr? expression))
+                 (fail! :invocation-source-order-uncovered
+                        "retained source body has no ordered equation producer" {:body-index index}))
+               (cond-> {:position (+ (count pairs) index) :body-index index}
+                 (seq matches) (assoc :equation (:id (first matches))))))
+           (range) body)
+          order (into binding-order body-order)
+          expected (mapv :id (:equations program))
+          actual (into [] (keep :equation) order)]
+      (when-not (= expected actual)
+        (fail! :invocation-source-order-equations
+               "source order must account for every equation exactly once"
+               {:expected expected :actual actual}))
+      order)))
+
+(defn source-order
+  "Derive source positions from the exact realized program, not pruned step ordinals.
+
+   Entries reference existing invocation steps, equations and verified realization scaffolding.
+   A shared host binding carries both IDs and denotes one computation, not two evaluations.
+   This is correspondence data only: it does not authorize hoisting, binding unresolved storage,
+   skipping checked evaluation, or treating a graph submission as completion. Source-free and
+   non-flat programs require their separate explicit execution contract."
+  [plan program]
+  (let [plan (validate-against! plan program)]
+    (if (contains? (:attributes plan) :source-order)
+      (get-in plan [:attributes :source-order])
+      (derive-source-order plan program))))

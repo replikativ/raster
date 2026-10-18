@@ -8,6 +8,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
@@ -25,13 +26,6 @@
             [raster.compiler.passes.parallel.typed-soac-ownership :as ownership]
             [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.core.util :as util]))
-
-(def ^:private dtype->allocation
-  {:float ['clojure.core/float-array 'floats 'float]
-   :double ['clojure.core/double-array 'doubles 'double]
-   :int ['clojure.core/int-array 'ints 'int]
-   :long ['clojure.core/long-array 'longs 'long]
-   :byte ['clojure.core/byte-array 'bytes 'byte]})
 
 (defn- scalar-region
   [equation]
@@ -72,32 +66,6 @@
    (`short[]` carries `:half`) and a host statement stores them without a scalar cast."
   [dtype]
   (= :half (some-> dtype dtype/canon)))
-
-(defn- typed-store-value
-  [cast value]
-  (let [source-operation (when (seq? value) (descriptor/semantic-op value))
-        target (some-> cast descriptor/cast-result-tag
-                       dtype/dtype-for-scalar-tag dtype/canon)
-        source (when (seq? value)
-                 (some-> source-operation descriptor/cast-result-tag
-                         dtype/dtype-for-scalar-tag dtype/canon))]
-    ;; The scalar equation's result dtype still owns the host/JVM boundary conversion.  When its
-    ;; already-validated body ends in exactly that primitive cast, reusing it preserves the source
-    ;; check/rounding point without manufacturing a redundant `(long (long ...))` wrapper.
-    (cond
-      (nil? cast) value
-
-      (= target source)
-      ;; This cast is now a compiler-attested result conversion. Preserve its exact operand and
-      ;; metadata, but not a bare operator spelling that a public scalar named `long`/`float`
-      ;; could capture when the materialized source is compiled in its destination scope.
-      (if (and (= 2 (count value)) (descriptor/cast-op? source-operation))
-        (with-meta (list (symbol "clojure.core" (name source-operation)) (second value))
-          (meta value))
-        value)
-
-      :else
-      (list (symbol "clojure.core" (name cast)) value))))
 
 (defn- materialize-region
   [locals body]
@@ -159,28 +127,6 @@
                    (map (juxt :parameter :value) (:scalars transform))))]
         (util/subst-syms substitutions expression)))))
 
-(defn- allocation-pair
-  [values result extent]
-  (let [dtype (:dtype (get values result))
-        [allocation tag] (or (get dtype->allocation dtype)
-                             (throw (ex-info "TypedSOAC materialization has no array allocation"
-                                             {:reason :typed-soac-materialization-dtype
-                                              :result result :dtype dtype})))
-        result' (with-meta result {:tag tag :raster.type/tag tag
-                                   :raster.buffer/hoistable true})]
-    [result' (list allocation extent)]))
-
-(defn- equation-allocation-pair
-  "Exact allocation scaffolding for the equation kinds which realize fresh result storage."
-  [values equation result]
-  (let [{:keys [kind attributes]} (dialect/operation-parts equation)
-        extent (case kind
-                 map (:extent attributes)
-                 reduce 1
-                 scalar 1
-                 nil)]
-    (when extent (allocation-pair values result extent))))
-
 (defn- segmented-result-extent
   [attributes]
   (let [shape (dialect/segmented-reduce-result-shape attributes)]
@@ -216,14 +162,14 @@
             scalar-tag (dtype/scalar-tag-for-dtype result-dtype)
             source (materialize-region
                     region-locals
-                    (typed-store-value (symbol "clojure.core" (name scalar-tag)) (first bodies)))
+                    (invocation-source/typed-store-value (symbol "clojure.core" (name scalar-tag)) (first bodies)))
             resident? (resident/resident-scalar-value? (get values result))]
         (if resident?
           (let [effect (gensym (str "typed_soac_scalar_" equation-id "__"))
                 store (list 'clojure.core/aset result 0 source)]
             {:equation-id equation-id
              :placement placement
-             :pairs [(equation-allocation-pair values equation result) [effect store]]
+             :pairs [(invocation-source/equation-allocation-pair values equation result) [effect store]]
              :site [:binding effect]
              :source store})
           {:equation-id equation-id
@@ -242,7 +188,7 @@
                            :equation equation-id :results results})))
         (let [result (first results)
               result-dtypes (mapv #(:dtype (get values %)) results)
-              casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
+              casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
               projected-source-casts
               (mapv (fn [body result-dtype]
                       (when (and (seq? body) (= 2 (count body))
@@ -282,7 +228,7 @@
               secondary-stores
               (mapv (fn [secondary secondary-cast body]
                       (list 'clojure.core/aset secondary (:index attributes)
-                            (typed-store-value secondary-cast body)))
+                            (invocation-source/typed-store-value secondary-cast body)))
                     (rest physical-results) (rest casts) (rest bodies))
               body (materialize-region
                     region-locals
@@ -300,7 +246,7 @@
                                        (map (fn [destination result-cast result-body]
                                               (list 'clojure.core/aset destination
                                                     (:index attributes)
-                                                    (typed-store-value result-cast result-body)))
+                                                    (invocation-source/typed-store-value result-cast result-body)))
                                             physical-results casts bodies))))
 
                          (= #{:buffer} host-returns)
@@ -333,7 +279,7 @@
                                       [binding destination])))
                                 (map vector results physical-results)))
                     :else
-                    (conj (mapv #(equation-allocation-pair values equation %) results)
+                    (conj (mapv #(invocation-source/equation-allocation-pair values equation %) results)
                           [effect source]))
            :site [:binding (if (and storage (not multiple-buffer-results?)) host-binding effect)]
            :source source}))
@@ -344,7 +290,7 @@
             host-binding (or (get-in placement-facts [:attributes :host-binding])
                              (first results))
             result-dtypes (mapv #(:dtype (get values %)) results)
-            casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
+            casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
             writes (mapv dialect/write-parts bodies)
             conflict (:conflict attributes)
             reducing? (dialect/reducing-scatter-conflict? conflict)
@@ -365,7 +311,7 @@
                                         {:raster.type/tag
                                          (dtype/array-tag-for-dtype result-dtype)
                                          :tag (dtype/array-tag-for-dtype result-dtype)})
-                          typed-value (typed-store-value cast value)
+                          typed-value (invocation-source/typed-store-value cast value)
                           store (if reducing?
                                   (list 'raster.par/atomic-add!
                                         destination destination-index typed-value)
@@ -395,7 +341,7 @@
             host-binding (or (get-in placement-facts [:attributes :host-binding])
                              (first results))
             result-dtypes (mapv #(:dtype (get values %)) results)
-            casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
+            casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
             dtype-by-destination (zipmap physical-results result-dtypes)
             cast-by-destination (zipmap physical-results casts)
             effects (mapv dialect/scheduled-effect bodies)
@@ -476,7 +422,7 @@
             transform (:result-transform attributes)
             resident-target (or resident-destination result)
             result-dtype (:dtype (get values result))
-            result-cast (nth (get dtype->allocation result-dtype) 2 nil)
+            result-cast (nth (get invocation-source/dtype->allocation result-dtype) 2 nil)
             source
             (cond
               (and resident? transform)
@@ -485,7 +431,7 @@
               ;; resident result: reduce to a scalar, apply the authoritative transform (including
               ;; its explicit singleton operand loads), then store the transformed value once.
               (list 'clojure.core/aset resident-target 0
-                    (typed-store-value
+                    (invocation-source/typed-store-value
                      result-cast
                      (materialize-functional-result-transform scalar-reduction-source transform)))
 
@@ -501,7 +447,7 @@
             {:equation-id equation-id
              :placement placement
              :pairs (cond-> []
-                      (nil? resident-destination) (conj (equation-allocation-pair values equation result))
+                      (nil? resident-destination) (conj (invocation-source/equation-allocation-pair values equation result))
                       true (conj [effect source]))
              :site [:binding effect]
              :source source})
@@ -526,7 +472,7 @@
                 effect (gensym (str "typed_soac_segmented_reduce_" equation-id "__"))]
             {:equation-id equation-id
              :placement placement
-             :pairs [(allocation-pair values result (segmented-result-extent attributes))
+             :pairs [(invocation-source/allocation-pair values result (segmented-result-extent attributes))
                      [effect source]]
              :site [:binding effect]
              :source source})
@@ -577,7 +523,7 @@
                            (first (:accumulators attributes))
                            (first (:identities attributes))
                            (:index attributes) (:extent attributes)
-                           (nth (get dtype->allocation (first (:dtypes attributes))) 2 nil)
+                           (nth (get invocation-source/dtype->allocation (first (:dtypes attributes))) 2 nil)
                            (materialize-region region-locals (first bodies)))
                      {:raster.type/elem-type (first (:dtypes attributes))})]
         {:equation-id equation-id
@@ -1378,53 +1324,6 @@
 (defn- equation-operation?
   [operation]
   (boolean (fusion/equation-info operation)))
-
-(defn realization-binding?
-  "Whether one exact retained auxiliary pair belongs to an unchanged realized equation.
-   The realization pass, not whole-program promotion, owns allocation/alias scaffolding."
-  [program symbol expression]
-  (let [source-pairs (mapv vec (partition 2 (second (:source program))))
-        source-bindings (into {} source-pairs)]
-    (boolean
-     (some
-      (fn [equation]
-        (let [primary (second (:site equation))
-              witness (get-in equation [:attributes :realization-bindings])
-              destinations (set (map :destination
-                                     (get-in equation [:attributes :result-storage])))]
-          (and (= :binding (first (:site equation)))
-               (vector? witness)
-               ;; A nonmatching binding cannot be this equation's auxiliary result. Keep the
-               ;; exact semantic checks below for every potentially matching witness; do not
-               ;; encode unrelated kernel bodies while searching by binding identity.
-               (some #(= symbol (:binding %)) witness)
-               (parallel-program/equation-for-binding program primary (get source-bindings primary))
-               (= (count witness) (count (distinct (map :binding witness))))
-               (every? (fn [{:keys [binding expression]}]
-                         (and (not= primary binding)
-                              (= 1 (count (filter #(and (= binding (first %))
-                                                         (semantic/equivalent? [binding expression] (vec %)))
-                                                   source-pairs)))))
-                       witness)
-               (some (fn [{binding :binding generated :expression kind :kind}]
-                       (and (= symbol binding)
-                            (semantic/equivalent? [symbol expression] [binding generated])
-                            (case kind
-                              :result-allocation
-                              (and (some #{binding} (:results equation))
-                                   (dialect/program-form? (:algorithm equation))
-                                   (some (fn [inner]
-                                           (and (some #{binding} (nth inner 2))
-                                                (semantic/equivalent?
-                                                 [binding generated]
-                                                 (equation-allocation-pair
-                                                  (:values program) inner binding))))
-                                         (dialect/equations (:algorithm equation))))
-                              :storage-alias
-                              (and (symbol? generated) (contains? destinations generated))
-                              false)))
-                     witness))))
-      (:equations program)))))
 
 (defn- envelope
   [typed-program source realized]

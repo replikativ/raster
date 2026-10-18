@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.structured-control-route-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [raster.compiler.ir.invocation-source :as invocation-source]
+            [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
@@ -55,8 +56,8 @@
         "a structured loop remains one semantic equation with its nested control")))
 
 (deftest wrapping-casts-do-not-prove-shape-projections
-  (is (= 'xs (#'route/shape-projection-source '(clojure.core/long (alength xs)))))
-  (is (nil? (#'route/shape-projection-source '(clojure.core/unchecked-int (alength xs))))))
+  (is (= 'xs (invocation-source/shape-projection-source '(clojure.core/long (alength xs)))))
+  (is (nil? (invocation-source/shape-projection-source '(clojure.core/unchecked-int (alength xs))))))
 
 (deftest effect-result-refinement-uses-authoritative-inner-storage
   (doseq [[host-return shape expected]
@@ -781,7 +782,7 @@
           allocation (first (filter #(= :result-allocation (:kind %)) witnesses))]
       (is (some? allocation) "functional map realization certifies its generated allocation")
       (doseq [{:keys [binding expression]} witnesses]
-        (is (typed-route/realization-binding? semantic binding expression)))
+        (is (invocation-source/realization-binding? semantic binding expression)))
       (when allocation
         (let [{:keys [binding expression]} allocation
               altered (list 'let* (vec (mapcat (fn [[symbol value]]
@@ -789,9 +790,9 @@
                                                           '(clojure.core/println :unexpected) value)])
                                               (partition 2 (second (:source semantic)))))
                             (last (:source semantic)))]
-          (is (false? (typed-route/realization-binding? semantic binding
+          (is (false? (invocation-source/realization-binding? semantic binding
                                                        '(clojure.core/println :unexpected))))
-          (is (false? (typed-route/realization-binding? (assoc semantic :source altered)
+          (is (false? (invocation-source/realization-binding? (assoc semantic :source altered)
                                                        binding expression)))
           (doseq [wrong ['(clojure.core/float-array 1)
                          '(clojure.core/double-array 1)
@@ -812,7 +813,7 @@
                                                                     (assoc :expression wrong)))
                                                                 bindings)))
                                              equations))))]
-              (is (false? (typed-route/realization-binding? forged binding wrong))
+              (is (false? (invocation-source/realization-binding? forged binding wrong))
                   "a forged witness cannot change canonical allocation dtype, extent or arity")))
           (let [pure-source (list 'let* (vec (mapcat (fn [[symbol value]]
                                                      [symbol (if (= binding symbol) 'x value)])
@@ -926,7 +927,7 @@
         (is (= (min left right) (get-in result [:program-scalars 'n :value])))))))
 
 (deftest metadata-leaf-projection-keeps-carriers-and-refusal-boundaries
-  (let [project #'route/project-scalar-metadata
+  (let [project invocation-source/project-scalar-metadata
         values {'a (av/tensor {:dtype :float :shape '[size]})
                 'size (av/tensor {:dtype :long :shape []})}
         length (with-meta '(raster.arrays/alength a) {:raster.type/tag 'long})
