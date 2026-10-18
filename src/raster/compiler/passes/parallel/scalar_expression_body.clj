@@ -1396,18 +1396,15 @@
 (defn- qualify-source-casts
   "Resolve only existing bare cast spellings in the observed source namespace.
    A local or user Var named float must not borrow the core conversion contract."
-  [body parameters source-ns]
+  [body parameters body-context]
   (util/postwalk-preserving-meta
    (fn [node]
      (let [head (when (seq? node) (first node))]
        (if (and (symbol? head) (nil? (namespace head))
                 (not (contains? parameters head)) (descriptor/cast-op? head))
-         (let [v (ns-resolve source-ns head)]
-           (if (and (var? v) (identical? (:ns (meta v)) (find-ns 'clojure.core)))
-             (do (method-entry/observe-definition-input! v source-ns head)
-                 (util/remake-from node
-                                   (cons (symbol "clojure.core" (str (:name (meta v))))
-                                         (rest node))))
+         (let [operation (method-entry/observed-body-operation body-context head parameters)]
+           (if (and operation (= "clojure.core" (namespace operation)))
+             (util/remake-from node (cons operation (rest node)))
              node))
          node)))
    body))
@@ -1426,11 +1423,11 @@
                             semantic-op implementation-op (count arguments))]
         (when-let [entry (method-entry/selected-source-entry-carriers
                          semantic-op implementation-op (count arguments) (:source-var candidate))]
-          (let [{:keys [parameters source-body source-var] :as definition} (:definition entry)
-                body (when (and (= 1 (count source-body))
-                                 (instance? clojure.lang.Namespace (:ns (meta source-var))))
-                       (qualify-source-casts (first source-body) (set parameters)
-                                             (:ns (meta source-var))))]
+          (let [{:keys [parameters] :as definition} (:definition entry)
+                body-context (method-entry/selected-definition-body definition)
+                source-body (:body body-context)
+                body (when (= 1 (count source-body))
+                       (qualify-source-casts (first source-body) (set parameters) body-context))]
             (when (and (seq? body) (strict-core-expression? body (set parameters)))
               {:definition definition :entry entry :body body :arguments arguments
                :operation semantic-op :implementation-op implementation-op})))))))

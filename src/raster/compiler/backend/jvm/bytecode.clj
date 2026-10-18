@@ -2441,8 +2441,16 @@
          (or (= (namespace head) "clojure.core")
              (and (nil? (namespace head))
                   (when-let [v (ns-resolve src-ns head)]
-                    (and (var? v)
-                         (= (the-ns 'clojure.core) (:ns (meta v))))))))))
+                    (when (var? v)
+                      ;; Both positive and negative lookup results choose an
+                      ;; emission route. Preserve the original alias edge, not
+                      ;; a new observation made by a later body analysis.
+                      (me/observe-definition-input! v src-ns head)
+                      ;; The enclosing emitter validates ALL observations at
+                      ;; publication, after lazy child materialization. An
+                      ;; unrelated whole-owner assertion here would interrupt
+                      ;; that existing retry boundary.
+                      (= (the-ns 'clojure.core) (:ns (meta v))))))))))
 
 (defn- emit-deftm-invokestatic
   "Emit invokestatic for a compiled deftm method with typed argument coercions."

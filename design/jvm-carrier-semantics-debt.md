@@ -71,11 +71,27 @@ ownership. It then checks the ORIGINAL observations, causing whole-construction
 retry after promotion; it never restamps the old closure. Real definition
 replacement still invalidates the published derivative.
 
-The separate `normal-return` recursive producer summary still needs a historical
-body-correspondence audit; making its refused queries transactional does not
-establish that broader guarantee. Internal resident scalar staging also remains
-distinct work: nonterminal producer certification, explicit singleton capture
-loads and predicate storage encoding must be proved before using that route.
+`normal-return` and selected scalar proofs share historical body/lookup authority.
+Pending typed code uses its exact `jit-spec` source with observed current lookup
+edges. Warm typed code uses the body actually consumed by its owned emitter,
+not current walked metadata or a reinterpretation of raw source. Bare calls in
+compiled bodies require original lookup observations, which are also retained
+by the new artifact's owner. The emitter records both core and noncore bare
+resolution decisions; a negative decision selects code just as a positive one
+does. Missing legacy lookup evidence abstains without forcing compilation.
+
+Plain `deftm` declarations freeze the exact Clojure body at function creation,
+before dispatch publication. Declaration-specific keys in the existing body
+registry keep delayed/interleaved macro expansions from borrowing another
+declaration's metadata. This does not solve registry retention: every expansion
+now retains its own entry, and repeated evaluation of an expansion prevents a
+naive consume-once cleanup. A lifecycle solution remains separate work.
+
+These are sequential correspondence fences, not authentication against forged
+compiler-owned metadata or concurrent mutation/ABA guarantees. No guarded-loop
+rewrite is enabled here. Internal resident scalar staging also remains distinct
+work: nonterminal producer certification, explicit singleton capture loads and
+predicate storage encoding must be proved before using that route.
 
 Shared recovery of scalar-cast/read presence is held out until their source
 evaluation obligations survive value liveness and DCE. Being present on normal
