@@ -53,9 +53,42 @@
   {:source-context :jvm-primitive-input :target-carrier parameter-class
    :policy :preserve-source-input :source-policy source-policy})
 
+(def bytecode-operand-context-keys
+  "Bytecode result-position facts that affect an input's original evaluation.
+   Retained only by a compilation owner, never inferred from scalar tags."
+  [:object-result? :object-call-result? :preserve-source-call-results? :void-context])
+
+(defn bytecode-operand-context
+  "Capture the existing emitter's result-context facets at an actual input."
+  [emitter-context]
+  (into {} (map (fn [key] [key (boolean (get emitter-context key))])) bytecode-operand-context-keys))
+
+(defn- bytecode-operand-context? [context]
+  (and (map? context) (= (set bytecode-operand-context-keys) (set (keys context)))
+       (every? boolean? (vals context))))
+
+(defn bytecode-floating-input-contract
+  "Retain a floating parameter conversion owned by Raster's bytecode emitter.
+   This is NOT Clojure source input conversion: Number.xxxValue and JVM FP
+   conversion instructions are interpreted by the original emitter authority.
+   The producer still owes exact Method/lexical correspondence and the operand
+   context captured from that actual emitter, not a chosen replacement context."
+  [parameter-class operand-context]
+  (when-not (and (contains? #{Float/TYPE Double/TYPE} parameter-class)
+                 (bytecode-operand-context? operand-context))
+    (throw (ex-info "bytecode floating completion requires an actual FP parameter Class"
+                    {:reason :unsupported-value-completion :carrier parameter-class})))
+  {:source-context :jvm-bytecode-floating-input :target-carrier parameter-class
+   :policy :preserve-bytecode-input :operand-context operand-context})
+
 (defn canonical-contract? [contract]
   (and (map? contract)
        (or (= object-input-contract contract)
+           (and (= #{:source-context :target-carrier :policy :operand-context} (set (keys contract)))
+                (= :jvm-bytecode-floating-input (:source-context contract))
+                (= :preserve-bytecode-input (:policy contract))
+                (contains? #{Float/TYPE Double/TYPE} (:target-carrier contract))
+                (bytecode-operand-context? (:operand-context contract)))
            (and (= #{:source-context :target-carrier :policy} (set (keys contract)))
                 (= :jvm-checkcast (:source-context contract))
                 (= :preserve-source-reference-check (:policy contract))
@@ -167,6 +200,10 @@
      (if (and (seq? form) (= completion-symbol (first form)))
        (if-let [{:keys [contract operand]} (canonical-parts form)]
          (with-meta (case (:source-context contract)
+                      :jvm-bytecode-floating-input
+                      (throw (ex-info "Bytecode-owned input completion requires its bytecode consumer"
+                                      {:reason :unsupported-value-completion-source-context
+                                       :contract contract}))
                       :jvm-object-input (list '. (list 'do Object) (list 'cast operand))
                       :jvm-checkcast (list '. (reference-class-expression contract reference-bindings)
                                           (list 'cast operand))
