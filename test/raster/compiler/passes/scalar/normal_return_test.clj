@@ -5,6 +5,7 @@
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.scalar.local-products :as products]
+            [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.pipeline :as pipeline]))
 
@@ -12,6 +13,46 @@
   (fn [test!]
     (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
       (test!))))
+
+(deftest presence-refinement-must-not-delete-a-trapping-read
+  (doseq [size [0 1]]
+    (let [body (list 'let* ['before '(clojure.core/aset events 0 7)
+                            'a (list 'clojure.core/double-array size)
+                            'x '(clojure.core/aget a 0)
+                            'after '(clojure.core/aset events 1 11)]
+                     '(if (clojure.core/nil? x) 1 2))
+          lowered (:form (dce/eliminate-dead-bindings (products/lower-local-products body)))
+          outcome (fn [expression]
+                    (let [events (int-array [0 0])
+                          run (eval (list 'fn '[events] expression))]
+                      (assoc (try {:value (run events)}
+                                  (catch Throwable error {:error (class error)}))
+                             :events (vec events))))]
+      (is (= (outcome body) (outcome lowered)))
+      (is (= (if (zero? size)
+               {:error ArrayIndexOutOfBoundsException :events [7 0]}
+               {:value 2 :events [7 11]})
+             (outcome lowered))))))
+
+(deftest nested-producer-presence-must-not-delete-reference-conversion-checks
+  (doseq [operator '[clojure.core/double clojure.core/float]]
+    (let [nullable (with-meta 'nullable {:raster.type/tag 'double})
+          body (list 'let* ['before '(clojure.core/aset events 0 7)
+                            nullable 'input
+                            'x (list 'let* ['temporary (list operator nullable)] 'temporary)
+                            'after '(clojure.core/aset events 1 11)]
+                     '(if (clojure.core/nil? x) 1 2))
+          lowered (:form (dce/eliminate-dead-bindings (products/lower-local-products body)))
+          outcome (fn [expression input]
+                    (let [events (int-array [0 0])
+                          run (eval (list 'fn '[input events] expression))]
+                      (assoc (try {:value (run input events)}
+                                  (catch Throwable error {:error (class error)}))
+                             :events (vec events))))]
+      (doseq [input [nil "not a Number" 2.0]]
+        (is (= (outcome body input) (outcome lowered input))))
+      (is (= {:error NullPointerException :events [7 0]} (outcome lowered nil)))
+      (is (= {:value 2 :events [7 11]} (outcome lowered 2.0))))))
 
 (deftest definition-dependent-analysis-needs-an-owning-collector
   (binding [method-entry/*emission-inputs* nil]

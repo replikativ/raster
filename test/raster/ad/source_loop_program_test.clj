@@ -5,6 +5,51 @@
             [raster.par :as par]
             [raster.ad.reverse :as rev]))
 
+(deftest internal-ad-ports-follow-code-not-activity-map-order
+  (let [parameters (mapv #(with-meta (symbol (str "p" %))
+                           {:raster.type/tag 'double :port %}) (range 16))
+        activity (zipmap parameters (repeat true))
+        expression (list 'n/+ (nth parameters 11) (nth parameters 2)
+                         (nth parameters 15) (nth parameters 11))
+        expected (mapv parameters [11 2 15])
+        ports (#'rev/ordered-active-inputs expression activity)]
+    (is (= expected ports))
+    (is (= (mapv meta expected) (mapv meta ports)))
+    (is (= ports (#'rev/ordered-active-inputs expression
+                  (into {} (reverse (seq activity))))))
+    (let [renaming (zipmap parameters (mapv #(symbol (str "fresh_" %)) (range 16)))
+          renamed (apply list 'n/+ (map renaming (rest expression)))]
+      (is (= (mapv renaming ports)
+             (#'rev/ordered-active-inputs renamed
+               (into {} (map (fn [[p active]] [(renaming p) active]) activity))))))
+    (with-redefs-fn {#'rev/gen-reverse-par-reduce
+                    (fn [_ active] {:active-free active})}
+      #(is (= expected (get-in (#'rev/ad-record :par-reduce 'result expression activity)
+                              [:record :active-free]))))))
+
+(deftest internal-ad-ports-respect-lexical-shadowing-and-initializers
+  (let [activity {'p true 'q true 'r true 'count true 'inactive false}
+        order #(#'rev/ordered-active-inputs % activity)]
+    (is (= '[q r] (order '(let* [p q q r] (n/+ p q) p))))
+    ;; p in the initializer is external; the body p is loop-local.
+    (is (= '[p q] (order '(loop* [p p q q] (if q (recur p q) p)))))
+    (is (= '[q count] (order '(fn* p [p] (n/+ p q count)))))
+    (is (= '[q] (order '(fn* [p] (fn* [r] (n/+ p r q))))))
+    (is (= '[r q] (order '(do (quote [p count]) (n/+ r inactive q)))))
+    (is (= '[count p] (order '(if condition (n/* count count) (n/+ p count)))))))
+
+(deftm deterministic-port-density
+  [x :- Double y :- Double values :- (Array double) rows :- Long] :- Double
+  (par/reduce acc 0.0 i rows
+    (n/+ acc (n/+ (n/* y (aget values i)) (n/* x x)))))
+
+(deftest deterministic-port-layout-preserves-public-gradient-slots
+  (let [gradient (rev/value+grad #'deterministic-port-density)
+        selected (rev/value+grad #'deterministic-port-density :wrt [1])
+        values (double-array [1.0 3.0 5.0])]
+    (is (= [30.0 12.0 9.0] (subvec (vec (gradient 2.0 2.0 values 3)) 0 3)))
+    (is (= [30.0 nil 9.0 nil nil] (vec (selected 2.0 2.0 values 3))))))
+
 (deftm nested-replay-then-write
   [x :- Double ys :- (Array double) zs :- (Array double)] :- Double
   (let [out (double-array 1)]

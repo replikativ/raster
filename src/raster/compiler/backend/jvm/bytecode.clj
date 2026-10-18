@@ -696,7 +696,7 @@
   (:form (materialize/materialize-pass form nil)))
 
 ;; Forward declarations for mutual recursion
-(declare emit-form emit-object-value)
+(declare emit-form emit-object-value emit-boxed-ifn-call)
 
 (defn- emit-result-form [code expression locals ctx]
   (if (:object-result? ctx)
@@ -1758,74 +1758,96 @@
     :double (case op "+" (.dadd code) "-" (.dsub code) "*" (.dmul code) "/" (.ddiv code))))
 
 (defn- emit-arithmetic
-  "Emit type-aware arithmetic bytecode. Preserves integer types:
-   int×int→int, long×long→long, int×long→long, float×float→float, else→double.
-   Division (/) always uses float or double (integer division is quot)."
+  "Emit arithmetic from actual operand carriers, never logical result hints.
+   Direct core arithmetic is a left fold, matching its nary-inline contract.
+   Reference-carried Numbers retain generic arithmetic rather than rounding
+   through double. Primitive operands retain the existing numerical recipe."
   [code op args locals ctx]
   (cond
-    ;; Unary negation: (- x) → negate, preserving type
+    ;; These arities are not inlined by core. Preserve identity, Number
+    ;; validation, invalid arities, and unary division's generic zero check.
+    (or (empty? args) (and (= 1 (count args)) (not= op "-")))
+    (do
+      (emit-var-constant! code "clojure.core" op)
+      (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
+      (.checkcast code ifn-cd)
+      (emit-boxed-ifn-call code args locals ctx))
+
+    ;; Unary negation is itself a source inline operation.
     (and (= op "-") (= 1 (count args)))
     (let [t (emit-form code (first args) locals ctx)]
       (case t
-        (:int :bool) (do (.ineg code) :int)
+        :diverge :diverge
+        :void (throw (ex-info "Arithmetic operand has no retained value"
+                              {:reason :void-arithmetic-operand :operator op}))
+        :int (do (.ineg code) :int)
         :long   (do (.invokestatic code math-cd "negateExact"
                                   (MethodTypeDesc/of J-cd (into-array ClassDesc [J-cd]))) :long)
         :float  (do (.fneg code) :float)
         :double (do (.dneg code) :double)
-        ;; :ref → coerce to double
-        (do (emit-coerce code t :double) (.dneg code) :double)))
-
-    ;; Unary reciprocal: (/ x) → 1.0 / x (always floating point)
-    (and (= op "/") (= 1 (count args)))
-    (let [t (emit-form code (first args) locals ctx)]
-      (if (= t :float)
-        (do (.ldc code (float 1.0)) (.swap code) (.fdiv code) :float)
-        (do (when (not= t :double) (emit-coerce code t :double))
-            (let [tmp @(:next-slot ctx)]
-              (swap! (:next-slot ctx) + 2)
-              (.dstore code tmp)
-              (.ldc code 1.0)
-              (.dload code tmp)
-              (.ddiv code) :double))))
+        (:ref :bool) (do (when (= t :bool) (emit-box-to-ref code t))
+                         (.invokestatic code (ClassDesc/of "clojure.lang.Numbers") "minus"
+                                (MethodTypeDesc/of number-cd (into-array ClassDesc [obj-cd])))
+                 :ref)))
 
     :else
-    ;; Multi-arg: emit first arg, then fold remaining with type widening
     (let [division? (= op "/")
-          t1 (emit-form code (first args) locals ctx)
-          ;; For :ref, coerce to double eagerly
-          t1 (if (= t1 :ref) (do (emit-coerce code t1 :double) :double) t1)
-          ;; For division with integer first arg, coerce to double
-          t1 (if (and division? (#{:int :bool :long} t1))
-               (do (emit-coerce code t1 :double) :double)
-               t1)]
+          t1 (emit-form code (first args) locals ctx)]
       (loop [remaining (rest args) cur t1]
-        (if (empty? remaining)
+        (cond
+          (diverge? cur) :diverge
+          (= cur :void) (throw (ex-info "Arithmetic operand has no retained value"
+                                       {:reason :void-arithmetic-operand :operator op}))
+          (empty? remaining)
           cur
+
+          :else
           (let [t2 (emit-form code (first remaining) locals ctx)
-                ;; For :ref, coerce to double eagerly
-                t2 (if (= t2 :ref) (do (emit-coerce code t2 :double) :double) t2)
-                target (widen-arithmetic-type cur t2 division?)]
-            ;; Coerce t2 (on top of stack) to target if needed
-            (when (not= t2 target)
-              (emit-coerce code t2 target))
-            ;; Coerce cur (below t2) to target if needed
-            ;; This requires store/coerce/reload when sizes differ
-            (when (not= cur target)
-              (let [tmp @(:next-slot ctx)]
-                ;; Store t2 (on top)
-                (case target
-                  (:double :long) (do (swap! (:next-slot ctx) + 2)
-                                      (if (= target :double) (.dstore code tmp) (.lstore code tmp)))
-                  (do (swap! (:next-slot ctx) inc)
-                      (if (= target :float) (.fstore code tmp) (.istore code tmp))))
-                ;; Coerce cur
-                (emit-coerce code cur target)
-                ;; Reload t2
-                (case target
-                  :double (.dload code tmp) :long (.lload code tmp)
-                  :float (.fload code tmp) (:int :bool) (.iload code tmp))))
-            (emit-arith-op code op target)
-            (recur (rest remaining) target)))))))
+                generic? (or (contains? #{:ref :bool} cur) (contains? #{:ref :bool} t2))]
+            (cond
+              (diverge? t2) :diverge
+              (= t2 :void) (throw (ex-info "Arithmetic operand has no retained value"
+                                          {:reason :void-arithmetic-operand :operator op}))
+              generic?
+              (let [;; Numbers exposes long/double/Object input overloads.
+                    ;; In particular double/Object division is IEEE, whereas
+                    ;; Object/Object division checks zero. Preserve that ABI.
+                    normalize #(case % :int :long :float :double :bool :ref %)
+                    left (normalize cur) right (normalize t2)
+                    descriptor #(case % :long J-cd :double D-cd :ref obj-cd)
+                    result (if (or (= left :double) (= right :double)) :double :ref)
+                    tmp @(:next-slot ctx)]
+                (if (= t2 :bool) (emit-box-to-ref code t2)
+                    (when (not= t2 right) (emit-coerce code t2 right)))
+                (swap! (:next-slot ctx) + (if (two-slot? right) 2 1))
+                (case right :long (.lstore code tmp) :double (.dstore code tmp) :ref (.astore code tmp))
+                (if (= cur :bool) (emit-box-to-ref code cur)
+                    (when (not= cur left) (emit-coerce code cur left)))
+                (case right :long (.lload code tmp) :double (.dload code tmp) :ref (.aload code tmp))
+                (.invokestatic code (ClassDesc/of "clojure.lang.Numbers")
+                               (case op "+" "add" "-" "minus" "*" "multiply" "/" "divide")
+                               (MethodTypeDesc/of (if (= result :double) D-cd number-cd)
+                                                  (into-array ClassDesc [(descriptor left) (descriptor right)])))
+                (recur (rest remaining) result))
+
+              :else
+              (let [target (widen-arithmetic-type cur t2 division?)]
+                (when (not= t2 target)
+                  (emit-coerce code t2 target))
+                ;; Expose the left value for widening without reevaluation.
+                (when (not= cur target)
+                  (let [tmp @(:next-slot ctx)]
+                    (case target
+                      (:double :long) (do (swap! (:next-slot ctx) + 2)
+                                          (if (= target :double) (.dstore code tmp) (.lstore code tmp)))
+                      (do (swap! (:next-slot ctx) inc)
+                          (if (= target :float) (.fstore code tmp) (.istore code tmp))))
+                    (emit-coerce code cur target)
+                    (case target
+                      :double (.dload code tmp) :long (.lload code tmp)
+                      :float (.fload code tmp) (:int :bool) (.iload code tmp))))
+                (emit-arith-op code op target)
+                (recur (rest remaining) target)))))))))
 
 (defn- emit-comparison
   "Emit comparison bytecode. Uses int/long comparison when both operands are
@@ -3186,7 +3208,10 @@
                                                          (catch Exception _ nil))
                                                     (when-let [r (ns-resolve src-ns (symbol tag-str))]
                                                       (when (class? r) r))))))]
-                                  (when cls
+                                  ;; Object is the existing verifier carrier, not a
+                                  ;; narrower type proof. Keep all real array/record
+                                  ;; casts, but do not emit this no-op instruction.
+                                  (when (and cls (not= cls Object))
                                     (.checkcast code (class-desc-of cls)))))
                             ;; Skip store for void results (effectful calls like Arrays.fill)
                             slot (when-not (#{:void :diverge} t) (alloc-slot! ctx t))]

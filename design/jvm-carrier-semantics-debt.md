@@ -4,6 +4,65 @@ Numeric declarations, JVM stack categories and source boxing carriers are not
 interchangeable. Fixes must preserve conversions, reference identity and input
 evaluation order, not merely numerical values on valid inputs.
 
+## Nullable numerical values and boxing
+
+Four properties are independent:
+
+| Property | Authority |
+| --- | --- |
+| Logical numerical dtype | Retained typing and differentiation rules |
+| Presence on normal return | Producer/control-flow facts, not the numerical dtype |
+| Emitted JVM carrier | Actual method descriptors and emitted stack values |
+| Surviving allocation | Warmed counters and JIT/escape-analysis evidence |
+
+A logically Double cotangent may be absent (`nil`). Helper extraction must not
+turn it into a primitive parameter, return or local solely from its logical tag.
+Public primitive descriptors and successful primitive-array reads can establish
+stronger facts. A primitive-array descriptor admits null; its element read only
+establishes scalar presence *on normal completion*, without removing null/bounds
+checks. Unknown producers retain reference-capable numerical boundaries.
+
+Shared recovery of scalar-cast/read presence is held out until their source
+evaluation obligations survive value liveness and DCE. Being present on normal
+return does not mean that a null/bounds/conversion failure may be discarded.
+
+Arithmetic emission consumes actual operand carriers, including the return
+carrier of each intermediate operation. Reference-carried Numbers must not be
+rounded through double merely because a primitive numerical result is desired.
+Mixed `Numbers` overloads are semantically significant: Double/Object division
+is IEEE, whereas Object/Object division checks zero. A source cast descriptor
+alone does not prove that its emitter returns a primitive value.
+
+Direct variadic core arithmetic follows core's nested `nary-inline` operations;
+an overflowing inner operation can run before a later argument effect. An
+explicit IFn call instead evaluates its arguments before entering the function.
+Independent source-oracle tests cover both boundaries rather than assuming they
+have the same order. This does not qualify all existing primitive numerical
+recipes as complete Clojure semantics: primitive integer division, narrowing
+and Character carriers still require their own contracts and qualification.
+
+### Open: large backward-loop materialization
+
+The actual immutable MMM fixture has demonstrated surviving Double and product
+allocation. Small closed quadratic controls do not reproduce its row-dependent
+allocation, despite Object-returning signatures. A descriptor by itself is not
+an allocation measurement. Method size, inlining and escape analysis must be
+examined alongside retained loop carries/products and actual boxing sites.
+
+Nullable helper and arithmetic correctness repairs are not an allocation-gain
+claim. The small publication slice also does not finish the full MMM zero-trip
+case: the ordinary-call walker still inserts inferred primitive operand casts.
+Removing those casts exposes existing DCE exceptional-evaluation gaps, including
+negative allocation extents. That follow-up must preserve source evaluation
+obligations, not weaken exception tests or replace absent gradients with zero.
+
+The intended representation lowering scalar-replaces nonescaping products and
+uses separate presence/payload state for proven-safe internal optional scalars.
+It materializes reference values at escaping, public or identity-observable
+boundaries. Acceptance requires zero-trip and changed-input numerical checks,
+identity/effect/exception controls, and matched warmed allocation measurements
+on the real model; stable internal port order alone proves no speedup.
+
 ## Open: primitive Character completion
 
 Confirmed against commit `c57493ef0ca41056426f22f79fba976d0c5fc88a`, before
