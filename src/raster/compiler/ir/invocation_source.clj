@@ -213,6 +213,21 @@
   [program symbol expression]
   (boolean (realization-equation program symbol expression)))
 
+(defn realization-action
+  "Recover the exact validated auxiliary action at an attested source position. A witness is
+   correspondence only: the caller must still execute allocation or aliasing in source order."
+  [program entry]
+  (when (:realization entry)
+    (let [[binding expression] (nth (vec (partition 2 (second (:source program))))
+                                  (:position entry) nil)
+          equation (realization-equation program binding expression)]
+      (when-not (and (= binding (:binding entry)) (= (:id equation) (:realization entry)))
+        (throw (ex-info "auxiliary action differs from its exact source owner"
+                        {:reason :invocation-source-realization-action :entry entry})))
+      (assoc (first (filter #(= binding (:binding %))
+                            (get-in equation [:attributes :realization-bindings])))
+             :equation (:id equation)))))
+
 (defn scalar-equation-expression
   [equation]
   (let [algorithm (:algorithm equation)]

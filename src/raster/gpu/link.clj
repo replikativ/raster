@@ -1144,7 +1144,9 @@
                   :let [step (when-let [id (:invocation-step entry)]
                                (some #(when (= id (:id %)) %)
                                      (get-in initial [:materialization :plan :steps])))]]
-            (when (or (:realization entry)
+            (when (or (and (:realization entry)
+                           (not (contains? #{:result-allocation :storage-alias}
+                                           (get-in initial [:source-realizations (:position entry) :kind]))))
                       (and step (not (or (invocation/scalar-compute? step)
                                                         (invocation/shape-projection? step)
                                                         (and (:storage entry)
@@ -1323,7 +1325,11 @@
                            (some #(when (= id (:id %)) %) (get-in state [:program :equations])))
                 next-state
                 (cond
-                  (:storage entry) (run-ordered-allocation! executable state)
+                  (or (:storage entry)
+                      (= :result-allocation (get-in state [:source-realizations (:source-cursor state) :kind])))
+                  (run-ordered-allocation! executable state)
+                  (= :storage-alias (get-in state [:source-realizations (:source-cursor state) :kind]))
+                  (invocation-link/advance-source-alias state caller-options)
                   (and equation (not (true? (get-in equation [:attributes :host-only]))))
                   (run-ordered-stage! executable
                                       (invocation-link/realize-ready-equation state (:id equation)

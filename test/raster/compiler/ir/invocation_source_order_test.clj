@@ -160,3 +160,16 @@
            (reason #(source/realization-equation
                      (update program :equations conj (assoc equation :id :duplicate-owner))
                      binding expression))))))
+
+(deftest auxiliary-actions-are-recovered-only-at-their-exact-source-position
+  (doseq [program [(#'auxiliary/functional-program) (#'auxiliary/aliased-program)]
+          equation (:equations program)
+          {:keys [binding] :as witness} (get-in equation [:attributes :realization-bindings])
+          :let [pairs (mapv vec (partition 2 (second (:source program))))
+                position (first (keep-indexed #(when (= binding (first %2)) %1) pairs))
+                entry {:position position :binding binding :realization (:id equation)}]]
+    (is (= (assoc witness :equation (:id equation)) (source/realization-action program entry)))
+    (is (= :invocation-source-realization-action
+           (reason #(source/realization-action program (assoc entry :realization :wrong-owner)))))
+    (is (= :invocation-source-realization-action
+           (reason #(source/realization-action program (assoc entry :binding 'unrelated)))))))

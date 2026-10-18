@@ -9,6 +9,7 @@
             [raster.gpu.device-probe :as ocl-probe]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as parallel-program]
+            [raster.gpu.program-memory-order-test :as dense-fixture]
             [raster.math :as math]
             [raster.par :as par]))
 
@@ -22,6 +23,17 @@
 (deftm ordered-void!
   [out :- (Array double)] :- Void
   (par/map-void! i 1 (aset out i 2.0)))
+
+(deftm functional-source-allocation
+  [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! early i 1 double (+ (aget x i) 1.0))]
+    (par/pmap i n double 1.0)))
+
+(deftm source-aliases-after-fused-writes
+  [x :- (Array double), a :- (Array double), b :- (Array double), n :- Long] :- (Array double)
+  (let [left (par/map! a i n double (+ (aget x i) 1.0))
+        right (par/map! b i n double (- (aget x i) 1.0))]
+    right))
 
 (deftm selected-source-math
   [x :- (Array float), n :- Long] :- (Array float)
@@ -42,7 +54,7 @@
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
 (defn- check-owned-root! [target]
-  (doseq [source [#'source-zero-observed #'fixture/helper-source-zero-observed]
+  (doseq [source [#'source-zero-observed #'fixture/helper-source-zero-observed #'functional-source-allocation]
           :let [compilation (equation-first/compile source {:target target :dtype :double})]]
     (doseq [n [0 3]]
       (let [x (double-array [7.0])
@@ -79,7 +91,8 @@
   (doseq [[v n expected] [[#'fixture/write-before-shape Long/MAX_VALUE ArithmeticException]
                           [#'source-zero-observed -1 NegativeArraySizeException]
                           [#'fixture/helper-source-zero-observed -1 NegativeArraySizeException]
-                          [#'fixture/helper-source-zero-observed Long/MAX_VALUE NegativeArraySizeException]]]
+                          [#'fixture/helper-source-zero-observed Long/MAX_VALUE NegativeArraySizeException]
+                          [#'functional-source-allocation -1 NegativeArraySizeException]]]
     (let [compilation (equation-first/compile v {:target target :dtype :double})
           executable (link/instantiate-ordered-invocation!
                       compilation [(double-array [7.0]) (double-array 1) n] {})
@@ -100,6 +113,46 @@
           (is (= [8.0] (vec actual)) "the late failure cannot erase the completed earlier write"))
         (finally (link/close! executable)))
       (is (true? (:closed? @session))))))
+
+(defn- check-dense-realization-actions! [target]
+  (let [arguments [(double-array [1.0 0.25 -0.5 1.0])
+                   (double-array [0.25 -0.125]) (double-array [1.0 -2.0])]
+        compilation (equation-first/compile #'dense-fixture/four-layers {:target target :dtype :double})
+        executable (link/instantiate-ordered-invocation! compilation arguments {})]
+    (try
+      (dotimes [replay 2]
+        (let [output (first (keys (link/run! executable)))
+              expected (vec (apply dense-fixture/four-layers arguments))
+              runtime (:ordered @(:execution-state executable))]
+          (is (= expected (vec (link/download executable output))))
+          (is (= 7 (count (:roots runtime)))
+              "three public inputs plus four source allocations, with no duplicate result roots")
+          (is (= 4 (count (:source-realizations (:current runtime)))))
+          (is (= (inc replay) @(:completed-replays executable))))
+        (aset ^doubles (nth arguments 2) 0 3.0))
+      (finally (link/close! executable)))))
+
+(defn- check-source-alias-actions! [target]
+  (let [x (double-array [2.0 4.0])
+        compilation (equation-first/compile #'source-aliases-after-fused-writes
+                                           {:target target :dtype :double})
+        executable (link/instantiate-ordered-invocation!
+                    compilation [x (double-array 2) (double-array 2) 2] {})]
+    (try
+      (dotimes [_ 2]
+        (link/run! executable)
+        (let [runtime (:ordered @(:execution-state executable))
+              aliases (filter #(= :storage-alias (:kind %))
+                              (vals (get-in runtime [:current :source-realizations])))
+              buffers (get-in runtime [:current :realized :buffers])]
+          (is (= 2 (count aliases)) "both fused output aliases retain distinct source positions")
+          (doseq [{:keys [binding expression]} aliases]
+            (is (= (get buffers binding) (get buffers expression))))
+          (is (= 3 (count (:roots runtime))) "aliases acquire no additional roots")
+          (is (= (mapv inc x) (vec (link/download executable (get buffers 'a)))))
+          (is (= (mapv dec x) (vec (link/download executable (get buffers 'b))))))
+        (aset x 0 7.0))
+      (finally (link/close! executable)))))
 
 (defn- check-shared-check-and-admission! [target]
   (let [compilation (equation-first/compile #'fixture/write-before-shape
@@ -265,7 +318,8 @@
     (do (check-owned-root! :ocl:0) (check-failed-root! :ocl:0)
         (check-shared-check-and-admission! :ocl:0) (check-math-request! :ocl:0)
         (check-release-failure! :ocl:0) (check-captured-entry-replay! :ocl:0)
-        (check-capture-failure! :ocl:0))
+        (check-capture-failure! :ocl:0) (check-dense-realization-actions! :ocl:0)
+        (check-source-alias-actions! :ocl:0))
     (ocl-probe/opencl-skip! "owned source-ordered invocation root")))
 
 (deftest level-zero-owned-root-obeys-source-order-and-replay
@@ -273,5 +327,6 @@
     (do (check-owned-root! :ze:0) (check-failed-root! :ze:0)
         (check-shared-check-and-admission! :ze:0) (check-math-request! :ze:0)
         (check-release-failure! :ze:0) (check-captured-entry-replay! :ze:0)
-        (check-capture-failure! :ze:0))
+        (check-capture-failure! :ze:0) (check-dense-realization-actions! :ze:0)
+        (check-source-alias-actions! :ze:0))
     (ze-probe/gpu-skip! "owned source-ordered invocation root")))
