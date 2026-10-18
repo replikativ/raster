@@ -227,6 +227,82 @@
   [emission]
   (validate-emission-inputs! emission (java.util.IdentityHashMap.)))
 
+(defn assert-typed-entrypoint!
+  "Validate an emitter-owned typed wrapper artifact against its actual receiver
+   and reflective Methods. This is carrier evidence, not purity, freshness,
+   source-policy or permission to discard/reorder a producer. A publishing owner
+   separately retains/validates the historical inputs of this same emission.
+
+   Trust boundary: the emitter constructs the Method/owner/recipe tuple from
+   the code it emits. These structural checks do NOT inspect loaded wrapper
+   instructions or authenticate arbitrary metadata maps. Replacing a matched
+   owner/Method pair together cannot be ruled out by reflection alone. Consume
+   only a live publisher-owned artifact, never a user-supplied certificate."
+  [{:keys [implementation invocation-method compute-owner compute-method return-completion] :as entrypoint}
+   expected-implementation]
+  (let [fail! #(throw (ex-info "Typed entrypoint disagrees with its emitted implementation"
+                              {:reason :raster/bug :rule :typed-entrypoint :entrypoint entrypoint}))]
+    (when-not (and (map? entrypoint) (some? implementation)
+                   (identical? implementation expected-implementation)
+                   (instance? java.lang.reflect.Method invocation-method)
+                   (class? compute-owner)
+                   (instance? java.lang.reflect.Method compute-method))
+      (fail!))
+    (let [^java.lang.reflect.Method invocation invocation-method
+          ^java.lang.reflect.Method compute compute-method
+          owner (class implementation)
+          primitive (.getReturnType compute)]
+      (when-not (and (identical? owner (.getDeclaringClass invocation))
+                     (= "invk" (.getName invocation))
+                     (= Object (.getReturnType invocation))
+                     (java.lang.reflect.Modifier/isPublic (.getModifiers invocation))
+                     (not (java.lang.reflect.Modifier/isStatic (.getModifiers invocation)))
+                     (java.lang.reflect.Modifier/isPublic (.getModifiers compute))
+                     (java.lang.reflect.Modifier/isStatic (.getModifiers compute))
+                     (= "compute_static" (.getName compute))
+                     (identical? compute-owner (.getDeclaringClass compute))
+                     (= (.getParameterCount invocation) (.getParameterCount compute))
+                     (identical? (.getClassLoader owner)
+                                 (.getClassLoader (.getDeclaringClass compute)))
+                     (= invocation (.getDeclaredMethod owner "invk" (.getParameterTypes invocation)))
+                     (= compute (.getDeclaredMethod (.getDeclaringClass compute)
+                                                    (.getName compute) (.getParameterTypes compute))))
+        (fail!))
+      (letfn [(check-return! [{:keys [kind presence primitive-carrier object-carrier
+                                     source-carrier boxing-method] :as result}]
+                (case kind
+                  :boxed
+                  (do
+                    (when-not (and (identical? primitive primitive-carrier)
+                                   (.isPrimitive primitive) (not= Void/TYPE primitive)
+                                   (= :present presence)
+                                   (instance? java.lang.reflect.Method boxing-method))
+                      (fail!))
+                    (let [^java.lang.reflect.Method boxing boxing-method
+                          arguments (vec (.getParameterTypes boxing))]
+                      (when-not (and (= "valueOf" (.getName boxing))
+                                     (java.lang.reflect.Modifier/isPublic (.getModifiers boxing))
+                                     (java.lang.reflect.Modifier/isStatic (.getModifiers boxing))
+                                     (identical? object-carrier (.getDeclaringClass boxing))
+                                     (identical? object-carrier (.getReturnType boxing))
+                                     (or (= [primitive] arguments)
+                                         (and (contains? #{"B" "S" "C" "I"} (.descriptorString primitive))
+                                              (= [Integer/TYPE] arguments))))
+                        (fail!))))
+                  :absent (when-not (and (= Void/TYPE primitive) (identical? primitive primitive-carrier)
+                                         (= :absent presence)) (fail!))
+                  :reference (when-not (and (not (.isPrimitive primitive))
+                                            (identical? primitive source-carrier) (= :unknown presence))
+                               (fail!))
+                  :guarded (let [indices (:guarded-indices result)]
+                             (when-not (and (= :unknown presence) (vector? indices) (seq indices)
+                                            (every? #(and (integer? %) (<= 0 %) (< % (.getParameterCount invocation)))
+                                                    indices)) (fail!))
+                             (check-return! (:compute-return result)))
+                  (fail!)))]
+        (check-return! return-completion)))
+    entrypoint))
+
 (defn retryable-emission-change?
   "Lazy compilation may materialize an input definition during emission. Only
    these historical-input failures authorize a bounded fresh emission, never
@@ -278,20 +354,92 @@
                 :walked-body (:raster.core/deftm-walked-body source-meta)}))))
        (get @table argument-count)))))
 
+(defn- observe-selected-inputs! [{:keys [receiver-var generic-var source-var]}]
+  (doseq [v [generic-var receiver-var source-var]]
+    (observe-definition-input! v (:ns (meta v))
+                               (symbol (str (ns-name (:ns (meta v)))) (str (:name (meta v)))))))
+
+(defn selected-typed-entrypoint
+  "Consume a current selected receiver's actual published emission artifact.
+   Requires a collecting compilation owner; consult/capture definitions BEFORE
+   deriving facts. No overload selection, numerical execution or lazy upgrade.
+   Absence of an owned entrypoint is not evidence about a logical return tag."
+  [operation implementation-op argument-count]
+  (when *emission-inputs*
+    (when-let [{:keys [receiver-var] :as definition}
+               (selected-definition operation implementation-op argument-count)]
+      (let [implementation (var-get receiver-var)
+            emission (:raster.core/bytecode-emission (meta receiver-var))
+            entrypoint (:entrypoint emission)]
+        (when (and entrypoint (identical? implementation (:implementation emission)))
+          (observe-selected-inputs! definition)
+          (assert-emission-inputs-current! emission)
+          (assert-typed-entrypoint! entrypoint implementation)
+          {:definition definition :emission emission :entrypoint entrypoint})))))
+
+(defn selected-typed-source-entry
+  "Read the frontend's retained source entry for the SAME still-owned receiver.
+   This is a source contract, NOT an emitted Method/body/boxing certificate.
+   Capture historical premises before deriving anything; no code generation,
+   numerical execution or registry mutation. Replaced/upgraded receivers cannot
+   inherit a previous stub's source contract. Requires a collecting owner."
+  [operation implementation-op argument-count]
+  (when *emission-inputs*
+    (when-let [{:keys [receiver-var source-var parameters tags return-tag source-body entry] :as definition}
+               (selected-definition operation implementation-op argument-count)]
+      (let [implementation (var-get receiver-var)
+            source-entry (:raster.core/source-entry (meta receiver-var))]
+        (when (and source-entry
+                   (identical? implementation (:implementation source-entry))
+                   (identical? source-var (:source-var source-entry))
+                   (= parameters (:params source-entry)) (= tags (:tags source-entry))
+                   (= return-tag (:return-tag source-entry))
+                   (= source-body (:source-body source-entry))
+                   (= (:name (meta source-var)) (:mangled-sym source-entry))
+                   (= (ns-name (:ns (meta source-var))) (:source-ns-name source-entry))
+                   (= (:typed-iface entry) (:typed-iface-name source-entry)))
+          (observe-selected-inputs! definition)
+          (let [carriers (mapv #(get types/tag->java-class (types/tag->iface-type %)) tags)
+                methods (filterv
+                         (fn [^java.lang.reflect.Method method]
+                           (and (= "invk" (.getName method))
+                                (java.lang.reflect.Modifier/isPublic (.getModifiers method))
+                                (not (java.lang.reflect.Modifier/isStatic (.getModifiers method)))
+                                (= Object (.getReturnType method))
+                                (= carriers (vec (.getParameterTypes method)))))
+                         (.getMethods (class implementation)))]
+            (when (= 1 (count methods))
+              {:definition definition :source-entry source-entry
+               :invocation-method (first methods)})))))))
+
+(defn- published-dispatch-definition [operation]
+  (let [generic (retained-global-var operation)
+        table (:raster.core/dispatch-table (meta generic))
+        owner (:raster.core/dispatch-owner (meta generic))]
+    (when (and generic table (identical? generic (:var owner))
+               (identical? table (:table owner))
+               (bound? generic) (identical? (var-get generic) (:root owner)))
+      {:generic-var generic :table table})))
+
+(defn observe-generic-dispatch!
+  "Retain an actually published generic dispatcher before selecting a method.
+   A replacement root cannot inherit the old table's interpretation. No method
+   is selected or executed; requires the existing compilation-input owner."
+  [operation]
+  (when *emission-inputs*
+    (when-let [{:keys [generic-var] :as definition} (published-dispatch-definition operation)]
+      (observe-definition-input! generic-var (:ns (meta generic-var)) operation)
+      definition)))
+
 (defn direct-selected-definition
   "Correspondence for an already selected plain mangled function call.
    The dispatcher and table must have their producer-owned identity; the exact
    registered invocation target must still occupy the mangled Var. This selects
    no overload, executes nothing and does not infer presence or argument types."
   [operation implementation-op argument-count]
-  (let [generic (retained-global-var operation)
-        source (retained-global-var implementation-op)
-        table (:raster.core/dispatch-table (meta generic))
-        owner (:raster.core/dispatch-owner (meta generic))]
-    (when (and generic source table
-               (identical? generic (:var owner))
-               (identical? table (:table owner))
-               (bound? generic) (identical? (var-get generic) (:root owner)))
+  (let [{generic :generic-var table :table} (published-dispatch-definition operation)
+        source (retained-global-var implementation-op)]
+    (when (and generic source table)
       (some
        (fn [{:keys [tags mangled-ns target-fn typed-target-fn] :as entry}]
          (let [name (types/mangle (symbol (name operation)) tags)
@@ -315,6 +463,6 @@
   nil)
 
 (def ^:dynamic *bytecode-compiler*
-  "When bound, compile-typed-impl! function for lazy JIT bytecode upgrade.
+  "When bound, compile-typed-entrypoint! factory for lazy JIT bytecode upgrade.
   Set by bytecode.clj at load time. Used by core.clj's do-bytecode-upgrade!."
   nil)

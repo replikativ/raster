@@ -22,6 +22,7 @@
             [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.passes.parallel.staged-contraction-admission :as staged-admission]
             [raster.compiler.passes.parallel.staged-scalar-body :as scalar-stage-body]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
             [raster.compiler.ir.index-algebra :as index-algebra]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -3259,11 +3260,6 @@
        (or (= :pure (effects/analyze-effect expression))
            (symbol? (alength-array expression)))))
 
-(defn- requires-ordered-evaluation?
-  [expression]
-  (boolean (some #{:checked-source-cast :source-reference-cast}
-                 (:flags (effects/descriptor expression)))))
-
 (defn- parallel-extent
   [expression]
   (cond
@@ -3865,12 +3861,13 @@
   "Peel a pure, total scalar let prefix from one counted store loop.
 
    The prefix will execute once per active map lane rather than once before the source loop, so
-   every initializer must satisfy the shared removable-expression contract and may not read
-   mutable array storage. Anything less stays as source control."
-  [expression]
+   every initializer must satisfy the shared removable-expression contract or the strict
+   scalar lowerer's totality proof in its lexical type environment, and may not read mutable
+   array storage. Anything less stays as source control."
+  [expression scalar-types]
   (cond
     (and (seq? expression) (= 'do (first expression)) (= 2 (count expression)))
-    (duplicable-counted-loop-branch (second expression))
+    (duplicable-counted-loop-branch (second expression) scalar-types)
 
     (and (seq? expression)
          (contains? '#{dotimes clojure.core/dotimes} (first expression)))
@@ -3880,11 +3877,17 @@
          (vector? (second expression)) (even? (count (second expression)))
          (= 3 (count expression)))
     (let [bindings (second expression)
-          initializers (take-nth 2 (rest bindings))]
-      (when (every? #(and (effects/removable-expr? %)
-                          (empty? (par/collect-aget-arrays %)))
-                    initializers)
-        (when-let [nested (duplicable-counted-loop-branch (nth expression 2))]
+          types (reduce
+                 (fn [types [symbol initializer]]
+                   (let [proof (when (ordered-scalar-expression? initializer)
+                                 (scalar-expression/checked-total-scalar-result initializer types))]
+                     (if (and (empty? (par/collect-aget-arrays initializer))
+                              (or (effects/removable-expr? initializer) proof))
+                       (cond-> (dissoc types symbol) proof (assoc symbol (:type proof)))
+                       (reduced nil))))
+                 scalar-types (partition 2 bindings))]
+      (when types
+        (when-let [nested (duplicable-counted-loop-branch (nth expression 2) types)]
           (update nested :bindings #(into (vec bindings) %)))))
 
     :else nil))
@@ -3896,7 +3899,7 @@
    the existing effect ownership pass still decides whether iterations are independent. Requiring
    a removable predicate preserves zero-trip behavior even though the predicate moves into the
    traversal. Two-arm algorithm choice remains program-control work."
-  [expression]
+  [expression scalar-types]
   (or
    (when (and (seq? expression)
               (contains? '#{if clojure.core/if} (first expression))
@@ -3905,7 +3908,7 @@
               (effects/removable-expr? (second expression))
               (empty? (par/collect-aget-arrays (second expression))))
      (when-let [{:keys [bindings loop]}
-                (duplicable-counted-loop-branch (nth expression 2))]
+                (duplicable-counted-loop-branch (nth expression 2) scalar-types)]
        (let [normalized (normalize-counted-store-loop loop)]
          (when (and (not= normalized loop) (par/par-map-void-form? normalized))
            (let [{:keys [idx bound body]} (par/extract-par-map-void-info normalized)
@@ -4048,7 +4051,8 @@
 
                        :else [state expression])
                      expression (or (flatten-counted-row-map expression) expression)
-                     expression (normalize-guarded-counted-store-loop expression)
+                     expression (normalize-guarded-counted-store-loop
+                                 expression (merge scalar-types local-scalar-types))
                      counted-expression (normalize-counted-store-loop expression)
                      [state expression] (if (= expression counted-expression)
                                           [state expression]
@@ -4092,7 +4096,7 @@
                      ;; not permission to move a new check before an earlier kernel.
                      checked-scalar? (and scalar-form
                                           (ordered-scalar-expression? scalar-form)
-                                          (requires-ordered-evaluation? scalar-form)
+                                          (effects/ordered-scalar-evaluation-required? scalar-form)
                                           (immutable-scalar-operands? scalar-form
                                                                       local-scalar-types))
                      checked-id (when checked-scalar?
@@ -4227,7 +4231,7 @@
                    ;; receives an SSA identity and is not generally CSE-safe; only a dominating
                    ;; identical check over immutable scalar operands may reuse that proved value.
                    (and (ordered-scalar-expression? canonical-extent)
-                        (requires-ordered-evaluation? canonical-extent))
+                        (effects/ordered-scalar-evaluation-required? canonical-extent))
                    (let [immutable-operands?
                          (immutable-scalar-operands? canonical-extent local-scalar-types)]
                      (if-let [extent-id (when immutable-operands?
@@ -4338,7 +4342,15 @@
                            ;; Empty-nonpositive rectangular domains are guarded products. The
                            ;; index algebra accepts only its exact sufficient-condition shape.
                            (some? (index-algebra/monomial expression)))
-                       (provably-pure-scalar? expression)
+                       ;; A preceding successful checked computation also
+                       ;; establishes an algebraic SSA fact. Keep its ordered
+                       ;; equation (selected-scalars roots the check); using the
+                       ;; fact for index proofs does not make it removable or
+                       ;; move a fresh check across a device effect.
+                       (or (provably-pure-scalar? expression)
+                           (and (ordered-scalar-expression? expression)
+                                (effects/ordered-scalar-evaluation-required? expression)
+                                (immutable-scalar-operands? expression local-scalar-types)))
                        ;; a definition that reads an array is not an invariant extent
                        (empty? (par/collect-aget-arrays expression)))
               (or nonnegative-clamp-source
@@ -4371,7 +4383,7 @@
           (assoc :before-parallel? false)
           (or (not= :scalar (:kind description))
               (and (not (effects/removable-expr? expression))
-                   (not (requires-ordered-evaluation? expression))))
+                   (not (effects/ordered-scalar-evaluation-required? expression))))
           (assoc :stageable-prefix? false)
           scalar-dtype (assoc-in [:local-scalar-types symbol] scalar-dtype)
           allocation-dtype (assoc-in [:array-types symbol] allocation-dtype)
@@ -4509,7 +4521,8 @@
     :scalar (and (not (contains-parallel-form? (:expr description)))
                  (or (and (ordered-scalar-expression? (:expr description))
                           (or (effects/removable-expr? (:expr description))
-                              (:source-prefix? description)))
+                              (:source-prefix? description)
+                              (:scalar-totality description)))
                      (generated-scaffolding? description physical-outputs)))
     :map (let [target-dtype (or (:elem-type description)
                                 (:result-dtype description) :double)]
@@ -4585,7 +4598,7 @@
            ;; occurred, the same scalar remains a decline until the graph represents
            ;; the required device-to-host sequencing explicitly.
            (not (contains-parallel-form? (:expr description)))
-           (or (not (requires-ordered-evaluation? (:expr description)))
+           (or (not (effects/ordered-scalar-evaluation-required? (:expr description)))
                (and (:before-parallel? description)
                     ;; This value becomes a typed input of the following island. Its
                     ;; source declaration/metadata must therefore attest the ABI; the
@@ -5468,7 +5481,7 @@
         (allocation-capacity-scalars descriptions physical-outputs by-symbol)
         ordered-evaluation-roots
         (into #{} (keep (fn [[symbol description]]
-                          (when (requires-ordered-evaluation? (:expr description)) symbol)))
+                          (when (effects/ordered-scalar-evaluation-required? (:expr description)) symbol)))
               by-symbol)
         roots (set (concat outputs
                            allocation-capacity-roots
@@ -5689,9 +5702,18 @@
                     (nil? (:logical-layout prior))
                     (= 1 (count (:shape prior)) (count (:shape contract)))
                     (extent-proof/same-volume? extent-environment
-                                               (first (:shape prior)) (:shape contract))))]
+                                               (first (:shape prior)) (:shape contract))))
+           ;; An identical seed needs no new proof or reconstruction. Keep
+           ;; the original staging value; final dialect validation remains
+           ;; responsible for validating the complete published contract.
+           refined (when-not (= prior contract) (av/merge-refinement prior contract))]
        (cond
          (= prior contract) values
+         ;; Preserve independently supplied input constraints when ordinary
+         ;; inference contributes a wider fact about the same value. Domain
+         ;; declarations are restricted to public scalar inputs below, where
+         ;; the invocation boundary must guard them before numerical use.
+         refined (assoc values id refined)
          ;; Equality proves compatibility, not that the consumer's dimension spelling is
          ;; available at the producer. Replacing an allocation's retained extent with a
          ;; later `(alength allocation)` binder creates a circular invocation dependency.
@@ -5894,6 +5916,29 @@
                                   (declared-type array-types sym))}))))
           descriptions)))
 
+(defn- refine-scalar-domain-descriptions
+  "Check source-ordered scalar regions with the existing strict lowerer.
+   Input domains are explicit entry constraints validated by form->program*;
+   aliases/locals receive only the range of their own successful computation."
+  [descriptions scalar-types values]
+  (:descriptions
+   (reduce
+    (fn [{:keys [types ranges] :as state} {:keys [kind sym expr scalar-dtype] :as description}]
+      (let [proof (when (and (= :scalar kind) scalar-dtype
+                             (ordered-scalar-expression? expr))
+                    (scalar-expression/checked-total-scalar-result expr types ranges))
+            proof (when (= scalar-dtype (:type proof)) proof)]
+        (cond-> (-> state
+                    (update :descriptions conj (cond-> description proof (assoc :scalar-totality proof)))
+                    (update :ranges dissoc sym))
+          scalar-dtype (assoc-in [:types sym] scalar-dtype)
+          (:range proof) (assoc-in [:ranges sym] (:range proof)))))
+    {:descriptions [] :types scalar-types
+     :ranges (into {} (keep (fn [[id value]]
+                             (when-let [domain (get-in value [:attributes :scalar-domain])]
+                               [id domain]))) values)}
+    descriptions)))
+
 (defn- source-storage-analysis
   "Establish allocation-owned extents before a consumer can infer element shapes.
    Allocation capacity is not permission to flatten a declared logical layout. Reuse the same
@@ -5902,6 +5947,7 @@
   (let [descriptions (normalize-extents
                       (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
                       shape-equalities values)
+        descriptions (refine-scalar-domain-descriptions descriptions scalar-types values)
         source-scalar-types
         (reduce (fn [types {:keys [kind sym scalar-dtype]}]
                   (if (and (= :scalar kind) scalar-dtype)
@@ -6099,12 +6145,27 @@
                original-source)
        :rewrites (:rewrites rebuilt) :declines (:declines rebuilt)}))))
 
+(defn ^:no-doc validate-public-scalar-domains!
+  [source public-parameters scalar-types values]
+  (let [public (set public-parameters)
+        rebound (if (form/binding-form? source) (set (take-nth 2 (second source))) #{})]
+    (doseq [[id value] values :when (contains? (:attributes value) :scalar-domain)]
+      (av/validate! value)
+      (when-not (and (contains? public id) (not (contains? rebound id))
+                     (contains? scalar-types id)
+                     (= (dtype/canon (:dtype value)) (dtype/canon (get scalar-types id))))
+        (fail! :source-scalar-domain-boundary
+               "a supplied scalar domain requires an unrebound declared public scalar parameter"
+               {:id id :value value :public-parameters public-parameters
+                :declared-dtype (get scalar-types id)})))))
+
 (defn- form->program*
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
-                 preserve-declared-array-storage? host-scalars?]
+                 preserve-declared-array-storage? host-scalars? public-parameters]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
-    (let [_ (validate-declared-array-values! array-types values)
+    (let [_ (validate-public-scalar-domains! source public-parameters scalar-types values)
+          _ (validate-declared-array-values! array-types values)
           [_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)

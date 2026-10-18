@@ -62,8 +62,8 @@
 (def ^:private simd-pass-fn
   (delay (requiring-resolve 'raster.compiler.backend.jvm.par-simd/simd-pass)))
 
-(def ^:private compile-typed-impl-fn
-  (delay (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-impl!)))
+(def ^:private compile-typed-entrypoint-fn
+  (delay (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-entrypoint!)))
 
 (def ^:private inline-ad-applications-fn
   (delay (requiring-resolve 'raster.compiler.passes.scalar.inline/inline-ad-applications)))
@@ -380,11 +380,13 @@
                         body source-ns)
           revision (dispatch/compiler-definition-revision)
           inputs (atom {:static [] :values []})
-          implementation
+          entrypoint
           (binding [me/*emission-inputs* inputs]
             (emitter (str class-name (gensym "__owned")) params tags return-tag
                      body source-ns typed-interface (str (ns-name source-ns)) (str mangled-sym)))
-          emission {:backend :jvm-bytecode :implementation implementation
+          implementation (:implementation entrypoint)
+          _ (when implementation (me/assert-typed-entrypoint! entrypoint implementation))
+          emission {:backend :jvm-bytecode :implementation implementation :entrypoint entrypoint
                     :params params :tags tags :return-tag return-tag :body body :source-ns source-ns
                     :typed-interface typed-interface
                     :dependency-snapshots (into dependencies (:values @inputs))
@@ -434,7 +436,7 @@
                               "_" (bit-and (hash effective-body) 0x7FFFFFFF)
                               "_" (mod (System/nanoTime) 1000000))
               {:keys [implementation emission]}
-              (emit-owned-bytecode! @compile-typed-impl-fn class-name params tags return-tag
+              (emit-owned-bytecode! @compile-typed-entrypoint-fn class-name params tags return-tag
                                     effective-body source-ns typed-iface-name mangled-sym)
               impl implementation]
           (when impl
@@ -921,18 +923,24 @@
                   `(def ~(vary-meta mangled-impl-var assoc :tag typed-iface-name)
                      (new ~mangled-impl-type))
               ;; Mark for JIT compilation — walked body retrieved from registry
-                  `(let [reg# (walked-body-for ~(str mangled))]
+                  `(let [reg# (walked-body-for ~(str mangled))
+                         source-entry# {:implementation ~mangled-impl-var
+                                        :source-var (var ~mangled)
+                                        :mangled-sym '~mangled
+                                        :params '~params
+                                        :tags '~tags
+                                        :annotations '~annotations
+                                        :return-tag '~(or ret-tag 'Object)
+                                        :source-body (:source-body reg#)
+                                        :walked-body (or (:walked-body-typed reg#) (:walked-body reg#))
+                                        :source-ns-name '~(ns-name *ns*)
+                                        :typed-iface-name '~typed-iface-name}]
+                     ;; Source ownership is independent of a request for JVM
+                     ;; code generation. Both owners share one immutable spec;
+                     ;; native compilation must not need to realize the JIT.
+                     (alter-meta! (var ~mangled-impl-var) assoc ::source-entry source-entry#)
                      (when *compile-deftm-bytecode?*
-                       (alter-meta! (var ~mangled-impl-var) assoc
-                                    ::jit-spec {:mangled-sym '~mangled
-                                                :params '~params
-                                                :tags '~tags
-                                                :annotations '~annotations
-                                                :return-tag '~(or ret-tag 'Object)
-                                                :source-body (:source-body reg#)
-                                                :walked-body (or (:walked-body-typed reg#) (:walked-body reg#))
-                                                :source-ns-name '~(ns-name *ns*)
-                                                :typed-iface-name '~typed-iface-name})))]))
+                       (alter-meta! (var ~mangled-impl-var) assoc ::jit-spec source-entry#)))]))
        ;; Register: typed-target-fn triggers lazy JIT on first call,
        ;; then routes through the -impl (which after JIT implements IFn).
        ;; Julia model: first dispatch call triggers compilation.

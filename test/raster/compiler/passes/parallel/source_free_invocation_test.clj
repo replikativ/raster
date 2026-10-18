@@ -480,6 +480,29 @@
                                   :source-free-shape-projections])))
       (is (empty? (get-in promoted [:attributes :invocation-plan :steps]))))))
 
+(deftest source-free-domains-remain-guarded-through-promotion
+  (let [base (pure-map)
+        bounded (change-facts base #(assoc-in % [:values 'n :attributes :scalar-domain]
+                                              {:lower 2 :upper 8}))
+        promoted (route/promote-typed-algorithm bounded)
+        plan (get-in promoted [:attributes :invocation-plan])
+        parameter (some #(when (= 'n (:symbol %)) %) (:parameters plan))
+        input (double-array [1.0 2.0 3.0])
+        widened (assoc-in (:value parameter) [:attributes :scalar-domain] {:lower 0 :upper 10})
+        changed (-> plan
+                    (update :parameters
+                            #(mapv (fn [p] (if (= (:id parameter) (:id p))
+                                             (assoc p :value widened) p)) %))
+                    (assoc-in [:values (:id parameter)] widened))]
+    (is (= {:lower 2 :upper 8} (get-in parameter [:value :attributes :scalar-domain])))
+    (is (= {:type :long :value 3}
+           (get-in (materialization/materialize plan [input 3] nil) [:program-scalars 'n])))
+    (is (= :invocation-materialization-scalar
+           (reason #(materialization/materialize plan [input 9] nil))))
+    (is (= :invocation-program-input-contract
+           (reason #(invocation/validate-against! changed promoted)))
+        "a copied invocation cannot weaken the guard required by the numerical program")))
+
 (deftest source-free-promotion-materializes-through-the-existing-flat-boundary
   (let [promoted (route/promote-typed-algorithm (pure-map))
         plan (get-in promoted [:attributes :invocation-plan])

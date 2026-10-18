@@ -56,6 +56,33 @@
             "a retained parameter's domain still holds when it is not a program input")))
     (is (= 1 @calls))))
 
+(deftest declared-scalar-domains-guard-before-dependent-evaluation
+  (let [domain {:lower 2 :upper 8}
+        value (av/tensor {:dtype :long :shape [] :attributes {:scalar-domain domain}})
+        plan (invocation/from-prefix
+              {:id :bounded-entry :parameters '[n] :parameter-values {'n value}
+               :bindings '[[m (inc n)]] :binding-values {'m (scalar :long)}
+               :program-values {'m (scalar :long)} :program-inputs '[m] :program-outputs '[m]})
+        calls (atom 0)
+        evaluate (fn [_ operands]
+                   (swap! calls inc)
+                   {:type :long :value (inc (:value (get operands 'n)))})]
+    (doseq [argument [1 9 {:type :long :value 1} {:type :long :value 9}]]
+      (is (= :invocation-materialization-scalar
+             (try (materialization/materialize plan [argument] evaluate)
+                  nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (is (zero? @calls))
+    (doseq [argument [2 8 {:type :long :value 2} {:type :long :value 8}]]
+      (let [result (materialization/materialize plan [argument] evaluate)
+            n (if (map? argument) (:value argument) argument)
+            parameter-id (:id (first (:parameters plan)))]
+        (is (= (inc n) (get-in result [:program-scalars 'm :value])))
+        (is (= :invocation-materialization-scalar
+               (try (materialization/validate!
+                     (assoc-in result [:values parameter-id :value] 9))
+                    nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+    (is (= 4 @calls))))
+
 (defn- fixture-plan []
   (let [public-array (array-value :double '(extent u0))
         internal-array (array-value :double 'n)]

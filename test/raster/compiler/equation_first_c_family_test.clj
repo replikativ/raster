@@ -24,6 +24,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
@@ -54,6 +55,77 @@
 (def ^:private hip-matrix-target :hip:equation-first-matrix-test)
 (def ^:private ocl-target :ocl:equation-first-source-test)
 (def ^:private intel-matrix-target :ocl:equation-first-intel-matrix-test)
+
+(deftest public-source-scalar-domains-reach-the-invocation-guard
+  (let [domain {:lower 1 :upper 8}
+        value (av/tensor {:dtype :long :shape [] :attributes {:scalar-domain domain}})
+        options {:target ocl-target :dtype :float :values {'n value}}
+        compilation (equation-first/compile #'scalar-helpers/map-cast-helper options)
+        plan (get-in compilation [:semantic :attributes :invocation-plan])
+        parameter (some #(when (= 'n (:symbol %)) %) (:parameters plan))]
+    (is (= domain (get-in parameter [:value :attributes :scalar-domain])))
+    (is (seq (:kernels compilation)))
+    (doseq [n [1 3 8]]
+      (is (= {:type :long :value n}
+             (get-in (materialization/materialize plan [(float-array n) n] nil)
+                     [:program-scalars 'n]))))
+    (doseq [n [0 9]]
+      (is (= :invocation-materialization-scalar
+             (try (materialization/materialize plan [(float-array 9) n] nil)
+                  nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (let [prepare #(compiled/lower #'scalar-helpers/map-cast-helper %
+                                  (assoc options :compiler :equation-first))]
+      (is (some? (prepare [(float-array 3) 3])))
+      (is (some? (prepare [(float-array 4) 4]))
+          "changed valid dimensions share the same declared domain")
+      (is (= :invocation-materialization-scalar
+             (try (prepare [(float-array 9) 9]) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+          "a cached compilation does not bypass the fresh invocation guard"))
+    (doseq [values [{'rogue value}
+                   {'n (av/tensor {:dtype :int :shape [] :attributes {:scalar-domain domain}})}]]
+      (is (= :source-scalar-domain-boundary
+             (try (equation-first/compile #'scalar-helpers/map-cast-helper (assoc options :values values))
+                  nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+          "only declared public scalar inputs may impose a guarded source precondition"))))
+
+(deftest prepared-source-domains-share-buckets-without-freezing-runtime-values
+  ;; A fresh wrapper identity isolates this observation without clearing anyone's cache.
+  (let [observed (atom [])
+        original equation-first/compile
+        options {:compiler :equation-first :target ocl-target :dtype :float}
+        prepare (fn [n extra]
+                  (compiled/lower #'scalar-helpers/map-cast-helper
+                                  [(float-array 8) n] (merge options extra)))]
+    (with-redefs [equation-first/compile
+                  (fn [source opts & more]
+                    (swap! observed conj (get-in opts [:values 'n :attributes :scalar-domain]))
+                    (apply original source opts more))]
+      (let [first-prepared (prepare 3 {})
+            same-bucket (prepare 4 {})
+            next-bucket (prepare 5 {})]
+        (is (= [{:lower 1 :upper 4} {:lower 1 :upper 8}] @observed))
+        (is (false? (get-in (compiled/preparation-report first-prepared) [:template :cache-hit?])))
+        (is (true? (get-in (compiled/preparation-report same-bucket) [:template :cache-hit?])))
+        (is (false? (get-in (compiled/preparation-report next-bucket) [:template :cache-hit?])))
+        (is (not= (:lowering first-prepared) (:lowering same-bucket))
+            "a shared compiler template still materializes fresh runtime dimensions"))
+      (let [domain {:lower 2 :upper 7}
+            explicit {:values {'n (av/tensor {:dtype :long :shape []
+                                             :attributes {:scalar-domain domain}})}}]
+        (is (some? (prepare 3 explicit)))
+        (is (= domain (peek @observed)))
+        (is (= :invocation-materialization-scalar
+               (try (prepare 8 explicit) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is (= 3 (count @observed))
+            "an explicit contract is neither replaced nor silently widened"))
+      (doseq [invalid [1.5 9223372036854775808N]]
+        (is (= :invocation-materialization-scalar
+               (try (prepare invalid {}) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+      (is (= 3 (count @observed))
+          "malformed integral arguments fail before compiling a specialization"))))
 
 (deftest equation-template-owns-static-proof-with-fresh-final-validation
   (compiled/clear-compilation-cache!)

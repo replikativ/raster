@@ -7,6 +7,9 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index]
             [raster.compiler.passes.parallel.patterns :as patterns]
@@ -20,6 +23,82 @@
      {:array-types {'x :float} :arrays #{'x} :scalar-types {'i :int}
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
+
+(deftest enforced-invocation-domains-compose-with-scalar-range-lowering
+  (let [domain {:lower 2 :upper 8}
+        parameter (av/tensor {:dtype :long :shape [] :attributes {:scalar-domain domain}})
+        result (av/tensor {:dtype :long :shape []})
+        expression (with-meta '(clojure.core/* n n) {:raster.type/tag 'long})
+        plan (invocation/from-prefix
+              {:id :guarded-product :parameters '[n] :parameter-values {'n parameter}
+               :bindings [['product expression]] :binding-values {'product result}
+               :program-values {'product result} :program-inputs '[product]
+               :program-outputs '[product]})
+        actual (first (:parameters (invocation/validate! plan)))
+        options {:arrays #{} :array-types {} :scalar-types {'n (:dtype (:value actual))}
+                 :require-source-types? true
+                 :lower-index (fn [& _] (throw (AssertionError. "scalar proof used an index")))
+                 :decline! (fn [rule message data]
+                             (throw (ex-info message (assoc data :rule rule))))}
+        lower (fn [domains]
+                ((:lower (scalar/make-lowerer (assoc options :scalar-ranges domains)))
+                 expression :long {'n :long}))
+        generic (lower {})
+        guarded (lower {'n (get-in actual [:value :attributes :scalar-domain])})
+        calls (atom 0)
+        evaluate (fn [_ operands]
+                   (swap! calls inc)
+                   (let [n (:value (get operands 'n))]
+                     {:type :long :value (* n n)}))]
+    (is (= :trap (get-in generic [:operations 0 :expression :options :overflow])))
+    (is (= :no-overflow (get-in guarded [:operations 0 :expression :options :overflow])))
+    (is (= {:lower 4 :upper 64} (:range guarded)))
+    (doseq [n [1 9 Long/MAX_VALUE]]
+      (is (= :invocation-materialization-scalar
+             (try (materialization/materialize plan [n] evaluate)
+                  nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (is (zero? @calls))
+    (doseq [n (range 2 9)]
+      (is (= (* n n)
+             (get-in (materialization/materialize plan [n] evaluate)
+                     [:program-scalars 'product :value]))))
+    (is (= 7 @calls))))
+
+(deftest shared-totality-proof-is-stronger-than-normal-return-presence
+  (let [expression (with-meta '(clojure.core/* n n) {:raster.type/tag 'long})
+        types {'n :long}
+        ranges {'n {:lower 2 :upper 8}}]
+    (is (= {:type :long} (scalar/checked-primitive-result expression types)))
+    (is (nil? (scalar/checked-total-scalar-result expression types)))
+    (is (= {:type :long :range {:lower 4 :upper 64}}
+           (scalar/checked-total-scalar-result expression types ranges)))
+    (is (nil? (scalar/checked-total-scalar-result '(fixture/opaque n) types ranges)))
+    (is (nil? (scalar/checked-total-scalar-result
+               '(loop* [i 0] (recur i)) types ranges))
+        "absence of arithmetic traps does not prove termination")
+    (is (nil? (scalar/checked-total-scalar-result
+               '(let* [n 9223372036854775807] (clojure.core/+ n 1)) types ranges))
+        "a shadowed local cannot borrow the public parameter's narrow range")
+    (is (= :invalid-scalar-range-proof
+           (try (scalar/checked-total-scalar-result
+                 expression types {'n {:lower 0 :upper 9223372036854775808N}})
+                nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        "malformed owner evidence is an error, not optional coverage")))
+
+(deftest scalar-totality-requires-a-proved-safe-divisor
+  (let [expression (with-meta '(clojure.core/quot n d) {:raster.type/tag 'long})
+        types {'n :long 'd :long}]
+    (is (= {:type :long :range {:lower -9 :upper 9}}
+           (scalar/checked-total-scalar-result
+            expression types {'n {:lower -9 :upper 9} 'd {:lower 1 :upper 4}})))
+    (doseq [domain [{:lower 0 :upper 4} {:lower -1 :upper 1}]]
+      (is (nil? (scalar/checked-total-scalar-result
+                 expression types {'n {:lower -9 :upper 9} 'd domain}))))
+    (is (nil? (scalar/checked-total-scalar-result expression types)))
+    (is (nil? (scalar/checked-total-scalar-result
+               (list 'double expression) types
+               {'n {:lower -9 :upper 9} 'd {:lower 0 :upper 4}}))
+        "a floating consumer cannot erase the integral producer's exception")))
 
 (deftest scalar-realization-policy-is-closed-and-canonical
   (is (= {:overrides {}} (numerics/validate-scalar-math-policy! nil)))

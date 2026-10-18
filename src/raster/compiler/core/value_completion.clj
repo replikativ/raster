@@ -5,12 +5,17 @@
    explicit primitive input context preserves the original expected-parameter
    conversion under a retained source compilation policy. Neither is inferred
    from a scalar tag or permission to reorder calls or enable an AD rule."
-  (:require [raster.compiler.core.util :as util]))
+  (:require [raster.compiler.core.util :as util]
+            [raster.compiler.core.op-descriptor :as descriptor]))
 
 (def completion-symbol
   ;; Reserved IR syntax, deliberately not this namespace's constructor Var.
   ;; Unprojected terms must not run the constructor as if it were a value op.
   'raster.compiler.ir.value-completion/complete-value)
+
+;; Reserved IR is not an undevirtualized source function. This facet only
+;; informs the existing census; consumers still validate the complete term.
+(descriptor/register-op-descriptor! completion-symbol {:compiler-ir? true})
 
 (def object-input-contract
   "An operand originally consumed in JVM Object context. Unknown primitive or

@@ -480,21 +480,6 @@
     (when (= (count pairs) (count typed-symbols))
       (util/subst-syms typed-symbols (first (:body-results info))))))
 
-(defn- nontrapping-scalar-operations?
-  "Audit a complete emitted scalar operation tree with the existing totality boundary."
-  [operations]
-  (let [nodes (tree-seq #(or (map? %) (sequential? %))
-                        #(if (map? %) (vals %) (seq %))
-                        operations)]
-    (not-any?
-     (fn [operation]
-       (let [expression (:expression operation)
-             result-type (:result-type expression)]
-         (or (= :trap (get-in expression [:options :overflow]))
-             (and (contains? #{:byte :int :long} result-type)
-                  (contains? #{:quot :rem :mod :div} (:op expression))))))
-     nodes)))
-
 (defn- typed-scalar-expression-total?
   "Ask the existing strict typed scalar lowerer to certify compound conversion boundaries.
 
@@ -514,26 +499,7 @@
                               (= scalar-dtype (dtype/canon scalar-dtype))))
                        scalar-types)
                (keyword? result-dtype) (= result-dtype (dtype/canon result-dtype)))
-      (try
-        (let [decline! (fn [rule message data]
-                         (throw (ex-info message (assoc data :reason rule))))
-              lowerer (scalar-expression/make-lowerer
-                       {:arrays #{} :array-types {} :scalar-types scalar-types
-                        :index-scope #{} :source-region [expression]
-                        :require-source-types? true
-                        :conversion-policy scalar-conversion/policy
-                        :lower-index (fn [& _]
-                                       (decline! :uniform-scalar-index
-                                                 "scalar closure arithmetic cannot lower an index"
-                                                 {:expression expression}))
-                        :decline! decline! :id-prefix "uniform-proof"})
-              derived ((:source-type lowerer) expression scalar-types)
-              lowered (when derived ((:lower lowerer) expression derived scalar-types))
-              operations (:operations lowered)
-              trapping? (not (nontrapping-scalar-operations? operations))]
-          (and (= result-dtype derived (:type lowered))
-               (not trapping?)))
-        (catch Exception _ false)))))
+      (= result-dtype (:type (scalar-expression/checked-total-scalar-result expression scalar-types))))))
 
 (defn- removable-typed-scalar-expression?
   [facts info expression]
@@ -1459,7 +1425,7 @@
           result-dtype (:dtype projected)
           operations (concat (:operations lowered) (:operations body-value))]
         (and lowered body-value (= result-dtype body-derived (:type body-value))
-             (nontrapping-scalar-operations? operations)))
+             (scalar-expression/nontrapping-operations? operations)))
       (catch clojure.lang.ExceptionInfo exception
         (if (or (:device-scalar-eligibility (ex-data exception))
                 (= :typed-soac-device-scalar-subset (:reason (ex-data exception))))

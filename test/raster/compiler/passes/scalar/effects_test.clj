@@ -1,7 +1,85 @@
 (ns raster.compiler.passes.scalar.effects-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.op-descriptor :as descriptor]))
+
+(deftest object-context-completion-inherits-evaluation-not-sharing-permission
+  (doseq [operand [nil 1.0
+                   (with-meta '(raster.numeric/+ x y) {:raster.type/tag 'long})
+                   '(clojure.core/double-array -1)
+                   '(clojure.core/double-array n)
+                   '(fixture/unknown x)]]
+    (let [expression (completion/complete-value completion/object-input-contract operand)]
+      (is (= (effects/descriptor operand) (effects/descriptor expression)))
+      (is (= (effects/removable-expr? operand) (effects/removable-expr? expression)))
+      (is (false? (effects/cse-safe-expr? expression))
+          "separate Object materializations may have distinct boxing identities")))
+  (doseq [expression [(completion/complete-value
+                      (completion/primitive-input-contract Long/TYPE {:unchecked-math false}) nil)
+                     (list completion/completion-symbol {:policy :unknown} nil)]]
+    (is (not (effects/removable-expr? expression)))))
+
+(deftest checked-integral-evaluation-is-not-external-impurity
+  (let [checked (with-meta '(raster.numeric/+ x y) {:raster.type/tag 'long})
+        wrapped (with-meta '(clojure.core/unchecked-add x y) {:raster.type/tag 'long})
+        floating (with-meta '(raster.numeric/+ x y) {:raster.type/tag 'double})
+        source (effects/descriptor checked)]
+    (is (= :pure (:effect source)))
+    (is (contains? (:flags source) :checked-source-arithmetic))
+    (is (not (effects/removable-expr? checked)))
+    (is (not (contains? (:flags (effects/descriptor wrapped)) :checked-source-arithmetic)))
+    (is (not (contains? (:flags (effects/descriptor floating)) :checked-source-arithmetic)))
+    (is (contains? (:flags (effects/descriptor (list 'clojure.core/float checked)))
+                   :checked-source-arithmetic)
+        "a floating consumer does not erase the original checked integral operation")))
+
+(deftest literal-range-proof-discharge-is-separate-from-source-wrapping
+  (doseq [[operation arguments trapped?]
+          [['clojure.core/+ [1 2] false]
+           ['clojure.core/+ [Long/MAX_VALUE 1] true]
+           ['clojure.core/* [2 3] false]
+           ['clojure.core/* [Long/MAX_VALUE 2] true]
+           ['clojure.core/unchecked-add [Long/MAX_VALUE 1] false]]]
+    (let [expression (with-meta (list* operation arguments) {:raster.type/tag 'long})]
+      (is (= trapped? (contains? (:flags (effects/descriptor expression)) :checked-source-arithmetic))))))
+
+(deftest shared-ordering-obligations-distinguish-total-values
+  (doseq [expression [(with-meta '(raster.numeric/* rows width) {:raster.type/tag 'long})
+                      '(clojure.core/int n)]]
+    (is (effects/ordered-scalar-evaluation-required? expression)))
+  (doseq [expression [nil 1.0 '(clojure.core/double-array 3)
+                      (with-meta '(clojure.core/unchecked-multiply rows width)
+                        {:raster.type/tag 'long})]]
+    (is (not (effects/ordered-scalar-evaluation-required? expression)))))
+
+(deftest partial-divisor-evaluation-is-not-external-impurity
+  (doseq [expression [(with-meta '(clojure.core/quot x y) {:raster.type/tag 'long})
+                      '(clojure.core/quot x y)
+                      (with-meta '(clojure.core/rem x y) {:raster.type/tag 'double})
+                      '(clojure.core/quot 1 0)]]
+    (is (= :pure (effects/analyze-effect expression)))
+    (is (effects/ordered-scalar-evaluation-required? expression))
+    (is (not (effects/removable-expr? expression))))
+  (doseq [expression [(with-meta '(clojure.core/quot x 2) {:raster.type/tag 'long})
+                      (with-meta '(clojure.core// x y) {:raster.type/tag 'double})]]
+    (is (not (effects/ordered-scalar-evaluation-required? expression)))))
+
+(deftest array-extent-obligations-use-the-source-number-narrowing
+  (doseq [[extent checked?] [[0 false] [3 false] [-1 true] [2147483648 true]
+                             [4294967296 false] [4294967299 false] [-4294967296 false] ['n true]]]
+    (let [expression (list 'clojure.core/double-array extent)]
+      (is (= checked? (contains? (:flags (effects/descriptor expression)) :source-array-extent)))))
+  (is (not (contains? (:flags (effects/descriptor '(quote (clojure.core/double-array -1))))
+                      :source-array-extent))))
+
+(deftest source-semantic-flags-are-not-stale-effect-cache-entries
+  (let [expression (with-meta '(raster.numeric/+ x y) {:raster.type/tag 'long})]
+    (is (contains? (:flags (effects/descriptor expression)) :checked-source-arithmetic))
+    (with-redefs [intrinsics/source-overflow-policy (constantly :wrap)]
+      (is (not (contains? (:flags (effects/descriptor expression)) :checked-source-arithmetic))))
+    (is (contains? (:flags (effects/descriptor expression)) :checked-source-arithmetic))))
 
 (deftest storage-contracts-deny-cse-without-body-analysis
   (doseq [contract [{:buffer-write {:mode :overwrite :buf-arg-idx 0}}
@@ -72,8 +150,10 @@
           {:raster.op/original 'raster.numeric/*
            :raster.type/tag 'long :tag 'long})
         unknown-call '(.invk user/unknown-impl rows width)]
-    (is (= {:effect :pure :flags #{}} (effects/descriptor pure-call)))
-    (is (effects/removable-expr? pure-call))
+    (is (= :pure (:effect (effects/descriptor pure-call))))
+    (is (contains? (:flags (effects/descriptor pure-call)) :checked-source-arithmetic))
+    (is (not (effects/removable-expr? pure-call))
+        "external purity does not erase a checked Long multiplication")
     (is (not (effects/removable-expr? unknown-call))
         "an invk without certified semantic metadata remains conservative")))
 
@@ -83,8 +163,10 @@
           '(.invk raster.arrays/zeros-like_m_floats_long-impl exemplar n)
           {:raster.op/original 'raster.arrays/zeros-like
            :raster.type/tag 'floats :tag 'floats})]
-    (is (effects/removable-expr? allocation)
-        "an unused local allocation may be eliminated")
+    (is (= :pure (:effect (effects/descriptor allocation))))
+    (is (contains? (:flags (effects/descriptor allocation)) :source-allocation-evaluation))
+    (is (not (effects/removable-expr? allocation))
+        "an allocation facet alone does not prove that a dynamic extent is valid")
     (is (not (effects/cse-safe-expr? allocation))
         "two live allocations may not share mutable identity")))
 
@@ -135,5 +217,6 @@
                                    :raster.type/tag 'long :tag 'long})]
     (is (= form certified))
     (is (not (effects/removable-expr? form)))
-    (is (effects/removable-expr? certified))
+    (is (= :pure (:effect (effects/descriptor certified))))
+    (is (contains? (:flags (effects/descriptor certified)) :checked-source-arithmetic))
     (is (not (effects/removable-expr? form)) "a cached certified result is not reused")))

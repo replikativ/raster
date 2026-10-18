@@ -1730,6 +1730,16 @@
     (is (= :unique (-> parts :region :body-results first dialect/effect-parts :conflict)))
     (is (= algorithm (dialect/validate! algorithm)))))
 
+(deftest guarded-loop-normalization-keeps-unproved-divisor-checks-in-source-control
+  (let [source '(if (clojure.core/> norm max-norm)
+                 (let* [scale (clojure.core/quot norm max-norm)]
+                   (dotimes [i n] (clojure.core/aset grads i scale)))
+                 nil)]
+    (doseq [types [{'norm :long 'max-norm :long 'n :long}
+                   {'norm :double 'max-norm :double 'n :long}]]
+      (is (= source (#'frontend/normalize-guarded-counted-store-loop source types))
+          "quotient checks zero even for floating operands, including zero-trip loops"))))
+
 (deftest a-nested-scalar-reduction-is-lifted-and-fused-before-a-guarded-effect
   (let [reduction (with-meta
                     '(raster.par/reduce acc (float 0.0) i n
@@ -2378,6 +2388,26 @@
           "device effects can change read operands; no dominating immutable value is proven")
       (is (nil? (frontend/form->program array-backed options))
           "the second array-backed check cannot move before the intervening device effect"))))
+
+(deftest repeated-checked-arithmetic-requires-the-same-dominating-inputs
+  (let [product (fn [right]
+                  (with-meta (list 'clojure.core/* 'n right) {:raster.type/tag 'long}))
+        options {:dtype :double :scalar-types {'n :long 'm :long 'k :long}
+                 :array-types {'out-a :double 'out-b :double}}
+        source (fn [right]
+                 (list 'let*
+                       ['first-count (product 'm)
+                        'a '(raster.par/map! out-a i first-count double 1.0)
+                        'second-count (product right)
+                        'b '(raster.par/map! out-b j second-count double 2.0)] 'b))
+        repeated (frontend/normalize-source (source 'm) options)
+        pairs (into {} (map vec) (partition 2 (second repeated)))
+        distinct (frontend/normalize-source (source 'k) options)]
+    (is (= (product 'm) (pairs 'first-count)))
+    (is (= 'first-count (pairs 'second-count)))
+    (is (some? (frontend/form->program repeated options)))
+    (is (nil? (frontend/form->program distinct options))
+        "a new overflow check may not move before an earlier device effect")))
 
 (deftest fixed-rng-inputs-keep-their-ordered-checked-conversions
   (let [options {:dtype :long :array-types {'seeds :long}

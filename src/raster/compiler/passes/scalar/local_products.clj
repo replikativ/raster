@@ -9,6 +9,7 @@
             [raster.ad.accumulation :as accumulation]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.value-product :as value-product]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
@@ -98,6 +99,16 @@
 
 (defn- binding-fact [scope id init]
   (let [known (or (fact scope init)
+                  ;; An Object completion returns the original object, including
+                  ;; nil. Forward only independently established result facts;
+                  ;; retain the completion and its original evaluation in IR.
+                  ;; This is NOT permission to discharge its materialization or
+                  ;; to treat a primitive/checkcast context as an Object alias.
+                  (when-let [{:keys [contract operand]} (completion/canonical-parts init)]
+                    (when (= completion/object-input-contract contract)
+                      (select-keys (binding-fact scope id operand)
+                                   [:literal :presence :present? :scalar-type
+                                    :producer-scalar-type :array-tag])))
                   ;; A real primitive conversion cannot return nil. This is a
                   ;; normal-return fact, not permission to remove its source
                   ;; evaluation or the exception raised for a nullable input.
@@ -192,8 +203,20 @@
                  (and products? (product-shape? init))
                  (let [[prefix fields] (split-product (util/alpha-convert init))
                        snapshots (mapv (fn [value]
-                                         [(with-meta (gensym "product_field__")
-                                            (select-keys (meta value) [:raster.type/tag])) value])
+                                         (let [array-tag (:array-tag (binding-fact scope nil value))]
+                                          [(with-meta (gensym "product_field__")
+                                             (cond-> (select-keys (meta value) [:raster.type/tag])
+                                               array-tag (assoc :raster.type/tag array-tag)))
+                                          ;; A source vector consumes the ORIGINAL
+                                          ;; field in Object context, not a raw ANF
+                                          ;; temporary subsequently reboxed.
+                                          ;; Independently proved array producers
+                                          ;; already return references: snapshotting
+                                          ;; that exact value preserves identity and
+                                          ;; adds neither boxing nor conversion.
+                                          ;; Do not use a desired/formal type tag.
+                                          (if array-tag value
+                                              (completion/complete-value completion/object-input-contract value))]))
                                        fields)
                        lifted (vec (concat prefix (mapcat identity snapshots)))
                        scope (reduce (fn [local [id init]]
@@ -232,6 +255,15 @@
             :else expression))
 
     (and (seq? expression) (= 'quote (first expression))) expression
+
+    ;; A later expansion can expose the actual array producer after this
+    ;; snapshot was introduced. Discharge only the already-reference Object
+    ;; context using that same independent producer fact; preserve conversions
+    ;; and scalar materialization contexts unchanged.
+    (when-let [{:keys [contract operand]} (completion/canonical-parts expression)]
+      (and (= completion/object-input-contract contract)
+           (:array-tag (binding-fact env nil operand))))
+    (lower env (:operand (completion/canonical-parts expression)) products?)
 
     (and (seq? expression) (contains? #{'let 'let*} (first expression)))
     (lower-let env expression products?)

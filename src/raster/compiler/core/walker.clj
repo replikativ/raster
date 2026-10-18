@@ -16,6 +16,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
@@ -186,6 +187,9 @@
   Returns a keyword identifying which defmethod should handle it."
   [form ctx]
   (cond
+    (and (seq? form) (= completion/completion-symbol (first form)))
+    :value-completion
+
     ;; Binding forms — ALL let/loop spellings (form/let-heads + loop-heads):
     ;; backtick `let expands to clojure.core/let, which appears in
     ;; macroexpanded input before the walker normalizes to let*.
@@ -666,6 +670,14 @@
   "Walk a source form, returning the rewritten form.
   Dispatches on (classify-form form ctx)."
   (fn [form ctx] (classify-form form ctx)))
+
+(defmethod walk-form :value-completion [expression _]
+  ;; An original operand belongs to its retained evaluation context, not an
+  ;; ordinary argument list which the walker may retype or devirtualize.
+  (if (completion/canonical-form? expression)
+    expression
+    (throw (ex-info "Malformed reserved value completion"
+                    {:reason :invalid-value-completion :expression expression}))))
 
 ;; ================================================================
 ;; Branch: let/let*/loop
@@ -1697,21 +1709,10 @@
               f)
             f)
         f (or f (first form))  ;; fallback if ns-resolve returned nil
-        static-call? (and (symbol? f) (some? (namespace f)))
         walked-args (map #(walk % ctx) args)
-        cast-args (if static-call?
-                    (map (fn [orig walked]
-                           (let [tag (or (when (symbol? orig) (inf/type-env-tag type-env orig))
-                                         (inf/literal-tag orig))]
-                             (if (and tag (contains? types/primitive-info tag)
-                                      ;; Don't re-wrap already-cast args
-                                      (not (and (seq? walked)
-                                                (descriptor/cast-op? (first walked)))))
-                               (compiler-cast tag walked)
-                               walked)))
-                         args walked-args)
-                    walked-args)
-        result (apply list (walk f ctx) cast-args)]
+        ;; Qualification is not an input ABI. Selected typed invocations have
+        ;; separate signature-owning handlers; ordinary calls retain inputs.
+        result (apply list (walk f ctx) walked-args)]
     ;; Propagate operand-return contracts before a following binding is consumed.
     (stamp-operand-return result walked-args ctx)))
 

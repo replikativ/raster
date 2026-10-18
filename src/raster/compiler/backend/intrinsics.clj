@@ -23,6 +23,7 @@
      :c       C/OpenCL form — infix string, or {:fn name} (GLSL fn override via :glsl)
      :wgsl    WGSL form — infix string or {:fn name}"
   (:require [clojure.string :as str]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as operation]
             [raster.compiler.support.mangled :as mangled]))
 
@@ -348,6 +349,28 @@
   operand/result dtype before attaching the policy to typed IR."
   [op]
   (:source-overflow (source-contract op)))
+
+(defn integral-arithmetic?
+  "Whether this canonical operation/dtype pair needs an integral overflow
+   contract. Source wrapping, checked and range-proved cases remain distinct."
+  [op dtype]
+  (and (contains? #{:byte :int :long} dtype)
+       (contains? #{:+ :- :*} (canonical op))))
+
+(defn integral-division?
+  "Integral division-family operations need a defined-divisor obligation."
+  [op dtype]
+  (and (contains? #{:byte :int :long} dtype)
+       (contains? #{:quot :rem :mod :div} (canonical op))))
+
+(defn source-divisor-check?
+  "Source quotient/remainder/modulo check zero even for floating operands.
+   Ordinary floating division is IEEE; unknown/integral division stays checked."
+  [op type]
+  (let [operator (canonical op)]
+    (or (contains? #{:quot :rem :mod} operator)
+        (and (= :div operator)
+             (not (and type (dtype/known? type) (dtype/fp-dtype? type)))))))
 
 ;; Semantic scalar domains are centralized beside canonical operator identity.  Backend facets say
 ;; how an operation is spelled; they do not by themselves prove that (for example) sqrt accepts an

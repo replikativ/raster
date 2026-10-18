@@ -48,17 +48,17 @@
         params (mapv #(symbol (str "p" %)) (range 22))
         {:keys [iface-name]} (types/ensure-fn-interface! tags)
         loader (clojure.lang.DynamicClassLoader. (clojure.lang.RT/baseLoader))
-        compiled (binding [method-entry/*compilation-classloader* loader]
-                   (bytecode/compile-typed-impl!
+        compiled (:implementation (binding [method-entry/*compilation-classloader* loader]
+                   (bytecode/compile-typed-entrypoint!
                     (str "raster.compiled.WideObjectOwner" (clojure.lang.RT/nextID))
-                    params tags 'long [(last params)] *ns* iface-name))]
+                    params tags 'long [(last params)] *ns* iface-name))) ]
     (is (= 21 (apply compiled (mapv long (range 22)))))
     (is (= 22 (apply compiled (mapv (comp long inc) (range 22)))))
     (let [token (Double. 5.125)
-          owned (binding [method-entry/*compilation-classloader* loader]
-                  (bytecode/compile-typed-impl!
+          owned (:implementation (binding [method-entry/*compilation-classloader* loader]
+                  (bytecode/compile-typed-entrypoint!
                    (str "raster.compiled.WideCapturedOwner" (clojure.lang.RT/nextID))
-                   params tags 'Object [[token (last params)]] *ns* iface-name))]
+                   params tags 'Object [[token (last params)]] *ns* iface-name)))]
       (doseq [offset [0 1]]
         (let [[captured last-value] (apply owned (mapv (comp long #(+ offset %)) (range 22)))]
           (is (identical? token captured))

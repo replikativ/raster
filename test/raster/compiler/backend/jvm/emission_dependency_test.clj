@@ -23,14 +23,15 @@
             compile! (fn [change?]
                        (#'core/emit-owned-bytecode!
                         (fn [& args]
-                          (let [impl (apply bytecode/compile-typed-impl! args)]
+                          (let [entrypoint (apply bytecode/compile-typed-entrypoint! args)
+                                impl (:implementation entrypoint)]
                             (swap! emitted conj impl)
                             (when (change? (count @emitted))
                               ;; The generated code is real; a consumed definition
                               ;; changes after emission but before publication.
                               (alter-meta! dependency update :raster.core/deftm-walked-body
                                            #(vector (list 'do (first %) 0.0))))
-                            impl))
+                            entrypoint))
                         "raster.compiled.OwnedRetry" params tags return-tag body scope
                         typed-interface (:name (meta source))))]
         (is (var? dependency))

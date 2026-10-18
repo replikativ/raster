@@ -119,6 +119,22 @@
     (is (= '[checked (clojure.core/int x) result 0] (second lowered))
         "DCE must retain the possible exceptional control transfer")))
 
+(deftest dead-allocation-retains-extent-validation-not-every-allocation
+  (doseq [extent [0 3 4294967296 4294967299 -4294967296]]
+    (let [source (list 'let* ['dead (list 'clojure.core/double-array extent)] 7)
+          lowered (:form (dce/eliminate-dead-bindings source))]
+      (is (= 7 (eval source) (eval lowered)))
+      (is (empty? (second lowered)) "proved safe literal extents do not pin dead storage")))
+  (doseq [extent [-1 2147483648]]
+    (let [source (list 'let* ['dead (list 'clojure.core/double-array extent)] 7)
+          lowered (:form (dce/eliminate-dead-bindings source))]
+      (is (thrown? NegativeArraySizeException (eval source)))
+      (is (thrown? NegativeArraySizeException (eval lowered)))))
+  (let [source '(let* [dead (clojure.core/double-array n)] 7)
+        lowered (:form (dce/eliminate-dead-bindings source))]
+    (is (thrown? NegativeArraySizeException (eval (list 'let ['n -1] lowered))))
+    (is (= 7 (eval (list 'let ['n 0] lowered))))))
+
 (deftest checked-conversion-survives-dead-local-writes-and-allocation
   (doseq [source
           ['(let* [dead (clojure.core/double-array 1)
@@ -283,6 +299,18 @@
     (testing "the dx GEMM (whose buffer IS read) survives"
       (is (contains? kept 'dx_buf))
       (is (contains? kept '_1)))))
+
+(deftest dead-division-retains-its-source-exception
+  (doseq [[operator type zero] [['clojure.core/quot 'long 0]
+                               ['clojure.core/rem 'double 0.0]]]
+    (let [expression (with-meta (list operator 'x 'y) {:raster.type/tag type})
+          source (list 'let* ['unused expression] 7)
+          lowered (:form (dce/eliminate-dead-bindings source))
+          execute #(eval (list 'fn '[x y] %))]
+      (is (seq (second lowered)))
+      (is (thrown? ArithmeticException ((execute source) 1 zero)))
+      (is (thrown? ArithmeticException ((execute lowered) 1 zero)))
+      (is (= 7 ((execute source) 9 2) ((execute lowered) 9 2))))))
 
 (deftest verified-local-write-into-unread-buffer-is-eliminated
   (let [write '(clojure.core/aset dead 0 (+ (clojure.core/aget dy 0) (clojure.core/aget x 0)))

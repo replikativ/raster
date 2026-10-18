@@ -32,6 +32,7 @@
             [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.scalar.effects :as effects]
@@ -321,8 +322,20 @@
           (assoc equation :algorithm algorithm :operations [operation] :operands captures))))
     equation))
 
+(defn- scalar-equation-domain-proof
+  [values ranges equation expression]
+  (when (and expression
+             (every? #(and (scalar-value? (get values %))
+                            (= {:kind :plain} (:representation (get values %))))
+                     (:operands equation))
+             (= :pure (effects/analyze-effect expression)))
+    (let [types (into {} (map (fn [id] [id (:dtype (get values id))])) (:operands equation))
+          proof (scalar-expression/checked-total-scalar-result
+                 expression types (select-keys ranges (:operands equation)))]
+      (when (= (:type proof) (:dtype (get values (first (:results equation))))) proof))))
+
 (defn- host-invocation-equation?
-  [available program-outputs required-shape-scalars source-prefix? equation]
+  [available program-outputs required-shape-scalars source-prefix? equation totality]
   (let [expression (scalar-equation-expression equation)]
     (and expression
          (not-any? (set (:results equation)) program-outputs)
@@ -333,6 +346,7 @@
          ;; may cross only when a retained shape requires its value before launch; the attested
          ;; InvocationPlan region then becomes the exceptional computation's single owner.
          (or (effects/removable-expr? expression)
+             totality
              (and source-prefix?
                   (true? (get-in equation [:attributes :source-prefix?]))
                   (some required-shape-scalars (:results equation)))))))
@@ -363,19 +377,25 @@
   [parallel-program public-inputs]
   (let [program-outputs (:outputs parallel-program)
         shape-scalars (required-shape-scalars parallel-program)
+        public-ranges (into {} (keep (fn [id]
+                                      (when-let [domain (get-in parallel-program
+                                                               [:values id :attributes :scalar-domain])]
+                                        [id domain]))) public-inputs)
         {:keys [hoisted retained]}
-        (reduce (fn [{:keys [available source-prefix?] :as state} equation]
+        (reduce (fn [{:keys [available source-prefix? ranges] :as state} equation]
                   (let [original-equation equation
                         equation (project-scalar-equation-metadata (:values parallel-program)
                                                                   public-inputs equation)
                         expression (scalar-equation-expression equation)
+                        totality (scalar-equation-domain-proof (:values parallel-program)
+                                                               ranges equation expression)
                         scalar? (some? expression)
                         required-shape? (some shape-scalars (:results equation))
                         exceptional-shape? (and required-shape?
                                                 (not (effects/removable-expr? expression)))
                         host? (host-invocation-equation? available program-outputs
                                                            shape-scalars source-prefix?
-                                                           equation)
+                                                           equation totality)
                         ;; Required shape membership authorizes the exceptional one-shot branch;
                         ;; only the frontend's explicit proof contract retains a removable scalar
                         ;; as a host-only graph equation.
@@ -385,6 +405,8 @@
                         ;; sequence is an ordering barrier: a later checked shape cannot move
                         ;; ahead of it merely because invocation needs that shape.
                         state (cond-> state
+                                (and host? (:range totality))
+                                (assoc-in [:ranges (first (:results equation))] (:range totality))
                                 (or (not scalar?)
                                     (and (not host?)
                                          (not (effects/removable-expr? expression))))
@@ -419,7 +441,7 @@
                       :else
                       (update state :retained conj original-equation))))
                 {:available (set/union (set (:inputs parallel-program)) public-inputs)
-                 :source-prefix? true :hoisted [] :retained []}
+                 :source-prefix? true :hoisted [] :retained [] :ranges public-ranges}
                 (:equations parallel-program))]
     (if (and (empty? hoisted) (= retained (:equations parallel-program)))
       parallel-program

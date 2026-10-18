@@ -14,6 +14,7 @@
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -36,6 +37,8 @@
     (assoc matched
            :inclusive? (= :inclusive (:bound-mode matched))
            :update-expr (:scoped-update-expr matched))))
+
+(declare nontrapping-operations?)
 
 (defn make-lowerer
   "Build a scalar-expression lowerer.
@@ -1209,8 +1212,7 @@
                               ;; `unchecked-*` forms wrap.  Retain that distinction in KernelBody
                               ;; rather than leaving a C-family emitter to choose signed overflow.
                               integral-arithmetic?
-                              (and (contains? #{:byte :int :long} operand-type)
-                                   (contains? #{:+ :- :*} operator))
+                              (intrinsics/integral-arithmetic? operator operand-type)
                               operand-ranges (mapv :range lowered)
                               proven-range (when integral-arithmetic?
                                              (scalar-range/arithmetic operator operand-ranges))
@@ -1249,6 +1251,8 @@
       ;; Reserve at public region boundaries, not at every recursive child: identifiers are
       ;; scoped facts, and rescanning each subtree would make deeply nested lowering quadratic.
       {:fresh-binding fresh
+       :nontrapping-operations? (fn [operations]
+                                 (nontrapping-operations? operations @value-ranges))
        ;; Owners that must validate a source conversion without contributing a consumer dtype
        ;; may ask this same strict authority for the independently derived expression type.
        :source-type (fn [expression env]
@@ -1310,23 +1314,71 @@
             :results (mapv :result lowered-results)
             :types (mapv :type lowered-results)}))})))
 
-(defn- checked-scalar-result
-  [expression scalar-types]
+(defn nontrapping-operations?
+  "Audit the entire scalar operation tree for currently represented traps.
+   This alone proves neither termination nor purity, and grants no motion or reuse."
+  ([operations] (nontrapping-operations? operations {}))
+  ([operations ranges]
+  (not-any?
+   (fn [operation]
+     (let [expression (or (:expression operation)
+                          (when (:result-type operation) operation))
+           result-type (:result-type expression)
+           divisor (second (:arguments expression))
+           divisor-range (if (symbol? divisor) (get ranges divisor)
+                             (when (and (map? divisor) (integer? (:value divisor)))
+                               (scalar-range/literal (:value divisor) (:type divisor))))
+           safe-quotient? (and (= :quot (:op expression))
+                               (scalar-range/strictly-positive-integral-divisor? divisor-range))]
+       (or (= :trap (get-in expression [:options :overflow]))
+           (and (intrinsics/integral-division? (:op expression) result-type)
+                (not safe-quotient?)))))
+   (tree-seq #(or (map? %) (sequential? %))
+             #(if (map? %) (vals %) (seq %)) operations))))
+
+(defn- lower-scalar-proof
+  [expression scalar-types scalar-ranges & [audit?]]
   (let [decline! (fn [rule message data]
-                   (throw (ex-info message (assoc data :reason :primitive-presence-decline :rule rule))))
+                   (throw (ex-info message (assoc data :reason ::scalar-proof-decline :rule rule))))
         lowerer (make-lowerer {:scalar-types scalar-types :array-types {} :arrays #{}
+                              :scalar-ranges scalar-ranges
                               :index-scope #{} :source-region expression
                               :lower-index (fn [& _]
-                                             (decline! :presence-index "Presence proof has no index owner" {}))
+                                             (decline! :proof-index "Scalar proof has no index owner" {}))
                               :require-source-types? true :decline! decline!})]
     (try
       (when-let [source-type ((:source-type lowerer) expression scalar-types)]
         (let [result ((:lower lowerer) expression source-type scalar-types)]
           (when (and (= source-type (:type result))
                      (or (= :predicate source-type) (dtype/info source-type)))
-            {:type source-type})))
+            (cond-> result
+              audit? (assoc :nontrapping? ((:nontrapping-operations? lowerer) (:operations result)))))))
       (catch clojure.lang.ExceptionInfo e
-        (if (= :primitive-presence-decline (:reason (ex-data e))) nil (throw e))))))
+        (if (= ::scalar-proof-decline (:reason (ex-data e))) nil (throw e))))))
+
+(defn- checked-scalar-result
+  [expression scalar-types]
+  (some-> (lower-scalar-proof expression scalar-types {}) (select-keys [:type])))
+
+(defn checked-total-scalar-result
+  "Prove a closed loop-free scalar region nontrapping through the strict lowerer.
+   Input intervals must come from the owner's enforced contracts, not annotations
+   invented for a consumer. Unknown operations/loads/conversions decline; invalid
+   owner intervals and compiler invariants still throw. This supplies no purity,
+   immutable-input or guard-ownership proof. Loops need a separate termination proof."
+  ([expression scalar-types] (checked-total-scalar-result expression scalar-types {}))
+  ([expression scalar-types scalar-ranges]
+   (when-not (some #(and (seq? %)
+                        (or (contains? form/loop-heads (first %))
+                            (dialect/scalar-fold-form? %)
+                            (dialect/product-fold-form? %)))
+                   (tree-seq #(and (coll? %)
+                                   (not (and (seq? %)
+                                             (contains? '#{quote clojure.core/quote} (first %)))))
+                             seq expression))
+     (when-let [result (lower-scalar-proof expression scalar-types scalar-ranges true)]
+       (when (:nontrapping? result)
+         (select-keys result [:type :range]))))))
 
 (defn checked-primitive-result
   "Prove primitive presence on normal return of one canonical scalar call using
@@ -1338,11 +1390,13 @@
   (let [operation (descriptor/semantic-op expression)
         intrinsic (some-> operation intrinsics/canonical intrinsics/descriptor)
         arguments (vec (descriptor/call-args expression))
+        cast? (and (symbol? operation) (= "clojure.core" (namespace operation))
+                   (= 1 (count arguments)) (descriptor/cast-result-tag operation))
         known? (fn [argument]
                  (or (and (symbol? argument) (contains? present-types argument))
                      (and (number? argument) (inference/infer-arg-tag argument {}))))]
-    (when (and (symbol? operation) (namespace operation) (descriptor/scalar-op? operation)
-               intrinsic
+    (when (and (symbol? operation) (namespace operation)
+               (or cast? (and (descriptor/scalar-op? operation) intrinsic))
                (every? known? arguments))
       (checked-scalar-result expression present-types))))
 
@@ -1388,3 +1442,78 @@
                      (seq? body) (strict-core-expression? body (set parameters)))
             (let [proof (checked-scalar-result body (zipmap parameters scalar-types))]
               (when (= result-type (:type proof)) proof))))))))
+
+(defn- closed-core-computation? [expression parameters]
+  (and (strict-core-expression? expression parameters)
+       ;; A retained raw alias is not the Class identity used by an emission.
+       ;; Presence analysis may keep a producer opaque; executable projection
+       ;; must not reinterpret an unresolved Math binding as java.lang.Math.
+       (not-any? #(and (seq? %) (symbol? (first %)) (= "Math" (namespace (first %))))
+                 (tree-seq coll? seq expression))))
+
+(defn checked-selected-object-result
+  "Stronger, emitter-owned boxed scalar provenance for native numeric islands.
+   Read actual parameter/return Classes and the emitted boxing recipe, then
+   check the retained computation with this module's strict scalar lowerer.
+   Unlike presence-only proofs, this establishes the exact successful Object
+   carrier. It does NOT close consumers, prove unobservability/purity or license
+   moving, duplicating or removing the original invocation."
+  [expression]
+  (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+        (descriptor/call-description expression)]
+    (when (and dispatch? (not lexical-callee))
+      (when-let [{:keys [emission entrypoint] :as owner}
+                 (method-entry/selected-typed-entrypoint semantic-op implementation-op (count arguments))]
+        (let [{:keys [compute-method invocation-method return-completion]} entrypoint
+              ^java.lang.reflect.Method compute compute-method
+              ^java.lang.reflect.Method invocation invocation-method
+              {:keys [kind primitive-carrier object-carrier boxing-method]} return-completion
+              parameters (:params emission)
+              body (when (= 1 (count (:body emission))) (first (:body emission)))
+              physical-type (fn [carrier]
+                              (some (fn [[dt facets]]
+                                      (when (identical? carrier (get types/tag->java-class (:scalar-tag facets))) dt))
+                                    dtype/dtype-info))
+              inputs (vec (.getParameterTypes invocation))
+              input-types (mapv physical-type inputs)
+              output-type (physical-type (.getReturnType compute))]
+          (when (and (= :boxed kind) output-type (every? some? input-types)
+                     (vector? parameters) (every? symbol? parameters)
+                     (= (count parameters) (count (distinct parameters)) (count inputs))
+                     (= inputs (vec (.getParameterTypes compute)))
+                     (= [primitive-carrier] (vec (.getParameterTypes ^java.lang.reflect.Method boxing-method)))
+                     (closed-core-computation? body (set parameters)))
+            (when-let [proof (checked-scalar-result body (zipmap parameters input-types))]
+              (when (= output-type (:type proof))
+                {:kind :boxed-scalar :type output-type
+                 :primitive-carrier primitive-carrier :object-carrier object-carrier
+                 :input-carriers inputs :parameters parameters :body body
+                 :owner owner}))))))))
+
+(defn checked-selected-source-double-result
+  "Source-level Double result for a still-owned frontend entry, independently
+   of JVM emission. Actual invk input Classes must be primitive double; the
+   retained closed computation must itself produce double, so no guessed
+   return conversion/nullable result is admitted. The source wrapper materializes
+   that value as Double at its Object boundary. This is NOT an emitted recipe or
+   a license to delete an observable materialization; consumers close uses.
+   Unresolved source class aliases require a resolved frontend contract first."
+  [expression]
+  (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+        (descriptor/call-description expression)]
+    (when (and dispatch? (not lexical-callee))
+      (when-let [{:keys [source-entry invocation-method] :as owner}
+                 (method-entry/selected-typed-source-entry semantic-op implementation-op (count arguments))]
+        (let [parameters (:params source-entry)
+              source-body (:source-body source-entry)
+              body (when (= 1 (count source-body)) (first source-body))
+              inputs (vec (.getParameterTypes ^java.lang.reflect.Method invocation-method))]
+          (when (and (= 'double (:return-tag source-entry))
+                     (vector? parameters) (every? symbol? parameters)
+                     (= (count parameters) (count (distinct parameters)) (count inputs))
+                     (every? #(identical? Double/TYPE %) inputs)
+                     (closed-core-computation? body (set parameters)))
+            (when (= :double (:type (checked-scalar-result body (zipmap parameters (repeat :double)))))
+              {:kind :source-scalar :type :double :primitive-carrier Double/TYPE
+               :object-carrier Double :input-carriers inputs
+               :parameters parameters :body body :owner owner})))))))

@@ -73,6 +73,7 @@
 
 (defn- checked-scalar [id abstract value]
   (let [expected (dtype/canon (:dtype abstract))
+        domain (get-in abstract [:attributes :scalar-domain])
         value (if (typed-scalar? value) value {:type expected :value value})]
     (when-not (and (scalar-value? abstract)
                    (= expected (dtype/canon (:type value)))
@@ -83,7 +84,10 @@
                    ;; Floating NaNs/infinities keep their existing IEEE contract.
                    (or (nil? (scalar-range/for-dtype expected))
                        (and (integer? (:value value))
-                            (some? (scalar-range/literal (:value value) expected)))))
+                            (some? (scalar-range/literal (:value value) expected))))
+                   (or (nil? domain)
+                       (and (integer? (:value value))
+                            (<= (:lower domain) (:value value) (:upper domain)))))
       (fail! :invocation-materialization-scalar
              "public or computed scalar differs from its retained rank-zero contract"
              {:value-id id :expected abstract :actual value}))
@@ -331,10 +335,12 @@
 (defn projection-path [leaf]
   (or (:path leaf) (when-let [field (:field leaf)] [field])))
 
-(defn- project-parameter-arguments
-  [plan arguments]
-  (let [projection (get-in plan [:attributes :parameter-projection])
-        public (or (:public-parameters projection) (mapv :symbol (:parameters plan)))
+(defn ^:no-doc project-arguments
+  "Read an owner's declared argument projection before or after plan construction.
+   This grants no dtype, storage or guard authority; the owner retains the
+   declaration and validates the resulting invocation contract separately."
+  [parameters projection arguments]
+  (let [public (or (:public-parameters projection) parameters)
         arguments (vec arguments)]
     (when-not (= (count public) (count arguments))
       (fail! :invocation-materialization-arity "public arguments must follow the declared parameter order"
@@ -351,7 +357,9 @@
   "Project declared aggregate fields at the public invocation boundary.
    Flat callers retain their original argument order. This evaluates no source expressions."
   [plan arguments]
-  (project-parameter-arguments (invocation/validate-parameter-projection! plan) arguments))
+  (let [plan (invocation/validate-parameter-projection! plan)]
+    (project-arguments (mapv :symbol (:parameters plan))
+                       (get-in plan [:attributes :parameter-projection]) arguments)))
 
 (defn materialize
   "Specialize `plan` against ordered public `arguments` without allocating device resources.
@@ -364,7 +372,8 @@
   (let [plan (invocation/validate! plan)
         _ (refuse-external-dimensions! plan)
         _ (refuse-external-storage! plan)
-        arguments (project-parameter-arguments plan arguments)]
+        arguments (project-arguments (mapv :symbol (:parameters plan))
+                                     (get-in plan [:attributes :parameter-projection]) arguments)]
     (let [parameter-pairs (mapv vector (:parameters plan) arguments)
           scalar-values
           (into {}

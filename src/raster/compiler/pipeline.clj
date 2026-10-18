@@ -507,6 +507,11 @@
               ;; representation facts, shared by JVM/C/GPU. Do not invoke broad
               ;; arithmetic PE or rewalk merely to remove a known presence arm.
               expanded (local-products/lower-local-products expanded)
+              ;; Product replacement introduces evaluate-once field snapshots,
+              ;; including unused absent cotangents. Close their liveness with
+              ;; the shared effect/exception-aware DCE before the typedness
+              ;; boundary; no scalar type can be invented for an absent field.
+              expanded (:form (dce/eliminate-dead-bindings (ensure-let*-result expanded)))
               ;; Step 2: Normalize + Rewalk only if expand introduced NEW
               ;; undevirtualized calls (e.g. from composable AD body inlining).
               ;; Regular expand (compound deftm inlining) produces pre-walked code
@@ -859,6 +864,8 @@
                 :scalar-types (:scalar-types opts)
                 :public-parameters (or (:public-parameters opts) (:active-params opts))
                 :abstract-machine abstract-machine}
+        _ (typed-soac-frontend/validate-public-scalar-domains!
+           source (:public-parameters common) (:scalar-types common) values)
         structured (when (device/gpu-target? (:target-device opts))
                      (structured-route/attempt source common))]
     (if (:program structured)
@@ -873,6 +880,7 @@
                     :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
                     :values values
+                    :public-parameters (:public-parameters common)
                     :abstract-machine abstract-machine})
             ;; Mixed source construction shares the ordinary frontend but cannot depend on
             ;; this route's validator without a namespace cycle. Certify the closed algorithm

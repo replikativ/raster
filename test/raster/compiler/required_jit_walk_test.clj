@@ -31,7 +31,7 @@
         (let [walks (atom 0) compiles (atom 0)]
           (with-redefs-fn
             {#'core/jit-walk-with-tc (fn [& _] (swap! walks inc) (throw failure))
-             (ns-resolve 'raster.core 'compile-typed-impl-fn)
+             (ns-resolve 'raster.core 'compile-typed-entrypoint-fn)
              (delay (fn [& _] (swap! compiles inc) :new-implementation))}
             (fn []
               (binding [core/*jit-silent-fallback?* silent?]
@@ -50,7 +50,7 @@
     (fn [v ns']
       (with-redefs-fn
         {#'core/jit-walk-with-tc (fn [& _] '[x])
-         (ns-resolve 'raster.core 'compile-typed-impl-fn)
+         (ns-resolve 'raster.core 'compile-typed-entrypoint-fn)
          (delay (fn [& _] (throw (ex-info "unsupported bytecode" {:reason :unsupported-test-body}))))}
         (fn []
           (binding [core/*jit-silent-fallback?* true]
@@ -66,7 +66,7 @@
       (fn [v ns']
         (with-redefs-fn
           {#'core/jit-walk-with-tc (fn [& _] '[x])
-           (ns-resolve 'raster.core 'compile-typed-impl-fn) (delay (fn [& _] (throw failure)))}
+           (ns-resolve 'raster.core 'compile-typed-entrypoint-fn) (delay (fn [& _] (throw failure)))}
           (fn []
             (binding [core/*jit-silent-fallback?* true]
               (is (identical? failure
@@ -100,7 +100,7 @@
         (with-redefs-fn
           {#'core/jit-walk-with-tc (fn [& _]
                                    (swap! seen conj method-entry/*compilation-classloader*) '[x])
-           (ns-resolve 'raster.core 'compile-typed-impl-fn)
+           (ns-resolve 'raster.core 'compile-typed-entrypoint-fn)
            (delay (fn [& _]
                     (swap! seen conj method-entry/*compilation-classloader*)
                     (throw (ex-info "optional bytecode refusal" {}))))}
