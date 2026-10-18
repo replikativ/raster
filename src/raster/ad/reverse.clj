@@ -6317,24 +6317,19 @@
       (let [result (lower-input original input-index)]
         {:bindings @bindings :result (:value result) :calls calls :helpers @helpers}))))
 
-(defn- owned-bytecode-body-program
-  "Normalize a guarded actual caller, retaining its lexical binding evidence.
+(defn- owned-bytecode-region-program
+  "Normalize an attested region, retaining its actual lexical binding evidence.
    This producer supplies ordered bindings to the existing AD engine. It does
    not infer types, recover original code from equality, or hide array reads."
-  [emission params active]
-  (let [body-context ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-body-context) emission)
-        retained (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-invocation-context)
+  [emission params active body-context env]
+  (let [retained (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-invocation-context)
         binding-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-binding-context)
         conversion-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-floating-conversion)
         calls (java.util.IdentityHashMap.)
         state (atom {:bindings [] :helpers [] :activity (zipmap active (repeat true))})
         fail! (fn [& [details]]
                 (throw (ex-info "Owned caller needs an attested numerical lexical region"
-                                (merge {:reason :ad-unclosed-bytecode-body-region} details))))
-        env (into {} (map (fn [source value]
-                           [source {:value value :facts (get-in body-context [:locals source])}])
-                         (:params emission) params))]
-    (when-not (and body-context (= (set (:params emission)) (set (keys (:locals body-context))))) (fail!))
+                                (merge {:reason :ad-unclosed-bytecode-body-region} details))))]
     (letfn [(append! [id expression]
               (swap! state (fn [s]
                              (-> s (update :bindings into [id expression])
@@ -6494,7 +6489,7 @@
                 (conversion-context emission expression) (lower-conversion expression env)
                 (seq? expression) (lower-call expression env)
                 :else (fail!)))]
-      (let [body-result (last (mapv #(lower % env) (:body emission)))
+      (let [body-result (last (mapv #(lower % env) (:body body-context)))
             tag (case (:return-stack-type body-context) :double 'double :float 'float (fail!))
             result (ad-gensym "body_return" tag)
             contract (value-completion/bytecode-floating-input-contract
@@ -6503,6 +6498,19 @@
         ;; body's logical tail dtype. Reverse projection transposes it too.
         (append! result (value-completion/complete-value contract body-result))
         (assoc @state :result result :calls calls)))))
+
+(defn- owned-bytecode-body-program
+  "Establish the original method entry before using the shared region producer."
+  [emission params active]
+  (let [context ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-body-context) emission)]
+    (when-not (and context (= (set (:params emission)) (set (keys (:locals context)))))
+      (throw (ex-info "Owned caller needs an attested numerical lexical region"
+                      {:reason :ad-unclosed-bytecode-body-region})))
+    (owned-bytecode-region-program
+     emission params active context
+     (into {} (map (fn [source value]
+                     [source {:value value :facts (get-in context [:locals source])}])
+                   (:params emission) params)))))
 
 (defn- prepare-owned-bytecode-value+grad-once
   "Prepare a whole selected numerical caller from its actual guarded emission.

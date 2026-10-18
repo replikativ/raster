@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as n]
+            [raster.par :as par]
             [raster.ad.reverse :as reverse]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
@@ -46,6 +47,8 @@
   (let [a (aget theta 0) k (aget theta 1)]
     (n/* 2.0 (response a k (double cnt)))))
 (deftm explicit-float [x :- Double] :- Float (float x))
+(deftm scalar-carry-region [x :- Double cnt :- Long] :- Double
+  (par/reduce acc 1.0 i cnt (n/* acc x)))
 (deftm mismatched-array-alias [xs :- (Array double) x :- Double] :- Double
   (let [^floats unused xs] (n/* x x)))
 
@@ -53,6 +56,31 @@
 
 (defn- prepared [v]
   (reverse/prepare-owned-bytecode-value+grad v [0]))
+
+(deftest actual-reduction-step-uses-the-same-owned-region-producer
+  (let [source (core/resolve-deftm-var #'scalar-carry-region)
+        receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))
+        _ (core/ensure-current-owned-bytecode! receiver)
+        emission (:raster.core/bytecode-emission (meta receiver))
+        original (first (vals (:reduction-catalog emission)))
+        observed (bytecode/retained-reduction-emission emission original)
+        locals (get-in observed [:loop :locals])
+        env (into {} (map (fn [[id facts]]
+                           [id {:value (vary-meta id assoc :raster.type/tag (symbol (name (:type facts))))
+                                :facts facts}])) locals)
+        carry (second (get-in observed [:loop :variables]))
+        context {:body [(nth original 5)]
+                 :return-stack-type (get-in locals [carry :type])
+                 :result-context (get-in observed [:recur :values 1 :context])}
+        program (with-bindings {#'reverse/*gensym-counter* (atom 0)}
+                  (#'reverse/owned-bytecode-region-program
+                    emission (mapv :value (vals env))
+                    [(get-in env [carry :value]) (get-in env ['x :value])]
+                    context env))]
+    (is (some? observed))
+    (is (seq (:bindings program)))
+    (is (= 'double (:raster.type/tag (meta (:result program)))))
+    (is (pos? (.size ^java.util.IdentityHashMap (:calls program))))))
 
 (defn- check [v values offset zero-prefix]
   (let [p (prepared v)
