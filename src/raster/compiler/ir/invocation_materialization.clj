@@ -19,6 +19,7 @@
 (defrecord MaterializedBuffer [id value shape source initialization])
 (defrecord MaterializedInvocation
            [plan values program-buffers program-scalars attributes])
+(defrecord InvocationMaterializationState [plan values lexical next-step])
 
 (defn materialized-buffer? [value]
   (and value (= "raster.compiler.ir.invocation_materialization.MaterializedBuffer"
@@ -197,7 +198,7 @@
 (defn- checked-computed-scalar [step value]
   (checked-scalar (:id step) (:value step) value))
 
-(defn- validate-buffer! [binding-id buffer]
+(defn- validate-buffer! [binding-id buffer expected]
   (when-not (materialized-buffer? buffer)
     (fail! :invocation-materialization-buffer-binding
            "program buffer input requires a MaterializedBuffer"
@@ -207,7 +208,10 @@
       (fail! :invocation-materialization-buffer-id
              "materialized buffer requires a stable storage identity"
              {:value-id binding-id}))
-    (av/validate! value)
+    (when-not (av/storage-contract-compatible? expected value)
+      (fail! :invocation-materialization-buffer-value
+             "materialized buffer differs from its retained value contract"
+             {:value-id binding-id :expected expected :actual value}))
     (when-not (and (buffer-value? value) (vector? shape)
                    (= (count (:shape value)) (count shape))
                    (every? #(and (integer? %) (not (neg? %))) shape))
@@ -280,7 +284,7 @@
       (fail! :invocation-materialization-input-kind
              "one program input cannot be both a buffer and scalar" {}))
     (doseq [[id buffer] program-buffers]
-      (validate-buffer! id buffer)
+      (validate-buffer! id buffer (get-in plan [:values id]))
       (let [expected (concrete-shape id (get-in plan [:values id]) lexical values)]
         (when-not (= expected (:shape buffer))
           (fail! :invocation-materialization-program-shape
@@ -353,14 +357,15 @@
   [plan arguments]
   (project-parameter-arguments (invocation/validate-parameter-projection! plan) arguments))
 
-(defn materialize
-  "Specialize `plan` against ordered public `arguments` without allocating device resources.
+(defn begin-materialization
+  "Validate public arguments without evaluating any invocation step.
 
-   `evaluate-scalar` receives `[step operand-values]`, where `step` owns a closed TypedSOAC scalar
-   region and `operand-values` maps its ordered parameter symbols to typed scalar maps. It must
-   return one typed scalar map. This is the only executable hook; shapes, copies, allocations and
-   aliases are interpreted from structured invocation records."
-  [plan arguments evaluate-scalar]
+   The returned immutable state owns no driver resources or evaluator. It is not a completed
+   MaterializedInvocation or permission to bind its unevaluated suffix. Advancing a state chain
+   evaluates one step at a time; callers may place existing device completion boundaries between
+   advances. Reusing an older state explicitly repeats computation, not a successful-check proof.
+   Host arrays remain borrowed sources, not snapshots or newly acquired lifetime leases."
+  [plan arguments]
   (let [plan (invocation/validate! plan)
         _ (refuse-external-dimensions! plan)
         _ (refuse-external-storage! plan)
@@ -385,64 +390,148 @@
                                                                     initial-lexical scalar-values)
                                               argument :copy))
                  values)))
-           scalar-values parameter-pairs)
-          {:keys [values lexical]}
-          (reduce
-           (fn [{:keys [values lexical]} step]
-             (let [id (:id step)
-                   materialized
-                   (cond
-                     (invocation/shape-projection? step)
-                     (let [source (get values (:source step))
-                           axis (:axis step)]
-                       (when-not (materialized-buffer? source)
-                         (fail! :invocation-materialization-shape-source
-                                "shape projection source is not a materialized buffer"
-                                {:step id :source (:source step) :actual source}))
-                       (checked-computed-scalar
-                        step {:type (get-in step [:value :dtype])
-                              :value (nth (:shape source) axis)}))
+           scalar-values parameter-pairs)]
+      (->InvocationMaterializationState plan parameter-values initial-lexical 0))))
 
-                     (invocation/scalar-compute? step)
-                     (do
-                       (when-not (ifn? evaluate-scalar)
-                         (fail! :invocation-materialization-scalar-evaluator
-                                "scalar invocation regions require a typed evaluator"
-                                {:step id :region (:region step)}))
-                       (checked-computed-scalar
-                        step
-                        (evaluate-scalar
-                         step
-                         (into {}
-                               (map (fn [{:keys [symbol value]}]
-                                      [symbol (get values value)]))
-                               (:operands step)))))
+(defn- advance-materialization
+  [{:keys [plan values lexical next-step] :as state} evaluate-scalar]
+  (let [step (nth (:steps plan) next-step)
+        id (:id step)
+        materialized
+        (cond
+          (invocation/shape-projection? step)
+          (let [source (get values (:source step))]
+            (when-not (materialized-buffer? source)
+              (fail! :invocation-materialization-shape-source
+                     "shape projection source is not a materialized buffer"
+                     {:step id :source (:source step) :actual source}))
+            (checked-computed-scalar
+             step {:type (get-in step [:value :dtype])
+                   :value (nth (:shape source) (:axis step))}))
 
-                     (invocation/buffer-clone? step)
-                     (let [source (get values (:source step))]
-                       (when-not (materialized-buffer? source)
-                         (fail! :invocation-materialization-clone-source
-                                "buffer clone source is not materialized storage"
-                                {:step id :source (:source step) :actual source}))
-                       (->MaterializedBuffer id (:value step)
-                                             (concrete-shape id (:value step) lexical values)
-                                             (:source source) :copy))
+          (invocation/scalar-compute? step)
+          (do
+            (when-not (ifn? evaluate-scalar)
+              (fail! :invocation-materialization-scalar-evaluator
+                     "scalar invocation regions require a typed evaluator"
+                     {:step id :region (:region step)}))
+            (checked-computed-scalar
+             step (evaluate-scalar
+                   step (into {} (map (fn [{:keys [symbol value]}]
+                                        [symbol (get values value)])) (:operands step)))))
 
-                     (invocation/buffer-allocation? step)
-                     (->MaterializedBuffer id (:value step)
-                                           (concrete-shape id (:value step) lexical values)
-                                           nil (:initialization step))
+          (invocation/buffer-clone? step)
+          (let [source (get values (:source step))]
+            (when-not (materialized-buffer? source)
+              (fail! :invocation-materialization-clone-source
+                     "buffer clone source is not materialized storage"
+                     {:step id :source (:source step) :actual source}))
+            (->MaterializedBuffer id (:value step)
+                                  (concrete-shape id (:value step) lexical values)
+                                  (:source source) :copy))
 
-                     (invocation/value-alias? step)
-                     (get values (:source step)))]
-               (when-not materialized
-                 (fail! :invocation-materialization-step
-                        "invocation step did not produce a runtime value" {:step id}))
-               {:values (assoc values id materialized)
-                :lexical (assoc lexical (:symbol step) id)}))
-           {:values parameter-values :lexical initial-lexical}
-           (:steps plan))
-          input-values
+          (invocation/buffer-allocation? step)
+          (->MaterializedBuffer id (:value step)
+                                (concrete-shape id (:value step) lexical values)
+                                nil (:initialization step))
+
+          (invocation/value-alias? step)
+          (get values (:source step)))]
+    (when-not materialized
+      (fail! :invocation-materialization-step
+             "invocation step did not produce a runtime value" {:step id}))
+    (assoc state :values (assoc values id materialized)
+                 :lexical (assoc lexical (:symbol step) id)
+                 :next-step (inc next-step))))
+
+(defn validate-state!
+  "Check an incremental materialization's completed prefix, without evaluating scalar regions.
+   As for MaterializedInvocation, computed values come from the caller's trusted evaluator;
+   structural validation is not a certificate that arbitrary supplied numbers were computed."
+  [state]
+  (when-not (and state (= "raster.compiler.ir.invocation_materialization.InvocationMaterializationState"
+                         (.getName (class state))))
+    (fail! :invocation-materialization-state-type "expected an InvocationMaterializationState"
+           {:actual (type state)}))
+  (let [{:keys [plan values lexical next-step]} state
+        plan (invocation/validate! plan)]
+    (refuse-external-dimensions! plan)
+    (refuse-external-storage! plan)
+    (when-not (and (integer? next-step) (<= 0 next-step (count (:steps plan))))
+      (fail! :invocation-materialization-position "materialization position is outside the plan"
+             {:next-step next-step :steps (count (:steps plan))}))
+    (let [prefix (concat (:parameters plan) (take next-step (:steps plan)))
+          expected-ids (set (map :id prefix))
+          expected-lexical (into {} (map (juxt :symbol :id)) prefix)]
+      (when-not (and (map? values) (= expected-ids (set (keys values)))
+                     (= expected-lexical lexical))
+        (fail! :invocation-materialization-prefix "materialization state differs from its exact prefix"
+               {:next-step next-step :expected-values expected-ids
+                :actual-values (when (map? values) (set (keys values)))}))
+      (let [parameters (:parameters plan)
+            parameter-lexical (into {} (map (juxt :symbol :id)) parameters)
+            parameter-values (select-keys values (map :id parameters))
+            scalar-values (into {} (filter (comp typed-scalar? val)) parameter-values)
+            check-scalar! (fn [id value actual]
+                            (when-not (typed-scalar? actual)
+                              (fail! :invocation-materialization-state-scalar
+                                     "retained scalar state requires a typed value"
+                                     {:value-id id :actual actual}))
+                            (checked-scalar id value actual))]
+        (doseq [{:keys [id value] :as parameter} parameters]
+          (let [actual (get values id)]
+            (if (scalar-value? value)
+              (check-scalar! id value actual)
+              (do
+                (validate-buffer! id actual value)
+                (let [expected (->MaterializedBuffer
+                                id value
+                                (runtime-buffer-shape parameter value (:source actual)
+                                                      parameter-lexical scalar-values)
+                                (:source actual) :copy)]
+                  (when-not (= expected actual)
+                    (fail! :invocation-materialization-state-parameter
+                           "retained buffer parameter differs from its original projection"
+                           {:value-id id :expected expected :actual actual})))))))
+        ;; Reuse the same interpreter to check deterministic shape, allocation,
+        ;; clone and alias steps in their original lexical environment. Only
+        ;; ScalarCompute results are supplied, never reevaluated during validation.
+        (reduce
+         (fn [prior step]
+           (let [{:keys [id symbol value]} step
+                 actual (get values id)]
+             (if (invocation/scalar-compute? step)
+               (do (check-scalar! id value actual)
+                   (-> prior
+                       (assoc-in [:values id] actual)
+                       (assoc-in [:lexical symbol] id)
+                       (update :next-step inc)))
+               (let [expected (advance-materialization prior nil)]
+                 (when-not (= actual (get-in expected [:values id]))
+                   (fail! :invocation-materialization-state-producer
+                          "retained structured value differs from its ordered producer"
+                          {:value-id id :actual actual
+                           :expected (get-in expected [:values id])}))
+                 expected))))
+         (->InvocationMaterializationState plan parameter-values parameter-lexical 0)
+         (take next-step (:steps plan))))
+      state)))
+
+(defn materialize-next
+  "Evaluate exactly the next invocation step after validating the current prefix.
+   A failure returns no advanced state and does not evaluate or materialize any later step."
+  [state evaluate-scalar]
+  (let [state (validate-state! state)]
+    (when (= (:next-step state) (count (get-in state [:plan :steps])))
+      (fail! :invocation-materialization-complete "materialization has no remaining step" {}))
+    (advance-materialization state evaluate-scalar)))
+
+(defn- complete-materialization
+  [{:keys [plan values next-step]}]
+    (when-not (= next-step (count (:steps plan)))
+      (fail! :invocation-materialization-incomplete "cannot publish an unevaluated invocation suffix"
+             {:next-step next-step :steps (count (:steps plan))}))
+    (let [input-values
           (into {}
                 (map (fn [{:keys [program-value invocation-value]}]
                        [program-value (get values invocation-value)]))
@@ -452,4 +541,23 @@
       (validate!
        (->MaterializedInvocation
         plan values program-buffers program-scalars
-        {:source-inspected false :driver-allocations 0})))))
+        {:source-inspected false :driver-allocations 0}))))
+
+(defn finish-materialization
+  "Publish a completed invocation only after validating every completed prefix step."
+  [state]
+  (complete-materialization (validate-state! state)))
+
+(defn materialize
+  "Specialize a typed plan against public arguments without allocating driver resources.
+
+   This eager convenience entry uses the same step interpreter as incremental materialization.
+   `evaluate-scalar` receives the retained closed ScalarCompute and typed operand map, and must
+   return one typed scalar. It is neither retained nor called for shapes, allocations or aliases."
+  [plan arguments evaluate-scalar]
+  (let [initial (begin-materialization plan arguments)
+        final (reduce (fn [state _] (advance-materialization state evaluate-scalar))
+                      initial (get-in initial [:plan :steps]))]
+    ;; The eager chain is produced here, not supplied by a caller. Keep its
+    ;; existing final validation without reinterpreting every structured step.
+    (complete-materialization final)))

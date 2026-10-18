@@ -1299,6 +1299,20 @@ compilation must be incremental at the granularity of plan nodes, with unchanged
 artifacts reused by identity. A forkable execution context, as in Spindel, is the mechanism for
 trying a plan change on a branch and committing or discarding it with its measurements.
 
+Typed invocation materialization has an incremental execution state over the existing
+`ShapeProjection`, `ScalarCompute`, allocation, clone and alias descriptions. Beginning validates
+public arguments only; each advance evaluates one step, and finishing requires the complete
+prefix. The eager entry uses the same interpreter. Prefix validation reconstructs deterministic
+steps in their original lexical environments without repeating scalar computations; supplied
+scalar results still belong to the trusted evaluator, not an arbitrary metadata certificate.
+States retain borrowed host sources but own no driver handles or lifetime leases. Public prefix
+validation is linear per advance, not a demonstrated preparation-time optimization. Clones of
+newly allocated storage without a host source still require a separate realization contract.
+This is a prerequisite for ordered host/device execution, not its completion: the prepared runner
+must still finish the preceding graph, evaluate the deferred host check, then allocate and bind
+the suffix, preserving failure order and cleanup. A primitive input ABI does not prove that a
+later multiplication cannot overflow, and a logical dtype does not justify hoisting that check.
+
 JAX pytrees are the model for separating user structure from flat leaves, but
 Raster trees should retain stable keyed paths and type/shape information. JAX
 donation and sharding contracts are also useful references; Raster's existing
