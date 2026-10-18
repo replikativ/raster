@@ -38,6 +38,44 @@
         result (outcome f (into [(long-array [value]) output (long 1)] trailing))]
     (assoc (dissoc result :value) :output (vec output))))
 
+(deftest emitted-generic-arithmetic-matches-real-numbers-carrier-matrix
+  (let [tags {:int 'int :long 'long :float 'float :double 'double :ref 'Object :bool 'boolean}
+        normalize {:int :long :long :long :float :double :double :double :ref :ref :bool :ref}
+        classes {:long Long/TYPE :double Double/TYPE :ref Object}
+        pairs [[:double :ref] [:ref :double] [:ref :ref] [:bool :double] [:double :bool]
+               [:long :ref] [:ref :long] [:float :ref] [:ref :float] [:int :ref] [:ref :int]]
+        specs (vec (for [[op method] [["+" "add"] ["-" "minus"] ["*" "multiply"] ["/" "divide"]]
+                         [left right] pairs]
+                     {:name (gensym "carrier") :params (parameters [(tags left) (tags right)])
+                      :walked-body [(list (symbol "clojure.core" op) 'x 'y)]
+                      :source-ns *ns* :return-tag 'Object
+                      :left left :right right :numbers-method method}))
+        compiled (bytecode/compile-specialized-class!
+                  (str "raster.test.GenericCarrierMatrix" (gensym)) specs)
+        value (fn [carrier reference zero?]
+                (case carrier :ref reference :bool true :int (int (if zero? 0 3))
+                      :long (long (if zero? 0 3)) :float (float (if zero? 0 1.5))
+                      :double (double (if zero? 0 1.5))))
+        converted (fn [carrier v] (case carrier :int (long v) :float (double v) v))
+        comparable (fn [result]
+                     (if (contains? result :value)
+                       (let [v (:value result)]
+                         {:class (class v) :value (if (double? v) (Double/doubleToRawLongBits v) v)})
+                       result))]
+    (doseq [{:keys [name left right numbers-method]} specs
+            reference [0.0 -0.0 1.0 9007199254740995 nil true]
+            zero? [false true]
+            :let [method (get-in compiled [:methods name])
+                  overload (.getMethod clojure.lang.Numbers numbers-method
+                                       (into-array Class [(classes (normalize left))
+                                                          (classes (normalize right))]))
+                  args [(value left reference zero?) (value right reference zero?)]
+                  expected (outcome #(.invoke overload nil
+                                             (object-array [(converted left %1) (converted right %2)])) args)
+                  actual (outcome #(.invoke method nil (object-array %&)) args)]]
+      (is (= (comparable expected) (comparable actual))
+          (pr-str [numbers-method left right args expected actual])))))
+
 (deftest checked-and-explicitly-wrapping-long-arithmetic-match-clojure
   (let [specs (mapv (fn [{:keys [name types body]}]
                       {:name name :params (parameters types) :walked-body [body]
