@@ -364,6 +364,7 @@
 (declare ^:private gen-reverse-par-map)
 (declare ^:private gen-reverse-par-reduce)
 (declare ^:private gen-reverse-ordered-reduce)
+(declare ^:private assemble-ordered-reduce)
 (declare ^:private gen-reverse-par-scan)
 (declare ^:private let-gradient-pieces)
 (declare ^:private extract-let-parts)
@@ -3433,9 +3434,24 @@
                                                 active-params)))
                            (= 'double (or (:raster.type/tag (meta body-result))
                                           (inf/infer-rewritten-tag body-result)))
-                           (carry-dtype-consistent? :double body-expr))
+                           (carry-dtype-consistent? :double body-expr))]
+    (assemble-ordered-reduce
+     {:acc-sym acc-sym :init-expr init-expr :idx-sym idx-sym
+      :bound-expr bound-expr :body-expr body-expr
+      :agets agets :scalar-bindings scalar-bindings :body-result body-result
+      :free-syms free-syms :typed-double? typed-double?
+      :replay-values (util/free-syms par-reduce-form)}
+     active-params)))
 
-        ;; Read arrays (via aget in body)
+(defn- assemble-ordered-reduce
+  "Shared ordered tape/sweep assembly after step preparation.
+   Source analysis owns normalization, dtype and replay proofs above; this
+   layer does not rerun source read/carry analysis. Scalar differentiation
+   still uses the common binding engine."
+  [{:keys [acc-sym init-expr idx-sym bound-expr body-expr
+           agets scalar-bindings body-result free-syms typed-double? replay-values]}
+   active-params]
+  (let [;; Read arrays (via aget in body)
         read-arrs (vec (distinct (map :arr agets)))
 
         ;; Active free symbols
@@ -3492,7 +3508,7 @@
                                                         iter-active d-acc-chain-sym)
                              (:form scalar-program)))
         step-replays (into (index-replays agets idx-sym)
-                           (if typed-double? (util/free-syms par-reduce-form)
+                           (if typed-double? replay-values
                                (:replays scalar-program)))
 
         ;; === Forward code ===

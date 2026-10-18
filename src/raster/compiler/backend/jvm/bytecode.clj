@@ -839,13 +839,18 @@
               input (nth (:inputs parent) input-index)
               actual (:operand input)
               scope-token (::binding-scope-occurrence (meta source))
-              call-token (::call-occurrence (meta source))]
+              call-token (::call-occurrence (meta source))
+              reduction (retained-reduction-emission emission source)]
           (when (or (and scope-token
                          (identical? source (get (:binding-catalog emission) scope-token))
                          (identical? scope-token (::binding-scope-occurrence (meta actual))))
                     (and call-token
                          (identical? source (get (:invocation-catalog emission) call-token))
-                         (identical? call-token (::call-occurrence (meta actual)))))
+                         (identical? call-token (::call-occurrence (meta actual))))
+                    ;; Reduction expansion changes the immediate input's
+                    ;; syntax. Its actual emitted bound scope, not a copied
+                    ;; source token, establishes this parent/region edge.
+                    (and reduction (identical? actual (get-in reduction [:bound :expression]))))
             (assoc input :source-original source)))))))
 
 (defn- retain-floating-conversion! [ctx operand input-type target-carrier locals]

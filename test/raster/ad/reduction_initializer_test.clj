@@ -38,3 +38,21 @@
         events (atom 0)]
     (is (thrown? ArithmeticException (invoke 2.0 Long/MAX_VALUE events)))
     (is (zero? @events))))
+
+(deftest assembly-does-not-repeat-source-read-or-carry-analysis
+  (let [captured (atom nil)
+        original @#'reverse/assemble-ordered-reduce]
+    (with-redefs-fn {#'reverse/assemble-ordered-reduce
+                    (fn [step active]
+                      (reset! captured [step active])
+                      (original step active))}
+      ordered-program)
+    (let [[step active] @captured
+          reject (fn [& _] (throw (ex-info "source analysis repeated" {})))
+          assembled (with-bindings {#'reverse/*gensym-counter* (atom 0)}
+                      (with-redefs-fn {#'reverse/analyze-par-map-body reject
+                                      #'reverse/carry-dtype-consistent? reject}
+                        #(original step active)))]
+      (is (= :double-carry (:residual-kind assembled)))
+      (is (seq (:forward-bindings assembled)))
+      (is (seq (:backward-reduces assembled))))))

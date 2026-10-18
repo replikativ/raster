@@ -4,6 +4,7 @@
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as n]
             [raster.par :as par]
+            [raster.compiler.core.util :as util]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
 (deftm response [a :- Double k :- Double x :- Double] :- Double
@@ -19,6 +20,8 @@
     (par/reduce acc 0.0 i cnt (n/+ acc (n/* gain (aget xs i))))))
 (deftm float-reduced [xs :- (Array float) cnt :- Long] :- Float
   (par/reduce acc (float 0.0) i cnt (n/+ acc (aget xs i))))
+(deftm reduction-input [xs :- (Array double) coefficient :- Double cnt :- Long] :- Double
+  (n/* coefficient (par/reduce acc 0.0 i cnt (n/+ acc (aget xs i)))))
 (deftm initialized-reduction [xs :- (Array double) events :- (Array long) cnt :- Long] :- Double
   (par/reduce acc (double (do (aset events 0 (long 1)) (aget xs 0))) i cnt (n/+ acc 1.0)))
 
@@ -137,3 +140,24 @@
                     (catch Exception error (class error)))]
     (is (= expected actual))
     (is (= [0] (vec events)))))
+
+(deftest reduction-input-edge-requires-the-actual-emitted-region
+  (let [emission (emitted #'reduction-input)
+        source (first (vals (:reduction-catalog emission)))
+        parent (some (fn [call]
+                       (when (some #(identical? source %) (util/call-args call)) call))
+                     (vals (:invocation-catalog emission)))
+        input-index (first (keep-indexed #(when (identical? source %2) %1)
+                                         (util/call-args parent)))
+        edge (bytecode/retained-input-source-context emission parent input-index)
+        token (:raster.compiler.backend.jvm.bytecode/call-occurrence (meta parent))
+        actual (:operand edge)]
+    (is (some? parent))
+    (is (some? edge))
+    (is (identical? source (:source-original edge)))
+    (is (identical? actual (get-in (bytecode/retained-reduction-emission emission source)
+                                  [:bound :expression])))
+    (is (nil? (bytecode/retained-input-source-context
+               (assoc-in emission [:invocation-contexts token :inputs input-index :operand]
+                         (with-meta (apply list actual) (meta actual)))
+               parent input-index)))))
