@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.scalar.native-alias-storage-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :refer [deftm]]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.inference :as inference]
@@ -14,6 +15,45 @@
 
 (defn- project [source]
   (products/project-storage-alias-snapshots source {} Double/TYPE))
+
+(deftm nil-product-numeric-consumer [x :- Double] :- Double
+  (let [values [nil x]] (double (nth values 0))))
+
+(deftest native-nil-consumers-cannot-acquire-numeric-zero
+  (is (thrown? NullPointerException (nil-product-numeric-consumer 1.0)))
+  (is (= :unclosed-c-family-value-completion
+         (try (pipeline/compile-aot #'nil-product-numeric-consumer :target :c)
+              nil
+              (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+
+(deftest literal-nil-object-completion-has-no-storage-or-conversion
+  (is (= (snapshot nil) (project (snapshot nil)))
+      "a root or escaping nil is not a native numeric value")
+  (let [source (list 'let* ['unused (snapshot nil)] 3.0)
+        lowered (project source)]
+    (is (not (completion/contains-completion? lowered)))
+    (is (= '(let* [] 3.0) (:form (dce/eliminate-dead-bindings lowered)))))
+  (doseq [source [(snapshot '(do (side-effect) nil))
+                  (snapshot 1.0)
+                  (snapshot 'unknown)
+                  (list 'clojure.core/double (snapshot nil))
+                  (list 'let* ['saved (snapshot nil)] '(clojure.core/double saved))
+                  (list 'let* ['saved (snapshot nil)] 'saved)
+                  (completion/complete-value
+                   (completion/primitive-input-contract Double/TYPE {:unchecked-math false}) nil)
+                  (vary-meta (snapshot nil) assoc :raster.effect/preserve-evaluation true)
+                  (vary-meta (snapshot nil) assoc :raster.effect/source-reference-cast true)
+                  (list completion/completion-symbol completion/object-input-contract)]]
+    (is (= source (project source)))
+    (is (completion/contains-completion? (project source))))
+  (let [quoted (list 'quote (snapshot nil))]
+    (is (identical? quoted (project quoted))))
+  (let [source (list 'let* ['a (snapshot nil) 'b (snapshot 'a)] 3.0)
+        lowered (project source)]
+    (is (completion/contains-completion? lowered))
+    (is (= 3.0 (eval (completion/project-to-jvm-source lowered))))
+    (is (:raster.effect/preserve-evaluation (meta (second (second lowered))))
+        "an alias can consume the exact nil producer's evaluation token")))
 
 (defn- invoke [source x calls]
   ;; This pass targets C declarations, not Clojure primitive-local hint syntax.

@@ -33,6 +33,16 @@ gates are not evidence of broad compatibility. Triage retains these groups:
 - AD products/completion: conditional product schemas, higher-order completion
   transposes, and native residual Object completions need closure; source guards
   and strict precision refusals must remain observable.
+  An adversarial native probe rejected the proposed *general* literal-nil
+  completion erasure: source numeric consumption throws NPE, whereas exposed
+  native nil could become zero. Keep used/escaping nil behind its completion
+  boundary; only a provably unused, flag-free literal-nil Object snapshot may
+  be discarded by its lexical binding owner. Passing ordinary callers alone
+  was insufficient safety evidence for that broader rewrite.
+  The restricted dead-binding repair passes the cold shared gate (165 tests,
+  969 assertions) and native AD caller gate (6 tests, 32 assertions), including
+  the new source-NPE/native-refusal regression. Alias-chain cleanup remains
+  conservative; these receipts do not close higher-order/compositional AD.
 - TypedSOAC composition: contraction scalar-contract projection, resident
   training coverage, RMSNorm effect loops, and checked terminal scalar results
   remain integration failures, not permission to restore retired fallbacks.

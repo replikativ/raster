@@ -16,6 +16,7 @@
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.scalar.normal-return :as normal-return]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.util :as util]))
 
 (defn- literal? [x]
@@ -533,6 +534,15 @@
                 (loop [pairs (seq (partition 2 bindings)) scope scope output []]
                   (if-let [[id init] (first pairs)]
                     (let [operand (object-alias-operand init)
+                          parts (completion/canonical-parts init)
+                          ;; Only an unobserved literal nil has no storage or
+                          ;; conversion obligation. Used nil must retain its
+                          ;; context: native numeric consumers cannot treat it
+                          ;; as zero. Never erase a retained denial flag.
+                          literal-nil? (and parts
+                                            (= completion/object-input-contract (:contract parts))
+                                            (nil? (:operand parts))
+                                            (empty? (:flags (effects/descriptor init))))
                           [known token] (owned-binding-fact scope id init)
                           known (dissoc known :native-erased-box?)
                           payload (fp-payload known)
@@ -547,10 +557,10 @@
                                                :declared (select-keys (meta id) [:tag :raster.type/tag])})))
                           continuation (relist value
                                                (concat [head (vec (mapcat identity (next pairs)))] body))
-                          unused? (and operand (contains? scope operand)
+                          unused? (and (or literal-nil? (and operand (contains? scope operand)))
                                        (binding [util/*shadowing-locals* (conj util/*shadowing-locals* id)]
                                          (not (contains? (util/free-syms continuation) id))))
-                          _ (when unused? (consume-evaluation! known))
+                          _ (when (and unused? (not literal-nil?)) (consume-evaluation! known))
                           erase? (and operand
                                       (or array?
                                           (and payload
