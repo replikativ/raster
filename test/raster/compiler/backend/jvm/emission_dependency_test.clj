@@ -194,6 +194,44 @@
         (is (not (method-entry/same-var-snapshot? before (method-entry/var-snapshot v)))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest direct-live-observations-match-fresh-snapshot-semantics
+  (let [scope (create-ns (gensym "raster.live-observation."))
+        v (doto (intern scope 'value (Object.)) (.setDynamic))
+        original-meta (meta v)
+        original-root @v
+        observations [(method-entry/var-snapshot v)
+                      (method-entry/emission-definition-snapshot v)]
+        assert-current! (fn [expected]
+                          (doseq [[snapshot expected?] (map vector observations expected)]
+                            (let [fresh (if (= :emission-definition (:snapshot-kind snapshot))
+                                          (method-entry/emission-definition-snapshot v)
+                                          (method-entry/var-snapshot v))]
+                              (is (= expected?
+                                     (method-entry/same-var-snapshot? snapshot fresh)
+                                     (method-entry/var-value-current? snapshot))))))]
+    (try
+      (assert-current! [true true])
+      (with-bindings {v (Object.)} (assert-current! [false false]))
+      (alter-meta! v assoc :raster.core/deftm-bytecode {:unused :cache})
+      (assert-current! [false true])
+      (alter-meta! v assoc :changed true)
+      (assert-current! [false false])
+      (reset-meta! v original-meta)
+      (.bindRoot v nil)
+      (assert-current! [false false])
+      (let [bound-nil (method-entry/var-snapshot v)]
+        (is (method-entry/var-value-current? bound-nil))
+        (.unbindRoot v)
+        (is (not (method-entry/var-value-current? bound-nil)))
+        (let [unbound (method-entry/var-snapshot v)]
+          (is (method-entry/var-value-current? unbound))
+          (.bindRoot v nil)
+          (is (not (method-entry/var-value-current? unbound)))))
+      (finally
+        (.bindRoot v original-root)
+        (reset-meta! v original-meta)
+        (remove-ns (ns-name scope))))))
+
 (deftest prepared-emission-guards-preserve-historical-live-checks
   (let [scope (create-ns (gensym "raster.prepared-emission."))
         caller (create-ns (gensym "raster.prepared-emission-caller."))
