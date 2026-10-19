@@ -194,6 +194,57 @@ definition changes before changing invalidation; a passing warmed small control
 does not reproduce or close this lifecycle bug. Cold time/RSS are not improved
 by this functional qualification.
 
+The preserved helper fixture now reproduces on campaign source as well: runtime
+and AOT both evaluate to `2.0620095064443418`, then retained runtime reuse refuses
+with compiler revision 1699 to 1703 (template revision 239 unchanged). Tracing the
+four actual changes identifies two generated `deftm` definitions evaluated in
+the marketing namespace: each publishes a result descriptor and registers its
+method. This is deliberate source publication by the bridge, not a numerical
+failure or a mysteriously mutating AOT cache. Raster's own
+`compiled-value+grad-fn` has the analogous named-wrapper pattern.
+
+Reviewed continuation: extract one anonymous retained-entry compiler from the
+existing JVM AOT path after definition resolution. The Var API remains an
+adapter; both use the same source preparation, forward passes, loader and
+hoisting/emission. Anonymous entries return diagnostics instead of mutating a
+Var and retain actual source namespace/policy, annotations, return contexts,
+captures and definition observations. Share typed-body AD preparation rather
+than fabricating a Var or introducing another differentiation path. Existing
+`ftm` and source-owner helpers are precedents, not substitutes for the complete
+AOT owner contract. Keep epoch and changed-definition guards intact: finer
+invalidation would require historical selection and negative-lookup dependencies.
+Acceptance is an already-retained MMM gradient surviving subsequent anonymous
+compilation without namespace/GF publication, with unchanged template/callee/
+overload mutation refusals. The local implementation now reuses the existing
+metadata-carrier resolver and full JVM AOT path rather than adding another IR
+or compiler. It retains actual namespace identity, checked source policy,
+annotations and the physical Object return contract. Captured closures,
+unchecked arithmetic and anonymous native/GPU targets remain explicitly held.
+The generated gradient wrapper uses `ftm`, without interning a definition;
+diagnostics attach to the returned anonymous callable. Warm anonymous-entry
+qualification passes 10 tests / 55 assertions, including retained-gradient reuse,
+unchanged definition revision and Var-held source-context routing. Static review
+found no remaining bounded defect. This is not yet released, and the downstream
+bridge still needs migration and its actual MMM lifecycle qualification.
+
+The compatibility gate also independently reproduced a silent source-product
+regression: lexical substitution/alpha conversion rebuilt vectors without their
+runtime metadata, changing the primal branch and derivative. Both vector walkers
+now preserve original metadata unchanged; the existing source-product oracle
+passes without changing its expectations. A nested-vector control covers both
+walkers. A separate product join now forgets absence for an exact unknown leaf
+only at a path inactive in both validated arms; it never derives a tangent dtype
+or creates a tangent edge there. Nested, reversed, repeated-join and active-unknown
+denial controls accompany this repair. Both changes received static review.
+The fresh-JVM combined gate passes 69 tests / 423 assertions across anonymous
+AOT, lexical utilities, product ports, conditional ports and source products.
+This is bounded source/JVM evidence, not a green integration PR or device result.
+The additional four-namespace owner/lifecycle/replay/function-algebra gate is not
+green: 41 tests / 187 assertions report two failures and one error. The native
+replay refusal stops at unclosed value completion before the expected guard
+diagnostic, and `D-pipeline-rewrite` still errors. Do not treat these as covered
+by the narrower passing product gate; both remain in the integration backlog.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.

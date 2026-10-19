@@ -7477,7 +7477,7 @@
 
 (defn- compiled-value+grad-fn
   "The runtime value+grad of `f-var` compiled by the full pipeline: a private
-  wrapper deftm with `f`'s own parameters and annotations that binds the
+  anonymous ftm with `f`'s own parameters and annotations that binds the
   value+grad call and returns its elements — the pipeline inlines the
   AD-transformed body there and devirtualizes it, as for a value+grad inside
   any compiled deftm — then compile-aot. Returns {:fn compiled} or, when the
@@ -7495,15 +7495,14 @@
               target (symbol f-var)]
           (if-not (and source-ns (seq params) (= (count params) (count anns)))
             {:failure {:reason :missing-deftm-metadata :var f-var}}
-            (let [wrapper (gensym (str (name target) "--value+grad-"))
-                  slots (vec (repeatedly (inc (count params)) #(gensym "vg")))
-                  form `(raster.core/deftm ~(with-meta wrapper {:private true})
+            (let [slots (vec (repeatedly (inc (count params)) #(gensym "vg")))
+                  form `(raster.core/ftm
                           [~@(mapcat (fn [p a] [p :- a]) params anns)]
                           (let [~slots ((raster.ad.reverse/value+grad (var ~target) ~@(when (some? wrt) [:wrt wrt]))
                                         ~@params)]
                             ~slots))]
-              (binding [*ns* source-ns] (eval form))
-              {:fn ((requiring-resolve 'raster.compiler.pipeline/compile-aot) (ns-resolve source-ns wrapper))})))
+              {:fn ((requiring-resolve 'raster.compiler.pipeline/compile-aot)
+                    (binding [*ns* source-ns] (eval form)))})))
         (catch Throwable t {:failure t})))))
 
 (defn ^:no-doc project-owned-value+grad-call
@@ -7749,11 +7748,15 @@
   "Construct value and all positional gradient slots. Default :representation :source
    retains existing AD. :normalized-scalar opts into the checked scalar runtime bundle;
    it supports :mode :reverse and :wrt, but not :compile? true yet."
-  ([f-var] (source-value+grad f-var))
+  ([f-var] (value+grad f-var :representation :source))
   ([f-var & {:keys [representation mode wrt compile?]
              :or {representation :source mode :reverse} :as options}]
-   (case representation
-     :source (apply source-value+grad f-var (mapcat identity (dissoc options :representation)))
+   (let [source-entry (resolve-deftm-var f-var)]
+    (source-owner/call-with-source-context
+    (meta source-entry)
+    (fn []
+     (case representation
+     :source (apply source-value+grad source-entry (mapcat identity (dissoc options :representation)))
      :normalized-scalar
      (do
        (when-not (= :reverse mode)
@@ -7763,7 +7766,7 @@
          (throw (ex-info "normalized scalar value+grad currently supports runtime construction only"
                          {:reason :normalized-scalar-compile-unsupported})))
        (let [bundle ((requiring-resolve 'raster.ad.normalized-scalar/prepare)
-                     (resolve-deftm-var f-var) wrt)
+                     source-entry wrt)
              {:keys [walked-body params tags source-ns]}
              ((requiring-resolve 'raster.ad.normalized-scalar/value+grad-body) bundle)
              runtime-fn ((requiring-resolve 'raster.ad.normalized-scalar/guarded-runtime)
@@ -7776,7 +7779,7 @@
             :raster.core/deftm-source-ns (ns-name source-ns)
             :raster.ad/normalized-bundle bundle})))
      (throw (ex-info "unknown AD representation"
-                     {:reason :ad-representation :representation representation})))))
+                     {:reason :ad-representation :representation representation}))))))))
 
 (defn grad
   "Composable gradient operator.

@@ -65,6 +65,7 @@
             [raster.compiler.core.hoist :as hoist]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as value-completion]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.inference :as inf]
@@ -1424,7 +1425,10 @@
 (declare compile-aot-jvm)
 
 (defn compile-aot
-  "Compile a deftm var into an optimized forward function with buffer fusion.
+  "Compile a deftm var or capture-free ftm into an optimized forward function.
+   Anonymous ftm currently uses the JVM path with checked source arithmetic;
+   lexical captures and unchecked source arithmetic require their own retained
+   lowering authority and are refused rather than reinterpreted in the caller.
 
   Pipeline: walker → inline → DCE → buffer-fuse → typed SOAC fusion → backend
             → mem-merge → hoist → eval
@@ -1458,7 +1462,22 @@
   [f-var & {:keys [inline? simd? dtype target-device target preserve-declared-array-storage?
                    reuse-buffers? no-alias?]
             :or {inline? true simd? true no-alias? true}}]
-  (if (= target :c)
+  (let [anonymous? (not (var? f-var))
+        metadata (meta f-var)
+        policy (:raster.core/source-policy metadata)]
+    (when anonymous?
+      (source-owner/assert-portable-source! metadata)
+      (when-not (and (:raster.core/anonymous-function metadata)
+                     (value-completion/source-policy? policy)
+                     (some-> (:raster.core/deftm-source-ns metadata) find-ns))
+        (throw (ex-info "Anonymous AOT requires retained ftm source context"
+                        {:reason :unclosed-anonymous-aot-source})))
+      (when (or target target-device)
+        (throw (ex-info "Anonymous AOT target requires its own retained source owner"
+                        {:reason :unsupported-anonymous-aot-target :target target :device target-device}))))
+  (source-owner/call-with-source-context metadata
+   (fn []
+   (if (= target :c)
     ;; Native CPU-C backend: emit the whole fused body as one C function (no
     ;; per-op JVM dispatch) + Panama FFM. Bypasses the bytecode/hoist path.
     ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
@@ -1466,7 +1485,7 @@
     (compile-aot-jvm f-var :inline? inline? :simd? simd? :dtype dtype
                      :target-device target-device
                      :preserve-declared-array-storage? preserve-declared-array-storage?
-                     :reuse-buffers? reuse-buffers?)))
+                     :reuse-buffers? reuse-buffers?))))))
 
 (defn- retained-compilation-loader
   "Preserve retained class identities when defining AOT bytecode.
@@ -1529,7 +1548,7 @@
                     (if (instance? clojure.lang.DynamicClassLoader tcl)
                       tcl
                       ;; Find a DCL from the f-var's namespace
-                      (let [root (try (.getRawRoot ^clojure.lang.Var f-var)
+                      (let [root (try (if (var? f-var) (.getRawRoot ^clojure.lang.Var f-var) f-var)
                                       (catch Exception _ nil))
                             var-cl (when root (.getClassLoader (class root)))]
                         (if (instance? clojure.lang.DynamicClassLoader var-cl)
@@ -1612,10 +1631,10 @@
                                            (list 'let* [] form)
                                            active-params active-params hoist-opts))))]
                        ;; Store diagnostics on the compiled function's metadata
-                         (alter-meta! f-var assoc
-                                      ::compiled-diagnostics
-                                      (dissoc result :fn))
-                         (:fn result)))]
+                         (when (var? f-var)
+                           (alter-meta! f-var assoc ::compiled-diagnostics (dissoc result :fn)))
+                         (if (var? f-var) (:fn result)
+                             (vary-meta (:fn result) assoc ::compiled-diagnostics (dissoc result :fn)))))]
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
           (compile!))))))

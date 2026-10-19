@@ -16,11 +16,40 @@
   "Refuse source extraction that would discard an unprojected private owner.
    Prepared programs and callable metadata use separate, explicit owner slots."
   [program]
+  (when (:raster.core/anonymous-function program)
+    (let [retained (:ns program)
+          live (some-> (:raster.core/deftm-source-ns program) find-ns)]
+      (when-not (and (instance? clojure.lang.Namespace retained)
+                     (identical? retained live))
+        (throw (ex-info "Anonymous source namespace has been removed or replaced"
+                        {:reason :stale-anonymous-source-namespace
+                         :source-ns (:raster.core/deftm-source-ns program)}))))
+    (let [policy (:raster.core/source-policy program)]
+      (when-not (completion/source-policy? policy)
+        (throw (ex-info "Anonymous source has no retained compilation policy"
+                        {:reason :unclosed-anonymous-source-policy})))
+      (when-not (false? (:unchecked-math policy))
+        (throw (ex-info "Anonymous unchecked arithmetic needs source-owned lowering"
+                        {:reason :unsupported-anonymous-source-policy :source-policy policy})))))
   (when (or (contains? program :source-owner)
-            (contains? program :raster.compiler/source-owner))
+            (contains? program :raster.compiler/source-owner)
+            (seq (:raster.core/lexical-captures program)))
     (throw (ex-info "Private JVM source ownership requires a capture-aware projection"
                     {:reason :unprojected-jvm-source-owner})))
   program)
+
+(defn call-with-source-context
+  "Reuse an anonymous producer's actual namespace/policy, never the caller's.
+   Named and separately owned entries retain their existing context contracts."
+  [metadata compile!]
+  (if (:raster.core/anonymous-function metadata)
+    (do (assert-portable-source! metadata)
+        (binding [*ns* (:ns metadata)
+                  *unchecked-math* (get-in metadata [:raster.core/source-policy :unchecked-math])]
+          (let [compiled (compile!)]
+            (assert-portable-source! metadata)
+            compiled)))
+    (compile!)))
 
 (defn- bound-identifiers [source]
   (let [identifiers (volatile! #{})]

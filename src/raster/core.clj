@@ -1061,6 +1061,16 @@
 ;; Public API: ftm macro (typed anonymous function)
 ;; ================================================================
 
+(clojure.core/defn ^:no-doc anonymous-capture-fields
+  "Actual reify storage catches captures introduced by macro expansion too.
+   Static constants and reify's metadata slot are not lexical input ports."
+  [function]
+  (into #{} (keep (fn [^java.lang.reflect.Field field]
+                    (when-not (or (java.lang.reflect.Modifier/isStatic (.getModifiers field))
+                                  (= "__meta" (.getName field)))
+                      (.getName field))))
+        (.getDeclaredFields (class function))))
+
 (defmacro ftm
   "Typed anonymous function via reify on a shared interface.
   Supports 5+ primitive args without boxing. Backward-compatible as IFn.
@@ -1109,26 +1119,45 @@
         ;; Build IFn invoke arity — uses un-walked body for dispatch compatibility
         invoke-params (mapv (fn [p] (gensym (str p "__"))) params)
         invoke-let-bindings (vec (interleave params invoke-params))
+        ;; Source syntax catches elided constant captures; actual reify fields
+        ;; below also catch macro-introduced captures without expanding twice.
+        captured-source (binding [util/*shadowing-locals*
+                                  (into util/*shadowing-locals* (keys &env))]
+                          (set (filter (set (keys &env))
+                                       (util/free-syms
+                                        (list* 'fn* (vec params)
+                                               (concat (or walker-source-body body) walked-body))))))
+        source-policy {:unchecked-math *unchecked-math*}
         this-sym (gensym "this__")
         invk-sym 'invk]  ;; returns Object (interface contract)
     `(do
        (import ~iface-name)
-       (vary-meta
-        (reify
+       (let [function# (reify
           ~iface-name  ;; extends raster.compiler.core.types.TypedFn (marker for function algebra dispatch)
           (~invk-sym [~this-sym ~@prim-hinted-params] ~@walked-body)
           clojure.lang.IFn
           (~'invoke [~this-sym ~@invoke-params]
             (let ~invoke-let-bindings
-              ~@(or walker-source-body body))))
-        merge {::deftm true
+              ~@(or walker-source-body body))))]
+        (vary-meta function# merge {::deftm true
+               ::anonymous-function true
+               :ns (the-ns '~(ns-name *ns*))
+               ::deftm-source-ns '~(ns-name *ns*)
+               ::deftm-annotations '~(vec annotations)
+               ;; Both IFn.invoke and the shared typed invk interface return
+               ;; Object. A declaration must not invent a primitive completion.
+               ::return-tag '~'Object
+               ::deftm-return-annotation '~ret-type
+               ::source-policy '~source-policy
+               ::lexical-captures (into ~(set (map str captured-source))
+                                        (anonymous-capture-fields function#))
                ::deftm-walked-body '~(vec walked-body)
                 ;; Source body for AD: walker's pre-walk source (uses raster.numeric
                 ;; dispatch which handles Dual) when ftm is inside a walked deftm body.
                 ;; Falls back to the raw body when ftm is used standalone.
                ::deftm-source-body '~(vec (or walker-source-body body))
                ::deftm-params '~(vec params)
-               ::deftm-tags '~tags}))))
+               ::deftm-tags '~tags})))))
 
 ;; ================================================================
 ;; Public API: defvalue macro
