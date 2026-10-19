@@ -360,6 +360,24 @@ downstream-device-consumer refusals. Hardware-free contract/emission evidence,
 actual OpenCL/Level Zero execution and performance measurements remain separate.
 The broader distributed placement/planning obligations below remain open.
 
+Implementation seams confirmed by follow-up review: retain the validated
+continuation at InvocationPlan's existing attribute boundary, not its prefix
+`:steps`. Construct it during frontend terminal-source analysis and whole-source
+promotion; both host coverage and result coverage must consume the same owned
+contract. The existing ordered invocation executor already acknowledges numerical
+stages after synchronous completion. Extend that owner and its final realization
+validation to perform explicit terminal observation. Keep exact producer/export
+relations in the contract; rank-zero dtype alone is not export evidence.
+
+`gpu.compiled/invoke-compiled` is a resident API today. Its output tree, resident
+view projection and leases must not silently change to return host objects.
+Provide a distinct, explicit source-result observation boundary; reject unsupported
+resident requests before mutation/replay. The JVM typed-scalar interpreter's
+numeric result coercion and restricted expression grammar are not already an
+Object/nil completion evaluator. Reuse the existing retained source/bytecode
+completion owner when closing the result computation, rather than evaluating
+arbitrary source or inventing runtime implementations of canonical IR terms.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.
