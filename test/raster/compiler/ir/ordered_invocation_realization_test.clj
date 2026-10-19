@@ -94,7 +94,19 @@
     (is (= :link-checked-entry-owner-required
            (reason #(#'gpu-link/run-ordered-stage! nil ready))))
     (is (= :invocation-ordered-pending
-           (reason #(invocation-link/realize-ready-equation (:state ready) (:equation entry) nil))))))
+           (reason #(invocation-link/realize-ready-equation (:state ready) (:equation entry) nil))))
+    (is (= :invocation-ordered-incomplete
+           (reason #(invocation-link/finish-ordered-storage-boundary (:state ready) nil))))
+    ;; Synthetic source state proves layout only: no device work or observation
+    ;; happened in this test and the returned value must grant neither.
+    (let [completed (-> (:state ready) (dissoc :pending)
+                        (assoc :source-cursor (count (:source-order state))))
+          boundary (invocation-link/finish-ordered-storage-boundary completed nil)]
+      (is (= [output] (:outputs boundary)))
+      (is (every? #(nil? (:source %)) (vals (:nodes boundary))))
+      (is (nil? (:instances boundary)))
+      (is (nil? (:effect-evidence boundary)))
+      (is (= :link-plan-type (reason #(link-plan/validate! boundary)))))))
 
 (deftest early-equation-binds-without-evaluating-the-late-checked-shape
   (let [compilation (equation-first/compile #'fixture/write-before-shape

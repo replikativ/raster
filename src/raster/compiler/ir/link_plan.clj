@@ -43,6 +43,7 @@
 (defrecord LinkEffectEvidence
            [source-dialect target-dialect plan-id target step-facts initialization])
 (defrecord PendingObservedEntry [layout equation entry-contract])
+(defrecord StorageBoundary [id target nodes values outputs aliases attributes])
 
 (def ^:dynamic ^:private *validated-program-instances* nil)
 (def ^:dynamic ^:private *retained-program-validations* nil)
@@ -916,6 +917,27 @@
                        :nodes (set (keys nodes))}))))
   {:nodes nodes :values values})
 
+(defn- validate-output-layout! [{:keys [nodes values outputs] :as boundary}]
+  (when-not (and (vector? outputs) (every? #(contains? nodes %) outputs))
+    (throw (ex-info "link outputs must name existing storage nodes"
+                    {:reason :link-outputs :outputs outputs :nodes (set (keys nodes))})))
+  (when-not (= (count outputs) (count (distinct outputs)))
+    (throw (ex-info "link output identities must be unique"
+                    {:reason :link-output-duplicates :outputs outputs})))
+  (let [positions (zipmap outputs (range))]
+    (doseq [[value-id link-value] values
+            :let [leaf-nodes (mapv :node (:leaves link-value))
+                  leaf-positions (vec (keep positions leaf-nodes))]
+            :when (seq leaf-positions)]
+      (when-not (and (= (count leaf-nodes) (count leaf-positions))
+                     (= leaf-positions
+                        (vec (range (first leaf-positions)
+                                    (+ (first leaf-positions) (count leaf-positions))))))
+        (throw (ex-info "public outputs must flatten whole logical values in field order"
+                        {:reason :link-output-value :value value-id :leaves leaf-nodes
+                         :positions leaf-positions :outputs outputs})))))
+  boundary)
+
 (defn- validate-plan-storage-and-instances! [plan]
   (when-not (link-plan? plan)
     (throw (ex-info "expected a LinkPlan value"
@@ -939,24 +961,7 @@
     (when-not (= (count instances) (count (distinct (map :id instances))))
       (throw (ex-info "link instance identities must be unique"
                       {:reason :link-instance-ids :ids (mapv :id instances)})))
-    (when-not (and (vector? outputs) (every? #(contains? nodes %) outputs))
-      (throw (ex-info "link plan outputs must be an ordered vector of existing node identities"
-                      {:reason :link-outputs :outputs outputs :nodes (set (keys nodes))})))
-    (when-not (= (count outputs) (count (distinct outputs)))
-      (throw (ex-info "link plan output identities must be unique"
-                      {:reason :link-output-duplicates :outputs outputs})))
-    (let [positions (zipmap outputs (range))]
-      (doseq [[value-id link-value] values
-              :let [leaf-nodes (mapv :node (:leaves link-value))
-                    leaf-positions (vec (keep positions leaf-nodes))]
-              :when (seq leaf-positions)]
-        (when-not (and (= (count leaf-nodes) (count leaf-positions))
-                       (= leaf-positions
-                          (vec (range (first leaf-positions)
-                                      (+ (first leaf-positions) (count leaf-positions))))))
-          (throw (ex-info "public outputs must flatten whole logical values in field order"
-                          {:reason :link-output-value :value value-id :leaves leaf-nodes
-                           :positions leaf-positions :outputs outputs})))))
+    (validate-output-layout! plan)
     (when-not (and (set? aliases) (every? set? aliases))
       (throw (ex-info "link plan aliases must be a set of two-node sets"
                       {:reason :link-aliases :aliases aliases})))
@@ -1021,6 +1026,27 @@
                         {:reason :link-storage-node-identities :node id})))
       (validate-node-device! target id node true))
     (validate-allocations-and-aliases! {:nodes by-id :aliases (set aliases)})))
+
+(defn ^:no-doc make-storage-boundary
+  "Validate only a non-executable storage/output layout.
+   No instances, initialized-byte claim, completion evidence or binding permission
+   is represented. A live execution owner must independently establish all of
+   those obligations before exposing any view. Reuses LinkPlan storage rules."
+  [{:keys [id target nodes values outputs aliases attributes]
+    :or {outputs [] aliases #{} attributes {}} :as request}]
+  (when (or (nil? id)
+            (seq (set/difference (set (keys request))
+                                 #{:id :target :nodes :values :outputs :aliases :attributes}))
+            (not (map? attributes)))
+    (throw (ex-info "storage boundary cannot carry executable or effect evidence"
+                    {:reason :link-storage-boundary-contract})))
+  (let [nodes (:nodes (validate-storage-nodes! target nodes aliases))
+        values (normalize-values nodes values)
+        boundary (->StorageBoundary id target nodes values (vec outputs)
+                                    (into #{} (map canonical-alias-pair) aliases) attributes)]
+    (validate-storage-structure! target nodes values false)
+    (validate-output-layout! boundary)
+    boundary))
 
 (defn- validate-instance-bindings! [nodes values instance]
   (let [{:keys [id descriptor bindings roles]} instance

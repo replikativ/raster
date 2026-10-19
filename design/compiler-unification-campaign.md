@@ -118,6 +118,18 @@ prewalk-A/materialize-B helper import. Aliases and parametric cases remain requi
 Live allocation-ledger checks, success-conditional initialization and a non-executable
 final storage boundary remain required after this source-provenance work.
 
+The non-executable storage projection is now represented separately as
+`StorageBoundary`: it shares the existing physical/logical storage, alias and
+whole-value output-order validators, but cannot carry instances, effect evidence
+or initialization fields. `finish-ordered-storage-boundary` projects completed
+source-state storage without rebuilding an executable whole-program call or
+replaying initializers. Its construction proves layout only; even a fabricated
+completed cursor grants no device completion. Ordinary LinkPlan validation and
+instantiation reject its distinct type. Focused storage/LinkPlan/ordered-realization
+gate passes 34 tests / 255 assertions. Runtime activation still owes exact
+source-occurrence/replay-epoch observation accounting, live private-root ownership,
+initialized-range checks and failure poisoning before this boundary can publish.
+
 The original-frontend slice passes the nine-namespace focused gate: 119 tests /
 928 assertions, including actual confined local-device checks. The new source
 oracles cover both original eager/plain frontend code and successful JIT frontend

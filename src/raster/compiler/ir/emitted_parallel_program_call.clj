@@ -784,6 +784,19 @@
   ([call f] (map-buffers-for-request call f nil))
   ([call f caller-options] (map-buffers-for-request call f caller-options)))
 
+(defn ^:no-doc project-output-bindings
+  "Project declared outputs from already resolved buffers/scalars. This is data,
+   not program validation, completion or initialized-storage evidence."
+  [parallel-program buffers scalars]
+  (into {}
+        (map (fn [id]
+               [id (cond
+                     (contains? scalars id) (get scalars id)
+                     (contains? buffers id) (get buffers id)
+                     :else (fail! :emitted-program-output-binding
+                                  "program output has no runtime binding" {:value id}))]))
+        (:outputs parallel-program)))
+
 (defn- checked-stage-inputs
   "Check runtime bindings against the exact program without evaluating host equations."
   [parallel-program buffers scalar-values loop-scratch result-views retained-validation caller-options]
@@ -926,14 +939,7 @@
          (:equations parallel-program))
         final-buffers (:buffers planned)
         outputs
-        (into {}
-              (map (fn [id]
-                     [id (cond
-                           (contains? scalars id) (get scalars id)
-                           (contains? final-buffers id) (get final-buffers id)
-                           :else (fail! :emitted-program-output-binding
-                                        "program output has no runtime binding" {:value id}))]))
-              (:outputs parallel-program))]
+        (project-output-bindings parallel-program final-buffers scalars)]
     (validate-call-against-program!
      (->EmittedParallelProgramCall
       parallel-program (:steps planned) buffers final-buffers scalars loop-scratch outputs

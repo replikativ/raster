@@ -1427,17 +1427,49 @@
           (assoc-in [:instances 0 :roles] compiler-roles)
           (assoc-in [:attributes :public-buffer-roles] roles)))))
 
-(defn ^:no-doc finish-ordered-realization
-  "Construct and independently validate the ordinary whole-program boundary after source work.
-   Cached host results are looked up, not recomputed. Zeroed source allocations remain conditional
-   initialized inputs; the runtime must prove their actual completed initialization before export."
+(defn- require-completed-source!
   [state caller-options]
   (when-not (= caller-options (:caller-options state))
     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
   (when-not (and (nil? (:pending state))
                  (= (:source-cursor state) (count (:source-order state)))
                  (or (empty? (:terminal-exports state)) (:terminal-observed? state)))
-    (fail! :invocation-ordered-incomplete "source work has not completed" {}))
+    (fail! :invocation-ordered-incomplete "source work has not completed" {})))
+
+(defn ^:no-doc finish-ordered-storage-boundary
+  "Project completed source storage, not an executable program or completion proof.
+   The runtime must still check its own observation ledger, initialized ranges and
+   live acquired roots. No whole-program call is rebound or stripped of checks."
+  [state caller-options]
+  (require-completed-source! state caller-options)
+  (let [materialized (materialization/finish-materialization (:materialization state))
+        scalars (merge (invocation-shape-scalars materialized)
+                       (:program-scalars materialized) (:host-scalars state))
+        realized (:realized state)
+        output-bindings (program-call/project-output-bindings
+                         (:program state) (:buffers realized) scalars)
+        outputs (into [] (keep (fn [id]
+                                (let [binding (get output-bindings id)]
+                                  (when-not (typed-scalar? binding) [id binding]))))
+                      (get-in state [:program :outputs]))
+        tokens (mapv second outputs)
+        layout (storage-link-layout realized scalars (:target state) (set tokens)
+                                    (keys (:storage realized)))
+        ;; Initializers have already run. This boundary must not replay them.
+        nodes (mapv #(assoc % :source nil) (:nodes layout))]
+    (link/make-storage-boundary
+     {:id [(get-in materialized [:plan :id]) :completed-storage]
+      :target (:target state) :nodes nodes :values (:values layout) :outputs (vec (distinct tokens))
+      :aliases (into #{} (map set) (bview/overlapping-id-pairs (map (juxt :id :view) nodes)))
+      :attributes {:source :typed-invocation :semantic-outputs outputs
+                   :compiler-buffer-bindings (:buffers realized)}})))
+
+(defn ^:no-doc finish-ordered-realization
+  "Construct and independently validate the ordinary whole-program boundary after source work.
+   Cached host results are looked up, not recomputed. Zeroed source allocations remain conditional
+   initialized inputs; the runtime must prove their actual completed initialization before export."
+  [state caller-options]
+  (require-completed-source! state caller-options)
   (let [materialized (materialization/finish-materialization (:materialization state))
         initialized-tokens (into #{}
                                  (keep (fn [[token storage]]
