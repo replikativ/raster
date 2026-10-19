@@ -58,6 +58,47 @@
       (is (true? (run source x nil)))
       (is (true? (run lowered x nil))))))
 
+(deftest object-snapshots-compose-with-reference-consumers-and-captures
+  ;; Identity is not peculiar to identical?: storing a key, returning a field
+  ;; from a closure, and selecting a product arm all observe the same snapshot.
+  (doseq [source
+          ['(let* [p [(clojure.core/double x)]
+                   saved (fn* [] (clojure.core/nth p 0))]
+              (clojure.core/identical? (saved) (saved)))
+           '(let* [p (if (pos? x) [(clojure.core/double x)]
+                         [(clojure.core/double (- x))])
+                   keys (java.util.IdentityHashMap.)]
+              (.put keys (clojure.core/nth p 0) :saved)
+              (= :saved (.get keys (clojure.core/nth p 0))))
+           '(let* [p [(clojure.core/double x)]
+                   saved (clojure.core/nth p 0)]
+              (loop* [i 0]
+                (if (< i 3) (recur (inc i))
+                    (clojure.core/identical? saved (clojure.core/nth p 0)))))]]
+    (let [lowered (products/lower-local-products source)]
+      (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+        (is (true? (run source x nil)))
+        (is (true? (run lowered x nil))))))
+  (let [source '(let* [p [(clojure.core/double x) (clojure.core/double x)]]
+                 (clojure.core/identical? (clojure.core/nth p 0)
+                                         (clojure.core/nth p 1)))
+        lowered (products/lower-local-products source)]
+    (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+      (is (false? (run source x nil)))
+      (is (false? (run lowered x nil))))))
+
+(deftest snapshot-completion-preserves-failure-before-later-field-effects
+  (let [source '(let* [p [(clojure.core/double x)
+                         (do (swap! calls conj :later) 2.0)]]
+                 (clojure.core/nth p 0))
+        lowered (products/lower-local-products source)
+        invoke (fn [expression calls]
+                 (try (run expression nil calls) :returned
+                      (catch Throwable failure (class failure))))
+        a (atom []) b (atom [])]
+    (is (= NullPointerException (invoke source a) (invoke lowered b)))
+    (is (= [] @a @b))))
+
 (deftest scalar-accumulation-lowering-requires-independent-present-carriers
   (let [source '(let* [left (clojure.core/double x)
                        right (clojure.core/double 2.0)]
