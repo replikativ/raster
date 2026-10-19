@@ -25,6 +25,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
@@ -889,6 +890,12 @@
   With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
   __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
   [f-var dtype & {:keys [simd? reuse-buffers? no-alias?] :or {simd? false no-alias? true}}]
+  ;; Native code freezes definition-dependent frontend decisions just as JVM
+  ;; AOT does. Own them BEFORE normalization; post-hoc snapshots cannot certify
+  ;; old decisions. The shared owner retries the entire compilation, never the
+  ;; numerical call. Staging/workspace allocation remains invocation-local.
+  (method-entry/call-with-definition-inputs
+   (fn []
   (let [return-tag (:return-tag (pl/deftm-frontend-facts f-var dtype))
         return-type (some-> return-tag dtype/dtype-for-scalar-tag)
         return-class (get types/tag->java-class return-tag)
@@ -970,4 +977,4 @@
       {:c-source src :kernel-name kernel-name :native-call-policy :ordinary
        :native-alias-policy (if no-alias? :disjoint :same-region-pointwise)
        :entry-preconditions (:preconditions entry-contract)
-       :native-pointer-access pointer-access})))
+       :native-pointer-access pointer-access})))))
