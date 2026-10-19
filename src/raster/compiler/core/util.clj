@@ -200,7 +200,7 @@
      (cond
        (symbol? expr) (leaf-fn smap expr)
 
-       (and (seq? expr) (= 'quote (first expr))) expr
+       (and (seq? expr) (contains? #{'quote 'clojure.core/quote} (first expr))) expr
 
        (seq? expr)
        (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expr)]
@@ -263,7 +263,7 @@
                       (if (and (not (identical? r form)) (symbol? r) (meta form))
                         (with-meta r (merge (meta form) (meta r)))
                         r))
-     (and (seq? form) (= 'quote (first form))) form
+     (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) form
      (seq? form)
      (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)]
        (rebuild (mapv #(alpha-scope env % sequential? rec?) scopes)

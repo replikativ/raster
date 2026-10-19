@@ -226,7 +226,9 @@
 
 (deftest subst-syms-quote-opaque-test
   (testing "quote is opaque to substitution"
-    (is (= '(quote (+ a a)) (util/subst-syms '{a A} '(quote (+ a a)))))))
+    (doseq [quoted ['(quote (+ a a)) '(clojure.core/quote (+ a a))]]
+      (is (identical? quoted (util/subst-syms '{a A} quoted)))
+      (is (identical? quoted (util/alpha-convert {'a 'A} quoted))))))
 
 (deftest fold-local-scope-utils-test
   (let [fold '(fold {:accumulator acc :index i :identity 0.0 :dtype :float

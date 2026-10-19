@@ -144,6 +144,19 @@ payload-width or policy authorization. An original-versus-DCE oracle retains
 the failing reference check and its exception order. The cold presence,
 local-product, DCE and effects gate passes 83 tests / 482 assertions. No nullable
 product or tangent-tag producer changes are included in that foundation.
+The next bounded normalization change transports existing `:raster.type/tag`
+declarations through lexical references, aliases and the final result. It uses
+the shared capture-avoiding scope traversal, publishes bindings only after their
+initializers and removes shadowed declarations. It does not infer operation
+types, copy physical JVM hints, prove non-nullness or relax product schemas.
+Conflicting reference declarations refuse pending an owning refinement proof.
+An independent review found qualified-quote traversal; shared substitution and
+alpha-renaming now preserve both quote spellings, with direct and nested data
+identity controls. Executed source and bytecode controls preserve nil, String
+and arbitrary Object identity despite logical numeric declarations. The cold
+six-namespace normalization, shared-scope, conditional, initializer and reverse-AD
+gate passes 112 tests / 544 assertions. This is not nullable-product closure or
+a fix for marketing's separate runtime/AOT lifecycle invalidation.
 Inspection of completed unit job 32391 (`bb27191d`) confirms the Q4_K exact-bit,
 Long/SIMD, raw-evaluation test-consumer and outdated scan-reason failures are
 gone. Its remaining failures include HVP consumers (repaired in the subsequent
