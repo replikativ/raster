@@ -177,9 +177,8 @@
     (is (= :ad-unclosed-bytecode-reduction-entry
            (try (produce original (update-in env [(:binder binding-record) :facts :slot] inc) [gain]) nil
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
-    (is (= :ad-unclosed-bytecode-body-region
-           (try (produce original env [gain (first params)]) nil
-                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+    (is (seq (:bindings (produce original env [gain (first params)])))
+        "an active array receiver is independent of its attested inactive Int index")))
 
 (defn- check [v values offset zero-prefix]
   (let [p (prepared v)
