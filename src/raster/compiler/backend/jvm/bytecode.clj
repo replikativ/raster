@@ -772,6 +772,52 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
+(defn ^:no-doc retained-typed-return-bridge
+  "Observe an actual unguarded FP-static-return → Object invk boxing edge.
+   This is payload correspondence, not permission to erase an Object use or
+   change a parent's arithmetic overload. Missing/legacy/split emissions abstain.
+   Actual body emission must already match its primitive return without a hidden
+   reference conversion. Consumers additionally own the selected receiver and
+   all original argument completions and definition guards."
+  [emission]
+  (let [implementation (:implementation emission)
+        candidates (filterv #(and (identical? implementation (:implementation %))
+                                  (identical? (:body emission) (:body %)))
+                            (:typed-return-bridges emission))
+        context (retained-body-context emission)]
+    (when (and implementation context (= 1 (count candidates)))
+      (let [{:keys [kind payload-carrier result-carrier interface invocation-method
+                    compute-method parameter-carriers compute-parameter-carriers] :as bridge}
+            (first candidates)]
+        (when (and (= :boxed-fp-static-return kind)
+                   (contains? #{Double/TYPE Float/TYPE} payload-carrier)
+                   (identical? Object result-carrier)
+                   (class? interface) (.isInterface ^Class interface)
+                   (.isInstance ^Class interface implementation)
+                   (instance? java.lang.reflect.Method invocation-method)
+                   (instance? java.lang.reflect.Method compute-method)
+                   (= "invk" (.getName ^java.lang.reflect.Method invocation-method))
+                   (identical? interface (.getDeclaringClass ^java.lang.reflect.Method invocation-method))
+                   (identical? Object (.getReturnType ^java.lang.reflect.Method invocation-method))
+                   (identical? payload-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
+                   (java.lang.reflect.Modifier/isStatic (.getModifiers ^java.lang.reflect.Method compute-method))
+                   (= "compute_static" (.getName ^java.lang.reflect.Method compute-method))
+                   (vector? parameter-carriers)
+                   (= parameter-carriers compute-parameter-carriers
+                      (vec (.getParameterTypes ^java.lang.reflect.Method invocation-method))
+                      (vec (.getParameterTypes ^java.lang.reflect.Method compute-method)))
+                   (every? #{Double/TYPE Float/TYPE} parameter-carriers)
+                   (= (count (:params emission)) (count parameter-carriers))
+                   (every? true? (map (fn [parameter carrier]
+                                       (= (class-type->stack carrier)
+                                          (get-in context [:locals parameter :type])))
+                                     (:params emission) parameter-carriers))
+                   (= (class-type->stack payload-carrier)
+                      (:return-stack-type context) (:emitted-result-type context))
+                   (= (completion/bytecode-operand-context {}) (:result-context context)))
+          (me/assert-emission-inputs-current! emission)
+          (assoc bridge :body-context context))))))
+
 (defn- retain-call-observation!
   "Retain one actual emitter observation per original call occurrence.
    Repeated emission is ambiguous, never repaired by structural equality."
@@ -5643,6 +5689,14 @@
                                                                                               :return-stack-type return-stack-type
                                                                                               :result-context (completion/bytecode-operand-context ctx)}))))))
                                                        ret-type (emit-body code expanded-body locals ctx)
+                                                       _ (when-let [token (::body-occurrence (meta walked-body))]
+                                                           (when me/*emission-inputs*
+                                                             (swap! me/*emission-inputs* update-in [:body-contexts token]
+                                                                    (fn [record]
+                                                                      (if (and (= :known (:status record))
+                                                                               (identical? walked-body (:body record)))
+                                                                        (assoc record :emitted-result-type ret-type)
+                                                                        record)))))
                                                        _ (when (and expected-body-type (not= expected-body-type ret-type))
                                                            (throw (ex-info "Outlined operand changed its emitted carrier"
                                                                            {:reason :bytecode-input-result-carrier
@@ -6216,6 +6270,7 @@
         invk-mt (MethodTypeDesc/of ret-cd (into-array ClassDesc param-cds))
         compute-mt (MethodTypeDesc/of compute-ret-cd
                                       (into-array ClassDesc compute-param-cds))
+        return-bridge (atom nil)
         bytes (.build cf wrapper-cd
                       (reify java.util.function.Consumer
                         (accept [_ cb]
@@ -6289,6 +6344,15 @@
                                                (accept [_ code]
                                                  (if (empty? guarded-indices)
                                                    (do (emit-load-and-cast code)
+                                                       ;; Record this actual unguarded wrapper edge,
+                                                       ;; not a logical return-tag interpretation.
+                                                       (when (and (= ret-cd obj-cd)
+                                                                  (contains? #{Double/TYPE Float/TYPE}
+                                                                             (.getReturnType compute-method)))
+                                                         (reset! return-bridge
+                                                                 {:kind :boxed-fp-static-return
+                                                                  :payload-carrier (.getReturnType compute-method)
+                                                                  :result-carrier Object}))
                                                        (let [crd (.descriptorString ^ClassDesc compute-ret-cd)]
                                                          (cond
                                                            (= crd "D") (emit-box-to-ref code :double)
@@ -6483,9 +6547,17 @@
                                                      (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
                                                      (.areturn code))))))))))
         loader (compilation-loader)
-        wrapper-class (.defineClass loader wrapper-name bytes nil)]
-    (.newInstance (.getDeclaredConstructor wrapper-class (into-array Class []))
-                  (into-array Object []))))
+        wrapper-class (.defineClass loader wrapper-name bytes nil)
+        implementation (.newInstance (.getDeclaredConstructor wrapper-class (into-array Class []))
+                                     (into-array Object []))]
+    (when (and me/*emission-inputs* @return-bridge)
+      (swap! me/*emission-inputs* update :typed-return-bridges (fnil conj [])
+             (assoc @return-bridge :implementation implementation :body walked-body
+                    :interface iface-class :invocation-method iface-invk
+                    :compute-method compute-method
+                    :parameter-carriers (vec iface-param-types)
+                    :compute-parameter-carriers (vec compute-params))))
+    implementation))
 
 ;; ================================================================
 ;; compile-pipeline! — batch recompilation into a single class
