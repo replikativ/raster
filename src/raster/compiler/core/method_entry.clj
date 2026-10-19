@@ -269,6 +269,39 @@
   [emission]
   (validate-emission-inputs! emission (java.util.IdentityHashMap.)))
 
+(defn prepare-emission-input-guard!
+  "Validate immutable historical lineage once, retaining its live reuse checks.
+   Each invocation still checks the ORIGINAL lookup sites, effective Var values
+   and metadata, including every consumed static source. No epoch shortcut or
+   refreshed observation certifies old code. Sequential fence only, like
+   assert-emission-inputs-current!; not concurrent mutation/ABA protection."
+  [emission]
+  (assert-emission-inputs-current! emission)
+  (let [seen (java.util.IdentityHashMap.)
+        checks (atom [])]
+    (letfn [(retain! [inputs]
+              (let [snapshots (:dependency-snapshots inputs)]
+                (swap! checks conj
+                       (fn [] (every? var-snapshot-current? snapshots))))
+              (doseq [{:keys [source-var artifact]} (:static-inputs inputs)]
+                (let [nested (:raster.compiler/emission-inputs artifact)
+                      snapshot (:source-snapshot nested)]
+                  ;; Owner correspondence and acyclicity were validated above.
+                  ;; Retain the source check even on a shared artifact edge.
+                  (swap! checks conj
+                         (fn [] (var-snapshot-current? snapshot)))
+                  (when-not (.containsKey seen artifact)
+                    (.put seen artifact true)
+                    (retain! nested)))))]
+      (retain! emission)
+      (let [checks @checks]
+        (fn []
+          ;; Keep the full validator as the single diagnostic authority. The
+          ;; immutable shape is specialized, not its live success/failure.
+          (when-not (every? (fn [check] (check)) checks)
+            (assert-emission-inputs-current! emission))
+          emission)))))
+
 (defn retryable-emission-change?
   "Lazy compilation may materialize an input definition during emission. Only
    these historical-input failures authorize a bounded fresh emission, never

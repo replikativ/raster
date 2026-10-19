@@ -194,6 +194,89 @@
         (is (not (method-entry/same-var-snapshot? before (method-entry/var-snapshot v)))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest prepared-emission-guards-preserve-historical-live-checks
+  (let [scope (create-ns (gensym "raster.prepared-emission."))
+        caller (create-ns (gensym "raster.prepared-emission-caller."))
+        leaf (intern scope 'leaf (Object.))
+        source (intern scope 'source (Object.))
+        original-leaf-meta (meta leaf)
+        observe #(assoc (method-entry/var-snapshot %) :lookups #{[scope (:name (meta %))]})
+        base {:dependency-snapshots [] :static-inputs []
+              :definition-revision 1 :completed-definition-revision 1}
+        artifact {:raster.compiler/emission-inputs
+                  (assoc base :dependency-snapshots [(observe leaf)]
+                         :source-snapshot (method-entry/emission-definition-snapshot source))}
+        emission (assoc base :static-inputs [{:source-var source :artifact artifact}
+                                            {:source-var source :artifact artifact}])
+        guard (method-entry/prepare-emission-input-guard! emission)
+        reason (fn [invoke]
+                 (try (invoke) nil
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        parity! (fn [expected]
+                  (is (= expected (reason guard)))
+                  (is (= expected (reason #(method-entry/assert-emission-inputs-current! emission)))))]
+    (try
+      (is (identical? emission (guard)))
+      (with-redefs-fn {leaf (Object.)} #(parity! :stale-emission-inputs))
+      (parity! nil)
+      (try
+        (alter-meta! leaf assoc :changed true)
+        (parity! :stale-emission-inputs)
+        (finally (reset-meta! leaf original-leaf-meta)))
+      (let [original (meta source)]
+        (try
+          (alter-meta! source assoc :raster.core/deftm-bytecode {:unused :new-cache})
+          (parity! nil) ;; The existing definition snapshot excludes cache output.
+          (alter-meta! source assoc :changed true)
+          (parity! :stale-static-emission-source)
+          (finally (reset-meta! source original))))
+      (testing "preparation does not accept stale or owner-mismatched lineage"
+        (doseq [malformed [(dissoc emission :dependency-snapshots)
+                           (assoc emission :dependency-snapshots [{}])
+                           (assoc emission :completed-definition-revision 2)]]
+          (is (= (reason #(method-entry/assert-emission-inputs-current! malformed))
+                 (reason #(method-entry/prepare-emission-input-guard! malformed)))))
+        (with-redefs-fn {leaf (Object.)}
+          #(is (= :stale-emission-inputs
+                  (reason (fn [] (method-entry/prepare-emission-input-guard! emission))))))
+        (is (= :unowned-static-emission-inputs
+               (reason #(method-entry/prepare-emission-input-guard!
+                         (assoc-in emission [:static-inputs 1 :source-var] leaf))))))
+      (testing "live effective thread bindings are not replaced by root-only checks"
+        (let [dynamic-var (doto (intern scope 'dynamic-value (Object.)) (.setDynamic))
+              inputs (assoc base :dependency-snapshots [(observe dynamic-var)])
+              dynamic-guard (method-entry/prepare-emission-input-guard! inputs)]
+          (with-bindings {dynamic-var (Object.)}
+            (is (= :stale-emission-inputs (reason dynamic-guard))))
+          (is (identical? inputs (dynamic-guard)))))
+      (testing "alias lookup changes invalidate an otherwise unchanged Var"
+        (binding [*ns* caller] (alias 'h (ns-name scope)))
+        (let [inputs (assoc base :dependency-snapshots
+                            [(assoc (method-entry/var-snapshot leaf) :lookups #{[caller 'h/leaf]})])
+              lookup-guard (method-entry/prepare-emission-input-guard! inputs)]
+          (is (identical? inputs (lookup-guard)))
+          (ns-unalias caller 'h)
+          (is (= :stale-emission-inputs (reason lookup-guard)))))
+      (testing "a detached historical Var cannot bless a replacement"
+        (ns-unmap scope 'leaf)
+        (intern scope 'leaf @leaf)
+        (parity! :stale-emission-inputs))
+      (testing "recreating a namespace does not revive its old observations"
+        (let [replacement-scope (create-ns (gensym "raster.prepared-replaced-ns."))
+              original (intern replacement-scope 'value (Object.))
+              inputs (assoc base :dependency-snapshots
+                            [(assoc (method-entry/var-snapshot original)
+                                    :lookups #{[replacement-scope 'value]})])
+              namespace-guard (method-entry/prepare-emission-input-guard! inputs)]
+          (try
+            (remove-ns (ns-name replacement-scope))
+            (intern (create-ns (ns-name replacement-scope)) 'value @original)
+            (is (= :stale-emission-inputs (reason namespace-guard)))
+            (finally (remove-ns (ns-name replacement-scope))))))
+      (finally
+        (remove-ns (ns-name caller))
+        (remove-ns (ns-name scope))))))
+
 (deftest static-cache-retains-actual-inputs-and-renews-a-stale-definition
   (let [scope (create-ns (gensym "raster.static-cache-lineage."))]
     (try

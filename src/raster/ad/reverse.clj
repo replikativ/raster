@@ -4186,8 +4186,9 @@
                       (gen-reverse-loop-with-let-program bindings (first results) active-params)
                       (gen-reverse-let-program bindings results active-params)))))
               program-guard (capture source-ns expected [{:parameters all-params :body (:form program)}])
+              emission-guard (method-entry/prepare-emission-input-guard! emission)
               guard (fn []
-                      (method-entry/assert-emission-inputs-current! emission)
+                      (emission-guard)
                       (when-not (identical? source-ns (find-ns (ns-name source-ns)))
                         (throw (ex-info "paired helper source namespace changed"
                                         {:reason :ad-paired-helper-namespace})))
@@ -4279,8 +4280,9 @@
                 (throw (ex-info "selected paired helper definition changed"
                                 {:reason :ad-paired-helper-selected-definition
                                  :operation operation :implementation-op implementation-op})))))
+          emission-guard (method-entry/prepare-emission-input-guard! emission)
           guard (fn [] (selection-guard)
-                  (method-entry/assert-emission-inputs-current! emission)
+                  (emission-guard)
                   nil)
           _ (guard)]
       {:emission emission :guard guard :signature signature :method resolved-method})))
