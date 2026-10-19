@@ -540,7 +540,9 @@
                 'clojure.core/float 'float})
          ;; Only the resolved core spelling is admitted: a lexical function named
          ;; unchecked-int is not a source conversion contract.
-         'clojure.core/unchecked-int {:result-tag 'int :integral-narrowing :wrap}))
+         'clojure.core/unchecked-int {:result-tag 'int :integral-narrowing :wrap}
+         'clojure.core/unchecked-float {:result-tag 'float :integral-narrowing :reject
+                                        :floating-narrowing :ieee}))
 
 (defn cast-op?
   "True if sym is a primitive cast operation."
@@ -556,6 +558,12 @@
   "Explicit source narrowing policy, or nil for a non-cast."
   [sym]
   (get-in cast-ops [sym :integral-narrowing]))
+
+(defn cast-floating-narrowing
+  "Source Float narrowing policy. Ordinary core float is checked; unchecked-float is IEEE."
+  [sym]
+  (when (= 'float (cast-result-tag sym))
+    (get-in cast-ops [sym :floating-narrowing] :checked)))
 
 ;; --- Scalar ops (type-preserving, pure) ---
 

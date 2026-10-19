@@ -329,6 +329,7 @@
     (= (name h) "long")   :long
     (= (name h) "int")    :int
     (= (name h) "float")  :float
+    (and (= 'clojure.core/unchecked-float h) (= 2 (count form))) :float
         ;; Arithmetic: JVM numeric promotion — all-float → float, all-integer
         ;; → int/long (any long ⇒ long), anything unknown/mixed-float → double.
         ;; The old rule hard-defaulted every non-float case to :double, typing
@@ -2626,6 +2627,22 @@
     "float"  (let [t (emit-form code (first args) locals ctx)]
                (retain-floating-conversion! ctx (first args) t Float/TYPE locals)
                (if (= t :float) t (do (emit-coerce code t :float) :float)))
+    "unchecked-float"
+    (when (= 1 (count args))
+      (let [t (emit-form code (first args) locals ctx)]
+        (if (= :diverge t)
+          :diverge
+          (let [input (case t
+                        :int I-cd :long J-cd :float F-cd :double D-cd
+                        ;; Boolean is not numeric. Preserve the core Object overload's
+                        ;; failure instead of silently converting its JVM int encoding.
+                        :bool (do (emit-box-to-ref code t) obj-cd)
+                        :void (do (.aconst_null code) obj-cd)
+                        :ref obj-cd)]
+            (retain-floating-conversion! ctx (first args) t Float/TYPE locals)
+            (.invokestatic code rt-cd "uncheckedFloatCast"
+                           (MethodTypeDesc/of F-cd (into-array ClassDesc [input])))
+            :float))))
     "int"    (let [t (emit-form code (first args) locals ctx)
                    result (case t
                  :int :int

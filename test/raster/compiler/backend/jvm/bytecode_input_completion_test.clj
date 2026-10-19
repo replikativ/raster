@@ -31,6 +31,34 @@
       (try (.invoke ^java.lang.reflect.Method method nil (object-array arguments))
            (catch java.lang.reflect.InvocationTargetException e (throw (.getCause e))))))))
 
+(defn- float-outcome [f x]
+  (try [:value (Float/floatToIntBits (f x))]
+       (catch Exception e [:exception (class e)])))
+
+(deftest unchecked-float-preserves-primitive-and-object-overloads
+  (doseq [[tag values] [['double [0.0 -0.0 Math/PI Double/MAX_VALUE
+                                 Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
+                       ['long [Long/MIN_VALUE Long/MAX_VALUE 16777217]]
+                       ['int [Integer/MIN_VALUE Integer/MAX_VALUE (int 16777217)]]
+                       ['float [(float 0.0) (float -0.0) Float/POSITIVE_INFINITY Float/NaN]]
+                       ['Object [nil true false "1.0" \a (float 1.25) 2.5 1M 2N]]
+                       ['boolean [true false]]]]
+    (let [f (compiled [(with-meta 'x {:tag tag})] '(clojure.core/unchecked-float x) 'float)]
+      (doseq [x values]
+        (is (= (float-outcome unchecked-float x) (float-outcome f x))
+            (str tag " " (pr-str x)))))))
+
+(deftest unchecked-float-evaluates-once-and-respects-lexical-callees
+  (let [f (compiled ['counter] '(clojure.core/unchecked-float
+                                (do (clojure.core/swap! counter clojure.core/inc) 1.25)) 'float)
+        counter (atom 0)]
+    (is (= (float 1.25) (f counter)))
+    (is (= 1 @counter)))
+  (let [f (compiled ['unchecked-float 'x] '(unchecked-float x))]
+    (is (= :lexical (f (constantly :lexical) 1.25))))
+  (let [f (compiled [] '(clojure.core/unchecked-float 1.0 2.0))]
+    (is (thrown? clojure.lang.ArityException (f)))))
+
 (deftest mixed-floating-comparisons-retain-source-order
   (doseq [integer-tag ['int 'long]]
     (let [params [(with-meta 'i {:tag integer-tag}) (with-meta 'f {:tag 'float})]

@@ -47,7 +47,11 @@
                         long (long operand-value)
                         ;; A source conversion and a typed IEEE storage conversion are
                         ;; distinct contracts, even when they agree on ordinary inputs.
-                        float (if source? (float operand-value) (.floatValue ^Number operand-value))
+                        float (if (and source?
+                                       (not= :ieee (descriptor/cast-floating-narrowing
+                                                    (first expression))))
+                                (float operand-value)
+                                (.floatValue ^Number operand-value))
                         double (.doubleValue ^Number operand-value))}
               (catch IllegalArgumentException _ nil)
               (catch ArithmeticException _ nil))))))
@@ -63,11 +67,12 @@
   (constant-value expression false 128))
 
 (defn source-value
-  "Prove a closed numeric literal/conversion under checked Clojure SOURCE semantics.
+  "Prove a closed numeric literal/conversion under Clojure SOURCE semantics.
    Only exact qualified core cast identities and numeric literals are admitted. Bare or
    lexical callees, static-field spellings, unknown/effectful operands and failing casts
    provide no evidence. Unlike canonical IEEE value, finite Float overflow and Double
-   infinities rejected by core float remain failures. This proves a total closed value,
+   infinities rejected by core float remain failures; unchecked-float keeps IEEE narrowing.
+   This proves a total closed value,
    not permission to erase an independently retained evaluation obligation."
   [expression]
   (constant-value expression true 128))

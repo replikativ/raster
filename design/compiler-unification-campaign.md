@@ -14,7 +14,7 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Integration hold: PR #1539 at `4cdbcb89` is draft, not qualified for merge.
+Integration hold: PR #1539 at `e3046c82` is draft, not qualified for merge.
 Setup/build passed, but unit, OpenCL CPU and emission-fixture jobs failed;
 dependent CUDA/HIP checks do not establish acceptance. Focused source-obligation
 gates are not evidence of broad compatibility. Triage retains these groups:
@@ -56,6 +56,22 @@ gates are not evidence of broad compatibility. Triage retains these groups:
 - Numerical/control evidence: Q4_K exact Float-bit comparisons differ by an ULP
   on multiple outputs; integer-bound/control regressions also remain. Do not
   relax exact contracts or update expectations without establishing semantics.
+  The Q4_K mismatch has now been attributed independently: the compatibility
+  consumer's boxed Float subblock result selects Double scale/add followed by
+  a Float carry checkpoint; the product consumer accidentally selected Float
+  scale/add. Explicit Double scale/add and `clojure.core/unchecked-float` at
+  every superblock restore all 33 original outputs exactly in a REPL source
+  intervention. Expanded host parity checks cover one, two and three
+  superblocks, single/multiple rows and changed data (two selected tests,
+  156 assertions pass). General unchecked-float support uses the shared cast
+  descriptor, source constant policy and JVM RT overloads; it is not a
+  quantization-specific emitter rule. Checked core float remains distinct.
+  The cold five-namespace gate passes 103 tests / 1,351 assertions (numeric
+  constants, descriptors, JVM input completion, scalar-region lowering and
+  the full K-quant kernel namespace). Backend acceptance remains required. This is not
+  a device-equivalence or performance receipt. Explicit source FP64 operations
+  must not be hidden merely because public storage is Float; the existing
+  widened-math capability gate is not a general source-dtype capability proof.
 
 CI on `d3d2d824` also exposed three regressions absent from the prior job: fresh
 map/gather AD rejects source reads carrying mandatory-evaluation flags. Two
@@ -67,6 +83,9 @@ fresh-write admission, scoped AD effects, owned allocations and the independent
 tangent-storage law. Original bounds/negative-size failures remain, while aliases
 and unsupported active effects still refuse. This repairs those three regressions;
 it does not establish general replay safety or permit DCE to discard reads.
+The subsequent actual `e3046c82` jobs (unit 32377, emission 32378, OpenCL CPU
+32381) are terminal failures; the three fresh-map/gather errors are absent
+from the inspected unit logs. The remaining groups above are still open.
 
 Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
 (49 tests, 757 assertions plus both fresh workers). Helper migration separately

@@ -2,6 +2,14 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
+(deftest source-float-narrowing-has-one-descriptor-owner
+  (is (= 'float (descriptor/cast-result-tag 'clojure.core/unchecked-float)))
+  (is (= :ieee (descriptor/cast-floating-narrowing 'clojure.core/unchecked-float)))
+  (is (= :checked (descriptor/cast-floating-narrowing 'clojure.core/float)))
+  (is (not (descriptor/cast-op? 'unchecked-float)))
+  (is (not (descriptor/cast-op? 'other/unchecked-float)))
+  (is (nil? (descriptor/cast-floating-narrowing 'clojure.core/double))))
+
 (deftest reduction-identities-retain-exact-qualified-algebra
   (let [original descriptor/get-op-descriptor
         monoid {:associative? true :commutative? true :identity 42}

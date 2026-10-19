@@ -68,3 +68,19 @@
     (is (nil? (constant/source-value expression)))
     (is (nil? (constant/value expression)))
     (is (= expression (constant/literal-or-original expression)))))
+
+(deftest unchecked-float-source-evidence-preserves-ieee-narrowing
+  (doseq [value [0.0 -0.0 Math/PI Double/MAX_VALUE Double/POSITIVE_INFINITY
+                 Double/NEGATIVE_INFINITY Double/NaN]]
+    (let [form (list 'clojure.core/unchecked-float value)
+          expected (Float/floatToIntBits (unchecked-float value))]
+      (is (= expected (Float/floatToIntBits (:value (constant/source-value form)))))
+      (is (= expected (Float/floatToIntBits (:value (constant/value form)))))))
+  (doseq [expression ['(unchecked-float 1.0) '(other/unchecked-float 1.0)
+                      '(clojure.core/unchecked-float nil)
+                      '(clojure.core/unchecked-float true)
+                      '(clojure.core/unchecked-float (do (effect!) 1.0))
+                      '(clojure.core/unchecked-float 1.0 2.0)
+                      (with-meta '(clojure.core/unchecked-float 1.0)
+                        {:raster.op/lexical-callee true})]]
+    (is (nil? (constant/source-value expression)) (str expression))))
