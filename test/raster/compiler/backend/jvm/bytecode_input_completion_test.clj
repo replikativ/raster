@@ -53,7 +53,14 @@
         less (compiled params '(clojure.core/< i wide))
         greater (compiled params '(clojure.core/> wide i))]
     (is (true? (less (int 1) (long 9007199254740993))))
-    (is (true? (greater (int 1) (long 9007199254740993))))))
+    (is (true? (greater (int 1) (long 9007199254740993)))))
+  (let [params [(with-meta 'a {:tag 'long}) (with-meta 'b {:tag 'long})]
+        less (compiled params '(clojure.core/< a b))
+        greater (compiled params '(clojure.core/> b a))]
+    ;; Adjacent Longs collapse to the same Double; unlike int1 vs wide Long,
+    ;; this actually detects accidental integral-to-floating promotion.
+    (is (true? (less 9007199254740992 9007199254740993)))
+    (is (true? (greater 9007199254740992 9007199254740993)))))
 
 (defn- outcome [f & arguments]
   (try {:value (apply f arguments)}
