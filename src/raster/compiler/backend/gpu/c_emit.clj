@@ -17,6 +17,7 @@
             [raster.compiler.core.util :as util]
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.types :as types]
@@ -1041,6 +1042,17 @@
   ([expr idx-sym array-syms] (emit-expr expr idx-sym array-syms "idx"))
   ([expr idx-sym array-syms opencl-idx]
    (cond
+     ;; Reserved IR is not an ordinary callee. This emitter has no authority
+     ;; to erase Object identity or a retained input conversion, even when the
+     ;; operand has a numerical tag. An upstream representation proof must
+     ;; discharge the contract before this boundary. This root check is not a
+     ;; whole-body validator: owners must check before source simplification can
+     ;; discard unused terms (native emit-c-fn does that once at entry).
+     (and (seq? expr) (= completion/completion-symbol (first expr)))
+     (throw (ex-info "C-family emission requires a discharged value completion"
+                     {:reason :unclosed-c-family-value-completion
+                      :expression expr :contract (second expr)}))
+
      (nil? expr) "0"
 
      (number? expr)

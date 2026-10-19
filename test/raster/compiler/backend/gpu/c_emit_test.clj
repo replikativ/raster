@@ -1,6 +1,20 @@
 (ns raster.compiler.backend.gpu.c-emit-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.backend.gpu.c-emit :as c-emit]))
+
+(deftest unprojected-value-completions-are-not-c-function-calls
+  (doseq [config [c-emit/opencl-config c-emit/glsl-config c-emit/hip-config]
+          expression [(completion/complete-value completion/object-input-contract 'x)
+                      ;; Malformed reserved syntax must not become a guessed
+                      ;; target callee either.
+                      (list completion/completion-symbol {:invalid :contract} 'x)]]
+    (binding [c-emit/*emit-config* config]
+      (doseq [emit [c-emit/emit-expr c-emit/emit-stmt]]
+        (let [failure (try (emit expression nil #{} "idx") nil
+                           (catch clojure.lang.ExceptionInfo e e))]
+          (is (= :unclosed-c-family-value-completion (:reason (ex-data failure))))
+          (is (= expression (:expression (ex-data failure)))))))))
 
 (deftest qualified-primitive-casts-emit-like-their-bare-spelling
   (doseq [cast '[double float long int byte]]
