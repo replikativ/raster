@@ -95,6 +95,16 @@ versus invoked AOT sums cover empty/small inputs and a result larger than Int.
 The two affected JVM namespaces pass 63 tests / 180 assertions in the bounded
 REPL. This is target eligibility, not a restored GPU source fallback or a claim
 of integer vectorization; Object-parameter completeness warnings remain visible.
+Product-boundary test consumers now use the existing JVM source projection
+instead of evaluating canonical completion terms as runtime namespace calls.
+The oracle also checks that a failing, unselected field is still evaluated in
+source order. Both AD modes reach the common preparation-time scan precision
+guard; checks retain its original inexact-storage witness and independently
+contrast the source result (0.25) with a wrongly storage-rounded carry (0.0).
+These three reviewed checks pass 13 assertions. The full namespace remains
+red (8 tests / 27 assertions, one error): reentrant transformation of an
+untyped compound completion still lacks a closed scalar transpose declaration.
+That production admission issue is not waived by the test-consumer migration.
 
 Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
 (49 tests, 757 assertions plus both fresh workers). Helper migration separately
