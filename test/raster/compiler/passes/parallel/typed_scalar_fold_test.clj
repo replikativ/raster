@@ -449,7 +449,7 @@
 (deftest canonical-result-conversion-canonicalizes-its-fold-at-the-source-dtype
   (let [attributes {:source-dtype :double :target-dtype :float
                     :rounding :nearest-even :overflow :ieee
-                    :source-op 'clojure.core/float}
+                    :source-op 'clojure.core/unchecked-float}
         conversion (dialect/scalar-convert
                     attributes '(raster.par/reduce acc 0.0 i n
                                                     (+ acc (clojure.core/aget x i))))
@@ -461,7 +461,7 @@
         nested-fold (:operand (dialect/scalar-convert-parts nested-conversion))]
     (is (= {:source-dtype :double :target-dtype :float
             :rounding :nearest-even :overflow :ieee
-            :source-op 'clojure.core/float}
+            :source-op 'clojure.core/unchecked-float}
            attributes))
     (is (dialect/scalar-fold-form? operand))
     (is (= :double (get-in (dialect/scalar-fold-parts operand) [:attributes :dtype])))

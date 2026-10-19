@@ -428,6 +428,43 @@ The full affected namespace passes 10 tests / 115 assertions, including local
 Level Zero execution. Independent static review found no coverage weakening.
 This closes the stale test assumption, not the remaining integration failures.
 
+### Source conversion contracts beneath residency
+
+A subsequent independent REPL check found a second interpretation mismatch:
+canonical Double-to-Float conversion accepted `:overflow :ieee` together with
+`clojure.core/float`, although projecting that term to source throws on
+`Double/MAX_VALUE` while an IEEE narrowing returns infinity. The shared
+`scalar-conversion/source-policy` now separates descriptor-owned source casts
+from implicit numerical/storage conversion. Checked Double-to-Float retains
+`:nearest-even/:trap`; unchecked narrowing retains `:nearest-even/:ieee`.
+Canonical validation and frontend construction consume this same policy.
+
+Raw checked Float calls also retain the existing checked-source-cast evaluation
+obligation before canonicalization. Totality uses checked source constant evidence
+or retained source dtypes, never IEEE constant folding or a destination hint.
+The scalar KernelBody lowerer admits a checked narrowing only when its actual
+lowered literal proves it cannot throw; other cases refuse rather than silently
+emitting IEEE conversion. Existing trapping-conversion fusion barriers therefore
+also cover checked Float producers. This does not implement a device exception
+protocol or the missing terminal host continuation.
+
+Independent review found no further confirmed soundness blocker in this bounded
+repair. The focused conversion/body/effect gate passes 77 tests / 829 assertions;
+two further fusion/order controls pass nine assertions. These include overflow,
+infinities, NaN, signed zero, lexical callees, nested unchecked Float infinity and
+failure before later output writes. Intentionally IEEE test terms now name the
+unchecked source operation; checked-source refusal controls remain separate.
+
+Broader qualification is still red: the initial seven-namespace affected gate
+reported 35 failures and 11 errors. A subsequent concise inventory, after the
+masked-reduction fixture repair, still shows fusion expectation failures,
+unclosed terminal scalar programs, the public layer-norm backward checked cast
+and missing native vector emission. That inventory suppressed standard assertion
+reporting and is diagnostic only, not a passing gate. Do not change source casts,
+drop acceptance assertions or relax exceptions to make these green. Finish the
+ordered observation/realization boundary and distinguish actual source conversion
+from compiler-owned storage conversion using retained producer evidence.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.

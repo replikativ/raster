@@ -147,6 +147,27 @@
                       :checked-source-cast))
       "the op descriptor's explicit wrapping cast has no checked exception obligation"))
 
+(deftest checked-floating-casts-retain-source-evaluation-before-canonicalization
+  (let [wide (with-meta 'wide {:tag 'double})
+        narrow (with-meta 'narrow {:tag 'float})]
+    (doseq [expression [(list 'clojure.core/float wide)
+                        '(clojure.core/float Double/MAX_VALUE)
+                        '(clojure.core/float Double/POSITIVE_INFINITY)
+                        '(let* [unused (clojure.core/float wide)] 7)]]
+      (is (contains? (:flags (effects/descriptor expression)) :checked-source-cast))
+      (is (not (effects/removable-expr? expression))))
+    (doseq [expression [(list 'clojure.core/float narrow)
+                        '(clojure.core/float 1.0)
+                        '(clojure.core/unchecked-float wide)]]
+      (is (not (contains? (:flags (effects/descriptor expression)) :checked-source-cast))))))
+
+(deftest lexical-float-callees-do-not-acquire-a-core-cast-contract
+  (doseq [expression [(with-meta '(float x) {:raster.op/lexical-callee true})
+                      (with-meta '(.invk local/float-impl x)
+                        {:raster.op/lexical-callee true :raster.op/original 'clojure.core/float})]]
+    (is (nil? (descriptor/semantic-op expression)))
+    (is (not (contains? (:flags (effects/descriptor expression)) :checked-source-cast)))))
+
 (deftest generated-reference-conversions-retain-their-evaluation-obligation
   (let [cast '(clojure.core/double x)
         retained (with-meta cast {:raster.effect/source-reference-cast true})

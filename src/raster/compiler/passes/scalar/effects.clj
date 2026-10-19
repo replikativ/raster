@@ -165,16 +165,22 @@
                          dtype/dtype-for-scalar-tag)
           target (some-> (descriptor/semantic-op expression) descriptor/cast-result-tag
                          dtype/dtype-for-scalar-tag)]
-      (or (some? (numeric-constant/value expression))
+      (or (some? (when-let [operation (descriptor/semantic-op expression)]
+                   (when (descriptor/cast-op? operation)
+                     (numeric-constant/source-value
+                      (apply list (symbol "clojure.core" (name operation))
+                             (descriptor/call-args expression))))))
           (and source target
-               (= [:exact :exact] (scalar-conversion/policy source target)))))))
+               (contains? #{[:exact :exact] [:nearest-even :exact]}
+                          (scalar-conversion/source-policy
+                           source target (descriptor/semantic-op expression))))))))
 
 (defn- source-cast-flags
   "Evaluation obligations for source conversions/arithmetic from shared descriptors.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   checked integral casts remain conservatively non-removable. Local product
+   checked integral/Float casts remain conservatively non-removable. Local product
    lowering additionally retains its generic factory's reference conversion
    obligation explicitly. Untyped scoped binders require their own type evidence;
    this does not globally reinterpret their casts as reference conversions."
@@ -186,7 +192,8 @@
                         (and (seq? node) (not (proven-total-cast? node))
                              (descriptor/cast-op? operation)
                              (= :reject (descriptor/cast-integral-narrowing operation))
-                             (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
+                             (or (contains? '#{byte int long} (descriptor/cast-result-tag operation))
+                                 (= :checked (descriptor/cast-floating-narrowing operation))))
                         (conj :checked-source-cast)
                         ;; This is denial-only evidence from the source factory:
                         ;; no optimizer may erase its conversion merely because

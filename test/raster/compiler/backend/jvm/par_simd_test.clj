@@ -183,7 +183,8 @@
                      (dialect/scalar-convert
                       {:source-dtype source :target-dtype target
                        :rounding rounding :overflow overflow
-                       :source-op 'clojure.core/float}
+                       :source-op (if (= source target) 'clojure.core/float
+                                      'clojure.core/unchecked-float)}
                       operand))]
     (is (segop-simd/simd-able?
          (conversion :float :float :exact :exact '(+ (aget a i) (float 1.0))) 'i :float)

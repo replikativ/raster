@@ -142,7 +142,7 @@
           narrow-call (with-meta (list raster-call '(aget x i)) {:raster.type/tag 'float})
           wide-call (with-meta (list java-call '(double (aget x i))) {:raster.type/tag 'double})
           narrow (lower narrow-call :float {'i :int})
-          wide (lower (list 'float wide-call) :float {'i :int})
+          wide (lower wide-call :float {'i :int})
           math-calls #(filter (fn [operation] (= operator (get-in operation [:expression :op])))
                               (:operations %))]
       (is (= [:float] (mapv #(get-in % [:expression :result-type]) (math-calls narrow))))
@@ -158,8 +158,10 @@
         result (lower 'java.lang.Float/NEGATIVE_INFINITY :float {})]
     (is (= :float (:type result)))
     (is (= Float/NEGATIVE_INFINITY (get-in result [:result :value])))
-    (is (= :float (:type (lower '(float Double/NEGATIVE_INFINITY) :float {})))
-        "a closed Java numeric field retains its source width across an explicit cast")
+    (is (= :checked-floating-conversion
+           (try (lower '(float Double/NEGATIVE_INFINITY) :float {}) nil
+                (catch clojure.lang.ExceptionInfo e (:rule (ex-data e)))))
+        "a closed throwing source conversion is not an IEEE constant")
     (is (= 'Float/NEGATIVE_INFINITY
            (:result (lower 'Float/NEGATIVE_INFINITY :float
                            {'Float/NEGATIVE_INFINITY :float})))
@@ -527,8 +529,13 @@
   (let [factory scalar/make-lowerer
         calls (atom [])
         coordinates (atom [])
-        expression (list 'float (with-meta '(+ (aget x (+ i 1)) scale)
-                                  {:raster.type/tag 'double}))
+        numeric-expression (with-meta '(+ (aget x (+ i 1)) scale)
+                             {:raster.type/tag 'double})
+        expression (dialect/scalar-convert
+                    {:source-dtype :double :target-dtype :float
+                     :rounding :nearest-even :overflow :ieee
+                     :source-op 'clojure.core/unchecked-float}
+                    numeric-expression)
         options {:index 'i :coordinate 'i :dtype :float
                  :arrays #{'x} :array-types {'x :int}
                  :scalars #{'scale} :scalar-types {'scale :double}
@@ -559,7 +566,11 @@
            (mapv #(get-in % [:result :type]) [promote add narrow])))
     (is (= {:rounding :exact :overflow :exact} (get-in promote [:expression :options])))
     (is (= {:rounding :nearest-even :overflow :ieee}
-           (get-in narrow [:expression :options])))))
+           (get-in narrow [:expression :options])))
+    (is (= :checked-floating-conversion
+           (try (segred/lower-element-operations (list 'float numeric-expression) options) nil
+                (catch clojure.lang.ExceptionInfo e (:missing-rule (ex-data e)))))
+        "an implicit result coercion does not license an explicit checked source cast")))
 
 (deftest reduction-literal-conversion-is-not-contextual-literal-typing
   (let [expression (with-meta '(+ scale 0.1) {:raster.type/tag 'float})
@@ -661,7 +672,7 @@
 (deftest scalar-casts-use-the-shared-descriptor-vocabulary
   (doseq [[head target source overflow]
           [['byte :byte :long :trap] ['int :int :long :trap]
-           ['long :long :int :exact] ['float :float :double :ieee]
+           ['long :long :int :exact]
            ['double :double :float :exact]]
           qualified? [false true]]
     (let [head (if qualified? (symbol "clojure.core" (name head)) head)
@@ -867,6 +878,28 @@
             options (get-in (last (:operations lowered)) [:expression :options])]
         (is (= {:rounding :toward-zero :overflow :saturate} options))
         (is (= expected (:type lowered)))))))
+
+(deftest checked-floating-source-conversion-cannot-become-an-ieee-device-cast
+  (let [lower (:lower (lowerer))
+        attributes {:source-dtype :double :target-dtype :float
+                    :rounding :nearest-even :overflow :trap :source-op 'clojure.core/float}]
+    (doseq [expression ['(clojure.core/float value)
+                        (dialect/scalar-convert attributes 'value)]]
+      (is (= :checked-floating-conversion
+             (try (lower expression :float {'value :double}) nil
+                  (catch clojure.lang.ExceptionInfo e (:rule (ex-data e)))))))
+    (is (= :checked-floating-conversion
+           (try (lower '(clojure.core/float Double/MIN_VALUE)
+                       :float {'Double/MIN_VALUE :double}) nil
+                (catch clojure.lang.ExceptionInfo e (:rule (ex-data e)))))
+        "a declared value is not constant evidence from its apparent field spelling")
+    (doseq [expression ['(clojure.core/unchecked-float value)
+                        (dialect/scalar-convert
+                         (assoc attributes :overflow :ieee :source-op 'clojure.core/unchecked-float)
+                         'value)]]
+      (is (= {:rounding :nearest-even :overflow :ieee}
+             (get-in (last (:operations (lower expression :float {'value :double})))
+                     [:expression :options]))))))
 
 (deftest unary-subtraction-retains-floating-sign-and-integral-overflow
   (doseq [type [:float :double :int :long]]

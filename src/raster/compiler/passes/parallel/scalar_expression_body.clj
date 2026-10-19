@@ -362,7 +362,14 @@
                                (body/scalar-expression operator result-type arguments options))]
                  :result result :type result-type :range range}))
 
-            (cast-lowered [lowered target expression & [explicit-narrowing]]
+            (total-floating-literal? [lowered]
+              ;; Consult the lowered operand, not a source spelling that could name
+              ;; a lexical value instead of the apparent Java numeric field.
+              (when (instance? raster.compiler.ir.kernel_body.Literal (:result lowered))
+                (some? (numeric-constant/source-value
+                        (list 'clojure.core/float (:value (:result lowered)))))))
+
+            (cast-lowered [lowered target expression & [explicit-source-op]]
               (let [target (dtype/canon target)]
                 (if (= target (:type lowered))
                   lowered
@@ -382,21 +389,28 @@
                           ;; An explicit source cast owns its checked-versus-unchecked narrowing
                           ;; contract. Implicit conversions continue to use the owner's policy, or
                           ;; the legacy map/fold wrap default when the owner supplies none.
-                          (or (case explicit-narrowing
-                                :wrap (scalar-conversion/policy source target :wrap)
-                                :reject (scalar-conversion/policy source target :trap)
-                                nil (if conversion-policy
-                                      (conversion-policy source target)
-                                      ;; The historical fallback wraps implicit integral
-                                      ;; narrowing only. Floating narrowing is source-cast
-                                      ;; semantics and must not leak into a result/local coercion.
-                                      (if (and (not (dtype/fp-dtype? source))
-                                               (not (dtype/fp-dtype? target)))
-                                        (scalar-conversion/policy source target :wrap)
-                                        (scalar-conversion/policy source target))))
+                          (or (if explicit-source-op
+                                (scalar-conversion/source-policy source target explicit-source-op)
+                                (if conversion-policy
+                                  (conversion-policy source target)
+                                  ;; The historical fallback wraps implicit integral narrowing
+                                  ;; only; it must not acquire checked source-cast semantics.
+                                  (if (and (not (dtype/fp-dtype? source))
+                                           (not (dtype/fp-dtype? target)))
+                                    (scalar-conversion/policy source target :wrap)
+                                    (scalar-conversion/policy source target))))
                               (decline! :cast-policy
                                         "scalar cast has no portable rounding and overflow policy"
                                         {:expression expression :source source :target target})))
+                        checked-floating? (and (= :double source) (= :float target)
+                                               (= :trap overflow))
+                        total-floating? (and checked-floating?
+                                             (total-floating-literal? lowered))
+                        _ (when (and checked-floating? (not total-floating?))
+                            (decline! :checked-floating-conversion
+                                      "checked Float source conversion requires an ordered host observation"
+                                      {:expression expression :source source :target target}))
+                        overflow (if total-floating? :ieee overflow)
                         id (fresh "cast")]
                     (let [range (when (scalar-range/contained-in-dtype? (:range lowered) target)
                                   (:range lowered))]
@@ -678,8 +692,7 @@
                                            {:expression expression :operand operand
                                             :target target})))
                             lowered (lower operand source-expected env)]
-                        (cast-lowered lowered target expression
-                                      (descriptor/cast-integral-narrowing (first expression))))))
+                        (cast-lowered lowered target expression (first expression)))))
 
                   (dialect/scalar-convert-form? expression)
                   (let [{:keys [attributes operand]} (dialect/scalar-convert-parts expression)
@@ -691,6 +704,15 @@
                                       {:expression expression :expected expected
                                        :attributes attributes}))
                         lowered (lower operand (canon-type source-dtype) env)
+                        checked-floating? (and (= :double source-dtype) (= :float target-dtype)
+                                               (= :trap overflow))
+                        total-floating? (and checked-floating?
+                                             (total-floating-literal? lowered))
+                        _ (when (and checked-floating? (not total-floating?))
+                            (decline! :checked-floating-conversion
+                                      "checked Float source conversion requires an ordered host observation"
+                                      {:expression expression :source source-dtype :target target-dtype}))
+                        overflow (if total-floating? :ieee overflow)
                         _ (when-not (= (canon-type source-dtype) (:type lowered))
                             (decline! :typed-scalar-convert-source
                                       "typed scalar conversion operand disagrees with its source dtype"

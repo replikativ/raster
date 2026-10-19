@@ -53,20 +53,37 @@
 
        :else nil))))
 
+(defn source-policy
+  "Resolve a descriptor-owned source cast, separately from an implicit numeric conversion.
+
+   Checked Double-to-Float narrowing may throw, including on infinities. Its :trap
+   contract must survive source projection and fusion; a target without that contract
+   must refuse, not replace it with an IEEE storage conversion."
+  [source target source-op]
+  (let [source (dtype/canon source)
+        target (dtype/canon target)
+        narrowing (descriptor/cast-integral-narrowing source-op)
+        requested (case narrowing :reject :trap :wrap :wrap nil)]
+    (when (and requested
+               (= target (some-> source-op descriptor/cast-result-tag
+                                 dtype/dtype-for-scalar-tag dtype/canon)))
+      (if (and (= :double source) (= :float target)
+               (= :checked (descriptor/cast-floating-narrowing source-op)))
+        [:nearest-even :trap]
+        (policy source target requested)))))
+
 (defn canonical-attributes?
   "Whether attributes fully and consistently describe one canonical scalar conversion."
   [{:keys [source-dtype target-dtype rounding overflow source-op] :as attributes}]
-  (let [narrowing (descriptor/cast-integral-narrowing source-op)
-        requested (case narrowing :reject :trap :wrap :wrap nil)]
-    (and (map? attributes)
-         (= #{:source-dtype :target-dtype :rounding :overflow :source-op}
-            (set (keys attributes)))
-         (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %)))
-                 [source-dtype target-dtype])
-         (descriptor/cast-op? source-op)
-         (= target-dtype
-            (some-> source-op descriptor/cast-result-tag dtype/dtype-for-scalar-tag dtype/canon))
-         (= (policy source-dtype target-dtype requested) [rounding overflow]))))
+  (and (map? attributes)
+       (= #{:source-dtype :target-dtype :rounding :overflow :source-op}
+          (set (keys attributes)))
+       (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %)))
+               [source-dtype target-dtype])
+       (descriptor/cast-op? source-op)
+       (= target-dtype
+          (some-> source-op descriptor/cast-result-tag dtype/dtype-for-scalar-tag dtype/canon))
+       (= (source-policy source-dtype target-dtype source-op) [rounding overflow])))
 
 (defn canonical-form?
   "Whether value has the canonical scalar-conversion term shape and a valid contract."

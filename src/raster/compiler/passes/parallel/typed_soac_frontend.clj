@@ -314,10 +314,8 @@
           target-dtype (some-> target-dtype dtype/canon)
           source-op (descriptor/semantic-op (list cast expression))
           source-op (when source-op (symbol "clojure.core" (name source-op)))
-          narrowing (descriptor/cast-integral-narrowing source-op)
-          requested (case narrowing :reject :trap :wrap :wrap nil)
-          policy (when (and source-dtype target-dtype requested)
-                   (scalar-conversion/policy source-dtype target-dtype requested))]
+          policy (when (and source-dtype target-dtype)
+                   (scalar-conversion/source-policy source-dtype target-dtype source-op))]
       (when (and policy
                  (= target-dtype
                     (some-> source-op descriptor/cast-result-tag

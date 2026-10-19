@@ -109,6 +109,39 @@
                            conversions)))
         "the producer check remains in its materialized equation")))
 
+(deftest checked-float-producer-preserves-the-materialization-boundary
+  (doseq [[producer expected-fusions]
+          [['(clojure.core/aget input i) 0]
+           ['(clojure.core/unchecked-float (clojure.core/aget input i)) 1]]]
+    (let [source (list 'let* ['y (list 'raster.par/pmap 'i 'n 'float producer)
+                              'z '(raster.par/pmap j n float (clojure.core/aget y j))] 'z)
+          program (source-program source {'input :double})
+          [result stats] (typed-fusion/fusion-fixpoint program)]
+      (is (= expected-fusions (:vertical stats)))
+      (is (= (- 2 expected-fusions) (count (dialect/equations result)))))))
+
+(deftest checked-float-producer-throws-before-later-output-writes
+  (let [source '(let* [y (raster.par/pmap i n float (clojure.core/aget input i))
+                       z (raster.par/map! out j n float (clojure.core/aget y j))] z)
+        program (source-program source {'input :double 'out :float})
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        {:keys [lambda]} (dialect/operation-parts (first (dialect/equations result)))
+        {:keys [parameters body-results]} (dialect/lambda-parts lambda)
+        parameter (with-meta (first parameters) {:tag 'double})
+        produce (eval (list 'fn [parameter]
+                            (projection/scalar-folds->source (first body-results))))
+        execute (eval (list 'fn [(with-meta 'input {:tag 'doubles})
+                                 (with-meta 'out {:tag 'floats}) 'n] source))]
+    (is (zero? (:vertical stats)))
+    (is (= :trap (get-in (dialect/scalar-convert-parts (first body-results))
+                         [:attributes :overflow])))
+    (is (thrown? IllegalArgumentException (produce Double/MAX_VALUE)))
+    (let [output (float-array [9.0 9.0])]
+      (is (thrown? IllegalArgumentException
+                   (execute (double-array [1.0 Double/MAX_VALUE]) output 2)))
+      (is (= [9.0 9.0] (vec output))
+          "a later consumer cannot write before checked producer completion"))))
+
 (deftest vertical-candidate-enumeration-checks-each-producer-once
   (let [program (source-program
                  '(let* [u (raster.par/pmap i n float (+ (aget x i) 1.0))
