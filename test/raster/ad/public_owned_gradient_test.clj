@@ -28,6 +28,16 @@
         gradient (nth result 1)]
     (p/map [i 3] (double (if (zero? i) (nth result 0) (a/aget gradient (dec i)))))))
 
+(deftm packed-tail-factor [theta :- (Array double) data :- (Array double) cnt :- Long] :- Double
+  (let [amplitude (a/aget theta 0) kappa (a/aget theta 1)]
+    (n/* 2.0 (response amplitude kappa
+                        (p/reduce acc 0.0 i cnt
+                          (n/+ acc (response amplitude kappa (a/aget data (+ (* (long i) 3) 1)))))))))
+(deftm packed-tail-gradient [theta :- (Array double) data :- (Array double) cnt :- Long] :- (Array double)
+  (let [result ((reverse/value+grad #'packed-tail-factor :wrt [0]) theta data cnt)
+        gradient (nth result 1)]
+    (p/map [i 3] (double (if (zero? i) (nth result 0) (a/aget gradient (dec i)))))))
+
 (deftm tail-gradient [theta :- (Array double) exposure :- Double] :- (Array double)
   (let [result ((reverse/value+grad #'tail-factor :wrt [0]) theta exposure)
         gradient (nth result 1)]
@@ -50,28 +60,29 @@
 (defn- close? [left right] (< (Math/abs (- left right)) 1e-12))
 
 (deftest owned-reduction-composes-into-runtime-and-invoked-aot-helpers
-  (let [prepared (reverse/prepare-owned-bytecode-value+grad #'reduction-tail-factor [0])
+  (doseq [[factor wrapper data] [[#'reduction-tail-factor #'reduction-tail-gradient (double-array [0.2 0.8 1.1])]
+                                 [#'packed-tail-factor #'packed-tail-gradient (double-array [9.0 0.2 9.0 9.0 0.8 9.0 9.0 1.1 9.0])]]]
+   (let [prepared (reverse/prepare-owned-bytecode-value+grad factor [0])
         direct (#'reverse/compile-prepared-value+grad prepared)
-        aot (pipeline/compile-aot #'reduction-tail-gradient)]
+        aot (pipeline/compile-aot wrapper)]
     (doseq [[amplitude kappa] [[0.8 0.7] [1.2 0.4]]
             cnt [0 1 3]]
       (let [theta (double-array [amplitude kappa])
-            data (double-array [0.2 0.8 1.1])
             [value gradient inactive-data inactive-count] (direct theta data cnt)
             actual (into [value] gradient)
             h 1e-6
-            expected (into [(reduction-tail-factor theta data cnt)]
+            expected (into [(factor theta data cnt)]
                            (for [coordinate [0 1]]
                              (let [plus (aclone theta) minus (aclone theta)]
                                (aset plus coordinate (+ (aget theta coordinate) h))
                                (aset minus coordinate (- (aget theta coordinate) h))
-                               (/ (- (reduction-tail-factor plus data cnt)
-                                     (reduction-tail-factor minus data cnt)) (* 2.0 h)))))]
+                               (/ (- (factor plus data cnt)
+                                     (factor minus data cnt)) (* 2.0 h)))))]
         (is (nil? inactive-data))
         (is (nil? inactive-count))
         (is (every? true? (map #(< (Math/abs (- %1 %2)) 1e-8) actual expected)))
         (is (every? true? (map #(< (Math/abs (- %1 %2)) 1e-8) (aot theta data cnt) expected)))))
-    (is (thrown? ArithmeticException (direct (double-array [0.8 0.7]) (double-array 0) Long/MAX_VALUE)))))
+    (is (thrown? ArithmeticException (direct (double-array [0.8 0.7]) (double-array 0) Long/MAX_VALUE))))))
 
 (deftest public-runtime-and-explicit-compiled-construction-share-the-owner
   (doseq [[v offset] [[#'tail-factor 0.0] [#'nested-tail-factor 0.6]]

@@ -53,6 +53,13 @@
   (par/reduce acc seed i cnt (n/* acc x)))
 (deftm overwritten-carry-region [x :- Double cnt :- Long] :- Double
   (par/reduce acc x i cnt x))
+(deftm packed-observation-region [x :- Double data :- (Array double) cnt :- Long
+                                  stride :- Long offset :- Long] :- Double
+  (par/reduce acc 0.0 i cnt
+    (n/+ acc (n/* x (aget data (+ (* (long i) stride) offset))))))
+(def index-events (atom []))
+(deftm effectful-index-region [x :- Double data :- (Array double)] :- Double
+  (n/* x (aget data (do (swap! index-events conj :index) 0))))
 (deftm array-carry-region [xs :- (Array double) coefficient :- Double cnt :- Long] :- Double
   (let [gain (n/* coefficient coefficient)]
     (par/reduce acc 0.0 i cnt (n/+ acc (n/* gain (aget xs i))))))
@@ -80,6 +87,37 @@
   (let [invoke (#'reverse/compile-prepared-value+grad (prepared #'overwritten-carry-region))]
     (doseq [cnt [-1 0 1 3]]
       (is (= [0.7 1.0 nil] (invoke 0.7 cnt))))))
+
+(deftest packed-inactive-observations-use-primitive-owned-index-siblings
+  (let [p (prepared #'packed-observation-region)
+        invoke (#'reverse/compile-prepared-value+grad p)
+        regions (get-in p [:source-owner :entry :index-regions])]
+    (is (= 1 (count regions)))
+    (is (= 'int (get-in regions [0 :spec :return-tag])))
+    (is (= :ad-unowned-index-spec
+           (try (#'reverse/compile-prepared-value+grad
+                  (update-in p [:source-owner :entry :index-regions 0 :spec] assoc :return-tag 'long))
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (doseq [x [0.7 1.2] cnt [0 1 3] stride [0 1 2] offset [0 1]]
+      (let [data (double-array [0.2 0.8 1.1 0.4 0.6 0.9])
+            total (reduce + 0.0 (map #(aget data (+ (* % stride) offset)) (range cnt)))
+            [value dx inactive-data inactive-count inactive-stride inactive-offset]
+            (invoke x data cnt stride offset)]
+        (is (< (Math/abs (- value (* x total))) 1e-12))
+        (is (< (Math/abs (- dx total)) 1e-12))
+        (is (every? nil? [inactive-data inactive-count inactive-stride inactive-offset]))))
+    (is (= [1.4 2.0 nil nil nil nil] (invoke 0.7 (double-array [2.0]) 1 1 4294967296)))
+    (is (thrown? ArrayIndexOutOfBoundsException (invoke 0.7 (double-array [2.0]) 1 1 Long/MAX_VALUE)))
+    (is (thrown? ArrayIndexOutOfBoundsException (invoke 0.7 (double-array [2.0]) 1 1 -1)))
+    (is (thrown? NullPointerException (invoke 0.7 nil 1 1 0)))
+    (is (= [0.0 0.0 nil nil nil nil] (invoke 0.7 nil 0 1 0)))))
+
+(deftest inactive-index-ports-do-not-prove-effect-closure
+  (let [before @index-events]
+    (is (= :ad-unclosed-bytecode-body-region
+           (try (prepared #'effectful-index-region)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= before @index-events))))
 
 (deftest actual-reduction-step-uses-the-same-owned-region-producer
   (let [source (core/resolve-deftm-var #'scalar-carry-region)

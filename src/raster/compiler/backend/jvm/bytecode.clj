@@ -2006,6 +2006,17 @@
     ;; Not handled here
     nil))
 
+(defn- retain-primitive-index-route!
+  "Close one actually emitted primitive index node. Unrecognized routes stay
+   open, so inactive ports alone cannot hide reads, writes or fallback calls."
+  [ctx route type]
+  (when (and (::index-proof ctx) (contains? #{:int :long} type))
+    (swap! (::index-proof ctx)
+           (fn [proof]
+             (-> proof (update :open dissoc (::index-node ctx))
+                 (update :routes conj {:route route :type type})))))
+  type)
+
 (defn- emit-arith-op
   "Emit ordinary arithmetic for the given type and op string. Plain long add/subtract/multiply
    preserve Clojure's checked semantics; explicit unchecked forms have separate emitters below."
@@ -2232,6 +2243,36 @@
   (.checkcast code ifn-cd)
   (emit-boxed-ifn-call code args locals ctx))
 
+(defn- retain-array-read! [ctx array index index-type result-type locals proof]
+  (when-let [token (::call-occurrence ctx)]
+    (when me/*emission-inputs*
+      (let [free (binding [util/*shadowing-locals* (set (keys locals))]
+                   (util/free-syms index))
+            record {:status :known :expression (::call-expression ctx)
+                    :array array :array-local (get locals array)
+                    :result-type result-type
+                    :input {:operand index :type index-type :ports (select-keys locals free)
+                            :context (completion/bytecode-operand-context ctx)}
+                    :primitive-index? (and (contains? #{:int :long} index-type) (empty? (:open proof)))
+                    :index-routes (:routes proof)
+                    :element-type (:element-type ctx)}]
+        (swap! me/*emission-inputs* update :array-read-contexts
+               (fn [contexts]
+                 (assoc contexts token (if (contains? contexts token)
+                                         {:status :ambiguous} record))))))))
+
+(defn ^:no-doc retained-array-read
+  "Actual original array read and its evaluated index carrier/context.
+   This observation grants no activity, purity or source-projection permission."
+  [emission original]
+  (let [token (::call-occurrence (meta original))
+        record (get (:array-read-contexts emission) token)]
+    (when (and (= :jvm-bytecode (:backend emission)) token
+               (identical? original (get (:invocation-catalog emission) token))
+               (= :known (:status record)))
+      (me/assert-emission-inputs-current! emission)
+      record)))
+
 (defn- emit-aget-intrinsic
   "Emit bytecode for aget (array read). Handles typed array checkcast and
    dispatches to the correct JVM *aload instruction based on arr-tag."
@@ -2249,7 +2290,9 @@
     ;; Checkcast array to correct type when on stack as Object ref.
     ;; Skip when the type is already verified by the method descriptor.
     (emit-retained-array-checkcast code arr-tag arr-type arr-verified? ctx)
-    (let [t (emit-form code idx locals ctx)]
+    (let [proof (atom {:open {} :routes []})
+          t (emit-form code idx locals (assoc ctx ::index-proof proof))]
+      (retain-array-read! ctx arr idx t (array-read-stack-type arr locals) locals @proof)
       (when (not= t :int) (emit-coerce code t :int)))
     (case (array-read-stack-type arr locals)
       :double (do (.daload code) :double)
@@ -2523,8 +2566,8 @@
     "float"  (let [t (emit-form code (first args) locals ctx)]
                (retain-floating-conversion! ctx (first args) t Float/TYPE locals)
                (if (= t :float) t (do (emit-coerce code t :float) :float)))
-    "int"    (let [t (emit-form code (first args) locals ctx)]
-               (case t
+    "int"    (let [t (emit-form code (first args) locals ctx)
+                   result (case t
                  :int :int
                  ;; `int` is a checked source conversion. Keep this distinct from the raw JVM
                  ;; coercions used to satisfy array-store and method descriptors, and from the
@@ -2533,11 +2576,15 @@
                                           (MethodTypeDesc/of I-cd
                                                              (into-array ClassDesc [J-cd])))
                            :int)
-                 (do (emit-coerce code t :int) :int)))
+                 (do (emit-coerce code t :int) :int))]
+               (when (contains? #{:int :long} t) (retain-primitive-index-route! ctx :integer-cast result))
+               result)
     "long"   (let [t (emit-form code (first args) locals ctx)]
+               (when (contains? #{:int :long} t) (retain-primitive-index-route! ctx :integer-cast :long))
                (if (= t :long) t (do (emit-coerce code t :long) :long)))
     ;; Arithmetic — dispatched to emit-arithmetic helper
-    ("+" "-" "*" "/") (emit-arithmetic code head-name args locals ctx)
+    ("+" "-" "*" "/") (retain-primitive-index-route! ctx :primitive-arithmetic
+                                                       (emit-arithmetic code head-name args locals ctx))
     ;; Inc/dec (polymorphic, including unchecked variants)
     ;; NOTE: IINC optimization is NOT safe here because (unchecked-inc-int i)
     ;; may appear in a multi-arg recur where other args reference i.
@@ -3126,7 +3173,7 @@
 
     ;; ---- Sibling method call ----
         (and (symbol? head) (get (:sibling-methods ctx) (str head)))
-        (let [{:keys [method-name method-type param-descs]} (get (:sibling-methods ctx) (str head))]
+        (let [{:keys [method-name method-type param-descs owner]} (get (:sibling-methods ctx) (str head))]
           (doseq [[a pd] (map vector args (concat param-descs (repeat obj-cd)))]
             (let [t (if (.equals ^ClassDesc pd obj-cd)
                       (emit-object-value code a locals ctx)
@@ -3141,7 +3188,7 @@
                 (.checkcast code pd)
                 (when (not= t target-st)
                   (emit-coerce code t target-st)))))
-          (.invokestatic code (:class-desc ctx) method-name method-type)
+          (.invokestatic code (or owner (:class-desc ctx)) method-name method-type)
           ;; Return type from method descriptor
           (let [ret-cd (.returnType method-type)]
             (cond (.equals ^ClassDesc ret-cd D-cd) :double
@@ -4988,13 +5035,17 @@
                        ::binding-scope-occurrence (::binding-scope-occurrence (meta form))
                        ::reduction-witness (::reduction-witness (meta form))
                        ::reduction-role (::reduction-role (meta form))
-                       ::call-expression form)]
+                       ::call-expression form)
+        ctx (if (::index-proof ctx)
+              (let [node (Object.)]
+                (swap! (::index-proof ctx) assoc-in [:open node] form)
+                (assoc ctx ::index-node node)) ctx)]
     (cond
       ;; --- Atoms ---
       (nil? form)     (do (.aconst_null code) :ref)
       (true? form)    (do (.ldc code (int 1)) :bool)
       (false? form)   (do (.ldc code (int 0)) :bool)
-      (number? form)  (emit-numeric-literal code form)
+      (number? form)  (retain-primitive-index-route! ctx :literal (emit-numeric-literal code form))
       (char? form)    (do (.ldc code (int form)) :int) ;; JVM chars are ints
       (string? form)  (do (.ldc code form) :ref)
       (keyword? form) (let [kw-cd (ClassDesc/of "clojure.lang" "Keyword")
@@ -5007,7 +5058,10 @@
                                        (MethodTypeDesc/of kw-cd (into-array ClassDesc [str-cd str-cd])))
                         :ref)
 
-      (symbol? form) (emit-symbol code form locals ctx)
+      (symbol? form) (let [type (emit-symbol code form locals ctx)]
+                       (when (and (contains? locals form) (contains? #{:int :long} (:type (get locals form))))
+                         (retain-primitive-index-route! ctx :local type))
+                       type)
 
       ;; Reserved contexts are interpreted, never called as runtime functions.
       (and (seq? form) (= completion/completion-symbol (first form)))
@@ -5395,7 +5449,7 @@
                                 :param-stack-types param-stack-types
                                 :return-stack-type ret-st}))
                            fn-specs)
-        sibling-methods (into {} (map (fn [ms] [(str (:name ms)) ms]) method-specs))
+        sibling-methods (into {} (map (fn [ms] [(str (:name ms)) (assoc ms :owner class-desc)]) method-specs))
         ;; Auto-discover deftm vars referenced in fn-spec bodies
         src-ns (or (:source-ns (first fn-specs)) *ns*)
         deftm-refs (scan-deftm-refs (mapcat :walked-body fn-specs) src-ns)
@@ -5448,7 +5502,9 @@
                           (doseq [[{:keys [method-name method-type params param-descs param-stack-types param-reference-classes
                                            return-stack-type]}
                                    {:keys [walked-body element-type source-ns]
-                                    input-port-layout ::input-port-layout}]
+                                    input-port-layout ::input-port-layout
+                                    body-input-context ::body-input-context
+                                    expected-body-type ::expected-body-type}]
                                   (map vector method-specs fn-specs)]
                             (.withMethodBody cb method-name method-type
                                              (int 0x0009)  ;; PUBLIC + STATIC
@@ -5551,6 +5607,7 @@
                                                             :typed-sibling-methods typed-sibling-methods
                                                             :next-slot        next-slot
                                                             :source-ns        source-ns}
+                                                       ctx (merge ctx body-input-context)
                                                        expanded-body (binding [*ns* source-ns]
                                                                        (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        _ (when-let [token (::body-occurrence (meta walked-body))]
@@ -5563,7 +5620,11 @@
                                                                                               :locals locals
                                                                                               :return-stack-type return-stack-type
                                                                                               :result-context (completion/bytecode-operand-context ctx)}))))))
-                                                       ret-type (emit-body code expanded-body locals ctx)]
+                                                       ret-type (emit-body code expanded-body locals ctx)
+                                                       _ (when (and expected-body-type (not= expected-body-type ret-type))
+                                                           (throw (ex-info "Outlined operand changed its emitted carrier"
+                                                                           {:reason :bytecode-input-result-carrier
+                                                                            :expected expected-body-type :actual ret-type})))]
                               ;; Return according to method signature type
                                                    (when-not (#{:void :diverge} ret-type)
                                                      (case return-stack-type
@@ -5735,31 +5796,11 @@
      :return-stack-type (:stack-type ret-jvm)
      :bytes (:bytes result)}))
 
-(defn ^:no-doc compile-invocation-input-region
-  "Outline one ORIGINAL completed floating input using its owning emitter.
-
-   This is an owner-private numerical region, not a portable source projection.
-   The caller separately proves selected-parent implementation correspondence
-   and supplies the original lexical values in :parameters order. Physical
-   primitive ports must already be completed values; Object ports stay Object
-   even if their logical declaration is Double. Original stack slots are NOT
-   transferable identities. The retained transparent :spec is for composition
-   through this same bytecode compiler, never Clojure eval or another backend.
-
-   Compilation and execution fence historical dependencies. No AD rule or
-   permission to flatten this region is established by outlining it."
-  [emission original input-index]
-  (let [record (retained-invocation-context emission original)
-        input (when (and record (integer? input-index)
-                         (<= 0 input-index) (< input-index (count (:inputs record))))
-                (nth (:inputs record) input-index))]
-    (when-not input
-      (throw (ex-info "Input outlining requires an original owned invocation occurrence"
-                      {:reason :unowned-bytecode-input-region :input-index input-index})))
-    (let [^java.lang.reflect.Method method (:method record)
-          carrier (nth (vec (.getParameterTypes method)) input-index)
-          contract (completion/bytecode-floating-input-contract carrier (:context input))
-          ports (:ports input)
+(defn- compile-owned-input-region
+  "Shared physical ABI, guarded compilation and invocation for owned operands.
+   The caller owns the operand occurrence and its exact completion recipe."
+  [emission input carrier spec-options guard]
+    (let [ports (:ports input)
           parameters (mapv key (sort-by (comp :slot val) ports))
           physical-parameters
           (mapv (fn [parameter]
@@ -5775,15 +5816,8 @@
                                               {:reason :bytecode-input-port-carrier
                                                :parameter parameter})))]
                     (with-meta parameter (assoc (meta parameter) :tag tag)))) parameters)
-          spec {:name 'input :params physical-parameters
-                :return-tag (if (= carrier Double/TYPE) 'double 'float)
-                :walked-body [(completion/complete-value contract (:operand input))]
-                :source-ns (:source-ns emission) :element-type (:element-type record)
-                ::input-port-layout ports}
-          guard (fn []
-                  (when-not (identical? record (retained-invocation-context emission original))
-                    (throw (ex-info "Input region lost its owning invocation"
-                                    {:reason :unowned-bytecode-input-region}))))
+          spec (merge {:name 'input :params physical-parameters
+                       :source-ns (:source-ns emission) ::input-port-layout ports} spec-options)
           _ (guard)
           result (binding [me/*compilation-classloader*
                            (.getClassLoader (class (:implementation emission)))]
@@ -5803,7 +5837,7 @@
                               {:reason :bytecode-input-method-carrier})))
           _ (guard)]
       {:kind :owned-bytecode-input-region :parameters parameters :physical-ports ports
-       :input input :input-contract contract :spec spec :method compiled-method
+       :input input :spec spec :method compiled-method
        :guard guard
        :invoke (fn [& arguments]
                  (guard)
@@ -5812,7 +5846,54 @@
                                (catch java.lang.reflect.InvocationTargetException e
                                  (throw (.getCause e))))]
                    (guard)
-                   value))})))
+                   value))}))
+
+(defn ^:no-doc compile-invocation-input-region
+  "Outline one original completed FP input using its owning bytecode emitter.
+   Physical ports and historical guards are preserved; this is not portable
+   source, a derivative rule or permission to flatten the region."
+  [emission original input-index]
+  (let [record (retained-invocation-context emission original)
+        input (when (and record (integer? input-index)
+                         (<= 0 input-index) (< input-index (count (:inputs record))))
+                (nth (:inputs record) input-index))]
+    (when-not input
+      (throw (ex-info "Input outlining requires an original owned invocation occurrence"
+                      {:reason :unowned-bytecode-input-region :input-index input-index})))
+    (let [^java.lang.reflect.Method method (:method record)
+          carrier (nth (vec (.getParameterTypes method)) input-index)
+          contract (completion/bytecode-floating-input-contract carrier (:context input))
+          guard (fn []
+                  (when-not (identical? record (retained-invocation-context emission original))
+                    (throw (ex-info "Input region lost its owning invocation"
+                                    {:reason :unowned-bytecode-input-region}))))]
+      (assoc (compile-owned-input-region
+              emission input carrier
+              {:return-tag (if (= carrier Double/TYPE) 'double 'float)
+               :walked-body [(completion/complete-value contract (:operand input))]
+               :element-type (:element-type record)} guard)
+             :input-contract contract))))
+
+(defn ^:no-doc compile-array-index-region
+  "Outline the actual evaluated index and raw JVM Int completion of a read.
+   No checked source `int` is inserted: the method's Int return uses the same
+   emit-coerce path as the original array load. Activity is the AD caller's
+   responsibility, and the array read remains outside this operand region."
+  [emission original]
+  (let [record (retained-array-read emission original)]
+    (when-not record
+      (throw (ex-info "Index outlining requires an original owned array read"
+                      {:reason :unowned-bytecode-array-index-region})))
+    (let [input (:input record)
+          guard (fn []
+                  (when-not (identical? record (retained-array-read emission original))
+                    (throw (ex-info "Index region lost its owning array read"
+                                    {:reason :unowned-bytecode-array-index-region}))))]
+      (compile-owned-input-region
+       emission input Integer/TYPE
+       {:return-tag 'int :walked-body [(:operand input)]
+        :element-type (:element-type record)
+        ::body-input-context (:context input) ::expected-body-type (:type input)} guard))))
 
 (def ^:dynamic *compiling-deftms*
   "Set of deftm var symbols currently being compiled, for cycle detection."
@@ -6015,7 +6096,7 @@
   This replaces the Clojure-compiled deftype body with optimized bytecode
   (branch folding, int loops, checkcast elimination)."
   [class-name params tags return-tag walked-body source-ns typed-iface-name
-   & [fallback-ns fallback-name]]
+  & [fallback-ns fallback-name owned-siblings]]
   ;; Note: clojure.lang.IFn caps positional invoke at 20 args, but the JVM
   ;; method limit is 255. For >20 typed params we still emit compute_static
   ;; and the typed `invk` method as usual; the `invoke(Object…)` overloads
@@ -6051,16 +6132,24 @@
                                   :return-tag (or return-tag 'Object)
                                   :walked-body [main-form]
                                   :source-ns source-ns}
-                       all-specs (vec (cons main-spec helpers))
+                       all-specs (into (vec (cons main-spec helpers)) owned-siblings)
                        compiled (compile-specialized-class! class-name all-specs)]
                    {:class (:class compiled)
                     :method (get (:methods compiled) 'compute_static)
                     :bytes (:bytes compiled)})
                  ;; Simple path: single method
-                 (compile-deftm-method!
-                  class-name "compute_static"
-                  params tags return-tag
-                  walked-body source-ns))
+                 (if (seq owned-siblings)
+                   (let [main-spec {:name 'compute_static
+                                    :params (mapv #(vary-meta %1 assoc :tag %2) params tags)
+                                    :return-tag (or return-tag 'Object)
+                                    :walked-body walked-body :source-ns source-ns}
+                         compiled (compile-specialized-class! class-name (into [main-spec] owned-siblings))]
+                     {:class (:class compiled) :method (get-in compiled [:methods 'compute_static])
+                      :bytes (:bytes compiled)})
+                   (compile-deftm-method!
+                    class-name "compute_static"
+                    params tags return-tag
+                    walked-body source-ns)))
         statics-class (:class result)
         compute-method (:method result)
         ;; Step 2: generate wrapper class implementing the typed interface

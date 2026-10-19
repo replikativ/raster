@@ -6337,7 +6337,7 @@
         conversion-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-floating-conversion)
         calls (java.util.IdentityHashMap.)
         reductions (java.util.IdentityHashMap.)
-        state (atom {:bindings [] :helpers [] :activity (zipmap active (repeat true))})
+        state (atom {:bindings [] :helpers [] :index-regions [] :activity (zipmap active (repeat true))})
         fail! (fn [& [details]]
                 (throw (ex-info "Owned caller needs an attested numerical lexical region"
                                 (merge {:reason :ad-unclosed-bytecode-body-region} details))))]
@@ -6406,8 +6406,11 @@
                   (.put calls call entry)
                   (swap! state update :helpers conj entry)
                   (append! raw call))))
-            (lower-read [actual env after]
-              (let [[array index] (op/call-args actual)
+            (lower-read [original env after]
+              (let [observed ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-array-read)
+                              emission original)
+                    actual (or (:expression observed) original)
+                    [array index] (op/call-args actual)
                     source (get env array)
                     index-port (get env index)
                     attested-index (:index-port body-context)
@@ -6416,20 +6419,47 @@
                                   (= :int (get-in index-port [:facts :type]))
                                   (not (get-in @state [:activity (:value index-port)]))
                                   (not (get-in @state [:activity (:value source)])))
+                    input (:input observed)
+                    outlined? (and observed (:primitive-index? observed)
+                                   (= (:facts source) (:array-local observed))
+                                   (not (integer? index)) (not indexed?)
+                                   (not (get-in @state [:activity (:value source)]))
+                                   (every? (fn [[id facts]]
+                                             (and (= facts (get-in env [id :facts]))
+                                                  (contains? #{:int :long} (:type facts))
+                                                  (not (get-in @state [:activity (get-in env [id :value])]))))
+                                           (:ports input)))
                     tag (get types/primitive-array-element-types (types/sym-type-tag (:value source)))
                     result (ad-gensym "body_read" tag)]
-                ;; Symbolic reads initially admit only an inactive attested
-                ;; reduction index into inactive data. Other symbolic/control
-                ;; indices and active-array scatters need their own evidence.
+                ;; Inactive index computation stays with its actual emitter.
+                ;; Only observed primitive routes prove empty memory effects;
+                ;; inactive ports alone cannot hide reads/writes/fallback calls.
+                ;; Active-array scatters still need their own evidence.
                 (when-not (and (seq? actual) (= 'clojure.core/aget (first actual)) (= 3 (count actual))
                                source (contains? '#{double float} tag)
                                (or (nil? after) (= (:type after) (keyword (name tag))))
                                (identical? (get types/primitive-array-info (types/sym-type-tag (:value source)))
                                            (get-in source [:facts :reference-class]))
-                               (or (and (integer? index) (<= 0 index Integer/MAX_VALUE)) indexed?)) (fail!))
-                (append! result (with-meta (list 'clojure.core/aget (:value source)
-                                                (if indexed? (:value index-port) index))
-                                          {:raster.type/tag tag}))))
+                               (or (and (integer? index) (<= 0 index Integer/MAX_VALUE)) indexed? outlined?))
+                  (fail! {:phase :array-read :form original}))
+                (let [index-value
+                      (cond indexed? (:value index-port)
+                            outlined?
+                            (let [region ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-array-index-region)
+                                          emission original)
+                                  name (ad-gensym "array_index_region")
+                                  spec (assoc (:spec region) :name name)
+                                  validate-spec! (fn [candidate]
+                                                   (when-not (identical? spec candidate)
+                                                     (throw (ex-info "Index sibling lost its owning spec"
+                                                                     {:reason :ad-unowned-index-spec}))))
+                                  operands (mapv #(get-in env [% :value]) (:parameters region))]
+                              (swap! state update :index-regions conj
+                                     (assoc region :spec spec :validate-spec! validate-spec!))
+                              (append! (ad-gensym "array_index" 'int) (list* name operands)))
+                            :else index)]
+                  (append! result (with-meta (list 'clojure.core/aget (:value source) index-value)
+                                            {:raster.type/tag tag})))))
             (lower-conversion [expression env]
               (let [{:keys [operand input-type target-carrier ports context] :as record}
                     (conversion-context emission expression)
@@ -6508,6 +6538,7 @@
                             :agets [] :scalar-bindings [] :body-result (:result step) :free-syms free
                             :typed-double? false :replay-values #{} :step-program program}]
                   (swap! state update :helpers into (:helpers step))
+                  (swap! state update :index-regions into (:index-regions step))
                   (.put reductions marker {:form marker :step spec})
                   (append! (ad-gensym "body_reduction" 'double) marker))))
             (lower-scope [expression env]
@@ -6525,7 +6556,7 @@
                                   (check-ports! (select-keys before (keys current)) current)
                                   (let [value
                                         (cond
-                                          (op/aget-call? actual) (lower-read actual current after)
+                                          (op/aget-call? actual) (lower-read initializer current after)
                                           (trivial-expr? initializer) (lower initializer current)
                                           (conversion-context emission initializer) (lower-conversion initializer current)
                                           (par-ir/par-reduce-form? initializer)
@@ -6682,6 +6713,7 @@
                                [{:parameters (into params (map :companion helpers)) :body body}])
               guard (fn [] ((:guard selected))
                       (doseq [{:keys [guard helper]} helpers] (guard) ((:guard helper)))
+                      (doseq [region (:index-regions ordered)] ((:guard region)))
                       (method-entry/assert-definition-inputs-current! @proof-inputs)
                       (execution-guard))
               _ (guard)]
@@ -6689,7 +6721,13 @@
            :active-inputs active
            :source-owner {:backend :jvm-bytecode :guard guard :emission emission
                           :entry {:params params :tags tags :walked-body walked-body
-                                  :interface-class (:iface-class interface)}}
+                                  :interface-class (:iface-class interface)
+                                  :index-regions (:index-regions ordered)
+                                  :validate-index-regions!
+                                  (fn [regions]
+                                    (when-not (identical? regions (:index-regions ordered))
+                                      (throw (ex-info "Index siblings lost their enclosing caller"
+                                                      {:reason :ad-unowned-index-spec}))))}}
            :program program :helpers helpers})))))
 
 (defn ^:no-doc prepare-owned-bytecode-value+grad
@@ -6804,11 +6842,14 @@
         (throw (ex-info "Whole bytecode AD preparation lost its entry owner"
                         {:reason :ad-unclosed-bytecode-preparation})))
       (guard)
+      ((:validate-index-regions! entry) (:index-regions entry))
+      (doseq [region (:index-regions entry)] ((:validate-spec! region) (:spec region)))
       (let [compiled (binding [method-entry/*compilation-classloader*
                                (.getClassLoader (class (:implementation emission)))]
                        ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-impl!)
                         (str "raster.compiled.OwnedGradient_" (clojure.lang.RT/nextID))
-                        params (:tags entry) 'Object walked-body (:source-ns emission) (:interface-class entry)))]
+                        params (:tags entry) 'Object walked-body (:source-ns emission) (:interface-class entry)
+                        nil nil (mapv :spec (:index-regions entry))))]
         (when-not (and (instance? clojure.lang.IFn compiled) (.isInstance ^Class (:interface-class entry) compiled))
           (throw (ex-info "Whole bytecode AD compiler returned a different entry interface"
                           {:reason :ad-bytecode-preparation-carrier})))
