@@ -419,7 +419,14 @@ numerical step is a functional map rather than the former effect map. Merely
 selecting the numerical step is insufficient: effect mutation then edits nothing.
 Retain the public functional-map acceptance and exercise rectangular effect
 coverage with an explicit effect-map fixture; do not drop the negative guard,
-overflow, narrowing or injectivity checks. That test repair remains open.
+overflow, narrowing or injectivity checks. The reviewed repair now uses a validated
+6-by-10 effect-map fixture with explicit Long address evidence, asserts that each
+store mutation actually changes one store, and executes the positive fixture
+against sentinel-filled storage. Public prolongation/restriction separately retain
+complete-destination initialization assertions and device-versus-JVM checks.
+The full affected namespace passes 10 tests / 115 assertions, including local
+Level Zero execution. Independent static review found no coverage weakening.
+This closes the stale test assumption, not the remaining integration failures.
 
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
