@@ -6058,7 +6058,10 @@
                          (some #(contains? (util/free-syms (second %)) destination) earlier)
                          :fresh-write-prior-use
                          (contains? (util/free-syms map-body) destination) :fresh-write-self-read
-                         (not (effects/removable-expr? map-body)) :fresh-write-unproved-purity
+                         ;; This is a representation change at the original
+                         ;; allocation/effect sites, not deletion or replay of
+                         ;; the body. Retained read/cast failures stay executable.
+                         (not= :pure (effects/analyze-effect map-body)) :fresh-write-unproved-purity
                          (contains? (util/free-syms suffix) statement) :fresh-write-observed-statement
                          :else nil))
                      description

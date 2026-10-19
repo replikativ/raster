@@ -62,6 +62,11 @@ map/gather AD rejects source reads carrying mandatory-evaluation flags. Two
 derivation/canonicalization gates currently conflate external purity with
 removability. Keep the flags and source evaluations; repair the gate distinction
 under the existing private-output/replay contracts, with primal failure controls.
+The reviewed gate correction passes 33 tests / 314 assertions across functional
+fresh-write admission, scoped AD effects, owned allocations and the independent
+tangent-storage law. Original bounds/negative-size failures remain, while aliases
+and unsupported active effects still refuse. This repairs those three regressions;
+it does not establish general replay safety or permit DCE to discard reads.
 
 Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
 (49 tests, 757 assertions plus both fresh workers). Helper migration separately
