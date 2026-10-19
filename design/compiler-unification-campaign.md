@@ -8,6 +8,50 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### October 19 active continuation
+
+The original eight obligations below remain open. Execute bounded, reviewed
+verticals and land exact-head green PRs without waiting for another approval;
+keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
+
+The immediate JVM helper/ordered-reduction slice now has source qualification
+on the unchanged marketing formulation: runtime and invoked AOT gradients agree
+with nine-coordinate finite differences across changed parameters and data.
+This is not full marketing-suite acceptance. Its broader scan-based formulation
+still declines at temporary array allocation/scan ownership. AOT-created new
+definitions also advance the global epoch, so a previously cached runtime
+gradient may correctly refuse while its consumer cache retains that stale
+callable. Numerical correctness and cache-lifecycle recovery are separate gates.
+
+Continue in this order, interleaving independent small correctness cleanups:
+
+1. Land the owned helper/reduction vertical with historical source, carrier,
+   conversion and dependency checks intact. Extend allocation/scan through the
+   same owned region producer and shared recurrence assembly; saved pullbacks
+   come before any forward-replay optimization. Do not add a per-model rule.
+2. Profile current boxing, native calls and staging with warmed JIT and matched
+   scopes. Optimize measured residual/product boundaries while retaining absent
+   cotangents, alias preflight and completion-backed ownership. Object signatures
+   or redundant CHECKCASTs alone are not allocation evidence.
+3. Integrate the optional MLIR/Pattern prototype at KernelBody through shared
+   executable identity, native invocation, cache and lifetime contracts. Keep
+   ordinary deftm/semantic lowering distinct from this scheduled backend entry;
+   LLVM/MLIR must remain optional and must not add another runtime authority.
+4. Close unchanged Gemma/SFT, bounded GSDM trajectories/statistics, city and PDE
+   acceptance; reconcile TypedSOAC paths and retire covered adapters/tests.
+   Preserve separate compile, prepare, submit, transfer and device measurements.
+5. Requalify public CUDA/HIP fixtures and the external CUDA runtime against an
+   immutable integrated main. Then complete the existing distributed planner,
+   collective/halo and durable/multilevel simulator gates on this laptop, without
+   claiming multi-host/fabric performance from co-located execution.
+6. Consolidate support/evidence tables, reachable debt and test partitions after
+   their independent positive and refusal obligations have replacement coverage.
+
+The bounded JVM regions do not establish generic native/device AD or permission
+to discard source owners. No SOTA performance or complete compiler claim follows
+from this qualification. See `normalized-ad.md` for the explicit admission and
+remaining representation boundaries.
+
 ### October 16 continuation
 
 Fresh hardware-free planning qualification found that an explicit integer compute

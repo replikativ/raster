@@ -8,6 +8,29 @@
             [raster.par]
             [raster.numeric :as n]))
 
+(deftest paired-primal-keeps-original-nested-floating-call-context
+  (let [scope (create-ns (gensym "raster.paired-floating-context."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm identity-value [x :- Double] :- Double x))
+        (eval '(raster.core/deftm ratio [numerator :- Double denominator :- Double] :- Double
+                 (clojure.core// (identity-value numerator) (identity-value denominator)))))
+      (let [ratio (ns-resolve scope 'ratio)
+            source (core/resolve-deftm-var ratio)
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            _ (core/ensure-bytecode-implementation! receiver)
+            emission (:raster.core/bytecode-emission (meta receiver))
+            artifact (#'reverse/get-paired-helper-program emission [0 1])
+            outcome (fn [f arguments]
+                      (try {:bits (Double/doubleToRawLongBits (double (apply f arguments)))}
+                           (catch Throwable e {:error (class e)})))]
+        (doseq [arguments [[1.0 2.0] [1.0 0.0] [0.0 0.0] [-0.0 2.0]]]
+          (is (= (outcome @ratio arguments)
+                 (outcome (fn [& args] (first (apply (:companion artifact) args))) arguments))
+              (str "the paired result must preserve the actual primal for " arguments))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest paired-owner-retains-a-helper-premise-removed-by-scalar-projection
   (let [scope (create-ns (gensym "raster.projected-helper-premise."))]
     (try

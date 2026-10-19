@@ -52,6 +52,11 @@
    pipeline still expands its existing numeric implementation bodies before SOAC discovery."
   false)
 
+(def ^:dynamic *owned-jvm-calls?*
+  "Explicit JVM target admission for private owned AD calls. Portable source
+   consumers and native/GPU entries must not extract their bytecode programs."
+  false)
+
 (defn- inlinable-body?
   "Check if a walked body form is suitable for inlining.
    Forms with decomposable structure (let*, loop, dotimes, do, .invk, par) are
@@ -964,7 +969,14 @@
             ;; transform AD again or infer the gradient types from its consumers.
             prepared-body ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
                            (:var deftm-info) (:wrt (apply hash-map options)))
-            _ (source-owner/assert-portable-source! prepared-body)
+            owned? (contains? prepared-body :source-owner)]
+        (if owned?
+          (do
+            (when-not (and *owned-jvm-calls?*
+                           (= :jvm-bytecode (get-in prepared-body [:source-owner :backend])))
+              (source-owner/assert-portable-source! prepared-body))
+            ((requiring-resolve 'raster.ad.reverse/project-owned-value+grad-call) prepared-body args mode))
+          (let [_ (source-owner/assert-portable-source! prepared-body)
             params (:params prepared-body)
             prepared-form (inf/qualify-body-symbols
                            (first (:walked-body prepared-body))
@@ -1024,7 +1036,7 @@
                  :loss-sym loss-sym
                  :grad-syms grad-syms
                  :scalar-result? (and (= :grad mode) (= 1 (count grad-syms)))
-                 :elements elements}))))))))
+                 :elements elements}))))))))))
 
 (defn- inline-one-pass
   "Single pass of deftm inlining over a let* form's bindings."

@@ -28,6 +28,59 @@ does not infer the missing original `deftm` compilation policy, discover source
 calls, authorize captured global AD correspondence, or enable completion/product
 AD records on the default path. Those remain requirements before default normalization can migrate.
 
+## Owned JVM numerical regions
+
+The JVM helper-composition vertical retains the actual bytecode producer's
+method entry, lexical bindings, invocation operands, conversions and reduction
+expansion. Logical tangent declarations and physical JVM carriers are distinct:
+an Object-returning helper is not silently replaced by a primitive call merely
+because its declared mathematical result is Double. Input completion stays at
+its original consumer, in source order, before the next operand is evaluated.
+
+An owned lexical producer supplies ordered bindings to the existing forward
+record/reverse projection engine. Whole methods and observed reduction steps
+use that same producer. Helpers use the existing paired primal/pullback
+machinery and derivative templates; there is no helper-specific derivative
+registry or competing evaluator. Exact occurrence and physical-port evidence
+is required. Copying syntax or an occurrence annotation does not establish it.
+
+The initial reduction domain has an actually emitted Int index, Double carry,
+primitive count and primitive/literal seed. The checked bound is evaluated
+before the seed, and the seed is evaluated once, even on a zero-trip reduction.
+The existing ordered reduction assembler stores each step's pullback closure.
+Reverse traversal consumes those closures; it does not rerun forward steps or
+infer replay purity from an absence of known writes. Nested reductions and
+unclosed carry, active-array indexing or conversion contexts refuse.
+
+Packed inactive observation indices can be outlined by the same bytecode
+input-region compiler. Every emitted index node starts open. Only actual
+primitive integer literal/local loads, arithmetic and cast routes close nodes;
+unknown calls, interop, reads and writes do not. All physical index ports must
+be inactive and match the observed locals. This establishes empty index memory
+effects, not totality: checked arithmetic still throws. The original final raw
+JVM Int coercion is preserved, not replaced by a potentially trapping source
+`int` cast. A primitive-returning static sibling evaluates the index, while the
+ordinary array read remains visible to memory analysis. These sibling specs
+and their declaring owner are private parts of the enclosing executable.
+
+Original source walking is published before bytecode dependency capture, never
+reconstructed from AD/SIMD-transformed code. A missing legacy cache requires
+actual re-emission from a still-current original source plan; an old artifact's
+observations are never refreshed. Selected definitions, source inputs, compiler
+and rule epochs remain guarded. This is sequential staleness detection, not
+transactional publication, ABA safety or concurrent mutation support.
+
+New function definitions currently advance a global compiler epoch. A consumer
+holding an already-realized cached gradient can therefore receive a stale-owner
+refusal after constructing another compiler adapter. Dependency-precise cache
+recovery remains separate work; numerical qualification within one stable epoch
+does not establish transparent mixed-backend cache lifecycle support.
+
+These regions are JVM-private. Source extraction must not drop their owner or
+pretend that their physical contexts establish native/device AD support. The
+semantic normalized TypedSOAC/device work below remains a separate capability
+until an explicit capture-aware lowering connects those boundaries.
+
 ## Internal structural product interpretation
 
 The explicit generated-source owner additionally accepts a closed, read-only
