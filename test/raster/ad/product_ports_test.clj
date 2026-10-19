@@ -71,6 +71,24 @@
              (try (ports/join-facts unknown scalar) nil
                   (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
+(deftest inactive-opaque-joins-forget-absence-without-inventing-a-tangent
+  (let [absent {:kind :leaf :tag nil :presence :absent}
+        unknown {:kind :leaf :tag nil}
+        fact (fn [leaf] {:schema {:kind :product
+                                 :fields [{:kind :product :fields [leaf]}]}
+                         :active-paths #{}})
+        a (fact absent) u (fact unknown)]
+    (doseq [[left right] [[a u] [u a]]]
+      (let [joined (ports/join-facts left right)]
+        (is (= u joined))
+        (is (= u (ports/join-facts joined a)))
+        (is (= u (ports/join-facts a joined)))))
+    (doseq [[left right] [[(assoc u :active-paths #{[0 0]}) a]
+                         [a (assoc u :active-paths #{[0 0]})]]]
+      (is (= :ad-product-choice-schema
+             (try (ports/join-facts left right) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
 (deftest absence-does-not-follow-activity-or-unproved-facts
   (is (= {:kind :leaf :tag 'double}
          (get-in (ports/literal-plan 'p [1.0] {1.0 {:presence :absent}} {}) [:schema :fields 0])))

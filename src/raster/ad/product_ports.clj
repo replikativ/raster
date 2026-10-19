@@ -49,25 +49,34 @@
                                (and leaf (not (absent? leaf))
                                     (tangent/differentiable? (:tag leaf)))))
                            (:active-paths fact)))))
-          (join [a b]
+          (join [a b path]
             (cond
               (= a b) a
               (and (= :product (:kind a)) (= :product (:kind b))
                    (= #{:kind :fields} (set (keys a)) (set (keys b)))
                    (vector? (:fields a)) (vector? (:fields b))
                    (= (count (:fields a)) (count (:fields b))))
-              {:kind :product :fields (mapv join (:fields a) (:fields b))}
+              {:kind :product
+               :fields (mapv (fn [index left right] (join left right (conj path index)))
+                             (range) (:fields a) (:fields b))}
               ;; Absence is a producer fact, never a missing type or activity
               ;; bit. A declaration describes the present tangent only: this
               ;; join establishes neither presence nor a primitive carrier.
               (and (absent? a) (scalar? b)) b
               (and (scalar? a) (absent? b)) a
+              ;; Primal-only opaque fields need no tangent declaration. Forget
+              ;; absence, never infer a dtype or transfer presence from an arm.
+              (and (not (contains? (:active-paths then-fact) path))
+                   (not (contains? (:active-paths else-fact) path))
+                   (or (and (absent? a) (= {:kind :leaf :tag nil} b))
+                       (and (= {:kind :leaf :tag nil} a) (absent? b))))
+              {:kind :leaf :tag nil}
               :else (refuse)))]
     (when-not (and (fact? then-fact) (fact? else-fact)
                    (= :product (get-in then-fact [:schema :kind]))
                    (= :product (get-in else-fact [:schema :kind])))
       (refuse))
-    {:schema (join (:schema then-fact) (:schema else-fact))
+    {:schema (join (:schema then-fact) (:schema else-fact) [])
      :active-paths (into (:active-paths then-fact) (:active-paths else-fact))}))
 
 (defn choice-plan
