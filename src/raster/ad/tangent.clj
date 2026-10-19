@@ -125,12 +125,14 @@
   "Runtime Π fallback: a zero cotangent shaped like the PRIMAL value `x`,
   deriving dtype+shape dynamically. Used only where no static tag exists
   (e.g. untagged if-result syms in runtime AD) — unlike a bare scalar 0.0
-  it can never mis-shape an array slot. nil (0̄) passes through."
+  it can never mis-shape an array slot. Immutable vector products recurse
+  pointwise, including the empty product; nil (0̄) passes through."
   [x]
   (cond
     (nil? x) nil
     (instance? Double x) 0.0
     (instance? Float x) (Float/valueOf (float 0.0))
+    (vector? x) (mapv zero-like x)
     (.isArray (class x))
     (java.lang.reflect.Array/newInstance (.getComponentType (class x))
                                          (java.lang.reflect.Array/getLength x))

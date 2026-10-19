@@ -711,6 +711,16 @@
        symbol))
     (mapv key @ordered)))
 
+(defn- retain-live-residual-values
+  "Keep forward evaluation intact; save only values free in the reverse region.
+   The producer's one ordered projection is shared by save and restore."
+  [{:keys [fwd-bindings rev-bindings param-adj-syms] :as piece}]
+  (let [values (vec (take-nth 2 fwd-bindings))
+        demanded (binding [util/*shadowing-locals*
+                           (into util/*shadowing-locals* values)]
+                   (util/free-syms (list 'let* (vec rev-bindings) (vec param-adj-syms))))]
+    (assoc piece :saved-values (filterv demanded values))))
+
 (defmethod ad-record :if [_ sym init-expr activity]
   (let [[_ branch then else] init-expr
         then-product (get-in *source-memory-context* [:value-facts then :product])
@@ -734,7 +744,8 @@
                                        *generated-product-context*
                                        (when *generated-product-context*
                                          (assoc *generated-product-context* :internal-region? true))]
-                               (let-gradient-pieces bindings body params dy))))
+                               (retain-live-residual-values
+                                (let-gradient-pieces bindings body params dy)))))
                          [then else])
             result-products (mapv :result-product pieces)
             result-product (when (some some? result-products)
@@ -744,14 +755,14 @@
                             {:kind :conditional :representation :persistent-vector
                              :source-form init-expr})
             replay-roots (vec (sort-by str (into #{} (mapcat (comp keys :pullback-replay-conditions)) pieces)))
-            paired (mapv (fn [{:keys [fwd-bindings body-sym pullback-replay-conditions]}]
+            paired (mapv (fn [{:keys [fwd-bindings body-sym saved-values pullback-replay-conditions]}]
                            (let [saved (ad-gensym "branch_saved")
                                  conditions (mapv (fn [root]
                                                     [(ad-gensym "branch_replay")
                                                      (get pullback-replay-conditions root false)])
                                                   replay-roots)]
                              (list 'let* (vec (concat fwd-bindings
-                                                     [saved (vec (take-nth 2 fwd-bindings))]
+                                                     [saved saved-values]
                                                      (mapcat identity conditions)))
                                    ;; Export evaluated obligations through the existing
                                    ;; residual, never leak a child's private selector.
@@ -1436,10 +1447,10 @@
                                                    [path (get adj-sym (product-ports/field-port sym path))]))
                                          (product-ports/leaf-paths (:schema result-product))))
                adj-sym)
-        arms (mapv (fn [{:keys [fwd-bindings rev-bindings param-adj-syms]}]
+        arms (mapv (fn [{:keys [saved-values rev-bindings param-adj-syms]}]
                      (let [restore (mapcat (fn [index value]
                                              [value (list 'clojure.core/nth saved index)])
-                                           (range) (take-nth 2 fwd-bindings))]
+                                           (range) saved-values)]
                        (list 'let* (vec (concat restore [dy seed] rev-bindings))
                              (vec param-adj-syms))))
                    pieces)

@@ -245,6 +245,51 @@ replay refusal stops at unclosed value completion before the expected guard
 diagnostic, and `D-pipeline-rewrite` still errors. Do not treat these as covered
 by the narrower passing product gate; both remain in the integration backlog.
 
+Residual follow-up: the actual failing `D4-compiled` conditional paired a
+two-field result with every forward local as its residual. The two forward
+arms computed different numbers of locals, although neither reverse arm used
+those locals. The producer now retains an ordered free-variable projection of
+the reverse bindings and returned parameter adjoints; both saving and restoration
+consume that exact projection. All forward expressions and their evaluation
+order remain unchanged. No padding, product-schema relaxation or inactive tape
+claim is introduced. Truly incompatible live residuals remain unsupported until
+the branch owner supplies an explicit heterogeneous residual interface.
+
+This exposes the ordinary empty-vector product in forward-over-reverse. The
+existing dynamic tangent-zero fallback now recurses pointwise over vectors,
+including the empty product, as the vector JVP rule already does. Unsupported
+Object leaves/maps/lists still refuse, and array leaf zeros are freshly allocated.
+The warm conditional/replay gate passes 24 tests / 250 assertions, including
+selected unused-read failures/effects on runtime and invoked AOT paths. The
+existing full `D-pipeline-rewrite` numerical assertions now pass. Four separate
+Float cotangent-class law failures remain: template emission currently stamps
+the desired input tangent dtype onto produced expressions without materializing
+the conversion. Retained lexical declarations expose that producer-contract gap;
+do not remove declarations, change expected classes, or weaken precision checks.
+Fresh-JVM qualification passes five conditional/product namespaces (46 tests /
+436 assertions) plus the dedicated product-zero and existing first-through-fourth
+derivative pipeline checks (2 tests / 19 assertions). A subsequent strengthened
+forward-failure control explicitly asserts invoked AOT status and passes 1 test /
+13 assertions. Integration CI remains outstanding for this follow-up.
+
+Reviewed next repair: close every scalar template output at the shared
+`instantiate-template-ctx` boundary, for static and handwritten rules alike.
+Keep actual RHS dtype evidence separate from the desired input tangent-space
+declaration. Current `stamp-emitted-bindings` creates circular evidence by stamping
+the desired LHS tag onto the RHS and publishing `(or desired inferred)` as its
+actual dtype. Preserve independently established intermediate/array declarations,
+but do not feed an unfulfilled scalar output declaration into its own inference.
+Evaluate each original RHS once as a flat raw binding, apply the existing
+nil-safe `tangent/project-expr` at each returned scalar port, and publish the
+target declaration only after that projection. No `:materialized? true` without
+independent presence evidence. Ports returning an existing symbol, nil, or one
+shared source with conflicting Float/Double targets need separate projections,
+not mutation of that shared source's metadata. Keep kernel/SOAC RHSs flat.
+Acceptance includes the four existing Float laws, checked overflow/rounding,
+nil preservation, shared mixed-target outputs, static/custom rules and nested AD.
+This is a producer-contract repair, not per-operation dispatch or a change to
+AD algebra. It is planned, not yet implemented or qualified.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.
