@@ -9,6 +9,17 @@
 ;; free-syms: scoped free variable collection
 ;; ================================================================
 
+(deftest lexical-vector-rewrites-retain-runtime-product-metadata
+  (let [marker {:origin :source-product}
+        product (with-meta ['x (with-meta ['x] marker)] marker)]
+    (doseq [rewritten [(util/subst-syms {'x 'y} product)
+                       (util/alpha-convert {'x 'y} product)]]
+      (is (= ['y ['y]] rewritten))
+      (is (= marker (meta rewritten)))
+      (is (= marker (meta (second rewritten)))))
+    (is (= ['x ['x]] product))
+    (is (= marker (meta product)))))
+
 (deftest result-effect-branches-bind-only-their-continuation
   (let [source '(effect-region []
                  [(effect out :unique 0 true joined)

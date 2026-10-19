@@ -208,7 +208,7 @@
                   (mapv #(subst-syms smap % leaf-fn) outer))
          (remake-from expr (map #(subst-syms smap % leaf-fn) expr)))
 
-       (vector? expr) (mapv #(subst-syms smap % leaf-fn) expr)
+       (vector? expr) (with-meta (mapv #(subst-syms smap % leaf-fn) expr) (meta expr))
        ;; IR records (KernelBody IndexExpr, SegOps, ...) are maps whose type must survive:
        ;; substitute inside their fields, never `empty` them.
        (record? expr) (reduce-kv (fn [r k v] (assoc r k (subst-syms smap v leaf-fn))) expr expr)
@@ -269,7 +269,7 @@
        (rebuild (mapv #(alpha-scope env % sequential? rec?) scopes)
                 (mapv #(alpha-convert env %) outer))
        (remake-from form (map #(alpha-convert env %) form)))
-     (vector? form) (mapv #(alpha-convert env %) form)
+     (vector? form) (with-meta (mapv #(alpha-convert env %) form) (meta form))
      (record? form) (reduce-kv (fn [r k v] (assoc r k (alpha-convert env v))) form form)
      (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k) (alpha-convert env v)]) form))
      (set? form) (into (empty form) (map #(alpha-convert env %) form))
