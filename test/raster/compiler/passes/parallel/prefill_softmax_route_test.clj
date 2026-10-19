@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -60,10 +61,8 @@
         row-index-plus? (fn [form loop-index]
                           (and (seq? form) (= 'clojure.core/+ (first form))
                                (= 3 (count form))
-                               (seq? (second form))
-                               (= 'clojure.core/long (first (second form)))
-                               (symbol? (second (second form)))
-                               (= (list 'clojure.core/long loop-index) (nth form 2))))
+                               (symbol? (descriptor/unwrap-int-cast (second form)))
+                               (= loop-index (descriptor/unwrap-int-cast (nth form 2)))))
         shifted (rewrite
                  #(if (row-index-plus? % 'rstr_loop_index_1)
                     (list 'clojure.core/+ (second %) (nth % 2) 1)

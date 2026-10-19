@@ -37,7 +37,11 @@
       (binding [*ns* scope]
         (refer 'clojure.core)
         (eval '(raster.core/deftm twice [x :- Double] :- Double
-                 (let [left (double x) right (double x)]
+                 ;; This fixture needs an actually closed conversion, so that
+                 ;; the source helper is removed and its retained dependency
+                 ;; guard is tested. Bare names require frontend resolution;
+                 ;; local product analysis must not guess their identity.
+                 (let [left (clojure.core/double x) right (clojure.core/double x)]
                    (raster.ad.reverse/grad-acc left right)))))
       (let [source (core/resolve-deftm-var (ns-resolve scope 'twice))
             receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
