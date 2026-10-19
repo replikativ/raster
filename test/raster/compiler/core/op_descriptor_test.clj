@@ -10,6 +10,16 @@
   (is (not (descriptor/cast-op? 'other/unchecked-float)))
   (is (nil? (descriptor/cast-floating-narrowing 'clojure.core/double))))
 
+(deftest allocation-argument-literals-must-have-exact-primitive-carriers
+  (is (= {:dtype :long :shape []} (descriptor/direct-allocation-argument-value 1 {})))
+  (is (= {:dtype :float :shape []} (descriptor/direct-allocation-argument-value (float 1) {})))
+  (is (= {:dtype :double :shape []} (descriptor/direct-allocation-argument-value 1.0 {})))
+  (doseq [value [1N (bigint (inc (bigint Long/MAX_VALUE))) (biginteger 1) 1M 1/2
+                 '(inc 1) 'Long/MAX_VALUE nil]]
+    (is (nil? (descriptor/direct-allocation-argument-value value {}))))
+  (is (= {:dtype :float :shape [3]}
+         (descriptor/direct-allocation-argument-value 'x {'x {:dtype :float :shape [3]}}))))
+
 (deftest reduction-identities-retain-exact-qualified-algebra
   (let [original descriptor/get-op-descriptor
         monoid {:associative? true :commutative? true :identity 42}

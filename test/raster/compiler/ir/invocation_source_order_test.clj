@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.contractions :as contractions]
+            [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-source :as source]
@@ -48,6 +49,20 @@
                      (assoc-in plan [:steps step-index :source-projection :helper :implementation]
                                'unrelated/constructor)]]
       (is (= :invocation-source-step-mismatch (reason #(invocation/source-order changed program)))))))
+
+(deftest literal-helper-allocation-retains-an-independent-source-witness
+  (let [compiled (equation-first/compile #'storage/double-fold-float-storage
+                                        (merge storage/policy {:target :ocl:0 :dtype :double}))
+        program (:semantic compiled)
+        plan (get-in program [:attributes :invocation-plan])
+        allocation (first (get-in program [:attributes :allocations]))]
+    (is (= '(clojure.core/float-array 1) (get-in allocation [:source-projection :constructor])))
+    (is (vector? (invocation/source-order plan program)))
+    (doseq [changed [(assoc-in program [:attributes :allocations 0 :initialization] :unspecified)
+                     (update-in program [:attributes :allocations 0] dissoc :source-projection)
+                     (assoc-in program [:attributes :allocations 0 :source-projection :constructor]
+                               '(clojure.core/float-array 2))]]
+      (is (= :invocation-source-allocation (reason #(invocation/source-order plan changed)))))))
 
 (deftest source-position-is-not-the-dependency-pruned-prefix-ordinal
   (let [[program plan] (compilation #'write-before-shape :double)

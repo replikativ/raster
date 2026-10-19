@@ -603,6 +603,8 @@
      :acquired-storage #{}
      :source-allocations (into {} (map (juxt :destination :source-expression))
                               (get-in semantic-program [:attributes :allocations]))
+     :source-allocation-projections (into {} (map (juxt :destination :source-projection))
+                                        (get-in semantic-program [:attributes :allocations]))
      :projections (:projections checked) :target (:target compilation)
      :caller-options caller-options}))
 
@@ -807,7 +809,8 @@
     (when auxiliary? (validate-source-result-allocation! state entry action))
     (when (and (:helper projection)
                (not (semantic/equivalent? (select-keys projection [:constructor :helper])
-                                         (:source-projection step))))
+                                         (or (:source-projection step)
+                                             (get-in state [:source-allocation-projections destination])))))
       (fail! :invocation-ordered-allocation-definition
              "allocation helper differs from this invocation's retained constructor definition"
              {:entry entry}))
@@ -821,6 +824,7 @@
           _ (doseq [argument (get-in projection [:helper :arguments])]
               (when-not (or (contains? scalars argument)
                             (contains? (:program-buffers available) argument)
+                            (descriptor/direct-allocation-argument-value argument {})
                             (contains? (:acquired-storage state)
                                        (get-in state [:realized :buffers argument])))
                 (fail! :invocation-ordered-allocation-argument
@@ -961,13 +965,23 @@
                                                             (first (:operations equation)))
           private-source-results
           (let [checked-outputs (set (map :output (:stage-results projection)))]
-            (into #{} (keep (fn [[position {:keys [kind binding equation]}]]
-                             (when (and (< position (:source-cursor state))
-                                        (= :result-allocation kind)
-                                        (= equation equation-id)
-                                        (contains? checked-outputs binding))
-                               (get buffers binding))))
-                  (:source-realizations state)))
+            (let [created (into #{}
+                                (keep (fn [[position {:keys [kind binding]}]]
+                                        (when (and (< position (:source-cursor state))
+                                                   (= :result-allocation kind))
+                                          (get buffers binding))))
+                                (:source-realizations state))
+                  created (into created
+                                (keep-indexed
+                                 (fn [position entry]
+                                   (when (and (< position (:source-cursor state))
+                                              (contains? (:source-allocations state) (:storage entry)))
+                                     (get buffers (:storage entry)))))
+                                (:source-order state))]
+              ;; Both explicit constructors and generated result allocations
+              ;; are source-created storage. Aliases follow their same token.
+              ;; This is only a private-output requirement, not live ownership.
+              (set/intersection created (set (keep buffers checked-outputs)))))
           nodes (mapv (fn [node]
                         (if (contains? acquired (get-in node [:view :allocation :id]))
                           ;; Existing roots are conditional inputs to this stage. Retaining

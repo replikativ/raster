@@ -1484,8 +1484,11 @@
           completed-id (:id (first (:locals converted-region)))]
       (is (= :double (:dtype (first (:locals converted-region)))))
       (is (= [(list 'clojure.core/double (list 'clojure.core/float completed-id))]
-             (:body-results converted-region))
-          "raw explicit casts are retained; scheduled scalar SSA owns their conversion policy"))
+             (mapv dialect/scalar-converts->source (:body-results converted-region)))
+          "canonical conversions preserve the original checked cast and widening order")
+      (is (= {:source-dtype :float :target-dtype :double :rounding :exact :overflow :exact
+              :source-op 'clojure.core/double}
+             (:attributes (dialect/scalar-convert-parts (first (:body-results converted-region)))))))
     (doseq [expression ['(clojure.core/+ acc bias) '(clojure.core/aget C 0)]]
       (let [operation (nth (second source) 1)
             operation (apply list (concat (drop-last 2 operation)
@@ -1599,10 +1602,16 @@
                            [(:source-dtype attributes) (:target-dtype attributes)]))
                        body-results))
               "every map2 result retains its complete source-to-storage conversion")
-          (is (every? #(= 'float
-                          (some-> % descriptor/semantic-op descriptor/cast-result-tag))
-                      body-results)
-              "explicit user store casts remain source operations rather than implicit storage terms"))
+          (do
+            (is (every? #(= 'float
+                            (some-> % dialect/scalar-converts->source descriptor/semantic-op
+                                    descriptor/cast-result-tag))
+                        body-results)
+                "explicit user store casts preserve their source operation")
+            (is (every? #(= {:source-dtype :double :target-dtype :float
+                            :rounding :nearest-even :overflow :trap :source-op 'clojure.core/float}
+                           (:attributes (dialect/scalar-convert-parts %))) body-results)
+                "canonicalization retains checked narrowing, not an implicit IEEE cast")))
         (is (= [] (dialect/outputs program))
             "the host nil result is not mislabeled as a tensor result")))))
 

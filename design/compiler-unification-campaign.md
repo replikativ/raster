@@ -14,29 +14,38 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `e883ab54` is draft, not qualified for merge.
-Exact-head setup/build passed, emission and unit tests failed, and OpenCL was pending at
+Current integration hold: PR #1539 at `fe33ef0b` is draft, not qualified for merge.
+Exact-head setup/build passed; emission, unit tests and OpenCL failed at
 the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
 
-Emission has progressed past public `mixed-scale`; its next actual failure is a
-checked Double-to-Float after an ordered fold in `double-fold-float-storage`'s
-mutable map. That case is not admitted by the fresh functional-map refinement.
-Do not erase the check or assume that parallel partial writes preserve failure order.
+The next reviewed slice admits checked Double-to-Float after a finite literal-bound
+ordered fold, including an exact write-only destination with runtime-proven private
+ownership. It preserves the Double accumulator and source failure selection. Helper
+allocation correspondence uses the actual prepared original frontend, not an older
+walked-body cache; rejected speculative helpers retain no dependency observations.
+The affected gate passes 186 tests / 1,852 assertions, including local OpenCL/Level
+Zero execution, changed inputs, precision-sensitive folds and failure cleanup.
+This is not broad integration acceptance. Source-only public CUDA/HIP fixture probes
+progress to `double-exponential-float-storage`, where `exp` lacks descriptor-owned
+nonthrowing evidence. Preserve its declared target-library accuracy separately from
+exception totality; do not erase checks or claim vendor execution/performance.
 
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|
 | Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |
-| Checked numerical map result | Source-derived `mixed-scale` compiles across OpenCL/CUDA/HIP. The explicit internal ordered checked executor observes actual local OpenCL/Level Zero results, guards historical source ownership, tracks success-conditioned coverage, and rotates private output generations on replay. Ordinary invocation/composition/persistence still refuse. | Qualify broader integration and automatic Compiled admission; extend beyond the fresh functional-map case, including mutable ordered-fold conversions. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
+| Checked numerical map result | Source-derived `mixed-scale` compiles across OpenCL/CUDA/HIP. The explicit internal ordered checked executor observes actual local OpenCL/Level Zero results, guards historical source ownership, tracks success-conditioned coverage, and rotates private output generations on replay. Finite literal-bound ordered folds retain Double accumulation and a runtime private-output obligation. Ordinary invocation/composition/persistence still refuse. | Qualify broader integration and automatic Compiled admission; establish descriptor-owned nonthrowing target-math evidence without changing accuracy policy. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
 | Training scalar source coverage | Unit 32520 and warm local reproduction reject `local-gradient-sum`: nested reduce/divide and later scale scalar carry mandatory source evaluation | Close source-order/carrier evidence without dropping preservation flags or duplicating evaluation; retain the actual distributed-training composition oracle. |
 | Existing AD/native/fusion integration | Exact-head unit logs still contain native refusals, closed-product AD gaps and fusion/terminal-conversion failures | Classify actual semantic gaps versus obsolete structural expectations; preserve numerical/failure oracles. Updating tests must not substitute for implementation. |
 | Distributed and durable workload acceptance | Original obligations remain below; training composition currently blocked by the scalar row above | Complete their unchanged workload gates after shared compiler fixes. Local co-location/simulation is not multi-host performance evidence. |
 
-The checked-map refinement is deliberately limited to a fresh functional one-dimensional
+The checked-map refinement is deliberately limited to a single-result one-dimensional
 map, one outer checked Double-to-Float conversion, independently proved reads and an
-otherwise-total primitive operand region. Status is overwritten on every active lane;
+otherwise-total primitive operand region. Exact write-only destinations require actual
+private-generation ownership; finite literal-bound unit-step folds keep ordered carries.
+Dynamic loops and arbitrary mutable maps remain unsupported. Status is overwritten on every active lane;
 failed lanes retain their original Double diagnostic and do not store a public result.
 Neither those stores nor schedule metadata grant unconditional initialization. The emitted
 validator reconstructs from the semantic source even if a witness label is mutated.

@@ -227,6 +227,10 @@
       (when (symbol? expression) (some-> (get scalar-types expression) dtype/canon))
       (when (descriptor/aget-call? expression)
         (some-> (get array-types (descriptor/aget-array-sym expression)) dtype/canon))
+      ;; A canonical Fold declares its invariant accumulator dtype. Its own
+      ;; validator checks the recurrence; a consumer cannot retype that carry.
+      (when (dialect/scalar-fold-form? expression)
+        (some-> expression dialect/scalar-fold-parts :attributes :dtype dtype/canon))
       ;; A value conditional owns a result dtype exactly when both exits independently own the
       ;; same dtype.  TypedClojure commonly retains the branch facts without tagging the `if`
       ;; node itself, so preserve that join here rather than borrowing the surrounding map/store
@@ -4849,9 +4853,15 @@
              (not (contains? util/*shadowing-locals* (first expression))))
       (let [operand (second expression)
             source-dtype (retained-expression-dtype operand {} {})
-            canonical (canonicalize-scalar-folds operand (or source-dtype default-dtype))]
-        (if (= canonical operand) expression
-            (util/remake expression (first expression) canonical)))
+            canonical (canonicalize-scalar-folds operand (or source-dtype default-dtype))
+            target-dtype (some-> (first expression) descriptor/cast-result-tag
+                                dtype/dtype-for-scalar-tag dtype/canon)]
+        ;; Record the source conversion AFTER constructing the typed recurrence.
+        ;; The fold's dtype, never its storage consumer, owns the source side.
+        ;; Unknown source types retain the original cast and still fail closed.
+        (or (typed-source-conversion (first expression) canonical source-dtype target-dtype)
+            (if (= canonical operand) expression
+                (util/remake expression (first expression) canonical))))
       ;; `loop*` is a surface spelling, not part of canonical TypedSOAC. Translate only a complete
       ;; scalar initializer/result here: descending beneath an enclosing `let*` would detach the
       ;; Fold from those lexical binders. Unlike `raster.par/reduce`, a Clojure recurrence promises
@@ -5895,14 +5905,21 @@
     (into []
           (keep (fn [{:keys [kind id sym expr]}]
                   (when (= :scalar kind)
-                    (when-let [extent (allocation-length expr)]
-                      {:destination sym :source-binding-id id
-                       :source-expression expr
-                       :extent (canonical-extent shape-equalities values extent)
-                       :initialization (descriptor/allocation-initialization
-                                        (descriptor/semantic-op expr))
-                       :dtype (or (:dtype (get values sym))
-                                  (declared-type array-types sym))}))))
+                    (let [projection (descriptor/direct-allocation-projection expr values)
+                          constructor (:constructor projection)
+                          helper-extent (when (:helper projection)
+                                          (descriptor/array-allocation-size constructor))]
+                      (when-let [extent (or (when (and helper-extent (length-expression? helper-extent))
+                                             helper-extent)
+                                            (allocation-length expr))]
+                        (cond-> {:destination sym :source-binding-id id
+                                 :source-expression expr
+                                 :extent (canonical-extent shape-equalities values extent)
+                                 :initialization (descriptor/allocation-initialization
+                                                  (descriptor/semantic-op (or constructor expr)))
+                                 :dtype (or (:dtype (get values sym))
+                                            (declared-type array-types sym))}
+                          (:helper projection) (assoc :source-projection projection)))))))
           descriptions)))
 
 (defn- source-storage-analysis
@@ -6368,6 +6385,20 @@
                                                      (get source-scalar-types extent))]
                                  (merge-value values extent (tensor-value declared []) shape-equalities)
                                  values)) values allocations)
+              ;; Helper correspondence requires the completed retained argument
+              ;; environment, including allocation-only scalar parameters.
+              allocations (mapv (fn [allocation]
+                                  (let [projection (descriptor/direct-allocation-projection
+                                                    (:source-expression allocation) values)]
+                                    (cond-> allocation
+                                      (:helper projection)
+                                      (assoc :source-projection projection
+                                             :initialization (descriptor/allocation-initialization
+                                                              (descriptor/semantic-op (:constructor projection)))
+                                             :extent (canonical-extent
+                                                      shape-equalities values
+                                                      (descriptor/array-allocation-size (:constructor projection)))))))
+                                allocations)
               equation-facts
               (into {}
                     (map (fn [description]

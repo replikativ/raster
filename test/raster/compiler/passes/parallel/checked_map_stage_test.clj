@@ -57,6 +57,28 @@
       (is (= (:stage-results report)
              (:stage-results (emitted/validate-with-result-contracts equation)))))))
 
+(deftest source-ordered-fold-preserves-precision-and-private-write-obligation
+  (doseq [target targets]
+    (let [compilation (equation-first/compile #'storage/double-fold-float-storage
+                                             (merge storage/policy {:target target :dtype :double}))
+          equation (numerical-equation compilation)
+          obligation (first (:stage-results (emitted/validate-with-result-contracts equation)))
+          body (get-in equation [:graph :nodes 0 :operation :attributes :kernel-body])
+          loop (first (filter #(= "raster.compiler.ir.kernel_body.ForLoop" (some-> % class .getName))
+                              (tree-seq coll? seq body)))]
+      (is (some? (:checked-result-source-owner compilation)))
+      (is (= :invocation-private (:output-ownership obligation)))
+      (is (= :trap (get-in obligation [:source-conversion :overflow])))
+      (is (= :ordered (get-in loop [:attributes :association])))
+      (is (= :double (get-in loop [:iter-args 0 :binding :type])))
+      (is (nil? (#'checked/otherwise-total! [loop])))
+      (doseq [changed [(assoc loop :upper 'unknown)
+                       (assoc loop :upper (inc (bigint Long/MAX_VALUE)))
+                       (assoc loop :lower -1)
+                       (assoc loop :step 2)
+                       (assoc-in loop [:attributes :upper-bound] :inclusive)]]
+        (is (= :checked-map-stage-declined (reason #(#'checked/otherwise-total! [changed]))))))))
+
 (deftest physical-refinement-does-not-authorize-unobserved-consumers
   (let [compilation (compilation (first targets))
         equation (numerical-equation compilation)

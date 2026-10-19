@@ -51,35 +51,73 @@
             (let [id (first (remove @occupied (map #(symbol (str prefix %)) (range))))]
               (vswap! occupied conj id) id)) prefixes)))
 
+(defn- total-expression! [expression]
+  (doseq [expression (filter #(record-kind? "ScalarExpr" %)
+                            (tree-seq coll? seq expression))]
+    (let [descriptor (intrinsics/descriptor (:op expression))]
+      (when-not
+       (and (not= :trap (get-in expression [:options :overflow]))
+            (or (= :cast (:op expression))
+                (= :cmp (:kind descriptor))
+                (and (contains? #{:float :double} (:result-type expression))
+                     (true? (:primitive-fp-total descriptor)))))
+        (decline! "checked map operand has another potentially failing operation"
+                  {:expression expression})))))
+
+(defn- literal-loop-bound [expression]
+  (cond
+    (integer? expression) expression
+    (and (record-kind? "Literal" expression)
+         (contains? #{:int :long} (:type expression))
+         (integer? (:value expression))) (:value expression)
+    (and (record-kind? "IndexCast" expression)
+         (= :exact (:overflow expression))
+         (= :long (:dtype expression))) (literal-loop-bound (:argument expression))))
+
 (defn- otherwise-total! [operations]
   ;; This is a deliberately closed schedule grammar, not a purity claim. A
   ;; validated load also requires the independent source address proof below.
   (doseq [operation operations]
     (cond
-      (or (record-kind? "ScalarLoad" operation) (record-kind? "Yield" operation)) nil
+      (record-kind? "ScalarLoad" operation) nil
+      (record-kind? "Yield" operation) (doseq [value (:values operation)] (total-expression! value))
       (record-kind? "ScalarCompute" operation)
-      (doseq [expression (filter #(record-kind? "ScalarExpr" %)
-                                 (tree-seq coll? seq (:expression operation)))]
-        (let [descriptor (intrinsics/descriptor (:op expression))]
-          (when-not
-           (and (not= :trap (get-in expression [:options :overflow]))
-                (or (= :cast (:op expression))
-                    (= :cmp (:kind descriptor))
-                    (and (contains? #{:float :double} (:result-type expression))
-                         (true? (:primitive-fp-total descriptor)))))
-            (decline! "checked map operand has another potentially failing operation"
-                      {:expression expression}))))
+      (total-expression! (:expression operation))
       (record-kind? "IfRegion" operation)
-      (do (otherwise-total! (:then-operations operation))
+      (do (total-expression! (:condition operation))
+          (otherwise-total! (:then-operations operation))
           (otherwise-total! (:else-operations operation)))
+      (record-kind? "ForLoop" operation)
+      (let [lower (literal-loop-bound (:lower operation))
+            upper (literal-loop-bound (:upper operation))]
+        ;; Unit-step, exclusive literal bounds prove termination AND the final
+        ;; increment representable. Typed KernelBody validation alone does not.
+        (when-not (and (= :long (get-in operation [:index :type]))
+                       (= 1 (:step operation))
+                       (not= :inclusive (get-in operation [:attributes :upper-bound]))
+                       (integer? lower) (integer? upper)
+                       (<= 0 lower upper Long/MAX_VALUE))
+          (decline! "checked map fold needs a finite nonoverflowing counted domain"
+                    {:operation operation}))
+        (doseq [argument (:iter-args operation)] (total-expression! (:initial argument)))
+        (otherwise-total! (:operations operation)))
       :else (decline! "checked map operand is not a total scalar/load region"
                       {:operation operation}))))
 
+(defn- private-result-storage? [facts equation output]
+  (let [results (nth equation 2)]
+    (and (= 1 (count results))
+         (= #{:memory/write} (:effects facts))
+         (= {(first results) output} (:aliases facts))
+         (= [{:destination output :access :write :host-return :buffer}]
+            (get-in facts [:attributes :result-storage])))))
+
 (defn plan
   "Derive one checked result obligation and its complete physical schedule.
-   Only a fresh functional, single-result map with one outer checked Double to
-   Float conversion is currently admitted. Unsupported candidates throw a
-   precise decline; callers must retain the original semantic operation."
+   A single-result map, either functional or an exact write-only destination,
+   retains an explicit invocation-private output requirement. The managed owner
+   must prove that requirement before execution; roles/effects alone do not.
+   Unsupported candidates retain their original semantic operation."
   [algorithm source-graph options]
   (let [algorithm (soac/validate! algorithm)
         source-graph (graph/validate! source-graph)
@@ -90,6 +128,7 @@
         region (:scalar-region operation)
         {:keys [attributes operand]} (conversion/canonical-parts (:result region))
         output (:out-sym operation)
+        {index :name bound :bound} (first (get-in operation [:space :dims]))
         _ (when-not (and (= 1 (count (soac/equations algorithm)))
                          (= 'map (soac/operation-kind equation))
                          (= 1 (count (:nodes source-graph)))
@@ -99,14 +138,16 @@
                          (= 1 (count (:outputs source-graph)))
                          (= output (:id (first (:outputs source-graph))))
                          (= :output (:role (first (:outputs source-graph))))
-                         (empty? (:effects facts)) (empty? (:aliases facts))
-                         (empty? (get-in facts [:attributes :result-storage]))
+                         (= bound (:elements (first (:outputs source-graph))))
+                         (or (and (empty? (:effects facts)) (empty? (:aliases facts))
+                                  (empty? (get-in facts [:attributes :result-storage])))
+                             (private-result-storage? facts equation output))
                          (= #{output} (:outputs operation))
                          (not (contains? (:inputs operation) output))
                          (vector? (:locals region))
                          (not (contains? region :effects))
                          (= source-conversion attributes))
-            (decline! "checked map requires a fresh functional outer Double-to-Float result"
+            (decline! "checked map requires a single write-only outer Double-to-Float result"
                       {:operation (:id operation) :conversion attributes}))
         projected (reads/validate-and-project-addresses operation node source-graph)
         requirements (get-in node [:read-capacity-certificate :requirements])
@@ -117,7 +158,6 @@
         (fresh-symbols [algorithm source-graph]
                        ["checked_status_" "checked_operand_" "checked_below_"
                         "checked_above_" "checked_float_"])
-        {index :name bound :bound} (first (get-in operation [:space :dims]))
         ;; This private schedule input exposes the original Double producer. No
         ;; unchecked source conversion is invented and no target emits this
         ;; intermediate value as the source result.
@@ -164,6 +204,7 @@
                (body/->IfRegion below failure
                                [(body/->IfRegion above failure success []) (body/->Yield [])] [])])
         obligation {:kind kind :node (:id node) :extent bound :output output
+                    :output-ownership :invocation-private
                     :status status :diagnostics diagnostics :source-conversion attributes
                     :failure-selection :first-linear-index
                     :initialization :conditional-on-success}

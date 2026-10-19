@@ -90,13 +90,11 @@
                        (every? #(param-derived? % param-set binding-map environment) args)))
     :else false))
 
-(defn- detect-auto-buffer-semantics
-  "Analyze a deftm var's walked body for the single-alloc-return pattern.
+(defn- detect-buffer-semantics-from-source
+  "Analyze a supplied deftm frontend body for the single-alloc-return pattern.
    Returns a buffer-semantics map or nil."
-  [v]
+  [v walked-body]
   (let [m (meta v)
-        walked-body (or (:raster.core/deftm-walked-body m)
-                        ((requiring-resolve 'raster.core/ensure-walked-body!) v))
         params (:raster.core/deftm-params m)
         parameter-types (zipmap params (:raster.core/deftm-tags m))
         ;; A one-argument constructor can also consume initializer data. Its
@@ -242,6 +240,11 @@
                        :rewrite-fn (fn [args buf-sym]
                                      (substitute (assoc (zipmap params args) buffer-placeholder buf-sym)
                                                  into-template))}))))))))))))
+
+(defn- detect-auto-buffer-semantics [v]
+  (detect-buffer-semantics-from-source
+   v (or (:raster.core/deftm-walked-body (meta v))
+         ((requiring-resolve 'raster.core/ensure-walked-body!) v))))
 
 (defn resolve-buffer-semantics
   "Resolve the buffer facet, handling mangled/unqualified names.
@@ -825,12 +828,22 @@
                :arguments (vec (call-args form))}
         lexical (assoc :lexical-callee lexical)))))
 
-(defn direct-allocation-projection
+(defn ^:no-doc direct-allocation-argument-value
+  "Read an existing argument value or an exactly typed numeric literal fact.
+   Does not evaluate expressions, erase casts, or infer a type from a parameter."
+  [argument values]
+  (if (symbol? argument)
+    (get values argument)
+    (when (or (instance? Long argument) (instance? Float argument) (instance? Double argument))
+      (when-let [dtype (some-> argument types/literal-tag dtype/dtype-for-scalar-tag dtype/canon)]
+        {:dtype dtype :shape []}))))
+
+(defn- direct-allocation-projection-in-context
   "Project an exact constructor or a definition-derived direct allocation helper.
 
    Helpers require the selected qualified implementation's actual retained deftm body, not a
-   registered alloc-form or allocator basename. Actual arguments must already be bound values
-   with matching retained storage/scalar types: substituting them cannot discard evaluation of
+   registered alloc-form or allocator basename. Actual arguments must be bound values or exact
+   primitive literals with matching retained types: substitution cannot discard evaluation of
    an unused argument, duplicate a check, or reorder call-argument effects. Returned helper data
    is correspondence material, not a frozen-definition/completion certificate."
   [expression values]
@@ -843,27 +856,29 @@
                      (method-entry/selected-definition operation implementation-op (count arguments))
                      (method-entry/direct-selected-definition operation implementation-op (count arguments)))]
       (when (and (not lexical-callee) (symbol? implementation-op) (namespace implementation-op)
-                 (every? #(and (symbol? %) (contains? values %)) arguments))
+                 (every? #(some? (direct-allocation-argument-value % values)) arguments))
         ;; Mangling is only a lookup address. The existing registered MethodEntry must prove
         ;; the exact executable receiver and delegated source; no overload is inferred here.
         (when-let [{v :source-var} (select!)]
           (when (and (var? v) (:raster.core/deftm (meta v)))
-            ;; Lazy walking may publish metadata. Complete that compiler-owned analysis before
-            ;; snapshotting the definition rather than making admission depend on REPL warmth.
-            (when-not (:raster.core/deftm-walked-body (meta v))
-              ((requiring-resolve 'raster.core/ensure-walked-body!) v))
-            (let [root (.getRawRoot ^clojure.lang.Var v)
+            ;; Prepare the same original producer used by JIT and scalar import.
+            ;; A walked cache can predate the actual implementation's expansion.
+            ((requiring-resolve 'raster.core/prepare-deftm-frontend!) v)
+            (let [frontend (method-entry/original-source-frontend v)
+                  root (.getRawRoot ^clojure.lang.Var v)
                   metadata (meta v)
                   selected (select!)
                   observations (mapv method-entry/var-snapshot
                                      (distinct (keep #(get selected %) [:source-var :generic-var :receiver-var])))
-                  definition (:direct-allocation (detect-auto-buffer-semantics v))
+                  definition (when frontend
+                               (:direct-allocation
+                                (detect-buffer-semantics-from-source v (:body frontend))))
                   {:keys [parameters parameter-tags constructor]} definition
                   compatible? (fn [argument tag]
                                 (let [array? (types/array-tag? tag)
                                       expected (if array? (dtype/dtype-for-array-tag tag)
                                                    (dtype/dtype-for-scalar-tag tag))
-                                      actual (get values argument)]
+                                      actual (direct-allocation-argument-value argument values)]
                                   (and expected (= (dtype/canon expected) (:dtype actual))
                                        (= array? (boolean (seq (:shape actual)))))))]
               (when (and definition (= (count parameters) (count arguments) (count parameter-tags))
@@ -878,6 +893,14 @@
                     {:constructor projected
                      :helper {:operation operation :implementation implementation-op :definition definition
                               :arguments arguments}}))))))))))
+
+(defn direct-allocation-projection
+  "Derive constructor correspondence from the selected original frontend.
+   Literal facts or metadata alone grant neither source lifetime nor completion."
+  [expression values]
+  (method-entry/call-with-definition-inputs
+   #(method-entry/call-with-optional-definition-inputs
+     (fn [] (direct-allocation-projection-in-context expression values)))))
 
 (defn- unwrap-array-arg
   "Unwrap a cast wrapper around an array argument — (double arr) → arr,

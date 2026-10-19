@@ -156,3 +156,36 @@
   (if @opencl/opencl-available?
     (check-ordered-device :ocl:0)
     (opencl/opencl-skip! "ordered checked result on OpenCL")))
+
+(defn- check-fold-device [target]
+  ;; Materialize the JVM oracle before retaining historical compilation owners.
+  (is (= [1.0] (vec (storage/double-fold-float-storage
+                      (float-array [16777216.0 1.0 -16777216.0])))))
+  (let [compiled (equation-first/compile #'storage/double-fold-float-storage
+                                        (merge storage/policy {:target target :dtype :double}))
+        input (float-array [16777216.0 1.0 -16777216.0])
+        executable (link/instantiate-checked-invocation! compiled [input])]
+    (try
+      (doseq [values [[16777216.0 1.0 -16777216.0] [1.0 2.0 3.0]
+                      [Float/MAX_VALUE (- Float/MAX_VALUE) 1.0]]]
+        (dotimes [i 3] (aset input i (float (nth values i))))
+        (let [output (first (keys (link/run! executable)))
+              expected (float (double (reduce + 0.0 (map double input))))]
+          (is (= [expected] (vec (link/download executable output))))))
+      (aset input 0 Float/MAX_VALUE)
+      (aset input 1 Float/MAX_VALUE)
+      (is (= (thrown-description #(float (* (double Float/MAX_VALUE) 2.0)))
+             (thrown-description #(link/run! executable))))
+      (is (= 3 @(:completed-replays executable)))
+      (is (false? @(:output-ready? executable)))
+      (is (nil? (:resident-boundary @(:execution-state executable))))
+      (is (empty? (get-in @(:execution-state executable) [:ordered :observed])))
+      (finally (link/close! executable)))))
+
+(deftest checked-cast-after-ordered-fold-executes-with-original-double-precision
+  (if @level-zero/gpu-available?
+    (check-fold-device :ze:0)
+    (level-zero/gpu-skip! "checked ordered fold on Level Zero"))
+  (if @opencl/opencl-available?
+    (check-fold-device :ocl:0)
+    (opencl/opencl-skip! "checked ordered fold on OpenCL")))

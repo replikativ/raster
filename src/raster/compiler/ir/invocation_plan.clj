@@ -948,6 +948,8 @@
               (fail! :invocation-source-allocation-claims
                      "allocation destinations require unique source producers" {}))
           allocations (into {} (map (juxt :destination :source-expression)) allocation-claims)
+          allocation-contracts (into {} (map (juxt :destination identity)) allocation-claims)
+          allocation-projections (into {} (map (juxt :destination :source-projection)) allocation-claims)
           binding-order
           (mapv
            (fn [position [symbol expression]]
@@ -960,14 +962,19 @@
                  (fail! :invocation-source-order-ambiguous
                         "one source binding cannot be two different equation sites"
                         {:binding symbol}))
-               (when (and allocation?
-                          (not (invocation-source/allocation-corresponds?
-                                expression (get-in program [:values symbol])
-                                (descriptor/allocation-initialization
-                                 (descriptor/semantic-op expression)) (:values program))))
-                 (fail! :invocation-source-allocation
-                        "source storage allocation differs from its retained physical contract"
-                        {:binding symbol :source expression}))
+               (when allocation?
+                 (let [projection (invocation-source/allocation-source expression (:values program))]
+                   (when-not (and (invocation-source/allocation-corresponds?
+                                  expression (get-in program [:values symbol])
+                                  (:initialization projection) (:values program))
+                                 (= (:initialization projection)
+                                    (get-in allocation-contracts [symbol :initialization]))
+                                 (semantic/equivalent?
+                                  (when (:helper projection) (select-keys projection [:constructor :helper]))
+                                  (get allocation-projections symbol)))
+                     (fail! :invocation-source-allocation
+                            "source storage allocation differs from its retained physical contract"
+                            {:binding symbol :source expression}))))
                (when (and step equation)
                  (let [canonical (invocation-source/canonicalize-shape-projection
                                   (:values plan) public symbol expression)]

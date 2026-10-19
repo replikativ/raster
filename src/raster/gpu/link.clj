@@ -1366,6 +1366,8 @@
         position (get-in ready [:state :source-cursor])
         occurrence (get (invocation-link/ordered-observation-occurrences (:state ready)) position)
         _ (when-not (and (= contract (:entry-contract ready))
+                         (every? #(= :invocation-private (:output-ownership %))
+                                 (:observations contract))
                          (= (:observations contract) (:observations occurrence)))
             (throw (ex-info "checked entry lost its exact source occurrence"
                             {:reason :link-checked-observation-occurrence})))
