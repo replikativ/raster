@@ -1097,6 +1097,14 @@
           (doseq [b body] (walk-form b bound)))))
     (vec (sort-by (comp str first) @free))))
 
+(defn- capture-field-desc
+  "Translate an actual captured stack carrier once for fields and constructors.
+   Boolean is an integer-width JVM local but a Z descriptor, not Object."
+  [info]
+  (case (:type info)
+    :double D-cd :long J-cd :int I-cd :float F-cd :bool Z-cd
+    obj-cd))
+
 (defn- emit-anon-fn-class
   "Generate an anonymous IFn class with captured fields and invoke methods.
   Returns {:class-desc ClassDesc, :class Class, :field-names [str...],
@@ -1110,14 +1118,7 @@
         class-desc (ClassDesc/of pkg simple)
         ;; Field info for captured vars
         field-names (mapv (fn [[sym _]] (str sym)) free-vars)
-        field-types (mapv (fn [[_ info]]
-                            (case (:type info)
-                              :double D-cd
-                              :long   J-cd
-                              :int    I-cd
-                              :float  F-cd
-                              obj-cd))
-                          free-vars)
+        field-types (mapv (comp capture-field-desc second) free-vars)
         cf (clojure-classfile)
         bytes (.build cf class-desc
                       (reify java.util.function.Consumer
@@ -1149,7 +1150,7 @@
                                                        (cond
                                                          (.equals ftype D-cd) (.dload code slot)
                                                          (.equals ftype J-cd) (.lload code slot)
-                                                         (.equals ftype I-cd) (.iload code slot)
+                                                         (or (.equals ftype I-cd) (.equals ftype Z-cd)) (.iload code slot)
                                                          (.equals ftype F-cd) (.fload code slot)
                                                          :else (.aload code slot))
                                                        (.putfield code class-desc fname ftype)
@@ -1176,9 +1177,7 @@
                                                          (reduce
                                                           (fn [locs [sym info]]
                                                             (let [fname (str sym)
-                                                                  ftype (case (:type info)
-                                                                          :double D-cd :long J-cd
-                                                                          :int I-cd :float F-cd :bool Z-cd obj-cd)
+                                                                  ftype (capture-field-desc info)
                                                                   st (:type info)
                                                                   slot (let [s @next-slot]
                                                                          (swap! next-slot + (if (two-slot? st) 2 1))
@@ -1332,14 +1331,7 @@
         ipmap-cd (ClassDesc/ofDescriptor "Lclojure/lang/IPersistentMap;")
         ;; Field info for captured vars
         field-names (mapv (fn [[sym _]] (str sym)) free-vars)
-        field-types (mapv (fn [[_ info]]
-                            (case (:type info)
-                              :double D-cd
-                              :long   J-cd
-                              :int    I-cd
-                              :float  F-cd
-                              obj-cd))
-                          free-vars)
+        field-types (mapv (comp capture-field-desc second) free-vars)
         ;; Full constructor takes all captured fields + __meta as last param
         all-ctor-types (conj field-types ipmap-cd)
         cf (clojure-classfile)
@@ -1375,7 +1367,7 @@
                                                        (cond
                                                          (.equals ftype D-cd) (.dload code slot)
                                                          (.equals ftype J-cd) (.lload code slot)
-                                                         (.equals ftype I-cd) (.iload code slot)
+                                                         (or (.equals ftype I-cd) (.equals ftype Z-cd)) (.iload code slot)
                                                          (.equals ftype F-cd) (.fload code slot)
                                                          :else (.aload code slot))
                                                        (.putfield code class-desc fname ftype)
@@ -1407,7 +1399,7 @@
                                                        (cond
                                                          (.equals ftype D-cd) (.dload code slot)
                                                          (.equals ftype J-cd) (.lload code slot)
-                                                         (.equals ftype I-cd) (.iload code slot)
+                                                         (or (.equals ftype I-cd) (.equals ftype Z-cd)) (.iload code slot)
                                                          (.equals ftype F-cd) (.fload code slot)
                                                          :else (.aload code slot))
                                                        (.putfield code class-desc fname ftype)
@@ -1483,9 +1475,7 @@
                                                              (reduce
                                                               (fn [locs [sym info]]
                                                                 (let [fname (str sym)
-                                                                      ftype (case (:type info)
-                                                                              :double D-cd :long J-cd
-                                                                              :int I-cd :float F-cd :bool Z-cd obj-cd)
+                                                                      ftype (capture-field-desc info)
                                                                       st (:type info)
                                                                       slot (let [s @next-slot]
                                                                              (swap! next-slot + (if (two-slot? st) 2 1))
@@ -1572,9 +1562,7 @@
                                                              (reduce
                                                               (fn [locs [sym info]]
                                                                 (let [fname (str sym)
-                                                                      ftype (case (:type info)
-                                                                              :double D-cd :long J-cd
-                                                                              :int I-cd :float F-cd :bool Z-cd obj-cd)
+                                                                      ftype (capture-field-desc info)
                                                                       st (:type info)
                                                                       slot (let [s @next-slot]
                                                                              (swap! next-slot + (if (two-slot? st) 2 1))
