@@ -1333,7 +1333,7 @@
             :results (mapv :result lowered-results)
             :types (mapv :type lowered-results)}))})))
 
-(defn- checked-scalar-result
+(defn- checked-scalar-program
   [expression scalar-types]
   (let [decline! (fn [rule message data]
                    (throw (ex-info message (assoc data :reason :primitive-presence-decline :rule rule))))
@@ -1347,9 +1347,12 @@
         (let [result ((:lower lowerer) expression source-type scalar-types)]
           (when (and (= source-type (:type result))
                      (or (= :predicate source-type) (dtype/info source-type)))
-            {:type source-type})))
+            result)))
       (catch clojure.lang.ExceptionInfo e
         (if (= :primitive-presence-decline (:reason (ex-data e))) nil (throw e))))))
+
+(defn- checked-scalar-result [expression scalar-types]
+  (some-> (checked-scalar-program expression scalar-types) (select-keys [:type])))
 
 (defn checked-primitive-result
   "Prove primitive presence on normal return of one canonical scalar call using
@@ -1456,43 +1459,57 @@
   "Bounded completion summary INSIDE a selected primitive entry, not source inference.
    Only exact core binary FP operations and FP conversions are admitted. Reuse the
    emitter's arithmetic plan and the intrinsic table's independent totality facet."
-  [expression parameters]
-  (cond
-    (symbol? expression) (get parameters expression)
-    (instance? Double expression) Double/TYPE
-    (instance? Float expression) Float/TYPE
-    (seq? expression)
-    (let [operation (descriptor/semantic-op expression)
-          arguments (vec (descriptor/call-args expression))
-          carriers (mapv #(completed-fp-body-carrier % parameters) arguments)
-          intrinsic (intrinsics/descriptor operation)]
-      (when (and (= operation (first expression))
-                 (= "clojure.core" (namespace operation))
-                 (not (contains? parameters operation))
-                 (every? #{Float/TYPE Double/TYPE} carriers))
-        (cond
-          (and (= 1 (count arguments)) (descriptor/cast-op? operation))
-          (let [target (types/tag->java-class (descriptor/cast-result-tag operation))
-                source (first carriers)]
-            ;; Do not borrow unchecked JVM narrowing for a checked source cast.
-            ;; Identity and Float->Double share the exact conversion contract.
-            (when (and (contains? #{Float/TYPE Double/TYPE} target)
-                       (= [:exact :exact]
-                          (scalar-conversion/policy
-                           (if (= source Float/TYPE) :float :double)
-                           (if (= target Float/TYPE) :float :double))))
-              target))
+  ([expression parameters] (completed-fp-body-carrier expression parameters false))
+  ([expression parameters check-retained-types?]
+   (let [actual
+         (cond
+           (symbol? expression) (get parameters expression)
+           (instance? Double expression) Double/TYPE
+           (instance? Float expression) Float/TYPE
+           (seq? expression)
+           (let [operation (descriptor/semantic-op expression)
+                 arguments (vec (descriptor/call-args expression))
+                 carriers (mapv #(completed-fp-body-carrier % parameters check-retained-types?) arguments)
+                 intrinsic (intrinsics/descriptor operation)]
+             (when (and (= operation (first expression))
+                        (= "clojure.core" (namespace operation))
+                        (not (contains? parameters operation))
+                        (every? #{Float/TYPE Double/TYPE} carriers))
+               (cond
+                 (and (= 1 (count arguments)) (descriptor/cast-op? operation))
+                 (let [target (types/tag->java-class (descriptor/cast-result-tag operation))
+                       source (first carriers)]
+                   ;; Do not borrow unchecked JVM narrowing for a checked source cast.
+                   ;; Identity and Float->Double share the exact conversion contract.
+                   (when (and (contains? #{Float/TYPE Double/TYPE} target)
+                              (= [:exact :exact]
+                                 (scalar-conversion/policy
+                                  (if (= source Float/TYPE) :float :double)
+                                  (if (= target Float/TYPE) :float :double))))
+                     target))
 
-          (intrinsics/primitive-fp-total? operation carriers)
-          (if (= :cmp (:kind intrinsic))
-            Boolean/TYPE
-            (let [plan (source-arithmetic/binary-plan
-                        (:c intrinsic)
-                        (if (= Float/TYPE (first carriers)) :float :double)
-                        (if (= Float/TYPE (second carriers)) :float :double))]
-              (when (= :primitive (:kind plan))
-                (case (:result-carrier plan) :float Float/TYPE :double Double/TYPE nil)))))))
-    :else nil))
+                 (intrinsics/primitive-fp-total? operation carriers)
+                 (if (= :cmp (:kind intrinsic))
+                   Boolean/TYPE
+                   (let [plan (source-arithmetic/binary-plan
+                               (:c intrinsic)
+                               (if (= Float/TYPE (first carriers)) :float :double)
+                               (if (= Float/TYPE (second carriers)) :float :double))]
+                     (when (= :primitive (:kind plan))
+                       (case (:result-carrier plan) :float Float/TYPE :double Double/TYPE nil)))))))
+           :else nil)
+         tag (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
+         retained (or (when (and (keyword? tag) (dtype/known? tag)) (dtype/canon tag))
+                      (dtype/dtype-for-scalar-tag tag))
+         actual-type (when actual
+                       (if (= Boolean/TYPE actual) :predicate
+                           (dtype/dtype-for-scalar-tag (symbol (.getName ^Class actual)))))]
+     ;; The ordinary summary does not lower a replacement. A payload recipe
+     ;; does: every retained width used by the SSA lowerer must independently
+     ;; agree with the actual primitive operand plan, including nested nodes.
+     (when (and actual (or (not check-retained-types?) (nil? retained)
+                          (= retained actual-type)))
+       actual))))
 
 (defn- completed-fp-argument?
   "A logical dtype or nullable reference class cannot discharge entry unboxing."
@@ -1545,3 +1562,37 @@
              :presence :present :builtin-class (case result-type
                                                 :float Float :double Double :predicate Boolean)
              :nonthrowing? true}))))))))
+
+(defn checked-selected-fp-payload
+  "Retain a primitive SSA computation behind an ACTUAL owned Object-return bridge.
+   This bounded leaf admits only primitive FP formals and the same closed core
+   body checked by completed-fp evaluation. No query invokes the JIT or a method.
+   Cold source entries and unknown Object/generic/nested selected recipes abstain.
+
+   Physical result remains Object. Payload type is NOT the carrier supplied to a
+   parent's overload selection. A consumer still owes original argument evaluation
+   and conversion, use-closed box-storage erasure, and the owning definition guard.
+   This does not authorize arbitrary source inlining, motion or reassociation."
+  [expression argument-facts]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [entry body arguments definition]}
+                (selected-strict-scalar-source expression)]
+       (when-let [bridge (and (not (:pending-source? entry))
+                             ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge)
+                              (:emission entry)))]
+         (let [parameters (:parameters definition)
+               carriers (:parameter-carriers entry)
+               actual (completed-fp-body-carrier body (zipmap parameters carriers) true)
+               program (when (and (vector? argument-facts)
+                                  (= (count arguments) (count argument-facts))
+                                  (= (:invocation-method entry) (:invocation-method bridge))
+                                  (= carriers (:parameter-carriers bridge))
+                                  (every? true? (map completed-fp-argument? argument-facts carriers))
+                                  (= actual (:payload-carrier bridge)))
+                         (checked-scalar-program
+                          body (zipmap parameters (map #(if (= Float/TYPE %) :float :double) carriers))))]
+           (when (= (if (= actual Float/TYPE) :float :double) (:type program))
+             {:scope :owned-fp-return-payload :result-carrier Object :payload-carrier actual
+              :parameters parameters :parameter-carriers carriers :arguments (vec arguments)
+              :computation program :bridge bridge})))))))
