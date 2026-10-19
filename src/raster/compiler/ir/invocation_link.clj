@@ -904,9 +904,10 @@
           (update :source-cursor inc)))))
 
 (defn ^:no-doc realize-ready-equation
-  "Realize only the next numerical source entry into an ordinary concrete graph LinkPlan.
+  "Realize the next numerical source entry into a graph plan or explicit pending observed entry.
    This neither executes nor advances the cursor. Its conditional entry contract must be
-   satisfied by the enclosing owner, and produced views become ready only after completion."
+   satisfied by the enclosing owner. Checked success views require observation, not merely
+   binding, buffer acquisition or device completion."
   [state equation-id caller-options]
   (when-not (= caller-options (:caller-options state))
     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
@@ -956,11 +957,29 @@
           outputs (vec (distinct (vals (:outputs call))))
           tokens (vec (distinct (concat (vals (:buffers call)) outputs)))
           layout (storage-link-layout realized scalars (:target state) (set outputs) tokens)
+          projection (emitted-program/operation-projection (:projections state)
+                                                            (first (:operations equation)))
+          private-source-results
+          (let [checked-outputs (set (map :output (:stage-results projection)))]
+            (into #{} (keep (fn [[position {:keys [kind binding equation]}]]
+                             (when (and (< position (:source-cursor state))
+                                        (= :result-allocation kind)
+                                        (= equation equation-id)
+                                        (contains? checked-outputs binding))
+                               (get buffers binding))))
+                  (:source-realizations state)))
           nodes (mapv (fn [node]
                         (if (contains? acquired (get-in node [:view :allocation :id]))
                           ;; Existing roots are conditional inputs to this stage. Retaining
                           ;; their old host initializer would silently overwrite earlier work.
-                          (assoc node :source nil :role (if (some #{(:id node)} outputs) :state :input))
+                          (assoc node :source nil
+                                 :role (if (some #{(:id node)} outputs)
+                                         ;; A preceding owned source allocation is
+                                         ;; still invocation-private, not caller state.
+                                         ;; The runtime must prove its actual live
+                                         ;; acquisition separately before execution.
+                                         (if (contains? private-source-results (:id node)) :internal :state)
+                                         :input))
                           node))
                       (:nodes layout))
           instance-id [:ordered-equation equation-id]
@@ -973,17 +992,23 @@
                    :instances [instance] :outputs outputs
                    :aliases (into #{} (map set)
                                   (bview/overlapping-id-pairs (map (juxt :id :view) nodes)))}
+          pending (when (seq (:stage-results projection))
+                    (link/make-pending-observed-entry (:boundary projection) request caller-options))
           {:keys [plan effect-evidence]}
-          (if (nil? caller-options)
-            (link/make-with-effect-evidence request)
-            (link/make-with-effect-evidence request caller-options))
-          contract (first (link/relative-entry-contracts! plan effect-evidence
-                                                         [[instance-id]] caller-options))]
-      {:state (assoc state :realized realized
+          (when-not pending
+            (if (nil? caller-options)
+              (link/make-with-effect-evidence request)
+              (link/make-with-effect-evidence request caller-options)))
+          contract (if pending (:entry-contract pending)
+                       (first (link/relative-entry-contracts! plan effect-evidence
+                                                              [[instance-id]] caller-options)))]
+      (cond-> {:state (assoc state :realized realized
                            :pending {:equation equation-id :source-cursor (:source-cursor state)})
-       :call call :stage-plan plan :effect-evidence effect-evidence :entry-contract contract
+       :call call :entry-contract contract
        :new-storage (select-keys (:storage realized)
-                                 (remove #(contains? acquired %) tokens))})))
+                                 (remove #(contains? acquired %) tokens))}
+        pending (assoc :pending-observed-entry pending :stage-layout (:layout pending))
+        (not pending) (assoc :stage-plan plan :effect-evidence effect-evidence)))))
 
 (defn- lower-in-context
   "Lower one specialized invocation and matching emitted program into a validated LinkPlan.

@@ -14,9 +14,9 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `1fc7a331` is draft, not qualified for merge.
-Setup 32536/build 32537 passed; emission 32540 failed. Unit 32539 and OpenCL 32538
-were still running at the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
+Current integration hold: PR #1539 at `4ffce98f` is draft, not qualified for merge.
+Setup 32543/build 32544 passed; emission 32545 and unit 32548 failed. OpenCL 32547
+was still running at the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
@@ -63,6 +63,20 @@ Review explicitly does not treat the confined seam as ordinary invocation activa
 The five-namespace affected gate passes 76 tests / 563 assertions, including actual
 OpenCL and Level Zero execution. The original hardware-free C-family compilation
 receipts remain separate; no CUDA/HIP execution or performance claim is implied.
+
+Ordered entry planning now preserves that observation condition explicitly. The existing
+semantic write-coverage analysis partitions unconditional writes from checked writes;
+ordinary whole-plan analysis refuses unresolved checked conditions. A separate
+`PendingObservedEntry` retains a validated storage layout and a rederived entry contract,
+not an executable LinkPlan or effect witness. Its `full-produces` excludes checked outputs;
+`observations` and `success-produces` remain conditional and cannot satisfy a later read.
+The source-ready path returns this pending variant rather than ordinary plan/evidence.
+A preceding exact source result-allocation may identify private layout provenance, but
+its acquisition or zeroing does not prove map completion or runtime nonescape. The runtime
+still refuses this pending entry before acquisition until historical source ownership and
+live allocation-ledger checks are integrated. The six affected namespaces pass 86 tests /
+697 assertions, including adversarial bindings, condition mutations, ordinary-consumer
+refusal, source-ready realization and the existing confined local-device qualification.
 
 ### Historical integration receipts (not the current acceptance status)
 

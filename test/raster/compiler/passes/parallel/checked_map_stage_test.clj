@@ -248,3 +248,70 @@
                          (reset! captured (bound-fn [] (result/refuse-unobserved! artifact :kernel-call)))
                          (throw (ex-info "scope failure" {:reason :injected-scope-failure})))))))
       (is (= :checked-stage-observation-required (reason @captured))))))
+
+(defn- pending-entry-request [compilation equation]
+  (let [graph (:graph equation)
+        numerical (first (remove #(get-in % [:attributes :host-only])
+                                 (get-in compilation [:emitted :equations])))
+        input (:id (first (:inputs graph)))
+        output (:id (first (:outputs graph)))
+        target (:target compilation)]
+    {:id :pending-checked-entry :target target
+     :nodes [(link-plan/node {:id :input :role :input :dtype :float :shape [4] :device target})
+             (link-plan/node {:id :output :role :output :dtype :float :shape [4] :device target})]
+     :instances [(link-plan/graph-instance
+                  {:id :checked :graph graph :bindings {input :input output :output}
+                   :scalar-values (into {} (map (fn [{:keys [id dtype]}]
+                                                 [id {:type dtype :value (case dtype :long 4 :double 2.0)}]))
+                                        (:scalars graph))
+                   :attributes {:emitted-equation-source
+                                {:program (:emitted compilation) :equation-id (:id numerical)}}})]
+     :outputs [:output]}))
+
+(deftest checked-write-coverage-remains-conditional-in-an-ordered-entry
+  (let [compilation (compilation (first targets))
+        equation (numerical-equation compilation)
+        request (pending-entry-request compilation equation)
+        pending (link-plan/make-pending-observed-entry equation request)
+        contract (:entry-contract pending)
+        layout (:layout pending)
+        facts (vec (#'link-plan/instance-access-facts layout))]
+    (is (= #{:input} (:requires contract)))
+    (is (= #{} (:full-produces contract)))
+    (is (= #{:output} (:success-produces contract)))
+    (is (= (:stage-results (emitted/validate-with-result-contracts equation))
+           (:observations contract)))
+    (is (= :link-unobserved-result-condition
+           (reason #(#'link-plan/analyze-effects! layout facts))))
+    (is (= #{:input :output}
+           (:requires (#'link-plan/relative-entry-contract
+                       (:nodes layout)
+                       (conj facts {:facts [{:node :output :access :read}]
+                                    :complete-writes #{}}))))
+        "a following consumer cannot use a merely conditionally written view")
+    (is (identical? pending (link-plan/validate-pending-observed-entry! pending)))
+    (is (= :checked-stage-observation-required
+           (reason #(link-plan/validate! (:layout pending)))))
+    (is (= :checked-stage-observation-required
+           (reason #(link/instantiate! (:layout pending)))))
+    (is (= :link-pending-observation-contract
+           (reason #(link-plan/validate-pending-observed-entry!
+                     (assoc-in pending [:entry-contract :full-produces] #{:output})))))
+    (is (= :link-pending-observation-contract
+           (reason #(link-plan/validate-pending-observed-entry!
+                     (assoc-in pending [:entry-contract :observations] [])))))
+    (doseq [[bad-layout expected]
+            [[(assoc-in layout [:nodes :output :source] (float-array 4)) :link-pending-observation-contract]
+             [(assoc-in layout [:nodes :output :role] :state) :link-pending-observation-contract]
+             [(assoc-in layout [:nodes :output :view :allocation :ownership] :borrowed)
+              :link-value-abstract-ownership]]]
+      (is (= expected (reason #(link-plan/make-pending-observed-entry equation bad-layout)))))
+    (let [extent (:extent (first (:observations contract)))
+          output (:output (first (:observations contract)))]
+      (doseq [bad-request
+              [(assoc-in request [:instances 0 :attributes :emitted-equation-source :program] {})
+               (assoc-in request [:instances 0 :scalar-values extent :value] 5)
+               (assoc-in request [:instances 0 :bindings output] :input)
+               (assoc-in request [:instances 0 :attributes] {})]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (link-plan/make-pending-observed-entry equation bad-request)))))))

@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.ordered-invocation-realization-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
@@ -11,6 +12,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
+            [raster.gpu.link :as gpu-link]
             [raster.core :refer [deftm]]
             [raster.par :as par]))
 
@@ -33,17 +35,22 @@
 (deftm scalar-total [x :- (Array double)] :- Double
   (let [total (par/reduce sum 0.0 i (alength x) (+ sum (aget x i)))] total))
 
+(defn- advance-host-prefix [initial compilation]
+  (loop [state initial]
+    (let [entry (nth (:source-order state) (:source-cursor state) nil)
+          equation (some #(when (= (:equation entry) (:id %)) %) (get-in state [:program :equations]))]
+      (when-not entry (throw (ex-info "test fixture has no numerical entry" {})))
+      (if (or (:realization entry)
+              (and equation (not (true? (get-in equation [:attributes :host-only])))))
+        state
+        (recur (invocation-link/advance-host-source
+                state (partial scalar/evaluate-invocation-step (:source-ns compilation))
+                (partial scalar/evaluate-host-equation (:source-ns compilation)) nil))))))
+
 (deftest equation-graph-stage-retains-revalidated-reduction-write-coverage
   (let [compilation (equation-first/compile #'scalar-total {:target :cuda:0 :dtype :double})
         initial (invocation-link/begin-ordered-realization compilation [(double-array [1.0 2.0])] nil)
-        state (loop [state initial]
-                (let [entry (nth (:source-order state) (:source-cursor state))
-                      equation (some #(when (= (:equation entry) (:id %)) %) (get-in state [:program :equations]))]
-                  (if (and equation (not (true? (get-in equation [:attributes :host-only]))))
-                    state
-                    (recur (invocation-link/advance-host-source
-                            state (partial scalar/evaluate-invocation-step (:source-ns compilation))
-                            (partial scalar/evaluate-host-equation (:source-ns compilation)) nil)))))
+        state (advance-host-prefix initial compilation)
         entry (nth (:source-order state) (:source-cursor state))
         ready (invocation-link/realize-ready-equation state (:equation entry) nil)
         plan (:stage-plan ready)
@@ -52,6 +59,42 @@
     (is (contains? (get-in ready [:entry-contract :full-produces]) output))
     (is (not (contains? (get-in ready [:entry-contract :requires]) output)))
     (is (= :emitted-program-ready-equation (reason #(link-plan/validate! changed))))))
+
+(deftest checked-source-ready-entry-retains-observation-without-crediting-completion
+  (let [compilation (equation-first/compile #'storage/mixed-scale
+                                           (merge storage/policy {:target :ocl:0 :dtype :double}))
+        initial (invocation-link/begin-ordered-realization compilation [2.0 (float-array [1.0 2.0])] nil)
+        allocation-state (advance-host-prefix initial compilation)
+        allocation (invocation-link/prepare-source-allocation
+                    allocation-state
+                    (fn [expression scalars]
+                      (scalar/evaluate-array-size (:source-ns compilation)
+                                                  (update-vals scalars :value) expression)) nil)
+        ;; IR-only post-allocation state, as in the acquired-root controls below.
+        ;; This supplies no device initialization/completion evidence.
+        state (advance-host-prefix
+               (-> (:state allocation) (dissoc :pending) (update :source-cursor inc)
+                   (update :acquired-storage conj (:storage allocation))) compilation)
+        position (:source-cursor state)
+        entry (nth (:source-order state) position)
+        ready (invocation-link/realize-ready-equation state (:equation entry) nil)
+        pending (:pending-observed-entry ready)
+        output (first (get-in ready [:stage-layout :outputs]))]
+    (is (some? pending))
+    (is (nil? (:stage-plan ready)))
+    (is (nil? (:effect-evidence ready)))
+    (is (= position (get-in ready [:state :source-cursor])))
+    (is (= #{} (get-in ready [:entry-contract :full-produces])))
+    (is (= #{output} (get-in ready [:entry-contract :success-produces])))
+    (is (seq (get-in ready [:entry-contract :observations])))
+    (is (= :internal (get-in ready [:stage-layout :nodes output :role])))
+    (is (identical? pending (link-plan/validate-pending-observed-entry! pending)))
+    (is (= :checked-stage-observation-required
+           (reason #(link-plan/validate! (:stage-layout ready)))))
+    (is (= :link-checked-entry-owner-required
+           (reason #(#'gpu-link/run-ordered-stage! nil ready))))
+    (is (= :invocation-ordered-pending
+           (reason #(invocation-link/realize-ready-equation (:state ready) (:equation entry) nil))))))
 
 (deftest early-equation-binds-without-evaluating-the-late-checked-shape
   (let [compilation (equation-first/compile #'fixture/write-before-shape

@@ -1270,6 +1270,9 @@
                                      (map (juxt :id :view) (:nodes layout)))))))
 
 (defn- run-ordered-stage! [executable ready]
+  (when (:pending-observed-entry ready)
+    (throw (ex-info "checked ordered entry still requires its historical source and output owner"
+                    {:reason :link-checked-entry-owner-required})))
   (let [execution-state (:execution-state executable)
         {:keys [execution-id ledger caller-options]} (:ordered @execution-state)
         plan (:stage-plan ready)

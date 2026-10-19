@@ -237,15 +237,17 @@
 
 (declare validate-with-result-contracts)
 
+(defn- physical-result-report [report]
+  (cond-> (select-keys report [:boundary :physical-results :complete-write-domains])
+    (seq (:stage-results report)) (assoc :stage-results (:stage-results report))))
+
 (defn ^:no-doc validate-with-physical-results
   "Validate an equation and return its exact boundary with the derived storage projection.
    This report is data, not authority to accept a later call without checking its bindings."
   ([emitted]
-   (select-keys (validate-with-result-contracts emitted)
-                [:boundary :physical-results :complete-write-domains]))
+   (physical-result-report (validate-with-result-contracts emitted)))
   ([emitted caller-options]
-   (select-keys (validate-with-result-contracts emitted caller-options)
-                [:boundary :physical-results :complete-write-domains])))
+   (physical-result-report (validate-with-result-contracts emitted caller-options))))
 
 (defn- result-contract-report
   [emitted caller-options]
