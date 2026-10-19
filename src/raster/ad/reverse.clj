@@ -43,6 +43,7 @@
             [raster.analysis.memory :as memory]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par-ir]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
@@ -2864,6 +2865,39 @@
       (vector? expr) (with-meta (mapv #(lift % scoped? locals) expr) (meta expr))
       :else expr))))
 
+(defn- closed-index-replay?
+  "Recognize the existing explicit index vocabulary, never arbitrary pure helpers.
+   This is an admission check only: source expressions/conversions are replayed
+   unchanged, not replaced by the scheduling algebra's normalized expression."
+  [expression index]
+  (let [known (into {} (map (fn [value] [value (types/sym-type-tag value)]))
+                    (:values *source-memory-context*))
+        ;; Constant integer-array gathers already have replay-root/write protection.
+        ;; Treat each checked read as an opaque scalar leaf for this grammar check,
+        ;; retaining the ORIGINAL read and its roots in the actual replay program.
+        expression (walk/postwalk
+                    (fn [value]
+                      (let [[array coordinate] (when (op/aget-call? value) (op/call-args value))]
+                        (if (and array (symbol? array) (not (namespace array))
+                                 (contains? #{'ints 'longs}
+                                            (or (types/sym-type-tag array) (get known array)))
+                                 (not (gradient-bearing-array-read? value))
+                                 (closed-index-replay? coordinate index))
+                          (ad-gensym "index-read-proof" 'long)
+                          value))) expression)
+        free (util/free-syms expression)]
+    (and (every? #(and (symbol? %) (not (namespace %))
+                       (or (= % index)
+                           (contains? #{'int 'long 'Integer 'Long}
+                                      (or (types/sym-type-tag %) (get known %))))) free)
+         (try
+           (index-expression/lower
+            expression free
+            (fn [& _] (throw (ex-info "Index replay is not closed" {::index-replay-decline true}))))
+           true
+           (catch clojure.lang.ExceptionInfo error
+             (if (::index-replay-decline (ex-data error)) false (throw error)))))))
+
 (defn- analyze-par-map-body
   "Analyze a par/map! body for aget references and free scalars.
   Returns {:agets [{:sym :arr :idx} ...], :scalar-bindings [[sym init] ...],
@@ -2897,6 +2931,16 @@
         ;; original local initializers at their original evaluation sites; these
         ;; expressions are proof/replay data, not a reordered scalar program.
         local-ids (set (map first bindings))
+        assert-closed-read!
+        (fn [array index]
+          (let [unclosed (binding [util/*shadowing-locals*
+                                   (into util/*shadowing-locals* (conj local-ids idx-sym))]
+                           (set/intersection local-ids
+                                             (conj (util/free-syms index) array)))]
+            (when (seq unclosed)
+              (throw (ex-info "AD lifted array read retains step-local dependencies"
+                              {:reason :ad-unclosed-lifted-read-index
+                               :index index :unclosed unclosed :array array})))))
         index-alias-state
         (when (some? replay-forbidden-values)
           (binding [util/*shadowing-locals* (into util/*shadowing-locals*
@@ -2910,7 +2954,8 @@
                                     (not-any? replay-forbidden-values free)
                                     (not-any? gradient-bearing-array-read?
                                               (tree-seq coll? seq expanded))
-                                    (= :pure (effects/analyze-effect expanded)))
+                                    (= :pure (effects/analyze-effect expanded))
+                                    (closed-index-replay? expanded idx-sym))
                              (assoc aliases id expanded)
                              (dissoc aliases id))}))
              {:aliases {} :snapshots []} bindings)))
@@ -2919,15 +2964,19 @@
     ;; (1) let*-bound agets
     (doseq [[[sym init] aliases] (map vector bindings alias-snapshots)]
       (when (gradient-bearing-array-read? init)
-        (let [[array index] (op/call-args init)]
+        (let [[array original-index] (op/call-args init)
+              index (if aliases (util/subst-syms aliases original-index) original-index)]
+          ;; Lifted reads execute before scalar bindings in the backward step.
+          ;; Only the existing checked alias replay may discharge their local
+          ;; dependencies; emitting a forward reference is never a valid plan.
+          (assert-closed-read! array index)
           (swap! agets conj {:sym sym :arr array
-                            :idx (if aliases
-                                   (util/subst-syms aliases index)
-                                   index)}))))
+                            :idx index}))))
     ;; (2) lift admitted inline reads, deduplicating by array AND original index.
     ;; Literal reads in scan stay inside the reverse iteration, not outside a zero-trip loop.
     (let [seen (atom {})
           on-read (fn [arr index]
+                  (assert-closed-read! arr index)
                   (let [k [arr index]]
                     (or (get @seen k)
                         (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
@@ -3289,7 +3338,8 @@
         step-expr (if (untemplated-scan-call? body-expr)
                     (lower-composites body-expr)
                     body-expr)
-        analyzed (analyze-par-map-body step-expr idx-sym true)
+        analyzed (analyze-par-map-body step-expr idx-sym true
+                                       (conj (set active-params) acc-sym))
         ;; ANF ends the step in `v = acc ± term; v`: the update is v's init
         {:keys [agets scalar-bindings body-result free-syms]}
         (let [{:keys [scalar-bindings body-result]} analyzed
@@ -3430,7 +3480,8 @@
                     {:reason :par-reduce-active-compound-init
                      :init init-expr})))
         {:keys [agets scalar-bindings body-result free-syms]}
-        (analyze-par-map-body body-expr idx-sym true)
+        (analyze-par-map-body body-expr idx-sym true
+                              (conj (set active-params) acc-sym))
         typed-double? (and (every? (comp replay-pure-reduce-expr? second)
                                   scalar-bindings)
                            (replay-pure-reduce-expr? body-result)
@@ -3805,7 +3856,8 @@
         ;; acc-sym lands in :free-syms
         ;; but is never an active param, so it cannot leak into active-free.
         {:keys [agets scalar-bindings body-result free-syms]}
-        (analyze-par-map-body body-expr idx-sym true)
+        (analyze-par-map-body body-expr idx-sym true
+                              (conj (set active-params) acc-sym out-sym))
 
         read-arrs (vec (distinct (map :arr agets)))
         active-free (filterv (fn [p] (contains? free-syms p)) active-params)
