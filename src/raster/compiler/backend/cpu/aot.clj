@@ -27,6 +27,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -697,6 +698,12 @@
    Returns the C source string."
   [kernel-name dtype array-params scalar-params buffers local-buffers length-syms stripped
    & {:keys [return-type written-pointers no-alias?] :or {return-type :void no-alias? true}}]
+  ;; Check before the source-shaped C emitter can inline/drop a single-use or
+  ;; unused initializer. A completion can still owe evaluation/conversion even
+  ;; if its returned value is dead. Dtype tags cannot discharge that obligation.
+  (when (completion/contains-completion? stripped)
+    (throw (ex-info "Native emission requires discharged value completions"
+                    {:reason :unclosed-c-family-value-completion :expression stripped})))
   (let [ct (ctype dtype "double")  ; default scalar type for the body (the dominant dtype)
         array-syms (set (concat (map first array-params) (map first buffers) (map first local-buffers)))
         ;; SROA: small, compile-time-fixed-size, non-escaping scratch buffers are emitted

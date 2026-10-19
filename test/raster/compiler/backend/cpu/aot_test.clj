@@ -20,6 +20,7 @@
             [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [clojure.string :as str]
             [raster.compiler.fixtures.absolute :as absolute]
@@ -28,6 +29,27 @@
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]))
+
+(deftest native-completion-admission-precedes-local-source-simplification
+  (let [value (completion/complete-value completion/object-input-contract 'x)]
+    (doseq [source [value
+                    (list 'let* ['saved value] 'saved)
+                    (list 'let* ['unused value] 7.0)
+                    (list 'let* ['unused (list completion/completion-symbol
+                                              {:invalid :contract} 'x)] 7.0)
+                    (list 'do value 7.0)
+                    (list 'if 'flag value 7.0)]]
+      (is (= :unclosed-c-family-value-completion
+             (try (aot/emit-c-fn "completion_probe" :double []
+                                 [['x "double"] ['flag "int"]] [] [] {} source
+                                 :return-type :double)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest quoted-completion-syntax-is-not-an-executable-native-obligation
+  (let [quoted (list 'quote (list completion/completion-symbol {:invalid :contract} 'x))
+        source (aot/emit-c-fn "quoted_completion_probe" :double [] [] [] [] {}
+                              (list 'if true 7.0 quoted) :return-type :double)]
+    (is (str/includes? source "return 7.0"))))
 
 (deftest qualified-integer-size-casts-use-the-shared-descriptor
   (doseq [cast '[int long clojure.core/int clojure.core/long]]
