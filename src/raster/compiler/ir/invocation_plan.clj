@@ -12,6 +12,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
@@ -255,6 +256,84 @@
 (defn- buffer-value?
   [value]
   (and (= :tensor (:kind value)) (seq (:shape value))))
+
+(defn terminal-source-result
+  "Describe the exact terminal source region and its logical producer ports.
+
+   This is correspondence data for the InvocationPlan attribute boundary, NOT
+   an executable, a physical scalar-export proof or permission to bypass source
+   coverage. Policy and namespace are supplied by the actual source producer.
+   A later owner must establish physical exports, compile under that retained
+   context, guard dependencies, await completion and explicitly observe results.
+
+   The initial boundary is one return expression over produced Double/Long
+   scalars. Nested scopes and canonical completions remain intact; prefix
+   computations, public inputs, array reads and private captures are not silently
+   acquired as terminal parameters. Portable encoding does not prove purity or
+   callee legality; logical producer IDs do not certify producer semantics.
+   Existing resident APIs remain unchanged."
+  [program {:keys [source-policy source-namespace]}]
+  (parallel-program/validate! program)
+  (source-policy/unchecked-math source-policy)
+  (let [[head bindings & body] (:source program)]
+    (when-not (and (contains? '#{let let* clojure.core/let} head)
+                   (vector? bindings) (even? (count bindings)) (= 1 (count body))
+                   (symbol? source-namespace) (nil? (namespace source-namespace)))
+      (fail! :invocation-terminal-source
+             "terminal observation requires one return at a flat source boundary" {}))
+    (let [pairs (mapv vec (partition 2 bindings))
+          symbols (mapv first pairs)
+          _ (when-not (and (every? symbol? symbols) (distinct-vector? symbols))
+              (fail! :invocation-terminal-source
+                     "terminal observation requires distinct lexical source identities" {}))
+          expression (first body)
+          lexical (into (set symbols) (:inputs program))
+          free (binding [util/*shadowing-locals* (into util/*shadowing-locals* lexical)]
+                 (util/free-syms expression))
+          producers (into {} (mapcat (fn [equation]
+                                      (map-indexed (fn [position result]
+                                                     [result [equation position]])
+                                                   (:results equation))))
+                          (:equations program))
+          parameters
+          (into []
+                (keep (fn [result]
+                        (when (contains? free result)
+                          (let [[equation position] (get producers result)
+                                value (get (:values program) result)]
+                            (when-not (and (scalar-value? value)
+                                           (contains? #{:double :long} (:dtype value)))
+                              (fail! :invocation-terminal-carrier
+                                     "terminal port requires a supported produced scalar"
+                                     {:value result :abstract value}))
+                            {:symbol result :value result :dtype (:dtype value)
+                             :producer-equation (:id equation) :result-position position}))))
+                (mapcat :results (:equations program)))
+          missing (set/difference free (set (map :value parameters)))]
+      (when (seq missing)
+        (fail! :invocation-terminal-free-values
+               "terminal source depends on values without retained numerical producers"
+               {:values missing}))
+      (when (empty? parameters)
+        (fail! :invocation-terminal-free-values
+               "terminal observation requires a numerical producer dependency" {}))
+      (let [contract {:kind :terminal-host-result :site [:return]
+                      :parameters parameters :body expression
+                      :source-policy source-policy :source-namespace source-namespace}]
+        ;; No runtime object, private completion Class or executable may enter
+        ;; this portable semantic boundary. Such owners need a separate path.
+        (semantic/canonical-bytes contract)
+        contract))))
+
+(defn validate-terminal-source-result!
+  "Re-derive terminal correspondence from the actual program and source context.
+   Matching this data alone does not attest ownership, exports or execution."
+  [contract program context]
+  (let [actual (terminal-source-result program context)]
+    (when-not (semantic/equivalent? contract actual)
+      (fail! :invocation-terminal-correspondence
+             "terminal contract differs from its source or producer boundary" {}))
+    contract))
 
 (defn- operand-map
   [step]

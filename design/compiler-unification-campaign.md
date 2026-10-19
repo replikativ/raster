@@ -332,6 +332,22 @@ behavior without acquiring source ownership; old pending JIT specs with missing
 policy fail closed. Sequential source guards do not claim general concurrent
 metadata mutation/ABA protection. All eight campaign obligations remain open.
 
+Terminal correspondence groundwork (October 19): the existing InvocationPlan
+namespace now derives and independently rechecks a portable terminal-result
+description. It preserves the entire final expression, scoped locals, lazy
+branches and canonical completion terms, with deterministic logical Double/Long
+ports identified by producer equation/result position. It refuses unrepresented
+free values, unsupported carriers, missing policy and nonterminal source shapes.
+The actual mixed-gradient candidate yields its one Double dependency without
+rewriting its conditional checked Float/Object return. The focused warm plan and
+materialization gate passes 23 tests / 177 assertions. Review requested explicit
+authority-limit controls: descriptive analysis does not execute an effectful
+terminal call, and unchanged producer IDs do not certify changed computations.
+Both controls pass. Portable encoding is not purity/callee legality evidence.
+This helper is not yet activated in promotion, source-order admission or runtime:
+existing refusals remain until actual source ownership, physical scalar exports,
+completion and an explicit observation API form the complete vertical.
+
 The independent residency review distinguishes established physical contracts
 from an incomplete source-level phase boundary. AbstractValue/LinkValue separate
 logical values from physical leaves; LinkPlan checks overlapping writes and
