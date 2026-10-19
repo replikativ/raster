@@ -44,6 +44,13 @@ machinery and derivative templates; there is no helper-specific derivative
 registry or competing evaluator. Exact occurrence and physical-port evidence
 is required. Copying syntax or an occurrence annotation does not establish it.
 
+Long-lived helper guards prepare the immutable historical dependency graph once.
+Every invocation still checks original namespace/lookups, effective Var values
+(including thread bindings), metadata and consumed static source owners. Failed
+checks delegate to the full validator for diagnostics. This specializes graph
+validation, not its live result; it grants no epoch-only reuse or concurrent/ABA
+guarantee, and does not replace selected-method/receiver correspondence checks.
+
 The initial reduction domain has an actually emitted Int index, Double carry,
 primitive count and primitive/literal seed. The checked bound is evaluated
 before the seed, and the seed is evaluated once, even on a zero-trip reduction.
