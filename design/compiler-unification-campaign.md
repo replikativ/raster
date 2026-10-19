@@ -14,20 +14,31 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `db3b4789` is draft, not qualified for merge.
-Setup/build passed; emission 32517 and unit 32520 failed. All 16 unit shards
-finished (15 failed, one passed); this is not a green compiler baseline. OpenCL
-32521 also failed. Dependent CUDA/HIP
+Current integration hold: PR #1539 at `f8133bc5` is draft, not qualified for merge.
+Setup 32522/build 32523 passed; emission 32526, unit 32524 and OpenCL 32525
+failed. The previous head's 16 unit shards finished (15 failed, one passed);
+this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
 
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|
 | Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |
-| Checked numerical map result | Actual emission 32517 refuses checked Double-to-Float in public `mixed-scale`; no production status observation yet | Certify private output/diagnostic realization, observe success before initialization/consumer/publication, and preserve checked source diagnostics. Never relabel checked casts IEEE to pass. |
+| Checked numerical map result | A source-derived refinement now compiles public `mixed-scale` into guarded KernelBody across OpenCL/CUDA/HIP; actual CUDA/HIP source compilation passes locally. Execution, initialization, composition and persistence refuse pending observation support. | Observe completion/status before initialization/consumer/publication; derive private diagnostic access from the exact validated equation and ownership contract. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
 | Training scalar source coverage | Unit 32520 and warm local reproduction reject `local-gradient-sum`: nested reduce/divide and later scale scalar carry mandatory source evaluation | Close source-order/carrier evidence without dropping preservation flags or duplicating evaluation; retain the actual distributed-training composition oracle. |
 | Existing AD/native/fusion integration | Exact-head unit logs still contain native refusals, closed-product AD gaps and fusion/terminal-conversion failures | Classify actual semantic gaps versus obsolete structural expectations; preserve numerical/failure oracles. Updating tests must not substitute for implementation. |
 | Distributed and durable workload acceptance | Original obligations remain below; training composition currently blocked by the scalar row above | Complete their unchanged workload gates after shared compiler fixes. Local co-location/simulation is not multi-host performance evidence. |
+
+The checked-map refinement is deliberately limited to a fresh functional one-dimensional
+map, one outer checked Double-to-Float conversion, independently proved reads and an
+otherwise-total primitive operand region. Status is overwritten on every active lane;
+failed lanes retain their original Double diagnostic and do not store a public result.
+Neither those stores nor schedule metadata grant unconditional initialization. The emitted
+validator reconstructs from the semantic source even if a witness label is mutated.
+Review caught and closed both a label-dispatch bypass and an overbroad conversion trigger.
+Structural graph/ABI tests now use Double storage rather than claiming that an arbitrary
+fixture-only schedule implements checked narrowing; the real checked-source tests remain.
+This is compile-only progress, not production checked-map execution or campaign completion.
 
 ### Historical integration receipts (not the current acceptance status)
 

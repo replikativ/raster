@@ -35,6 +35,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
@@ -2003,6 +2004,7 @@
    (bind-kernel-graph! sess graph-key graph buffer-keys scalar-values {}))
   ([sess graph-key graph buffer-keys scalar-values {:keys [profile? record?]
                                                     :or {profile? false record? true}}]
+   (stage-result/refuse-unobserved! graph :bind-kernel-graph)
    (with-session-use sess
      (let [{:keys [device-id closed?]} @sess
            graph (kexec/validate! graph)
@@ -2109,6 +2111,7 @@
    (bind-kernel-call! sess call-key artifact arguments {}))
   ([sess call-key artifact arguments {:keys [profile? group-count]
                                       :or {profile? false}}]
+   (stage-result/refuse-unobserved! artifact :bind-kernel-call)
    (with-session-use sess
      (let [{:keys [device-id closed?]} @sess
            artifact (kart/validate! artifact)

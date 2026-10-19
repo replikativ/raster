@@ -1,0 +1,220 @@
+(ns raster.compiler.passes.parallel.checked-map-stage
+  "A checked map schedule with conditional result initialization.
+
+   The semantic conversion stays in the source equation. This refinement computes
+   its Double operand once, guards Float materialization, and records private
+   per-lane status/diagnostics. It does NOT grant execution or initialization:
+   the enclosing stage owner must observe successful completion first."
+  (:require [clojure.set :as set]
+            [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.layout :as layout]
+            [raster.compiler.core.scalar-conversion :as conversion]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.scheduled-graph-refinement :as refinement]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.map-read-requirements :as reads]
+            [raster.compiler.passes.parallel.segmap-body :as map-body]))
+
+(def kind :checked-float-map)
+
+(def ^:private source-conversion
+  {:source-dtype :double :target-dtype :float
+   :rounding :nearest-even :overflow :trap
+   :source-op 'clojure.core/float})
+
+(defn candidate?
+  "A cheap syntactic trigger, never admission evidence. plan rechecks the
+   complete source, storage, read and numerical conditions independently."
+  [algorithm source-graph]
+  (and (soac/program-form? algorithm)
+       (= 1 (count (soac/equations algorithm)))
+       (= 'map (soac/operation-kind (first (soac/equations algorithm))))
+       (= 1 (count (:nodes source-graph)))
+       (= source-conversion (get-in (conversion/canonical-parts
+                         (get-in source-graph [:nodes 0 :operation :scalar-region :result]))
+                        [:attributes]))))
+
+(defn- decline! [message data]
+  (throw (ex-info message (assoc data :reason :checked-map-stage-declined))))
+
+(defn- record-kind? [kind value]
+  (= (str "raster.compiler.ir.kernel_body." kind) (some-> value class .getName)))
+
+(defn- fresh-symbols [source prefixes]
+  (let [occupied (volatile! (set (filter symbol? (tree-seq coll? seq source))))]
+    (mapv (fn [prefix]
+            (let [id (first (remove @occupied (map #(symbol (str prefix %)) (range))))]
+              (vswap! occupied conj id) id)) prefixes)))
+
+(defn- otherwise-total! [operations]
+  ;; This is a deliberately closed schedule grammar, not a purity claim. A
+  ;; validated load also requires the independent source address proof below.
+  (doseq [operation operations]
+    (cond
+      (or (record-kind? "ScalarLoad" operation) (record-kind? "Yield" operation)) nil
+      (record-kind? "ScalarCompute" operation)
+      (doseq [expression (filter #(record-kind? "ScalarExpr" %)
+                                 (tree-seq coll? seq (:expression operation)))]
+        (let [descriptor (intrinsics/descriptor (:op expression))]
+          (when-not
+           (and (not= :trap (get-in expression [:options :overflow]))
+                (or (= :cast (:op expression))
+                    (= :cmp (:kind descriptor))
+                    (and (contains? #{:float :double} (:result-type expression))
+                         (true? (:primitive-fp-total descriptor)))))
+            (decline! "checked map operand has another potentially failing operation"
+                      {:expression expression}))))
+      (record-kind? "IfRegion" operation)
+      (do (otherwise-total! (:then-operations operation))
+          (otherwise-total! (:else-operations operation)))
+      :else (decline! "checked map operand is not a total scalar/load region"
+                      {:operation operation}))))
+
+(defn plan
+  "Derive one checked result obligation and its complete physical schedule.
+   Only a fresh functional, single-result map with one outer checked Double to
+   Float conversion is currently admitted. Unsupported candidates throw a
+   precise decline; callers must retain the original semantic operation."
+  [algorithm source-graph options]
+  (let [algorithm (soac/validate! algorithm)
+        source-graph (graph/validate! source-graph)
+        equation (first (soac/equations algorithm))
+        facts (get-in (soac/facts algorithm) [:equations (second equation)])
+        node (first (:nodes source-graph))
+        operation (:operation node)
+        region (:scalar-region operation)
+        {:keys [attributes operand]} (conversion/canonical-parts (:result region))
+        output (:out-sym operation)
+        _ (when-not (and (= 1 (count (soac/equations algorithm)))
+                         (= 'map (soac/operation-kind equation))
+                         (= 1 (count (:nodes source-graph)))
+                         (segop/seg-map? operation)
+                         (= 1 (count (get-in operation [:space :dims])))
+                         (empty? (:temporaries source-graph))
+                         (= 1 (count (:outputs source-graph)))
+                         (= output (:id (first (:outputs source-graph))))
+                         (= :output (:role (first (:outputs source-graph))))
+                         (empty? (:effects facts)) (empty? (:aliases facts))
+                         (empty? (get-in facts [:attributes :result-storage]))
+                         (= #{output} (:outputs operation))
+                         (not (contains? (:inputs operation) output))
+                         (vector? (:locals region))
+                         (not (contains? region :effects))
+                         (= source-conversion attributes))
+            (decline! "checked map requires a fresh functional outer Double-to-Float result"
+                      {:operation (:id operation) :conversion attributes}))
+        projected (reads/validate-and-project-addresses operation node source-graph)
+        requirements (get-in node [:read-capacity-certificate :requirements])
+        _ (when-not (set/subset? (:inputs operation) (set (keys requirements)))
+            (decline! "checked map requires a complete independent source read-domain proof"
+                      {:inputs (:inputs operation) :proved (set (keys requirements))}))
+        [status diagnostics below above converted]
+        (fresh-symbols [algorithm source-graph]
+                       ["checked_status_" "checked_operand_" "checked_below_"
+                        "checked_above_" "checked_float_"])
+        {index :name bound :bound} (first (get-in operation [:space :dims]))
+        ;; This private schedule input exposes the original Double producer. No
+        ;; unchecked source conversion is invented and no target emits this
+        ;; intermediate value as the source result.
+        producer (-> projected
+                     (assoc :dtype :double :cast-fn nil)
+                     (assoc-in [:scalar-region :result] operand))
+        scalar-types (merge (:scalar-types options)
+                            (into {} (map (juxt :id :dtype)) (:scalars source-graph)))
+        shapes (into {} (map (fn [buffer] [(:id buffer) [(:elements buffer)]]))
+                     (concat (:inputs source-graph) (:outputs source-graph)))
+        lowered (map-body/lower producer
+                                (merge options
+                                       {:array-types (assoc (into {} (map (juxt :id :dtype))
+                                                                  (:inputs source-graph)) output :double)
+                                        :array-shapes shapes :scalar-types scalar-types}))
+        original-body (:kernel-body lowered)
+        guard (first (:operations original-body))
+        operations (:operations guard)
+        store (last operations)
+        _ (when-not (and (= 1 (count (:operations original-body)))
+                         (record-kind? "Guard" guard) (= :map-active (:mask guard))
+                         (record-kind? "ScalarStore" store) (= output (:buffer store))
+                         (= [index] (:coordinates store))
+                         (= :map-active (:predicate store)))
+            (decline! "checked map requires one lane-owned final result store" {}))
+        _ (otherwise-total! (butlast operations))
+        extent ['_n_bound]
+        failure [(body/->ScalarStore diagnostics [index] (:value store) :map-active)
+                 (body/->ScalarStore status [index] (body/literal 1 :int) :map-active)
+                 (body/->Yield [])]
+        success [(body/->ScalarCompute (body/value converted :float)
+                                       (body/cast-expression (:value store) :float :nearest-even :ieee))
+                 (assoc store :value converted)
+                 (body/->ScalarStore status [index] (body/literal 0 :int) :map-active)
+                 (body/->Yield [])]
+        checked-operations
+        (into (vec (butlast operations))
+              [(body/->ScalarCompute (body/value below :predicate)
+                                     (body/scalar-expression :lt :predicate
+                                       [(:value store) (body/literal (- (double Float/MAX_VALUE)) :double)]))
+               (body/->ScalarCompute (body/value above :predicate)
+                                     (body/scalar-expression :gt :predicate
+                                       [(:value store) (body/literal (double Float/MAX_VALUE) :double)]))
+               (body/->IfRegion below failure
+                               [(body/->IfRegion above failure success []) (body/->Yield [])] [])])
+        obligation {:kind kind :node (:id node) :extent bound :output output
+                    :status status :diagnostics diagnostics :source-conversion attributes
+                    :failure-selection :first-linear-index
+                    :initialization :conditional-on-success}
+        kernel-body
+        (body/make
+         (-> original-body
+             (update :parameters
+                     (fn [parameters]
+                       (into (mapv #(if (= output (:id %))
+                                      (assoc % :dtype :float :layout (layout/row-major (:shape %) :float)) %) parameters)
+                             [(body/->KernelParameter status :output :int extent :global
+                                                      (layout/row-major extent :int) :status)
+                              (body/->KernelParameter diagnostics :output :double extent :global
+                                                      (layout/row-major extent :double) :diagnostics)])))
+             (assoc :operations [(assoc guard :operations checked-operations)])
+             (assoc-in [:attributes :checked-stage-result] obligation)))
+        arguments (mapv #(if (= '_n_bound (:id %)) bound (:id %)) (:parameters kernel-body))
+        uses (scheduled/derive-uses kernel-body arguments)
+        certificate
+        (scheduled/make
+         {:source operation :body kernel-body :arguments arguments
+          :scalar-bindings (scheduled/derive-scalar-bindings kernel-body arguments scalar-types)
+          :effects {:kind :checked-elementwise-map :uses uses :write-conflict :unique}
+          :legality {:kind kind} :numerics {:mode :exact :policy :same-scalar-evaluation-order
+                                          :scalar-math (numerics/validate-scalar-math-policy!
+                                                        (:scalar-math options))}
+          :provenance {:source-dialect :typed-soac}
+          :attributes {:checked-stage-result obligation}})
+        checked-graph
+        (graph/make
+         (-> source-graph
+             (assoc :temporaries [(graph/buffer status :int bound :device :temporary)
+                                  (graph/buffer diagnostics :double bound :device :temporary)])
+             (assoc-in [:nodes 0 :uses]
+                       (mapv #(graph/->ValueUse (:value %) (:access %)) uses))
+             (assoc-in [:attributes :checked-stage-results] [obligation])))
+        witness (refinement/make {:source source-graph :graph checked-graph
+                                  :schedule {:kind kind :workgroup-size (get options :workgroup-size 256)}
+                                  :numerics (:numerics certificate)})]
+    (scheduled/validate-against-node! certificate (first (:nodes checked-graph)) checked-graph)
+    {:refinement witness :graph checked-graph :stage-bodies [certificate]
+     :stage-results [obligation]}))
+
+(defn validate-reconstruction!
+  "Reconstruct from the original semantic operation and source graph. Caller
+   metadata or an emitted ABI never substitutes for this complete comparison."
+  [algorithm source-graph witness options]
+  (refinement/validate-against! witness source-graph)
+  (let [expected (plan algorithm source-graph
+                       (assoc options :workgroup-size (get-in witness [:schedule :workgroup-size])))]
+    (when-not (semantic/equivalent? (:refinement expected) witness)
+      (throw (ex-info "checked stage refinement changed its exact source-derived schedule"
+                      {:reason :checked-map-stage-refinement})))
+    expected))

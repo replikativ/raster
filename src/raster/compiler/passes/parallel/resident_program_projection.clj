@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.soac-dialect :as soac]))
 
 (defn- fail! [reason message data]
@@ -118,6 +119,7 @@
    Prefix allocation is retained only when an emitted graph still names that value.  A graph
    refinement can therefore eliminate a semantic temporary without leaving dead resident scratch."
   [parallel-program device-id]
+  (stage-result/refuse-unobserved! parallel-program :resident-marker-projection)
   (let [program (emitted-program/validate! parallel-program)
         plan (some-> program :attributes :invocation-plan invocation/validate!)]
     (when-not plan

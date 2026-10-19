@@ -23,6 +23,7 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.mixed-matrix-candidate :as mixed-candidate]
+            [raster.compiler.passes.parallel.checked-map-stage :as checked-stage]
             [raster.compiler.passes.parallel.product-consumer-region :as product-consumer-region]
             [raster.compiler.passes.parallel.product-consumer-route :as product-consumer-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
@@ -190,19 +191,27 @@
       (soac/program-form? algorithm)
       (let [{:keys [body graph]} (equation-graph/make-for-equation
                                   parallel-program equation)
+            checked (when (checked-stage/candidate? algorithm graph)
+                      (checked-stage/plan algorithm graph opts))
+            scheduled-graph (or (:graph checked) graph)
             ;; Multi-phase schedules retain family-independent decisions (algebra, phase
             ;; decomposition, tuning choice) on their certified graph. Rebuilding the physical
             ;; dataflow remains generic, but those schedule facts must survive to target lowering.
             operations (:operations equation)
             contraction-facts (contraction-facts-by-operation algorithm operations)
-            emitted (emit-graph graph
+            emitted (emit-graph scheduled-graph
                                 (cond-> (assoc opts
                                                :scheduled-equation-algorithm algorithm
                                                :scheduled-equation-body body)
+                                  checked
+                                  (assoc :scheduled-bodies
+                                         (zipmap (map :id (:nodes scheduled-graph)) (:stage-bodies checked)))
                                   (seq contraction-facts)
                                   (assoc :contraction-facts contraction-facts)))]
         (assoc equation :operations
-               [(make-emitted-equation algorithm body emitted {:provenance provenance} opts)]))
+               [(make-emitted-equation algorithm body emitted
+                                       (cond-> {:provenance provenance}
+                                         checked (assoc :refinement (:refinement checked))) opts)]))
 
       (swr/plan? algorithm)
       (let [{:keys [body graph]} (equation-graph/make-for-plan-equation

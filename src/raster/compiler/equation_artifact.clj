@@ -11,6 +11,7 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint])
   (:import [clojure.lang IObj]
            [java.security MessageDigest]))
@@ -130,6 +131,7 @@
     {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math caller-options))}))
 
 (defn- validate-compilation! [compilation caller-options]
+  (stage-result/refuse-unobserved! compilation :persist-equation-compilation)
   (when-not (equation-first/equation-first-compilation? compilation)
     (fail! "artifact payload must be an EquationFirstCompilation"
            :equation-artifact-payload-type {:actual (type compilation)}))

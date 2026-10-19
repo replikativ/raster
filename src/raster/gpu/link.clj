@@ -13,6 +13,7 @@
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.ir.link-composition :as link-composition]
@@ -315,6 +316,7 @@
    and direct graphs record one resident command graph; dynamic emitted loops retain their
    separate bounded runner and cannot be mixed with descriptors."
   [plan {:keys [session external-buffers profile?] :or {external-buffers {} profile? false} :as opts}]
+   (stage-result/refuse-unobserved! plan :instantiate-link-plan)
    ;; This is intentionally the first operation. Everything below may contact a backend.
    (let [caller-options (caller-math-options opts)
          instantiation-started (System/nanoTime)
@@ -1164,6 +1166,7 @@
    inputs refresh on replay. Attached sessions and profiling need their own activation
    tests before this path is exposed by Compiled; the ordinary eager instantiator is unchanged."
   [compilation arguments opts]
+  (stage-result/refuse-unobserved! compilation :instantiate-ordered-invocation)
   (when (or (:session opts) (:profile? opts)
             (seq (set/difference (set (keys opts)) #{:scalar-math :profile? :entry-roles :result-mode})))
     (throw (ex-info "ordered invocation activation currently requires an owned unprofiled session"

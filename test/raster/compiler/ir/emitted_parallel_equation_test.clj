@@ -17,7 +17,10 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]))
 
 (def ^:private map-source
-  '(raster.par/pmap i n float (clojure.core/+ 1.0 (clojure.core/aget values i))))
+  ;; This fixture exercises graph topology/ABI validation, not numerical
+  ;; narrowing. Checked Float materialization has its own exact refinement
+  ;; tests; an arbitrary fixture-only three-stage witness cannot certify it.
+  '(raster.par/pmap i n double (clojure.core/+ 1.0 (clojure.core/aget values i))))
 
 (deftest emitted-scan-reconstructs-its-schedule-without-descriptive-graph-metadata
   (let [source '(let* [effect (raster.par/scan out acc 0.0 i n double
@@ -41,10 +44,10 @@
 (defn- scheduled-fixture []
   (let [source (list 'let* ['result map-source] 'result)
         typed (:program (typed-route/attempt
-                         source :float {'values :float}
+                         source :double {'values :double}
                          {:scalar-types {'n :int}}))
         lowered (:form (segop-lower/segop-lower-pass
-                        typed {:target-device :cpu:0 :dtype :float}))
+                        typed {:target-device :cpu:0 :dtype :double}))
         equation (first (:equations lowered))
         ;; Production equation emission narrows the enclosing program to this equation and retains
         ;; its semantic operand order. The whole-program lowerer sorts independent outer inputs.
@@ -93,7 +96,8 @@
                    (str (if (= :opencl-c target)
                           (if (= :input (:kind slot)) "__global const " "__global ")
                           (if (= :input (:kind slot)) "const " ""))
-                        "float* " (:c-name slot))))
+                        (case (:dtype slot) :double "double* " :float "float* ")
+                        (:c-name slot))))
                slots)
          prefix (if (= :opencl-c target) "__kernel void " "extern \"C\" __global__ void ")]
      (artifact/certify-scheduled-operation

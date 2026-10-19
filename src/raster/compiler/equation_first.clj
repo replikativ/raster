@@ -25,6 +25,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
             [raster.compiler.ir.kernel-executable :as kernel-executable]
@@ -772,6 +773,7 @@
    Retained-validation is an internal capability path: it must be exact-owner
    static evidence. Invocation materialization and final LinkPlan validation remain fresh."
   [compilation arguments project retained-validation caller-options]
+  (stage-result/refuse-unobserved! compilation :lower-equation-compilation)
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))

@@ -21,6 +21,7 @@
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
@@ -904,6 +905,7 @@
   {:nodes nodes :values values})
 
 (defn- validate-plan-structure! [plan]
+  (stage-result/refuse-unobserved! plan :link-plan-validation)
   (when-not (link-plan? plan)
     (throw (ex-info "expected a LinkPlan value"
                     {:reason :link-plan-type :plan plan :actual (type plan)})))
