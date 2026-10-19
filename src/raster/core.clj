@@ -528,7 +528,13 @@
                 ;; and retain the ordinary selected-definition/dependency guards.
                 ;; Attach only after successful dispatch/callsite publication.
                 (alter-meta! impl-var assoc ::bytecode-emission
-                             (cond-> emission source-entry (assoc :source-entry source-entry)))
+                             (cond-> emission source-entry
+                               (assoc :source-entry source-entry
+                                      :frontend-source-owner
+                                      (me/own-frontend-source
+                                       source-entry impl fresh-body
+                                       {:element-dtype (dtype/infer-dtype-from-tags tags)
+                                        :parameter-dtype (dtype/infer-dtype-from-tags tags)}))))
                 impl
                 (catch Exception e
               ;; Rollback var to old impl on dispatch table or callsite failure
@@ -1031,7 +1037,12 @@
                                         :source-policy '~policy
                                         :source-ns *ns* :typed-interface nil
                                         :clojure-body (:walked-body reg#)})]
-                 (alter-meta! source# assoc ::clojure-source-entry lineage#)))
+                 (alter-meta! source# assoc ::clojure-source-entry lineage#
+                              ::frontend-source-owner
+                              (me/own-frontend-source
+                               lineage# (var-get source#) (:walked-body reg#)
+                               {:element-dtype nil
+                                :parameter-dtype (dtype/infer-dtype-from-tags '~tags)}))))
            ~(when (seq fn-param-checks)
               `(alter-meta! (var ~mangled) assoc ::has-fn-params true))
            ~@(when generate-typed?

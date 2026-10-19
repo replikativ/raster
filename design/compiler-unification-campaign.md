@@ -8,15 +8,15 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
-### October 19 active continuation
+### October 20 active continuation
 
 The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `4ffce98f` is draft, not qualified for merge.
-Setup 32543/build 32544 passed; emission 32545 and unit 32548 failed. OpenCL 32547
-was still running at the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
+Current integration hold: PR #1539 at `f6b9f1ac` is draft, not qualified for merge.
+Exact-head setup/build passed, emission failed, and unit/OpenCL were pending at
+the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
@@ -77,6 +77,48 @@ still refuses this pending entry before acquisition until historical source owne
 live allocation-ledger checks are integrated. The six affected namespaces pass 86 tests /
 697 assertions, including adversarial bindings, condition mutations, ordinary-consumer
 refusal, source-ready realization and the existing confined local-device qualification.
+
+Historical source ownership now freezes the original producer's definition inputs,
+exact semantic/emitted identities, and policies of actually imported helper bodies.
+The inliner consumes snapshot metadata rather than pairing an old body with a later
+definition observation. Refused optional imports leave no dependency. Unknown or
+unchecked imported policies refuse this checked-source capability; prepared reverse-AD
+imports without transitive lineage explicitly refuse it too. Ordinary AD is unchanged.
+The eight-namespace focused gate passes 113 tests / 905 assertions, including local
+OpenCL/Level Zero checks. This does not enable ordered checked-result execution or
+qualify the red integration baseline.
+
+Before activation, close an independently reproduced source-correspondence gap:
+a materialized `deftm` keeps its original user-macro behavior, but fresh raw-source
+walking can expand a redefined macro differently while the source Var guard still
+passes. A REPL oracle returned `3.0` before and after macro replacement; compiler
+walking changed from `x + 2.0` to `x + 7.0`. A fresh macro snapshot cannot authenticate
+the original expansion. The smaller first route retains the actual typed frontend
+body in an opaque producer owner, before backend AD/SIMD, bound to the selected
+implementation and original source-entry lineage. Eager/plain producers retain
+their actual Clojure frontend too; the context distinguishes parameter precision
+from the original literal-walking mode. Consume that typed body without retyping
+it, and normalize scopes with the same helper used by fresh source compilation.
+Requested precision must correspond to the selected specialization, not silently
+retype it. Root lookup uses existing flat-var and mangled-operation authority;
+helper imports must use the same original frontend rather than stale walk caches.
+Cold/legacy layouts without that evidence receive no checked-execution owner.
+Next share one frontend-materialization producer between pending JIT and GPU
+compilation; do not introduce a duplicate expansion/type-inference pipeline.
+Acceptance includes changed-macro source oracles, distinct genuine Float/Double
+specializations, backed/wrapped source handles, edited metadata refusals and a
+prewalk-A/materialize-B helper import. Aliases and parametric cases remain required.
+Live allocation-ledger checks, success-conditional initialization and a non-executable
+final storage boundary remain required after this source-provenance work.
+
+The original-frontend slice passes the nine-namespace focused gate: 119 tests /
+928 assertions, including actual confined local-device checks. The new source
+oracles cover both original eager/plain frontend code and successful JIT frontend
+code, original implementation/owner identity, backed lookup, precision mismatch,
+and transitive helper-cache drift. Under explicit declared-storage preservation,
+source typing remains fixed while the target carrier can differ; Float buffer /
+Double scalar ABI checks pass. These receipts do not close cold frontend sharing,
+generated-AD provenance, ordered checked execution or the red broad CI baseline.
 
 ### Historical integration receipts (not the current acceptance status)
 

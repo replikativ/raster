@@ -3,6 +3,7 @@
             [raster.core :as core]
             [raster.compiler.backend.jvm.source-owner :as owner]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.inline :as inline]))
 
 (core/deftm public-source [x :- Double] :- Object (float x))
@@ -17,8 +18,13 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
-(defn- source [] (core/resolve-deftm-var #'public-source {:dtype :double}))
-(defn- helper [] (core/resolve-deftm-var #'checked-helper {:dtype :double}))
+(defn- source []
+  (public-source 1.0)
+  (core/resolve-deftm-var #'public-source {:dtype :double}))
+(defn- frontend [v] (pipeline/retained-frontend-source #'public-source v :double))
+(defn- helper []
+  (checked-helper 1.0)
+  (core/resolve-deftm-var #'checked-helper {:dtype :double}))
 (defn- import! [v]
   (binding [inline/*inline-scalar-bodies?* true]
     ((deref (ns-resolve 'raster.compiler.passes.scalar.inline 'try-resolve-walked-body)) v)))
@@ -33,7 +39,7 @@
          (entry/observe-definition-input! public (:ns (meta public)) (:name (meta public)))
          (is (some? (import! v)))
          {:program program :emission emission :collector entry/*emission-inputs*
-          :owner (owner/compile-checked-result-source program emission public)})))))
+          :owner (owner/compile-checked-result-source program emission public (frontend public))})))))
 
 (deftest imported-policy-is-owned-at-the-actual-body-extraction
   (let [v (helper)
@@ -71,9 +77,8 @@
       (finally (reset-meta! v original)))))
 
 (deftest function-value-body-retains-its-own-policy-origin
-  (let [{:keys [owner program emission collector]} (compile-owned #'value-helper)]
-    (is (contains? (:source-body-inputs @collector) [#'value-helper :value]))
-    (is (identical? owner (owner/assert-checked-result-source! owner program emission))))
+  (is (= :unclosed-checked-result-source-imports (reason #(compile-owned #'value-helper)))
+      "a retained policy alone cannot authenticate a generated function's body")
   (let [original @#'value-helper]
     (try
       (alter-var-root #'value-helper #(with-meta % (dissoc (meta %) :raster.core/source-policy)))
@@ -95,8 +100,25 @@
        (entry/observe-definition-input! public (:ns (meta public)) (:name (meta public)))
        (swap! entry/*emission-inputs* assoc :unclosed-source-imports #{[:prepared-reverse-ad 'loss]})
        (is (= :unclosed-checked-result-source-imports
-              (reason #(owner/compile-checked-result-source (Object.) (Object.) public))))))))
+              (reason #(owner/compile-checked-result-source (Object.) (Object.) public
+                                                           (frontend public)))))))))
+
+(deftest missing-original-frontend-cannot-acquire-a-checked-source-owner
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [public (source)]
+       (entry/observe-definition-input! public (:ns (meta public)) (:name (meta public)))
+       (is (= :unowned-checked-result-frontend
+              (reason #(owner/compile-checked-result-source (Object.) (Object.) public nil))))))))
 
 (deftest checked-owner-cannot-authenticate-replaced-bootstrap-intrinsics
-  (with-redefs [clojure.core/float (fn [_] :replaced)]
-    (is (= :intrinsic-source-definition-mismatch (reason #(compile-owned (helper)))))))
+  ;; Materialize original fixtures BEFORE replacing a bootstrap dependency.
+  ;; Otherwise their genuinely stale emissions must continue refusing afterward.
+  (let [public (source)]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [original-frontend (frontend public)]
+         (with-redefs [clojure.core/float (fn [_] :replaced)]
+           (is (= :intrinsic-source-definition-mismatch
+                  (reason #(owner/compile-checked-result-source
+                            (Object.) (Object.) public original-frontend))))))))))

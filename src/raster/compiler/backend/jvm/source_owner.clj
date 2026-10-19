@@ -193,17 +193,14 @@
   "Freeze source ownership after checked-stage emission under the original producer.
    This grants no physical binding, completion or initialization. The compiler
    producer owes source-to-semantic correspondence; consumers cannot refresh it."
-  [program emission source-var]
+  [program emission source-var frontend]
+  (entry/assert-frontend-source! frontend source-var)
   (let [{:keys [collector source-ns policy]} (original-source-context! source-var :unowned-checked-result-source)]
     (when-not (false? (:unchecked-math policy))
       (throw (ex-info "checked result source requires its retained checked compilation policy"
                       {:reason :unsupported-checked-result-source-policy :source-policy policy})))
     (intrinsic-source/observe-originals! source-ns)
     (let [observations @collector]
-      (when (seq (:unclosed-source-imports observations))
-        (throw (ex-info "checked result source needs original lineage for generated body imports"
-                        {:reason :unclosed-checked-result-source-imports
-                         :imports (:unclosed-source-imports observations)})))
       (doseq [[v origin] (:source-body-inputs observations)]
         (let [snapshot (get-in observations [:definition-proofs v])
               metadata (case origin :var (:metadata snapshot) :value (meta (:value snapshot)) nil)
@@ -213,6 +210,10 @@
             (throw (ex-info "checked result source cannot import a body with unknown or unchecked policy"
                             {:reason :unsupported-checked-result-import-policy
                              :source v :origin origin :source-policy imported-policy})))))
+      (when (seq (:unclosed-source-imports observations))
+        (throw (ex-info "checked result source needs original lineage for body imports"
+                        {:reason :unclosed-checked-result-source-imports
+                         :imports (:unclosed-source-imports observations)})))
       (source-history-current! source-ns observations :stale-checked-result-source-namespace)
       (CheckedResultSourceOwner. program emission observations source-ns))))
 

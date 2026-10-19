@@ -68,6 +68,7 @@
             [raster.compiler.core.value-completion :as value-completion]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.op-descriptor :as op]
+            [raster.compiler.support.mangled :as mangled]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.macroexpand :as mex]
@@ -138,6 +139,32 @@
                     (#{:float :double} element-dtype) (assoc :element-dtype element-dtype))]
     (mapv #(walker/walk-body % walk-opts) body)))
 
+(defn normalize-source-bindings
+  "Scope normalization shared by fresh and retained typed source; never retypes it."
+  [body params]
+  (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
+    (mapv #(util/uniquify-rebindings param-syms %) body)))
+
+(defn retained-frontend-source
+  "Optional original frontend for a published, exactly selected specialization.
+   This is not a fresh source walk or a materialization request."
+  ([f-var resolved dtype] (retained-frontend-source f-var resolved dtype {}))
+  ([f-var resolved dtype {:keys [preserve-declared-array-storage?]}]
+  (when (and (var? f-var) (var? resolved) me/*emission-inputs*)
+    (let [source (or (:raster.params/flat-var (meta f-var)) f-var)
+          metadata (meta resolved)
+          source-ns (:ns metadata)
+          source-op (symbol (str (:ns (meta source))) (str (:name (meta source))))
+          operation (if (:raster.core/deftm (meta source))
+                      (mangled/impl->op source-op) source-op)
+          implementation (symbol (str source-ns) (str (:name metadata) "-impl"))
+          ;; Under the existing preserve-declared contract, requested dtype is
+          ;; a target carrier, not permission to retype the original program.
+          source-dtype (if preserve-declared-array-storage?
+                         (dtype/infer-dtype-from-tags (:raster.core/deftm-tags metadata)) dtype)]
+      (me/selected-frontend-source operation implementation
+                                   (count (:raster.core/deftm-params metadata)) resolved source-dtype)))))
+
 (defn get-walked-body [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)
         m (meta resolved)]
@@ -170,8 +197,7 @@
             ;; body's read of `x` hits the uninitialized output). Distinct names
             ;; remove the hazard; non-shadowing bindings are untouched.
             (when walked
-              (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
-                (mapv #(util/uniquify-rebindings param-syms %) walked)))))
+              (normalize-source-bindings walked params))))
         ;; Legacy source-less metadata: use a pre-walked body only when no source was available.
         (:raster.core/deftm-walked-body-typed m)
         (:raster.core/deftm-walked-body m)

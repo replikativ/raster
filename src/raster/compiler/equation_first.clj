@@ -434,7 +434,7 @@
 
 (defn- compile-semantic
   "Schedule and emit one exact typed semantic program without source or ABI reconstruction."
-  [{:keys [id function-id target dtype source-ns source-var options compiler-options]
+  [{:keys [id function-id target dtype source-ns source-var retained-frontend options compiler-options]
     :as context}
    semantic]
   (when-not (= :typed-parallel (:dialect semantic))
@@ -477,8 +477,10 @@
                   :schedule resolved-schedule))
           emission)
         invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
-        checked-owner (when (and source-var (stage-result/requires-observation? (:program emission)))
-                        (source-owner/compile-checked-result-source semantic (:program emission) source-var))]
+        checked-owner (when (and source-var retained-frontend
+                                 (stage-result/requires-observation? (:program emission)))
+                        (source-owner/compile-checked-result-source
+                         semantic (:program emission) source-var retained-frontend))]
     (when-not invocation-plan
       (fail! :equation-first-invocation
              "equation-first semantic program has no retained public invocation plan"
@@ -718,7 +720,12 @@
                                                 (dissoc :target :gemm-precision)
                                                 (assoc :schedule reference-schedule
                                                        :target-descriptor target-descriptor)))
-         walked (pipeline/get-walked-body resolved-var (:dtype compiler-options))
+         retained-frontend (pipeline/retained-frontend-source
+                            f-var resolved-var (:dtype compiler-options) compiler-options)
+         walked (or (when retained-frontend
+                      (pipeline/normalize-source-bindings
+                       (:body retained-frontend) (:raster.core/deftm-params (meta resolved-var))))
+                    (pipeline/get-walked-body resolved-var (:dtype compiler-options)))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
          represented-source (pipeline/run-passes
                              source pipeline/gpu-resident-pre-soa-passes compiler-options)
@@ -764,7 +771,8 @@
       (merge policy
              {:id id :function-id (function-symbol f-var) :target target
               :dtype (:dtype compiler-options) :source-ns source-ns-symbol
-              :source-var resolved-var :options options :compiler-options compiler-options})
+              :source-var resolved-var :retained-frontend retained-frontend
+              :options options :compiler-options compiler-options})
       semantic))))))
 
 (defn- lower-in-context

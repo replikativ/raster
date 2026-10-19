@@ -18,6 +18,8 @@
   Maps use value equality across classloaders, eliminating ClassCastException
   when compiled (eval'd) code calls back into dispatch."
   (:require [raster.compiler.core.types :as types]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.support.mangled :as mangled]
             [raster.compiler.core.source-policy :as source-policy]))
 
 (defn var-snapshot
@@ -553,6 +555,91 @@
                        (mapv (fn [^Class carrier]
                                {:carrier carrier :presence (if (.isPrimitive carrier) :present :unknown)})
                              parameter-carriers)))))))
+
+(deftype ^:private FrontendSourceOwner [lineage implementation body context])
+
+(defn own-frontend-source
+  "Original producer boundary: bind pre-backend source to its actual implementation.
+   The opaque owner is not reconstructed from a later emission-metadata map."
+  [lineage implementation body context]
+  (assert-source-entry-current! lineage)
+  (when-not (and implementation (vector? body)
+                 (= #{:element-dtype :parameter-dtype} (set (keys context))))
+    (throw (ex-info "frontend producer needs its original body and context"
+                    {:reason :unclosed-original-frontend})))
+  (FrontendSourceOwner. lineage implementation body context))
+
+(defn- original-frontend [owner lineage implementation expected-dtype]
+  (when owner
+    (when-not (and (instance? FrontendSourceOwner owner)
+                   (identical? lineage (.-lineage ^FrontendSourceOwner owner))
+                   (identical? implementation (.-implementation ^FrontendSourceOwner owner)))
+      (throw (ex-info "frontend source is not owned by this original implementation"
+                      {:reason :retained-frontend-owner-mismatch})))
+    (assert-source-entry-current! lineage)
+    (let [context (.-context ^FrontendSourceOwner owner)]
+      (when-not (or (nil? (:parameter-dtype context))
+                    (= expected-dtype (:parameter-dtype context)))
+        (throw (ex-info "retained source specialization cannot be retyped for this request"
+                        {:reason :retained-frontend-dtype-mismatch
+                         :source (:source-var lineage) :requested-dtype expected-dtype
+                         :source-dtype (:parameter-dtype context)})))
+      {:body (.-body ^FrontendSourceOwner owner) :frontend-context context})))
+
+(defn assert-frontend-source!
+  "Check original producer identity, not asserted body/context fields in a map."
+  [frontend source-var]
+  (let [{:keys [source-owner source-entry implementation frontend-context body]} frontend
+        expected (original-frontend source-owner source-entry implementation
+                                    (:parameter-dtype frontend-context))]
+    (when-not (and expected (identical? source-var (:source-var source-entry))
+                   (identical? body (:body expected))
+                   (= frontend-context (:frontend-context expected)))
+      (throw (ex-info "checked source requires its original frontend producer"
+                      {:reason :unowned-checked-result-frontend})))
+    frontend))
+
+(defn selected-frontend-source
+  "Original typed frontend of an actually published specialization.
+   Reuses receiver/implementation/source-entry correspondence; never substitutes
+   transformed emission :body or an unattested walked-metadata cache. Nil means
+   cold/legacy evidence is absent, not permission for source-owned execution."
+  [operation implementation-op argument-count source-var expected-dtype]
+  (call-with-optional-definition-inputs
+   (fn []
+     (let [projection (selected-source-entry-carriers
+                       operation implementation-op argument-count source-var)
+           direct-op (symbol (str (:ns (meta source-var))) (str (:name (meta source-var))))
+           direct (when-not projection
+                    (observed-selected-definition :direct operation direct-op argument-count))
+           lineage (if projection (:source-entry projection)
+                       (when (identical? source-var (:source-var direct))
+                         (:raster.core/clojure-source-entry (meta source-var))))
+           emission (:emission projection)
+           owner (if projection (:frontend-source-owner emission)
+                     (:raster.core/frontend-source-owner (meta source-var)))
+           implementation (if projection (:implementation emission)
+                              (when direct (var-get source-var)))]
+       (when (and lineage (not (:pending-source? projection)))
+         (when-let [frontend (original-frontend owner lineage implementation expected-dtype)]
+           (observe-source-body-input! source-var :var)
+           (assert-definition-inputs-current! @*emission-inputs*)
+           (merge {:source-entry lineage :definition (or (:definition projection) direct)
+                   :source-owner owner :implementation implementation} frontend)))))))
+
+(defn original-source-frontend
+  "Optional original frontend for an exact already-resolved deftm source Var.
+   Shared mangling only discovers the operation; selected correspondence proves it."
+  [source-var]
+  (when (and *emission-inputs* (var? source-var))
+    (let [metadata (meta source-var)
+          source-op (symbol (str (:ns metadata)) (str (:name metadata)))
+          operation (mangled/impl->op source-op)]
+      (when operation
+        (selected-frontend-source operation
+                                  (symbol (namespace source-op) (str (name source-op) "-impl"))
+                                  (count (:raster.core/deftm-params metadata)) source-var
+                                  (dtype/infer-dtype-from-tags (:raster.core/deftm-tags metadata)))))))
 
 (defn selected-definition-body
   "Historical body for an already observed selected definition, never current

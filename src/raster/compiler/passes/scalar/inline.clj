@@ -235,7 +235,10 @@
                        (try (meta (if snapshot (:value snapshot) @v)) (catch Exception _ nil)))
         _ (source-owner/assert-portable-source! metadata)
         _ (source-owner/assert-portable-source! val-metadata)
-        var-body (or (:raster.core/deftm-walked-body-typed metadata)
+        retained-frontend (when (:raster.core/deftm metadata)
+                            (method-entry/original-source-frontend v))
+        var-body (or (:body retained-frontend)
+                     (:raster.core/deftm-walked-body-typed metadata)
                      (:raster.core/deftm-walked-body metadata))
         walked-body (or var-body
                         (:raster.core/deftm-walked-body-typed val-metadata)
@@ -261,6 +264,12 @@
                                (not (canonical-callee callee))))]
                 (inlinable-body? (first effective-wb)))
           (let [_ (method-entry/observe-source-body-input! v (if var-body :var :value))
+                _ (when (and method-entry/*emission-inputs* (nil? retained-frontend))
+                    ;; A legacy walked cache or generated function value is
+                    ;; usable for existing non-owning compilation, but cannot
+                    ;; authenticate the live helper's original source body.
+                    (swap! method-entry/*emission-inputs* update :unclosed-source-imports
+                           (fnil conj #{}) [:unowned-helper-frontend v]))
                 source-ns-sym (symbol (str (.name (.ns v))))
                 source-ns (try (the-ns source-ns-sym) (catch Exception _ nil))
                 param-set (set (map #(if (symbol? %) % (symbol (name %))) params))
