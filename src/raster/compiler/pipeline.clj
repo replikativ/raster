@@ -864,7 +864,26 @@
    coverage decline preserves the original source and remains visible beside any later TypedSOAC
    decline; certified contradictions are never converted into fallback."
   [source opts abstract-machine]
-  (let [;; A public array's backing capacity is independent of each traversal.
+  (let [;; Physical parameter derivation precedes this shared GPU admission
+        ;; boundary. Array ABI descriptors permit nullable references, not
+        ;; nonnull claims; Object completion keeps that same reference.
+        source (if (device/gpu-target? (:target-device opts))
+                 (inline/flatten-nested-lets
+                  (local-products/project-storage-alias-snapshots
+                   source
+                  (merge (into {} (keep (fn [[parameter t]]
+                                         (when-let [tag (:array-tag (dtype/info t))]
+                                           [parameter {:presence :unknown :array-tag tag}])))
+                               (:array-types opts))
+                         (into {} (keep (fn [[parameter t]]
+                                          (when (#{:float :double} t)
+                                            [parameter {:presence :present :scalar-type t
+                                                        :producer-scalar-type t}])))
+                               (:scalar-types opts)))
+                   nil)
+                  {:sequential-only? true})
+                 source)
+        ;; A public array's backing capacity is independent of each traversal.
         ;; Semantic owners must prove their logical access footprint separately.
         values (merge (when (device/gpu-target? (:target-device opts))
                         (into {} (map (fn [[parameter t]]

@@ -13,7 +13,7 @@
   (completion/complete-value completion/object-input-contract value))
 
 (defn- project [source]
-  (products/project-native-alias-snapshots source {} Double/TYPE))
+  (products/project-storage-alias-snapshots source {} Double/TYPE))
 
 (defn- invoke [source x calls]
   ;; This pass targets C declarations, not Clojure primitive-local hint syntax.
@@ -246,3 +246,55 @@
         (is (= 129 (count @consumed)))
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no producer"
               (#'products/consume-evaluation! {:evaluation-obligations #{(Object.)}})))))))
+
+(deftest array-snapshots-preserve-reference-identity-and-nullability
+  (let [source (list 'let* ['a 'x 'saved (snapshot 'a) 'copy 'saved]
+                     '(clojure.core/identical? x copy))
+        projected (products/project-storage-alias-snapshots
+                   source {'x {:presence :unknown :array-tag 'doubles}} nil)]
+    (is (not (completion/contains-completion? projected)))
+    (is (= 'doubles (:tag (meta (nth (second projected) 2)))))
+    (doseq [x [nil (double-array 0) (double-array [1.0 2.0])]]
+      (is (true? (invoke source x nil)))
+      (is (true? (invoke projected x nil)))))
+  (let [source (list 'let* ['saved (snapshot 'x)]
+                     '(clojure.core/aget saved 0))
+        projected (products/project-storage-alias-snapshots
+                   source {'x {:presence :unknown :array-tag 'doubles}} nil)]
+    (doseq [form [source projected]]
+      (is (thrown? NullPointerException (invoke form nil nil)))
+      (is (thrown? ArrayIndexOutOfBoundsException (invoke form (double-array 0) nil))))))
+
+(deftest array-storage-evidence-is-not-a-consumer-hint-or-a-nonnull-claim
+  (let [hinted (with-meta 'x {:tag 'doubles :raster.type/tag 'doubles})
+        source (list 'let* ['saved (snapshot hinted)] 'saved)]
+    (is (completion/contains-completion?
+         (products/project-storage-alias-snapshots source {} nil))))
+  (let [source (list 'let* ['saved (snapshot 'x)] '(clojure.core/nil? saved))
+        projected (products/project-storage-alias-snapshots
+                   source {'x {:presence :unknown :array-tag 'doubles}} nil)]
+    (is (true? (invoke projected nil nil)))
+    (is (false? (invoke projected (double-array 0) nil)))))
+
+(deftest conflicting-array-binders-do-not-get-silently-retyped
+  (doseq [saved [(with-meta 'saved {:tag 'floats})
+                 (with-meta 'saved {:tag 'Object :raster.type/tag 'floats})]]
+    (let [source (list 'let* [saved (snapshot 'x)] saved)]
+      (is (= :storage-alias-carrier-conflict
+             (try (products/project-storage-alias-snapshots
+                   source {'x {:presence :unknown :array-tag 'doubles}} nil)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest array-producer-effects-remain-at-their-source-position
+  (let [source (list 'let* ['a '(do (swap! calls conj :allocate) (clojure.core/double-array x))
+                            'saved (snapshot 'a)]
+                     '(do (swap! calls conj :observe) (clojure.core/identical? a saved)))
+        projected (project source)]
+    (is (not (completion/contains-completion? projected)))
+    (doseq [form [source projected]]
+      (let [calls (atom [])]
+        (is (true? (invoke form 2 calls)))
+        (is (= [:allocate :observe] @calls)))
+      (let [calls (atom [])]
+        (is (thrown? NegativeArraySizeException (invoke form -1 calls)))
+        (is (= [:allocate] @calls))))))

@@ -12,6 +12,7 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.scalar.normal-return :as normal-return]
@@ -319,6 +320,19 @@
     (and (seq? expression) (contains? #{'let 'let*} (first expression)))
     (lower-let env expression products?)
 
+    ;; Import an inline literal projection through the SAME saved-product
+    ;; owner. Selecting a field directly would discard eager sibling fields
+    ;; and their Object input contexts, including failures after that field.
+    (and products? (seq? expression)
+         (value-product/literal-fields (second expression))
+         (value-product/constant-projection expression (count (second expression))))
+    (let [product (gensym "inline_product__")]
+      (lower-let env
+                 (relist expression
+                         ['let* [product (second expression)]
+                          (relist expression [(first expression) product (nth expression 2)])])
+                 products?))
+
     ;; Constant-index projection consumes a saved product without reconstructing
     ;; its allocation. Out-of-bounds/defaulted/dynamic accesses remain unchanged.
     (and (seq? expression) (symbol? (second expression))
@@ -487,22 +501,27 @@
               :else true))]
     (boolean (uses? expression aliases result-carrier))))
 
-(defn project-native-alias-snapshots
-  "Erase only use-closed STORAGE for Object completions of lexical FP aliases.
+(defn project-storage-alias-snapshots
+  "Discharge Object snapshot storage using actual producer/parameter carriers.
+   Array references keep their identity even in Object context, so a proved
+   array alias needs no boxing-use closure and may still be nullable. Primitive
+   FP aliases require the existing exact primitive-consumer closure instead.
    Every original producer and its position stay unchanged. No call body is
    substituted, no arithmetic overload changes, and no direct producer recipe
    is inferred from a field tag. Unknown snapshots retain their Object IR and
    are refused by native completion admission.
 
-   parameter-facts come from the native primitive ABI, not semantic annotations;
+   parameter-facts come from the physical ABI, not semantic annotations;
    result-carrier is that same ABI's actual scalar result Class (or nil). Local
    payload/presence facts reuse this pass's existing producer authority. Requires
    the enclosing definition owner for any selected method observations."
   [expression parameter-facts result-carrier]
   (letfn [(storage-id [id known]
-            (if-let [payload (fp-payload known)]
-              (let [tag (if (= Float/TYPE payload) 'float 'double)]
-                (vary-meta id assoc :tag tag :raster.type/tag tag))
+            (if-let [tag (or (when (contains? types/primitive-array-info (:array-tag known))
+                               (:array-tag known))
+                             (when-let [payload (fp-payload known)]
+                               (if (= Float/TYPE payload) 'float 'double)))]
+              (vary-meta id assoc :tag tag :raster.type/tag tag)
               id))
           (project [value scope expected]
             (visit-native-snapshot!)
@@ -517,14 +536,25 @@
                           [known token] (owned-binding-fact scope id init)
                           known (dissoc known :native-erased-box?)
                           payload (fp-payload known)
+                          array? (contains? types/primitive-array-info (:array-tag known))
+                          _ (when (and array?
+                                       (some #(and (contains? types/primitive-array-info %)
+                                                   (not= (:array-tag known) %))
+                                             [(:tag (meta id)) (:raster.type/tag (meta id))]))
+                              (throw (ex-info "Array alias declaration contradicts its physical producer"
+                                              {:reason :storage-alias-carrier-conflict
+                                               :binding id :producer (:array-tag known)
+                                               :declared (select-keys (meta id) [:tag :raster.type/tag])})))
                           continuation (relist value
                                                (concat [head (vec (mapcat identity (next pairs)))] body))
                           unused? (and operand (contains? scope operand)
                                        (binding [util/*shadowing-locals* (conj util/*shadowing-locals* id)]
                                          (not (contains? (util/free-syms continuation) id))))
                           _ (when unused? (consume-evaluation! known))
-                          erase? (and operand payload
-                                      (primitive-use-closed? continuation #{id} payload expected))
+                          erase? (and operand
+                                      (or array?
+                                          (and payload
+                                               (primitive-use-closed? continuation #{id} payload expected))))
                           inherited? (and (symbol? init) (:native-erased-box? (get scope init)))
                           known (cond-> known (or erase? inherited?) (assoc :native-erased-box? true))
                           id (if (or erase? inherited?) (storage-id id known) id)

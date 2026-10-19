@@ -354,6 +354,71 @@ links, NVLink branding or a forecast never grant ownership, numerical permission
 | 7. Data parallelism and halos | Co-located update/collective and numerical halo demonstrations | Close public compiler-to-plan-to-runtime composition with device-scoped views, completion and cleanup; check nonuniform partitions and exact byte accounting. Do not claim multi-host transport or overlap from one laptop. |
 | 8. Durable and multilevel simulation | Manifests, mmap lease tests, checkpoint/restart and AMR provider slices | Fresh-owner restore/publication with producer geometry, time and lineage; numerical restart/branch and declared conservation/convergence/fidelity oracles; reject corrupt, incompatible or prematurely released state. |
 
+### Loop import and vectorization consolidation (October 19 REPL exploration)
+
+Explicit `par/` combinators remain the primary parallel-intent API. Ordinary Clojure loops
+remain a best-effort import into the same typed operations and ordered control regions, not
+a second scheduler or a promise to infer arbitrary parallel algorithms. Recognition, legality,
+target representability and profitability must be reported separately.
+
+The bounded source REPL exploration found:
+
+| Surface case | Observed boundary | Remaining obligation |
+|---|---|---|
+| Explicit map / dense `dotimes` map | Both reach TypedSOAC; raw map reports one recovery | Numerical/device controls and declared alias contracts remain separate. |
+| Explicit reduction / recovered sum loop | Explicit form imports; recovered form is recognized but its unbound terminal operation does not import | A flat terminal-result binding admits it in the REPL prototype; close this canonicalization handoff without changing evaluation context/order. |
+| Explicit contraction | One generated kernel through public equation-first compilation | Compare schedules/performance under matched numerical permissions. |
+| Outer `par/map-void!` with ordered inner reduction | One generated kernel | Do not confuse outer parallelism with cooperative reduction-axis scheduling. |
+| Raw nested row loop | Imports after the flat terminal-binding prototype | Keep the recovered inner fold ordered unless separately authorized. |
+| Data-dependent search inside a map | Semantic import succeeds; KernelBody lowering refuses | Import success is not end-to-end language coverage. |
+| Dependent stores | Terminal-binding prototype imports an effect-map with `:iteration-order :sequential` | Never upgrade it solely because the surrounding source is counted. |
+
+These observations used a synthetic target and small JVM numerical controls; they are not GPU
+execution, bounds-completeness or performance receipts. Shared array snapshot discharge now
+composes inline literal projection through the existing saved-product owner, followed by
+sequential-only let normalization; it does not introduce another product lowerer or enable
+broad copy propagation. A cold-loaded focused gate passes 161 tests / 924 assertions, and the
+new public array-product integration check passes two assertions. Controls include eager sibling
+evaluation/failure, reference identity, nullable arrays, contradictory carriers and preservation
+of evaluation obligations across nested wrappers. Mixed-precision reduction completion and
+actual device qualification remain separate obligations.
+
+Independent read-only review found no confirmed defect in this shared-storage change; it
+explicitly did not qualify emitted-device execution. The retained mixed-scale scalar-gradient
+control still refuses with `:equation-first-coverage`. Its trace first declines an ordered
+scalar after parallel work, and still contains a later Object-carried checked narrowing.
+Do not substitute payload metadata for either evaluation sequencing or source conversion proof.
+
+Downstream qualification of the downloaded 0.2.1690 jar now reports 49 tests / 757 assertions
+and both fresh inline/packed-lagged marketing workers passing, including changed-data AOT and
+MM allocation finite differences. This is workflow correctness evidence, not throughput evidence.
+The separate preserved helper lifecycle still fails when a retained runtime gradient is reused
+after AOT preparation: template revision stays 238 while compiler revision advances 1560→1564.
+Keep that runtime→AOT→runtime sequence as a compatibility-debt acceptance case. Identify the
+actual semantic/derived definition changes before changing invalidation granularity; never
+reset or bypass the freshness guard to make the acceptance pass.
+
+The read-only reference audit used local LLVM `585e2a01` and Valhalla JDK `775bcc5bdf2`.
+LLVM LoopVectorize separates CFG/instruction/memory legality, runtime alias checks, VPlan and
+costing; SLP is a separate packing optimization. C2 SuperWord likewise has dependency analysis,
+speculative alias checks and profitability filtering. LLVM and C2 distinguish strict ordered
+FP reductions from authorized reassociation; MLIR VectorToLLVM defaults reassociation off.
+Do not rank these systems from unmatched numerical contracts or source inspection alone.
+
+Priority within items 1–5: (1) close canonicalization/import handoffs with shared scope/context
+machinery; (2) separate region numerical permissions from operator-level monoid facts;
+(3) connect access/range, physical-view alias, ownership and completion evidence; (4) add narrow
+guarded/costed vector plans only after differential legality controls. Existing raw-loop recovery
+consults a global FP monoid permission; qualify and reconcile this with explicit-permission
+semantics before widening it. The tested native scalar/requested-SIMD cancellation probe agreed,
+so no changed numerical result was established by this exploration.
+
+External acceptance may include a small synthesis/GA workload from Jack Rusher and, later,
+Timestral-5M forecasting in pretrained-rstr. Timestral adds tests for mixed F32/F64 statistics,
+masking/scans and robust existing math, not a new time-series compiler dialect. Its public
+inference does not require AD; training qualification is separate. Existing naive `asinh`
+cancellation is numerical-stdlib debt. These additions do not replace the original eight gates.
+
 ### Execution order
 
 1. **Bound local compilation work (items 1–3).** Profile scalar-effect analysis, fusion candidate

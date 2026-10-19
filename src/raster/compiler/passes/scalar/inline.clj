@@ -1484,6 +1484,12 @@
   ([expr] (anf-lift expr false))
   ([expr sequential-only?]
   (cond
+    ;; Distributing this obligation across a wrapper's children needs its own
+    ;; proof. Keep the wrapper intact rather than stripping a denial marker
+    ;; and allowing a later DCE to erase a throwing discarded initializer.
+    (true? (:raster.effect/preserve-evaluation (meta expr)))
+    [[] expr]
+
     ;; Binding form in expression position → lift bindings out with renaming
     (form/binding-form? expr)
     (let [[_ inner-bindings & inner-body] expr

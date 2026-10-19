@@ -69,6 +69,17 @@
     (let [source (list 'let* ['result opaque] 'result)]
       (is (= source (inline/flatten-nested-lets source {:sequential-only? true}))))))
 
+(deftest wrapper-normalization-does-not-discard-evaluation-denials
+  (let [wrapped (with-meta '(let* [unused (clojure.core// x 0)] 7.0)
+                  {:raster.effect/preserve-evaluation true})
+        source (list 'let* ['result wrapped] 'result)]
+    (doseq [policy [{} {:sequential-only? true}]]
+      (let [normalized (inline/flatten-nested-lets source policy)
+            initializer (nth (second normalized) 1)]
+        (is (= wrapped initializer))
+        (is (true? (:raster.effect/preserve-evaluation (meta initializer))))
+        (is (false? (effects/removable-expr? initializer)))))))
+
 (deftest value-gradient-projection-indices-use-checked-constant-evidence
   (let [elements {'vg ['primal 'gradient]}]
     (doseq [index [1 '(long 1) '(clojure.core/long 1) '(clojure.core/int (long 1))]]

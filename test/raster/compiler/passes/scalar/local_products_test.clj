@@ -334,6 +334,41 @@
     (is (= :good (run (products/lower-local-products source) nil calls)))
     (is (= 1 @calls))))
 
+(deftest inline-projections-reuse-ordered-product-completion
+  (let [source '(clojure.core/nth
+                 [(do (swap! calls conj :first) x)
+                  (do (swap! calls conj :second) (clojure.core// 1 x))] 0)
+        lowered (products/lower-local-products source)]
+    (is (not-any? #{'clojure.core/nth} (tree-seq coll? seq lowered)))
+    (doseq [x [0 2]]
+      (let [outcome (fn [form]
+                      (let [calls (atom [])]
+                        (assoc (try {:value (run form x calls)}
+                                    (catch Throwable e {:error (class e)}))
+                               :trace @calls)))
+            expected (outcome source)]
+        (is (= [:first :second] (:trace expected)))
+        (is (= expected (outcome lowered)))))))
+
+(deftest inline-product-projections-preserve-existing-reference-identity
+  (let [source '(clojure.core/identical? x (clojure.core/nth [x x] 0))
+        lowered (products/lower-local-products source)]
+    (doseq [x [nil (Double/valueOf 1234.5) (Float/valueOf (float 1234.5)) (double-array 0)]]
+      (is (true? (run source x nil)))
+      (is (true? (run lowered x nil))))))
+
+(deftest inline-projections-do-not-consume-default-or-trapping-index-evaluation
+  (doseq [source ['(clojure.core/nth [x] 0 (do (swap! calls inc) 9))
+                  '(clojure.core/nth [x] 2)
+                  '(clojure.core/nth [] 0)
+                  '(clojure.core/nth [x] (int 4294967296))]]
+    (is (= source (products/lower-local-products source))))
+  (let [source '(clojure.core/nth [x] 0 (do (swap! calls inc) 9))]
+    (doseq [form [source (products/lower-local-products source)]]
+      (let [calls (atom 0)]
+        (is (= 7 (run form 7 calls)))
+        (is (= 1 @calls))))))
+
 (deftest known-seed-removes-an-unknown-product-branch-without-arithmetic-rewrites
   (let [source '(let* [dy 1.0
                        result (if (clojure.core/nil? dy) [nil nil]

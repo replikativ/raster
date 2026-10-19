@@ -918,12 +918,15 @@
         ;; the parameter payload authority. Arrays remain nullable references.
         scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
                              [p (elem->ctype (tag->elem (get param-env p)) "int")]))
-        parameter-facts (into {} (keep (fn [[p c]]
+        parameter-facts (into (into {} (keep (fn [[p tag]]
+                                              (when (contains? types/primitive-array-info tag)
+                                                [p {:presence :unknown :array-tag tag}])) param-env))
+                             (keep (fn [[p c]]
                                         (let [dt (ctype->ffm c nil)]
                                           (when (#{:float :double} dt)
                                             [p {:presence :present :scalar-type dt
                                                 :producer-scalar-type dt}])))) scalar-params)
-        form (local-products/project-native-alias-snapshots
+        form (local-products/project-storage-alias-snapshots
               form parameter-facts
               (when (#{:float :double} return-type)
                 (types/tag->java-class (dtype/scalar-tag-for-dtype return-type))))

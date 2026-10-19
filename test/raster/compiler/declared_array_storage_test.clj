@@ -26,6 +26,13 @@
                             :max-workgroup-size 1024 :shared-local-memory 65536}})
     (f)))
 
+(deftest shared-semantic-entry-discharges-array-reference-snapshots
+  (is (= [3.0 -4.0]
+         (vec (storage/object-context-array-map (double-array [1.5 -2.0])))))
+  (let [compiled (equation-first/compile #'storage/object-context-array-map
+                                       (merge policy {:target target :dtype :double}))]
+    (is (= :typed-parallel (get-in compiled [:semantic :dialect])))))
+
 (defn- pointer-types [artifact]
   (into {} (keep (fn [slot]
                   (when-not (= :scalar (:kind slot)) [(:name slot) (:dtype slot)])))

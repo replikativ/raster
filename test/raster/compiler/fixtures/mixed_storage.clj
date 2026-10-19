@@ -6,6 +6,11 @@
 
 (def policy {:preserve-declared-array-storage? true})
 
+(deftm object-context-array-map
+  [values :- (Array double)] :- (Array double)
+  (let [mapped (par/map [i (alength values)] (* (aget values i) 2.0))]
+    (nth [mapped mapped] 0)))
+
 (deftm double-exponential-float-storage
   "Explicit Double transcendental evaluation followed by one Float storage conversion."
   [x :- (Array float)] :- (Array float)
