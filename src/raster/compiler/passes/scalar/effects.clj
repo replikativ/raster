@@ -181,10 +181,9 @@
   [expr]
   (into #{}
    (mapcat (fn [node]
-           (when (seq? node)
-             (let [operation (descriptor/semantic-op node)]
+             (let [operation (when (seq? node) (descriptor/semantic-op node))]
                     (cond-> []
-                        (and (not (proven-total-cast? node))
+                        (and (seq? node) (not (proven-total-cast? node))
                              (descriptor/cast-op? operation)
                              (= :reject (descriptor/cast-integral-narrowing operation))
                              (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
@@ -199,7 +198,7 @@
                         ;; This obligation is independent of numeric width,
                         ;; external purity, and actual primitive/Object storage.
                         (true? (:raster.effect/preserve-evaluation (meta node)))
-                        (conj :preserve-source-evaluation)))))
+                        (conj :preserve-source-evaluation))))
          (tree-seq coll? seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)
@@ -266,7 +265,11 @@
    context; cached source analysis must not survive helper redefinition."
   [expr]
   (if (not (seq? expr))
-    {:effect :pure :flags #{}}
+    ;; Collection literals evaluate their children. They are not scalar leaves,
+    ;; and their evaluation/exception obligations must survive DCE and CSE too.
+    (if (coll? expr)
+      (analyze-descriptor expr)
+      {:effect :pure :flags (source-cast-flags expr)})
     (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
                    [(descriptor-key expr) proof])

@@ -5,6 +5,8 @@
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.scalar.dce :as dce]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.local-products :as products]))
 
 (defn- snapshot [value]
@@ -140,3 +142,107 @@
     (is (not (completion/contains-completion? lowered)))
     (is (= 7.0 (invoke lowered nil calls)))
     (is (= 1 @calls))))
+
+(deftest representation-erasure-preserves-exceptional-evaluation-through-dce
+  (doseq [source ['(let* [a (clojure.core// x 0) p [a 7.0]]
+                     (clojure.core/nth p 1))
+                  '(let* [a (clojure.core/+ x 1) p [a 7.0]]
+                     (clojure.core/nth p 1))
+                  '(let* [a {:value (clojure.core// x 0)} p [a 7.0]]
+                     (clojure.core/nth p 1))
+                  '(let* [a #{(clojure.core// x 0)} p [a 7.0]]
+                     (clojure.core/nth p 1))
+                  '(let* [a [(clojure.core// x 0)] p [a 7.0]]
+                     (clojure.core/nth p 1))
+                  '(let* [a (clojure.core// x 0) b (do a 8.0) p [b 7.0]]
+                     (clojure.core/nth p 1))
+                  '(let* [a (clojure.core/double x) p [a 7.0]]
+                     (clojure.core/nth p 1))]]
+    (let [lowered (products/lower-local-products source)
+          projected (project lowered)
+          repeated (project (products/lower-local-products projected))
+          optimized (:form (dce/eliminate-dead-bindings repeated))
+          x (if (= 'clojure.core/+ (first (nth (second source) 1))) Long/MAX_VALUE nil)
+          ;; Division receives a real number; the nullable conversion receives
+          ;; nil. Each source must throw, independently of compiler inspection.
+          x (if (and (nil? x) (not= '(clojure.core/double x) (nth (second source) 1))) 1 x)
+          outcome (fn [form]
+                    (try (invoke form x nil)
+                         (catch Throwable e (class e))))
+          expected (outcome source)]
+      (is (instance? Class expected) (str source))
+      (doseq [form [lowered projected repeated optimized]]
+        (is (= expected (outcome form)) (str form))))))
+
+(deftest evaluation-denials-apply-to-collection-roots
+  (doseq [value [[1.0] {:value 1.0} #{1.0}]]
+    (let [marked (vary-meta value assoc :raster.effect/preserve-evaluation true)]
+      (is (contains? (:flags (effects/descriptor marked)) :preserve-source-evaluation))
+      (is (false? (effects/removable-expr? marked)))
+      (is (false? (effects/cse-safe-expr? marked))))))
+
+(deftest transitive-obligations-are-owned-by-the-visible-lexical-producer
+  (let [source '(let* [inc (clojure.core// x 0)
+                      b (do inc 8.0)
+                      p [b 7.0]]
+                 (clojure.core/nth p 1))
+        projected (project (products/lower-local-products source))
+        bindings (into {} (map vec) (partition 2 (second projected)))]
+    (is (true? (:raster.effect/preserve-evaluation (meta (get bindings 'inc)))))
+    (is (true? (:raster.effect/preserve-evaluation (meta (get bindings 'b)))))
+    ;; Independent removal of a discarded read must not erase the earlier
+    ;; throwing producer. Its own obligation, not a live use in b, retains it.
+    (let [without-read (util/postwalk-preserving-meta
+                        #(if (= % '(do inc 8.0)) (with-meta '(do 8.0) (meta %)) %) projected)
+          optimized (:form (dce/eliminate-dead-bindings without-read))]
+      (is (thrown? ArithmeticException (invoke optimized 1 nil))))))
+
+(deftest erased-snapshots-preserve-first-failure-and-source-order
+  (let [source '(let* [a (do (swap! calls conj :first) (clojure.core// x 0))
+                      b (do (swap! calls conj :second) (clojure.core/double nil))
+                      p [a b 7.0]]
+                 (clojure.core/nth p 2))
+        optimized (:form (dce/eliminate-dead-bindings
+                          (project (products/lower-local-products source))))]
+    (doseq [form [source optimized]]
+      (let [calls (atom [])]
+        (is (thrown? ArithmeticException (invoke form 1 calls)))
+        (is (= [:first] @calls))))))
+
+(deftest nonlexical-static-field-producers-are-not-total-lexical-aliases
+  ;; System/out is a real, nonconstant GETSTATIC, not a lexical reference.
+  ;; Erasing its storage does not authorize erasing its evaluation (including
+  ;; initialization for an as-yet uninitialized declaring class).
+  (let [source '(let* [a java.lang.System/out p [a 7.0]] (clojure.core/nth p 1))
+        projected (project (products/lower-local-products source))
+        optimized (:form (dce/eliminate-dead-bindings projected))
+        bindings (into {} (map vec) (partition 2 (second optimized)))]
+    (is (contains? bindings 'a))
+    (is (= 'java.lang.System/out (get bindings 'a)))
+    (is (true? (:raster.effect/preserve-evaluation (meta (get bindings 'a)))))
+    (is (= 7.0 (invoke source nil nil) (invoke optimized nil nil)))))
+
+(deftest evaluation-dependency-bookkeeping-is-direct-and-invocation-owned
+  (let [graph (atom {}) consumed (atom #{})]
+    (with-bindings {#'products/*evaluation-dependencies* graph
+                   #'products/*consumed-evaluation-obligations* consumed}
+      (let [scope (reduce (fn [scope i]
+                            (let [id (symbol (str "value_" i))
+                                  previous (symbol (str "value_" (dec i)))
+                                  [known _] (#'products/owned-binding-fact
+                                             scope id (list 'identity previous))]
+                              (assoc scope id known)))
+                          {} (range 128))
+            [_ alias-token] (#'products/owned-binding-fact scope 'alias 'value_127)
+            [diamond _] (#'products/owned-binding-fact scope 'diamond
+                         '[value_126 value_127])]
+        (is (nil? alias-token))
+        (is (every? #(= 1 (count (:evaluation-obligations %))) (vals scope)))
+        (is (= 129 (count @graph)))
+        (is (= 129 (reduce + (map count (vals @graph)))))
+        (#'products/consume-evaluation! diamond)
+        (is (= 129 (count @consumed)))
+        (#'products/consume-evaluation! diamond)
+        (is (= 129 (count @consumed)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no producer"
+              (#'products/consume-evaluation! {:evaluation-obligations #{(Object.)}})))))))

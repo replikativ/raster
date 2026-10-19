@@ -79,7 +79,8 @@
 
 (def ^:private conditional-expansion-limit 4096)
 (def ^:dynamic ^:private *conditional-expansion-budget* nil)
-(def ^:dynamic ^:private *consumed-presence-obligations* nil)
+(def ^:dynamic ^:private *consumed-evaluation-obligations* nil)
+(def ^:dynamic ^:private *evaluation-dependencies* nil)
 
 (defn- product-arity [expression]
   (cond
@@ -180,20 +181,51 @@
 
 (defn- owned-binding-fact [scope id init]
   (let [known (binding-fact scope id init)
-        alias? (or (symbol? init)
+        lexical-read? #(and (symbol? %) (contains? scope %))
+        alias? (or (lexical-read? init)
                    (and (completion/canonical-form? init)
                         (= completion/object-input-contract
                            (:contract (completion/canonical-parts init)))
-                        (symbol? (:operand (completion/canonical-parts init)))))
-        token (when (and *consumed-presence-obligations*
-                         (= :present (:presence known)) (seq? init) (not alias?))
-                (Object.))]
+                        (lexical-read? (:operand (completion/canonical-parts init)))))
+        ;; Presence and evaluation are separate facts. Even an unknown producer
+        ;; must still execute when representation projection removes its last
+        ;; saved reference; it may throw before returning any value at all.
+        token (when (and *consumed-evaluation-obligations*
+                         (or (coll? init) (symbol? init)) (not alias?))
+                (Object.))
+        ;; Retaining a producer alone is insufficient: normalization can remove
+        ;; discarded lexical reads inside it. Record direct dependency edges;
+        ;; copying all ancestors at every binding would grow quadratically.
+        dependencies (when token
+                       (binding [util/*shadowing-locals*
+                                 (into util/*shadowing-locals* (keys scope))]
+                         (into #{} (mapcat #(get-in scope [% :evaluation-obligations]))
+                               (util/free-syms init))))
+        _ (when token
+            ;; Publish immutable edges before the fact can be consumed. Tokens
+            ;; and this graph belong to exactly one analysis invocation.
+            (swap! *evaluation-dependencies* assoc token
+                   (into (or (:evaluation-obligations known) #{}) dependencies)))]
     [(cond-> known token (assoc :evaluation-obligations #{token})) token]))
+
+(defn- consume-evaluation! [known]
+  (when *consumed-evaluation-obligations*
+    (loop [pending (vec (:evaluation-obligations known))]
+      (when (seq pending)
+        (let [token (peek pending) remaining (pop pending)]
+          (if (contains? @*consumed-evaluation-obligations* token)
+            (recur remaining)
+            (let [graph @*evaluation-dependencies*]
+              (when-not (contains? graph token)
+                (throw (ex-info "Evaluation obligation has no producer in this analysis"
+                                {:reason :local-product-evaluation-obligation})))
+              (swap! *consumed-evaluation-obligations* conj token)
+              (recur (into remaining (get graph token))))))))))
 
 (defn- emit-owned-bindings [entries original]
   (with-meta
     (vec (mapcat (fn [[id init token]]
-                   [id (if (and token (contains? @*consumed-presence-obligations* token))
+                   [id (if (and token (contains? @*consumed-evaluation-obligations* token))
                          (vary-meta init assoc :raster.effect/preserve-evaluation true)
                          init)]) entries))
     (meta original)))
@@ -300,9 +332,7 @@
     (and (seq? expression) (= 'clojure.core/nil? (descriptor/semantic-op expression)) (= 2 (count expression)))
     (let [argument (second expression) known (fact env argument)]
       (cond (:fields known) false
-            (:present? known) (do (when *consumed-presence-obligations*
-                                   (swap! *consumed-presence-obligations* into
-                                          (:evaluation-obligations known)))
+            (:present? known) (do (consume-evaluation! known)
                                  false)
             (contains? known :literal) (nil? (:literal known))
             ;; A primitive cast cannot return nil, but can throw. Retain its
@@ -346,7 +376,8 @@
    an escape or expansion limit rolls the entire product rewrite back."
   [expression]
   (binding [*conditional-expansion-budget* (atom conditional-expansion-limit)
-            *consumed-presence-obligations* (atom #{})]
+            *consumed-evaluation-obligations* (atom #{})
+            *evaluation-dependencies* (atom {})]
     (try (lower {} expression true)
        (catch clojure.lang.ExceptionInfo e
          (case (:reason (ex-data e))
@@ -483,13 +514,15 @@
                 (loop [pairs (seq (partition 2 bindings)) scope scope output []]
                   (if-let [[id init] (first pairs)]
                     (let [operand (object-alias-operand init)
-                          known (dissoc (binding-fact scope id init) :native-erased-box?)
+                          [known token] (owned-binding-fact scope id init)
+                          known (dissoc known :native-erased-box?)
                           payload (fp-payload known)
                           continuation (relist value
                                                (concat [head (vec (mapcat identity (next pairs)))] body))
                           unused? (and operand (contains? scope operand)
                                        (binding [util/*shadowing-locals* (conj util/*shadowing-locals* id)]
                                          (not (contains? (util/free-syms continuation) id))))
+                          _ (when unused? (consume-evaluation! known))
                           erase? (and operand payload
                                       (primitive-use-closed? continuation #{id} payload expected))
                           inherited? (and (symbol? init) (:native-erased-box? (get scope init)))
@@ -500,9 +533,12 @@
                       ;; source conversion failure. If never observed, its box
                       ;; storage may disappear without deleting its producer.
                       (recur (next pairs) (assoc scope id known)
-                             (if unused? output (conj output id init))))
-                    (relist value (concat [head (with-meta (vec output) (meta bindings))]
-                                           (map #(project % scope expected) body))))))
+                             (if unused? output (conj output [id init token]))))
+                    ;; Child consumers may discharge a snapshot after the
+                    ;; producer was visited. Realize them before publishing its
+                    ;; initializer and the occurrence-owned evaluation marker.
+                    (let [body' (mapv #(project % scope expected) body)]
+                      (relist value (concat [head (emit-owned-bindings output bindings)] body'))))))
               (and (seq? value) (form/scope-info value))
               (let [{:keys [scopes outer rebuild]} (form/scope-info value)]
                 (rebuild
@@ -512,5 +548,7 @@
                  (mapv #(project % scope nil) outer)))
               (seq? value) (relist value (map #(project % scope nil) value))
               :else value))]
-    (binding [*native-snapshot-visits* (volatile! native-snapshot-visit-limit)]
+    (binding [*native-snapshot-visits* (volatile! native-snapshot-visit-limit)
+              *consumed-evaluation-obligations* (atom #{})
+              *evaluation-dependencies* (atom {})]
       (project expression parameter-facts result-carrier))))
