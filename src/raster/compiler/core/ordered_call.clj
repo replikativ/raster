@@ -58,6 +58,14 @@
    this is not a portable certificate or authority for a later/different loader.
    Lookup does not initialize the classes or execute the target method."
   [^Method method]
+  ;; A qualified method spelling is also syntactically a namespaced Var call.
+  ;; Class identity alone does not close compiler resolution when an alias or
+  ;; namespace masks that qualifier. Refuse before source compilation rather
+  ;; than execute a different Var under an exact-Method certificate.
+  (let [qualifier (symbol (.getName (.getDeclaringClass method)))]
+    (when (or (get (ns-aliases *ns*) qualifier) (find-ns qualifier))
+      (throw (ex-info "source method qualifier is masked by a namespace"
+                      {:reason :source-invocation-namespace-shadow :qualifier qualifier}))))
   (doseq [^Class carrier (distinct (concat [(.getDeclaringClass method) (.getReturnType method)]
                                           (.getParameterTypes method)))
           :when (not (.isPrimitive carrier))]

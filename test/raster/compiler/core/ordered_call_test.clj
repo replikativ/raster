@@ -8,6 +8,22 @@
 (def ^:dynamic *target* nil)
 (def policy {:unchecked-math false})
 
+(deftest qualified-method-source-cannot-be-redirected-through-a-namespace-alias
+  (let [source (create-ns (gensym "raster.test.method_source_"))
+        shadow (create-ns (gensym "raster.test.method_shadow_"))
+        method (.getMethod java.util.Objects "isNull" (into-array Class [Object]))
+        head (with-meta 'java.util.Objects/isNull {:param-tags [Object]})]
+    (try
+      (intern shadow 'isNull (fn [_] :shadowed))
+      (binding [*ns* source]
+        (alias 'java.util.Objects (ns-name shadow))
+        (is (= :shadowed ((eval (list 'fn* '[x] (list head 'x))) nil))
+            "the actual source compiler resolves the alias, not the claimed static Method")
+        (is (= :source-invocation-namespace-shadow
+               (try (ordered/verify-source-method! method) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+      (finally (remove-ns (ns-name source)) (remove-ns (ns-name shadow))))))
+
 (defn- compile-source [params body source-policy]
   (binding [*unchecked-math* (:unchecked-math source-policy)]
     (eval (list 'fn* params body))))
