@@ -854,6 +854,11 @@
                            "double_division_narrowing"
                            (body-fixtures/double-division-narrowing-body)
                            {:target-dialect dialect}))
+           (write-source! directory suffix "checked-float-stage-qualification"
+                          (body-emit/emit-scalar-kernel
+                           "checked_float_stage_qualification"
+                           (body-fixtures/checked-float-stage-body 25)
+                           {:target-dialect dialect}))
            (write-source! directory suffix "scalar-while"
                           (body-emit/emit-scalar-kernel
                            "scalar_while" (body-fixtures/scalar-while-body)

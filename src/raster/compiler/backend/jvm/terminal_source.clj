@@ -5,6 +5,7 @@
   (:require [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.ordered-call :as ordered]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util])
@@ -22,9 +23,13 @@
   (into {}
         (map (fn [operation]
                [operation (entry/emission-definition-snapshot (resolve operation))]))
-        (conj (into #{} (filter #(and (= "clojure.core" (namespace %))
-                                      (contains? #{'float 'double} (descriptor/cast-result-tag %))))
-                    (keys descriptor/cast-ops))
+        (conj (into (into #{} (filter #(and (= "clojure.core" (namespace %))
+                                            (contains? #{'float 'double} (descriptor/cast-result-tag %))))
+                          (keys descriptor/cast-ops))
+                    (comp (filter #(= "clojure.core" (namespace %)))
+                          (filter #(source-arithmetic/binary-operator? (name %))))
+                    (concat descriptor/addition-ops descriptor/subtraction-ops
+                            descriptor/multiplication-ops descriptor/division-ops))
               'clojure.core/nil?)))
 
 (defn- intrinsic-current! [v operation]
@@ -181,6 +186,23 @@
                         (and (= 'clojure.core/nil? operation) (= 1 (count arguments)))
                         (do (intrinsic-current! v operation)
                             (static-call java.util.Objects "isNull" [Object] [(:source (first arguments))]))
+                        (and operation (= "clojure.core" (namespace operation))
+                             (source-arithmetic/binary-operator? (name operation)))
+                        (do
+                          (intrinsic-current! v operation)
+                          ;; This is physical carrier selection, not a result-tag
+                          ;; guess. Other carriers/arity need their own exact source
+                          ;; overload/completion projection before admission.
+                          (when-not (and (= 2 (count arguments))
+                                         (every? #(= Double/TYPE (:carrier %)) arguments)
+                                         (= :double (:result-carrier
+                                                     (source-arithmetic/binary-plan
+                                                      (name operation) :double :double))))
+                            (fail! "terminal arithmetic needs its exact primitive source carriers"
+                                   {:head head :carriers (mapv :carrier arguments)}))
+                          (static-call clojure.lang.Numbers
+                                       (source-arithmetic/numbers-method-name (name operation))
+                                       [Double/TYPE Double/TYPE] (mapv :source arguments)))
                         (or (:macro metadata) (:inline metadata) (nil? v))
                         (fail! "terminal call has no owned non-expanding projection" {:head head})
                         :else

@@ -14,10 +14,24 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Integration hold: PR #1539 at `e3046c82` is draft, not qualified for merge.
-Setup/build passed, but unit, OpenCL CPU and emission-fixture jobs failed;
-dependent CUDA/HIP checks do not establish acceptance. Focused source-obligation
-gates are not evidence of broad compatibility. Triage retains these groups:
+Current integration hold: PR #1539 at `db3b4789` is draft, not qualified for merge.
+Setup/build passed; emission 32517 and unit 32520 failed. All 16 unit shards
+finished (15 failed, one passed); this is not a green compiler baseline. OpenCL
+32521 also failed. Dependent CUDA/HIP
+jobs are not acceptance evidence. The following table takes precedence over
+historical receipts below; do not infer broad qualification from focused gates.
+
+| Boundary | Current evidence | Next acceptance requirement |
+|---|---|---|
+| Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |
+| Checked numerical map result | Actual emission 32517 refuses checked Double-to-Float in public `mixed-scale`; no production status observation yet | Certify private output/diagnostic realization, observe success before initialization/consumer/publication, and preserve checked source diagnostics. Never relabel checked casts IEEE to pass. |
+| Training scalar source coverage | Unit 32520 and warm local reproduction reject `local-gradient-sum`: nested reduce/divide and later scale scalar carry mandatory source evaluation | Close source-order/carrier evidence without dropping preservation flags or duplicating evaluation; retain the actual distributed-training composition oracle. |
+| Existing AD/native/fusion integration | Exact-head unit logs still contain native refusals, closed-product AD gaps and fusion/terminal-conversion failures | Classify actual semantic gaps versus obsolete structural expectations; preserve numerical/failure oracles. Updating tests must not substitute for implementation. |
+| Distributed and durable workload acceptance | Original obligations remain below; training composition currently blocked by the scalar row above | Complete their unchanged workload gates after shared compiler fixes. Local co-location/simulation is not multi-host performance evidence. |
+
+### Historical integration receipts (not the current acceptance status)
+
+Earlier integration hold at `e3046c82` identified these groups:
 
 - Source memory evaluation: unused owned allocations lose negative-size failures
   in invoked JVM AOT; independent probes also lose unused read bounds failures
@@ -605,6 +619,25 @@ held until their source-order and carrier-specific contracts are proved.
 Independent design review confirmed this bounded seam and requires replay-reset,
 failure-before-consumer, alias/donation refusal and extra-throwing-operation
 negative controls. No checked-stage runtime implementation is claimed here.
+
+The next physical realization was first exercised as a test-only KernelBody
+fixture, not a production schedule: compare the original Double to exact
+`+/-Float/MAX_VALUE`, convert/write only valid lanes, and overwrite each lane's
+status on both success and failure. NaN remains source-valid; infinities and the
+immediate Double neighbours outside the finite Float interval fail. Checking
+whether the narrowed Float is infinite would be incorrect at those neighbours.
+The experiment runs failure -> mixed -> success -> mixed to detect stale status.
+Local generated CUDA source compiled to PTX with nvcc 12.4, and HIP source to a
+gfx1100 code object with the installed HIP/Clang toolchain, both without hardware.
+These are physical feasibility checks, not public checked-map support, general
+initialization evidence, CUDA/HIP execution or performance qualification.
+
+A bit-only status cannot reproduce value-dependent source diagnostics. Preserve
+the offending original Double in private stage diagnostics, and prove the selected
+failure lane's correspondence to source traversal before reconstructing the source
+exception. Diagnostic storage is only readable for a failure-selected lane whose
+write completed; successful output initialization remains conditional on status
+observation. Zero-length success must require neither launch nor status read.
 
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
@@ -5506,6 +5539,18 @@ returns, changed-input replay, overflow, explicit mode refusal and injected miss
 publication. No full campaign, device-performance or broad source-completeness
 claim follows from these tests. Checked conversions inside numerical map stages
 remain a separate open completion-before-publication obligation.
+
+Follow-up terminal coverage includes binary core arithmetic over actual primitive
+Double operands. The owner uses the shared source-arithmetic plan and method-name
+translation to resolve exact Numbers overloads, retaining Double operations before
+checked Float narrowing. Logical result tags do not select carriers. Other arities
+and carriers still refuse. Core arithmetic Var/inline definitions join the existing
+bootstrap ownership guard, not a new inference registry. A fresh-process affected
+gate passes 27 tests / 1,067 assertions, including source arithmetic plans, terminal
+ownership controls and the guarded Float hardware experiment; the original public
+wide-add/narrow test passes ten assertions on OpenCL/Level Zero with changed replay
+and explicit resident-API refusal. This is host-result qualification, not resident
+composition or a broad green CI receipt.
 
 ### Observable scalar checkpoints alongside resident state
 

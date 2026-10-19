@@ -62,6 +62,31 @@
     (is (= (float 2.0) (invoke 2.0)))
     (is (= (float 3.0) (invoke 3.0)))))
 
+(deftest terminal-double-arithmetic-keeps-the-source-operation-before-narrowing
+  (doseq [operator '[clojure.core/+ clojure.core/- clojure.core/* clojure.core//]
+          right [0.25 0.0 -0.0]]
+    (let [body (list 'clojure.core/float (list operator 'total right))
+          p (boundary body) v (source) c (contract p v)
+          {:keys [owner]} (compile-owned p c v)
+          oracle (eval (list 'fn [(with-meta 'total {:tag 'double})] body))]
+      (doseq [value [16777217.0 0.0 -0.0 Double/MAX_VALUE
+                     Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
+        (is (= (outcome oracle value)
+               (outcome #(owner/invoke-terminal-result owner p c [%]) value)))))))
+
+(deftest terminal-arithmetic-never-borrows-a-dtype-tag-or-unowned-definition
+  (let [v (source)]
+    (doseq [body ['(float (+ total 1.0 2.0))
+                 '(float (+ total 1))]]
+      (let [p (boundary body) c (contract p v)]
+        (is (= :unclosed-terminal-source-projection (reason #(compile-owned p c v))))))
+    (let [p (boundary '(float (+ total 0.25))) c (contract p v)
+          original (meta #'clojure.core/+)]
+      (try
+        (alter-meta! #'clojure.core/+ assoc :inline (fn [& _] 0.0))
+        (is (= :terminal-intrinsic-definition-mismatch (reason #(compile-owned p c v))))
+        (finally (reset-meta! #'clojure.core/+ original))))))
+
 (deftest terminal-executable-needs-preexisting-definition-ownership
   (let [p (boundary '(float total)) v (source) c (contract p v)]
     (is (= :unowned-terminal-source (reason #(owner/compile-terminal-result p c v))))

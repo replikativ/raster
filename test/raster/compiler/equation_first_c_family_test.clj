@@ -2249,19 +2249,23 @@
       (is (= [-1 -1] (vec output))))))
 
 (deftest checked-scalars-after-device-work-do-not-become-preparation-checks
+  (let [output (int-array [-1 -1])]
+    (is (thrown? ArithmeticException
+                 (checked-casts/checked-after-write! output 2 2147483648)))
+    (is (= [1 1] (vec output)) "the source failure follows, not precedes, the writes"))
   (doseq [target [cuda-target hip-target]]
     (let [failure (try
                     (equation-first/compile #'checked-casts/checked-after-write!
                                            {:target target :dtype :int})
                     nil
                     (catch clojure.lang.ExceptionInfo exception (ex-data exception)))]
-      (is (= :equation-first-coverage (:reason failure)))
-      (is (= :none (:fallback failure)))
-      (is (= :typed-soac-source-coverage (get-in failure [:coverage :reason])))
-      (is (some #(and (= :uncertified-host-scalar (:reason %))
-                      (= 'int (:operation %))
-                      (symbol? (:binding %)))
-                (get-in failure [:coverage :bindings]))))))
+      ;; Terminal scalar observation now gets as far as complete-result proof.
+      ;; Returning the earlier ARRAY is still unsupported: it must not erase or
+      ;; run the unused checked suffix during preparation.
+      (is (= :structured-control-source-result (:reason failure)))
+      (is (= :invocation-terminal-carrier (get-in failure [:cause :reason])))
+      (is (= [:return] (:site failure)))
+      (is (= '(let* [checked (int limit)] written) (:source-result failure))))))
 
 (deftest padded-map-lanes-do-not-evaluate-checked-conversions
   (doseq [target [cuda-target hip-target]]
