@@ -15,6 +15,10 @@
   (let [a (ra/aget theta 0) b (ra/aget theta 1)]
     (scalar-pair a b xs cnt)))
 
+(deftm compound-vector-pair [theta :- (Array double) xs :- (Array double) cnt :- Long] :- Double
+  (let [a (ra/aget theta 0)]
+    (scalar-pair (n/* a a) 0.5 xs cnt)))
+
 (deftm inline-pair [theta :- (Array double) xs :- (Array double) cnt :- Long] :- Double
   (let [a (ra/aget theta 0) b (ra/aget theta 1)]
     (par/reduce acc 0.0 i cnt (n/+ acc (n/* a (n/+ b (ra/aget xs i)))))))
@@ -46,10 +50,12 @@
 (deftest unowned-helper-pullback-refuses-during-derivation-not-at-invocation
   ;; This is a safety regression, NOT nested-helper AD acceptance. Keep the
   ;; numerical oracle above for the future forward-owned residual implementation.
-  (doseq [options [[] [:wrt [0]]]]
-    (let [error (try (apply reverse/value+grad #'vector-pair options)
+  (doseq [v [#'vector-pair #'compound-vector-pair]
+          options [[] [:wrt [0]]]]
+    (let [error (try (apply reverse/value+grad v options)
                      (catch clojure.lang.ExceptionInfo e e))]
       (is (instance? clojure.lang.ExceptionInfo error))
       (is (= :ad-unowned-derived-pullback (:reason (ex-data error))))
+      (is (= :bytecode-input-completion (:scope (ex-data error))))
       (is (seq (:active (ex-data error))))
       (is (seq (:form (ex-data error)))))))

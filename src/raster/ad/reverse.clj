@@ -6354,6 +6354,20 @@
                 (when-not (and context dispatch? (nil? lexical-callee)
                                (contains? #{Float/TYPE Double/TYPE Object} (:return-carrier context)))
                   (fail! {:phase :call-context :form expression}))
+                ;; The current completed-input producer owns FP parameters,
+                ;; not arbitrary array/integer helper signatures. Refuse at
+                ;; the AD boundary with its retained active ports/form instead
+                ;; of leaking an unrelated value-completion construction error.
+                (when-not (every? #{Float/TYPE Double/TYPE}
+                                  (.getParameterTypes ^java.lang.reflect.Method (:method context)))
+                  (throw (ex-info "Derived helper inputs have no owned floating completion region"
+                                  {:reason :ad-unowned-derived-pullback
+                                   :op operation :implementation-op implementation-op
+                                   :form expression :scope :bytecode-input-completion
+                                   :active (ordered-active-inputs
+                                            expression
+                                            (into {} (map (fn [[id port]]
+                                                            [id (get-in @state [:activity (:value port)])])) env))})))
                 (let [inputs
                       (mapv (fn [index input]
                               (check-ports! (:ports input) env)
