@@ -708,12 +708,19 @@
         bound (get contexts [witness :bound-scope])
         loop-entry (get contexts [witness :loop])
         backedge (get contexts [witness :recur])
+        exit (get contexts [witness :exit])
         variables (:variables loop-entry)]
     (when (and (= :jvm-bytecode (:backend emission)) token witness
                (identical? original (get (:reduction-catalog emission) token))
                (identical? original (:source expansion))
-               (every? #(= :known (:status %)) [expansion bound loop-entry backedge])
-               (every? #(identical? witness (:witness %)) [bound loop-entry backedge])
+               (every? #(= :known (:status %)) [expansion bound loop-entry backedge exit])
+               (every? #(identical? witness (:witness %)) [bound loop-entry backedge exit])
+               ;; Macroexpansion rebuilds the generated node. Attest its actual
+               ;; emitted parent/child edges, not equality to pre-expansion code.
+               (some #(identical? (:expression exit) %) (:body loop-entry))
+               (identical? (nth (:expression exit) 2 nil) (:expression backedge))
+               (= (second variables) (:value exit))
+               (= (get-in loop-entry [:locals (second variables)]) (:local exit))
                (= 1 (:binding-count bound))
                (= :int (get-in bound [:after :type]))
                (= (:after bound) (get-in loop-entry [:outer-locals (:binder bound)]))
@@ -722,7 +729,7 @@
                (some? (:label-id loop-entry))
                (identical? (:label-id loop-entry) (:label-id backedge)))
       (me/assert-emission-inputs-current! emission)
-      {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge})))
+      {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge :exit exit})))
 
 (defn- retain-binding-context! [ctx binding-count index binder initializer before after]
   (when-let [token (::binding-scope-occurrence ctx)]
@@ -3701,6 +3708,12 @@
                               (do (.aconst_null code) :ref))]
               (when (primitive? else-type)
                 (emit-box-to-ref code else-type))
+              ;; Record the real carry load and merge conversion. A logical
+              ;; Double carry alone does not prove a primitive loop result.
+              (retain-reduction-observation!
+                ctx :exit {:value else :local (get locals else) :input-type else-type
+                           :result-type (if (primitive? else-type) :ref else-type)
+                           :context (completion/bytecode-operand-context ctx)})
               (.labelBinding code end-label)
               (if (primitive? else-type) :ref else-type)))
         ;; Normal case: both branches produce values.

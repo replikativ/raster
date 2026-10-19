@@ -99,7 +99,7 @@
 (deftest reduction-observations-retain-the-actual-loop-and-backedge-carriers
   (let [emission (emitted #'weighted-reduction)
         source (first (vals (:reduction-catalog emission)))
-        {:keys [expansion bound loop recur] :as observed}
+        {:keys [expansion bound loop recur exit] :as observed}
         (bytecode/retained-reduction-emission emission source)]
     (is (some? observed))
     (is (identical? source (:source expansion)))
@@ -111,6 +111,11 @@
            (:context bound)))
     (is (every? #(= (:context bound) (:context %)) (:initializers loop)))
     (is (identical? (:label-id loop) (:label-id recur)))
+    (is (= :double (get-in exit [:local :type])))
+    (is (= :ref (:result-type exit)))
+    (is (= (second (:variables loop)) (:value exit)))
+    (is (some #(identical? (:expression exit) %) (:body loop)))
+    (is (identical? (nth (:expression exit) 2) (:expression recur)))
     (is (= (:after bound) (get-in loop [:outer-locals (:binder bound)])))
     (is (= :ref (get-in loop [:outer-locals 'gain :type])))
     (is (identical? Object (get-in loop [:outer-locals 'gain :reference-class])))
@@ -119,7 +124,15 @@
                emission (with-meta (apply list source) (meta source)))))
     (is (nil? (bytecode/retained-reduction-emission
                (assoc-in emission [:reduction-contexts [(:witness expansion) :recur] :label-id] (Object.))
-               source)))))
+               source)))
+    (is (nil? (bytecode/retained-reduction-emission
+               (assoc-in emission [:reduction-contexts [(:witness expansion) :exit] :local :slot] -1)
+               source)))
+    (is (nil? (bytecode/retained-reduction-emission
+               (update-in emission [:reduction-contexts [(:witness expansion) :exit] :expression]
+                          #(with-meta (apply list %) (meta %))) source)))
+    (is (nil? (bytecode/retained-reduction-emission
+               (update emission :reduction-contexts dissoc [(:witness expansion) :exit]) source)))))
 
 (deftest reduction-observations-do-not-assume-double-carries
   (let [emission (emitted #'float-reduced)

@@ -3464,9 +3464,13 @@
 
         ;; Active free symbols
         active-free (filterv (fn [p] (contains? free-syms p)) active-params)
+        prepared-array-step? (and step-program (not typed-double?) (empty? agets)
+                                  (= (into [acc-sym] active-free) (:active-inputs step-program))
+                                  (= #{} (:writes step-program)))
         _ (doseq [p active-free]
-            (when (= :array (:kind (tangent/tangent-kind
-                                    (:raster.type/tag (meta p)))))
+            (when (and (not prepared-array-step?)
+                       (= :array (:kind (tangent/tangent-kind
+                                         (:raster.type/tag (meta p))))))
               (throw (ex-info
                       "par/reduce AD: active arrays must be read through a recognized aget"
                       {:reason :par-reduce-untracked-array-read
@@ -6444,13 +6448,11 @@
                     indexed? (and (symbol? index) (= index (:source attested-index))
                                   (= (:facts index-port) (:facts attested-index))
                                   (= :int (get-in index-port [:facts :type]))
-                                  (not (get-in @state [:activity (:value index-port)]))
-                                  (not (get-in @state [:activity (:value source)])))
+                                  (not (get-in @state [:activity (:value index-port)])))
                     input (:input observed)
                     outlined? (and observed (:primitive-index? observed)
                                    (= (:facts source) (:array-local observed))
                                    (not (integer? index)) (not indexed?)
-                                   (not (get-in @state [:activity (:value source)]))
                                    (every? (fn [[id facts]]
                                              (and (= facts (get-in env [id :facts]))
                                                   (contains? #{:int :long} (:type facts))
@@ -6461,7 +6463,8 @@
                 ;; Inactive index computation stays with its actual emitter.
                 ;; Only observed primitive routes prove empty memory effects;
                 ;; inactive ports alone cannot hide reads/writes/fallback calls.
-                ;; Active-array scatters still need their own evidence.
+                ;; Array receiver activity is independent of this proof; the
+                ;; ordinary read transpose retains the completed index.
                 (when-not (and (seq? actual) (= 'clojure.core/aget (first actual)) (= 3 (count actual))
                                source (contains? '#{double float} tag)
                                (or (nil? after) (= (:type after) (keyword (name tag))))
@@ -6532,6 +6535,7 @@
                     [_ _ init-source _ bound-source] expression
                     bound (:bound observed)
                     init (get-in observed [:loop :initializers 1])
+                    exit (:exit observed)
                     bound-facts (get-in env [bound-source :facts])]
                 ;; First integration: source primitive count/local and primitive
                 ;; Double seed only. Compound seeds/counts need their own entry
@@ -6544,6 +6548,14 @@
                                (= bound-source (second (:initializer bound)))
                                (= :double (:input-type init) (:completed-type init) (get-in init [:after :type]))
                                (= init-source (:initializer init))
+                               ;; Actual canonical loop exit loads the Double
+                               ;; carry, then boxes it at the divergent-if merge.
+                               ;; Never infer physical result from logical dtype.
+                               (= :double (get-in exit [:local :type]))
+                               (= :ref (:result-type exit))
+                               (or (= :double (:input-type exit))
+                                   (and (= :ref (:input-type exit))
+                                        (get-in exit [:context :object-result?])))
                                (or (instance? Double init-source)
                                    (and (symbol? init-source)
                                         (not= init-source (nth expression 3))
@@ -6564,7 +6576,12 @@
                                {:raster.type/tag 'double})
                       free (util/free-syms (list 'let* (:bindings step) (:result step)))
                       active-free (filterv free (ordered-active-inputs marker (:activity @state)))
-                      _ (when-not (every? #(= :scalar (:kind (tangent/tangent-kind (types/sym-type-tag %)))) active-free)
+                      ;; The prepared step saves its complete pullback. Array
+                      ;; cotangents use the same read transpose and grad-acc as
+                      ;; an owned straight-line body; indices are saved, not
+                      ;; reconstructed by the source/replay reduction path.
+                      _ (when-not (every? #(contains? #{:scalar :array}
+                                                      (:kind (tangent/tangent-kind (types/sym-type-tag %)))) active-free)
                           (fail! {:phase :active-reduction-array :form expression}))
                       visible (vec (distinct (concat params (map :value (vals env)) [(:index step) (:carry step)])))
                       program (binding [*generated-product-context*
@@ -6583,7 +6600,10 @@
                   (swap! state update :helpers into (:helpers step))
                   (swap! state update :input-regions into (:input-regions step))
                   (.put reductions marker {:form marker :step spec})
-                  (append! (ad-gensym "body_reduction" 'double) marker))))
+                  (let [value (append! (ad-gensym "body_reduction" 'double) marker)
+                        boxed (vary-meta (ad-gensym "body_reduction_result" 'double) assoc :tag 'Object)]
+                    (append! boxed (value-completion/complete-value
+                                     value-completion/object-input-contract value))))))
             (lower-scope [expression env]
               (let [{:keys [sequential? scopes outer]} (form/scope-info expression)
                     {:keys [binders inits body]} (first scopes)]
@@ -6634,7 +6654,9 @@
                                                                             (get-in current [initializer :facts :reference-class])))
                                                            (and allocation
                                                                 (identical? (:array-class allocation)
-                                                                            (:reference-class after)))))) (fail!))
+                                                                            (:reference-class after))))))
+                                      (fail! {:phase :binding-carrier :binder binder :form initializer
+                                              :physical after :value-tag tag :value-metadata (meta value)}))
                                     (append! id value)
                                     (assoc current binder {:value id :facts after}))))
                               env (map vector (range) binders inits))]

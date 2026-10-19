@@ -224,7 +224,8 @@
                                 (list 'recur (list 'clojure.core/unchecked-inc-int i-sym) body-expr))
          loop-node (retain-node :loop
                                (list 'loop* [i-sym '(int 0) acc-sym init-expr]
-                                     (list 'if (list '< i-sym n-sym) recur-node acc-sym)))]
+                                     (retain-node :exit
+                                                  (list 'if (list '< i-sym n-sym) recur-node acc-sym))))]
      (retain-node :bound-scope (list 'let* [n-sym (list 'int bound-expr)] loop-node)))))
 
 (defn expand-par-scan

@@ -56,8 +56,15 @@ primitive count and primitive/literal seed. The checked bound is evaluated
 before the seed, and the seed is evaluated once, even on a zero-trip reduction.
 The existing ordered reduction assembler stores each step's pullback closure.
 Reverse traversal consumes those closures; it does not rerun forward steps or
-infer replay purity from an absence of known writes. Nested reductions and
-unclosed carry, active-array indexing or conversion contexts refuse.
+infer replay purity from an absence of known writes. Nested reductions,
+active/effectful index computation and unclosed carry or conversion contexts
+refuse.
+
+The actual canonical exit branch is retained too: its emitted parent/child
+edges connect the loop body, carry load and backedge. A Double carry does not
+prove that the reduction result is physically primitive. When the emitter
+boxes the exit at its branch merge, normalization retains that Object completion
+and the local's Object carrier independently of its Double tangent declaration.
 
 Packed inactive observation indices can be outlined by the same bytecode
 input-region compiler. Every emitted index node starts open. Only actual
@@ -69,6 +76,22 @@ JVM Int coercion is preserved, not replaced by a potentially trapping source
 `int` cast. A primitive-returning static sibling evaluates the index, while the
 ordinary array read remains visible to memory analysis. These sibling specs
 and their declaring owner are private parts of the enclosing executable.
+
+The same inactive integer-index proof can address an active parameter array.
+Receiver activity and index activity are separate premises. The ordinary read
+transpose sees the completed Int index; the saved step pullback retains it and
+the original numerical read values. Prepared steps may therefore have array
+captures, accumulated by the existing `grad-acc`, only with exact tangent ports,
+no writes, no extracted-read reconstruction and no typed carry replay. Duplicate
+indices accumulate, rather than overwrite. No new array derivative rule or
+model-specific transformation is involved. This correctness-first path may
+allocate a whole array cotangent per step; it is not a performance claim.
+
+Observed size-only Float/Double zero-array allocations use these same owned
+integer-input siblings for count completion. The completed count and constructor
+remain in source order, including unused negative-size failures. Freshness is
+separate from count admission and grants neither replay nor nonescape authority;
+active/effectful count computation remains unsupported by this AD producer.
 
 Original source walking is published before bytecode dependency capture, never
 reconstructed from AD/SIMD-transformed code. A missing legacy cache requires
