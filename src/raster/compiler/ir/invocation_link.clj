@@ -1436,6 +1436,22 @@
                  (or (empty? (:terminal-exports state)) (:terminal-observed? state)))
     (fail! :invocation-ordered-incomplete "source work has not completed" {})))
 
+(defn ^:no-doc ordered-observation-occurrences
+  "Derive required observations from every emitted source occurrence, including
+   unused results. This is an obligation map, never evidence of execution."
+  [state]
+  (let [equations (into {} (map (juxt :id identity)) (get-in state [:program :equations]))]
+    (into {}
+          (keep-indexed
+           (fn [position entry]
+             (when-let [equation (get equations (:equation entry))]
+               (let [observations (into [] (mapcat #(-> (emitted-program/operation-projection
+                                                         (:projections state) %) :stage-results))
+                                        (:operations equation))]
+                 (when (seq observations)
+                   [position {:equation (:id equation) :observations observations}])))))
+          (:source-order state))))
+
 (defn ^:no-doc finish-ordered-storage-boundary
   "Project completed source storage, not an executable program or completion proof.
    The runtime must still check its own observation ledger, initialized ranges and

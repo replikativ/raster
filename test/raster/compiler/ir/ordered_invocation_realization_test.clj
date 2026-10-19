@@ -87,6 +87,11 @@
     (is (= #{} (get-in ready [:entry-contract :full-produces])))
     (is (= #{output} (get-in ready [:entry-contract :success-produces])))
     (is (seq (get-in ready [:entry-contract :observations])))
+    (is (= {:equation (:equation entry) :observations (get-in ready [:entry-contract :observations])}
+           (get (invocation-link/ordered-observation-occurrences state) position)))
+    (is (= (invocation-link/ordered-observation-occurrences state)
+           (invocation-link/ordered-observation-occurrences (assoc-in state [:program :outputs] [])))
+        "unused checked results still require their source observation")
     (is (= :internal (get-in ready [:stage-layout :nodes output :role])))
     (is (identical? pending (link-plan/validate-pending-observed-entry! pending)))
     (is (= :checked-stage-observation-required

@@ -29,7 +29,7 @@ Do not erase the check or assume that parallel partial writes preserve failure o
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|
 | Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |
-| Checked numerical map result | Source-derived `mixed-scale` compiles across OpenCL/CUDA/HIP. A confined internal binder now executes and observes the actual generated equation on local OpenCL/Level Zero, with source Float results/exceptions and cleanup. Ordinary invocation, initialization, composition and persistence still refuse. | Integrate historical source ownership, private output nonescape and success-conditional coverage into the ordered executor. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
+| Checked numerical map result | Source-derived `mixed-scale` compiles across OpenCL/CUDA/HIP. The explicit internal ordered checked executor observes actual local OpenCL/Level Zero results, guards historical source ownership, tracks success-conditioned coverage, and rotates private output generations on replay. Ordinary invocation/composition/persistence still refuse. | Qualify broader integration and automatic Compiled admission; extend beyond the fresh functional-map case, including mutable ordered-fold conversions. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
 | Training scalar source coverage | Unit 32520 and warm local reproduction reject `local-gradient-sum`: nested reduce/divide and later scale scalar carry mandatory source evaluation | Close source-order/carrier evidence without dropping preservation flags or duplicating evaluation; retain the actual distributed-training composition oracle. |
 | Existing AD/native/fusion integration | Exact-head unit logs still contain native refusals, closed-product AD gaps and fusion/terminal-conversion failures | Classify actual semantic gaps versus obsolete structural expectations; preserve numerical/failure oracles. Updating tests must not substitute for implementation. |
 | Distributed and durable workload acceptance | Original obligations remain below; training composition currently blocked by the scalar row above | Complete their unchanged workload gates after shared compiler fixes. Local co-location/simulation is not multi-host performance evidence. |
@@ -126,9 +126,28 @@ source-state storage without rebuilding an executable whole-program call or
 replaying initializers. Its construction proves layout only; even a fabricated
 completed cursor grants no device completion. Ordinary LinkPlan validation and
 instantiation reject its distinct type. Focused storage/LinkPlan/ordered-realization
-gate passes 34 tests / 255 assertions. Runtime activation still owes exact
+gate passes 34 tests / 255 assertions. Runtime activation must independently establish exact
 source-occurrence/replay-epoch observation accounting, live private-root ownership,
 initialized-range checks and failure poisoning before this boundary can publish.
+
+The explicit internal `instantiate-checked-invocation!` vertical now connects
+these owners: exact historical source guards precede session creation, source
+actions and publication; pending stages reconstruct their contracts and validate
+actual private roots against the acquisition ledger and live cleanup owners.
+Only successful device completion plus source observation commits initialized
+ranges, the source cursor and that replay's occurrence entry together. Final
+publication requires all emitted source observation occurrences, including unused
+results, for the current epoch, plus live acquired roots and initialized outputs.
+Checked replay retires private roots before any source zeroing and acquires them
+under fresh physical keys; captured inputs retain their original acquisition
+scope. Output leases prohibit that transition. Reallocating under an old key is
+not sufficient because old raw resident views could otherwise resolve new bytes.
+Focused checked/ordinary ordered execution passes 22 tests / 750 assertions with
+both local OpenCL and Level Zero exercised. Review found no further concrete
+blocker in this slice. This does not admit checked programs to ordinary binding,
+composition or persistence, cover mutable checked folds, prove generated-AD
+source lineage, qualify the red integration baseline, or close the eight-item
+campaign. Automatic Compiled admission remains separate acceptance work.
 
 The original-frontend slice passes the nine-namespace focused gate: 119 tests /
 928 assertions, including actual confined local-device checks. The new source

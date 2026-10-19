@@ -5,6 +5,7 @@
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.ir.emitted-parallel-equation :as emitted]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.gpu.device-probe :as opencl]
             [raster.runtime.checked-stage-result :as observation]
             [raster.dl.gpu-grad-parity :as level-zero]))
@@ -17,6 +18,9 @@
 
 (defn- thrown-description [f]
   (try (f) nil (catch Throwable error [(class error) (.getMessage error)])))
+
+(defn- reason [f]
+  (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
 (defn- check-device [target]
   (let [equation (equation target)
@@ -83,3 +87,72 @@
   (if @opencl/opencl-available?
     (check-device :ocl:0)
     (opencl/opencl-skip! "source-derived checked equation on OpenCL")))
+
+(defn- check-ordered-device [target]
+  (let [compilation (equation-first/compile #'storage/mixed-scale
+                                           (merge storage/policy {:target target :dtype :double}))
+        input (float-array [1.0 -2.0 0.0])
+        executable (link/instantiate-checked-invocation! compilation [2.0 input])
+        session (:session executable)]
+    (try
+      (with-redefs [gpu/make-session (fn [& _] (throw (AssertionError. "premature driver contact")))]
+        (is (= :checked-stage-observation-required
+               (reason #(link/instantiate-ordered-invocation! compilation [2.0 input] {}))))
+        (is (= :checked-result-source-owner-mismatch
+               (reason #(link/instantiate-checked-invocation!
+                         (dissoc compilation :checked-result-source-owner) [2.0 input])))))
+      (let [first-result (link/run! executable)
+            output (first (keys first-result))
+            old-view (get first-result output)
+            first-occurrences (get-in @(:execution-state executable) [:ordered :observed])]
+        (is (= [2.0 -4.0 0.0] (vec (link/download executable output))))
+        (is (= 1 (count first-occurrences)))
+        (with-open [lease (link/output-lease! executable)]
+          (is (= :link-output-lease-active (reason #(link/run! executable))))
+          (is (= 1 @(:completed-replays executable)))
+          (is (= (:key old-view) (:key (get (:outputs @lease) output))))
+          (is (= [2.0 -4.0 0.0] (vec (link/download executable output)))))
+        (aset input 0 (float 3.0))
+        (let [next-result (link/run! executable)
+              next-view (get next-result output)
+              next-occurrences (get-in @(:execution-state executable) [:ordered :observed])]
+          (is (= [6.0 -4.0 0.0] (vec (link/download executable output))))
+          (is (not= (:key old-view) (:key next-view)))
+          (is (not= first-occurrences next-occurrences) "observations belong to one replay epoch")
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (gpu/download-range! session old-view (float-array 3) {:elements 3}))))
+        (is (= 2 @(:completed-replays executable)))
+        (aset input 0 Float/MAX_VALUE)
+        (is (= (thrown-description #(float (* (double 2.0) (double Float/MAX_VALUE))))
+               (thrown-description #(link/run! executable))))
+        (is (= 2 @(:completed-replays executable)))
+        (is (false? @(:output-ready? executable)))
+        (is (nil? (:resident-boundary @(:execution-state executable))))
+        (is (empty? (get-in @(:execution-state executable) [:ordered :observed])))
+        (is (some? (thrown-description #(link/outputs executable))))
+        (is (some? (thrown-description #(link/run! executable))))
+        (is (empty? (:kernel-graphs @session)))
+        (is (empty? (:events @session))))
+      (finally (link/close! executable)))
+    (is (true? (:closed? @session)))
+    (let [executable (link/instantiate-checked-invocation! compilation [2.0 (float-array [1.0])])
+          session (:session executable)
+          failure (ex-info "injected ordered observation failure" {:reason :injected-observation-failure})]
+      (try
+        (with-redefs [observation/observe! (fn [& _] (throw failure))]
+          (is (identical? failure (try (link/run! executable) nil (catch Throwable error error)))))
+        (is (zero? @(:completed-replays executable)))
+        (is (empty? (get-in @(:execution-state executable) [:ordered :observed])))
+        (is (nil? (:resident-boundary @(:execution-state executable))))
+        (is (= :link-execution-poisoned (reason #(link/run! executable))))
+        (is (empty? (:kernel-graphs @session)))
+        (is (empty? (:events @session)))
+        (finally (link/close! executable))))))
+
+(deftest ordered-checked-results-publish-only-after-observation-and-use-private-generations
+  (if @level-zero/gpu-available?
+    (check-ordered-device :ze:0)
+    (level-zero/gpu-skip! "ordered checked result on Level Zero"))
+  (if @opencl/opencl-available?
+    (check-ordered-device :ocl:0)
+    (opencl/opencl-skip! "ordered checked result on OpenCL")))
