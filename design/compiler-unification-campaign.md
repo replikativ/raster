@@ -484,6 +484,49 @@ unsupported trapping FP-to-integral KernelBody cast. Independent final static
 review found no remaining confirmed blocker in this bounded delta. This is not
 a cold integration gate or qualification of the broader currently failing suite.
 
+The real mixed-storage energy-gradient REPL probe still reaches
+`:structured-control-source-result`, retaining its conditional Float/Object
+completion and one free Double-result port. An explicitly experimental host-only
+projection through the existing `source-owner/compile-function` agrees with
+ordinary Clojure on Float carrier, rounding, signed zero, NaN and checked
+overflow/infinities. This experiment deliberately chose a generated-source
+policy and provided no runtime guard; it is NOT production ownership evidence.
+The named public deftm metadata inspected here does not retain that policy.
+The semantic producer must therefore supply the actual generated source context
+and dependency guard, rather than infer them from a return hint, ambient REPL
+bindings or an unrelated original bytecode tail.
+
+The existing source-owner seam now has permanent conditional Object/nil-result
+and unprojectable bytecode-completion controls (eight tests / 29 assertions).
+Next retain the semantic terminal region/context at its producer, derive exact
+physical scalar exports, and execute its guarded observation through the existing
+ordered executor and an explicit host-result API. None of those integration
+steps is established by this host-only experiment.
+
+Exact-head `9ca37eb6` emission CI (32484) additionally reaches a checked
+Double-to-Float conversion inside the functional mixed-scale map. Independent
+CPU invocation of `par/scale Double/MAX_VALUE` over a Float array throws too;
+this is not permission to relabel its conversion IEEE. Terminal result
+observation alone will not close that map's execution contract.
+
+After the terminal complete/observe/publish boundary, reuse that transition for
+a typed checked-stage result obligation. The first status-buffer realization
+may cover only checked Double-to-Float with fresh private non-escaping output,
+no aliases/donation, one conversion kind, and otherwise total independent
+element computations. Purity alone is insufficient. Preserve the checked
+semantic operation; explicit KernelBody predicates/branches and existing
+AtomicRMW may realize its validation, with private status storage accounted for
+by LinkPlan. Reset before every replay, await actual kernel completion and
+observe success BEFORE initialization credit, cursor advancement, consumers or
+output publication. Failure must not yield a ready output or output lease.
+Do not make status-buffer representation the semantic model or silently add
+downloads to resident-only APIs. General effectful/otherwise-throwing maps,
+multiple error classes and checked FP-to-integral device realization remain
+held until their source-order and carrier-specific contracts are proved.
+Independent design review confirmed this bounded seam and requires replay-reset,
+failure-before-consumer, alias/donation refusal and extra-throwing-operation
+negative controls. No checked-stage runtime implementation is claimed here.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.

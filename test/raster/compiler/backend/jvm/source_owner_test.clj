@@ -61,6 +61,28 @@
         (is (= 1 (compiled 4294967297)))
         (is (thrown? ArithmeticException (compiled 4294967297)))))))
 
+(deftest generated-terminal-source-preserves-conditional-object-completion
+  ;; This qualifies the existing host compiler seam, not device export authority.
+  (let [projected (completion/complete-value completion/object-input-contract 'projected)
+        source (list 'if '(clojure.core/nil? value) '(float 0.0)
+                     (list 'let* '[projected (clojure.core/float value)] projected))
+        compiled (owner/compile-function '[value] source function-form (context []))
+        oracle (fn [value] (if (nil? value) (float 0.0) (float value)))
+        observe (fn [f value]
+                  (try (let [result (f value)]
+                         [:value (class result) (Float/floatToRawIntBits result)])
+                       (catch IllegalArgumentException e [:exception (class e)])))]
+    (doseq [value [nil 0.0 -0.0 1.25 Double/MAX_VALUE Double/POSITIVE_INFINITY
+                   Double/NEGATIVE_INFINITY Double/NaN Float/POSITIVE_INFINITY]]
+      (is (= (observe oracle value) (observe compiled value))))))
+
+(deftest generated-source-cannot-reinterpret-bytecode-floating-completion
+  (let [contract (completion/bytecode-floating-input-contract
+                  Float/TYPE (completion/bytecode-operand-context {}))
+        source (completion/complete-value contract 'value)]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bytecode"
+                         (owner/compile-function '[value] source function-form (context []))))))
+
 (deftest captures-cannot-shadow-even-unused-nested-binders
   (doseq [[params source]
           [['[private] 1.0]
