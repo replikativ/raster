@@ -12,6 +12,8 @@
             [raster.ad.tangent :as tangent]
             [raster.ad.templates :as tmpl]
             [raster.compiler.ad.bind-ctx :as bind-ctx]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]
             ;; external :grads-fn registration sites (Phase 1d — tagged mints)
             [raster.dl.nn]
             [raster.dl.loss]
@@ -111,7 +113,59 @@
     ;; nullable intermediate is an unboxed primitive local.
     (is (nil? (:tag (meta (first n-binding)))))
     (is (nil? (:tag (meta (first scale-binding)))))
-    (is (= 'long (first (second n-binding))))))
+    (is (= 'clojure.core/long (first (second n-binding))))))
+
+(deftest generated-mse-scalar-prefix-owns-its-core-casts
+  (let [[template _] (tmpl/resolve-template 'raster.dl.loss/mse-loss)
+        [ctx _] (tmpl/instantiate-template-ctx
+                  template [(tagged 'pred 'floats) (tagged 'target 'floats)
+                            (tagged 'n 'long)]
+                  nil (tagged 'dy 'double) (make-test-ctx))
+        prefix (vec (take 4 (:bindings ctx)))
+        result (nth prefix 2)
+        outcome (fn [f] (try [:value (f)] (catch Exception e [:error (class e)])))
+        scope (create-ns (gensym "raster.ad.generated-cast-owner."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core :exclude '[long double])
+        (intern scope 'long (fn [& _] (throw (AssertionError. "borrowed caller long"))))
+        (intern scope 'double (fn [& _] (throw (AssertionError. "borrowed caller double"))))
+        (is (= 0.5 (eval (list 'let* (into ['n 4 'dy 1.0] prefix) result)))))
+      (doseq [n [4 0 -4 nil Double/MAX_VALUE]]
+        (is (= (outcome #(/ 2.0 (double (long n))))
+               (outcome #(binding [*ns* scope]
+                           (eval (list 'let* (into ['n n 'dy 1.0] prefix) result)))))))
+      (method-entry/call-with-definition-inputs
+       #(let [facts (normal-return/completed-scalar-bindings
+                     (into [['dy '(clojure.core/double 1.0)]] (partition 2 prefix)))]
+          (is (= Long/TYPE (:carrier (get facts (first prefix)))))
+          (is (= {:carrier Object :presence :present :builtin-class Double}
+                 (get facts result)))
+          (is (not (contains? (get facts result) :nonthrowing?)))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest generated-pool-index-allocation-does-not-borrow-a-caller-constructor
+  (let [[template _] (tmpl/resolve-template 'raster.dl.nn/maxpool2d)
+        scope (create-ns (gensym "raster.ad.generated-allocation-owner."))
+        outcome (fn [f] (try [:value (vec (f))] (catch Exception e [:error (class e)])))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core :exclude '[long-array])
+        (intern scope 'long-array
+                (fn [& _] (throw (AssertionError. "borrowed caller long-array")))))
+      (doseq [batch [-1 0 2]]
+        (let [[ctx _] (tmpl/instantiate-template-ctx
+                       template [(tagged 'x 'floats) batch 1 2 2 1 1]
+                       nil (tagged 'dy 'floats) (make-test-ctx))
+              allocation (some (fn [[_ expression]]
+                                 (when (and (seq? expression)
+                                            (= 'clojure.core/long-array (first expression)))
+                                   expression))
+                               (partition 2 (:bindings ctx)))]
+          (is (some? allocation))
+          (is (= (outcome #(long-array (* batch 4)))
+                 (outcome #(binding [*ns* scope] (eval allocation)))))))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest unknown-intermediates-mask-earlier-selection-facts
   (let [pred (tagged 'pred 'floats)
@@ -348,11 +402,11 @@
       (is (every? #(nil? (tag-of %)) (:bindings ctx))
           "no :raster.type/tag invented anywhere — LHS or RHS")))
 
-  (testing "min with untagged args: exact pre-change if-form"
+  (testing "min with untagged args: symbolic if-form with producer-owned core casts"
     (let [[template _] (tmpl/resolve-template 'Math/min)
           [ctx _] (tmpl/instantiate-template-ctx template '[x0 y0] nil 'dy0 (make-test-ctx))]
-      (is (= '[dg_x__1 (if (clojure.core/<= (double x0) (double y0)) dy0 0.0)
-               dg_y__2 (if (clojure.core/<= (double x0) (double y0)) 0.0 dy0)]
+      (is (= '[dg_x__1 (if (clojure.core/<= (clojure.core/double x0) (clojure.core/double y0)) dy0 0.0)
+               dg_y__2 (if (clojure.core/<= (clojure.core/double x0) (clojure.core/double y0)) 0.0 dy0)]
              (:bindings ctx)))
       (is (every? #(nil? (tag-of %)) (:bindings ctx)))))
 

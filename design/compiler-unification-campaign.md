@@ -89,6 +89,18 @@ review found no further concrete blocker in this restricted tightening. The affe
 six-namespace gate passes 41 tests / 496 assertions, including checked device execution;
 the final payload namespace adds positive Float lowering coverage (10 / 89).
 
+The training investigation also found a producer hygiene defect: built-in AD
+generators constructed bare `long`, `double` and `long-array` calls. The MSE,
+min/max, convolution-dimension and pool-allocation generators now name their
+intended Clojure builtins explicitly, leaving supplied argument forms unchanged.
+Hostile-caller execution tests preserve value and exception oracles (including
+null/out-of-range casts and negative allocation sizes). The affected three namespaces
+pass 42 tests / 346 assertions; the actual JVM training gradient additionally matches
+an independent exact-binary oracle on two changed target arrays. Review found no
+further concrete issue. Actual training refusal now reports the MSE scale's normal
+completion as Object containing Double. It still refuses retained evaluation:
+neither qualification nor completion grants motion, erasure or GPU admission.
+
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|
 | Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |

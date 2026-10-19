@@ -597,9 +597,9 @@
                                  (let [gx (gensym-fn "dg_x" (grad-tag x))
                                        gy (gensym-fn "dg_y" (grad-tag y))]
                                    [(update ctx :bindings into
-                                            [gx (list 'if (list 'clojure.core/<= (list 'double x) (list 'double y))
+                                            [gx (list 'if (list 'clojure.core/<= (list 'clojure.core/double x) (list 'clojure.core/double y))
                                                       adjoint-sym 0.0)
-                                             gy (list 'if (list 'clojure.core/<= (list 'double x) (list 'double y))
+                                             gy (list 'if (list 'clojure.core/<= (list 'clojure.core/double x) (list 'clojure.core/double y))
                                                       0.0 adjoint-sym)])
                                     [gx gy]]))})
 
@@ -610,9 +610,9 @@
                                  (let [gx (gensym-fn "dg_x" (grad-tag x))
                                        gy (gensym-fn "dg_y" (grad-tag y))]
                                    [(update ctx :bindings into
-                                            [gx (list 'if (list 'clojure.core/>= (list 'double x) (list 'double y))
+                                            [gx (list 'if (list 'clojure.core/>= (list 'clojure.core/double x) (list 'clojure.core/double y))
                                                       adjoint-sym 0.0)
-                                             gy (list 'if (list 'clojure.core/>= (list 'double x) (list 'double y))
+                                             gy (list 'if (list 'clojure.core/>= (list 'clojure.core/double x) (list 'clojure.core/double y))
                                                       0.0 adjoint-sym)])
                                     [gx gy]]))})
 
@@ -878,15 +878,15 @@
            ;; (All [T]) mse-grad SOAC (a broadcast), NOT the CPU-era ^:no-inline
            ;; BLAS helper daxpy-diff! — so the fused backward lowers to a resident
            ;; GPU kernel (on-device LoRA training) and SIMD-vectorizes on CPU. The
-           ;; scale is a plain Double — it becomes mse-grad's declared scalar
-           ;; kernel param (a uniform, emitted float at :float dtype), so it does
-           ;; not drag the forward array into a host size/scalar closure and does
-           ;; not become a double intermediate in the float kernel.
+           ;; The scale's Double arithmetic is source semantics, separate from
+           ;; the gradient array's storage precision. Later lowering must retain
+           ;; its evaluation and justify any boundary conversion explicitly.
+           ;; Builtin casts belong to this producer, not the caller namespace.
                              scale (gensym-fn "mse_scale")
                              n-long (gensym-fn "mse_n")
                              ctx1 (update ctx :bindings into
-                                          [n-long (list 'long n)
-                                           scale (list 'raster.numeric// (list 'raster.numeric/* 2.0 adjoint-sym) (list 'double n-long))
+                                          [n-long (list 'clojure.core/long n)
+                                           scale (list 'raster.numeric// (list 'raster.numeric/* 2.0 adjoint-sym) (list 'clojure.core/double n-long))
                                            d-pred (list 'raster.dl.loss/mse-grad pred target scale n-long)])]
                          [ctx1 [d-pred nil nil]]))})
 
@@ -1075,8 +1075,8 @@
                                                      (list 'clojure.core/+ (list 'clojure.core/+ w (list 'clojure.core/* 2 pad-w))
                                                            (list 'clojure.core/- kw))
                                                      stride-w))
-                                   ckk   (list 'long (list 'clojure.core/* c-in (list 'clojure.core/* kh kw)))
-                                   bhw   (list 'long (list 'clojure.core/* batch (list 'clojure.core/* h-out w-out)))
+                                   ckk   (list 'clojure.core/long (list 'clojure.core/* c-in (list 'clojure.core/* kh kw)))
+                                   bhw   (list 'clojure.core/long (list 'clojure.core/* batch (list 'clojure.core/* h-out w-out)))
            ;; rearrange dy -> dy_cols[c_out, bhw]
                                    (vary-meta dy-cols-buf assoc :hoistable true)
                                    (list 'raster.arrays/zeros-like W (list 'clojure.core/* c-out bhw))
@@ -1137,7 +1137,7 @@
                                    n-in   n-in-expr
            ;; forward with argmax tracking — inline size exprs for hoistability
                                    out-buf (list 'raster.arrays/zeros-like x n-out-expr)
-                                   argmax  (list 'long-array n-out-expr)
+                                   argmax  (list 'clojure.core/long-array n-out-expr)
                                    fwd     (list 'raster.dl.nn/maxpool2d! x out-buf argmax
                                                  batch channels h w kh kw)
            ;; backward: scatter dy to argmax positions
