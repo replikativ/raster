@@ -1219,8 +1219,13 @@
                               (when-not comparison?
                                 (dtype/canon (source-type expression expected env)))
                               operand-type (if comparison?
-                                             (dtype/canon
-                                              (or (source-type (first arguments) :int env) :int))
+                                             (let [types (mapv #(some-> (authoritative-source-type % env)
+                                                                       dtype/canon)
+                                                               arguments)]
+                                               (if (every? #{:int :long :float :double} types)
+                                                 (apply source-arithmetic/comparison-carrier types)
+                                                 (dtype/canon
+                                                  (or (source-type (first arguments) :int env) :int))))
                                              source-result-type)
                               lowered (mapv #(cast-lowered
                                               (lower % operand-type env)

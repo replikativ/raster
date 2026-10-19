@@ -21,6 +21,39 @@
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
 
+(deftest comparison-operands-retain-independent-source-widths
+  (doseq [strict? [false true]
+          [expression types expected]
+          [['(clojure.core/= 0.5 0.0) {} :double]
+           ['(clojure.core/= 0.0 0.5) {} :double]
+           ['(clojure.core/< i 0.5) {'i :int} :double]
+           ['(clojure.core/< 0.5 i) {'i :int} :double]
+           ['(clojure.core/< i wide) {'i :int 'wide :long} :long]
+           ['(clojure.core/< wide i) {'i :int 'wide :long} :long]
+           ['(clojure.core/< f i) {'f :float 'i :int} :double]
+           ['(clojure.core/< i f) {'f :float 'i :int} :double]
+           ['(clojure.core/< f wide) {'f :float 'wide :long} :double]
+           ['(clojure.core/< wide f) {'f :float 'wide :long} :double]
+           ['(clojure.core/< f g) {'f :float 'g :float} :float]]]
+    (let [builder (scalar/make-lowerer
+                   {:array-types {} :arrays #{} :scalar-types types
+                    :require-source-types? strict?
+                    :lower-index (fn [& _] (throw (AssertionError. "no index owner")))
+                    :decline! (fn [rule message data]
+                                (throw (ex-info message (assoc data :rule rule))))})
+          lowered ((:lower builder) expression :predicate types)
+          comparison (last (:operations lowered))
+          result-types (into types (map (fn [operation]
+                                          [(get-in operation [:result :id])
+                                           (get-in operation [:expression :result-type])])
+                                        (:operations lowered)))]
+      (is (= :predicate (:type lowered)))
+      (doseq [operand (get-in comparison [:expression :arguments])]
+        (if (instance? raster.compiler.ir.kernel_body.Literal operand)
+          (do (is (= expected (:type operand)))
+              (is (some? (#'body/literal! operand))))
+          (is (= expected (get result-types operand))))))))
+
 (deftest scalar-realization-policy-is-closed-and-canonical
   (is (= {:overrides {}} (numerics/validate-scalar-math-policy! nil)))
   (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}]

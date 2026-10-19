@@ -235,16 +235,30 @@
 
 (deftest codegen-opencl-pass-requires-canonical-casts-test
   (testing "the scheduled backend does not invent a float-to-int conversion policy"
-    (let [form '(raster.par/map-void! i n
-                                      (if (clojure.core/== 1 (aget alive i))
-                                        (clojure.core/aset output i (float 1.0))
-                                        (clojure.core/aset output i (float 0.0))))
+    (let [form (list 'raster.par/map-void! 'i 'n
+                     (list 'let*
+                           [(with-meta 'mark {:tag 'int :raster.type/tag 'int})
+                            '(clojure.core/aget alive i)]
+                           '(clojure.core/aset output i (clojure.core/float mark))))
           error (try
                   (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false)
                   nil
                   (catch clojure.lang.ExceptionInfo e e))]
       (is (= :cast-policy (:missing-rule (ex-data error))))
       (is (= '(clojure.core/aget alive i) (:expression (ex-data error)))))))
+
+(deftest codegen-mixed-comparison-widens-without-implicit-narrowing
+  ;; Comparison does not require narrowing the Float array load to the integral
+  ;; literal's width. Keep the genuine local-storage narrowing refusal above.
+  (let [form '(raster.par/map-void! i n
+                                 (if (clojure.core/== 1 (aget alive i))
+                                   (clojure.core/aset output i (float 1.0))
+                                   (clojure.core/aset output i (float 0.0))))
+        result (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false)
+        source (:source (first (:kernels result)))]
+    (is (seq source))
+    (is (str/includes? source "alive["))
+    (is (str/includes? source "double"))))
 
 ;; ================================================================
 ;; Tier 2: Numerical Correctness (GPU-gated)
