@@ -3261,7 +3261,7 @@
 
 (defn- requires-ordered-evaluation?
   [expression]
-  (boolean (some #{:checked-source-cast :source-reference-cast}
+  (boolean (some #{:checked-source-cast :source-reference-cast :preserve-source-evaluation}
                  (:flags (effects/descriptor expression)))))
 
 (defn- parallel-extent

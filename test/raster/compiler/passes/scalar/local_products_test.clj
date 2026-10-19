@@ -43,10 +43,17 @@
   (let [product [(clojure.core/* x x)]]
     (if (identical? (nth product 0) (nth product 0)) 1.0 0.0)))
 
+(deftm observed-product-aliases [x :- Double] :- Double
+  (let [product [(clojure.core/* x x)]
+        saved (nth product 0)
+        copy saved]
+    (if (identical? saved copy) 1.0 0.0)))
+
 (deftest product-fields-retain-the-original-object-snapshot
-  (let [compiled (pipeline/compile-aot #'observed-product-field :dtype :double)]
-    (doseq [x [-3.5 -0.0 0.0 Math/PI]]
-      (is (= 1.0 (observed-product-field x) (compiled x)))))
+  (doseq [function [#'observed-product-field #'observed-product-aliases]]
+    (let [compiled (pipeline/compile-aot function :dtype :double)]
+      (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+        (is (= 1.0 (function x) (compiled x))))))
   (let [source '(let* [p [(clojure.core/* (clojure.core/double x) 2.0)]
                        q p
                        first-field (clojure.core/nth q 0)

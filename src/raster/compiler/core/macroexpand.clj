@@ -7,7 +7,8 @@
    ~12 special forms (`let*`/`loop*`/`case*`/`if`). `clojure.walk/macroexpand-all`
    would strip metadata (the :raster.type/tag, :raster.op/original the backends
    rely on), so we re-implement it preserving meta."
-  (:refer-clojure :exclude []))
+  (:refer-clojure :exclude [])
+  (:require [raster.compiler.core.value-completion :as completion]))
 
 (defn walk-preserving-meta
   "Like clojure.walk/walk but preserves metadata on forms."
@@ -71,7 +72,11 @@
    ;; (quote ...) as a :leaf and never descends; we must match that contract here, or
    ;; macroexpand would rewrite macros/classes sitting in head position INSIDE quoted
    ;; data (e.g. '(let [a 1] a) -> '(let* [a 1] a)), silently corrupting it.
-   (if (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form)))
+   (if (or (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form)))
+           ;; Compiler-owned completion operands are already walked under
+           ;; their retained input context; generic macroexpansion must not
+           ;; reconstruct them as new source computations.
+           (completion/canonical-form? form))
      form
      (let [expanded (if (and (seq? form)
                              (not (and (symbol? (first form)) (skip-head? (first form)))))

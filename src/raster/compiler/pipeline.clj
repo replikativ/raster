@@ -296,12 +296,22 @@
           (reduce
            (fn [[env acc] [sym init-expr]]
              (let [tagged-init (tag-expr-types init-expr env)
-                   tag (or (inf/hint-tag sym) (inf/infer-arg-tag tagged-init env))
+                   object-input? (and (value-completion/canonical-form? tagged-init)
+                                      (= value-completion/object-input-contract
+                                         (:contract (value-completion/canonical-parts tagged-init))))
+                   object-storage? (or object-input?
+                                       (and (symbol? tagged-init)
+                                            (= Object (get-in env [tagged-init :physical-carrier]))))
+                   tag (if object-input?
+                         (inf/infer-arg-tag tagged-init env)
+                         (or (inf/hint-tag sym) (inf/infer-arg-tag tagged-init env)))
                    tagged-sym (cond-> sym
-                                tag (vary-meta assoc :tag tag :raster.type/tag tag)
+                                tag (vary-meta assoc :tag (if object-storage? 'Object tag)
+                                               :raster.type/tag tag)
                                 (util/void-form? tagged-init)
                                 (vary-meta assoc :raster.effect/effectful true))
-                   new-env (assoc env sym tag)]
+                   new-env (assoc env sym (if object-storage?
+                                           {:tag tag :physical-carrier Object} tag))]
                [new-env (conj acc tagged-sym tagged-init)]))
            [env []]
            pairs)

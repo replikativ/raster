@@ -22,6 +22,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]))
 
 (def ^:private tc-check-form-info-fn
@@ -1248,6 +1249,13 @@ stable physical-leaf order on every backend."}
      (let [head (first rewritten-form)]
        (or
         (cond
+          (and (completion/canonical-form? rewritten-form)
+               (= completion/object-input-contract
+                  (:contract (completion/canonical-parts rewritten-form))))
+          (let [operand (:operand (completion/canonical-parts rewritten-form))]
+            (or (infer-expr-tag operand type-env *ns*)
+                (infer-rewritten-tag operand nil type-env)))
+
            ;; Primitive cast — (double x), (long x), etc.
           (and (not (contains? type-env head))
                (or (descriptor/cast-result-tag head)
@@ -2029,6 +2037,12 @@ stable physical-leaf order on every backend."}
    Metadata-based inference is the primary mechanism."
   [expr env]
   (cond
+    (and (completion/canonical-form? expr)
+         (= completion/object-input-contract (:contract (completion/canonical-parts expr))))
+    ;; Object completion changes storage/evaluation context, not the logical
+    ;; numerical type. This is not presence or primitive carrier evidence.
+    (infer-arg-tag (:operand (completion/canonical-parts expr)) env)
+
     ;; A present local with unknown type masks outer/retained evidence, exactly as
     ;; the walker masks nil-tag local records. Absence and unknown are not the same.
     (symbol? expr) (if (contains? env expr)

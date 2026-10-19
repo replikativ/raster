@@ -3,6 +3,15 @@
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
+(deftest consumed-value-proofs-retain-source-evaluation
+  (doseq [source ['(clojure.core/+ x y) '(clojure.core// x y)
+                  (with-meta '(.invk raster.numeric/_plus__m_long_long-impl x y)
+                    {:raster.op/original 'raster.numeric/+})]]
+    (let [expression (vary-meta source assoc :raster.effect/preserve-evaluation true)]
+      (is (contains? (:flags (effects/descriptor expression)) :preserve-source-evaluation))
+      (is (false? (effects/removable-expr? expression)))
+      (is (false? (effects/cse-safe-expr? expression))))))
+
 (deftest storage-contracts-deny-cse-without-body-analysis
   (doseq [contract [{:buffer-write {:mode :overwrite :buf-arg-idx 0}}
                     {:buffer-write {:mode :accumulate :buf-arg-idx 0}}

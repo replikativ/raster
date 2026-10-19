@@ -47,8 +47,17 @@
           ;; dispatch; Float uses it. Never replace the Double branch with a
           ;; potentially user-redefined raster.numeric/+ method.
           operation (if (= :double dt) 'clojure.core/+ 'raster.numeric/+)
-          addition (with-meta (list* operation arguments)
-                     (assoc (select-keys (meta expression) [:line :column :file])
+          ;; The Double branch explicitly unboxes BOTH inputs. Preserve that
+          ;; consumer contract even when an operand lives in an Object slot.
+          ;; Presence and homogeneous producer-width premises above make these
+          ;; exact conversions; neither a nullable value nor a result hint can
+          ;; acquire them. Float still goes through its original typed dispatch.
+          operands (if (= :double dt)
+                     (mapv #(list 'clojure.core/double %) arguments)
+                     arguments)
+          addition (with-meta (list* operation operands)
+                     (assoc (select-keys (meta expression)
+                                         [:line :column :file :raster.effect/preserve-evaluation])
                             :raster.type/tag (dtype/scalar-tag-for-dtype dt)))]
       (when (validate-addition addition dt)
         (retain-approved-premise!)
@@ -79,7 +88,8 @@
     (let [tag (:array-tag (first operand-facts))
           addition (with-meta
                      (list* 'raster.numeric/+ (:arguments (descriptor/call-description expression)))
-                     (assoc (select-keys (meta expression) [:line :column :file])
+                     (assoc (select-keys (meta expression)
+                                         [:line :column :file :raster.effect/preserve-evaluation])
                             :raster.type/tag tag))]
       (when (validate-addition addition tag)
         (retain-approved-premise!)

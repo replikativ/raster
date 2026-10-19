@@ -170,7 +170,7 @@
                (= [:exact :exact] (scalar-conversion/policy source target)))))))
 
 (defn- source-cast-flags
-  "Evaluation obligations for source casts derived from the shared descriptor.
+  "Evaluation obligations for source conversions/arithmetic from shared descriptors.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
@@ -183,9 +183,9 @@
    (mapcat (fn [node]
            (when (seq? node)
              (let [operation (descriptor/semantic-op node)]
-               (when (descriptor/cast-op? operation)
                     (cond-> []
                         (and (not (proven-total-cast? node))
+                             (descriptor/cast-op? operation)
                              (= :reject (descriptor/cast-integral-narrowing operation))
                              (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
                         (conj :checked-source-cast)
@@ -193,7 +193,13 @@
                         ;; no optimizer may erase its conversion merely because
                         ;; the projected field is not otherwise used.
                         (true? (:raster.effect/source-reference-cast (meta node)))
-                        (conj :source-reference-cast))))))
+                        (conj :source-reference-cast)
+                        ;; A value proof consumed by simplification is not a
+                        ;; proof that its original evaluation can disappear.
+                        ;; This obligation is independent of numeric width,
+                        ;; external purity, and actual primitive/Object storage.
+                        (true? (:raster.effect/preserve-evaluation (meta node)))
+                        (conj :preserve-source-evaluation)))))
          (tree-seq coll? seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)

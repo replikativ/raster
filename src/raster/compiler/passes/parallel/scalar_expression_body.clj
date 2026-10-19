@@ -1366,7 +1366,10 @@
    this is neither purity nor nonthrowing evidence. The caller must retain the
    original initializer, its position, and its conversions/traps. Selected
    invk calls use checked-selected-primitive-result instead: known operands do
-   not establish the selected implementation's result or definition freshness."
+   not establish the selected implementation's result or definition freshness.
+   The returned :type is the scalar grammar's dtype under the supplied inputs,
+   NOT proof of an ordinary source call's physical result or boxed payload.
+   Source presence consumers must use checked-scalar-normal-return instead."
   [expression present-types]
   (let [operation (descriptor/semantic-op expression)
         intrinsic (some-> operation intrinsics/canonical intrinsics/descriptor)
@@ -1379,6 +1382,51 @@
                intrinsic
                (every? known? arguments))
       (checked-scalar-result expression present-types))))
+
+(defn checked-scalar-normal-return
+  "Prove only nonnull-on-normal-return for a bounded closed numeric expression.
+   Payload dtypes validate the existing scalar grammar; they are NOT actual
+   argument carriers or source overload evidence. Consequently this API returns
+   no dtype, payload or storage information. Unknown calls and lexical callees
+   decline. The caller must keep the original producer, conversions and order."
+  [expression present-types]
+  (when (seq? expression)
+    (let [closed?
+          (loop [pending [[expression 0]] visits 0]
+            (cond
+              (empty? pending) true
+              (>= visits 10000) false
+              :else
+              (let [[node depth] (peek pending)
+                    remaining (pop pending)]
+                (cond
+                  (> depth 128) false
+                  (number? node) (recur remaining (inc visits))
+                  (symbol? node) (and (contains? present-types node)
+                                      (recur remaining (inc visits)))
+                  (seq? node)
+                  (let [arguments (descriptor/call-args node)
+                        argument-count (bounded-count (inc (- 10000 visits)) arguments)
+                        operation (descriptor/semantic-op node)
+                        cast (descriptor/cast-result-tag operation)]
+                    (and (= operation (first node))
+                         (not (contains? present-types operation))
+                         (not (:raster.op/lexical-callee (meta node)))
+                         (not= '.invk (first node))
+                         (<= (+ visits (count remaining) argument-count) 10000)
+                         (symbol? operation)
+                         (contains? #{"clojure.core" "Math" "java.lang.Math"}
+                                    (namespace operation))
+                         (or (and cast (= 1 argument-count))
+                             (and (or (descriptor/scalar-op? operation)
+                                      (descriptor/comparison-kind operation))
+                                  (some-> operation intrinsics/canonical intrinsics/descriptor)))
+                         (recur (into remaining (map #(vector % (inc depth))
+                                                     arguments))
+                                (inc visits))))
+                  :else false))))]
+      (when (and closed? (checked-scalar-program expression present-types))
+        {:presence :present}))))
 
 (defn- strict-core-expression?
   "Closed scalar producer grammar, not a purity test. A root symbol may be

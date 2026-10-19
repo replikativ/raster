@@ -10,6 +10,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.value-product :as value-product]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
@@ -78,6 +79,7 @@
 
 (def ^:private conditional-expansion-limit 4096)
 (def ^:dynamic ^:private *conditional-expansion-budget* nil)
+(def ^:dynamic ^:private *consumed-presence-obligations* nil)
 
 (defn- product-arity [expression]
   (cond
@@ -106,6 +108,12 @@
 
 (defn- binding-fact [scope id init]
   (let [known (or (fact scope init)
+                  ;; Completion retains the operand's value and evaluation
+                  ;; context, not a new computation recipe. Reuse only the
+                  ;; existing result-fact authorities for a direct producer.
+                  (when-let [{:keys [contract operand]} (completion/canonical-parts init)]
+                    (when (= completion/object-input-contract contract)
+                      (binding-fact scope id operand)))
                   ;; A real primitive conversion cannot return nil. This is a
                   ;; normal-return fact, not permission to remove its source
                   ;; evaluation or the exception raised for a nullable input.
@@ -113,14 +121,17 @@
                     (let [type (some-> (descriptor/semantic-op init)
                                        descriptor/cast-result-tag dtype/dtype-for-scalar-tag)]
                       (cond-> {:present? true} type (assoc :scalar-type type))))
-                  (when-let [proof (and (seq? init)
-                                       (descriptor/scalar-op? (descriptor/semantic-op init))
-                                       (scalar-body/checked-primitive-result
-                                        init (into {} (keep (fn [argument]
-                                                             (when-let [type (:producer-scalar-type (get scope argument))]
-                                                               [argument type])))
-                                                   (descriptor/call-args init))))]
-                    {:present? true :scalar-type (:type proof)}))
+                  ;; Numerical payload tags do not establish the JVM overload
+                  ;; or physical result width of canonical source arithmetic.
+                  ;; Its checked grammar proves presence only. In particular,
+                  ;; Object-carried Float + Float may return a Double.
+                  (when-let [proof (scalar-body/checked-scalar-normal-return
+                                    init (into {} (keep (fn [[argument known]]
+                                                         (when (and (= :present (:presence known))
+                                                                    (:producer-scalar-type known))
+                                                           [argument (:producer-scalar-type known)])))
+                                               scope))]
+                    (assoc proof :present? true)))
         known (or known
                   (when-let [proof (scalar-body/checked-selected-primitive-result init)]
                     {:present? true :scalar-type (:type proof)})
@@ -167,6 +178,26 @@
          (= {:presence :present :array-tag tag}
             (normal-return/result-fact addition env)))))))
 
+(defn- owned-binding-fact [scope id init]
+  (let [known (binding-fact scope id init)
+        alias? (or (symbol? init)
+                   (and (completion/canonical-form? init)
+                        (= completion/object-input-contract
+                           (:contract (completion/canonical-parts init)))
+                        (symbol? (:operand (completion/canonical-parts init)))))
+        token (when (and *consumed-presence-obligations*
+                         (= :present (:presence known)) (seq? init) (not alias?))
+                (Object.))]
+    [(cond-> known token (assoc :evaluation-obligations #{token})) token]))
+
+(defn- emit-owned-bindings [entries original]
+  (with-meta
+    (vec (mapcat (fn [[id init token]]
+                   [id (if (and token (contains? @*consumed-presence-obligations* token))
+                         (vary-meta init assoc :raster.effect/preserve-evaluation true)
+                         init)]) entries))
+    (meta original)))
+
 (defn- lower-let [env expression products?]
   (let [[head bindings & body] expression]
     (when-not (and (vector? bindings) (even? (count bindings))
@@ -192,7 +223,7 @@
                        _ (spend-conditional-expansion! (concat suffix body))
                        choice (lower scope (relist init ['if test (continue then) (continue else)])
                                      products?)]
-                   (relist expression [head (with-meta (vec output) (meta bindings)) choice]))
+                   (relist expression [head (emit-owned-bindings output bindings) choice]))
 
                  (and products? (:fields alias))
                  (recur (next remaining) (assoc scope id alias) output)
@@ -211,17 +242,22 @@
                                            completion/object-input-contract value)])
                                        fields)
                        lifted (vec (concat prefix (mapcat identity snapshots)))
-                       scope (reduce (fn [local [id init]]
-                                       (assoc local id (binding-fact local id init)))
-                                     scope (partition 2 lifted))]
+                       [scope output] (reduce (fn [[local out] [id init]]
+                                                (let [[known token] (owned-binding-fact local id init)]
+                                                  [(assoc local id known)
+                                                   (conj out [id init token])]))
+                                              [scope output] (partition 2 lifted))]
                    (recur (next remaining) (assoc scope id {:fields (mapv first snapshots)})
-                          (into output lifted)))
+                          output))
 
                  :else
-                 (recur (next remaining) (assoc scope id (binding-fact scope id init))
-                        (conj output id init))))
-        (relist expression (concat [head (with-meta (vec output) (meta bindings))]
-                                   (map #(lower scope % products?) body)))))))
+                 (let [[known token] (owned-binding-fact scope id init)]
+                   (recur (next remaining) (assoc scope id known)
+                          (conj output [id init token])))))
+        ;; Realize consumers first: they record which occurrence-owned presence
+        ;; proofs were used. Tokens never leave this analysis invocation.
+        (let [body' (mapv #(lower scope % products?) body)]
+          (relist expression (concat [head (emit-owned-bindings output bindings)] body')))))))
 
 (defn- lower-scopes [env expression products?]
   (let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expression)
@@ -264,12 +300,17 @@
     (and (seq? expression) (= 'clojure.core/nil? (descriptor/semantic-op expression)) (= 2 (count expression)))
     (let [argument (second expression) known (fact env argument)]
       (cond (:fields known) false
-            (:present? known) false
+            (:present? known) (do (when *consumed-presence-obligations*
+                                   (swap! *consumed-presence-obligations* into
+                                          (:evaluation-obligations known)))
+                                 false)
             (contains? known :literal) (nil? (:literal known))
             ;; A primitive cast cannot return nil, but can throw. Retain its
             ;; evaluation once, at the original test position, before false.
             (primitive-cast? argument)
-            (list 'let* [(gensym "presence_evaluation__") (lower env argument products?)] false)
+            (list 'let* [(gensym "presence_evaluation__")
+                         (vary-meta (lower env argument products?) assoc
+                                    :raster.effect/preserve-evaluation true)] false)
             :else (relist expression [(first expression) (lower env argument products?)])))
 
     (and (seq? expression) (= 'if (first expression)))
@@ -304,12 +345,172 @@
    Conditional product joins distribute only a bounded lexical continuation;
    an escape or expansion limit rolls the entire product rewrite back."
   [expression]
-  (try (binding [*conditional-expansion-budget* (atom conditional-expansion-limit)]
-         (lower {} expression true))
+  (binding [*conditional-expansion-budget* (atom conditional-expansion-limit)
+            *consumed-presence-obligations* (atom #{})]
+    (try (lower {} expression true)
        (catch clojure.lang.ExceptionInfo e
          (case (:reason (ex-data e))
            (:local-product-escape :local-product-budget) (try (lower {} expression false)
                                       (catch clojure.lang.ExceptionInfo e
                                         (if (= :local-product-decline (:reason (ex-data e))) expression (throw e))))
            :local-product-decline expression
-           (throw e)))))
+           (throw e))))))
+
+(defn- fp-payload [known]
+  (when (and (= :present (:presence known))
+             (= (:producer-scalar-type known) (:scalar-type known)))
+    (case (:producer-scalar-type known) :float Float/TYPE :double Double/TYPE nil)))
+
+(defn- exact-fp-input? [payload consumer]
+  (or (= payload consumer)
+      (and (= Float/TYPE payload) (= Double/TYPE consumer))))
+
+(defn- object-alias-operand [expression]
+  (let [{:keys [contract operand]} (completion/canonical-parts expression)]
+    (when (and (= completion/object-input-contract contract) (symbol? operand)) operand)))
+
+(def ^:private native-snapshot-visit-limit 1000000)
+(def ^:dynamic ^:private *native-snapshot-visits* nil)
+
+(defn- visit-native-snapshot! []
+  (when (and *native-snapshot-visits* (neg? (vswap! *native-snapshot-visits* dec)))
+    ;; This optional representation analysis must never publish a partially
+    ;; checked rewrite. Compilation stops before C emission, not mid execution.
+    (throw (ex-info "Native Object snapshot analysis exceeded its visit budget"
+                    {:reason :native-object-storage-budget
+                     :visit-limit native-snapshot-visit-limit}))))
+
+(defn- primitive-use-closed?
+  "Check uses of one existing Object snapshot, not the producer's computation.
+   Lexical aliases copy its identity; only actual primitive inputs or the native
+   scalar return ABI may stop that flow. Unknown consumers and joins abstain."
+  [expression aliases payload result-carrier]
+  (letfn [(free-aliases [value names]
+            (binding [util/*shadowing-locals* (into util/*shadowing-locals* names)]
+              (some names (util/free-syms value))))
+          (uses? [value names expected]
+            (visit-native-snapshot!)
+            (cond
+              (symbol? value) (or (not (contains? names value))
+                                  (= :discard expected) (exact-fp-input? payload expected))
+              (and (seq? value) (#{'quote 'clojure.core/quote} (first value))) true
+              (and (seq? value) (#{'let 'let*} (first value)))
+              (let [[_ bindings & body] value]
+                (and (vector? bindings) (even? (count bindings))
+                     (loop [pairs (seq (partition 2 bindings)) names names]
+                       (if-let [[id init] (first pairs)]
+                         (let [alias (or (when (symbol? init) init) (object-alias-operand init))]
+                           (if (and (symbol? id) (contains? names alias))
+                             (let [declared (dtype/dtype-for-scalar-tag (:raster.type/tag (meta id)))
+                                   actual (if (= Float/TYPE payload) :float :double)]
+                               (and (or (nil? declared) (= actual declared))
+                                    (recur (next pairs) (conj names id))))
+                             (and (symbol? id) (uses? init names nil)
+                                  (recur (next pairs) (disj names id)))))
+                         (every? true? (map-indexed
+                                        (fn [i form]
+                                          (uses? form names (if (= i (dec (count body))) expected :discard)))
+                                        body))))))
+              (and (seq? value) (= 'if (first value)))
+              ;; An Object's truthiness is not its numerical nonzero test.
+              (and (not (free-aliases (second value) names))
+                   (every? #(uses? % names expected) (nnext value)))
+              (and (seq? value) (= 'do (first value)))
+              (every? true? (map-indexed
+                             (fn [i form]
+                               (uses? form names (if (= i (- (count value) 2)) expected :discard)))
+                             (rest value)))
+              (and (seq? value) (= :lambda (:kind (form/form-info value))))
+              (not (free-aliases value names))
+              (and (seq? value) (form/scope-info value))
+              (let [{:keys [scopes outer]} (form/scope-info value)]
+                (and (every? #(uses? % names nil) outer)
+                     (every? (fn [{:keys [binders inits body]}]
+                               (and (every? #(uses? % names nil) inits)
+                                    (every? #(uses? % (apply disj names binders) expected) body)))
+                             scopes)))
+              (seq? value)
+              (let [{:keys [semantic-op implementation-op arguments dispatch? lexical-callee]}
+                    (descriptor/call-description value)
+                    ;; Explicit core FP conversion is an actual consumer, not
+                    ;; a retained dtype hint. Narrowing remains unsupported.
+                    cast (when (and (not dispatch?) (not lexical-callee)
+                                    (symbol? semantic-op)
+                                    (= semantic-op (first value))
+                                    (= "clojure.core" (namespace semantic-op))
+                                    (= 1 (count arguments)))
+                           (case (descriptor/cast-result-tag semantic-op)
+                             double Double/TYPE float Float/TYPE nil))
+                    parameters (when (and (= '.invk (first value)) dispatch? (not lexical-callee)
+                                          (free-aliases value names))
+                                 (:parameter-carriers
+                                  (method-entry/selected-parameter-carriers
+                                   semantic-op implementation-op (count arguments))))]
+                (cond
+                  cast (uses? (first arguments) names cast)
+                  (and parameters (= (count arguments) (count parameters)))
+                  (and (not-any? names (take 2 value))
+                       (every? true? (map #(uses? %1 names %2) arguments parameters)))
+                  :else (every? #(uses? % names nil) value)))
+              (coll? value) (every? #(uses? % names nil) value)
+              :else true))]
+    (boolean (uses? expression aliases result-carrier))))
+
+(defn project-native-alias-snapshots
+  "Erase only use-closed STORAGE for Object completions of lexical FP aliases.
+   Every original producer and its position stay unchanged. No call body is
+   substituted, no arithmetic overload changes, and no direct producer recipe
+   is inferred from a field tag. Unknown snapshots retain their Object IR and
+   are refused by native completion admission.
+
+   parameter-facts come from the native primitive ABI, not semantic annotations;
+   result-carrier is that same ABI's actual scalar result Class (or nil). Local
+   payload/presence facts reuse this pass's existing producer authority. Requires
+   the enclosing definition owner for any selected method observations."
+  [expression parameter-facts result-carrier]
+  (letfn [(storage-id [id known]
+            (if-let [payload (fp-payload known)]
+              (let [tag (if (= Float/TYPE payload) 'float 'double)]
+                (vary-meta id assoc :tag tag :raster.type/tag tag))
+              id))
+          (project [value scope expected]
+            (visit-native-snapshot!)
+            (cond
+              (and (seq? value) (#{'quote 'clojure.core/quote} (first value))) value
+              (and (seq? value) (= :lambda (:kind (form/form-info value)))) value
+              (and (seq? value) (#{'let 'let*} (first value)))
+              (let [[head bindings & body] value]
+                (loop [pairs (seq (partition 2 bindings)) scope scope output []]
+                  (if-let [[id init] (first pairs)]
+                    (let [operand (object-alias-operand init)
+                          known (dissoc (binding-fact scope id init) :native-erased-box?)
+                          payload (fp-payload known)
+                          continuation (relist value
+                                               (concat [head (vec (mapcat identity (next pairs)))] body))
+                          unused? (and operand (contains? scope operand)
+                                       (binding [util/*shadowing-locals* (conj util/*shadowing-locals* id)]
+                                         (not (contains? (util/free-syms continuation) id))))
+                          erase? (and operand payload
+                                      (primitive-use-closed? continuation #{id} payload expected))
+                          inherited? (and (symbol? init) (:native-erased-box? (get scope init)))
+                          known (cond-> known (or erase? inherited?) (assoc :native-erased-box? true))
+                          id (if (or erase? inherited?) (storage-id id known) id)
+                          init (if erase? operand (project init scope nil))]
+                      ;; A bound lexical read in Object context cannot add a
+                      ;; source conversion failure. If never observed, its box
+                      ;; storage may disappear without deleting its producer.
+                      (recur (next pairs) (assoc scope id known)
+                             (if unused? output (conj output id init))))
+                    (relist value (concat [head (with-meta (vec output) (meta bindings))]
+                                           (map #(project % scope expected) body))))))
+              (and (seq? value) (form/scope-info value))
+              (let [{:keys [scopes outer rebuild]} (form/scope-info value)]
+                (rebuild
+                 (mapv (fn [{:keys [binders inits body] :as local}]
+                         (assoc local :inits (mapv #(project % scope nil) inits)
+                                      :body (mapv #(project % (apply dissoc scope binders) expected) body))) scopes)
+                 (mapv #(project % scope nil) outer)))
+              (seq? value) (relist value (map #(project % scope nil) value))
+              :else value))]
+    (binding [*native-snapshot-visits* (volatile! native-snapshot-visit-limit)]
+      (project expression parameter-facts result-carrier))))

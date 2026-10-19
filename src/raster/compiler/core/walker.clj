@@ -16,6 +16,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
@@ -129,6 +130,21 @@
          element (vary-meta assoc :raster.type/element element)))
      sym)))
 
+(defn- object-storage-initializer? [initializer type-env]
+  (or (and (completion/canonical-form? initializer)
+           (= completion/object-input-contract
+              (:contract (completion/canonical-parts initializer))))
+      (and (symbol? initializer)
+           (= Object (get-in type-env [initializer :physical-carrier])))))
+
+(defn- retain-binding-storage [ctx symbol initializer logical-tag element-tag]
+  (let [object? (object-storage-initializer? initializer (:type-env ctx))
+        symbol (cond-> (stamp-type-meta symbol logical-tag element-tag)
+                 object? (vary-meta assoc :tag 'Object))]
+    [symbol (cond-> (ctx-assoc-type ctx symbol logical-tag)
+              object? (update-in [:type-env symbol] assoc :physical-carrier Object)
+              element-tag (update-in [:type-env symbol] assoc :element element-tag))]))
+
 (defn ctx-get-tag
   "Get the dispatch tag for a symbol.
 
@@ -186,6 +202,9 @@
   Returns a keyword identifying which defmethod should handle it."
   [form ctx]
   (cond
+    (and (seq? form) (= completion/completion-symbol (first form)))
+    :value-completion
+
     ;; Binding forms — ALL let/loop spellings (form/let-heads + loop-heads):
     ;; backtick `let expands to clojure.core/let, which appears in
     ;; macroexpanded input before the walker normalizes to let*.
@@ -755,6 +774,17 @@
                                   numeric-tag-rank)]))))))
             pairs))))
 
+(defmethod walk-form :value-completion [form ctx]
+  ;; A compiler-owned completion wraps an ALREADY walked operand and its
+  ;; original evaluation context. A re-walk must not insert fresh conversions
+  ;; into that operand as if the reserved IR term were an ordinary function.
+  (when-not (completion/canonical-form? form)
+    (throw (ex-info "Walker encountered malformed value completion IR"
+                    {:reason :unsupported-value-completion :expression form})))
+  (if-let [tag (inf/infer-rewritten-tag form nil (:type-env ctx))]
+    (vary-meta form assoc :raster.type/tag tag)
+    form))
+
 (defmethod walk-form :let [form ctx]
   (let [[let-sym bindings & body] form
         [new-bindings new-ctx]
@@ -783,9 +813,9 @@
                              (let [etag (inf/infer-binding-tag esym einit einit (:type-env ctx)
                                                                {:source-ns (:source-ns ctx)
                                                                 :element-dtype (:element-dtype ctx)})
-                                   esym (if etag (stamp-type-meta esym etag) esym)]
+                                   [esym ctx] (retain-binding-storage ctx esym einit etag nil)]
                                [(conj binds esym einit)
-                                (ctx-assoc-type ctx esym etag)]))
+                                ctx]))
                            [binds ctx]
                            (partition 2 extra-binds))
                    [binds ctx])
@@ -809,16 +839,18 @@
                          ;; came from the already-walked args), so it beats TC's
                          ;; dtype-blind guess.
                          (:raster.type/tag (meta rewritten-init))
+                         ;; Flattening an initializer let changes its syntax,
+                         ;; not the logical type of the returned Object alias.
+                         (when (object-storage-initializer? rewritten-init type-env)
+                           (inf/infer-arg-tag rewritten-init type-env))
                          tc-tag
                          (inf/infer-binding-tag sym init rewritten-init type-env
                                                 {:source-ns (:source-ns ctx)
                                                  :element-dtype (:element-dtype ctx)}))
                  elem-tag (inf/infer-element-tag init tag type-env)
-                 hint (inf/compute-binding-hint tag sym)
-                 sym (stamp-type-meta sym (or hint tag) elem-tag)]
+                 [sym ctx] (retain-binding-storage ctx sym rewritten-init tag elem-tag)]
              [(conj binds sym rewritten-init)
-              (cond-> (ctx-assoc-type ctx sym tag)
-                elem-tag (update-in [:type-env sym] assoc :element elem-tag))]))
+              ctx]))
          [[] ctx]
          (partition 2 bindings))]
     (let [walked-body (walk-forms body new-ctx)]
@@ -1697,7 +1729,14 @@
               f)
             f)
         f (or f (first form))  ;; fallback if ns-resolve returned nil
-        static-call? (and (symbol? f) (some? (namespace f)))
+        ;; A qualified Clojure Var is not a Java static Method. Casting all
+        ;; qualified calls from logical operand tags reboxed Object aliases in
+        ;; identical?/identity and changed Numbers overloads. Only real Java
+        ;; class namespaces may request this interop conversion path.
+        static-call? (and (symbol? f) (some? (namespace f))
+                          (not (var? (try (ns-resolve source-ns f) (catch Exception _ nil))))
+                          (class? (try (ns-resolve source-ns (symbol (namespace f)))
+                                       (catch Exception _ nil))))
         walked-args (map #(walk % ctx) args)
         cast-args (if static-call?
                     (map (fn [orig walked]
