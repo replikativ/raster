@@ -13,6 +13,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.numerical-contract :as numerics]
@@ -37,6 +38,8 @@
     (assoc matched
            :inclusive? (= :inclusive (:bound-mode matched))
            :update-expr (:scoped-update-expr matched))))
+
+(declare canonical-selected-fp-operation)
 
 (defn make-lowerer
   "Build a scalar-expression lowerer.
@@ -1214,7 +1217,22 @@
                   (let [semantic-operation (descriptor/semantic-op expression)
                         operator (intrinsics/canonical semantic-operation)
                         intrinsic (intrinsics/descriptor operator)
-                        arguments (vec (descriptor/call-args expression))]
+                        arguments (vec (descriptor/call-args expression))
+                        ;; A selected implementation is not authenticated by
+                        ;; its nominal arithmetic name. Keep argument evaluation
+                        ;; and completion separate from this callee-only check.
+                        selected-operation? (and method-entry/*emission-inputs*
+                                     (= '.invk (first expression))
+                                     (= :infix (:kind intrinsic))
+                                     (source-arithmetic/binary-operator? (:c intrinsic))
+                                     (= 2 (count arguments))
+                                     (dtype/fp-dtype? expected))
+                        selected-operation (when selected-operation?
+                                             (canonical-selected-fp-operation expression))
+                        _ (when (and selected-operation? (nil? selected-operation))
+                            (decline! :selected-scalar-source-correspondence
+                                      "selected scalar body does not attest the emitted canonical operation"
+                                      {:expression expression :operator operator}))]
                     (when-not intrinsic
                       (decline! :scalar-expression
                                 "scalar expression has no canonical intrinsic"
@@ -1243,6 +1261,29 @@
                               source-result-type
                               (when-not comparison?
                                 (dtype/canon (source-type expression expected env)))
+                              ;; Correspondence includes widths, not just the operator.
+                              ;; Until entry conversions have their own source-completion
+                              ;; proof, accept only already matching primitive operands.
+                              ;; In particular a Double result stamp must not erase an
+                              ;; actual Float helper's rounding checkpoint.
+                              _ (when selected-operation
+                                  (let [carrier-dtype #(dtype/dtype-for-scalar-tag
+                                                       (symbol (.getName ^Class %)))
+                                        payload-type (carrier-dtype (:payload-carrier selected-operation))
+                                        formal-types (mapv carrier-dtype
+                                                           (:parameter-carriers selected-operation))
+                                        argument-types (mapv #(some-> (authoritative-source-type % env)
+                                                                      dtype/canon)
+                                                             arguments)]
+                                    (when-not (and (= payload-type source-result-type)
+                                                   (= formal-types argument-types)
+                                                   (every? #{payload-type} formal-types))
+                                      (decline! :selected-scalar-source-width
+                                                "selected scalar widths require source-owned entry and result conversions"
+                                                {:expression expression :payload-type payload-type
+                                                 :source-result-type source-result-type
+                                                 :formal-types formal-types
+                                                 :argument-types argument-types}))))
                               operand-type (if comparison?
                                              (let [types (mapv #(some-> (authoritative-source-type % env)
                                                                        dtype/canon)
@@ -1681,3 +1722,54 @@
              {:scope :owned-fp-return-payload :result-carrier Object :payload-carrier actual
               :parameters parameters :parameter-carriers carriers :arguments (vec arguments)
               :computation program :bridge bridge})))))))
+
+(defn canonical-selected-fp-operation
+  "Callee-only correspondence for a selected primitive FP arithmetic leaf.
+
+   The actual original body must be the same canonical core operation over its
+   ordered formals. Only identity result casts may surround it. This is NOT
+   operand completion, generic-call purity, Object erasure or permission to move
+   the source call. A wider body needs its actual owned computation recipe.
+   Existing source-entry and bootstrap definition guards own all assumptions."
+  [expression]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [entry body definition operation]}
+                (selected-strict-scalar-source expression)]
+       (let [parameters (:parameters definition)
+             carriers (:parameter-carriers entry)
+             intrinsic (intrinsics/descriptor operation)
+             scope (zipmap parameters carriers)
+             actual (completed-fp-body-carrier body scope true)
+             expected (some-> (:return-tag definition) types/tag->java-class)
+             ;; Do not erase Float checkpoints or even an exact widening:
+             ;; the computation width must stay the source operation's width.
+             primitive-body
+             (loop [source body]
+               (let [op (when (seq? source) (descriptor/semantic-op source))
+                     arguments (vec (descriptor/call-args source))
+                     operand (first arguments)]
+                 (if (and (seq? source) (= op (first source)) (= 1 (count arguments))
+                          (descriptor/cast-op? op)
+                          (= (completed-fp-body-carrier source scope true)
+                             (completed-fp-body-carrier operand scope true))
+                          (some? (completed-fp-body-carrier operand scope true)))
+                   (do
+                     (intrinsic-source/observe-original! (the-ns 'clojure.core) op)
+                     (recur operand))
+                   source)))
+             core-op (when (seq? primitive-body) (first primitive-body))]
+         (when (and (= :infix (:kind intrinsic))
+                    (source-arithmetic/binary-operator? (:c intrinsic))
+                    (= 2 (count parameters) (count carriers))
+                    (every? #{Float/TYPE Double/TYPE} carriers)
+                    (contains? #{Float/TYPE Double/TYPE} actual)
+                    (= expected actual)
+                    (symbol? core-op) (= "clojure.core" (namespace core-op))
+                    (= parameters (vec (rest primitive-body)))
+                    (= (intrinsics/canonical operation) (intrinsics/canonical core-op)))
+           (intrinsic-source/observe-original! (the-ns 'clojure.core) core-op)
+           {:scope :canonical-selected-fp-operation
+            :operation (intrinsics/canonical operation)
+            :parameter-carriers carriers :result-carrier (:result-carrier entry)
+            :payload-carrier actual}))))))

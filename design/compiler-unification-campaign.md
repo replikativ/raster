@@ -14,9 +14,8 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `87fea00a` is draft, not qualified for merge.
-Exact-head setup/build passed; emission 32603 and unit 32601 failed, while
-OpenCL 32602 was still running at the latest observation.
+Current integration hold: PR #1539 at `fdbaef58` is draft, not qualified for merge.
+Exact-head setup/build passed; emission, unit and OpenCL gates failed.
 The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
@@ -77,6 +76,18 @@ Next: connect owned payload computations and closed numerical uses to ordered
 scalar stages, with independent source-order coverage and the unchanged training
 composition oracle. Cold recipe availability and bare source lookup remain
 explicit obligations; a carrier fact alone is not sufficient.
+
+The next tightening authenticates the selected arithmetic implementation's actual
+original body, not just its nominal operation name. A canonical FP leaf must use
+the same core operation over ordered formals; extra arithmetic, permuted operands
+and intermediate rounding refuse. Lowering additionally requires matching actual
+formal, operand and payload widths. A conflicting Double result stamp cannot erase
+a Float helper's rounding checkpoint. Valid but unproved entry conversions still
+refuse; matching lowering widths is not proof of original argument completion.
+This does not activate training admission or remove preservation flags. Independent
+review found no further concrete blocker in this restricted tightening. The affected
+six-namespace gate passes 41 tests / 496 assertions, including checked device execution;
+the final payload namespace adds positive Float lowering coverage (10 / 89).
 
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|

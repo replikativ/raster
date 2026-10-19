@@ -205,3 +205,97 @@
                       {:arity 1 :kind :fn :primitive-fp-total true :c {:fn "exp"}}
                       (descriptor op)))]
       (is (nil? (#'scalar/completed-fp-body-carrier '(clojure.core/exp x) carriers))))))
+
+(defn- canonical-operation [expression]
+  (entry/call-with-definition-inputs #(scalar/canonical-selected-fp-operation expression)))
+
+(deftest canonical-arithmetic-keeps-callee-correspondence-and-object-result-separate
+  (doseq [[tag body carrier] [['Double '(clojure.core/* x y) Double/TYPE]
+                              ['Float '(clojure.core/float (clojure.core/* x y)) Float/TYPE]]]
+    (let [{:keys [scope] :as fixture} (fixture! "raster.canonical-body." body tag)]
+      (try
+        (with-selected-fixture
+          fixture
+          (fn [call]
+            (with-redefs [core/ensure-bytecode-implementation!
+                          (fn [& _] (throw (AssertionError. "correspondence forced the JIT")))]
+              (let [proof (canonical-operation call)]
+                (is (= :canonical-selected-fp-operation (:scope proof)))
+                (is (= :* (:operation proof)))
+                (is (= [carrier carrier] (:parameter-carriers proof)))
+                (is (= Object (:result-carrier proof)))
+                (is (= carrier (:payload-carrier proof)))
+                (is (not (contains? proof :nonthrowing?)))))))
+        (finally (remove-ns (ns-name scope)))))))
+
+(deftest canonical-operation-does-not-follow-a-nominal-multiply-name
+  (doseq [body ['(clojure.core// x y)
+                '(clojure.core/* y x)
+                '(clojure.core/* x x)
+                '(clojure.core/+ (clojure.core/* x y) 1.0)
+                '(clojure.core/double (clojure.core/float (clojure.core/* x y)))]]
+    (let [{:keys [scope] :as fixture} (fixture! "raster.noncanonical-body." body)]
+      (try
+        (with-selected-fixture fixture #(is (nil? (canonical-operation %))))
+        (finally (remove-ns (ns-name scope)))))))
+
+(deftest selected-float-width-cannot-be-overridden-by-a-double-result-stamp
+  (let [{:keys [scope] :as fixture}
+        (fixture! "raster.selected-width." '(clojure.core/float (clojure.core/* x y)) 'Float)]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (let [float-call (with-meta call (assoc (meta call) :tag 'float))
+                lowered (entry/call-with-definition-inputs
+                         #(let [builder (scalar/make-lowerer
+                                         {:scalar-types {'a :float 'b :float}
+                                          :lower-index (fn [expression _] expression)
+                                          :decline! (fn [rule message data]
+                                                      (throw (ex-info message (assoc data :rule rule))))})]
+                            ((:lower builder) float-call :float {})))]
+            (is (= :float (:type lowered)))
+            (is (= :float (get-in (last (:operations lowered)) [:expression :result-type]))))
+          (let [stamped-call (with-meta call (assoc (meta call) :tag 'double))]
+            (is (= Float/TYPE (:payload-carrier (canonical-operation stamped-call))))
+            (is (= :selected-scalar-source-width
+                   (entry/call-with-definition-inputs
+                    #(try
+                       (let [builder (scalar/make-lowerer
+                                      {:scalar-types {'a :float 'b :float}
+                                       :lower-index (fn [expression _] expression)
+                                       :decline! (fn [rule message data]
+                                                   (throw (ex-info message (assoc data :rule rule))))})]
+                         ((:lower builder) stamped-call :double {})
+                         nil)
+                       (catch clojure.lang.ExceptionInfo error
+                         (or (:rule (ex-data error)) (ex-data error))))))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest scalar-lowering-refuses-an-actually-selected-noncanonical-implementation
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.selected-source-guard." '(clojure.core// x y))]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (is (some? (entry/call-with-definition-inputs
+                      #(entry/selected-parameter-carriers 'raster.numeric/* (second call) 2))))
+          (is (= :selected-scalar-source-correspondence
+                 (entry/call-with-definition-inputs
+                  #(try
+                     (let [builder (scalar/make-lowerer
+                                    {:scalar-types {'a :double 'b :double}
+                                     :lower-index (fn [expression _] expression)
+                                     :decline! (fn [rule message data]
+                                                 (throw (ex-info message (assoc data :rule rule))))})]
+                       ((:lower builder) call :double {})
+                       nil)
+                     (catch clojure.lang.ExceptionInfo error
+                       (or (:rule (ex-data error)) (ex-data error)))))))))
+      ;; Only after the cold-source refusal: establish the actual implementation
+      ;; oracle independently, without changing the retained alias table mid-query.
+      (core/ensure-bytecode-implementation! receiver)
+      (is (= 2.0 (clojure.lang.Reflector/invokeInstanceMethod
+                   @receiver "invk" (object-array [4.0 2.0]))))
+      (finally (remove-ns (ns-name scope))))))
