@@ -45,3 +45,26 @@
   (is (nil? (constant/value 'java.lang.user/MAX_VALUE)))
   (is (nil? (constant/value 'user/MAX_VALUE)))
   (is (nil? (constant/value '(int user/MAX_VALUE)))))
+
+(deftest source-constant-evidence-retains-checked-floating-conversions
+  (doseq [value [0.0 -0.0 Math/PI Double/NaN]]
+    (is (= (Float/floatToIntBits (float value))
+           (Float/floatToIntBits
+            (:value (constant/source-value (list 'clojure.core/float value)))))))
+  (is (= {:value 1.0} (constant/source-value '(clojure.core/double 1.0))))
+  (is (= {:value 1.0} (constant/source-value '(clojure.core/double (clojure.core/float 1.0)))))
+  (doseq [value [Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+    (is (thrown? IllegalArgumentException (float value)))
+    (is (nil? (constant/source-value (list 'clojure.core/float value))))
+    (is (Float/isInfinite (:value (constant/value (list 'clojure.core/float value))))))
+  (doseq [expression ['(float 1.0) '(clojure.core/float x) '(clojure.core/byte 256)
+                      '(clojure.core/double (do (effect!) 1.0))
+                      '(clojure.core/double java.lang.Double/POSITIVE_INFINITY)
+                      (with-meta '(clojure.core/double 1.0) {:raster.op/lexical-callee true})]]
+    (is (nil? (constant/source-value expression)) (str expression))))
+
+(deftest constant-proof-depth-abstains-without-executing-or-overflowing
+  (let [expression (nth (iterate #(list 'clojure.core/double %) 1.0) 1024)]
+    (is (nil? (constant/source-value expression)))
+    (is (nil? (constant/value expression)))
+    (is (= expression (constant/literal-or-original expression)))))

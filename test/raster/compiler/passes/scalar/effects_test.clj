@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.scalar.effects-test
   (:require [clojure.test :refer [deftest is]]
+            [beichte.core :as beichte]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
@@ -11,6 +12,30 @@
       (is (contains? (:flags (effects/descriptor expression)) :preserve-source-evaluation))
       (is (false? (effects/removable-expr? expression)))
       (is (false? (effects/cse-safe-expr? expression))))))
+
+(deftest optional-purity-abstention-cannot-drop-source-obligations
+  (doseq [failure [(IllegalArgumentException. "unsupported analysis")
+                   (StackOverflowError. "bounded analyzer refusal")]
+          [expression flag]
+          [[(with-meta '(unknown/effect x) {:raster.effect/preserve-evaluation true})
+            :preserve-source-evaluation]
+           [(with-meta '(unknown/conversion x) {:raster.effect/source-reference-cast true})
+            :source-reference-cast]
+           ['(clojure.core/int x) :checked-source-cast]]]
+    (with-redefs [beichte/analyze-full (fn [& _] (throw failure))]
+      ;; Call the analyzer directly so an unrelated cached purity result cannot
+      ;; hide the abstention path under test.
+      (let [result (#'effects/analyze-descriptor expression)]
+        (is (= :io (:effect result)))
+        (is (contains? (:flags result) flag))))))
+
+(deftest optional-obligation-abstention-retains-a-generic-denial
+  (doseq [failure [(IllegalArgumentException. "unsupported obligation analysis")
+                   (StackOverflowError. "bounded obligation refusal")]]
+    (with-redefs-fn {#'effects/source-cast-flags (fn [& _] (throw failure))}
+      #(let [result (#'effects/analyze-descriptor '(clojure.core/double 1.0))]
+         (is (= :io (:effect result)))
+         (is (contains? (:flags result) :unclosed-source-obligations))))))
 
 (deftest storage-contracts-deny-cse-without-body-analysis
   (doseq [contract [{:buffer-write {:mode :overwrite :buf-arg-idx 0}}

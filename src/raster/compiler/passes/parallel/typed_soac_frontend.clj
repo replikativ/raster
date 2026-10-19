@@ -3259,10 +3259,23 @@
        (or (= :pure (effects/analyze-effect expression))
            (symbol? (alength-array expression)))))
 
+(defn- requires-evaluation?
+  [expression]
+  (boolean (some #{:checked-source-cast :source-reference-cast :preserve-source-evaluation
+                   :unclosed-source-obligations}
+                 (:flags (effects/descriptor expression)))))
+
 (defn- requires-ordered-evaluation?
   [expression]
-  (boolean (some #{:checked-source-cast :source-reference-cast :preserve-source-evaluation}
-                 (:flags (effects/descriptor expression)))))
+  (let [flags (:flags (effects/descriptor expression))]
+    (boolean
+     (or (some #{:checked-source-cast :source-reference-cast :unclosed-source-obligations} flags)
+         (and (contains? flags :preserve-source-evaluation)
+              ;; Retain the evaluation itself, but a proved closed, pure,
+              ;; nonthrowing source constant has no ordering observation.
+              ;; Canonical IEEE constant evidence is NOT enough: source float
+              ;; narrowing can throw where an IEEE storage cast returns infinity.
+              (nil? (numeric-constant/source-value expression)))))))
 
 (defn- parallel-extent
   [expression]
@@ -5466,13 +5479,13 @@
         ;; The ordinary dependency closure below keeps this independent of allocation spelling.
         allocation-capacity-roots
         (allocation-capacity-scalars descriptions physical-outputs by-symbol)
-        ordered-evaluation-roots
+        retained-evaluation-roots
         (into #{} (keep (fn [[symbol description]]
-                          (when (requires-ordered-evaluation? (:expr description)) symbol)))
+                          (when (requires-evaluation? (:expr description)) symbol)))
               by-symbol)
         roots (set (concat outputs
                            allocation-capacity-roots
-                           ordered-evaluation-roots
+                           retained-evaluation-roots
                            semantic-scalar-roots
                            (mapcat (fn [equation]
                                      (into (dialect/operation-inputs equation)

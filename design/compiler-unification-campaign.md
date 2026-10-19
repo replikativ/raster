@@ -385,9 +385,24 @@ actual device qualification remain separate obligations.
 
 Independent read-only review found no confirmed defect in this shared-storage change; it
 explicitly did not qualify emitted-device execution. The retained mixed-scale scalar-gradient
-control still refuses with `:equation-first-coverage`. Its trace first declines an ordered
-scalar after parallel work, and still contains a later Object-carried checked narrowing.
-Do not substitute payload metadata for either evaluation sequencing or source conversion proof.
+initially refused with `:equation-first-coverage` at a preserved constant seed after parallel
+work. The next source-completion increment separates retention from ordering: marked successful
+literal conversions remain executable roots, but their source-proved totality permits staging.
+Canonical IEEE constant evidence is distinct from checked Clojure source evidence; Float
+overflow cannot acquire infinity-on-overflow semantics through this proof. Both constant proofs
+abstain at a bounded cast depth. Optional purity abstention retains the original independent
+source obligations; incomplete obligation discovery produces a non-waivable unknown-obligation
+denial. Review caught the initially conflated retention/order predicate and abstention interaction
+before landing; both now have controls.
+
+Focused gates pass 12 tests / 118 assertions for numeric/source staging and 163 tests / 940
+assertions for evaluation/native behavior; array admission passes 1 test / 2 assertions. The full
+affected frontend/storage namespaces report 145 tests / 794 passing assertions / one error. The
+remaining mixed-gradient control now reaches the complete-source-return check and refuses
+`:structured-control-source-result`, rather than declining the constant seed. Its conditional
+Object-carried scalar completion and checked Float projection remain open. Do not substitute
+payload metadata for source conversion or evaluation-sequencing proof. No check was waived,
+no source precision contract changed, and no device-performance claim follows.
 
 Downstream qualification of the downloaded 0.2.1690 jar now reports 49 tests / 757 assertions
 and both fresh inline/packed-lagged marketing workers passing, including changed-data AOT and

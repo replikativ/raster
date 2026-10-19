@@ -283,21 +283,32 @@
 
 (defn- analyze-descriptor
   [expr]
+  ;; A failed optional purity analysis cannot discharge independently retained
+  ;; source obligations. Read those from original syntax, not its Beichte-only
+  ;; call projection, and merge them even when that analysis abstains.
   (try
-    (let [semantic-expr (semantic-calls expr)
-          locals (collect-locals semantic-expr)
-          context (b/make-context {:registry (:registry @raster-context)})
-          result (b/analyze-full semantic-expr context locals)
-          result (if (map? result)
-                   (update result :flags #(or % #{}))
-                   {:effect (or result :io) :flags #{}})]
-      (update result :flags into (source-cast-flags semantic-expr)))
-    (catch Exception _
-      ;; Conservative: unknown = effectful
-      {:effect :io :flags #{}})
-    (catch StackOverflowError _
-      ;; Deep expressions overflow tools.analyzer — assume effectful
-      {:effect :io :flags #{}})))
+   (let [obligations (source-cast-flags expr)
+        result
+        (try
+          (let [semantic-expr (semantic-calls expr)
+                locals (collect-locals semantic-expr)
+                context (b/make-context {:registry (:registry @raster-context)})
+                result (b/analyze-full semantic-expr context locals)]
+            (if (map? result)
+              (update result :flags #(or % #{}))
+              {:effect (or result :io) :flags #{}}))
+          (catch Exception _
+            ;; Conservative: unknown = effectful, not obligation-free.
+            {:effect :io :flags #{}})
+          (catch StackOverflowError _
+            ;; Deep expressions overflow tools.analyzer — assume effectful.
+            {:effect :io :flags #{}}))]
+    (update result :flags into obligations))
+   ;; Obligation discovery is optional analysis too. If it cannot complete,
+   ;; retain a NON-WAIVABLE unknown obligation, not a preservation-only marker
+   ;; whose ordering could be relaxed by an independent total-value proof.
+   (catch Exception _ {:effect :io :flags #{:unclosed-source-obligations}})
+   (catch StackOverflowError _ {:effect :io :flags #{:unclosed-source-obligations}})))
 
 (defn removable-expr?
   "True if an unused expression can be dropped without changing semantics."

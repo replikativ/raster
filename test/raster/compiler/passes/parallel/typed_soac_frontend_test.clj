@@ -14,6 +14,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -550,6 +551,57 @@
                       first-result)]
     (is (nil? (frontend/form->program source options))
         "host-only staging cannot move a later throw before an independent device write")))
+
+(deftest preserved-total-literal-evaluation-can-bound-a-later-island
+  (let [marked (fn [expression]
+                 (with-meta expression {:raster.effect/preserve-evaluation true
+                                       :raster.type/tag 'double}))
+        options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'n :long}}
+        source (list 'let* ['first-result '(raster.par/map! out i n double 1.0)
+                            'seed (marked '(clojure.core/double 1.0))
+                            'result '(raster.par/map! out j n double seed)] 'result)
+        components (frontend/form->program-components source (assoc options :segmented-plans? true))
+        program (:typed-program components)]
+    (is (some? program))
+    (is (false? (#'frontend/requires-ordered-evaluation? (marked '(clojure.core/double 1.0)))))
+    (is (= '(clojure.core/double 1.0) (get (apply hash-map (second (:source components))) 'seed))
+        "totality permits staging but does not erase the source expression")
+    (is (true? (:raster.effect/preserve-evaluation
+                (meta (get (apply hash-map (second (:source components))) 'seed)))))
+    (is (= [1] (get-in (dialect/facts program) [:attributes :host-binding-ids]))
+        "the preserved scalar is retained as an executable host binding")
+    (let [prefix-source (list 'let* ['seed (marked '(clojure.core/double 1.0))
+                                     'result '(raster.par/map! out i n double 2.0)] 'result)
+          prefix-program (frontend/form->program prefix-source options)]
+      (is (some? prefix-program))
+      (is (some #(= '[seed] (nth % 2)) (dialect/equations prefix-program))
+          "an unused preserved constant remains an evaluation root even without an ordering dependency"))
+    (doseq [expression [(list 'clojure.core/float Double/MAX_VALUE)
+                        '(clojure.core/int n)
+                        '(clojure.core/double (do (effect!) 1.0))
+                        (with-meta '(clojure.core/double 1.0) {:raster.op/lexical-callee true})]]
+      (let [expression (vary-meta expression assoc :raster.effect/preserve-evaluation true)
+            source (list 'let* ['first-result '(raster.par/map! out i n double 1.0)
+                                'seed expression
+                                'result '(raster.par/map! out j n double seed)] 'result)]
+        (is (#'frontend/requires-ordered-evaluation? expression))
+        (is (nil? (frontend/form->program source options)))))
+    (let [expression (marked '(clojure.core/double 1.0))
+          source (list 'let* ['first-result '(raster.par/map! out i n double 1.0)
+                              'seed expression
+                              'result '(raster.par/map! out j n double seed)] 'result)
+          ordinary-descriptor effects/descriptor]
+      (with-redefs [effects/descriptor
+                    (fn [node]
+                      (if (and (= node expression)
+                               (true? (:raster.effect/preserve-evaluation (meta node))))
+                        {:effect :io :flags #{:unclosed-source-obligations}}
+                        (ordinary-descriptor node)))]
+        (is (#'frontend/requires-evaluation? expression))
+        (is (#'frontend/requires-ordered-evaluation? expression)
+            "total-value evidence cannot discharge unknown source obligations")
+        (is (nil? (frontend/form->program source options)))))))
 
 (deftest certified-checked-scalars-after-host-allocation-bound-a-following-typed-island
   (let [source '(let* [out (double-array (long n))
