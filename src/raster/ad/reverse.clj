@@ -5222,58 +5222,6 @@
               :fwd-bindings    (vec fwd-bindings)
               :body-sym        (:body-sym pieces)}))))
 
-(defn- transform-pullback
-  "Apply AD to a reified pullback form, producing second-order derivatives.
-
-  Takes a reified pullback (from reify-pullback) and differentiates the
-  pullback function itself. This enables reverse-over-reverse (RoR) AD.
-
-  diff-params: which pullback params to differentiate w.r.t.
-               Typically the original function params (subset of captured-syms).
-               The dy param is always active (it's the 'input' to the pullback).
-
-  Returns a new reified pullback map for the second-order computation."
-  [reified-pb diff-params]
-  (let [{:keys [pullback-form pullback-params]} reified-pb
-        ;; The pullback form is a let* — extract bindings and body
-        [_ bindings-vec & body-exprs] pullback-form
-        ;; diff-params should be a subset of pullback-params
-        active (set diff-params)
-        active-ordered (filterv active pullback-params)]
-    (with-ad-gensym
-      (let [;; Treat the pullback-form as a function body with pullback-params
-            ;; Build a let* wrapping for the transform
-            transformed (gen-reverse-let bindings-vec body-exprs active-ordered)]
-        {:second-order-form transformed
-         :second-order-params active-ordered
-         :original reified-pb}))))
-
-(defn- vjp-compositional
-  "Value-and-pullback with reified pullback for composition.
-
-  Like vjp, but returns a map with both the standard [value, pullback-fn]
-  and the reified pullback form for optional second-order differentiation.
-
-  Returns {:value     f(args)
-           :pullback  (fn [dy] -> [d_p1 d_p2 ...])
-           :reified   reified-pullback-map}"
-  [f-var & args]
-  (let [resolved (resolve-deftm-var f-var)
-        m (meta resolved)
-        params (or (:raster.core/deftm-params m)
-                   (throw (ex-info "vjp-compositional requires a deftm var"
-                                   {:var f-var})))
-        walked-body (or (rcore/ensure-walked-body! resolved)
-                        (throw (ex-info "No walked body" {:var f-var})))
-        active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
-        reified (reify-pullback (first walked-body) active-params)
-        param-bindings (vec (mapcat vector active-params args))
-        ;; Eval the standard form for the actual computation
-        [value pullback] (eval (list 'let* param-bindings (:standard-form reified)))]
-    {:value value
-     :pullback pullback
-     :reified reified}))
-
 ;; ================================================================
 ;; Reified gradient program as a first-class deftm-style fn (#72)
 ;; ================================================================
@@ -5516,7 +5464,11 @@
         ;; Parameters: [p1 p2 ... v_a v_b ...] — ALL original params (⊥ dims
         ;; are still needed to evaluate) + one v per differentiable param.
           fn-params (vec (concat all-params v-syms))
-          compiled-fn (eval (list 'fn fn-params hvp-transformed))
+          ;; Reentrant AD retains canonical completion terms. Consume them at
+          ;; the same JVM source boundary as other runtime AD programs; reserved
+          ;; IR heads are not runtime Vars and must never be sent to eval raw.
+          compiled-fn (eval (value-completion/project-to-jvm-source
+                             (list 'fn fn-params hvp-transformed)))
           ;; A retained cold receiver would invalidate this closure when its
           ;; first numerical call performs ordinary JIT promotion. Compile the
           ;; observed dependencies WITHOUT evaluating their bodies, then let

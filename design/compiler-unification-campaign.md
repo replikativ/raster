@@ -105,6 +105,17 @@ These three reviewed checks pass 13 assertions. The full namespace remains
 red (8 tests / 27 assertions, one error): reentrant transformation of an
 untyped compound completion still lacks a closed scalar transpose declaration.
 That production admission issue is not waived by the test-consumer migration.
+The HVP/Hessian failures had a separate concrete consumer defect: the HVP
+constructor passed canonical completion IR directly to Clojure `eval`, causing
+`ClassNotFoundException` for the reserved IR namespace. It now uses the same
+JVM source projection as the other runtime AD consumers. No derivative rule,
+compilation policy, reference-Class binding or ownership guard is invented.
+Cold qualification passes the full reverse-AD namespace (46 tests / 121
+assertions) and the O4 composition law (1 test / 12 assertions), including
+analytic Hessians, directional finite differences and definition replacement
+guards. Two private, unreferenced pullback prototypes were removed during the
+consumer audit; active reification/HVP/Hessian paths remain. This repairs the
+observed HVP consumer failure, not all higher-order AD or the marketing lifecycle.
 
 Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
 (49 tests, 757 assertions plus both fresh workers). Helper migration separately
