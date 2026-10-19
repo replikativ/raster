@@ -308,6 +308,58 @@ tests (83 assertions): 138 tests / 989 assertions total. Static review found no
 confirmed remaining bounded defect. Integration CI qualification remains required;
 the draft PR is not ready to merge. No source arithmetic contract was relaxed.
 
+### Residency consolidation: ordered host observation
+
+The independent residency review distinguishes established physical contracts
+from an incomplete source-level phase boundary. AbstractValue/LinkValue separate
+logical values from physical leaves; LinkPlan checks overlapping writes and
+composed initialization/alias contracts; execution events, output leases and
+pending-transfer retention express completion and lifetime obligations. These
+foundations must be reused, not replaced by another residency runtime.
+
+The current public mixed-storage gradient exposes the missing composition:
+a device-produced Double scalar is followed by a conditional checked Float
+conversion and Object completion. Rank zero does not mean host availability.
+An IEEE device cast does not implement the host conversion's overflow exception,
+and a host preparation expression cannot depend on unfinished device work.
+Current refusal is correct, but does not satisfy the public compile vertical.
+Exact-head `962b054a` emission CI confirms this terminal source-result failure;
+unit and OpenCL gates also remain red. No merge qualification follows from the
+138-test bounded AD gate.
+
+Implement one typed terminal host-result continuation at the existing invocation
+boundary. Its contract must identify the actual producer values, their physical
+scalar exports and completion dependencies, the retained closed host computation,
+and the complete source result structure. Preserve checked conversions, lazy
+branches, Object completion, definition/source-policy ownership and evaluation
+order. Execute the host computation once after the required producers complete.
+Replace the restricted source-result proof with a proof of this continuation;
+do not waive result coverage or reinterpret a destination type as value evidence.
+
+The initial admissible region is terminal: no later device consumer or observable
+source operation may be moved across it. Resident-only entry points must refuse
+when they cannot return the promised resident result without host observation.
+Do not silently download resident chains. General intermediate host/device
+crossings require explicit ordered scheduling; deferred device error flags are
+not equivalent if later effects can occur before the host notices failure.
+
+Keep logical numerical encoding, physical realization/ABI, placement,
+initialization, ownership/escape and completion as separate proof obligations.
+The current `:resident-scalar-buffer` representation and pristine-value admission
+predicates are consolidation targets: document and remove their coupling only
+with replacement proof coverage, not by broadening whitelists. Centralize the
+transition contract (prepare, acquire, submit, complete, observe) and state which
+semantic/physical/effect/alias/completion changes invalidate each certificate.
+This is an execution-layer completion beneath TypedSOAC, not a replacement IR.
+
+Acceptance requires source-versus-execution tests for Float rounding, overflow,
+NaNs/infinities/signed zero, selected and unselected nil conversions, failure
+ordering around effects, Object boxing, multiple result leaves and repeated
+invocations. Add mismatched physical ABI, changed/shadowed source definition and
+downstream-device-consumer refusals. Hardware-free contract/emission evidence,
+actual OpenCL/Level Zero execution and performance measurements remain separate.
+The broader distributed placement/planning obligations below remain open.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.

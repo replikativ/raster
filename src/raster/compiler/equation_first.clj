@@ -35,6 +35,7 @@
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.pipeline :as pipeline]
@@ -738,7 +739,8 @@
              (fail! :equation-first-coverage
                     "deftm is outside the direct TypedSOAC/structured-control vertical"
                     {:function (function-symbol f-var)
-                     :dialect (:dialect semantic) :fallback :none}))
+                     :dialect (:dialect semantic) :fallback :none
+                     :coverage (typed-frontend/coverage-decline semantic compiler-options)}))
          semantic (cond-> semantic
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))

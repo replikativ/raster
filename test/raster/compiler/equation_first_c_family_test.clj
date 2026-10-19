@@ -2250,13 +2250,18 @@
 
 (deftest checked-scalars-after-device-work-do-not-become-preparation-checks
   (doseq [target [cuda-target hip-target]]
-    (is (= :equation-first-coverage
-           (try
-             (equation-first/compile #'checked-casts/checked-after-write!
-                                    {:target target :dtype :int})
-             :accepted
-             (catch clojure.lang.ExceptionInfo exception
-               (:reason (ex-data exception))))))))
+    (let [failure (try
+                    (equation-first/compile #'checked-casts/checked-after-write!
+                                           {:target target :dtype :int})
+                    nil
+                    (catch clojure.lang.ExceptionInfo exception (ex-data exception)))]
+      (is (= :equation-first-coverage (:reason failure)))
+      (is (= :none (:fallback failure)))
+      (is (= :typed-soac-source-coverage (get-in failure [:coverage :reason])))
+      (is (some #(and (= :uncertified-host-scalar (:reason %))
+                      (= 'int (:operation %))
+                      (symbol? (:binding %)))
+                (get-in failure [:coverage :bindings]))))))
 
 (deftest padded-map-lanes-do-not-evaluate-checked-conversions
   (doseq [target [cuda-target hip-target]]
