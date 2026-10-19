@@ -237,6 +237,8 @@
                 '(let* [count (unknown-index i) value (clojure.core/aget src count)] value)
                 '(let* [buf src value (clojure.core/aget buf i)] value)
                 '(let* [buf src] (raster.numeric/* 2.0 (clojure.core/aget buf i)))
+                '(let* [value (let* [buf src] (clojure.core/aget buf i))] value)
+                '(raster.numeric/+ acc (let* [buf src] (clojure.core/aget buf i)))
                 '(let* [index (clojure.core/+ acc i) value (clojure.core/aget src index)] value)
                 '(let* [index (clojure.core/aget out i) value (clojure.core/aget src index)] value)]]
     (is (= :ad-unclosed-lifted-read-index
@@ -245,6 +247,34 @@
               nil
               (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
         (str body))))
+
+(deftest lifted-read-receivers-respect-sequential-shadowing
+  (doseq [body ['(let* [value (clojure.core/aget src i) src other] value)
+                '(let* [src (clojure.core/aget src i)] src)]]
+    (let [analyzed (#'rev/analyze-par-map-body body 'i true)]
+      (is (= [['src 'i]] (mapv (juxt :arr :idx) (:agets analyzed)))))))
+
+(deftm local-index-check-before-read
+  [src :- (Array double) size :- Long] :- Double
+  (par/reduce total 0.0 i size
+    (let [checked (quot 1 (- size 1)) index (+ (* 2 size) i)
+          value (ra/aget src index)]
+      (n/+ total (n/* (double checked) value)))))
+
+(deftm local-index-check-after-read
+  [src :- (Array double) size :- Long] :- Double
+  (par/reduce total 0.0 i size
+    (let [index (+ (* 2 size) i) value (ra/aget src index)
+          checked (quot 1 (- size 1))]
+      (n/+ total (n/* (double checked) value)))))
+
+(deftest replay-closure-keeps-forward-exception-order-and-zero-trips
+  (doseq [[source expected] [[#'local-index-check-before-read ArithmeticException]
+                            [#'local-index-check-after-read ArrayIndexOutOfBoundsException]]]
+    (let [vg (rev/value+grad source :wrt [0])
+          failure (fn [f] (try (f (double-array 0) 1) nil (catch Throwable error (class error))))]
+      (is (= expected (failure source) (failure vg)))
+      (is (= [0.0 []] (let [[v g] (vg (double-array 0) 0)] [v (vec g)]))))))
 
 (deftest unrecognized-inline-index-stays-in-its-original-scope
   (let [body '(let* [count (unknown-index i)] (clojure.core/aget src count))

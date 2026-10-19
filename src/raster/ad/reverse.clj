@@ -2857,11 +2857,24 @@
                     (not (contains? locals array))
                     (or (integer? index)
                         (replayable-gather-index? index idx-sym locals)))))
-      (on-read array index)
+      (on-read array index locals)
       (seq? expr)
       (let [{:keys [kind liftable?]} (form/form-info expr)
             nested-scope? (or scoped? (= :binding kind) (not liftable?))]
-        (with-meta (apply list (map #(lift % nested-scope? locals) expr)) (meta expr)))
+        (if-let [{:keys [scopes outer sequential? rec? rebuild]} (form/scope-info expr)]
+          (rebuild
+           (mapv (fn [{:keys [binders inits body] :as scope}]
+                   (let [body-locals (into locals (filter symbol? binders))
+                         inits (if sequential?
+                                 (:inits
+                                  (reduce (fn [{:keys [locals inits]} [binder init]]
+                                            {:locals (cond-> locals (symbol? binder) (conj binder))
+                                             :inits (conj inits (lift init true locals))})
+                                          {:locals locals :inits []} (map vector binders inits)))
+                                 (mapv #(lift % true (if rec? body-locals locals)) inits))]
+                     (assoc scope :inits inits :body (mapv #(lift % true body-locals) body)))) scopes)
+           (mapv #(lift % nested-scope? locals) outer))
+          (with-meta (apply list (map #(lift % nested-scope? locals) expr)) (meta expr))))
       (vector? expr) (with-meta (mapv #(lift % scoped? locals) expr) (meta expr))
       :else expr))))
 
@@ -2932,10 +2945,11 @@
         ;; expressions are proof/replay data, not a reordered scalar program.
         local-ids (set (map first bindings))
         assert-closed-read!
-        (fn [array index]
+        (fn [array index visible-locals]
           (let [unclosed (binding [util/*shadowing-locals*
-                                   (into util/*shadowing-locals* (conj local-ids idx-sym))]
-                           (set/intersection local-ids
+                                   (into util/*shadowing-locals*
+                                         (conj (into local-ids visible-locals) idx-sym))]
+                           (set/intersection visible-locals
                                              (conj (util/free-syms index) array)))]
             (when (seq unclosed)
               (throw (ex-info "AD lifted array read retains step-local dependencies"
@@ -2962,21 +2976,22 @@
         index-aliases (:aliases index-alias-state)
         alias-snapshots (or (:snapshots index-alias-state) (repeat nil))]
     ;; (1) let*-bound agets
-    (doseq [[[sym init] aliases] (map vector bindings alias-snapshots)]
+    (doseq [[[sym init] aliases visible-locals]
+            (map vector bindings alias-snapshots (reductions conj #{} (map first bindings)))]
       (when (gradient-bearing-array-read? init)
         (let [[array original-index] (op/call-args init)
               index (if aliases (util/subst-syms aliases original-index) original-index)]
           ;; Lifted reads execute before scalar bindings in the backward step.
           ;; Only the existing checked alias replay may discharge their local
           ;; dependencies; emitting a forward reference is never a valid plan.
-          (assert-closed-read! array index)
+          (assert-closed-read! array index visible-locals)
           (swap! agets conj {:sym sym :arr array
                             :idx index}))))
     ;; (2) lift admitted inline reads, deduplicating by array AND original index.
     ;; Literal reads in scan stay inside the reverse iteration, not outside a zero-trip loop.
     (let [seen (atom {})
-          on-read (fn [arr index]
-                  (assert-closed-read! arr index)
+          on-read (fn [arr index visible-locals]
+                  (assert-closed-read! arr index visible-locals)
                   (let [k [arr index]]
                     (or (get @seen k)
                         (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
@@ -4855,7 +4870,7 @@
   "True when every active array read in a carry-loop let prelude is one the
   par/scan pullback can replay and scatter into (scan-read-lifter)."
   [bindings index-sym]
-  (let [lift (scan-read-lifter index-sym true (fn [_ _] '_read))]
+  (let [lift (scan-read-lifter index-sym true (fn [_ _ _] '_read))]
     (:ok? (reduce (fn [{:keys [locals]} [sym init]]
                     (let [ok? (if (gradient-bearing-array-read? init)
                                 (= '_read (lift init false locals))
