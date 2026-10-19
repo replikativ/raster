@@ -86,6 +86,15 @@ it does not establish general replay safety or permit DCE to discard reads.
 The subsequent actual `e3046c82` jobs (unit 32377, emission 32378, OpenCL CPU
 32381) are terminal failures; the three fresh-map/gather errors are absent
 from the inspected unit logs. The remaining groups above are still open.
+The integer JVM reduction crash was independently isolated to SIMD eligibility:
+`compile-segred` attempted Float/Double vector construction for a valid Long
+reduction. Eligibility now consults the existing implemented-species table
+before constructing vector forms; the caller keeps the original scalar
+reduction when no species exists. Direct Int/Long admission controls and source
+versus invoked AOT sums cover empty/small inputs and a result larger than Int.
+The two affected JVM namespaces pass 63 tests / 180 assertions in the bounded
+REPL. This is target eligibility, not a restored GPU source fallback or a claim
+of integer vectorization; Object-parameter completeness warnings remain visible.
 
 Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
 (49 tests, 757 assertions plus both fresh workers). Helper migration separately

@@ -1160,7 +1160,10 @@
                        " acc=" acc " init=" init
                        " inputs=" (vec (:inputs segred)))))
         {:keys [species-expr from-array broadcast] cf :cast-fn} (get simd-type-info elem-type)]
-    (when (and acc init idx bound lambda)
+    ;; A retained integral reduction is valid IR, but this emitter currently
+    ;; owns only Float/Double species. Decline before constructing vector forms;
+    ;; the caller retains the scalar reduction rather than changing its dtype.
+    (when (and (contains? simd-type-info elem-type) acc init idx bound lambda)
       ;; Unwrap let* in lambda
       (let [[let-bindings inner-body]
             (if (and (seq? lambda) (contains? #{'let* 'let} (first lambda)))
