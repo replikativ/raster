@@ -14,6 +14,40 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
+Integration hold: PR #1539 at `4cdbcb89` is draft, not qualified for merge.
+Setup/build passed, but unit, OpenCL CPU and emission-fixture jobs failed;
+dependent CUDA/HIP checks do not establish acceptance. Focused source-obligation
+gates are not evidence of broad compatibility. Triage retains these groups:
+
+- Source memory evaluation: unused owned allocations lose negative-size failures
+  in invoked JVM AOT; independent probes also lose unused read bounds failures
+  and read-before-allocation exception order. Repair at attested original memory
+  producers, not by disabling DCE or marking all generated AD reads effectful.
+  The current repair marks both the owned-bytecode producer and the portable
+  source-preparation frontier, including imported source helpers before generated
+  tape/map storage. Its cold compatibility gate ran 34 tests: 455 assertions
+  passed, with 2 failures and 10 errors in the already-identified product/native/
+  contraction groups; none was in the allocation/read-order regression namespace.
+  The shared evaluation/storage/native-alias gate passes 163 tests, 940 assertions.
+  These are bounded repair receipts, not a green PR or campaign completion.
+- AD products/completion: conditional product schemas, higher-order completion
+  transposes, and native residual Object completions need closure; source guards
+  and strict precision refusals must remain observable.
+- TypedSOAC composition: contraction scalar-contract projection, resident
+  training coverage, RMSNorm effect loops, and checked terminal scalar results
+  remain integration failures, not permission to restore retired fallbacks.
+- Numerical/control evidence: Q4_K exact Float-bit comparisons differ by an ULP
+  on multiple outputs; integer-bound/control regressions also remain. Do not
+  relax exact contracts or update expectations without establishing semantics.
+
+Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
+(49 tests, 757 assertions plus both fresh workers). Helper migration separately
+fails runtime-gradient reuse after AOT with `:ad-normalized-stale-rules`: template
+revision remains 238, compiler revision advances 1560 to 1564. Attribute the
+definition changes before changing invalidation; a passing warmed small control
+does not reproduce or close this lifecycle bug. Cold time/RSS are not improved
+by this functional qualification.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.

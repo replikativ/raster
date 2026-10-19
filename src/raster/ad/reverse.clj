@@ -5029,6 +5029,21 @@
        expression))
    body))
 
+(defn- retain-source-memory-evaluations
+  "Mark original memory evaluations before AD introduces residual/tangent storage.
+   External purity does not prove an unused read or allocation cannot fail.
+   Reuse the operation descriptor authority; this denial flag grants neither
+   memory independence nor permission to replay the operation."
+  [body]
+  (postwalk-code
+   (fn [expression]
+     (if (and (seq? expression)
+              (let [operation (op/semantic-op expression)]
+                (or (op/aget-op? operation) (op/alloc-op? operation))))
+       (vary-meta expression assoc :raster.effect/preserve-evaluation true)
+       expression))
+   body))
+
 (defn ^:no-doc ad-prepare
   "The ONE shared pre-AD preparation, used by the reverse path
   (`build-grad-walked-body`, `grad-expr`) AND the forward/JVP path
@@ -5050,7 +5065,8 @@
   here. Loops the gates decline are left untouched for the existing paths."
   ([body] (ad-prepare body nil))
   ([body param-env]
-   (let [body (retain-source-scan-checkpoint-obligations body)
+   (let [body (-> body retain-source-scan-checkpoint-obligations
+                  retain-source-memory-evaluations)
          body (local-products/lower-local-products body)
          body (inline/inline-transparent-lexical-calls body param-env)
          ;; A source-written reduction must project its initializer and step
@@ -5065,7 +5081,11 @@
         lowered (binding [inline/*param-env* param-env]
                   (-> source-scoped binaryize-core-arithmetic lower-composites
                       binaryize-core-arithmetic inline-qualified-constants))
-        lowered (soa-lower/lower-local-constructors lowered)
+        ;; Composite expansion imports original callee memory evaluations.
+        ;; Retain them before carry-tape and pure-map storage is synthesized;
+        ;; do not mark the final generated derivative program wholesale.
+        lowered (-> lowered soa-lower/lower-local-constructors
+                    retain-source-memory-evaluations)
         ;; §15.2 (1): recover SOAC structure from raw loop syntax — dotimes →
         ;; par/map!, tail-accumulation → par/reduce, carry+aset → par/scan —
         ;; with the lift's proven-soundness gates (stats are discarded here;
@@ -6547,7 +6567,11 @@
                               (lower-integer-input region env "array_index"))
                             :else index)]
                   (append! result (with-meta (list 'clojure.core/aget (:value source) index-value)
-                                            {:raster.type/tag tag})))))
+                                            {:raster.type/tag tag
+                                             ;; This is an attested source read, not a
+                                             ;; generated tangent read. Its bounds/null
+                                             ;; failure remains observable if unused.
+                                             :raster.effect/preserve-evaluation true})))))
             (lower-zero-array [expression env after allocation]
               (let [input (:count allocation)
                     array-class (:array-class allocation)
@@ -6572,7 +6596,8 @@
                   ;; its original completed count. Freshness is not permission
                   ;; to discard an unused allocation or move it across work.
                   (append! (ad-gensym "body_array" array-tag)
-                           (list constructor count-value)))))
+                           (with-meta (list constructor count-value)
+                             {:raster.effect/preserve-evaluation true})))))
             (lower-conversion [expression env]
               (let [{:keys [operand input-type target-carrier ports context] :as record}
                     (conversion-context emission expression)
