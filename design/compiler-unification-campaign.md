@@ -117,6 +117,39 @@ guards. Two private, unreferenced pullback prototypes were removed during the
 consumer audit; active reification/HVP/Hessian paths remain. This repairs the
 observed HVP consumer failure, not all higher-order AD or the marketing lifecycle.
 
+Next normalized product-closure work must preserve **presence, tangent declaration
+and physical completion as independent facts**. REPL attribution of the third
+derivative shows an actual inactive residual `[nil [nil]]` joining a Double
+residual, not permission to treat every untyped leaf as numeric. A prototype
+presence-aware schema join progressed to a second refusal: generated `grad-acc`
+results whose `present_gradient` operands already lack tangent declarations.
+That prototype was reverted, not landed as a partial repair or a guard waiver.
+
+The follow-up order is: shared normal-return facts for canonical completions;
+producer-time freezing of lexical facts; retained logical declarations through
+rule instantiation, absence lifting, snapshots and projections; existing shared
+typing for generated derivative programs before reentrant AD; then checked
+nullable-scalar product joins. `BindCtx/genlet` and absence-lifted slots are
+specific declaration-transport seams to audit, not grounds for a new AD function
+inference registry. Explicit absence may join a declared scalar; unknown Object
+must still refuse. Optional arrays stay held until zero construction and ownership
+are checked. Original producers, singular pullbacks, source guards and rounding
+checkpoints must remain observable. Controls include both branch orientations,
+alias shadowing, nested projections, unknown inactive values, differing tangent
+declarations, malformed schemas, and absent versus present-zero cotangents.
+The shared completion-presence foundation is separately reviewed and qualified:
+Object/reference-check contexts forward only already-owned operand facts;
+primitive contexts prove presence only on successful normal return, without
+payload-width or policy authorization. An original-versus-DCE oracle retains
+the failing reference check and its exception order. The cold presence,
+local-product, DCE and effects gate passes 83 tests / 482 assertions. No nullable
+product or tangent-tag producer changes are included in that foundation.
+Inspection of completed unit job 32391 (`bb27191d`) confirms the Q4_K exact-bit,
+Long/SIMD, raw-evaluation test-consumer and outdated scan-reason failures are
+gone. Its remaining failures include HVP consumers (repaired in the subsequent
+`5c745536`), schema/tag closure, training, native guards and integer/control
+proofs. This is a measured delta, not broad green CI or merge acceptance.
+
 Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
 (49 tests, 757 assertions plus both fresh workers). Helper migration separately
 fails runtime-gradient reuse after AOT with `:ad-normalized-stale-rules`: template

@@ -8,6 +8,7 @@
   (:require [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.support.mangled :as mangled]
             [raster.compiler.ir.form :as form]
@@ -134,6 +135,17 @@
     {:presence (if (nil? (second expression)) :absent :present)}
     (= 'throw (first expression)) {:presence :no-return}
     (= 'do (first expression)) (summary (last (rest expression)) env visited body-context)
+    (completion/canonical-parts expression)
+    (let [{:keys [contract operand]} (completion/canonical-parts expression)
+          fact (summary operand env visited body-context)]
+      (case (:source-context contract)
+        ;; These contexts preserve the actual reference, including nil. A
+        ;; desired CHECKCAST class does not establish a producer array carrier.
+        (:jvm-object-input :jvm-checkcast) fact
+        ;; Presence is conditional on normal return, not proof that a cast
+        ;; succeeds or authority to execute it under another compilation owner.
+        (:jvm-primitive-input :jvm-bytecode-floating-input)
+        {:presence (if (= :no-return (:presence fact)) :no-return :present)}))
     (form/binding-form? expression)
     (let [{:keys [sequential? scopes]} (form/scope-info expression)
           {:keys [binders inits body]} (first scopes)]
