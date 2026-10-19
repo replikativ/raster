@@ -216,12 +216,12 @@
   (source-owner/assert-portable-source! (meta v))
   (when (var? v)
     (source-owner/assert-portable-source! (try (meta @v) (catch Exception _ nil))))
-  (let [;; Materialize the walked body FIRST: ensure-walked-body! lazily walks the
-        ;; deftm and stamps deftm-params/deftm-tags/return-tag/typed-body onto the
-        ;; var. Reading (meta v) before this returns stale meta with no params, so
-        ;; a cold (never-JIT'd) callee like valley.core/chunk-block would fail the
-        ;; guard below even though its body is perfectly inlinable.
-        _ (when (instance? clojure.lang.Var v)
+  (let [;; Freeze the original producer first. Walking the legacy cache before
+        ;; preparation would expand a cold helper's macros twice.
+        _ (when (var? v) (rcore/prepare-deftm-frontend! v))
+        retained-frontend (when (:raster.core/deftm (meta v))
+                            (method-entry/original-source-frontend v))
+        _ (when (and (var? v) (nil? retained-frontend))
             (try (rcore/ensure-walked-body! v) (catch Exception _ nil)))
         _ (when method-entry/*emission-inputs*
             (method-entry/observe-definition-input! v (:ns (meta v)) (:name (meta v))))
@@ -235,8 +235,6 @@
                        (try (meta (if snapshot (:value snapshot) @v)) (catch Exception _ nil)))
         _ (source-owner/assert-portable-source! metadata)
         _ (source-owner/assert-portable-source! val-metadata)
-        retained-frontend (when (:raster.core/deftm metadata)
-                            (method-entry/original-source-frontend v))
         var-body (or (:body retained-frontend)
                      (:raster.core/deftm-walked-body-typed metadata)
                      (:raster.core/deftm-walked-body metadata))

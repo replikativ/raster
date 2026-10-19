@@ -14,8 +14,8 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `f6b9f1ac` is draft, not qualified for merge.
-Exact-head setup/build passed, emission failed, and unit/OpenCL were pending at
+Current integration hold: PR #1539 at `e883ab54` is draft, not qualified for merge.
+Exact-head setup/build passed, emission and unit tests failed, and OpenCL was pending at
 the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
@@ -103,8 +103,15 @@ Requested precision must correspond to the selected specialization, not silently
 retype it. Root lookup uses existing flat-var and mangled-operation authority;
 helper imports must use the same original frontend rather than stale walk caches.
 Cold/legacy layouts without that evidence receive no checked-execution owner.
-Next share one frontend-materialization producer between pending JIT and GPU
-compilation; do not introduce a duplicate expansion/type-inference pipeline.
+The pending JIT and GPU paths now share one frontend-materialization producer
+under the existing implementation lock, without numerical invocation or JVM
+emission. The immutable semantic frontend is separate from its pending/published
+implementation correspondence. Promotion reuses that body but invalidates older
+implementation observations; recompilation must obtain fresh correspondence,
+not refresh an old execution owner's guards. Cold helper import prepares this
+producer before considering legacy caches, avoiding a second frontend walk.
+Focused tests cover concurrent requests, macro stability, and specification
+changes during preparation. Ordered runtime activation remains separate work.
 Acceptance includes changed-macro source oracles, distinct genuine Float/Double
 specializations, backed/wrapped source handles, edited metadata refusals and a
 prewalk-A/materialize-B helper import. Aliases and parametric cases remain required.

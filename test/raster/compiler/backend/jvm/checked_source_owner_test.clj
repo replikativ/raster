@@ -73,7 +73,9 @@
   (let [v (helper) original (meta v)]
     (try
       (alter-meta! v dissoc :raster.core/source-policy)
-      (is (= :unsupported-checked-result-import-policy (reason #(compile-owned v))))
+      (is (= :stale-definition-proof-input
+             (reason #(entry/call-with-definition-inputs (fn [] (import! v)))))
+          "removing the policy invalidates the original frontend before import")
       (finally (reset-meta! v original)))))
 
 (deftest function-value-body-retains-its-own-policy-origin

@@ -556,35 +556,66 @@
                                {:carrier carrier :presence (if (.isPrimitive carrier) :present :unknown)})
                              parameter-carriers)))))))
 
-(deftype ^:private FrontendSourceOwner [lineage implementation body context])
+(deftype ^:private SourceFrontend [lineage body context preparation-inputs])
+(deftype ^:private FrontendSourceOwner [frontend implementation])
+
+(defn freeze-source-frontend
+  "Original producer: freeze semantic source before choosing a target module.
+   Preparation inputs fence publication, not later macro redefinition: the
+   already-expanded body retains its meaning just like compiled Clojure code."
+  [lineage body context preparation-inputs]
+  (assert-source-entry-current! lineage)
+  (assert-definition-inputs-current! preparation-inputs)
+  (when-not (and (vector? body) (map? preparation-inputs)
+                 (= #{:element-dtype :parameter-dtype} (set (keys context))))
+    (throw (ex-info "frontend producer needs its original body and context"
+                    {:reason :unclosed-original-frontend})))
+  (SourceFrontend. lineage body context preparation-inputs))
+
+(defn bind-source-frontend
+  "Producer-owned correspondence, separate from the frozen semantic frontend.
+   A pending binding identifies its stub/spec, not an executed numerical body."
+  [frontend implementation]
+  (when-not (and (instance? SourceFrontend frontend) implementation)
+    (throw (ex-info "frontend binding requires an original producer"
+                    {:reason :unclosed-original-frontend})))
+  (assert-source-entry-current! (.-lineage ^SourceFrontend frontend))
+  (FrontendSourceOwner. frontend implementation))
 
 (defn own-frontend-source
   "Original producer boundary: bind pre-backend source to its actual implementation.
    The opaque owner is not reconstructed from a later emission-metadata map."
   [lineage implementation body context]
-  (assert-source-entry-current! lineage)
-  (when-not (and implementation (vector? body)
-                 (= #{:element-dtype :parameter-dtype} (set (keys context))))
-    (throw (ex-info "frontend producer needs its original body and context"
-                    {:reason :unclosed-original-frontend})))
-  (FrontendSourceOwner. lineage implementation body context))
+  (bind-source-frontend (freeze-source-frontend lineage body context {}) implementation))
+
+(defn frontend-source-input!
+  "Read immutable producer inputs for this exact pending/published implementation."
+  [owner implementation]
+  (when-not (and (instance? FrontendSourceOwner owner)
+                 (identical? implementation (.-implementation ^FrontendSourceOwner owner)))
+    (throw (ex-info "frontend source is not owned by this original implementation"
+                    {:reason :retained-frontend-owner-mismatch})))
+  (let [frontend (.-frontend ^FrontendSourceOwner owner)
+        lineage (.-lineage ^SourceFrontend frontend)]
+    (assert-source-entry-current! lineage)
+    {:source-frontend frontend :source-entry lineage :source-owner owner
+     :implementation implementation :body (.-body ^SourceFrontend frontend)
+     :frontend-context (.-context ^SourceFrontend frontend)}))
 
 (defn- original-frontend [owner lineage implementation expected-dtype]
   (when owner
-    (when-not (and (instance? FrontendSourceOwner owner)
-                   (identical? lineage (.-lineage ^FrontendSourceOwner owner))
-                   (identical? implementation (.-implementation ^FrontendSourceOwner owner)))
-      (throw (ex-info "frontend source is not owned by this original implementation"
-                      {:reason :retained-frontend-owner-mismatch})))
-    (assert-source-entry-current! lineage)
-    (let [context (.-context ^FrontendSourceOwner owner)]
-      (when-not (or (nil? (:parameter-dtype context))
-                    (= expected-dtype (:parameter-dtype context)))
-        (throw (ex-info "retained source specialization cannot be retyped for this request"
-                        {:reason :retained-frontend-dtype-mismatch
-                         :source (:source-var lineage) :requested-dtype expected-dtype
-                         :source-dtype (:parameter-dtype context)})))
-      {:body (.-body ^FrontendSourceOwner owner) :frontend-context context})))
+    (let [original (frontend-source-input! owner implementation)]
+      (when-not (identical? lineage (:source-entry original))
+        (throw (ex-info "frontend source is not owned by this original implementation"
+                        {:reason :retained-frontend-owner-mismatch})))
+      (let [context (:frontend-context original)]
+        (when-not (or (nil? (:parameter-dtype context))
+                      (= expected-dtype (:parameter-dtype context)))
+          (throw (ex-info "retained source specialization cannot be retyped for this request"
+                          {:reason :retained-frontend-dtype-mismatch
+                           :source (:source-var lineage) :requested-dtype expected-dtype
+                           :source-dtype (:parameter-dtype context)})))
+        original))))
 
 (defn assert-frontend-source!
   "Check original producer identity, not asserted body/context fields in a map."
@@ -593,6 +624,7 @@
         expected (original-frontend source-owner source-entry implementation
                                     (:parameter-dtype frontend-context))]
     (when-not (and expected (identical? source-var (:source-var source-entry))
+                   (identical? (:source-frontend frontend) (:source-frontend expected))
                    (identical? body (:body expected))
                    (= frontend-context (:frontend-context expected)))
       (throw (ex-info "checked source requires its original frontend producer"
@@ -612,15 +644,19 @@
            direct-op (symbol (str (:ns (meta source-var))) (str (:name (meta source-var))))
            direct (when-not projection
                     (observed-selected-definition :direct operation direct-op argument-count))
-           lineage (if projection (:source-entry projection)
+           pending? (:pending-source? projection)
+           receiver (get-in projection [:definition :receiver-var])
+           pending-owner (when pending? (get-in (meta receiver) [:raster.core/jit-spec :frontend-source-owner]))
+           pending-input (when pending-owner (frontend-source-input! pending-owner (var-get receiver)))
+           lineage (if projection (or (:source-entry pending-input) (:source-entry projection))
                        (when (identical? source-var (:source-var direct))
                          (:raster.core/clojure-source-entry (meta source-var))))
            emission (:emission projection)
-           owner (if projection (:frontend-source-owner emission)
+           owner (if projection (or pending-owner (:frontend-source-owner emission))
                      (:raster.core/frontend-source-owner (meta source-var)))
-           implementation (if projection (:implementation emission)
+           implementation (if projection (if pending? (var-get receiver) (:implementation emission))
                               (when direct (var-get source-var)))]
-       (when (and lineage (not (:pending-source? projection)))
+       (when (and lineage (or (not pending?) pending-input))
          (when-let [frontend (original-frontend owner lineage implementation expected-dtype)]
            (observe-source-body-input! source-var :var)
            (assert-definition-inputs-current! @*emission-inputs*)

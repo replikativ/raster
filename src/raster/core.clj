@@ -414,6 +414,56 @@
         (do (when failure (throw failure))
             {:implementation implementation :emission emission})))))
 
+(clojure.core/defn ^:no-doc prepare-implementation-frontend!
+  "Freeze the original frontend under the existing implementation lock.
+   Does not invoke numerical code or emit a JVM module. Both GPU-first and
+   JVM-first compilation consume this exact semantic frontend."
+  [impl-var]
+  (locking impl-var
+    (if-let [spec (::jit-spec (meta impl-var))]
+      (if-let [owner (:frontend-source-owner spec)]
+        (me/frontend-source-input! owner (var-get impl-var))
+        (let [source-ns (find-ns (:source-ns-name spec))
+              source-var (when source-ns (ns-resolve source-ns (:mangled-sym spec)))
+              lineage (when source-var
+                        (me/capture-source-entry
+                         source-var (assoc spec :source-ns source-ns
+                                                :typed-interface (:typed-iface-name spec))))]
+          (when lineage
+            (let [implementation (var-get impl-var)
+                  inputs (atom {:static [] :values []})
+                  body (binding [me/*emission-inputs* inputs]
+                         (source-policy/call-with-policy
+                          (:source-policy lineage)
+                          #(jit-walk-with-tc (vec (:source-body lineage))
+                                             (:params lineage) (:tags lineage)
+                                             (:annotations lineage) source-ns)))
+                  element-dtype (dtype/infer-dtype-from-tags (:tags lineage))
+                  frontend (me/freeze-source-frontend
+                            lineage body {:element-dtype element-dtype
+                                          :parameter-dtype element-dtype} @inputs)
+                  owner (me/bind-source-frontend frontend implementation)]
+              (me/assert-source-entry-current! lineage)
+              (alter-meta! impl-var
+                           (fn [metadata]
+                             (when-not (and (identical? spec (::jit-spec metadata))
+                                            (identical? implementation (var-get impl-var)))
+                               (throw (ex-info "pending source changed during frontend preparation"
+                                               {:reason :unstable-pending-frontend :source source-var})))
+                             (assoc-in metadata [::jit-spec :frontend-source-owner] owner)))
+              (me/frontend-source-input! owner implementation)))))
+      (when-let [owner (get-in (meta impl-var) [::bytecode-emission :frontend-source-owner])]
+        ;; Renewal may replace a target module, never reconstruct its source.
+        (me/frontend-source-input! owner (var-get impl-var))))))
+
+(clojure.core/defn ^:no-doc prepare-deftm-frontend!
+  "Prepare an already selected source specialization without executing it."
+  [source-var]
+  (when (and (var? source-var) (::deftm (meta source-var)))
+    (when-let [impl-var (ns-resolve (:ns (meta source-var))
+                                   (symbol (str (:name (meta source-var)) "-impl")))]
+      (prepare-implementation-frontend! impl-var))))
+
 (clojure.core/defn ^:no-doc do-bytecode-upgrade!
   "Compile a deftm body to bytecode and swap the -impl var.
   Julia model: re-walks from source body with TC at JIT time for
@@ -441,17 +491,23 @@
               *unchecked-math* (if retained-policy?
                                 (source-policy/unchecked-math source-policy)
                                 *unchecked-math*)]
-      (let [source-entry (me/capture-source-entry
+      (let [prepared (prepare-implementation-frontend! impl-var)
+            captured-entry (me/capture-source-entry
                           source-var {:params params :tags tags :annotations annotations
                                       :source-body source-body :source-ns source-ns
                                       :source-policy source-policy
                                       :typed-interface typed-iface-name :return-tag return-tag})
-            _ (when (and retained-policy? (nil? source-entry))
+            _ (when (and prepared (not= captured-entry (:source-entry prepared)))
+                (throw (ex-info "JVM emission request differs from its frozen frontend"
+                                {:reason :frontend-emission-source-mismatch :source source-var})))
+            source-entry (or (:source-entry prepared) captured-entry)
+            _ (when (and retained-policy? (nil? captured-entry))
                 (throw (ex-info "Bytecode source ownership changed before lineage capture"
                                 {:reason :unclosed-bytecode-source-entry :source source-var})))
-            fresh-body (if (and source-body annotations)
+            fresh-body (if prepared (:body prepared)
+                         (if (and source-body annotations)
                          (jit-walk-with-tc (vec source-body) params tags annotations source-ns)
-                         walked-body)]
+                         walked-body))]
         (try
         (let [;; Publish the genuine source-walk cache before emission captures
               ;; dependencies. A later AOT cache fill must not invalidate code
@@ -531,10 +587,12 @@
                              (cond-> emission source-entry
                                (assoc :source-entry source-entry
                                       :frontend-source-owner
-                                      (me/own-frontend-source
-                                       source-entry impl fresh-body
-                                       {:element-dtype (dtype/infer-dtype-from-tags tags)
-                                        :parameter-dtype (dtype/infer-dtype-from-tags tags)}))))
+                                      (if prepared
+                                        (me/bind-source-frontend (:source-frontend prepared) impl)
+                                        (me/own-frontend-source
+                                         source-entry impl fresh-body
+                                         {:element-dtype (dtype/infer-dtype-from-tags tags)
+                                          :parameter-dtype (dtype/infer-dtype-from-tags tags)})))))
                 impl
                 (catch Exception e
               ;; Rollback var to old impl on dispatch table or callsite failure

@@ -711,6 +711,7 @@
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
          function-id (function-symbol resolved-var)
+         _ (rcore/prepare-deftm-frontend! resolved-var)
          _ (method-entry/observe-definition-input! resolved-var (:ns (meta resolved-var))
                                                    (:name (meta resolved-var)))
          policy (compilation-policy function-id target options captured-target)

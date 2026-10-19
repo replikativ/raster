@@ -76,6 +76,9 @@
         original (meta source)]
     (is (= :unowned-checked-result-frontend
            (reason #(entry/assert-frontend-source! (assoc frontend :body '[42.0]) source))))
+    (is (= :unowned-checked-result-frontend
+           (reason #(entry/assert-frontend-source!
+                     (assoc frontend :source-frontend (Object.)) source))))
     (try
       (alter-meta! source update :raster.core/clojure-source-entry assoc :clojure-body '[42.0])
       (is (= :retained-frontend-owner-mismatch (reason #(original-source :double))))
