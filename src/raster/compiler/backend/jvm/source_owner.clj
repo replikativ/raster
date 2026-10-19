@@ -7,8 +7,11 @@
    and must not export these private captures as ordinary portable source."
   (:require [clojure.set :as set]
             [raster.compiler.core.ordered-call :as ordered-call]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.util :as util]
+            [raster.compiler.backend.jvm.terminal-source :as terminal-source]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.form :as form])
   (:import [java.lang.reflect Method]))
 
@@ -102,13 +105,95 @@
           used (into (into bound ports) (util/free-syms-flat [params body]))
           arguments (loop [id (gensym "owner_captures__")]
                       (if (contains? used id) (recur (gensym "owner_captures__")) id))
+          nth-method (.getMethod clojure.lang.RT "nth" (into-array Class [Object Integer/TYPE]))
+          nth-head (with-meta 'clojure.lang.RT/nth {:param-tags [Object Integer/TYPE]})
           bindings (vec (mapcat (fn [port index]
-                                 [port (list 'clojure.core/nth arguments index)]) ports (range)))
-          factory (list 'fn ['& arguments]
+                                 [port (list nth-head arguments (int index))]) ports (range)))
+          factory (list 'fn* ['& arguments]
                         (list 'let* bindings (function-form params body)))]
       (binding [*ns* source-ns *unchecked-math* (:unchecked-math source-policy)]
         (when guard (guard))
+        (ordered-call/verify-source-method! nth-method)
         (doseq [method methods] (ordered-call/verify-source-method! method))
         (let [execute (apply (eval factory) (mapv :value captures))]
+          (ordered-call/verify-source-method! nth-method)
+          (doseq [method methods] (ordered-call/verify-source-method! method))
           (when guard (guard))
           execute)))))
+
+(deftype ^:private TerminalResultOwner [program contract execute observations source-ns])
+
+(defn- terminal-owner-current! [^TerminalResultOwner owner]
+  (let [source-ns (.-source-ns owner)]
+    (when-not (identical? source-ns (find-ns (ns-name source-ns)))
+      (throw (ex-info "terminal source namespace was replaced"
+                      {:reason :stale-terminal-source-namespace})))
+    (entry/assert-definition-inputs-current! (.-observations owner))))
+
+(defn compile-terminal-result
+  "Compile the generated terminal source region under its existing producer.
+
+   Requires an active definition collector which ALREADY observed source-var
+   before constructing the numerical program. Never manufactures historical
+   ownership from a fresh snapshot. The compiler producer remains responsible
+   for source-to-program correspondence. The returned owner is process-local,
+   nonportable, and tied to this exact program/contract pair.
+
+   This compiles the region's source Object result context, not an arbitrary
+   original bytecode method's return descriptor. It grants no physical export,
+   producer completion, device observation or whole-invocation result proof."
+  [program contract source-var]
+  (let [collector entry/*emission-inputs*
+        observation (when collector (get-in @collector [:definition-proofs source-var]))
+        metadata (:metadata observation)
+        source-ns (:ns metadata)
+        policy (:raster.core/source-policy metadata)]
+    (when-not (and observation (var? source-var)
+                   (instance? clojure.lang.Namespace source-ns)
+                   (completion/source-policy? policy))
+      (throw (ex-info "terminal source needs its original definition owner"
+                      {:reason :unowned-terminal-source})))
+    (entry/assert-definition-inputs-current! @collector)
+    (invocation/validate-terminal-source-result!
+     contract program {:source-policy policy :source-namespace (ns-name source-ns)})
+    (let [projection (terminal-source/project contract source-ns)
+          guard #(do
+                   (when-not (identical? source-ns (find-ns (ns-name source-ns)))
+                     (throw (ex-info "terminal source namespace was replaced"
+                                     {:reason :stale-terminal-source-namespace})))
+                   (entry/assert-definition-inputs-current! @collector))
+          execute (compile-function (:params projection) (:source projection)
+                                    (fn [params body] (list 'fn* params body))
+                                    (merge projection {:source-policy policy :source-ns source-ns :guard guard}))
+          ;; Freeze AFTER compilation, including dependencies discovered while
+          ;; compiling. Invocation must never reread a mutable collector to
+          ;; refresh an already-emitted function's historical observations.
+          observations @collector]
+      (entry/assert-definition-inputs-current! observations)
+      (TerminalResultOwner. program contract execute observations source-ns))))
+
+(defn invoke-terminal-result
+  "Evaluate one owned terminal region using completed, ordered scalar exports.
+   The runtime caller owes export/completion evidence BEFORE this boundary.
+   Exact carrier/arity and owner guards are checked before source effects;
+   successful source results are checked again before publication."
+  [owner program contract arguments]
+  (when-not (and (instance? TerminalResultOwner owner)
+                 (identical? program (.-program ^TerminalResultOwner owner))
+                 (identical? contract (.-contract ^TerminalResultOwner owner)))
+    (throw (ex-info "terminal executable belongs to another source/program boundary"
+                    {:reason :terminal-source-owner-mismatch})))
+  (let [^TerminalResultOwner owner owner
+        parameters (:parameters contract)]
+    (when-not (and (vector? arguments) (= (count parameters) (count arguments))
+                   (every? true?
+                           (map (fn [{:keys [dtype]} value]
+                                  (case dtype :double (instance? Double value)
+                                              :long (instance? Long value)))
+                                parameters arguments)))
+      (throw (ex-info "terminal arguments differ from their actual scalar carriers"
+                      {:reason :terminal-source-arguments})))
+    (terminal-owner-current! owner)
+    (let [result ((.-execute owner) arguments)]
+      (terminal-owner-current! owner)
+      result)))

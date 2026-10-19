@@ -310,6 +310,47 @@ the draft PR is not ready to merge. No source arithmetic contract was relaxed.
 
 ### Residency consolidation: ordered host observation
 
+October 19 implementation checkpoint: the generated terminal region now has a
+private JVM executable owner, compiled under the numerical producer's previously
+observed definition, namespace and arithmetic policy. It freezes historical
+dependencies, rejects mismatched program/contract identity and argument carriers
+before source effects, and fences successful publication with definition guards.
+This owner grants neither physical scalar exports nor completion evidence.
+
+Terminal source projection uses resolved Methods and actual captured IFns rather
+than unrestricted macro/inline expansion. Float conversions retain their actual
+operand overload and checked/unchecked policy. Unknown helper primitive ABIs,
+mixed primitive joins and unaccounted JVM hints refuse. The supported Clojure
+1.12 control forms derive carriers from children rather than form tags; those
+tags are preserved without becoming evidence. Exact Object hints are admitted
+only on already Object-valued locals. Other hint contexts remain unsupported.
+Independent source-oracle tests cover these distinctions.
+
+Review exposed a shared source-resolution defect: a namespace alias can redirect
+a qualified Class/method spelling to a Var even when the retained Method is
+correct. The existing ordered-call verifier now rejects namespace/alias masking
+of the declaring Class qualifier. Its regression first demonstrates actual
+Clojure compiler redirection, then checks refusal. These are sequential fences,
+not a concurrent Namespace mutation/ABA guarantee. Intrinsic projection assumes
+standard Clojure definitions at backend bootstrap and guards later replacement.
+
+The warm affected gate passes seven namespaces, 70 tests / 479 assertions. A real
+frontend capture of mixed-scale-energy-gradient successfully compiles its owned
+terminal expression and returns Float values with matching signed-zero and NaN
+bits; Double/MAX_VALUE throws as required. This is a terminal-owner probe, NOT
+end-to-end equation-first execution: ordinary compilation still refuses the
+unintegrated return boundary. The earlier cold 78-test gate predates the final
+hint adjustment and is not fresh-load qualification of that adjustment.
+
+Next acceptance remains the public compile/execute/replay path, not another
+standalone helper: attach portable correspondence to InvocationPlan, retain its
+private executable with the compilation owner, account for the final source-order
+observation, validate actual physical exports, and observe only after producer
+completion. Preserve resident-only refusal and complete return coverage until
+that entire transition is supported. Audit graph-liveness prefix pruning before
+omitting any pure-but-throwing scalar computation. Current exact-head CI remains
+red and PR #1539 remains draft; all eight campaign obligations remain open.
+
 Definition-policy prerequisite (October 19): named `deftm`, parametric templates
 and their concrete specializations now retain the actual producer's
 `*unchecked-math*` context, sharing the existing anonymous-function policy schema.

@@ -16,6 +16,7 @@
             [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
@@ -276,7 +277,7 @@
   (parallel-program/validate! program)
   (source-policy/unchecked-math source-policy)
   (let [[head bindings & body] (:source program)]
-    (when-not (and (contains? '#{let let* clojure.core/let} head)
+    (when-not (and (contains? form/let-heads head)
                    (vector? bindings) (even? (count bindings)) (= 1 (count body))
                    (symbol? source-namespace) (nil? (namespace source-namespace)))
       (fail! :invocation-terminal-source
