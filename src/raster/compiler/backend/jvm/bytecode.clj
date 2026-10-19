@@ -765,6 +765,31 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
+(defn- retain-call-observation!
+  "Retain one actual emitter observation per original call occurrence.
+   Repeated emission is ambiguous, never repaired by structural equality."
+  [ctx family observation repeated-reason]
+  (when-let [token (::call-occurrence ctx)]
+    (when me/*emission-inputs*
+      (let [record (assoc observation :expression (::call-expression ctx))]
+        (swap! me/*emission-inputs* update family
+               (fn [contexts]
+                 (assoc contexts token
+                        (if (contains? contexts token)
+                          (cond-> {:status :ambiguous}
+                            repeated-reason (assoc :reason repeated-reason))
+                          record))))))))
+
+(defn- retained-call-observation
+  [emission original family]
+  (let [token (::call-occurrence (meta original))
+        record (get (get emission family) token)]
+    (when (and (= :jvm-bytecode (:backend emission)) token
+               (identical? original (get (:invocation-catalog emission) token))
+               (= :known (:status record)))
+      (me/assert-emission-inputs-current! emission)
+      record)))
+
 (defn- retain-invocation-context!
   [method receiver arguments mode return-carrier locals ctx]
   (when-let [token (::call-occurrence ctx)]
@@ -786,29 +811,15 @@
                     :element-type (:element-type ctx)
                     :inputs (mapv input arguments)}
                      guarded? (assoc :reason :runtime-selected-input-context))]
-        (swap! me/*emission-inputs*
-               update :invocation-contexts
-               (fn [contexts]
-                 (if (contains? contexts token)
-                   ;; Syntax equality ignores metadata and quoted identities.
-                   ;; Until cloned regions have an exact equivalence proof,
-                   ;; refuse even superficially equal repeated emissions.
-                   (assoc contexts token {:status :ambiguous
-                                          :reason :repeated-emitted-invocation-context})
-                   (assoc contexts token record))))))))
+        (retain-call-observation! ctx :invocation-contexts record
+                                  :repeated-emitted-invocation-context)))))
 
 (defn ^:no-doc retained-invocation-context
   "Query one ORIGINAL occurrence from a trusted, guarded bytecode emission.
    The caller separately owns selected-definition/implementation correspondence.
    Copies, missing/cloned contexts and stale dependencies cannot establish it."
   [emission expression]
-  (let [token (::call-occurrence (meta expression))
-        original (get (:invocation-catalog emission) token)
-        record (get (:invocation-contexts emission) token)]
-    (when (and (= :jvm-bytecode (:backend emission))
-               token (identical? original expression) (= :known (:status record)))
-      (me/assert-emission-inputs-current! emission)
-      record)))
+  (retained-call-observation emission expression :invocation-contexts))
 
 (defn ^:no-doc retained-input-call-context
   "Follow an actual emitted input edge to its nested invocation context.
@@ -861,23 +872,14 @@
                     :operand operand :input-type input-type :target-carrier target-carrier
                     :context (completion/bytecode-operand-context ctx)
                     :ports (select-keys locals free)}]
-        (swap! me/*emission-inputs* update :floating-conversion-contexts
-               (fn [contexts]
-                 (assoc contexts token (if (contains? contexts token)
-                                         {:status :ambiguous} record))))))))
+        (retain-call-observation! ctx :floating-conversion-contexts record nil)))))
 
 (defn ^:no-doc retained-floating-conversion
   "Actual emitted FP conversion of an exact original source occurrence.
    Consumers separately prove their admitted operand domain; the source name
    or logical result tag alone cannot establish this evidence."
   [emission original]
-  (let [token (::call-occurrence (meta original))
-        record (get (:floating-conversion-contexts emission) token)]
-    (when (and (= :jvm-bytecode (:backend emission)) token
-               (identical? original (get (:invocation-catalog emission) token))
-               (= :known (:status record)))
-      (me/assert-emission-inputs-current! emission)
-      record)))
+  (retained-call-observation emission original :floating-conversion-contexts))
 
 (defn- comparison-form?
   "True if form is a comparison call: (< a b), (>= a b), (== a b), etc."
@@ -2244,22 +2246,35 @@
                     :primitive-index? (and (contains? #{:int :long} index-type) (empty? (:open proof)))
                     :index-routes (:routes proof)
                     :element-type (:element-type ctx)}]
-        (swap! me/*emission-inputs* update :array-read-contexts
-               (fn [contexts]
-                 (assoc contexts token (if (contains? contexts token)
-                                         {:status :ambiguous} record))))))))
+        (retain-call-observation! ctx :array-read-contexts record nil)))))
 
 (defn ^:no-doc retained-array-read
   "Actual original array read and its evaluated index carrier/context.
    This observation grants no activity, purity or source-projection permission."
   [emission original]
-  (let [token (::call-occurrence (meta original))
-        record (get (:array-read-contexts emission) token)]
-    (when (and (= :jvm-bytecode (:backend emission)) token
-               (identical? original (get (:invocation-catalog emission) token))
-               (= :known (:status record)))
-      (me/assert-emission-inputs-current! emission)
-      record)))
+  (retained-call-observation emission original :array-read-contexts))
+
+(defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals proof]
+  (when me/*emission-inputs*
+    (let [free (binding [util/*shadowing-locals* (set (keys locals))]
+                 (util/free-syms count-source))]
+      (retain-call-observation!
+       ctx :array-allocation-contexts
+       {:status :known :array-class array-class :fresh? true :initialization :jvm-zero
+        :element-type (:element-type ctx)
+        :primitive-count? (and (contains? #{:int :long} count-type) (empty? (:open proof)))
+        :count-routes (:routes proof)
+        :count {:operand count-source :input-type count-type :completed-type :int
+                :completion :raw-jvm-int
+                :ports (select-keys locals free)
+                :context (completion/bytecode-operand-context ctx)}} nil))))
+
+(defn ^:no-doc retained-zero-array-allocation
+  "Actual fresh, zero-filled newarray operation, with its original count input.
+   This grants no count purity, replay, alias-escape or AD activity permission.
+   Filled/literal allocations and copied source occurrences have no observation."
+  [emission original]
+  (retained-call-observation emission original :array-allocation-contexts))
 
 (defn- emit-aget-intrinsic
   "Emit bytecode for aget (array read). Handles typed array checkcast and
@@ -2506,8 +2521,11 @@
                            :ref)
                        ;; (double-array n) — size-only, zero-filled
                        :else
-                       (do (let [t (emit-form code arg locals ctx)]
-                             (when (not= t :int) (emit-coerce code t :int)))
+                       (do (let [proof (atom {:open {} :routes []})
+                                 t (emit-form code arg locals (assoc ctx ::index-proof proof))]
+                             (when (not= t :int) (emit-coerce code t :int))
+                             (when (= 1 (count args))
+                               (retain-zero-array-allocation! ctx (class (double-array 0)) arg t locals @proof)))
                            (.newarray code java.lang.classfile.TypeKind/DOUBLE) :ref)))
     "float-array"  (let [arg (first args)]
                      (cond
@@ -2544,8 +2562,11 @@
                            :ref)
                        ;; (float-array n) — size-only, zero-filled
                        :else
-                       (do (let [t (emit-form code arg locals ctx)]
-                             (when (not= t :int) (emit-coerce code t :int)))
+                       (do (let [proof (atom {:open {} :routes []})
+                                 t (emit-form code arg locals (assoc ctx ::index-proof proof))]
+                             (when (not= t :int) (emit-coerce code t :int))
+                             (when (= 1 (count args))
+                               (retain-zero-array-allocation! ctx (class (float-array 0)) arg t locals @proof)))
                            (.newarray code java.lang.classfile.TypeKind/FLOAT) :ref)))
     ;; Casts
     "double" (let [t (emit-form code (first args) locals ctx)]
@@ -5862,6 +5883,14 @@
                :element-type (:element-type record)} guard)
              :input-contract contract))))
 
+(defn- compile-raw-int-input-region
+  [emission input input-type element-type guard]
+  (compile-owned-input-region
+   emission input Integer/TYPE
+   {:return-tag 'int :walked-body [(:operand input)]
+    :element-type element-type
+    ::body-input-context (:context input) ::expected-body-type input-type} guard))
+
 (defn ^:no-doc compile-array-index-region
   "Outline the actual evaluated index and raw JVM Int completion of a read.
    No checked source `int` is inserted: the method's Int return uses the same
@@ -5877,11 +5906,23 @@
                   (when-not (identical? record (retained-array-read emission original))
                     (throw (ex-info "Index region lost its owning array read"
                                     {:reason :unowned-bytecode-array-index-region}))))]
-      (compile-owned-input-region
-       emission input Integer/TYPE
-       {:return-tag 'int :walked-body [(:operand input)]
-        :element-type (:element-type record)
-        ::body-input-context (:context input) ::expected-body-type (:type input)} guard))))
+      (compile-raw-int-input-region emission input (:type input) (:element-type record) guard))))
+
+(defn ^:no-doc compile-array-count-region
+  "Outline the actual count input and raw Int completion of an owned newarray.
+   The allocation remains outside this region. There is no count purity, replay,
+   movement, activity or successful-allocation permission in this projection."
+  [emission original]
+  (let [record (retained-zero-array-allocation emission original)]
+    (when-not record
+      (throw (ex-info "Count outlining requires an original zero-array allocation"
+                      {:reason :unowned-bytecode-array-count-region})))
+    (let [input (:count record)
+          guard (fn []
+                  (when-not (identical? record (retained-zero-array-allocation emission original))
+                    (throw (ex-info "Count region lost its owning array allocation"
+                                    {:reason :unowned-bytecode-array-count-region}))))]
+      (compile-raw-int-input-region emission input (:input-type input) (:element-type record) guard))))
 
 (def ^:dynamic *compiling-deftms*
   "Set of deftm var symbols currently being compiled, for cycle detection."

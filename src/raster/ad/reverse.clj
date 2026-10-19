@@ -6339,7 +6339,7 @@
         conversion-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-floating-conversion)
         calls (java.util.IdentityHashMap.)
         reductions (java.util.IdentityHashMap.)
-        state (atom {:bindings [] :helpers [] :index-regions [] :activity (zipmap active (repeat true))})
+        state (atom {:bindings [] :helpers [] :input-regions [] :activity (zipmap active (repeat true))})
         fail! (fn [& [details]]
                 (throw (ex-info "Owned caller needs an attested numerical lexical region"
                                 (merge {:reason :ad-unclosed-bytecode-body-region} details))))]
@@ -6350,6 +6350,17 @@
               id)
             (check-ports! [ports env]
               (when-not (every? (fn [[id facts]] (= facts (get-in env [id :facts]))) ports) (fail!)))
+            (lower-integer-input [region env prefix]
+              (let [name (ad-gensym (str prefix "_region"))
+                    spec (assoc (:spec region) :name name)
+                    validate-spec! (fn [candidate]
+                                     (when-not (identical? spec candidate)
+                                       (throw (ex-info "Integer input sibling lost its owning spec"
+                                                       {:reason :ad-unowned-bytecode-input-spec}))))
+                    operands (mapv #(get-in env [% :value]) (:parameters region))]
+                (swap! state update :input-regions conj
+                       (assoc region :spec spec :validate-spec! validate-spec!))
+                (append! (ad-gensym prefix 'int) (list* name operands))))
             (lower-call [expression env]
               (let [context (retained emission expression)
                     {:keys [dispatch? lexical-callee operation implementation-op]} (op/call-description expression)]
@@ -6462,20 +6473,36 @@
                       (cond indexed? (:value index-port)
                             outlined?
                             (let [region ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-array-index-region)
-                                          emission original)
-                                  name (ad-gensym "array_index_region")
-                                  spec (assoc (:spec region) :name name)
-                                  validate-spec! (fn [candidate]
-                                                   (when-not (identical? spec candidate)
-                                                     (throw (ex-info "Index sibling lost its owning spec"
-                                                                     {:reason :ad-unowned-index-spec}))))
-                                  operands (mapv #(get-in env [% :value]) (:parameters region))]
-                              (swap! state update :index-regions conj
-                                     (assoc region :spec spec :validate-spec! validate-spec!))
-                              (append! (ad-gensym "array_index" 'int) (list* name operands)))
+                                          emission original)]
+                              (lower-integer-input region env "array_index"))
                             :else index)]
                   (append! result (with-meta (list 'clojure.core/aget (:value source) index-value)
                                             {:raster.type/tag tag})))))
+            (lower-zero-array [expression env after allocation]
+              (let [input (:count allocation)
+                    array-class (:array-class allocation)
+                    array-tag (some (fn [[tag cls]] (when (identical? cls array-class) tag))
+                                    types/primitive-array-info)]
+                (check-ports! (:ports input) env)
+                (when-not (and allocation (:fresh? allocation) (= :jvm-zero (:initialization allocation))
+                               (:primitive-count? allocation)
+                               (contains? '#{doubles floats} array-tag)
+                               (= :ref (:type after))
+                               (identical? array-class (:reference-class after))
+                               (every? (fn [[source facts]]
+                                         (and (contains? #{:int :long} (:type facts))
+                                              (not (get-in @state [:activity (get-in env [source :value])]))))
+                                       (:ports input)))
+                  (fail! {:phase :array-allocation :form expression}))
+                (let [region ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-array-count-region)
+                              emission expression)
+                      count-value (lower-integer-input region env "allocation_count")
+                      constructor (if (= array-tag 'doubles) 'clojure.core/double-array 'clojure.core/float-array)]
+                  ;; Keep the potentially failing allocation immediately after
+                  ;; its original completed count. Freshness is not permission
+                  ;; to discard an unused allocation or move it across work.
+                  (append! (ad-gensym "body_array" array-tag)
+                           (list constructor count-value)))))
             (lower-conversion [expression env]
               (let [{:keys [operand input-type target-carrier ports context] :as record}
                     (conversion-context emission expression)
@@ -6554,7 +6581,7 @@
                             :agets [] :scalar-bindings [] :body-result (:result step) :free-syms free
                             :typed-double? false :replay-values #{} :step-program program}]
                   (swap! state update :helpers into (:helpers step))
-                  (swap! state update :index-regions into (:index-regions step))
+                  (swap! state update :input-regions into (:input-regions step))
                   (.put reductions marker {:form marker :step spec})
                   (append! (ad-gensym "body_reduction" 'double) marker))))
             (lower-scope [expression env]
@@ -6564,7 +6591,9 @@
                 (let [env
                       (reduce (fn [current [index binder initializer]]
                                 (let [{:keys [before after] :as record} (binding-context emission expression index)
-                                      actual (:initializer record)]
+                                      actual (:initializer record)
+                                      allocation ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-zero-array-allocation)
+                                                  emission initializer)]
                                   ;; retained-binding-context proves the exact
                                   ;; original scope/ordinal and emitted layout;
                                   ;; macroexpansion may retag the Symbol object.
@@ -6572,6 +6601,7 @@
                                   (check-ports! (select-keys before (keys current)) current)
                                   (let [value
                                         (cond
+                                          allocation (lower-zero-array initializer current after allocation)
                                           (op/aget-call? actual) (lower-read initializer current after)
                                           (trivial-expr? initializer) (lower initializer current)
                                           (conversion-context emission initializer) (lower-conversion initializer current)
@@ -6598,10 +6628,13 @@
                                                        (identical? Object (:reference-class after)))
                                                   (and (= :ref physical)
                                                        (get types/primitive-array-info tag)
-                                                       (symbol? initializer)
                                                        (identical? (get types/primitive-array-info tag) (:reference-class after))
-                                                       (identical? (:reference-class after)
-                                                                   (get-in current [initializer :facts :reference-class])))) (fail!))
+                                                       (or (and (symbol? initializer)
+                                                                (identical? (:reference-class after)
+                                                                            (get-in current [initializer :facts :reference-class])))
+                                                           (and allocation
+                                                                (identical? (:array-class allocation)
+                                                                            (:reference-class after)))))) (fail!))
                                     (append! id value)
                                     (assoc current binder {:value id :facts after}))))
                               env (map vector (range) binders inits))]
@@ -6729,7 +6762,7 @@
                                [{:parameters (into params (map :companion helpers)) :body body}])
               guard (fn [] ((:guard selected))
                       (doseq [{:keys [guard helper]} helpers] (guard) ((:guard helper)))
-                      (doseq [region (:index-regions ordered)] ((:guard region)))
+                      (doseq [region (:input-regions ordered)] ((:guard region)))
                       (method-entry/assert-definition-inputs-current! @proof-inputs)
                       (execution-guard))
               _ (guard)]
@@ -6738,12 +6771,12 @@
            :source-owner {:backend :jvm-bytecode :guard guard :emission emission
                           :entry {:params params :tags tags :walked-body walked-body
                                   :interface-class (:iface-class interface)
-                                  :index-regions (:index-regions ordered)
-                                  :validate-index-regions!
+                                  :input-regions (:input-regions ordered)
+                                  :validate-input-regions!
                                   (fn [regions]
-                                    (when-not (identical? regions (:index-regions ordered))
-                                      (throw (ex-info "Index siblings lost their enclosing caller"
-                                                      {:reason :ad-unowned-index-spec}))))}}
+                                    (when-not (identical? regions (:input-regions ordered))
+                                      (throw (ex-info "Integer input siblings lost their enclosing caller"
+                                                      {:reason :ad-unowned-bytecode-input-spec}))))}}
            :program program :helpers helpers})))))
 
 (defn ^:no-doc prepare-owned-bytecode-value+grad
@@ -6854,18 +6887,19 @@
       (when-not (and (identical? params (:params entry))
                      (identical? walked-body (:walked-body entry))
                      (identical? (:tags emission) (:tags entry))
-                     (class? (:interface-class entry)) (ifn? guard))
+                     (class? (:interface-class entry)) (ifn? guard)
+                     (vector? (:input-regions entry)) (ifn? (:validate-input-regions! entry)))
         (throw (ex-info "Whole bytecode AD preparation lost its entry owner"
                         {:reason :ad-unclosed-bytecode-preparation})))
       (guard)
-      ((:validate-index-regions! entry) (:index-regions entry))
-      (doseq [region (:index-regions entry)] ((:validate-spec! region) (:spec region)))
+      ((:validate-input-regions! entry) (:input-regions entry))
+      (doseq [region (:input-regions entry)] ((:validate-spec! region) (:spec region)))
       (let [compiled (binding [method-entry/*compilation-classloader*
                                (.getClassLoader (class (:implementation emission)))]
                        ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-impl!)
                         (str "raster.compiled.OwnedGradient_" (clojure.lang.RT/nextID))
                         params (:tags entry) 'Object walked-body (:source-ns emission) (:interface-class entry)
-                        nil nil (mapv :spec (:index-regions entry))))]
+                        nil nil (mapv :spec (:input-regions entry))))]
         (when-not (and (instance? clojure.lang.IFn compiled) (.isInstance ^Class (:interface-class entry) compiled))
           (throw (ex-info "Whole bytecode AD compiler returned a different entry interface"
                           {:reason :ad-bytecode-preparation-carrier})))

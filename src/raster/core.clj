@@ -393,6 +393,7 @@
                     :binding-catalog binding-catalog :binding-contexts (:binding-contexts @inputs)
                     :floating-conversion-contexts (:floating-conversion-contexts @inputs)
                     :array-read-contexts (:array-read-contexts @inputs)
+                    :array-allocation-contexts (:array-allocation-contexts @inputs)
                     :reduction-catalog reduction-catalog
                     :reduction-expansions (:reduction-expansions @inputs)
                     :reduction-contexts (:reduction-contexts @inputs)
