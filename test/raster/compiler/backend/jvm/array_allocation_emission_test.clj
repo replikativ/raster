@@ -30,6 +30,9 @@
       (is (identical? expected-class (:array-class observation)))
       (is (true? (:fresh? observation)))
       (is (= :jvm-zero (:initialization observation)))
+      (is (true? (:primitive-count? observation)))
+      (is (vector? (:count-routes observation)))
+      (is (seq (:count-routes observation)))
       (is (identical? (second (:expression observation))
                       (get-in observation [:count :operand])))
       (is (= :long (get-in observation [:count :input-type])))
@@ -58,10 +61,33 @@
     (is (seq? (get-in observation [:count :operand])))
     (is (= #{'events 'n} (set (keys (get-in observation [:count :ports])))))
     (is (not-any? #(contains? observation %) [:pure? :replayable? :does-not-escape?]))
+    (is (false? (:primitive-count? observation)))
     (is (= [] (vec (primal events 0))))
     (is (= 1 (aget events 0)))
     (is (thrown? NegativeArraySizeException (primal events -1)))
     (is (= 2 (aget events 0)))))
+
+(deftest count-region-preserves-raw-completion-without-allocating-or-replaying
+  (doseq [v [#'fresh-doubles #'fresh-floats]]
+    (let [{:keys [emission allocations]} (owned-allocation v)
+          original (:source (first allocations))
+          region (bytecode/compile-array-count-region emission original)]
+      (is (= ['n] (:parameters region)))
+      (is (= Integer/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+      (is (= 3 ((:invoke region) 3)))
+      (is (= 1 ((:invoke region) 4294967297)))
+      (is (= -1 ((:invoke region) -1)) "the count region does not execute the allocation")
+      (is (= :unowned-bytecode-array-count-region
+             (try (bytecode/compile-array-count-region emission
+                                                       (with-meta (apply list original) (meta original)))
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+  (let [{:keys [emission allocations]} (owned-allocation #'observable-count)
+        region (bytecode/compile-array-count-region emission (:source (first allocations)))
+        events (long-array 1)
+        arguments (mapv {'events events 'n 2} (:parameters region))]
+    (is (= 2 (apply (:invoke region) arguments)))
+    (is (= 1 (aget events 0)))))
 
 (deftest allocation-evidence-stays-with-original-occurrence-and-historical-emission
   (let [{:keys [emission allocations]} (owned-allocation #'fresh-doubles)

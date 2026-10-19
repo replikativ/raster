@@ -2254,13 +2254,16 @@
   [emission original]
   (retained-call-observation emission original :array-read-contexts))
 
-(defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals]
+(defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals proof]
   (when me/*emission-inputs*
     (let [free (binding [util/*shadowing-locals* (set (keys locals))]
                  (util/free-syms count-source))]
       (retain-call-observation!
        ctx :array-allocation-contexts
        {:status :known :array-class array-class :fresh? true :initialization :jvm-zero
+        :element-type (:element-type ctx)
+        :primitive-count? (and (contains? #{:int :long} count-type) (empty? (:open proof)))
+        :count-routes (:routes proof)
         :count {:operand count-source :input-type count-type :completed-type :int
                 :completion :raw-jvm-int
                 :ports (select-keys locals free)
@@ -2518,10 +2521,11 @@
                            :ref)
                        ;; (double-array n) — size-only, zero-filled
                        :else
-                       (do (let [t (emit-form code arg locals ctx)]
+                       (do (let [proof (atom {:open {} :routes []})
+                                 t (emit-form code arg locals (assoc ctx ::index-proof proof))]
                              (when (not= t :int) (emit-coerce code t :int))
                              (when (= 1 (count args))
-                               (retain-zero-array-allocation! ctx (class (double-array 0)) arg t locals)))
+                               (retain-zero-array-allocation! ctx (class (double-array 0)) arg t locals @proof)))
                            (.newarray code java.lang.classfile.TypeKind/DOUBLE) :ref)))
     "float-array"  (let [arg (first args)]
                      (cond
@@ -2558,10 +2562,11 @@
                            :ref)
                        ;; (float-array n) — size-only, zero-filled
                        :else
-                       (do (let [t (emit-form code arg locals ctx)]
+                       (do (let [proof (atom {:open {} :routes []})
+                                 t (emit-form code arg locals (assoc ctx ::index-proof proof))]
                              (when (not= t :int) (emit-coerce code t :int))
                              (when (= 1 (count args))
-                               (retain-zero-array-allocation! ctx (class (float-array 0)) arg t locals)))
+                               (retain-zero-array-allocation! ctx (class (float-array 0)) arg t locals @proof)))
                            (.newarray code java.lang.classfile.TypeKind/FLOAT) :ref)))
     ;; Casts
     "double" (let [t (emit-form code (first args) locals ctx)]
@@ -5878,6 +5883,14 @@
                :element-type (:element-type record)} guard)
              :input-contract contract))))
 
+(defn- compile-raw-int-input-region
+  [emission input input-type element-type guard]
+  (compile-owned-input-region
+   emission input Integer/TYPE
+   {:return-tag 'int :walked-body [(:operand input)]
+    :element-type element-type
+    ::body-input-context (:context input) ::expected-body-type input-type} guard))
+
 (defn ^:no-doc compile-array-index-region
   "Outline the actual evaluated index and raw JVM Int completion of a read.
    No checked source `int` is inserted: the method's Int return uses the same
@@ -5893,11 +5906,23 @@
                   (when-not (identical? record (retained-array-read emission original))
                     (throw (ex-info "Index region lost its owning array read"
                                     {:reason :unowned-bytecode-array-index-region}))))]
-      (compile-owned-input-region
-       emission input Integer/TYPE
-       {:return-tag 'int :walked-body [(:operand input)]
-        :element-type (:element-type record)
-        ::body-input-context (:context input) ::expected-body-type (:type input)} guard))))
+      (compile-raw-int-input-region emission input (:type input) (:element-type record) guard))))
+
+(defn ^:no-doc compile-array-count-region
+  "Outline the actual count input and raw Int completion of an owned newarray.
+   The allocation remains outside this region. There is no count purity, replay,
+   movement, activity or successful-allocation permission in this projection."
+  [emission original]
+  (let [record (retained-zero-array-allocation emission original)]
+    (when-not record
+      (throw (ex-info "Count outlining requires an original zero-array allocation"
+                      {:reason :unowned-bytecode-array-count-region})))
+    (let [input (:count record)
+          guard (fn []
+                  (when-not (identical? record (retained-zero-array-allocation emission original))
+                    (throw (ex-info "Count region lost its owning array allocation"
+                                    {:reason :unowned-bytecode-array-count-region}))))]
+      (compile-raw-int-input-region emission input (:input-type input) (:element-type record) guard))))
 
 (def ^:dynamic *compiling-deftms*
   "Set of deftm var symbols currently being compiled, for cycle detection."

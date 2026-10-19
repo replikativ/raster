@@ -91,12 +91,12 @@
 (deftest packed-inactive-observations-use-primitive-owned-index-siblings
   (let [p (prepared #'packed-observation-region)
         invoke (#'reverse/compile-prepared-value+grad p)
-        regions (get-in p [:source-owner :entry :index-regions])]
+        regions (get-in p [:source-owner :entry :input-regions])]
     (is (= 1 (count regions)))
     (is (= 'int (get-in regions [0 :spec :return-tag])))
-    (is (= :ad-unowned-index-spec
+    (is (= :ad-unowned-bytecode-input-spec
            (try (#'reverse/compile-prepared-value+grad
-                  (update-in p [:source-owner :entry :index-regions 0 :spec] assoc :return-tag 'long))
+                  (update-in p [:source-owner :entry :input-regions 0 :spec] assoc :return-tag 'long))
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (doseq [x [0.7 1.2] cnt [0 1 3] stride [0 1 2] offset [0 1]]
       (let [data (double-array [0.2 0.8 1.1 0.4 0.6 0.9])
