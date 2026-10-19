@@ -378,6 +378,49 @@ Object/nil completion evaluator. Reuse the existing retained source/bytecode
 completion owner when closing the result computation, rather than evaluating
 arbitrary source or inventing runtime implementations of canonical IR terms.
 
+The first implementation prerequisite now observes the actual outer lexical tail
+at JVM emission. Its final free ports come from emitted local slots/classes,
+including shadowing, and its actual result context remains distinct from the
+outer method context (Object regions strengthen call-result preservation).
+The owned whole-body record also retains the reflected method's actual return
+descriptor/carrier. `compile-terminal-result-region` reuses the existing physical
+port outliner and JVM emitter, excluding prefix initializers while preserving
+checked casts, lazy branches, Object/nil results and reference return checks.
+Original occurrence/definition guards remain; copied, stale, ambiguous, altered
+or actually split owners refuse. This is compiler-local ownership evidence,
+not an authenticated portable certificate or a device scheduling permission.
+
+An initial fresh-JVM owner gate passed 47 tests / 445 assertions, but stronger
+independent plain-Clojure oracles then exposed an existing explicit `float` bug:
+the JVM emitter used raw narrowing and accepted Double overflow/infinities instead
+of throwing. Explicit `float` now shares the existing RT cast-emission path with
+`unchecked-float`, choosing `RT.floatCast` rather than raw descriptor coercion.
+Implicit argument conversions remain unchanged. Review found the whole-bytecode
+AD consumer also rebuilt every cast as raw argument completion; retained cast
+evidence now identifies the actual checked source operation, and that consumer
+preserves its operation and mandatory evaluation even when its result is unused.
+This is a source-semantics repair, not new reassociation or fast-math permission.
+
+The new outliner namespace is discovered by the ordinary CI shard planner.
+Independent plain-Clojure oracles cover primitive/Object cast overloads, terminal
+conversion, reference return checks and array reads. Retained cast observations
+require an explicit lowering kind; missing or unknown provenance refuses rather
+than becoming raw conversion evidence. Checked and unchecked overflow paths have
+separate actual whole-bytecode AD regressions. Final fresh-JVM qualification of
+the combined repair passes six namespaces, 69 tests / 850 assertions. Full
+integration CI remains required. The result
+continuation's semantic port/export correspondence,
+explicit device completion/readback, host-facing invocation entry and resident
+preflight refusals are NOT implemented by this prerequisite.
+
+PDE CI triage found an obsolete representation assumption in the rectangular
+coverage mutation test: its first step is now a host equation, and the actual
+numerical step is a functional map rather than the former effect map. Merely
+selecting the numerical step is insufficient: effect mutation then edits nothing.
+Retain the public functional-map acceptance and exercise rectangular effect
+coverage with an explicit effect-map fixture; do not drop the negative guard,
+overflow, narrowing or injectivity checks. That test repair remains open.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.

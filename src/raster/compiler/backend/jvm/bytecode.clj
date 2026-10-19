@@ -773,6 +773,68 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
+(defn- retain-terminal-context!
+  "Observe only the actual outer lexical tail, after its bindings have been emitted.
+   This records physical context; it grants neither portability nor replay permission."
+  [ctx binding-count body locals result-type]
+  (let [token (::binding-scope-occurrence ctx)]
+    (when (and token (identical? token (::body-scope-occurrence ctx)) me/*emission-inputs*)
+      (let [visible (set (keys locals))
+            free (binding [util/*shadowing-locals* visible]
+                   (util/free-syms (cons 'do body)))
+            record {:status :known :scope (::call-expression ctx)
+                    :binding-count binding-count :body (vec body)
+                    :ports (select-keys locals (filter visible free))
+                    :context (completion/bytecode-operand-context ctx)
+                    :element-type (:element-type ctx) :emitted-result-type result-type}]
+        (swap! me/*emission-inputs*
+               (fn [inputs]
+                 (let [contexts (:terminal-contexts inputs)
+                       observed (if (contains? contexts token) {:status :ambiguous} record)]
+                   (-> inputs
+                       (assoc-in [:terminal-contexts token] observed)
+                       (assoc-in [:body-contexts (::body-occurrence ctx) :terminal-context]
+                                 observed)))))))))
+
+(defn ^:no-doc retained-terminal-context
+  "Query the emitted tail of an ORIGINAL whole-body lexical scope.
+   The ports are actual final locals, not logical type guesses. Initializers are
+   excluded. A copied scope, split/repeated emission or missing return owner refuses.
+   Consumers still owe effect, physical-export and terminal scheduling proofs."
+  [emission scope]
+  (let [token (::binding-scope-occurrence (meta scope))
+        body (:body emission)
+        owner (retained-body-context emission)
+        record (get (:terminal-contexts emission) token)
+        actual (:scope record)
+        final-locals
+        (when (and owner (= :known (:status record)))
+          (reduce (fn [locals index]
+                    (let [binding (retained-binding-context emission scope index)]
+                      (if (and binding (= locals (:before binding)))
+                        (assoc locals (:binder binding) (:after binding))
+                        (reduced nil))))
+                  (:locals owner) (range (:binding-count record))))
+        expected-ports
+        (when final-locals
+          (let [visible (set (keys final-locals))
+                free (binding [util/*shadowing-locals* visible]
+                       (util/free-syms (cons 'do (drop 2 actual))))]
+            (select-keys final-locals (filter visible free))))]
+    (when (and owner token (= 1 (count body)) (identical? scope (first body))
+               (identical? scope (get (:binding-catalog emission) token))
+               (= :known (:status record))
+               (identical? record (:terminal-context owner))
+               (identical? token (::binding-scope-occurrence (meta actual)))
+               (= (:binding-count record) (quot (count (second scope)) 2))
+               (= (:binding-count record) (quot (count (second actual)) 2))
+               (= (count (:body record)) (count (drop 2 actual)))
+               (every? true? (map identical? (:body record) (drop 2 actual)))
+               final-locals (= expected-ports (:ports record))
+               (= (:emitted-result-type owner) (:emitted-result-type record))
+               (string? (:return-descriptor owner)))
+      (assoc record :owner owner))))
+
 (defn ^:no-doc retained-typed-return-bridge
   "Observe an actual unguarded FP-static-return → Object invk boxing edge.
    This is payload correspondence, not permission to erase an Object use or
@@ -918,14 +980,16 @@
                     (and reduction (identical? actual (get-in reduction [:bound :expression]))))
             (assoc input :source-original source)))))))
 
-(defn- retain-floating-conversion! [ctx operand input-type target-carrier locals]
+(defn- retain-floating-conversion! [ctx operand input-type target-carrier locals & [source-operation]]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
       (let [free (binding [util/*shadowing-locals* (set (keys locals))] (util/free-syms operand))
             record {:status :known :expression (::call-expression ctx)
                     :operand operand :input-type input-type :target-carrier target-carrier
+                    :conversion-kind (if source-operation :source-cast :jvm-coerce)
                     :context (completion/bytecode-operand-context ctx)
-                    :ports (select-keys locals free)}]
+                    :ports (select-keys locals free)}
+            record (cond-> record source-operation (assoc :source-operation source-operation))]
         (retain-call-observation! ctx :floating-conversion-contexts record nil)))))
 
 (defn ^:no-doc retained-floating-conversion
@@ -2624,10 +2688,7 @@
     "double" (let [t (emit-form code (first args) locals ctx)]
                (retain-floating-conversion! ctx (first args) t Double/TYPE locals)
                (if (= t :double) t (do (emit-coerce code t :double) :double)))
-    "float"  (let [t (emit-form code (first args) locals ctx)]
-               (retain-floating-conversion! ctx (first args) t Float/TYPE locals)
-               (if (= t :float) t (do (emit-coerce code t :float) :float)))
-    "unchecked-float"
+    ("float" "unchecked-float")
     (when (= 1 (count args))
       (let [t (emit-form code (first args) locals ctx)]
         (if (= :diverge t)
@@ -2639,8 +2700,13 @@
                         :bool (do (emit-box-to-ref code t) obj-cd)
                         :void (do (.aconst_null code) obj-cd)
                         :ref obj-cd)]
-            (retain-floating-conversion! ctx (first args) t Float/TYPE locals)
-            (.invokestatic code rt-cd "uncheckedFloatCast"
+            (retain-floating-conversion! ctx (first args) t Float/TYPE locals
+                                         (if (= "float" head-name)
+                                           'clojure.core/float 'clojure.core/unchecked-float))
+            ;; Explicit core casts use RT's source overload, not the raw JVM
+            ;; coercion used to satisfy an already resolved method descriptor.
+            ;; In particular float(Double/MAX_VALUE) must throw, not become +Inf.
+            (.invokestatic code rt-cd (if (= "float" head-name) "floatCast" "uncheckedFloatCast")
                            (MethodTypeDesc/of F-cd (into-array ClassDesc [input])))
             :float))))
     "int"    (let [t (emit-form code (first args) locals ctx)
@@ -3633,7 +3699,9 @@
                             new-locs)
                           locs)))
                     locals pairs)]
-    (emit-body code body new-locals ctx)))
+    (let [result-type (emit-body code body new-locals ctx)]
+      (retain-terminal-context! ctx (count pairs) body new-locals result-type)
+      result-type)))
 
 (defn- comparison-pred-parts
   "Return [op-name arg1 arg2] when `pred` is a 2-arg comparison the if-handler can
@@ -5691,6 +5759,12 @@
                                                             :next-slot        next-slot
                                                             :source-ns        source-ns}
                                                        ctx (merge ctx body-input-context)
+                                                       ctx (assoc ctx
+                                                                  ::body-occurrence (::body-occurrence (meta walked-body))
+                                                                  ::body-scope-occurrence
+                                                                  (when (= 1 (count walked-body))
+                                                                    (::binding-scope-occurrence
+                                                                     (meta (first walked-body)))))
                                                        expanded-body (binding [*ns* source-ns]
                                                                        (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        _ (when-let [token (::body-occurrence (meta walked-body))]
@@ -5702,6 +5776,8 @@
                                                                         (assoc contexts token {:status :known :body walked-body
                                                                                               :locals locals
                                                                                               :return-stack-type return-stack-type
+                                                                                              :return-descriptor (.descriptorString
+                                                                                                                  (.returnType ^MethodTypeDesc method-type))
                                                                                               :result-context (completion/bytecode-operand-context ctx)}))))))
                                                        ret-type (emit-body code expanded-body locals ctx)
                                                        _ (when-let [token (::body-occurrence (meta walked-body))]
@@ -5841,14 +5917,26 @@
                 (println "[dump-class]" class-name "->" path))))
         loader (compilation-loader)
         cls (.defineClass loader class-name bytes nil)
-        _ (initialize-literals! cls @(:values literal-owner))]
+        _ (initialize-literals! cls @(:values literal-owner))
+        methods (into {} (map (fn [ms]
+                               [(:name ms)
+                                (first (filter #(= (.getName %) (:method-name ms))
+                                               (.getMethods cls)))])
+                             method-specs))
+        _ (when me/*emission-inputs*
+            (doseq [spec fn-specs
+                    :let [body (:walked-body spec)
+                          token (::body-occurrence (meta body))]
+                    :when token]
+              (swap! me/*emission-inputs* update-in [:body-contexts token]
+                     (fn [record]
+                       (if (and (= :known (:status record))
+                                (identical? body (:body record)))
+                         (assoc record :method (get methods (:name spec)))
+                         record)))))]
     {:class cls
      :bytes bytes
-     :methods (into {} (map (fn [ms]
-                              [(:name ms)
-                               (first (filter #(= (.getName %) (:method-name ms))
-                                              (.getMethods cls)))])
-                            method-specs))})))
+     :methods methods})))
 
 ;; ================================================================
 ;; deftm bytecode compilation
@@ -5964,6 +6052,40 @@
                :walked-body [(completion/complete-value contract (:operand input))]
                :element-type (:element-type record)} guard)
              :input-contract contract))))
+
+(defn ^:no-doc compile-terminal-result-region
+  "Outline the exact observed outer lexical tail, excluding its initializers.
+   Retain physical input ports, actual result context and the original method's
+   return adaptation. This does not authorize device exports, replay or admission
+   of the tail in a resident-only invocation."
+  [emission original-scope]
+  (let [record (retained-terminal-context emission original-scope)
+        ^java.lang.reflect.Method method (get-in record [:owner :method])]
+    (when-not (and record (instance? java.lang.reflect.Method method)
+                   (= (get-in record [:owner :return-descriptor])
+                      (.descriptorString (.getReturnType method))))
+      (throw (ex-info "Terminal outlining requires its original emitted return owner"
+                      {:reason :unowned-bytecode-terminal-region})))
+    (when (contains? #{:void :diverge} (:emitted-result-type record))
+      (throw (ex-info "Terminal outlining requires a value-producing result"
+                      {:reason :bytecode-terminal-result-carrier})))
+    (let [guard (fn []
+                  (let [current (retained-terminal-context emission original-scope)]
+                    (when-not (and current
+                                   (identical? (:terminal-context (:owner record))
+                                               (:terminal-context (:owner current)))
+                                   (identical? method (get-in current [:owner :method])))
+                      (throw (ex-info "Terminal region lost its original emitted owner"
+                                      {:reason :unowned-bytecode-terminal-region})))))
+          input {:operand (cons 'do (:body record)) :ports (:ports record)
+                 :context (:context record)}
+          region (compile-owned-input-region
+                  emission input (.getReturnType method)
+                  {:return-tag (.getReturnType method) :walked-body (:body record)
+                   :element-type (:element-type record)
+                   ::body-input-context (:context record)
+                   ::expected-body-type (:emitted-result-type record)} guard)]
+      (assoc region :kind :owned-bytecode-terminal-region :terminal-context record))))
 
 (defn- compile-raw-int-input-region
   [emission input input-type element-type guard]

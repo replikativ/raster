@@ -398,6 +398,7 @@
                     :reduction-expansions (:reduction-expansions @inputs)
                     :reduction-contexts (:reduction-contexts @inputs)
                     :body-contexts (:body-contexts @inputs)
+                    :terminal-contexts (:terminal-contexts @inputs)
                     :typed-return-bridges (:typed-return-bridges @inputs)
                     :invocation-contexts (:invocation-contexts @inputs)
                     :typed-interface typed-interface

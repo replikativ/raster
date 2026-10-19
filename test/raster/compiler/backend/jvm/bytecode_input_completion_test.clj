@@ -35,6 +35,32 @@
   (try [:value (Float/floatToIntBits (f x))]
        (catch Exception e [:exception (class e)])))
 
+(deftest checked-float-preserves-core-source-overloads
+  (doseq [[tag values] [['double [0.0 -0.0 Math/PI Double/MAX_VALUE
+                                 Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
+                       ['long [Long/MIN_VALUE Long/MAX_VALUE 16777217]]
+                       ['int [Integer/MIN_VALUE Integer/MAX_VALUE (int 16777217)]]
+                       ['float [(float 0.0) (float -0.0) Float/POSITIVE_INFINITY Float/NaN]]
+                       ['Object [nil true false "1.0" \a (float 1.25) 2.5 1M 2N
+                                 Double/MAX_VALUE Double/POSITIVE_INFINITY]]
+                       ['boolean [true false]]]]
+    (let [parameter (with-meta 'x {:tag tag})
+          initializer (case tag
+                        double '(clojure.core/double input)
+                        long '(clojure.core/long input)
+                        int '(clojure.core/int input)
+                        float '(clojure.core/unchecked-float input)
+                        'input)
+          oracle (binding [*unchecked-math* false]
+                   ;; Clojure fn parameters support primitive Long/Double only;
+                   ;; ordinary let initializers also preserve Int/Float locals.
+                   (eval (list 'fn '[input]
+                               (list 'let ['x initializer] '(clojure.core/float x)))))
+          f (compiled [parameter] '(clojure.core/float x) 'float)]
+      (doseq [x values]
+        (is (= (float-outcome oracle x) (float-outcome f x))
+            (str tag " " (pr-str x)))))))
+
 (deftest unchecked-float-preserves-primitive-and-object-overloads
   (doseq [[tag values] [['double [0.0 -0.0 Math/PI Double/MAX_VALUE
                                  Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
@@ -48,16 +74,18 @@
         (is (= (float-outcome unchecked-float x) (float-outcome f x))
             (str tag " " (pr-str x)))))))
 
-(deftest unchecked-float-evaluates-once-and-respects-lexical-callees
-  (let [f (compiled ['counter] '(clojure.core/unchecked-float
-                                (do (clojure.core/swap! counter clojure.core/inc) 1.25)) 'float)
-        counter (atom 0)]
-    (is (= (float 1.25) (f counter)))
-    (is (= 1 @counter)))
-  (let [f (compiled ['unchecked-float 'x] '(unchecked-float x))]
-    (is (= :lexical (f (constantly :lexical) 1.25))))
-  (let [f (compiled [] '(clojure.core/unchecked-float 1.0 2.0))]
-    (is (thrown? clojure.lang.ArityException (f)))))
+(deftest floating-casts-evaluate-once-and-respect-lexical-callees
+  (doseq [operation '[clojure.core/float clojure.core/unchecked-float]]
+    (let [f (compiled ['counter] (list operation
+                                     '(do (clojure.core/swap! counter clojure.core/inc) 1.25)) 'float)
+          counter (atom 0)]
+      (is (= (float 1.25) (f counter)))
+      (is (= 1 @counter)))
+    (let [local (symbol (name operation))
+          f (compiled [local 'x] (list local 'x))]
+      (is (= :lexical (f (constantly :lexical) 1.25))))
+    (let [f (compiled [] (list operation 1.0 2.0))]
+      (is (thrown? clojure.lang.ArityException (f))))))
 
 (deftest mixed-floating-comparisons-retain-source-order
   (doseq [integer-tag ['int 'long]]

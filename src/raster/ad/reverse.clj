@@ -6581,26 +6581,40 @@
                            (with-meta (list constructor count-value)
                              {:raster.effect/preserve-evaluation true})))))
             (lower-conversion [expression env]
-              (let [{:keys [operand input-type target-carrier ports context] :as record}
+              (let [{:keys [operand input-type target-carrier ports context source-operation conversion-kind] :as record}
                     (conversion-context emission expression)
                     source (first (util/call-args expression))]
                 (check-ports! ports env)
                 ;; This first closed cast domain is a primitive local/literal.
-                ;; For it emit-form and emit-argument-value have the same load
-                ;; and conversion semantics. Arbitrary calls/reference values
-                ;; need their original cast-specific operand context instead.
+                ;; Preserve an attested checked source operation separately;
+                ;; only raw primitive conversions share argument completion.
+                ;; Arbitrary calls/reference values need their original
+                ;; cast-specific operand context instead.
                 (when-not (and record (= 2 (count expression))
                                (contains? #{:long :int :float :double} input-type)
                                (contains? #{Float/TYPE Double/TYPE} target-carrier)
+                               (case conversion-kind
+                                 :jvm-coerce (nil? source-operation)
+                                 :source-cast (and (identical? Float/TYPE target-carrier)
+                                                   (contains? '#{clojure.core/float clojure.core/unchecked-float}
+                                                              source-operation))
+                                 false)
                                (or (and (symbol? source) (= source operand))
                                    (and (number? source) (identical? source operand))))
                   (fail! {:phase :floating-conversion :form expression :input-type input-type}))
                 (let [value (lower source env)
                       tag (if (identical? Float/TYPE target-carrier) 'float 'double)
                       result (ad-gensym "body_conversion" tag)]
-                  (append! result (value-completion/complete-value
-                                   (value-completion/bytecode-floating-input-contract target-carrier context)
-                                   value)))))
+                  (append! result
+                           (if (= 'clojure.core/float source-operation)
+                             ;; An explicit checked source cast is not the raw
+                             ;; conversion completing a resolved JVM argument.
+                             ;; Retain both its operation and observable failure.
+                             (with-meta (list source-operation value)
+                               {:raster.type/tag tag :raster.effect/preserve-evaluation true})
+                             (value-completion/complete-value
+                              (value-completion/bytecode-floating-input-contract target-carrier context)
+                              value))))))
             (lower-reduction [expression env]
               (when (:reduction-step? body-context)
                 (fail! {:phase :nested-reduction :form expression}))
