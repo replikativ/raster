@@ -46,9 +46,22 @@ gates are not evidence of broad compatibility. Triage retains these groups:
 - TypedSOAC composition: contraction scalar-contract projection, resident
   training coverage, RMSNorm effect loops, and checked terminal scalar results
   remain integration failures, not permission to restore retired fallbacks.
+  Contraction projection now reuses the existing recurrence certificate with
+  accumulator-first orientation and lexical/evaluation checks. AD phase geometry
+  is checked separately from body-replacing dense-leaf eligibility: full scalar
+  elements and conversions remain; hardware replacement still requires the
+  original bare-product guard. Cold affected gates pass 76 tests / 1,181
+  assertions, including all normalized segmented AD checks. This includes host
+  oracles and compile-only scheduled phases, not new device/performance evidence.
 - Numerical/control evidence: Q4_K exact Float-bit comparisons differ by an ULP
   on multiple outputs; integer-bound/control regressions also remain. Do not
   relax exact contracts or update expectations without establishing semantics.
+
+CI on `d3d2d824` also exposed three regressions absent from the prior job: fresh
+map/gather AD rejects source reads carrying mandatory-evaluation flags. Two
+derivation/canonicalization gates currently conflate external purity with
+removability. Keep the flags and source evaluations; repair the gate distinction
+under the existing private-output/replay contracts, with primal failure controls.
 
 Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
 (49 tests, 757 assertions plus both fresh workers). Helper migration separately

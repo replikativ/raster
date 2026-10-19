@@ -256,6 +256,7 @@
                       {:reason reason-key :operation operation :projected normalized-projected
                        :element-position element-position})))
     {:certificate certificate
+     :accumulator-position accumulator-position
      :element (nth arguments element-position)
      :projected-step-result normalized-projected
      :normalized-step-result normalized-lambda}))

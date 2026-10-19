@@ -12,9 +12,12 @@
             [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.ir.soac-dialect :as dialect]))
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 (defn contraction-binding
   "Project a retained contraction closure without rebuilding its numerical payload.
@@ -191,16 +194,30 @@
 (defn- scalar-fold-parts
   [attributes expression]
   (let [accumulator (first (:accumulators attributes))
-        arguments (vec (when (seq? expression) (descriptor/call-args expression)))]
+        proof (try
+                (reduction/certify-projected-reassociation
+                 expression accumulator (first (:identities attributes))
+                 (first (:dtypes attributes)))
+                (catch clojure.lang.ExceptionInfo failure
+                  (throw (ex-info "segmented reduction has no ordered scalar contract projection"
+                                  {:reason :typed-soac-contract-projection
+                                   :accumulator accumulator :expression expression
+                                   :certificate-error (ex-data failure)} failure))))
+        arguments (vec (descriptor/call-args (:normalized-step-result proof)))
+        accumulator-input (first arguments)]
     ;; `par/contract` spells the fold as (combine accumulator element).  Reversing a merely
     ;; associative, non-commutative fold here would be a semantic change, so refuse that shape.
-    (when-not (and (seq? expression) (= 2 (count arguments))
-                   (= accumulator (first arguments)))
+    ;; Use the existing typed recurrence proof, not another cast recognizer.
+    ;; The element retains its original conversions and once-only prefix.
+    (when-not (and (= 0 (:accumulator-position proof))
+                   (not (:dispatch? (descriptor/call-description accumulator-input)))
+                   (empty? (:flags (effects/descriptor accumulator-input)))
+                   (scan/compatible-certificate? (first (:algebra attributes)) (:certificate proof)))
       (throw (ex-info "segmented reduction has no ordered scalar contract projection"
                       {:reason :typed-soac-contract-projection
                        :accumulator accumulator :expression expression})))
-    {:combine (descriptor/semantic-op expression)
-     :element (second arguments)}))
+    {:combine (:combine (:certificate proof))
+     :element (:element proof)}))
 
 (defn- result-transform-epilogue
   [transform]
@@ -230,7 +247,7 @@
   (let [program (dialect/validate! program)
         [_ equation-id results] equation
         {:keys [kind attributes arrays captures lambda]} (dialect/operation-parts equation)
-        {:keys [locals body-results]} (dialect/lambda-parts lambda)
+        {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
         {:keys [accumulators elements capture-parameters]} (dialect/parameter-layout equation)
         facts (dialect/facts program)
         storage (dialect/result-storage facts equation-id)
@@ -256,7 +273,12 @@
         folded (materialize-region
                 locals
                 (util/subst-syms substitutions (first body-results)))
-        {:keys [combine element]} (scalar-fold-parts attributes folded)
+        {:keys [combine element]}
+        (binding [util/*shadowing-locals*
+                  (into util/*shadowing-locals*
+                        (concat parameters arrays captures [(:index attributes)]
+                                (map first (:segment-axes attributes))))]
+          (scalar-fold-parts attributes folded))
         contraction-dtype (first (:dtypes attributes))
         result-transform (result-transform-epilogue (:result-transform attributes))]
     {:out (first physical-results)

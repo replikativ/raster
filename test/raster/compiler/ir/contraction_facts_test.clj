@@ -264,6 +264,19 @@
                      :dtype :float))]
       (is (= :body-has-unmodeled-terms (:reason rejected))))))
 
+(deftest dense-geometry-does-not-authorize-replacing-the-scalar-body
+  (doseq [body ['(clojure.core/double (* (aget a (+ (* i 3) k))
+                                        (aget b (+ (* k 4) j))))
+                '(* 2.0 (aget a (+ (* i 3) k)) (aget b (+ (* k 4) j)))]]
+    (let [facts (cf/from-components {:out 'out :free-axes '[[i 2] [j 4]]
+                                     :contract-axes '[[k 3]] :dtype :double :body body})
+          geometry (cf/dense-matrix-geometry facts)]
+      (is (:ok geometry))
+      (is (= :geometry-only (:scope geometry)))
+      (is (= [2 4 3] (:dimensions geometry)))
+      (is (= body (:body facts)))
+      (is (= :body-has-unmodeled-terms (:reason (cf/dense-matrix-view facts)))))))
+
 (deftest batched-dense-matrix-views-are-proved-with-explicit-broadcasting
   (let [form
         (fn [col-index]

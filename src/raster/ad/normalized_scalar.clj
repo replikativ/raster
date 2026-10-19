@@ -2524,7 +2524,10 @@
         program-facts (soac/facts program)
         equation-facts (get-in program-facts [:equations (second equation)])
         values (:values program-facts)
-        matrix (contraction/dense-matrix-view facts)
+        ;; Phase correspondence proves geometry, not eligibility to replace the
+        ;; derivative's full scalar element by a hardware product. Retain its
+        ;; conversions/checkpoints; dense leaf admission remains independent.
+        matrix (contraction/dense-matrix-geometry facts)
         actual-maps (into {} (map (fn [operand]
                                    [(:sym operand) (contraction/operand-axis-map facts operand)]))
                           (:operands facts))

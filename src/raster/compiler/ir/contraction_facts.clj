@@ -523,16 +523,8 @@
            :required (into {} (map (fn [r] [r (am/index-expr (role-map facts (get required r)))])) roles)
            :actual (mapv (juxt :sym :idx) ops)})))))
 
-(defn dense-matrix-view
-  "Recognize the dense matrix view of an ordinary verified product reduction.
-
-   This does not introduce a GEMM semantic node.  It proves that a two-free/one-contracted additive
-   reduction is exactly a product of two dense operands in one of the four AxisMap orientations,
-   or that a three-free reduction is a leading batch of canonical NN products.  It returns only
-   schedule-facing row/column bindings and B/M/N/K extents.  Anything else returns a structured
-   decline so sparse gathers, extra factors, non-additive monoids, and result transforms remain on
-   their general contraction schedules."
-  [facts]
+(defn- dense-matrix-view*
+  [facts require-product?]
   (when-not (facts? facts)
     (throw (ex-info "dense matrix classification requires verified contraction facts"
                     {:reason :raster/bug :facts facts})))
@@ -555,7 +547,7 @@
       (not (constant/zero-value? neutral))
       {:ok false :reason :non-zero-matrix-init :init neutral}
 
-      (nil? (body-product-of element (map :sym operands)))
+      (and require-product? (nil? (body-product-of element (map :sym operands))))
       {:ok false :reason :body-has-unmodeled-terms}
 
       :else
@@ -587,6 +579,25 @@
                                                     layout-kind)}))
         {:ok false :reason :non-dense-matrix-layout
          :actual (mapv (juxt :sym :idx) operands)}))))
+
+(defn dense-matrix-view
+  "Prove an additive reduction is exactly a product of two dense operands.
+
+   The bare-product check is mandatory for body-replacing hardware leaves. Dense
+   axes alone never authorize dropping scalar factors, conversions or checkpoints.
+   Returns the checked row/column bindings and B/M/N/K extents, or a decline."
+  [facts]
+  (dense-matrix-view* facts true))
+
+(defn dense-matrix-geometry
+  "Prove dense two-operand additive geometry while retaining the ENTIRE scalar body.
+
+   This establishes axes/layout, additive identity and logical operand placement,
+   not a replaceable matrix product or a numerical refinement. Only consumers
+   which separately retain/reconstruct the complete scalar computation may use it.
+   Hardware substitution must still pass dense-matrix-view independently."
+  [facts]
+  (assoc (dense-matrix-view* facts false) :scope :geometry-only))
 
 (defn layout-maps
   "For a PASSING `check-layout` verdict, the axis-map of each operand — derived from the layout the
