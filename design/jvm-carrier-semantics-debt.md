@@ -4,7 +4,35 @@ Numeric declarations, JVM stack categories and source boxing carriers are not
 interchangeable. Fixes must preserve conversions, reference identity and input
 evaluation order, not merely numerical values on valid inputs.
 
-## Helper composition and owned call regions
+## Qualification checkpoint — 2026-10-19
+
+The unchanged packed temporal lagged Michaelis–Menten marketing fixture passes
+runtime differentiation and actually invoked JVM AOT using the downloaded Raster
+0.2.1685 jar, not local source. Two parameter points and two data/row-count cases
+agree exactly across those execution paths; all nine coordinates agree with
+independent central differences (maximum absolute error about 1.33e-9).
+This is bounded model evidence, not general helper, scan/allocation-gradient,
+native-C, throughput or allocation qualification. Constructing AOT wrappers
+before retaining runtime gradients avoids the separately open mixed-lifecycle
+invalidation; no execution guard was reset or numerical call retried.
+
+Native AOT now uses the same definition-input owner as JVM AOT, starting before
+frontend analysis and ending at publication. Whole-compilation replacement
+retries are distinct from numerical invocation. Recovered absent/present-zero
+pullback tests include actual JVM/native calls and higher-order composition.
+
+Product representation is still open: moving a vector field into a primitive
+local can lose the original Object input context and rebox it at each later
+reference observation. A local Object-completion prototype fixes the JVM
+identity counterexample, but remains held because the existing numeric native
+acceptance cases need a sound payload projection. An identity-function blacklist
+or deleting boxes solely from logical dtype is not that projection.
+
+The earlier helper-boundary development notes below are historical. They explain
+the ownership obligations, not a claim that the qualified public marketing path
+still has the original admission failure or that all other paths are complete.
+
+## Historical helper composition and owned call regions
 
 The helper-based marketing density exposes a source-AD preparation gap: a
 nested helper in a lexical `let` tail can reach the reverse pass after composite
@@ -101,6 +129,37 @@ Number inputs and narrowing conversions abstain. Physical Object returns stay
 Object even when builtin Float/Double/Boolean presence is established. This is
 not global removability, external purity, or a promise against compiler/VM
 resource failures, and enables no guarded rewrite on its own.
+
+### Actual return bridges and primitive payload plans
+
+The typed interface's Object result and a primitive computation behind it are
+separate facts. The bytecode producer records the actual unguarded `invk` wrapper
+edge to its static FP computation, with actual Methods, implementation and body
+identity. It also records the body's emitted result category independently of
+the method's required return category. A hidden reference-to-FP return conversion
+does not qualify merely because the static method declares a primitive result.
+
+`retained-typed-return-bridge` checks that correspondence under the existing
+emission guard. `checked-selected-fp-payload` additionally checks a bounded closed
+FP leaf using the existing source arithmetic planner and scalar SSA lowerer.
+Every effective retained node dtype must agree with the independently computed
+primitive carrier; matching only the final result dtype would miss an inserted
+Float operation followed by widening back to Double. Numerical tests compare
+the actual wrapper and SSA on Float/Double, signed zero, NaN and infinity, and
+demonstrate that nested-width counterexample.
+
+This first proof requires an actual owned emission. It neither invokes the JIT
+to acquire evidence nor disguises a cold source contract as emitted evidence.
+Cold native preparation needs its own explicit source-context proof rather than
+a dependency on numerical JVM warm-up.
+
+The returned plan keeps the physical Object result separate from its FP payload.
+A parent Object/Object arithmetic operation must retain its Numbers overload;
+the proven payload cannot silently select primitive IEEE division instead.
+Original argument evaluation/conversion and use-closed box-storage erasure are
+additional obligations. These producer observations alone enable no native box
+erasure, do not repair the held product transformation, and add no derivative
+rule, cache, numerical permission or parallel function/type registry.
 
 Optional proof observations are transactional: an accepted fact contributes to
 the existing owner, while a refused query does not create an executable
