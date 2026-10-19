@@ -2,6 +2,19 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.source-arithmetic :as arithmetic]))
 
+(deftest comparison-carriers-are-not-arithmetic-promotion
+  (doseq [[left expected] [[:int [:int :long :double :double]]
+                          [:long [:long :long :double :double]]
+                          [:float [:double :double :float :double]]
+                          [:double [:double :double :double :double]]]
+          [right result] (map vector [:int :long :float :double] expected)]
+    (is (= result (arithmetic/comparison-carrier left right))))
+  (doseq [[left right] [[:ref :int] [nil :float] [:float nil]]]
+    (is (= :double (arithmetic/comparison-carrier left right))))
+  ;; Source oracle: narrowing the integer to Float here silently changes true to false.
+  (is (< (float 16777216) (int 16777217)))
+  (is (< (float 16777216) (long 16777217))))
+
 (deftest primitive-recipes-preserve-existing-widths
   ;; Ordered rows/columns are actual int, long, float, double carriers.
   (doseq [operator ["+" "-" "*"]

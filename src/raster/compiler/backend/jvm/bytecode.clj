@@ -2191,12 +2191,10 @@
                       (and (symbol? a2) (= :long (:type (get locals a2)))) :long
                       (and (symbol? a2) (= :float (:type (get locals a2)))) :float
                       :else nil)
-        use-int? (and (= t1-hint :int) (= t2-hint :int))
-        use-long? (and (= t1-hint :long) (= t2-hint :long))
-        ;; Mixed int/long: promote both to long (avoids double conversion)
-        use-long-mixed? (and (#{:int :long} t1-hint) (#{:int :long} t2-hint)
-                             (not use-int?))
-        use-float? (and (= t1-hint :float) (= t2-hint :float))]
+        carrier (source-arithmetic/comparison-carrier t1-hint t2-hint)
+        use-int? (= carrier :int)
+        use-long? (= carrier :long)
+        use-float? (= carrier :float)]
     (if use-int?
       ;; Both int: use if_icmpXX (no conversion, fastest path for loop counters)
       (let [t1 (emit-form code a1 locals ctx)
@@ -2207,7 +2205,7 @@
           "<"  (.if_icmplt code true-label) "<=" (.if_icmple code true-label)
           ">"  (.if_icmpgt code true-label) ">=" (.if_icmpge code true-label)
           "==" (.if_icmpeq code true-label) "not=" (.if_icmpne code true-label)))
-      (if (or use-long? use-long-mixed?)
+      (if use-long?
         ;; Both long (or mixed int/long → promote to long): use lcmp + ifXX
         (let [t1 (emit-form code a1 locals ctx)
               _ (when (not= t1 :long) (emit-coerce code t1 :long))

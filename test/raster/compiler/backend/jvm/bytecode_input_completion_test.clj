@@ -31,6 +31,30 @@
       (try (.invoke ^java.lang.reflect.Method method nil (object-array arguments))
            (catch java.lang.reflect.InvocationTargetException e (throw (.getCause e))))))))
 
+(deftest mixed-floating-comparisons-retain-source-order
+  (doseq [integer-tag ['int 'long]]
+    (let [params [(with-meta 'i {:tag integer-tag}) (with-meta 'f {:tag 'float})]
+          less (compiled params '(clojure.core/< f i))
+          greater (compiled params '(clojure.core/> i f))
+          integer (if (= integer-tag 'int) (int 16777217) (long 16777217))]
+      (is (= (< (float 16777216) integer) (less integer (float 16777216))))
+      (is (= (> integer (float 16777216)) (greater integer (float 16777216))))
+      (is (false? (less integer Float/NaN)))
+      (is (false? (greater integer Float/NaN)))
+      (is (false? (less integer Float/POSITIVE_INFINITY)))
+      (is (true? (greater integer Float/NEGATIVE_INFINITY)))))
+  (let [params [(with-meta 'a {:tag 'float}) (with-meta 'b {:tag 'float})]
+        less (compiled params '(clojure.core/< a b))]
+    (doseq [[a b] [[(float -0.0) (float 0.0)]
+                   [Float/NEGATIVE_INFINITY Float/POSITIVE_INFINITY]
+                   [Float/NaN (float 0.0)] [(float 0.0) Float/NaN]]]
+      (is (= (< a b) (less a b)))))
+  (let [params [(with-meta 'i {:tag 'int}) (with-meta 'wide {:tag 'long})]
+        less (compiled params '(clojure.core/< i wide))
+        greater (compiled params '(clojure.core/> wide i))]
+    (is (true? (less (int 1) (long 9007199254740993))))
+    (is (true? (greater (int 1) (long 9007199254740993))))))
+
 (defn- outcome [f & arguments]
   (try {:value (apply f arguments)}
        (catch Throwable e {:error (class e)})))

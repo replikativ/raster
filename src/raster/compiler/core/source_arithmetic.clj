@@ -4,6 +4,18 @@
    In particular :ref does not imply a present, numeric, or nonthrowing value.
    Do not apply these recipes to arbitrary generic calls or typed implementations.")
 
+(defn comparison-carrier
+  "Select the common comparison carrier from independently known operand carriers.
+   Unlike arithmetic promotion, mixed Float/integer comparisons widen to Double.
+   Unknown/Object carriers retain the JVM emitter's Double conversion path; this
+   decision is not evidence that those conversions complete normally."
+  [left right]
+  (cond
+    (= [:int :int] [left right]) :int
+    (and (#{:int :long} left) (#{:int :long} right)) :long
+    (= [:float :float] [left right]) :float
+    :else :double))
+
 (defn binary-plan
   "Plan one step of the source inline left fold for +, -, *, or /.
    Inputs are actual stack carriers, never logical dtype annotations. Callers
