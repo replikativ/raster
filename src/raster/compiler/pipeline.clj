@@ -1401,7 +1401,7 @@
 ;; Diagnostic runner for show-pipeline
 ;; ================================================================
 
-(defn- run-passes-diagnostic
+(defn ^:no-doc run-passes-diagnostic
   "Run passes with full intermediate recording for diagnostics.
   Returns {:form final-form :stages {stage-key form} :stats {stage-key stats}}."
   ([form passes opts]

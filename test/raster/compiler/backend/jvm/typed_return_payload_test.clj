@@ -5,6 +5,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (def ^:private fp {:carrier Double/TYPE :presence :present})
@@ -185,3 +186,22 @@
     (is (= Double/TYPE (#'scalar/completed-fp-body-carrier body {'x Double/TYPE 'y Double/TYPE})))
     (is (nil? (#'scalar/completed-fp-body-carrier body {'x Double/TYPE 'y Double/TYPE} true))
         "every admitted node must agree before its SSA can become a payload recipe")))
+
+(deftest nonthrowing-intrinsic-evidence-does-not-invent-a-result-carrier-recipe
+  (let [descriptor intrinsics/descriptor
+        expression '(clojure.core/+ x y)
+        carriers {'x Double/TYPE 'y Double/TYPE}]
+    (is (= Double/TYPE (#'scalar/completed-fp-body-carrier expression carriers)))
+    ;; Model independently extending descriptor totality, without changing
+    ;; source identity or teaching this arithmetic-only summary a new recipe.
+    (doseq [facts [{:arity 2 :kind :fn :primitive-fp-total true :c {:fn "hypot"}}
+                  {:arity 2 :kind :infix :primitive-fp-total true :c "%"}]]
+      (with-redefs [intrinsics/descriptor (fn [op]
+                                          (if (= op 'clojure.core/+) facts (descriptor op)))]
+        (is (nil? (#'scalar/completed-fp-body-carrier expression carriers)))))
+    (with-redefs [intrinsics/descriptor
+                  (fn [op]
+                    (if (= op 'clojure.core/exp)
+                      {:arity 1 :kind :fn :primitive-fp-total true :c {:fn "exp"}}
+                      (descriptor op)))]
+      (is (nil? (#'scalar/completed-fp-body-carrier '(clojure.core/exp x) carriers))))))

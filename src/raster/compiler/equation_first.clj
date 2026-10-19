@@ -744,9 +744,13 @@
                                               :public-parameters physical-parameters
                                               :array-types (:array-types physical-types)
                                               :scalar-types (:scalar-types physical-types)))
-         semantic-candidate (pipeline/run-passes
-                             (:body represented) pipeline/gpu-semantic-post-soa-passes
-                             compiler-options :write-read-fused)
+         ;; Keep the actual normalized admission refusal. Reanalyzing the
+         ;; original compatibility form can report already-normalized bindings
+         ;; as additional gaps and needlessly repeats source analysis.
+         semantic-trace (pipeline/run-passes-diagnostic
+                         (:body represented) pipeline/gpu-semantic-post-soa-passes
+                         compiler-options :write-read-fused)
+         semantic-candidate (:form semantic-trace)
          semantic (case (:dialect semantic-candidate)
                     :typed-parallel (if (get-in semantic-candidate [:attributes :invocation-plan])
                                       semantic-candidate
@@ -760,7 +764,8 @@
                     "deftm is outside the direct TypedSOAC/structured-control vertical"
                     {:function (function-symbol f-var)
                      :dialect (:dialect semantic) :fallback :none
-                     :coverage (typed-frontend/coverage-decline semantic compiler-options)}))
+                     :coverage (or (get-in semantic-trace [:stats :soac-fused :typed-soac-declined])
+                                   (typed-frontend/coverage-decline semantic compiler-options))}))
          semantic (cond-> semantic
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))

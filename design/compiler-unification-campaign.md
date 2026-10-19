@@ -14,9 +14,10 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `fe33ef0b` is draft, not qualified for merge.
-Exact-head setup/build passed; emission, unit tests and OpenCL failed at
-the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
+Current integration hold: PR #1539 at `2c27d18f` is draft, not qualified for merge.
+Exact-head setup/build passed; emission failed at job 32595, while unit 32594
+and OpenCL 32597 were still running at the latest observation.
+The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
@@ -33,11 +34,33 @@ progress to `double-exponential-float-storage`, where `exp` lacks descriptor-own
 nonthrowing evidence. Preserve its declared target-library accuracy separately from
 exception totality; do not erase checks or claim vendor execution/performance.
 
+Review identified a second requirement before admitting that target-math operand:
+nonthrowing `exp` does not prove the downstream checked cast has the same outcome.
+An implementation-defined approximation can cross `Float/MAX_VALUE`. The warm
+JVM probe around `log(Float/MAX_VALUE)` confirms adjacent Double inputs switch
+from successful narrowing to `IllegalArgumentException`. Keep the case rejected
+until a range-stability certificate or source-compatible observation policy
+justifies exception behavior; simply adding a totality flag is insufficient.
+Also separate primitive result-carrier proof from intrinsic nonthrowing evidence:
+the current completed-FP helper summary assumes binary arithmetic after that
+query and must not accidentally accept unary library operations.
+
+The next compiler-quality slice separates that carrier recipe explicitly from
+nonthrowing intrinsic evidence; library functions remain unadmitted. It also
+retains the actual semantic-pass decline in equation-first diagnostics instead
+of reanalyzing the original compatibility form. Manual normalization already
+lifts the nested training loss reduction, but the complete route retains further
+evaluation obligations; neither that observation nor better reporting proves
+training admission. The unchanged workload still refuses. The focused combined
+gate passes 44 tests / 636 assertions (carrier proofs, normalized diagnostics,
+checked schedules, source order and actual local device execution). No source
+evaluation flag, numerical check or compiler legality rule was relaxed.
+
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|
 | Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |
 | Checked numerical map result | Source-derived `mixed-scale` compiles across OpenCL/CUDA/HIP. The explicit internal ordered checked executor observes actual local OpenCL/Level Zero results, guards historical source ownership, tracks success-conditioned coverage, and rotates private output generations on replay. Finite literal-bound ordered folds retain Double accumulation and a runtime private-output obligation. Ordinary invocation/composition/persistence still refuse. | Qualify broader integration and automatic Compiled admission; establish descriptor-owned nonthrowing target-math evidence without changing accuracy policy. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
-| Training scalar source coverage | Unit 32520 and warm local reproduction reject `local-gradient-sum`: nested reduce/divide and later scale scalar carry mandatory source evaluation | Close source-order/carrier evidence without dropping preservation flags or duplicating evaluation; retain the actual distributed-training composition oracle. |
+| Training scalar source coverage | Actual normalized pass diagnostics now report `local-gradient-sum`'s retained scalar obligations. A second analysis of unnormalized source was misleading about the nested reduction; the complete route still refuses retained divide/multiply evaluations. | Close source-order/carrier evidence without dropping preservation flags or duplicating evaluation; retain the actual distributed-training composition oracle. |
 | Existing AD/native/fusion integration | Exact-head unit logs still contain native refusals, closed-product AD gaps and fusion/terminal-conversion failures | Classify actual semantic gaps versus obsolete structural expectations; preserve numerical/failure oracles. Updating tests must not substitute for implementation. |
 | Distributed and durable workload acceptance | Original obligations remain below; training composition currently blocked by the scalar row above | Complete their unchanged workload gates after shared compiler fixes. Local co-location/simulation is not multi-host performance evidence. |
 

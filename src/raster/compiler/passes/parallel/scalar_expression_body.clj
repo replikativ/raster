@@ -1566,7 +1566,14 @@
                                   (if (= target Float/TYPE) :float :double))))
                      target))
 
-                 (intrinsics/primitive-fp-total? operation carriers)
+                 ;; Nonthrowing evidence is independent of the result-carrier
+                 ;; recipe. This summary owns only core comparisons and the
+                 ;; existing binary arithmetic planner, not library functions.
+                 (and (intrinsics/primitive-fp-total? operation carriers)
+                      (or (= :cmp (:kind intrinsic))
+                          (and (= :infix (:kind intrinsic))
+                               (= 2 (:arity intrinsic))
+                               (source-arithmetic/binary-operator? (:c intrinsic)))))
                  (if (= :cmp (:kind intrinsic))
                    Boolean/TYPE
                    (let [plan (source-arithmetic/binary-plan
