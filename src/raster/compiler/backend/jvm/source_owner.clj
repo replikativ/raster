@@ -8,6 +8,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.ordered-call :as ordered-call]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.types :as types]
@@ -124,12 +125,26 @@
 
 (deftype ^:private TerminalResultOwner [program contract execute observations source-ns])
 
+(defn- original-source-context! [source-var reason]
+  (let [collector entry/*emission-inputs*
+        observation (when collector (get-in @collector [:definition-proofs source-var]))
+        metadata (:metadata observation)
+        source-ns (:ns metadata)
+        policy (:raster.core/source-policy metadata)]
+    (when-not (and observation (var? source-var)
+                   (instance? clojure.lang.Namespace source-ns)
+                   (completion/source-policy? policy))
+      (throw (ex-info "source projection needs its original definition owner" {:reason reason})))
+    (entry/assert-definition-inputs-current! @collector)
+    {:collector collector :metadata metadata :source-ns source-ns :policy policy}))
+
+(defn- source-history-current! [source-ns observations reason]
+  (when-not (identical? source-ns (find-ns (ns-name source-ns)))
+    (throw (ex-info "source namespace was replaced" {:reason reason})))
+  (entry/assert-definition-inputs-current! observations))
+
 (defn- terminal-owner-current! [^TerminalResultOwner owner]
-  (let [source-ns (.-source-ns owner)]
-    (when-not (identical? source-ns (find-ns (ns-name source-ns)))
-      (throw (ex-info "terminal source namespace was replaced"
-                      {:reason :stale-terminal-source-namespace})))
-    (entry/assert-definition-inputs-current! (.-observations owner))))
+  (source-history-current! (.-source-ns owner) (.-observations owner) :stale-terminal-source-namespace))
 
 (defn compile-terminal-result
   "Compile the generated terminal source region under its existing producer.
@@ -144,17 +159,7 @@
    original bytecode method's return descriptor. It grants no physical export,
    producer completion, device observation or whole-invocation result proof."
   [program contract source-var]
-  (let [collector entry/*emission-inputs*
-        observation (when collector (get-in @collector [:definition-proofs source-var]))
-        metadata (:metadata observation)
-        source-ns (:ns metadata)
-        policy (:raster.core/source-policy metadata)]
-    (when-not (and observation (var? source-var)
-                   (instance? clojure.lang.Namespace source-ns)
-                   (completion/source-policy? policy))
-      (throw (ex-info "terminal source needs its original definition owner"
-                      {:reason :unowned-terminal-source})))
-    (entry/assert-definition-inputs-current! @collector)
+  (let [{:keys [collector metadata source-ns policy]} (original-source-context! source-var :unowned-terminal-source)]
     (invocation/validate-terminal-source-result!
      contract program {:source-policy policy :source-namespace (ns-name source-ns)})
     (let [projection (terminal-source/project contract source-ns)
@@ -171,11 +176,7 @@
               (throw (ex-info "terminal result needs its original method return completion"
                               {:reason :terminal-source-return-completion :return-tag return-tag
                                :result-facts result-facts})))
-          guard #(do
-                   (when-not (identical? source-ns (find-ns (ns-name source-ns)))
-                     (throw (ex-info "terminal source namespace was replaced"
-                                     {:reason :stale-terminal-source-namespace})))
-                   (entry/assert-definition-inputs-current! @collector))
+          guard #(source-history-current! source-ns @collector :stale-terminal-source-namespace)
           execute (compile-function (:params projection) (:source projection)
                                     (fn [params body] (list 'fn* params body))
                                     (merge projection {:source-policy policy :source-ns source-ns :guard guard}))
@@ -185,6 +186,48 @@
           observations @collector]
       (entry/assert-definition-inputs-current! observations)
       (TerminalResultOwner. program contract execute observations source-ns))))
+
+(deftype ^:private CheckedResultSourceOwner [program emission observations source-ns])
+
+(defn compile-checked-result-source
+  "Freeze source ownership after checked-stage emission under the original producer.
+   This grants no physical binding, completion or initialization. The compiler
+   producer owes source-to-semantic correspondence; consumers cannot refresh it."
+  [program emission source-var]
+  (let [{:keys [collector source-ns policy]} (original-source-context! source-var :unowned-checked-result-source)]
+    (when-not (false? (:unchecked-math policy))
+      (throw (ex-info "checked result source requires its retained checked compilation policy"
+                      {:reason :unsupported-checked-result-source-policy :source-policy policy})))
+    (intrinsic-source/observe-originals! source-ns)
+    (let [observations @collector]
+      (when (seq (:unclosed-source-imports observations))
+        (throw (ex-info "checked result source needs original lineage for generated body imports"
+                        {:reason :unclosed-checked-result-source-imports
+                         :imports (:unclosed-source-imports observations)})))
+      (doseq [[v origin] (:source-body-inputs observations)]
+        (let [snapshot (get-in observations [:definition-proofs v])
+              metadata (case origin :var (:metadata snapshot) :value (meta (:value snapshot)) nil)
+              imported-policy (:raster.core/source-policy metadata)]
+          (when-not (and snapshot (completion/source-policy? imported-policy)
+                         (false? (:unchecked-math imported-policy)))
+            (throw (ex-info "checked result source cannot import a body with unknown or unchecked policy"
+                            {:reason :unsupported-checked-result-import-policy
+                             :source v :origin origin :source-policy imported-policy})))))
+      (source-history-current! source-ns observations :stale-checked-result-source-namespace)
+      (CheckedResultSourceOwner. program emission observations source-ns))))
+
+(defn assert-checked-result-source!
+  "Guard exact historical semantic/emitted ownership before and after source work."
+  [owner program emission]
+  (when-not (and (instance? CheckedResultSourceOwner owner)
+                 (identical? program (.-program ^CheckedResultSourceOwner owner))
+                 (identical? emission (.-emission ^CheckedResultSourceOwner owner)))
+    (throw (ex-info "checked result owner belongs to another source/program boundary"
+                    {:reason :checked-result-source-owner-mismatch})))
+  (source-history-current! (.-source-ns ^CheckedResultSourceOwner owner)
+                           (.-observations ^CheckedResultSourceOwner owner)
+                           :stale-checked-result-source-namespace)
+  owner)
 
 (defn assert-terminal-result-owner!
   "Preflight exact source ownership without observing any numerical value or executing source."

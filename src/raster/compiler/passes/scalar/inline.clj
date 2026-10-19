@@ -12,6 +12,7 @@
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -206,7 +207,7 @@
   [_deftm-info]
   true)
 
-(defn- try-resolve-walked-body
+(defn- resolve-walked-body-input
   "Try to extract walked body from a var. Returns {:params :walked-body :tags} or nil.
   Checks both var metadata (normal deftm) and the deref'd value's metadata
   (for value+grad/grad results stored in vars).
@@ -222,14 +223,21 @@
         ;; guard below even though its body is perfectly inlinable.
         _ (when (instance? clojure.lang.Var v)
             (try (rcore/ensure-walked-body! v) (catch Exception _ nil)))
-        metadata (meta v)
+        _ (when method-entry/*emission-inputs*
+            (method-entry/observe-definition-input! v (:ns (meta v)) (:name (meta v))))
+        snapshot (when method-entry/*emission-inputs*
+                   (get-in @method-entry/*emission-inputs* [:definition-proofs v]))
+        ;; Derive the imported body from the observation, not a metadata read
+        ;; made before it. A later policy/body mutation cannot bless old code.
+        metadata (if snapshot (:metadata snapshot) (meta v))
         ;; Also check the fn object's metadata (for value+grad results)
         val-metadata (when (instance? clojure.lang.Var v)
-                       (try (meta @v) (catch Exception _ nil)))
+                       (try (meta (if snapshot (:value snapshot) @v)) (catch Exception _ nil)))
         _ (source-owner/assert-portable-source! metadata)
         _ (source-owner/assert-portable-source! val-metadata)
-        walked-body (or (:raster.core/deftm-walked-body-typed metadata)
-                        (:raster.core/deftm-walked-body metadata)
+        var-body (or (:raster.core/deftm-walked-body-typed metadata)
+                     (:raster.core/deftm-walked-body metadata))
+        walked-body (or var-body
                         (:raster.core/deftm-walked-body-typed val-metadata)
                         (:raster.core/deftm-walked-body val-metadata))
         params (or (:raster.core/deftm-params metadata)
@@ -252,7 +260,8 @@
                              (let [callee (symbol (str (:ns metadata)) (str (:name metadata)))]
                                (not (canonical-callee callee))))]
                 (inlinable-body? (first effective-wb)))
-          (let [source-ns-sym (symbol (str (.name (.ns v))))
+          (let [_ (method-entry/observe-source-body-input! v (if var-body :var :value))
+                source-ns-sym (symbol (str (.name (.ns v))))
                 source-ns (try (the-ns source-ns-sym) (catch Exception _ nil))
                 param-set (set (map #(if (symbol? %) % (symbol (name %))) params))
                 ;; Qualify non-primitive tags to fully-qualified class names.
@@ -290,6 +299,10 @@
                :walked-body (mapv #(inf/qualify-body-symbols % source-ns param-set)
                                   hygienic-wb)}
               {:params params :tags tags :return-tag return-tag :walked-body hygienic-wb})))))))
+
+(defn- try-resolve-walked-body [v]
+  ;; Rejected inlining candidates do not become executable dependencies.
+  (method-entry/call-with-optional-definition-inputs #(resolve-walked-body-input v)))
 
 (defn- force-mangled-specialization!
   "Fresh-JVM determinism: a walked body may reference a mangled specialization
@@ -977,6 +990,13 @@
               (source-owner/assert-portable-source! prepared-body))
             ((requiring-resolve 'raster.ad.reverse/project-owned-value+grad-call) prepared-body args mode))
           (let [_ (source-owner/assert-portable-source! prepared-body)
+            ;; This derived program can come from an earlier AD preparation.
+            ;; Its caller's checked policy does not authenticate transitive
+            ;; source history. Leave ordinary AD import unchanged, but record
+            ;; the missing lineage for source-owned checked-result admission.
+            _ (when method-entry/*emission-inputs*
+                (swap! method-entry/*emission-inputs* update :unclosed-source-imports
+                       (fnil conj #{}) [:prepared-reverse-ad var-sym]))
             params (:params prepared-body)
             prepared-form (inf/qualify-body-symbols
                            (first (:walked-body prepared-body))

@@ -476,7 +476,9 @@
            (assoc compiler-options :target-dialect target-dialect
                   :schedule resolved-schedule))
           emission)
-        invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)]
+        invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
+        checked-owner (when (and source-var (stage-result/requires-observation? (:program emission)))
+                        (source-owner/compile-checked-result-source semantic (:program emission) source-var))]
     (when-not invocation-plan
       (fail! :equation-first-invocation
              "equation-first semantic program has no retained public invocation plan"
@@ -496,7 +498,8 @@
                  :equations (count (:equations scheduled))}
       :emission (:stats emission)
       :fallback :none})
-      terminal-owner (assoc :terminal-source-owner terminal-owner))))
+      terminal-owner (assoc :terminal-source-owner terminal-owner)
+      checked-owner (assoc :checked-result-source-owner checked-owner))))
 
 (def ^:private typed-compilation-options
   #{:target :schedule :scalar-math :resident-outputs})

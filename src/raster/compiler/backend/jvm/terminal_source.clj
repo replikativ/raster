@@ -3,6 +3,7 @@
    Carrier propagation here is physical: ports, literal carriers and resolved Method returns.
    This is backend source projection, not a new function/type registry or interpreter."
   (:require [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.ordered-call :as ordered]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.source-arithmetic :as source-arithmetic]
@@ -14,30 +15,8 @@
 (defn- fail! [message data]
   (throw (ex-info message (assoc data :reason :unclosed-terminal-source-projection))))
 
-(defonce ^:private intrinsic-source-observations
-  ;; Bootstrap references for this backend's intrinsic translations, NOT a
-  ;; dispatch/type registry. Conversion semantics remain in op-descriptor.
-  ;; Trust premise: standard Clojure definitions at compiler bootstrap. Later
-  ;; core redefinition/inline replacement (including namespace reload) must
-  ;; refuse; a fresh consumer observation cannot authenticate the replacement.
-  (into {}
-        (map (fn [operation]
-               [operation (entry/emission-definition-snapshot (resolve operation))]))
-        (conj (into (into #{} (filter #(and (= "clojure.core" (namespace %))
-                                            (contains? #{'float 'double} (descriptor/cast-result-tag %))))
-                          (keys descriptor/cast-ops))
-                    (comp (filter #(= "clojure.core" (namespace %)))
-                          (filter #(source-arithmetic/binary-operator? (name %))))
-                    (concat descriptor/addition-ops descriptor/subtraction-ops
-                            descriptor/multiplication-ops descriptor/division-ops))
-              'clojure.core/nil?)))
-
 (defn- intrinsic-current! [v operation]
-  (let [original (get intrinsic-source-observations operation)]
-    (when-not (and original (identical? v (:var original))
-                   (entry/var-value-current? original))
-      (throw (ex-info "terminal intrinsic no longer matches its compiler bootstrap definition"
-                      {:reason :terminal-intrinsic-definition-mismatch :operation operation})))))
+  (intrinsic-source/assert-original! v operation :terminal-intrinsic-definition-mismatch))
 
 (defn- source-hints!
   [expression local-carrier source-ns]

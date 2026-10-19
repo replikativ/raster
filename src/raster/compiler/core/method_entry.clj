@@ -116,6 +116,20 @@
                      (update :values (fnil conj []) snapshot)))))
       true)))
 
+(defn observe-source-body-input!
+  "Record an actual source-body import in the existing producer collector.
+   Origin selects metadata on the historical Var or its captured function value;
+   it is not a second copy of the definition or an inferred compilation policy.
+   Optional proof transactions discard this along with their other observations."
+  [v origin]
+  (when-not (contains? #{:var :value} origin)
+    (throw (ex-info "source body import needs its actual metadata origin"
+                    {:reason :source-body-input-origin :origin origin})))
+  (when *emission-inputs*
+    (observe-definition-input! v (:ns (meta v)) (:name (meta v)))
+    (swap! *emission-inputs* update :source-body-inputs (fnil conj #{}) [v origin])
+    true))
+
 (defn assert-definition-inputs-current!
   "Validate normalization's historical definition observations, not a fresh
    post-hoc source traversal. Sequential staleness fence, not an ABA guarantee."
@@ -562,6 +576,7 @@
                      (get-in projection [:emission :body]))
                    (:clojure-body lineage)))]
       (when (seq body)
+        (observe-source-body-input! source-var :var)
         (assert-definition-inputs-current! @*emission-inputs*)
         {:body body :parameters (:params lineage) :tags (:tags lineage)
          :source-var source-var :source-ns (:source-ns lineage)
