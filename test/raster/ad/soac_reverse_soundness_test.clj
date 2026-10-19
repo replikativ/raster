@@ -485,8 +485,11 @@
     (loop [i 0 s 0.0] (if (< i m) (recur (inc i) (n/+ s (ra/aget out i))) s))))
 
 (deftest a-map-read-at-a-step-local-index-is-rejected
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"par/map! AD"
-                        ((rev/value+grad #'locally-indexed-map :wrt [0]) (double-array [1.0 0.0]) 2))))
+  (let [error (try (rev/value+grad #'locally-indexed-map :wrt [0]) nil
+                   (catch clojure.lang.ExceptionInfo error error))]
+    (is (= :ad-unclosed-lifted-read-index (:reason (ex-data error))))
+    (is (= 'xs (:array (ex-data error))))
+    (is (seq (:unclosed (ex-data error))))))
 
 ;; Varying intercepts as a map: lanes gather alpha[group[i]], repeated groups
 ;; accumulate.

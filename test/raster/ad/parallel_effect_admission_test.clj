@@ -188,6 +188,101 @@
         overwritten (par/map! indices j size long 0)]
     (par/reduce total 0.0 i size (n/+ total (ra/aget out i)))))
 
+(deftm additive-local-index
+  [src :- (Array double) weights :- (Array double) size :- Long] :- Double
+  (par/reduce total 0.0 i size
+    (let [offset (* 2 size) index (+ offset i) value (ra/aget src index)]
+      (n/+ total (n/* (ra/aget weights i) value)))))
+
+(deftm ordered-local-index
+  [src :- (Array double) weights :- (Array double) size :- Long] :- Double
+  (par/reduce total 0.0 i size
+    (let [offset (* 2 size) index (+ offset i) value (ra/aget src index)]
+      (n/+ (n/* 0.5 total) (n/* (ra/aget weights i) value)))))
+
+(deftm scan-local-index
+  [src :- (Array double) size :- Long] :- Double
+  (let [out (double-array size)
+        scanned (par/scan out acc 0.0 i size double
+                         (let [offset (* 2 size) index (+ offset i)
+                               value (ra/aget src index)]
+                           (n/+ acc value)))]
+    (par/reduce total 0.0 i size (n/+ total (ra/aget scanned i)))))
+
+(deftest reduction-and-scan-replay-local-index-dependencies
+  (let [src (double-array [1 2 3 4 5 6]) weights (double-array [2 3])]
+    (doseq [[source expected gradient] [[#'additive-local-index 28.0 [0.0 0.0 0.0 0.0 2.0 3.0]]
+                                      [#'ordered-local-index 23.0 [0.0 0.0 0.0 0.0 1.0 3.0]]]]
+      (let [vg (rev/value+grad source :wrt [0])
+            [value derivative] (vg src weights 2)]
+        (is (= expected (source src weights 2) value))
+        (is (= gradient (vec derivative)))
+        (doseq [j (range (alength src))]
+          (let [left (aclone src) right (aclone src) h 1.0e-6]
+            (aset-double left j (- (aget left j) h))
+            (aset-double right j (+ (aget right j) h))
+            (is (< (Math/abs (- (aget ^doubles derivative j)
+                                (/ (- (source right weights 2) (source left weights 2)) (* 2 h))))
+                   1.0e-7))))
+        (is (= [0.0 []] (let [[v g] (vg (double-array 0) (double-array 0) 0)] [v (vec g)])))))
+    (let [vg (rev/value+grad #'scan-local-index :wrt [0])
+          [value derivative] (vg src 2)]
+      (is (= 16.0 (scan-local-index src 2) value))
+      (is (= [0.0 0.0 0.0 0.0 2.0 1.0] (vec derivative)))
+      (is (= [0.0 []] (let [[v g] (vg (double-array 0) 0)] [v (vec g)]))))))
+
+(deftest unproved-lifted-index-dependencies-decline-before-emission
+  (doseq [body ['(let* [index (unknown-index i) value (clojure.core/aget src index)] value)
+                '(let* [inc (unknown-index i) value (clojure.core/aget src inc)] value)
+                '(let* [count (unknown-index i) value (clojure.core/aget src count)] value)
+                '(let* [buf src value (clojure.core/aget buf i)] value)
+                '(let* [buf src] (raster.numeric/* 2.0 (clojure.core/aget buf i)))
+                '(let* [value (let* [buf src] (clojure.core/aget buf i))] value)
+                '(raster.numeric/+ acc (let* [buf src] (clojure.core/aget buf i)))
+                '(let* [index (clojure.core/+ acc i) value (clojure.core/aget src index)] value)
+                '(let* [index (clojure.core/aget out i) value (clojure.core/aget src index)] value)]]
+    (is (= :ad-unclosed-lifted-read-index
+         (try (#'rev/analyze-par-map-body
+               body 'i true #{'src 'acc 'out})
+              nil
+              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        (str body))))
+
+(deftest lifted-read-receivers-respect-sequential-shadowing
+  (doseq [body ['(let* [value (clojure.core/aget src i) src other] value)
+                '(let* [src (clojure.core/aget src i)] src)]]
+    (let [analyzed (#'rev/analyze-par-map-body body 'i true)]
+      (is (= [['src 'i]] (mapv (juxt :arr :idx) (:agets analyzed)))))))
+
+(deftm local-index-check-before-read
+  [src :- (Array double) size :- Long] :- Double
+  (par/reduce total 0.0 i size
+    (let [checked (quot 1 (- size 1)) index (+ (* 2 size) i)
+          value (ra/aget src index)]
+      (n/+ total (n/* (double checked) value)))))
+
+(deftm local-index-check-after-read
+  [src :- (Array double) size :- Long] :- Double
+  (par/reduce total 0.0 i size
+    (let [index (+ (* 2 size) i) value (ra/aget src index)
+          checked (quot 1 (- size 1))]
+      (n/+ total (n/* (double checked) value)))))
+
+(deftest replay-closure-keeps-forward-exception-order-and-zero-trips
+  (doseq [[source expected] [[#'local-index-check-before-read ArithmeticException]
+                            [#'local-index-check-after-read ArrayIndexOutOfBoundsException]]]
+    (let [vg (rev/value+grad source :wrt [0])
+          failure (fn [f] (try (f (double-array 0) 1) nil (catch Throwable error (class error))))]
+      (is (= expected (failure source) (failure vg)))
+      (is (= [0.0 []] (let [[v g] (vg (double-array 0) 0)] [v (vec g)]))))))
+
+(deftest unrecognized-inline-index-stays-in-its-original-scope
+  (let [body '(let* [count (unknown-index i)] (clojure.core/aget src count))
+        analyzed (#'rev/analyze-par-map-body body 'i true #{'src})]
+    (is (empty? (:agets analyzed)))
+    (is (= '([count (unknown-index i)]) (:scalar-bindings analyzed)))
+    (is (= '(clojure.core/aget src count) (:body-result analyzed)))))
+
 (deftest existing-functional-map-replays-pure-index-aliases-without-capture
   (let [src (double-array [2.0 3.0 5.0]) indices (long-array [2 0 2])
         tangent (double-array [0.25 -0.5 2.0])
