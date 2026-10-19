@@ -4,6 +4,7 @@
             [raster.numeric :as n]
             [raster.ad.reverse :as reverse]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.local-products :as products]))
 
 (deftm projected-product [x :- Double] :- Double
@@ -36,7 +37,26 @@
                    (.close ^java.lang.AutoCloseable compiled)))))))
 
 (defn- run [expression & arguments]
-  (apply (eval (list 'fn* '[x calls] expression)) arguments))
+  (apply (eval (list 'fn* '[x calls] (completion/project-to-jvm-source expression))) arguments))
+
+(deftm observed-product-field [x :- Double] :- Double
+  (let [product [(clojure.core/* x x)]]
+    (if (identical? (nth product 0) (nth product 0)) 1.0 0.0)))
+
+(deftest product-fields-retain-the-original-object-snapshot
+  (let [compiled (pipeline/compile-aot #'observed-product-field :dtype :double)]
+    (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+      (is (= 1.0 (observed-product-field x) (compiled x)))))
+  (let [source '(let* [p [(clojure.core/* (clojure.core/double x) 2.0)]
+                       q p
+                       first-field (clojure.core/nth q 0)
+                       second-field (clojure.core/nth p 0)]
+                 (clojure.core/identical? first-field second-field))
+        lowered (products/lower-local-products source)]
+    (is (completion/contains-completion? lowered))
+    (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+      (is (true? (run source x nil)))
+      (is (true? (run lowered x nil))))))
 
 (deftest scalar-accumulation-lowering-requires-independent-present-carriers
   (let [source '(let* [left (clojure.core/double x)

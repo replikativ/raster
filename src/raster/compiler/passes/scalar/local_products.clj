@@ -9,6 +9,7 @@
             [raster.ad.accumulation :as accumulation]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.value-product :as value-product]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
@@ -28,6 +29,13 @@
                                (assoc :scalar-type (some-> (inference/infer-arg-tag expression {})
                                                           dtype/dtype-for-scalar-tag)))
         (symbol? expression) (get env expression)
+        ;; Object completion changes representation, not the value of a saved
+        ;; literal/lexical reference. Transport only existing facts here; do
+        ;; not infer a producer recipe from the operand's logical scalar tag.
+        (and (completion/canonical-form? expression)
+             (= completion/object-input-contract
+                (:contract (completion/canonical-parts expression))))
+        (fact env (:operand (completion/canonical-parts expression)))
         :else nil))
 
 (defn- product-shape? [expression]
@@ -193,7 +201,14 @@
                  (let [[prefix fields] (split-product (util/alpha-convert init))
                        snapshots (mapv (fn [value]
                                          [(with-meta (gensym "product_field__")
-                                            (select-keys (meta value) [:raster.type/tag])) value])
+                                            (assoc (select-keys (meta value) [:raster.type/tag])
+                                                   :tag 'Object))
+                                          ;; A vector consumes each original field in Object
+                                          ;; context, once, before any projection. Merely
+                                          ;; binding its primitive value loses both that
+                                          ;; producer context and the identity of its box.
+                                          (completion/complete-value
+                                           completion/object-input-contract value)])
                                        fields)
                        lifted (vec (concat prefix (mapcat identity snapshots)))
                        scope (reduce (fn [local [id init]]
