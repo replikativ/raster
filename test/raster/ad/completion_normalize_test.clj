@@ -122,6 +122,75 @@
     (is (= 'x result))
     (is (nil? (:raster.type/tag (meta result))))))
 
+(deftest object-completion-retains-logical-declaration-alongside-physical-hint
+  (let [declared (with-meta 'x {:raster.type/tag 'double :tag 'Object})
+        snapshot (with-meta 'saved {:tag 'Object})
+        expression (completion/complete-value completion/object-input-contract 'x)
+        [flat result] (anf/normalize-for-ad [declared 'input snapshot expression 'alias 'saved]
+                                          ['alias] gensym)
+        body (list 'let* flat result)
+        source (source-function '[input] body)
+        artifact (bytecode/compile-specialized-class!
+                   "raster.compiled.CompletedDeclarationTransport"
+                   [{:name 'run :params '[input] :return-tag 'Object
+                     :walked-body [body] :source-ns *ns*}])
+        method (get-in artifact [:methods 'run])]
+    (is (= {:tag 'Object :raster.type/tag 'double} (meta (nth flat 2))))
+    (is (= 'double (:raster.type/tag (meta result))))
+    (doseq [input [nil (Double. 2.5) (Object.) "not numeric"]]
+      (is (identical? input (source input)))
+      (is (identical? input (.invoke ^java.lang.reflect.Method method nil (object-array [input])))))))
+
+(deftest object-completion-declaration-authority-is-exact
+  (let [declared (with-meta 'x {:raster.type/tag 'double})
+        completed (completion/complete-value completion/object-input-contract declared)]
+    (is (= 'double (completion/object-value-declaration completed)))
+    (is (nil? (completion/object-value-declaration
+                (completion/complete-value completion/object-input-contract (with-meta 'x {:tag 'double})))))
+    (is (nil? (completion/object-value-declaration
+                (completion/complete-value (completion/primitive-input-contract Float/TYPE policy) declared))))
+    (is (nil? (completion/object-value-declaration (concat completed [:extra]))))
+    (is (= :conflicting-value-completion-declaration
+           (try (completion/object-value-declaration (vary-meta completed assoc :raster.type/tag 'float)) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :ad-conflicting-lexical-declaration
+           (try (anf/anf-normalize-bindings [(with-meta 'saved {:raster.type/tag 'float}) completed] gensym) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest initial-owner-declarations-flow-without-defeating-shadowing
+  (let [[flat result] (anf/normalize-for-ad ['alias 'formal] ['alias] gensym {'formal 'double})]
+    (is (= 'double (:raster.type/tag (meta (first flat)))))
+    (is (= 'double (:raster.type/tag (meta (second flat)))))
+    (is (= 'double (:raster.type/tag (meta result)))))
+  (let [[flat result] (anf/normalize-for-ad [(with-meta 'formal {:tag 'Object}) 'formal 'alias 'formal]
+                                          ['alias] gensym {'formal 'double})]
+    (is (= 'double (:raster.type/tag (meta (second flat)))))
+    (is (nil? (:raster.type/tag (meta result)))))
+  (let [[flat _] (anf/normalize-for-ad ['f '(fn* [formal] formal)] ['f] gensym {'formal 'double})]
+    (is (nil? (:raster.type/tag (meta (last (second flat)))))))
+  (let [[_ result] (anf/normalize-for-ad [] ['formal] gensym {'formal 'double})]
+    (is (= 'double (:raster.type/tag (meta result))))))
+
+(deftest derivative-regions-import-only-visible-owner-declarations
+  (let [declared (with-meta 'outer {:raster.type/tag 'double})
+        context @#'rev/*source-memory-context*
+        normalized (fn [visible]
+                     (with-bindings {#'rev/*source-memory-context*
+                                     (assoc context :values visible
+                                            :value-facts {'outer {:value declared}})}
+                       (:fwd-bindings (#'rev/let-gradient-pieces ['alias 'outer] ['alias] [] 'dy))))]
+    (is (nil? (:raster.type/tag (meta (first (normalized []))))))
+    (is (= 'double (:raster.type/tag (meta (first (normalized ['outer]))))))))
+
+(deftest forward-presence-is-frozen-before-lexical-rebinding
+  (let [facts (:value-facts (#'rev/forward-pass
+                            ['original nil 'saved 'original 'original 1.0 'last 'saved] []))]
+    (is (= :present (get-in facts ['original :presence])))
+    (is (= :absent (get-in facts ['saved :presence])))
+    (is (= :absent (get-in facts ['last :presence]))))
+  (let [facts (:value-facts (#'rev/forward-pass ['p [nil] 'p 1.0] []))]
+    (is (nil? (get-in facts ['p :product])))))
+
 (deftest completion-preserves-original-primitive-result-context
   (let [contract (completion/primitive-input-contract Float/TYPE policy)
         original (completion/complete-value contract '(Math/abs (double x)))

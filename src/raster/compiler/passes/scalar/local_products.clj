@@ -376,8 +376,13 @@
 
     (seq? expression)
     (let [lowered (relist expression (map #(lower env % products?) expression))]
-      (or (project-scalar-accumulation env lowered)
-          (project-array-accumulation env lowered) lowered))
+      (if-let [identity (when (accumulation/approved-call? lowered)
+                         (accumulation/project-absent-identity
+                          lowered (mapv #(normal-return/result-fact % env)
+                                        (:arguments (descriptor/call-description lowered)))))]
+        (:expression identity)
+        (or (project-scalar-accumulation env lowered)
+            (project-array-accumulation env lowered) lowered)))
     (vector? expression) (with-meta (mapv #(lower env % products?) expression) (meta expression))
     (map? expression) (into (empty expression) (map (fn [[k v]] [(lower env k products?) (lower env v products?)])) expression)
     (set? expression) (into (empty expression) (map #(lower env % products?)) expression)

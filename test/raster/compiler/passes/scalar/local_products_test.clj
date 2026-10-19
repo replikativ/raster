@@ -3,9 +3,37 @@
             [raster.core :refer [deftm]]
             [raster.numeric :as n]
             [raster.ad.reverse :as reverse]
+            [raster.ad.accumulation :as accumulation]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.local-products :as products]))
+
+(deftest absent-cotangent-identity-retains-object-context-and-helper-ownership
+  (let [facts [{:presence :absent} {:presence :unknown}]
+        call '(raster.ad.reverse/grad-acc missing value)
+        projected (:expression (accumulation/project-absent-identity call facts))]
+    (is (= {:contract completion/object-input-contract :operand 'value}
+           (completion/canonical-parts projected)))
+    (let [execute (eval (list 'fn '[value] (completion/project-to-jvm-source projected))) ]
+      (doseq [value [nil (Double. 1.25) (float-array [1]) (Object.) "opaque"]]
+        (is (identical? value (execute value)))))
+    (is (nil? (accumulation/project-absent-identity call [{:presence :unknown} {:presence :unknown}])))
+    (is (nil? (accumulation/project-absent-identity call [{:presence :present} {:presence :unknown}])))
+    (is (nil? (accumulation/project-absent-identity
+                '(raster.ad.reverse/grad-acc (do (effect) nil) value) facts)))
+    (is (nil? (accumulation/project-absent-identity
+                (vary-meta call assoc :raster.op/lexical-callee true) facts)))
+    (doseq [flag [:raster.effect/preserve-evaluation :raster.effect/source-reference-cast]]
+      (is (nil? (accumulation/project-absent-identity (vary-meta call assoc flag true) facts))))
+    (with-redefs [reverse/grad-acc (fn [_ _] :replaced)]
+      (is (nil? (accumulation/project-absent-identity call facts)))))
+  (let [source '(let* [missing nil] (raster.ad.reverse/grad-acc value missing))
+        lowered (products/lower-local-products source)
+        execute (fn [body] (eval (list 'fn '[value] (completion/project-to-jvm-source body))))]
+    (is (not-any? #(= 'raster.ad.reverse/grad-acc %) (tree-seq coll? seq lowered)))
+    (doseq [value [nil (Double. 1.25) (Object.)]]
+      (is (identical? value ((execute source) value)))
+      (is (identical? value ((execute lowered) value))))))
 
 (deftm projected-product [x :- Double] :- Double
   (let [seed 1.0

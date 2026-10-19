@@ -24,13 +24,51 @@
   "Join two already-owned product interfaces, without importing private value
    identities or treating an unknown shape as evidence of compatibility."
   [then-fact else-fact]
-  (when-not (and (= :product (get-in then-fact [:schema :kind]))
-                 (= (:schema then-fact) (:schema else-fact)))
-    (throw (ex-info "conditional product arms require identical retained field schemas"
-                    {:reason :ad-product-choice-schema
-                     :then (:schema then-fact) :else (:schema else-fact)})))
-  {:schema (:schema then-fact)
-   :active-paths (into (:active-paths then-fact) (:active-paths else-fact))})
+  (letfn [(refuse []
+            (throw (ex-info "conditional product arms require compatible retained field schemas"
+                            {:reason :ad-product-choice-schema
+                             :then (:schema then-fact) :else (:schema else-fact)})))
+          (absent? [leaf]
+            (and (= #{:kind :tag :presence} (set (keys leaf)))
+                 (= :leaf (:kind leaf)) (nil? (:tag leaf))
+                 (= :absent (:presence leaf))))
+          (scalar? [leaf]
+            (and (= #{:kind :tag} (set (keys leaf)))
+                 (= :leaf (:kind leaf)) (contains? '#{float double} (:tag leaf))))
+          (schema? [schema]
+            (case (:kind schema)
+              :leaf (or (= #{:kind :tag} (set (keys schema))) (absent? schema))
+              :product (and (= #{:kind :fields} (set (keys schema)))
+                            (vector? (:fields schema)) (every? schema? (:fields schema)))
+              false))
+          (fact? [fact]
+            (and (schema? (:schema fact)) (set? (:active-paths fact))
+                 (let [leaves (into {} (leaf-paths (:schema fact)))]
+                   (every? (fn [path]
+                             (let [leaf (get leaves path)]
+                               (and leaf (not (absent? leaf))
+                                    (tangent/differentiable? (:tag leaf)))))
+                           (:active-paths fact)))))
+          (join [a b]
+            (cond
+              (= a b) a
+              (and (= :product (:kind a)) (= :product (:kind b))
+                   (= #{:kind :fields} (set (keys a)) (set (keys b)))
+                   (vector? (:fields a)) (vector? (:fields b))
+                   (= (count (:fields a)) (count (:fields b))))
+              {:kind :product :fields (mapv join (:fields a) (:fields b))}
+              ;; Absence is a producer fact, never a missing type or activity
+              ;; bit. A declaration describes the present tangent only: this
+              ;; join establishes neither presence nor a primitive carrier.
+              (and (absent? a) (scalar? b)) b
+              (and (scalar? a) (absent? b)) a
+              :else (refuse)))]
+    (when-not (and (fact? then-fact) (fact? else-fact)
+                   (= :product (get-in then-fact [:schema :kind]))
+                   (= :product (get-in else-fact [:schema :kind])))
+      (refuse))
+    {:schema (join (:schema then-fact) (:schema else-fact))
+     :active-paths (into (:active-paths then-fact) (:active-paths else-fact))}))
 
 (defn choice-plan
   "Route a joined field port only to the selected existing product value.
@@ -85,12 +123,15 @@
 
               (or (symbol? field) (number? field) (nil? field) (boolean? field)
                   (string? field) (keyword? field) (char? field))
-              (let [active? (boolean (and (symbol? field) (get activity field)))
-                    tag (leaf-tag field value-facts)]
+              (let [absent? (or (nil? field)
+                                (and (symbol? field)
+                                     (= :absent (get-in value-facts [field :presence]))))
+                    active? (boolean (and (not absent?) (symbol? field) (get activity field)))
+                    tag (when-not absent? (leaf-tag field value-facts))]
                 (when (and active? (not (tangent/differentiable? tag)))
                   (throw (ex-info "product field has no retained tangent-space declaration"
                                   {:reason :ad-product-unknown-tangent :field field :tag tag})))
-                {:schema {:kind :leaf :tag tag}
+                {:schema (cond-> {:kind :leaf :tag tag} absent? (assoc :presence :absent))
                  :edges [{:port (field-port owner path) :path path :tag tag
                           :source field :active? active?}]})
 

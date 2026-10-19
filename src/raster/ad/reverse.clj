@@ -48,6 +48,7 @@
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.scalar.local-products :as local-products]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
             [raster.compiler.passes.parallel.patterns :as patterns]
@@ -235,8 +236,8 @@
 (defn- anf-normalize-bindings [bindings]
   (anf/anf-normalize-bindings bindings ad-gensym))
 
-(defn- normalize-for-ad [bindings body-exprs]
-  (anf/normalize-for-ad bindings body-exprs ad-gensym))
+(defn- normalize-for-ad [bindings body-exprs declarations]
+  (anf/normalize-for-ad bindings body-exprs ad-gensym declarations))
 
 (defn- anf-wrap-bare-body
   "Normalize a BARE (non-binding-form) walked body into a `let*` whose bindings
@@ -565,8 +566,9 @@
                                         :tag (:tag leaf)})
                                      (filter (fn [[path _]] (contains? (:active-paths plan) path))
                                              (product-ports/leaf-paths (:schema plan))))
-              :value-facts (when structured?
-                             {sym {:product (select-keys plan [:schema :active-paths])}})}}))
+              :value-facts {sym (if structured?
+                                 {:product (select-keys plan [:schema :active-paths])}
+                                 (select-keys (:schema plan) [:presence]))}}}))
 
 (defmethod ad-record :product [_ sym init activity]
   (product-record sym (product-ports/literal-plan sym init (:value-facts *source-memory-context*) activity)))
@@ -1158,7 +1160,10 @@
    (fn [{:keys [activity fwd-bindings records replayed writes aliases input-replay-conditions
                 values value-facts unprojectable]}
         [sym init-expr]]
-     (let [active?  (binding [*source-memory-context* (assoc *source-memory-context* :value-facts value-facts)]
+     (let [;; Freeze at the original initializer, before this binder or child
+           ;; catalogs can replace any same-named lexical value.
+           result-fact (normal-return/result-fact init-expr (select-keys value-facts values))
+           active?  (binding [*source-memory-context* (assoc *source-memory-context* :value-facts value-facts)]
                       (init-active? init-expr activity))
            activity (assoc activity sym active?)
            may-aliases #(memory/transitive-closure (set %) aliases)
@@ -1275,11 +1280,13 @@
         ;; identity comes from the existing record or shared exact-tail authority.
         :values (conj values sym)
         :value-facts (assoc value-facts sym
-                            (cond-> {:value sym :alias (or (:result-alias record)
-                                                           (form/tail-symbol init-expr))}
-                              (some? constant-index) (assoc :constant-index constant-index)
-                              (get-in value-facts [sym :product])
-                              (assoc :product (get-in value-facts [sym :product]))))
+                            (cond-> (merge result-fact
+                                           ;; Only the current record owns its
+                                           ;; result, not old/child catalogs.
+                                           (get-in record [:value-facts sym])
+                                           {:value sym :alias (or (:result-alias record)
+                                                                 (form/tail-symbol init-expr))})
+                              (some? constant-index) (assoc :constant-index constant-index)))
         :unprojectable (join-input-replay-conditions unprojectable private-conditions)
         :input-replay-conditions (join-input-replay-conditions
                                   input-replay-conditions
@@ -1823,7 +1830,19 @@
   bindings. Both a reified pullback and an in-loop step gradient consume this
   representation; the latter must not allocate a closure per iteration."
   [bindings body-exprs active-params dy-sym]
-  (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
+  (let [declarations
+        (reduce (fn [decls value]
+                  (if-let [tag (:raster.type/tag (meta value))]
+                    (do
+                      (when (and (contains? decls value) (not= tag (get decls value)))
+                        (throw (ex-info "AD scope has conflicting logical declarations"
+                                        {:reason :ad-conflicting-lexical-declaration :symbol value})))
+                      (assoc decls value tag))
+                    decls))
+                {} (concat (map #(get-in *source-memory-context* [:value-facts % :value] %)
+                                (:values *source-memory-context*))
+                           active-params))
+        [norm-bindings body-sym] (normalize-for-ad bindings body-exprs declarations)
         {:keys [fwd-bindings rev-ctx param-adj-syms replays writes value-facts forward-scope adj-env
                 pullback-replays pullback-replay-conditions]}
         (process-bindings norm-bindings active-params

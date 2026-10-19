@@ -6,6 +6,8 @@
    operation registry, or permission to reassociate contributions."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.dtype :as dtype]))
 
 (defn- retain-approved-premise! []
@@ -62,6 +64,26 @@
       (when (validate-addition addition dt)
         (retain-approved-premise!)
         addition))))
+
+(defn project-absent-identity
+  "Project the approved optional sum's nil identity for lexical operands/literal
+   nil only. Retain the selected input's original Object completion; even a
+   lexical primitive can box at this call boundary. Compound operands retain
+   the original call because absence cannot discard their evaluation."
+  [expression operand-facts]
+  (let [arguments (:arguments (descriptor/call-description expression))]
+    (when (and (= 2 (count arguments) (count operand-facts))
+               (every? #(or (symbol? %) (nil? %)) arguments)
+               (approved-call? expression)
+               ;; A call-level denial is independent of the nil identity law.
+               ;; This projection has no authority to discharge that marker.
+               (empty? (:flags (effects/descriptor expression))))
+      (let [index (cond (= :absent (:presence (first operand-facts))) 1
+                        (= :absent (:presence (second operand-facts))) 0)]
+        (when (some? index)
+          (retain-approved-premise!)
+          {:expression (completion/complete-value completion/object-input-contract
+                                                  (nth arguments index))})))))
 
 (defn nullable-result-tag
   "Project the existing result facet only for the approved helper's closed

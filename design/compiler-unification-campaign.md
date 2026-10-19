@@ -157,6 +157,29 @@ and arbitrary Object identity despite logical numeric declarations. The cold
 six-namespace normalization, shared-scope, conditional, initializer and reverse-AD
 gate passes 112 tests / 544 assertions. This is not nullable-product closure or
 a fix for marketing's separate runtime/AOT lifecycle invalidation.
+
+The subsequent product-closure investigation found two concrete declaration
+losses rather than a need for AD-local arithmetic inference: canonical Object
+snapshots retained physical `Object` but lost the operand's logical declaration;
+and derivative-region normalization started empty even when the actual formal
+owner and visible outer value both retained Double declarations. The follow-up
+imports those declarations through the same lexical scope engine, never through
+private child catalogs. Exact Object completion supplies only a logical value
+declaration, with conflict refusals and source/bytecode identity controls.
+Presence is frozen at each initializer before rebinding; only the current
+record may publish the new result's facts. A recursively checked product join
+admits explicit absence with an already-declared scalar tangent, not unknown
+leaves, mixed widths, arrays, malformed schemas or active absent ports. The
+joined declaration proves neither presence nor a primitive carrier.
+The approved optional-cotangent sum's nil identity is projected only for lexical
+operands/literal nil, retaining the selected input's Object completion. Compound
+operands, changed helper definitions, lexical callees and call-level denial
+flags retain the original call. The first-through-third cubic derivative probe
+now returns its analytic values in a fresh JVM. The cold ten-namespace gate
+passes 182 tests / 981 assertions; the existing first-through-third derivative
+tests separately pass 3 tests / 9 assertions. Full CI remains required.
+Object-helper completeness warnings remain visible, so
+this is not a claim of optimized higher-order AD or complete AD coverage.
 Inspection of completed unit job 32391 (`bb27191d`) confirms the Q4_K exact-bit,
 Long/SIMD, raw-evaluation test-consumer and outdated scan-reason failures are
 gone. Its remaining failures include HVP consumers (repaired in the subsequent

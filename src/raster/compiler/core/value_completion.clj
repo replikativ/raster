@@ -126,6 +126,21 @@
   (when (canonical-form? expression)
     {:contract (second expression) :operand (nth expression 2)}))
 
+(defn object-value-declaration
+  "An exact Object completion preserves an explicitly declared logical value.
+   This conveys no presence or physical carrier and does not infer from hints.
+   Other conversions need their own declaration authority."
+  [expression]
+  (let [{:keys [contract operand]} (canonical-parts expression)]
+    (when (= object-input-contract contract)
+      (let [tag (:raster.type/tag (meta operand))
+            existing (:raster.type/tag (meta expression))]
+        (when (and tag existing (not= tag existing))
+          (throw (ex-info "Object completion has conflicting logical declarations"
+                          {:reason :conflicting-value-completion-declaration
+                           :operand-tag tag :completion-tag existing})))
+        tag))))
+
 (defn contains-completion?
   "Whether executable syntax contains a retained input/result context. Quoted
    data is opaque. Include malformed reserved terms so an optimization cannot
