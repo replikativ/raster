@@ -13,7 +13,8 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
             [raster.hardware-fixture :as fixture]
-            [raster.runtime.hardware :as hardware]))
+            [raster.runtime.hardware :as hardware]
+            [raster.runtime.checked-stage-result :as observation]))
 
 (def targets [:ocl:checked-stage-test :cuda:checked-stage-test :hip:checked-stage-test])
 
@@ -130,3 +131,92 @@
       (is (not (checked/candidate?
                 (:algorithm equation)
                 (assoc-in source path (list (first conversion) attributes (nth conversion 2)))))))))
+
+(deftest completed-status-protocol-is-bounded-and-empty-safe
+  (let [equation (numerical-equation (compilation (first targets)))
+        {:keys [extent status]} (first (:stage-results (emitted/validate-with-result-contracts equation)))]
+    (is (symbol? extent))
+    (doseq [length [0 1 16385]]
+      (let [reads (atom [])]
+        (is (nil? (observation/observe!
+                   equation {extent length}
+                   (fn [{:keys [elements] :as request}]
+                     (swap! reads conj request)
+                     (int-array elements)))))
+        (is (= length (reduce + 0 (map :elements @reads))))
+        (is (every? #(and (= status (:buffer %)) (= :int (:dtype %))
+                          (<= 1 (:elements %) 16384)) @reads))
+        (is (= (if (zero? length) [] [0])
+               (vec (take 1 (map :offset @reads)))))
+        (is (= (if (> length 16384) [0 16384] (if (zero? length) [] [0]))
+               (mapv :offset @reads)))))
+    (let [reads (atom 0)]
+      (is (= :checked-stage-observation-protocol
+             (reason #(observation/observe! equation {extent -1}
+                                            (fn [_] (swap! reads inc))))))
+      (is (zero? @reads)))))
+
+(defn- thrown-description [f]
+  (try (f) nil (catch Throwable error [(class error) (.getMessage error)])))
+
+(deftest completed-failure-selects-first-source-lane-and-exact-diagnostic
+  (let [equation (numerical-equation (compilation (first targets)))
+        {:keys [extent status diagnostics]}
+        (first (:stage-results (emitted/validate-with-result-contracts equation)))]
+    (doseq [value [(Math/nextUp (double Float/MAX_VALUE))
+                   (- (Math/nextUp (double Float/MAX_VALUE)))
+                   Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+      (let [reads (atom [])
+            actual (thrown-description
+                    #(observation/observe!
+                      equation {extent 4}
+                      (fn [request]
+                        (swap! reads conj request)
+                        (if (= status (:buffer request))
+                          (int-array [0 1 0 1])
+                          (double-array [value])))))
+            expected (thrown-description #(float (double value)))]
+        (is (some? expected))
+        (is (= expected actual))
+        (is (= [{:buffer status :dtype :int :offset 0 :elements 4}
+                {:buffer diagnostics :dtype :double :offset 1 :elements 1}] @reads))))))
+
+(deftest malformed-completed-status-protocol-never-credits-success
+  (let [equation (numerical-equation (compilation (first targets)))
+        {:keys [extent status]} (first (:stage-results (emitted/validate-with-result-contracts equation)))]
+    (doseq [snapshot [(long-array [0]) (int-array 0) (int-array [2]) (int-array [-1])]]
+      (is (= :checked-stage-observation-protocol
+             (reason #(observation/observe! equation {extent 1} (constantly snapshot))))))
+    (doseq [diagnostic [(float-array [Float/POSITIVE_INFINITY]) (double-array 0)
+                        (double-array [0.0]) (double-array [Double/NaN])]]
+      (is (= :checked-stage-observation-protocol
+             (reason #(observation/observe!
+                       equation {extent 1}
+                       (fn [request]
+                         (if (= status (:buffer request)) (int-array [1]) diagnostic)))))))
+    (let [reads (atom 0)]
+      (is (= :checked-map-stage-refinement
+             (reason #(observation/observe!
+                       (assoc-in equation [:refinement :schedule :kind] :ordinary)
+                       {extent 1} (fn [_] (swap! reads inc))))))
+      (is (zero? @reads)))))
+
+(deftest first-failure-in-later-chunk-keeps-global-lane-order
+  (let [equation (numerical-equation (compilation (first targets)))
+        {:keys [extent status diagnostics]}
+        (first (:stage-results (emitted/validate-with-result-contracts equation)))
+        reads (atom [])
+        failure (thrown-description
+                 #(observation/observe!
+                   equation {extent 40000}
+                   (fn [{:keys [buffer offset elements] :as request}]
+                     (swap! reads conj request)
+                     (if (= buffer status)
+                       (let [snapshot (int-array elements)]
+                         (when (= offset 16384) (aset-int snapshot 7 1))
+                         snapshot)
+                       (double-array [Double/POSITIVE_INFINITY])))))]
+    (is (= (thrown-description #(float Double/POSITIVE_INFINITY)) failure))
+    (is (= [{:buffer status :dtype :int :offset 0 :elements 16384}
+            {:buffer status :dtype :int :offset 16384 :elements 16384}
+            {:buffer diagnostics :dtype :double :offset 16391 :elements 1}] @reads))))

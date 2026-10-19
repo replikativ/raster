@@ -14,12 +14,17 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `f8133bc5` is draft, not qualified for merge.
-Setup 32522/build 32523 passed; emission 32526, unit 32524 and OpenCL 32525
-failed. The previous head's 16 unit shards finished (15 failed, one passed);
+Current integration hold: PR #1539 at `23f1948a` is draft, not qualified for merge.
+Setup 32529/build 32530 passed; emission 32532 failed. Unit 32531 and OpenCL 32535
+were still running at the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
+
+Emission has progressed past public `mixed-scale`; its next actual failure is a
+checked Double-to-Float after an ordered fold in `double-fold-float-storage`'s
+mutable map. That case is not admitted by the fresh functional-map refinement.
+Do not erase the check or assume that parallel partial writes preserve failure order.
 
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|
@@ -39,6 +44,17 @@ Review caught and closed both a label-dispatch bypass and an overbroad conversio
 Structural graph/ABI tests now use Double storage rather than claiming that an arbitrary
 fixture-only schedule implements checked narrowing; the real checked-source tests remain.
 This is compile-only progress, not production checked-map execution or campaign completion.
+
+The next observation component independently reconstructs the emitted obligation and
+interprets completed status snapshots in bounded chunks. It selects the first failing
+source lane and reads only that lane's initialized original-Double diagnostic; it reruns
+the immutable checked conversion rather than the operand computation. Empty stages do
+no reads; malformed protocols refuse. This component returns no initialization proof
+and cannot enable execution. The remaining integration is a confined graph-binding scope
+with exact temporary ownership/lifetimes, followed by observation before ordered cursor
+advance and success-conditional write coverage. Ordinary bind/composition/persistence
+gates stay closed. Review confirms this distinction; callback-only tests are not device
+completion, private-buffer ownership or production acceptance evidence.
 
 ### Historical integration receipts (not the current acceptance status)
 
