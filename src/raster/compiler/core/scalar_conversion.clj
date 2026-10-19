@@ -15,10 +15,10 @@
 
    Integral narrowing is rejected unless the caller explicitly requests :wrap or :trap. Those
    options distinguish representation wrapping from a checked source conversion; the default
-   remains rejection. Explicit Float/Double-to-Int/Long source casts use the JVM/Clojure boundary
-   contract: truncate toward zero, map NaN to zero, and saturate out-of-range values. The default
-   rejecting owner still declines that conversion, so an implicit result/storage coercion cannot
-   acquire source-cast semantics accidentally. Identity callers may elide the returned exact
+   remains rejection. Opted-in Float/Double-to-Int/Long numerical conversions truncate toward
+   zero, map NaN to zero, and saturate out-of-range values. That is NOT permission to implement
+   a checked Clojure source cast; use source-policy for descriptor-owned source conversions.
+   The default rejecting owner still declines that numerical conversion. Identity callers may elide the returned exact
    conversion. Unknown dtypes or policy options fail loudly."
   ([source target] (policy source target :reject))
   ([source target integral-narrowing]
@@ -56,9 +56,9 @@
 (defn source-policy
   "Resolve a descriptor-owned source cast, separately from an implicit numeric conversion.
 
-   Checked Double-to-Float narrowing may throw, including on infinities. Its :trap
-   contract must survive source projection and fusion; a target without that contract
-   must refuse, not replace it with an IEEE storage conversion."
+   Checked floating-to-integral casts and Double-to-Float narrowing may throw,
+   including on infinities. Their :trap contracts must survive source projection
+   and fusion; targets must not replace them with saturating or IEEE conversions."
   [source target source-op]
   (let [source (dtype/canon source)
         target (dtype/canon target)
@@ -67,10 +67,16 @@
     (when (and requested
                (= target (some-> source-op descriptor/cast-result-tag
                                  dtype/dtype-for-scalar-tag dtype/canon)))
-      (if (and (= :double source) (= :float target)
-               (= :checked (descriptor/cast-floating-narrowing source-op)))
+      (cond
+        (and (= :double source) (= :float target)
+             (= :checked (descriptor/cast-floating-narrowing source-op)))
         [:nearest-even :trap]
-        (policy source target requested)))))
+
+        (and (contains? #{:float :double} source) (contains? #{:int :long} target)
+             (= :trap requested))
+        [:toward-zero :trap]
+
+        :else (policy source target requested)))))
 
 (defn canonical-attributes?
   "Whether attributes fully and consistently describe one canonical scalar conversion."

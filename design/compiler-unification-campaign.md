@@ -465,6 +465,25 @@ drop acceptance assertions or relax exceptions to make these green. Finish the
 ordered observation/realization boundary and distinguish actual source conversion
 from compiler-owned storage conversion using retained producer evidence.
 
+The adjacent source-cast matrix found the same distinction for Float/Double to
+Int/Long: ordinary checked casts throw on overflow, whereas unchecked conversion
+saturates. `source-policy` now records `:toward-zero/:trap` for those checked
+casts, independently of the existing saturating numerical conversion policy.
+The shared scalar lowerer applies the same refusal/closed-literal proof boundary.
+
+Review also identified an overload-sensitive proof issue: a boxed Number cast can
+truncate before checking an integral bound, unlike the original primitive FP
+cast. `numeric-constant/source-value` now selects actual Float/Double primitive
+overloads for literal source casts; the separate numerical/IEEE `value` path is
+unchanged. Tests compare the proof itself with independently typed source
+oracles at fractional Byte/Int boundaries, neighboring Long boundaries,
+infinities and NaN, and assert the literal's actual carrier Class. The focused
+four-namespace gate passes 88 tests / 1,178 assertions in the reused REPL.
+Hardware-free tests also require all three C-family emitters to refuse an
+unsupported trapping FP-to-integral KernelBody cast. Independent final static
+review found no remaining confirmed blocker in this bounded delta. This is not
+a cold integration gate or qualification of the broader currently failing suite.
+
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
 with nine-coordinate finite differences across changed parameters and data.

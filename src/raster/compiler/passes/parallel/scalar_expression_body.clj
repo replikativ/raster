@@ -362,12 +362,14 @@
                                (body/scalar-expression operator result-type arguments options))]
                  :result result :type result-type :range range}))
 
-            (total-floating-literal? [lowered]
+            (total-source-cast-literal? [lowered source-op]
               ;; Consult the lowered operand, not a source spelling that could name
               ;; a lexical value instead of the apparent Java numeric field.
-              (when (instance? raster.compiler.ir.kernel_body.Literal (:result lowered))
+              (when (and (descriptor/cast-op? source-op)
+                         (instance? raster.compiler.ir.kernel_body.Literal (:result lowered)))
                 (some? (numeric-constant/source-value
-                        (list 'clojure.core/float (:value (:result lowered)))))))
+                        (list (symbol "clojure.core" (name source-op))
+                              (:value (:result lowered)))))))
 
             (cast-lowered [lowered target expression & [explicit-source-op]]
               (let [target (dtype/canon target)]
@@ -402,15 +404,15 @@
                               (decline! :cast-policy
                                         "scalar cast has no portable rounding and overflow policy"
                                         {:expression expression :source source :target target})))
-                        checked-floating? (and (= :double source) (= :float target)
-                                               (= :trap overflow))
+                        checked-floating? (and (dtype/fp-dtype? source) (= :trap overflow))
                         total-floating? (and checked-floating?
-                                             (total-floating-literal? lowered))
+                                             (total-source-cast-literal? lowered explicit-source-op))
                         _ (when (and checked-floating? (not total-floating?))
                             (decline! :checked-floating-conversion
-                                      "checked Float source conversion requires an ordered host observation"
+                                      "checked floating source conversion requires an ordered host observation"
                                       {:expression expression :source source :target target}))
-                        overflow (if total-floating? :ieee overflow)
+                        overflow (if total-floating?
+                                   (second (scalar-conversion/policy source target :trap)) overflow)
                         id (fresh "cast")]
                     (let [range (when (scalar-range/contained-in-dtype? (:range lowered) target)
                                   (:range lowered))]
@@ -704,15 +706,16 @@
                                       {:expression expression :expected expected
                                        :attributes attributes}))
                         lowered (lower operand (canon-type source-dtype) env)
-                        checked-floating? (and (= :double source-dtype) (= :float target-dtype)
-                                               (= :trap overflow))
+                        checked-floating? (and (dtype/fp-dtype? source-dtype) (= :trap overflow))
                         total-floating? (and checked-floating?
-                                             (total-floating-literal? lowered))
+                                             (total-source-cast-literal? lowered (:source-op attributes)))
                         _ (when (and checked-floating? (not total-floating?))
                             (decline! :checked-floating-conversion
-                                      "checked Float source conversion requires an ordered host observation"
+                                      "checked floating source conversion requires an ordered host observation"
                                       {:expression expression :source source-dtype :target target-dtype}))
-                        overflow (if total-floating? :ieee overflow)
+                        overflow (if total-floating?
+                                   (second (scalar-conversion/policy source-dtype target-dtype :trap))
+                                   overflow)
                         _ (when-not (= (canon-type source-dtype) (:type lowered))
                             (decline! :typed-scalar-convert-source
                                       "typed scalar conversion operand disagrees with its source dtype"

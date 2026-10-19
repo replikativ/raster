@@ -236,11 +236,13 @@
                           ((:cast legacy) {:operations [] :result 'x :type :long} :int 'x)))
                    [:expression :options]))
         "an implicit conversion without a strict owner retains the legacy wrap policy")
-    (doseq [form ['(clojure.core/int f) '(clojure.core/unchecked-int f)]]
-      (is (= {:rounding :toward-zero :overflow :saturate}
-             (get-in (last (:operations (lower form :int {'f :double})))
-                     [:expression :options]))
-          "checked and unchecked integer casts share Java's floating narrowing semantics"))
+    (is (= :checked-floating-conversion
+           (try (lower '(clojure.core/int f) :int {'f :double}) nil
+                (catch clojure.lang.ExceptionInfo e (:rule (ex-data e))))))
+    (is (= {:rounding :toward-zero :overflow :saturate}
+           (get-in (last (:operations (lower '(clojure.core/unchecked-int f) :int {'f :double})))
+                   [:expression :options]))
+        "only unchecked floating-to-integer casts grant saturation")
     (let [widened (lower '(clojure.core/long i) :long {'i :int})
           identity-cast (lower '(clojure.core/int i) :int {'i :int})]
       (is (= {:rounding :exact :overflow :exact}
@@ -871,13 +873,43 @@
     (is (= 'value (first (get-in (last (:operations checked)) [:expression :arguments])))
         "the typed term preserves its declared-source operand")))
 
-(deftest floating-source-casts-retain-jvm-saturation-semantics
+(deftest floating-source-casts-distinguish-checked-and-saturating-semantics
   (let [lower (:lower (lowerer))]
-    (doseq [[form expected] [['(long value) :long] ['(int value) :int]]]
+    (doseq [source [:float :double]
+            [form expected] [['(long value) :long] ['(int value) :int]]]
+      (is (= :checked-floating-conversion
+             (try (lower form expected {'value source}) nil
+                  (catch clojure.lang.ExceptionInfo e (:rule (ex-data e)))))))
+    (doseq [source [:float :double]]
+      (let [lowered (lower '(clojure.core/unchecked-int value) :int {'value source})
+            options (get-in (last (:operations lowered)) [:expression :options])]
+        (is (= {:rounding :toward-zero :overflow :saturate} options))
+        (is (= :int (:type lowered)))))
+    (doseq [[form expected] [['(long 1.75) :long] ['(int 1.75) :int]
+                            [(list 'int Double/NaN) :int]]]
       (let [lowered (lower form expected {'value :float})
             options (get-in (last (:operations lowered)) [:expression :options])]
         (is (= {:rounding :toward-zero :overflow :saturate} options))
         (is (= expected (:type lowered)))))))
+
+(deftest floating-trapping-casts-cannot-fall-through-to-a-target-c-cast
+  (doseq [source [:float :double] target [:int :long]]
+    (let [kernel (body/make
+                  {:id :checked-floating-cast
+                   :parameters [(body/->KernelParameter 'value :scalar source [] nil nil :parameter)
+                                (body/->KernelParameter 'out :output target [1] :global
+                                                       (layout/row-major [1] target) :result)]
+                   :operations [(body/->ScalarCompute
+                                 (body/value 'converted target)
+                                 (body/cast-expression 'value target :toward-zero :trap))
+                                (body/->ScalarStore 'out [0] 'converted nil)]
+                   :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                   :provenance {:dialect :test} :attributes {}})]
+      (doseq [dialect [:opencl-portable :cuda :hip]]
+        (is (= :kernel-body-c-cast-policy
+               (try (emit/emit-scalar-kernel "checked_floating_cast" kernel
+                                             {:target-dialect dialect}) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
 
 (deftest checked-floating-source-conversion-cannot-become-an-ieee-device-cast
   (let [lower (:lower (lowerer))

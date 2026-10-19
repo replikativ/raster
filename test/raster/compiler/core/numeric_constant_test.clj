@@ -63,6 +63,27 @@
                       (with-meta '(clojure.core/double 1.0) {:raster.op/lexical-callee true})]]
     (is (nil? (constant/source-value expression)) (str expression))))
 
+(deftest source-literal-proofs-use-the-actual-floating-carrier
+  (doseq [[carrier source-oracles]
+          [[:double [[(quote clojure.core/byte) (fn [^double v] (byte v))]
+                     [(quote clojure.core/int) (fn [^double v] (int v))]
+                     [(quote clojure.core/long) (fn [^double v] (long v))]]]
+           [:float [[(quote clojure.core/byte) (fn [^double v] (byte (unchecked-float v)))]
+                    [(quote clojure.core/int) (fn [^double v] (int (unchecked-float v)))]
+                    [(quote clojure.core/long) (fn [^double v] (long (unchecked-float v)))]]]]
+          [source-op oracle] source-oracles
+          v [0.0 -0.0 1.75 127.5 -128.5 2147483647.5 -2147483648.5
+             (Math/nextDown (double Long/MAX_VALUE)) (double Long/MAX_VALUE)
+             (Math/nextUp (double Long/MAX_VALUE))
+             (Math/nextDown (double Long/MIN_VALUE)) (double Long/MIN_VALUE)
+             Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
+    (let [value (if (= :float carrier) (unchecked-float v) v)
+          expected (try {:value (oracle (double value))}
+                        (catch IllegalArgumentException _ nil))
+          evidence (constant/source-value (list source-op value))]
+      (is (= (if (= :float carrier) Float Double) (class value)))
+      (is (= expected evidence) (str carrier " " source-op " " value)))))
+
 (deftest constant-proof-depth-abstains-without-executing-or-overflowing
   (let [expression (nth (iterate #(list 'clojure.core/double %) 1.0) 1024)]
     (is (nil? (constant/source-value expression)))

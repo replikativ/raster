@@ -4,6 +4,26 @@
    yield no evidence; callers must retain or decline them, never erase the conversion."
   (:require [raster.compiler.core.op-descriptor :as descriptor]))
 
+(defn- checked-source-cast
+  "Literal source carriers select primitive RT overloads, not boxed Number casts.
+   Fractional values beyond integral limits can pass a boxed cast after truncation
+   but fail the original primitive source cast. This helper grants no evidence
+   for Object-context completions or nonliteral operands."
+  [tag value]
+  (case tag
+    byte (cond (instance? Double value) (byte (.doubleValue ^Double value))
+               (instance? Float value) (byte (.floatValue ^Float value))
+               :else (byte value))
+    int (cond (instance? Double value) (int (.doubleValue ^Double value))
+              (instance? Float value) (int (.floatValue ^Float value))
+              :else (int value))
+    long (cond (instance? Double value) (long (.doubleValue ^Double value))
+               (instance? Float value) (long (.floatValue ^Float value))
+               :else (long value))
+    float (cond (instance? Double value) (float (.doubleValue ^Double value))
+                (instance? Float value) (float (.floatValue ^Float value))
+                :else (float value))))
+
 (defn- constant-value [expression source? remaining]
   (when (pos? remaining)
   (cond
@@ -40,17 +60,17 @@
           (when (number? operand-value)
             (try
               {:value (case tag
-                        byte (byte operand-value)
+                        byte (if source? (checked-source-cast tag operand-value) (byte operand-value))
                         int (if (= :wrap (descriptor/cast-integral-narrowing (first expression)))
                               (unchecked-int operand-value)
-                              (int operand-value))
-                        long (long operand-value)
+                              (if source? (checked-source-cast tag operand-value) (int operand-value)))
+                        long (if source? (checked-source-cast tag operand-value) (long operand-value))
                         ;; A source conversion and a typed IEEE storage conversion are
                         ;; distinct contracts, even when they agree on ordinary inputs.
                         float (if (and source?
                                        (not= :ieee (descriptor/cast-floating-narrowing
                                                     (first expression))))
-                                (float operand-value)
+                                (checked-source-cast tag operand-value)
                                 (.floatValue ^Number operand-value))
                         double (.doubleValue ^Number operand-value))}
               (catch IllegalArgumentException _ nil)

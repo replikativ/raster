@@ -53,3 +53,26 @@
         oracle (fn [^double value] (float (unchecked-float value)))]
     (doseq [value [Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
       (is (= (outcome oracle value) (outcome execute value))))))
+
+(deftest checked-floating-to-integral-source-casts-do-not-saturate-overflow
+  (doseq [[source-op target oracle]
+          [['clojure.core/int :int (fn [^double value] (int value))]
+           ['clojure.core/long :long (fn [^double value] (long value))]
+           ['clojure.core/unchecked-int :int (fn [^double value] (unchecked-int value))]]]
+    (let [overflow (if (= source-op 'clojure.core/unchecked-int) :saturate :trap)
+          attributes {:source-dtype :double :target-dtype target
+                      :rounding :toward-zero :overflow overflow :source-op source-op}
+          parameter (with-meta 'value {:tag 'double})
+          execute (eval (list 'fn [parameter]
+                              (conversion/project-canonical-to-source
+                               (list conversion/scalar-convert-symbol attributes parameter))))
+          observe (fn [f value]
+                    (try [:value (f value)]
+                         (catch IllegalArgumentException e [:exception (class e)])))]
+      (is (conversion/canonical-attributes? attributes))
+      (is (not (conversion/canonical-attributes?
+                (assoc attributes :overflow (if (= :trap overflow) :saturate :trap)))))
+      (doseq [value [0.0 -0.0 1.75 -1.75 Double/MAX_VALUE (- Double/MAX_VALUE)
+                     Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
+        (is (= (observe oracle value) (observe execute value))
+            (str source-op " value=" value))))))
