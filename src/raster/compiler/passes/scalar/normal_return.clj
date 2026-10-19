@@ -10,9 +10,11 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.support.mangled :as mangled]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.parallel.materialize :as materialize]))
 
 (def ^:private unknown {:presence :unknown})
@@ -202,3 +204,93 @@
    producers and lexical aliases establish presence."
   [expression]
   (:presence (result-fact expression)))
+
+(defn- primitive-completion-fact [^Class carrier]
+  (when (and (class? carrier) (.isPrimitive carrier) (not= Void/TYPE carrier))
+    {:carrier carrier :presence :present
+     :builtin-class (get types/primitive-info (symbol (.getName carrier)))}))
+
+(defn- completed-scalar-fact* [expression lexical-facts]
+  (cond
+    (symbol? expression)
+    ;; Only independently supplied producer facts, never a symbol's dtype tag.
+    (let [{:keys [carrier presence] :as fact} (get lexical-facts expression)]
+      (when (and (class? carrier) (= :present presence))
+        (select-keys fact [:carrier :presence :builtin-class])))
+
+    (not (seq? expression))
+    ;; literal-tag alone also describes nonprimitive integers. Exact wrapper
+    ;; correspondence prevents BigInt/BigInteger from becoming primitive Long.
+    (let [tag (types/literal-tag expression)]
+      (when (= (class expression) (get types/primitive-info tag))
+        (primitive-completion-fact (types/tag->java-class tag))))
+
+    (completion/canonical-parts expression)
+    (let [{:keys [contract operand]} (completion/canonical-parts expression)
+          fact (completed-scalar-fact* operand lexical-facts)]
+      (case (:source-context contract)
+        :jvm-object-input (when fact (assoc fact :carrier Object))
+        ;; An input conversion target is not the term's result carrier:
+        ;; source primitive-input projects through RT.box, whereas the
+        ;; bytecode-floating form requires its own emitter context.
+        ;; Neither supplies a consumer-independent producer fact here.
+        nil))
+
+    ;; Only the expanded special form, not an unauthenticated source macro.
+    (= 'let* (first expression))
+    (let [{:keys [sequential? scopes]} (form/scope-info expression)
+          {:keys [binders inits body]} (first scopes)]
+      (when (and sequential? (= 1 (count scopes)) (every? symbol? binders))
+        (let [scope (reduce (fn [scope [id init]]
+                              (assoc scope id (completed-scalar-fact* init scope)))
+                            lexical-facts (map vector binders inits))]
+          (completed-scalar-fact* (last body) scope))))
+
+    (= 'do (first expression))
+    (completed-scalar-fact* (last (rest expression)) lexical-facts)
+
+    :else
+    (let [{:keys [semantic-op arguments lexical-callee implementation-op]}
+          (descriptor/call-description expression)]
+      (when-not (or lexical-callee (contains? lexical-facts implementation-op))
+        (if (and (= semantic-op (first expression))
+                 (symbol? semantic-op) (= "clojure.core" (namespace semantic-op))
+                 (= 1 (count arguments)) (descriptor/cast-op? semantic-op))
+          ;; Conditional on successful source evaluation. A nullable operand
+          ;; can still throw; this fact cannot discharge that evaluation.
+          (when (and method-entry/*emission-inputs*
+                     (intrinsic-source/observe-original! (the-ns 'clojure.core) semantic-op))
+            (some-> semantic-op descriptor/cast-result-tag types/tag->java-class
+                    primitive-completion-fact))
+          (when method-entry/*emission-inputs*
+            (when-let [proof (scalar-body/checked-selected-primitive-evaluation
+                             expression
+                             (mapv #(completed-scalar-fact* % lexical-facts) arguments))]
+              {:carrier (:result-carrier proof) :presence (:presence proof)
+               :builtin-class (:builtin-class proof)})))))))
+
+(defn completed-scalar-fact
+  "Opt-in physical producer facts AFTER normal source evaluation.
+
+   Lexical facts must describe actual producers, not logical dtype annotations.
+   Selected calls reuse the existing source-owned primitive completion proof;
+   Object results remain Object, with a separate exact builtin payload class.
+   Missing/nullable/opaque evidence returns nil. This neither executes source
+   nor proves that its argument evaluation succeeds, authorizes motion, removes
+   evaluation flags, or supplies a kernel/payload lowering recipe. Qualified
+   core casts require their bootstrap definition and source owner; bare
+   spellings require their original namespace authority."
+  ([expression] (completed-scalar-fact expression {}))
+  ([expression lexical-facts]
+   (method-entry/call-with-optional-definition-inputs
+    #(completed-scalar-fact* expression lexical-facts))))
+
+(defn completed-scalar-bindings
+  "Normal-completion facts for sequential lexical producers. Unknown producers
+   shadow earlier facts; inputs must already have independent carrier evidence.
+   This does not execute, reorder, or certify evaluation of any binding."
+  ([pairs] (completed-scalar-bindings pairs {}))
+  ([pairs lexical-facts]
+   (reduce (fn [facts [id expression]]
+             (assoc facts id (completed-scalar-fact expression facts)))
+           lexical-facts pairs)))

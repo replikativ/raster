@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (def ^:private scratch
@@ -113,11 +114,18 @@
           checked (with-meta (list 'clojure.core/int source-n)
                     {:tag 'int :raster.type/tag 'int})
           checked-id (with-meta 'checked {:tag 'int :raster.type/tag 'int})
-          result (attempt (source [[checked-id checked]] 'live))]
+          result (entry/call-with-definition-inputs
+                  #(attempt (source [[checked-id checked]] 'live)))]
       (is (= :typed-soac-source-coverage (get-in result [:declined :reason])))
       (is (= {:id 2 :binding 'checked :kind :scalar
               :operation 'clojure.core/int :reason :uncertified-host-scalar}
-             (first (get-in result [:declined :bindings])))))))
+             (select-keys (first (get-in result [:declined :bindings]))
+                          [:id :binding :kind :operation :reason])))
+      (is (= #{:checked-source-cast}
+             (get-in result [:declined :bindings 0 :source-evaluation-flags])))
+      (is (= {:carrier "int" :presence :present :builtin-class "java.lang.Integer"}
+             (get-in result [:declined :bindings 0 :normal-completion]))
+          "normal return carrier evidence does not discharge a checked evaluation"))))
 
 (deftest eliminating-the-last-admitted-operation-keeps-the-validated-route
   (let [form (list 'let* [scratch '(clojure.core/float-array 4)

@@ -14,9 +14,9 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `2c27d18f` is draft, not qualified for merge.
-Exact-head setup/build passed; emission failed at job 32595, while unit 32594
-and OpenCL 32597 were still running at the latest observation.
+Current integration hold: PR #1539 at `87fea00a` is draft, not qualified for merge.
+Exact-head setup/build passed; emission 32603 and unit 32601 failed, while
+OpenCL 32602 was still running at the latest observation.
 The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
@@ -55,6 +55,28 @@ training admission. The unchanged workload still refuses. The focused combined
 gate passes 44 tests / 636 assertions (carrier proofs, normalized diagnostics,
 checked schedules, source order and actual local device execution). No source
 evaluation flag, numerical check or compiler legality rule was relaxed.
+
+Source completion now has an opt-in compositional query alongside the unchanged
+presence/array `result-fact`. It threads actual normal-return producer carriers
+through expanded sequential bindings and existing selected-method proofs. An
+Object result containing Double remains Object; explicit casts retain bootstrap
+callee ownership and may still throw while evaluating their operands. Unknown
+producers shadow old facts. Bare casts, unexpanded lexical macros, primitive-input
+contexts without result-carrier authority and opaque source remain unknown.
+In particular, the source primitive-input projection calls `RT.box(T)`: the
+conversion's input target does not establish a primitive result carrier.
+
+These facts currently enrich refused-source diagnostics only (source position,
+evaluation flags, normal-return carrier/payload); they do not admit kernels,
+remove evaluations or supply payload recipes. Selected-call proofs and rejected
+dependency transactions are reused rather than duplicating dispatch/type rules.
+The six-namespace affected gate passes 175 tests / 988 assertions, plus the
+changed nested-compatibility regression (1 / 2). Review found and corrected the
+input-context/result-carrier confusion and unauthenticated core-cast assumptions.
+Next: connect owned payload computations and closed numerical uses to ordered
+scalar stages, with independent source-order coverage and the unchanged training
+composition oracle. Cold recipe availability and bare source lookup remain
+explicit obligations; a carrier fact alone is not sufficient.
 
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|

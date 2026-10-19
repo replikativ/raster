@@ -33,7 +33,8 @@
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
-            [raster.compiler.passes.scalar.effects :as effects]))
+            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]))
 
 (defn- fail!
   [reason message data]
@@ -4713,26 +4714,38 @@
           declined (remove #(admitted-description? physical-outputs %) descriptions)
           parallel? (some #(not= :scalar (:kind %)) descriptions)]
       (when (and parallel? (seq declined))
-        {:reason :typed-soac-source-coverage
-         :bindings
-         (mapv (fn [{:keys [id sym kind expr]}]
-                 {:id id
-                  :binding sym
-                  :kind kind
-                  :operation (when (seq? expr) (descriptor/semantic-op expr))
-                  :reason (case kind
-                            :unsupported :unsupported-parallel-operation
-                            :scalar :uncertified-host-scalar
-                            :map :unverified-map-effects
-                            :scatter :unverified-scatter-conflict
-                            :effect-map :unverified-ordered-effects
-                            :stencil :unverified-stencil-storage
-                            :segmented-reduce :unverified-segmented-reduction
-                            :product-reduce :unverified-product-reduction
-                            :segmented-fold-map :unverified-segmented-fold-map
-                            :scan :unverified-scan-storage
-                            :unverified-operation-contract)})
-               declined)}))))
+        ;; Only diagnose a refused source. These are normal-completion facts,
+        ;; not admission evidence, and no logical scalar tags seed the scope.
+        (let [completed (normal-return/completed-scalar-bindings
+                         (mapv (juxt :sym :expr) descriptions))]
+          {:reason :typed-soac-source-coverage
+           :bindings
+           (mapv (fn [{:keys [id sym kind expr]}]
+                   (cond-> {:id id
+                            :binding sym
+                            :kind kind
+                            :operation (when (seq? expr) (descriptor/semantic-op expr))
+                            :reason (case kind
+                                      :unsupported :unsupported-parallel-operation
+                                      :scalar :uncertified-host-scalar
+                                      :map :unverified-map-effects
+                                      :scatter :unverified-scatter-conflict
+                                      :effect-map :unverified-ordered-effects
+                                      :stencil :unverified-stencil-storage
+                                      :segmented-reduce :unverified-segmented-reduction
+                                      :product-reduce :unverified-product-reduction
+                                      :segmented-fold-map :unverified-segmented-fold-map
+                                      :scan :unverified-scan-storage
+                                      :unverified-operation-contract)}
+                     (= :scalar kind)
+                     (assoc :source-evaluation-flags (:flags (effects/descriptor expr))
+                            :source (select-keys (meta expr) [:file :line :column])
+                            :normal-completion
+                            (when-let [fact (get completed sym)]
+                              (into {} (map (fn [[key value]]
+                                              [key (if (class? value) (.getName ^Class value) value)]))
+                                    fact)))))
+                 declined)})))))
 
 (defn- element-symbols [n] (mapv #(symbol (str "%element" %)) (range n)))
 (defn- capture-symbols [n] (mapv #(symbol (str "%capture" %)) (range n)))

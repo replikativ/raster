@@ -28,15 +28,22 @@
       (throw (ex-info "intrinsic no longer matches its compiler bootstrap definition"
                       {:reason reason :operation operation})))))
 
+(defn observe-original!
+  "Observe one actual bootstrap intrinsic lookup in the active source owner.
+   A qualified spelling or a fresh snapshot cannot authenticate a replacement."
+  [source-ns operation]
+  (let [v (ns-resolve source-ns operation)]
+    (assert-original! v operation :intrinsic-source-definition-mismatch)
+    (when-not (entry/observe-definition-input! v source-ns operation)
+      (throw (ex-info "intrinsic ownership requires its original definition collector"
+                      {:reason :unowned-intrinsic-source}))))
+  true)
+
 (defn observe-originals!
   "Retain original primitive source assumptions in the active producer collector.
    Conservatively guards this small existing source-intrinsic vocabulary; it does
    not infer which operations a later consumer wishes had been observed."
   [source-ns]
-  (doseq [[operation original] observations]
-    (let [v (ns-resolve source-ns operation)]
-      (assert-original! v operation :intrinsic-source-definition-mismatch)
-      (when-not (entry/observe-definition-input! v source-ns operation)
-        (throw (ex-info "intrinsic ownership requires its original definition collector"
-                        {:reason :unowned-intrinsic-source})))))
+  (doseq [operation (keys observations)]
+    (observe-original! source-ns operation))
   nil)

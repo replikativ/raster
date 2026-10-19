@@ -989,7 +989,8 @@
     (is (= :typed-soac-source-coverage (get-in result [:declined :reason])))
     (is (= [{:id 1 :binding 'mean :kind :scalar :operation 'let*
              :reason :uncertified-host-scalar}]
-           (get-in result [:declined :bindings]))
+           (mapv #(select-keys % [:id :binding :kind :operation :reason])
+                 (get-in result [:declined :bindings])))
         "a typed prefix must not hide nested parallel work behind a compatibility host barrier")))
 
 (deftest an-unsupported-consumer-cannot-erase-an-independent-gemm-producer
