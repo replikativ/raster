@@ -64,7 +64,8 @@
     (doseq [[sym snapshot] dependencies]
       (let [v (ns-resolve source-ns sym)]
         (when-not (and (not (contains? disagreements sym))
-                       (var? v) (same-dependency? snapshot (dependency-snapshot v)))
+                       (identical? v (:var snapshot))
+                       (method-entry/var-value-current? snapshot))
           (fail! :ad-normalized-execution-callee {:callee sym}))))))
 
 (defn- scalar-dtype! [value]

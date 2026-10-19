@@ -67,14 +67,25 @@
                         (identical? lookup-ns (find-ns (ns-name lookup-ns)))
                         (identical? var (ns-resolve lookup-ns lookup-symbol)))) lookups))))
 
+(defn var-value-current?
+  "Compare a historical observation directly to the effective live Var value.
+   Equivalent to same-var-snapshot? against a fresh observation, without building
+   that temporary map. Name/lookup identity remains the caller's responsibility.
+   Definition observations exclude only this emitter's static cache output."
+  [{:keys [var value metadata snapshot-kind] :as snapshot}]
+  (and (var? var)
+       (let [is-bound (bound? var)]
+         (and (= (:bound? snapshot) is-bound)
+              (identical? value (when is-bound (var-get var)))
+              (= metadata (if (= :emission-definition snapshot-kind)
+                            (dissoc (meta var) :raster.core/deftm-bytecode)
+                            (meta var)))))))
+
 (defn var-snapshot-current?
   "Match both the original lookup and its effective definition observation."
   [snapshot]
   (and (var-reference-current? snapshot)
-       (same-var-snapshot? snapshot
-                           (if (= :emission-definition (:snapshot-kind snapshot))
-                             (emission-definition-snapshot (:var snapshot))
-                             (var-snapshot (:var snapshot))))))
+       (var-value-current? snapshot)))
 
 (defn observe-definition-input!
   "Retain a definition actually consulted by a normalization proof.
