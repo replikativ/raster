@@ -14,6 +14,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -602,7 +603,7 @@
     (throw (ex-info "linked executable lacks execution state"
                     {:reason :link-execution-state-missing})))
   (swap! (:execution-state executable)
-         #(cond-> (update % :value-epoch inc) (:ordered %) (dissoc :resident-boundary)))
+         #(cond-> (update % :value-epoch inc) (:ordered %) (dissoc :resident-boundary :host-result)))
   (reset! (:output-ready? executable) false))
 
 (defn- poison-execution! [executable error]
@@ -662,6 +663,9 @@
    successful output set; deferred execution must publish its real boundary before access."
   [executable operation]
   (let [state (some-> (:execution-state executable) deref)
+        _ (when (= :host-result (get-in state [:ordered :result-mode]))
+            (throw (ex-info "host-result invocation does not export its private numerical dependencies"
+                            {:reason :explicit-host-result-required :operation operation})))
         boundary (if (:ordered state)
                    (:resident-boundary state)
                    {:plan (:plan executable) :node-views (:node-views executable)})]
@@ -1085,26 +1089,54 @@
                           :before before :after @(:completed-replays executable)})))
        {:result result :lease (output-lease! executable)}))))
 
-(defn run!
-  "Replay synchronously and return resident output views. No host copies. Live output leases
-   prevent replay until released. Failed replay poisons the executable; close and reinstantiate
-   rather than reusing potentially partially mutated state."
-  [executable]
-  (let [executable (ensure-live! executable :run!)]
+(defn- require-result-mode! [executable mode]
+  (when-not (= mode (or (get-in @(:execution-state executable) [:ordered :result-mode]) :resident))
+        (throw (ex-info "replay result mode differs from the executable's explicit observation contract"
+                        {:reason :explicit-host-result-required :mode mode})))
+  (when (= :host-result mode)
+    (let [compilation (get-in @(:execution-state executable) [:ordered :compilation])]
+      (source-owner/assert-terminal-result-owner!
+       (:terminal-source-owner compilation) (:semantic compilation)
+       (get-in compilation [:semantic :attributes :invocation-plan :attributes :terminal-host-result])))))
+
+(defn- replay-result! [executable mode]
+  (let [executable (ensure-live! executable mode)]
     (locking (:lifetime-lock executable)
-      (ensure-live! executable :run!)
-      (ensure-no-output-leases! executable :run!)
+      (ensure-live! executable mode)
+      (require-result-mode! executable mode)
+      (ensure-no-output-leases! executable mode)
       (when (seq @(:pending-inputs executable))
         (throw (ex-info "linked executable has owned inputs or state that have not been initialized"
                         {:reason :link-pending-inputs :plan (get-in executable [:plan :id])
                          :nodes @(:pending-inputs executable)})))
-      (execute-once! executable :run!
-                     #(if (:ordered @(:execution-state executable))
-                        (run-ordered-invocation! executable)
-                        (if-let [recorded (:graph-key executable)]
-                          (gpu/replay! (:session executable) recorded)
-                          (parallel-program/run-prepared! (:prepared-program executable)))))
-      (outputs executable))))
+      (execute-once! executable mode
+                     (fn []
+                       (if (:ordered @(:execution-state executable))
+                         (run-ordered-invocation! executable)
+                         (if-let [recorded (:graph-key executable)]
+                           (gpu/replay! (:session executable) recorded)
+                           (parallel-program/run-prepared! (:prepared-program executable))))
+                       ;; Publication is part of successful execution, not a check after
+                       ;; execute-once! has already credited readiness and replay count.
+                       (when (and (= :host-result mode)
+                                  (not (contains? @(:execution-state executable) :host-result)))
+                         (throw (ex-info "completed invocation has no observed host result"
+                                         {:reason :link-host-result-unavailable})))))
+      (if (= :host-result mode)
+        (:host-result @(:execution-state executable))
+        (outputs executable)))))
+
+(defn run!
+  "Replay synchronously and return resident output views, without host copies. Host-result
+   invocations refuse before mutation. Failed replay poisons the executable."
+  [executable]
+  (replay-result! executable :resident))
+
+(defn run-host-result!
+  "Explicitly replay a host-result invocation. Its producer scalars are downloaded only after
+   completed initialization, then the guarded terminal region runs once before publication."
+  [executable]
+  (replay-result! executable :host-result))
 
 (defn run-and-lease!
   "Replay and acquire an owned output lease as one serialized operation. Unlike separate run!
@@ -1133,16 +1165,25 @@
    tests before this path is exposed by Compiled; the ordinary eager instantiator is unchanged."
   [compilation arguments opts]
   (when (or (:session opts) (:profile? opts)
-            (seq (set/difference (set (keys opts)) #{:scalar-math :profile? :entry-roles})))
+            (seq (set/difference (set (keys opts)) #{:scalar-math :profile? :entry-roles :result-mode})))
     (throw (ex-info "ordered invocation activation currently requires an owned unprofiled session"
                     {:reason :link-ordered-options})))
-  (let [caller-options (caller-math-options opts)
+  (let [terminal (get-in compilation [:semantic :attributes :invocation-plan :attributes :terminal-host-result])
+        mode (get opts :result-mode :resident)
+        _ (when-not (if terminal (= :host-result mode) (= :resident mode))
+            (throw (ex-info "terminal observation requires explicit host-result instantiation"
+                            {:reason :explicit-host-result-required :mode mode})))
+        _ (when terminal
+            (source-owner/assert-terminal-result-owner! (:terminal-source-owner compilation)
+                                                        (:semantic compilation) terminal))
+        caller-options (caller-math-options opts)
         initial (invocation-link/validate-ordered-source-actions!
                  (invocation-link/begin-ordered-realization compilation arguments caller-options))
         entry-roles (invocation-link/ordered-entry-roles initial (:entry-roles opts))
         entry-layout (invocation-link/ordered-entry-layout initial entry-roles)
         execution-state (atom {:value-epoch 0
                                :ordered {:compilation compilation :arguments (vec arguments)
+                                         :result-mode mode
                                          :caller-options caller-options
                                          :entry-roles entry-roles
                                          :entry-refresh (:entry-refresh entry-layout)
@@ -1175,6 +1216,14 @@
         (capture-ordered-entries! executable entry-layout)
         executable)
      nil)))
+
+(defn instantiate-host-result!
+  "Instantiate an equation-first compilation with an explicit terminal host-result boundary.
+   Shares the ordinary ordered execution owner; no resident outputs or output leases escape.
+   Source ownership, emitted export ABIs and capability checks precede session creation."
+  ([compilation arguments] (instantiate-host-result! compilation arguments {}))
+  ([compilation arguments opts]
+   (instantiate-ordered-invocation! compilation arguments (assoc opts :result-mode :host-result))))
 
 (defn- ordered-require-initialized! [nodes initialized ids]
   (doseq [id ids]
@@ -1293,6 +1342,41 @@
                                         ledger timings roots)]
       (swap! execution-state assoc :resident-boundary {:plan plan :node-views (:node-views storage)}))))
 
+(defn- run-ordered-terminal! [executable state]
+  (let [execution-state (:execution-state executable)
+        {:keys [compilation result-mode initialized node-views]} (:ordered @execution-state)
+        contract (get-in compilation [:semantic :attributes :invocation-plan :attributes :terminal-host-result])
+        _ (when-not (= :host-result result-mode)
+            (throw (ex-info "resident execution cannot observe a terminal host region"
+                            {:reason :explicit-host-result-required})))
+        owner (source-owner/assert-terminal-result-owner! (:terminal-source-owner compilation)
+                                                         (:semantic compilation) contract)
+        {:keys [nodes exports]} (invocation-link/terminal-export-layout state)
+        nodes (into {} (map (juxt :id identity)) nodes)]
+    ;; Validate every dependency before downloading any of them. Neither a
+    ;; rank-zero AbstractValue nor an acquired buffer proves completed bytes.
+    (ordered-require-initialized! nodes initialized (mapv :node exports))
+    (doseq [{:keys [node dtype]} exports]
+      (when-not (and (get node-views node)
+                     (= (dtype/bytes-of dtype) (get-in nodes [node :view :byte-length])))
+        (throw (ex-info "terminal scalar export lost its exact realized resident view"
+                        {:reason :link-terminal-export-view :node node}))))
+    (let [arguments (mapv (fn [{:keys [node dtype]}]
+                            (let [destination (case dtype :double (double-array 1) :long (long-array 1))]
+                              (gpu/download-range! (:session executable) (get node-views node)
+                                                   destination {:elements 1})
+                              (java.lang.reflect.Array/get destination 0))) exports)
+          epoch (:value-epoch @execution-state)
+          result (source-owner/invoke-terminal-result owner (:semantic compilation) contract arguments)]
+      ;; Source helpers may call back into the owner through external references.
+      ;; The lifetime lock is reentrant; it cannot by itself preserve this state.
+      (ensure-live! executable :terminal-result)
+      (when-not (= epoch (:value-epoch @execution-state))
+        (throw (ex-info "terminal observation was invalidated by reentrant owner activity"
+                        {:reason :link-terminal-result-reentrancy})))
+      (-> state (assoc :terminal-observed? true :host-result result)
+          (update :source-cursor inc)))))
+
 (defn- run-ordered-invocation! [executable]
   (let [execution-state (:execution-state executable)
         {:keys [compilation arguments caller-options prepared entry-roles entry-refresh initialized]}
@@ -1313,6 +1397,8 @@
                            (some #(when (= id (:id %)) %) (get-in state [:program :equations])))
                 next-state
                 (cond
+                  (:terminal-result entry)
+                  (run-ordered-terminal! executable state)
                   (or (:storage entry)
                       (= :result-allocation (get-in state [:source-realizations (:source-cursor state) :kind])))
                   (run-ordered-allocation! executable state)
@@ -1328,7 +1414,10 @@
                    (partial scalar/evaluate-host-equation (:source-ns compilation)) caller-options)
                   :else (update state :source-cursor inc))]
             (recur next-state))
-          (finish-ordered-invocation! executable state))))))
+          (do
+            (finish-ordered-invocation! executable state)
+            (when (:terminal-observed? state)
+              (swap! execution-state assoc :host-result (:host-result state)))))))))
 
 (defn ^:no-doc run-ordered-with-inputs!
   "Internal host-array handoff under the existing execution guard. Complete preflight precedes
@@ -1341,6 +1430,7 @@
      (let [execution-state (:execution-state executable)
            {:keys [compilation arguments caller-options entry-roles] :as ordered}
            (:ordered @execution-state)]
+       (require-result-mode! executable :resident)
        (when-not ordered
          (throw (ex-info "ordered input handoff requires an ordered owned root"
                          {:reason :link-ordered-input-root})))

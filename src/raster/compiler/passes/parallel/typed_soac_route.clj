@@ -1734,7 +1734,7 @@
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
                                    resident-uniform-input-loads?
                                    scalar-types values abstract-machine segmented-plans?
-                                   preserve-declared-array-storage? host-scalars?]
+                                   preserve-declared-array-storage? host-scalars? terminal-host-results?]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form {:array-types array-types
@@ -1745,6 +1745,7 @@
                                  :host-scalars? host-scalars?
                                  :segmented-plans? segmented-plans?
                                  :preserve-declared-array-storage? preserve-declared-array-storage?}
+               form (if terminal-host-results? (frontend/terminal-host-source form frontend-options) form)
                live-projection (validated-live-source-projection form frontend-options)
                {live-form :form :keys [projection typed-input admitted? bindings-removed
                                        terminal-scalars-materialized]}

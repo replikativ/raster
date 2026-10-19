@@ -1353,7 +1353,27 @@
                                 [compiler-value (:view node)])))
                        bindings)]
     (kgcall/validate-binding-aliases! graph physical bview/overlaps?)
-    [(program-graph-fact nodes values id 0 :graph graph bindings scalar-values {})]))
+    (let [fact (program-graph-fact nodes values id 0 :graph graph bindings scalar-values {})
+          retained (get-in instance [:attributes :emitted-equation-source])]
+      (if (contains? (:attributes instance) :emitted-equation-source)
+        (let [_ (when-not (and (map? retained) (= #{:program :equation-id} (set (keys retained))))
+                  (throw (ex-info "graph equation projection requires its complete enclosing program"
+                                  {:reason :graph-link-equation-source :instance id})))
+              {:keys [call projection]}
+              (program-call/make-equation-call-with-contracts
+               (:program retained) (:equation-id retained) bindings scalar-values {} *caller-options*)]
+          (when-not (= [graph bindings scalar-values] [(:graph call) (:buffers call) (:scalar-values call)])
+            (throw (ex-info "graph stage differs from its exact emitted equation call"
+                            {:reason :graph-link-equation-projection :instance id
+                             :graph-match? (= graph (:graph call))
+                             :bindings-match? (= bindings (:buffers call))
+                             :scalars scalar-values :expected-scalars (:scalar-values call)})))
+          ;; Reuse the program binder's semantic coverage. Keeping a numerical
+          ;; equation as one graph stage must not erase its complete-write
+          ;; proof or promote ABI write permission into such a proof.
+          [(assoc fact :complete-writes
+                  (program-complete-writes nodes values id call (:scalar-values call) projection))])
+        [fact]))))
 
 (defn- instance-access-facts [{:keys [nodes values instances]}]
   (mapcat #(cond

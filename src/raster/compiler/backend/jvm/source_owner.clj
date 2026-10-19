@@ -10,6 +10,7 @@
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.types :as types]
             [raster.compiler.backend.jvm.terminal-source :as terminal-source]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.form :as form])
@@ -157,6 +158,19 @@
     (invocation/validate-terminal-source-result!
      contract program {:source-policy policy :source-namespace (ns-name source-ns)})
     (let [projection (terminal-source/project contract source-ns)
+          return-tag (get metadata :raster.core/return-tag 'Object)
+          result-facts (:result-facts projection)
+          ;; Source annotations are not evidence that final unboxing/checkcast
+          ;; is present. Permit Object, or prove the actual projected result is
+          ;; already the exact non-null box of the declared primitive result.
+          ;; Other method-return adaptations require a retained completion.
+          _ (when-not (or (contains? #{'Object 'java.lang.Object Object} return-tag)
+                          (and (get types/primitive-info return-tag)
+                               (= (get types/primitive-info return-tag) (:boxed-carrier result-facts))
+                               (:non-null? result-facts)))
+              (throw (ex-info "terminal result needs its original method return completion"
+                              {:reason :terminal-source-return-completion :return-tag return-tag
+                               :result-facts result-facts})))
           guard #(do
                    (when-not (identical? source-ns (find-ns (ns-name source-ns)))
                      (throw (ex-info "terminal source namespace was replaced"
@@ -172,17 +186,24 @@
       (entry/assert-definition-inputs-current! observations)
       (TerminalResultOwner. program contract execute observations source-ns))))
 
+(defn assert-terminal-result-owner!
+  "Preflight exact source ownership without observing any numerical value or executing source."
+  [owner program contract]
+  (when-not (and (instance? TerminalResultOwner owner)
+                 (identical? program (.-program ^TerminalResultOwner owner))
+                 (identical? contract (.-contract ^TerminalResultOwner owner)))
+    (throw (ex-info "terminal executable belongs to another source/program boundary"
+                    {:reason :terminal-source-owner-mismatch})))
+  (terminal-owner-current! owner)
+  owner)
+
 (defn invoke-terminal-result
   "Evaluate one owned terminal region using completed, ordered scalar exports.
    The runtime caller owes export/completion evidence BEFORE this boundary.
    Exact carrier/arity and owner guards are checked before source effects;
    successful source results are checked again before publication."
   [owner program contract arguments]
-  (when-not (and (instance? TerminalResultOwner owner)
-                 (identical? program (.-program ^TerminalResultOwner owner))
-                 (identical? contract (.-contract ^TerminalResultOwner owner)))
-    (throw (ex-info "terminal executable belongs to another source/program boundary"
-                    {:reason :terminal-source-owner-mismatch})))
+  (assert-terminal-result-owner! owner program contract)
   (let [^TerminalResultOwner owner owner
         parameters (:parameters contract)]
     (when-not (and (vector? arguments) (= (count parameters) (count arguments))

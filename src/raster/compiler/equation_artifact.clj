@@ -133,6 +133,10 @@
   (when-not (equation-first/equation-first-compilation? compilation)
     (fail! "artifact payload must be an EquationFirstCompilation"
            :equation-artifact-payload-type {:actual (type compilation)}))
+  (when (or (:terminal-source-owner compilation)
+            (get-in compilation [:semantic :attributes :invocation-plan :attributes :terminal-host-result]))
+    (fail! "terminal host regions require reconstruction of their process-local source owner"
+           :equation-artifact-terminal-owner {}))
   (when-not (and (symbol? (:function compilation))
                  (keyword? (:target compilation))
                  (keyword? (:dtype compilation))

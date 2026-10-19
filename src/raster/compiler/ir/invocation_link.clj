@@ -551,6 +551,27 @@
     (assoc layout :nodes (mapv #(assoc % :role (get refresh (:id %))) (:nodes layout))
                   :entry-refresh refresh)))
 
+(defn- terminal-export-contracts
+  [semantic-program program projections]
+  (when-let [contract (get-in semantic-program [:attributes :invocation-plan :attributes :terminal-host-result])]
+    (mapv
+     (fn [{:keys [value dtype producer-equation result-position] :as parameter}]
+       (let [equation (some #(when (= producer-equation (:id %)) %) (:equations program))
+             operation (first (:operations equation))
+             projection (when operation (emitted-program/operation-projection projections operation))
+             physical (get-in projection [:physical-results value])
+             graph (get-in projection [:boundary :graph])
+             output (some #(when (= physical (:id %)) %) (:outputs graph))]
+         (when-not (and equation (not (true? (get-in equation [:attributes :host-only])))
+                        (= 1 (count (:operations equation)))
+                        (= value (nth (:results equation) result-position nil))
+                        (= dtype (:dtype output)) (= 1 (:elements output)))
+           (fail! :invocation-terminal-export
+                  "terminal parameter lacks an exact one-element emitted output ABI"
+                  {:parameter parameter :physical physical :output output}))
+         (assoc parameter :physical-value physical)))
+     (:parameters contract))))
+
 (defn ^:no-doc begin-ordered-realization
   "Begin owner-local realization without evaluating invocation steps or acquiring resources.
    The returned map is runtime construction state, not a portable completion certificate."
@@ -573,6 +594,7 @@
       (fail! :invocation-ordered-program
              "ordered realization requires the exact retained semantic and emitted boundary" {}))
     {:program program :source-order order :source-cursor 0
+     :terminal-exports (terminal-export-contracts semantic-program program (:projections checked))
      :source-realizations (into {} (keep (fn [entry]
                                           (when-let [action (invocation-source/realization-action semantic-program entry)]
                                             [(:position entry) action]))) order)
@@ -613,6 +635,11 @@
             :let [step (get steps (:invocation-step entry))
                   equation (get equations (:equation entry))
                   action (get (:source-realizations state) (:position entry))]]
+      (when (and (:terminal-result entry)
+                 (not (and (= [:return] (:terminal-result entry))
+                           (= (:position entry) (dec (count (:source-order state))))
+                           (seq (:terminal-exports state)))))
+        (fail! :invocation-ordered-source-action "invalid terminal observation entry" {:entry entry}))
       (when (or (and (:realization entry)
                      (not (contains? #{:result-allocation :storage-alias} (:kind action))))
                 (and step (not (or (invocation/scalar-compute? step)
@@ -626,6 +653,33 @@
       (when (= :result-allocation (:kind action))
         (validate-source-result-allocation! state entry action))))
   state)
+
+(defn ^:no-doc terminal-export-layout
+  "Resolve terminal exports from already realized producer storage. This acquires no storage
+   and supplies no completion evidence; the execution owner must prove initialized views."
+  [state]
+  (let [entry (nth (:source-order state) (:source-cursor state) nil)]
+    (when-not (and (:terminal-result entry) (nil? (:pending state))
+                   (= (:source-cursor state) (dec (count (:source-order state)))))
+      (fail! :invocation-terminal-order "terminal observation is not the next completed source boundary" {}))
+    (let [exports
+          (mapv
+           (fn [{:keys [value physical-value dtype] :as export}]
+             (let [token (get-in state [:realized :buffers value])
+                   physical-token (get-in state [:realized :buffers physical-value])
+                   storage (get-in state [:realized :storage token])]
+               (when-not (and token (= token physical-token)
+                              (contains? (:acquired-storage state) token)
+                              (= dtype (get-in storage [:abstract :dtype]))
+                              (= 1 (reduce *' 1 (:shape storage)))
+                              (nil? (:source storage)) (nil? (:backing storage)))
+                 (fail! :invocation-terminal-storage
+                        "terminal export differs from acquired producer storage" {:export export}))
+               (assoc export :node token)))
+           (:terminal-exports state))
+          layout (storage-link-layout (:realized state) {} (:target state) #{}
+                                      (vec (distinct (map :node exports))))]
+      (assoc layout :exports exports))))
 
 (defn ^:no-doc ordered-input-arguments
   "Preflight primitive host-array replacements without evaluating source steps or mutating an
@@ -912,7 +966,8 @@
           instance-id [:ordered-equation equation-id]
           instance (link/graph-instance
                     {:id instance-id :graph (:graph call) :bindings (:buffers call)
-                     :scalar-values (:scalar-values call)})
+                     :scalar-values (:scalar-values call)
+                     :attributes {:emitted-equation-source {:program program :equation-id equation-id}}})
           request {:id [(get-in materialization [:plan :id]) :stage equation-id]
                    :target (:target state) :nodes nodes :values (:values layout)
                    :instances [instance] :outputs outputs
@@ -942,6 +997,10 @@
   [materialized parallel-program target evaluate-host project retained-validation caller-options
    & [source-state]]
   (let [materialized (materialization/validate! materialized)
+        _ (when (and (get-in materialized [:plan :attributes :terminal-host-result])
+                     (not (:terminal-observed? source-state)))
+            (fail! :explicit-host-result-required
+                   "terminal observation cannot be lowered as an eager resident invocation" {}))
         ;; Without a retained owner, independently prove this exact program once for this
         ;; synchronous lowering. The same sealed report feeds the storage/call/final phases;
         ;; it is never published as authority on the returned plan or bound around callbacks.
@@ -1351,7 +1410,8 @@
   (when-not (= caller-options (:caller-options state))
     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
   (when-not (and (nil? (:pending state))
-                 (= (:source-cursor state) (count (:source-order state))))
+                 (= (:source-cursor state) (count (:source-order state)))
+                 (or (empty? (:terminal-exports state)) (:terminal-observed? state)))
     (fail! :invocation-ordered-incomplete "source work has not completed" {}))
   (let [materialized (materialization/finish-materialization (:materialization state))
         initialized-tokens (into #{}

@@ -1009,6 +1009,24 @@
     (with-source-return parallel expression)
     (merge {:source-ns *ns* :public-parameters '[x n]} options))))
 
+(deftest terminal-extraction-refuses-ambiguous-source-site-claims
+  (let [parallel (scalar-reduction-program :double)
+        equation (first (:equations parallel))
+        duplicate (assoc equation :id :duplicate-site :results ['duplicate-result])
+        ambiguous (update parallel :equations conj duplicate)]
+    (is (= :structured-control-terminal-source-site
+           (reason-of #(#'route/terminal-source-program ambiguous))))))
+
+(deftest terminal-extraction-retains-shape-dependencies-outside-equation-operands
+  (let [parallel (scalar-reduction-program :double)
+        source (:source parallel)
+        shaped (-> parallel
+                   (assoc :source (list (first source)
+                                        (conj (second source) 'extent '(long n))
+                                        '(float extent)))
+                   (assoc-in [:values 'x :shape] ['extent]))]
+    (is (= shaped (#'route/terminal-source-program shaped)))))
+
 (deftest scalar-return-projection-requires-proved-identity-casts
   (testing "canonical Double, Float, and Long identities preserve the exact logical output"
     (doseq [dtype [:double :float :long]]

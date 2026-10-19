@@ -5936,6 +5936,35 @@
     {:descriptions (preserve-map-storage-inputs descriptions values)
      :values values :allocations allocations}))
 
+(defn terminal-host-source
+  "Retain a declined contiguous scalar suffix as one explicit terminal source region.
+   Uses the same source descriptions/admission rules as the numerical frontend. It neither
+   accepts an unsupported parallel leaf nor authorizes execution of the retained host region."
+  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
+                  preserve-declared-array-storage?]
+           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types values)
+            *region-local-counter* (atom -1)
+            *region-local-source-symbols* (source-symbols source)]
+  (if-not (and (seq? source) (contains? #{'let 'let*} (first source)) (= 3 (count source)))
+    source
+    (let [[head bindings body] source
+          pairs (mapv vec (partition 2 bindings))
+          array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
+          descriptions (:descriptions (source-storage-analysis pairs dtype array-types scalar-types
+                                                               segmented-plans? values shape-equalities))
+          suffix (vec (reverse (take-while #(= :scalar (:kind %)) (reverse descriptions))))
+          split (- (count pairs) (count suffix))
+          physical (physical-output-symbols descriptions)]
+      (if (and (seq suffix) (pos? split)
+               (= (mapv :sym suffix) (mapv first (subvec pairs split)))
+               (some semantic-description? (take split descriptions))
+               (some #(not (admitted-description? physical %)) suffix)
+               (not-any? #(contains-parallel-form? (:expr %)) suffix))
+        (with-meta (list head (vec (mapcat identity (subvec pairs 0 split)))
+                         (list 'let* (vec (mapcat identity (subvec pairs split))) body)) (meta source))
+        source)))))
+
 (defn canonicalize-fresh-full-write-maps
   "Project a closed single-write effect region to the existing functional map contract.
 

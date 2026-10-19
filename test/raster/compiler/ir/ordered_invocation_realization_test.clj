@@ -8,6 +8,7 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.core :refer [deftm]]
@@ -28,6 +29,29 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftm scalar-total [x :- (Array double)] :- Double
+  (let [total (par/reduce sum 0.0 i (alength x) (+ sum (aget x i)))] total))
+
+(deftest equation-graph-stage-retains-revalidated-reduction-write-coverage
+  (let [compilation (equation-first/compile #'scalar-total {:target :cuda:0 :dtype :double})
+        initial (invocation-link/begin-ordered-realization compilation [(double-array [1.0 2.0])] nil)
+        state (loop [state initial]
+                (let [entry (nth (:source-order state) (:source-cursor state))
+                      equation (some #(when (= (:equation entry) (:id %)) %) (get-in state [:program :equations]))]
+                  (if (and equation (not (true? (get-in equation [:attributes :host-only]))))
+                    state
+                    (recur (invocation-link/advance-host-source
+                            state (partial scalar/evaluate-invocation-step (:source-ns compilation))
+                            (partial scalar/evaluate-host-equation (:source-ns compilation)) nil)))))
+        entry (nth (:source-order state) (:source-cursor state))
+        ready (invocation-link/realize-ready-equation state (:equation entry) nil)
+        plan (:stage-plan ready)
+        output (first (:outputs plan))
+        changed (assoc-in plan [:instances 0 :attributes :emitted-equation-source :equation-id] :missing)]
+    (is (contains? (get-in ready [:entry-contract :full-produces]) output))
+    (is (not (contains? (get-in ready [:entry-contract :requires]) output)))
+    (is (= :emitted-program-ready-equation (reason #(link-plan/validate! changed))))))
 
 (deftest early-equation-binds-without-evaluating-the-late-checked-shape
   (let [compilation (equation-first/compile #'fixture/write-before-shape

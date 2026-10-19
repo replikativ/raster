@@ -13,6 +13,7 @@
             [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
@@ -136,6 +137,7 @@
     (merge {:resident-reductions? true}
            options
            {:dtype effective-dtype
+            :terminal-host-results? true
             :segmented-plans? true
             :target-device target
             :active-params parameters
@@ -431,14 +433,16 @@
 
 (defn- compile-semantic
   "Schedule and emit one exact typed semantic program without source or ABI reconstruction."
-  [{:keys [id function-id target dtype source-ns options compiler-options]
+  [{:keys [id function-id target dtype source-ns source-var options compiler-options]
     :as context}
    semantic]
   (when-not (= :typed-parallel (:dialect semantic))
     (fail! :equation-first-coverage
            "program is outside the direct TypedSOAC/structured-control vertical"
            {:function function-id :dialect (:dialect semantic) :fallback :none}))
-  (let [{:keys [target-descriptor resolved-schedule
+  (let [terminal (get-in semantic [:attributes :invocation-plan :attributes :terminal-host-result])
+        terminal-owner (when terminal (source-owner/compile-terminal-result semantic terminal source-var))
+        {:keys [target-descriptor resolved-schedule
                 dispatch-reassociated? dispatch-contractions?]} context
         scheduled (structured-route/schedule-program semantic compiler-options)
         backend (device/select-runtime-backend target true nil)
@@ -476,7 +480,7 @@
       (fail! :equation-first-invocation
              "equation-first semantic program has no retained public invocation plan"
              {:function function-id}))
-    (->EquationFirstCompilation
+    (cond-> (->EquationFirstCompilation
      id function-id target dtype source-ns
      (cond-> (-> compiler-options
                  (assoc :schedule resolved-schedule)
@@ -490,7 +494,8 @@
       :schedule {:dialect (:dialect scheduled)
                  :equations (count (:equations scheduled))}
       :emission (:stats emission)
-      :fallback :none})))
+      :fallback :none})
+      terminal-owner (assoc :terminal-source-owner terminal-owner))))
 
 (def ^:private typed-compilation-options
   #{:target :schedule :scalar-math :resident-outputs})
@@ -700,6 +705,8 @@
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
          function-id (function-symbol resolved-var)
+         _ (method-entry/observe-definition-input! resolved-var (:ns (meta resolved-var))
+                                                   (:name (meta resolved-var)))
          policy (compilation-policy function-id target options captured-target)
          {:keys [target-descriptor reference-schedule]} policy
          compiler-options (compiler-options resolved-var target dtype
@@ -753,7 +760,7 @@
       (merge policy
              {:id id :function-id (function-symbol f-var) :target target
               :dtype (:dtype compiler-options) :source-ns source-ns-symbol
-              :options options :compiler-options compiler-options})
+              :source-var resolved-var :options options :compiler-options compiler-options})
       semantic))))))
 
 (defn- lower-in-context
@@ -771,6 +778,9 @@
   (let [started (System/nanoTime)
         source-ns (:source-ns compilation)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
+        _ (when (get-in invocation-plan [:attributes :terminal-host-result])
+            (fail! :explicit-host-result-required
+                   "terminal host observation requires the ordered host-result executor" {}))
         unsupported-host-evaluation
         (fn [& _]
           (fail! :equation-first-source-free-host-evaluation

@@ -5477,6 +5477,36 @@ and uncast Double promotion are distinct oracles, not interchangeable tolerances
 The wider conditional-index proof, artifact quotienting, resident-scalar composition
 and unchanged real-model acceptance obligations remain open.
 
+### Explicit terminal host observation over the ordered invocation owner
+
+A checked scalar return is an observable source computation, not permission to
+expose its numerical dependency as the function result. Equation-first compilation
+now retains the complete ordered terminal scalar suffix in InvocationPlan and
+compiles it under the producer's historical source ownership. Double/Long ports
+come from revalidated equation/result correspondence, not output-name or dtype
+search. A later numerical consumer cannot be hidden in the host suffix.
+
+`raster.gpu.link/instantiate-host-result!` and `run-host-result!` explicitly opt into
+the host observation. They reuse the ordered executable's storage, lifetime lock,
+initialization proof and failure boundary; numerical stages remain resident until
+the declared scalar observation. Resident output/lease APIs refuse to expose these
+private dependencies. Source ownership is checked before replay mutation. Terminal
+exceptions or missing publication poison execution before replay credit/readiness.
+This is a deliberate API distinction, not an implicit download in resident replay.
+
+Projection into a GraphLinkInstance retains exact emitted-equation provenance as
+revalidation input; ordinary graph/ABI/alias checks precede reuse of existing
+complete-write analysis. It does not accept caller-authored coverage claims.
+Terminal-owner persistence remains refused pending a reconstruction contract.
+Equivalent lazy source-JIT definition transitions can still conservatively stale
+an owner; general lifecycle/cache convergence is not established by this slice.
+
+Bounded local qualification includes real OpenCL and Level Zero checked scalar
+returns, changed-input replay, overflow, explicit mode refusal and injected missing
+publication. No full campaign, device-performance or broad source-completeness
+claim follows from these tests. Checked conversions inside numerical map stages
+remain a separate open completion-before-publication obligation.
+
 ### Observable scalar checkpoints alongside resident state
 
 A returned loss can precede VJP and optimizer effects, while the typed envelope

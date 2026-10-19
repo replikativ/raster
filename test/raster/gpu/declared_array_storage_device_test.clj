@@ -1,6 +1,8 @@
 (ns raster.gpu.declared-array-storage-device-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.fixtures.mixed-storage :as storage]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.compatibility-map-packet-test :as map-packet]
             [raster.compiler.backend.gpu.segmap-retirement-fixture :as retirement]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
@@ -8,6 +10,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.link :as link]
             [raster.gpu.runtime-backend :as backend]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.value :as value]))
@@ -204,18 +207,14 @@
   (doseq [n [0 3 2049]]
     (let [x (double-array (take n (cycle [16777216.0 1.0 1.0])))
           expected (storage/double-reduction-float-result x)
-          artifact (compiled/compile
-                    #'storage/double-reduction-float-result [x]
-                    (merge storage/policy
-                           {:compiler :equation-first :target target :dtype :double}))]
-      (try
+          compilation (equation-first/compile
+                       #'storage/double-reduction-float-result
+                       (merge storage/policy {:target target :dtype :double}))]
+      (with-open [artifact (link/instantiate-host-result! compilation [x])]
         (dotimes [_ 2]
-          (let [outputs (artifact {})
-                result (value/->host (:result outputs))]
-            (is (= #{:result} (set (keys outputs))))
-            (is (= (class (float-array 0)) (class result)))
-            (is (= [expected] (vec result)))))
-        (finally (compiled/close! artifact))))))
+          (let [result (link/run-host-result! artifact)]
+            (is (= Float (class result)))
+            (is (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits result)))))))))
 
 (deftest completed-reduction-conversion-matches-jvm-on-both-backends
   (if @gp/gpu-available?
@@ -230,19 +229,14 @@
     (let [x (double-array (take n (cycle [1.5 -2.0 0.25])))
           coefficient (float 2.0)
           expected (storage/mixed-scale-energy-gradient coefficient x)
-          artifact (compiled/compile
-                    #'storage/mixed-scale-energy-gradient [coefficient x]
-                    (merge storage/policy
-                           {:compiler :equation-first :target target :dtype :double}))]
-      (try
+          compilation (equation-first/compile
+                       #'storage/mixed-scale-energy-gradient
+                       (merge storage/policy {:target target :dtype :double}))]
+      (with-open [artifact (link/instantiate-host-result! compilation [coefficient x])]
         (dotimes [_ 2]
-          ;; Select by the public result's tangent representation, never generated ABI
-          ;; names. Other returned arrays are Double intermediates, not scalar gradients.
-          (let [results (map value/->host (vals (artifact {})))
-                gradients (filter #(instance? (class (float-array 0)) %) results)]
-            (is (= 1 (count gradients)))
-            (is (= [expected] (vec (first gradients))))))
-        (finally (compiled/close! artifact))))))
+          (let [result (link/run-host-result! artifact)]
+            (is (= Float (class result)))
+            (is (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits result)))))))))
 
 (deftest projected-scalar-gradient-matches-jvm-on-both-backends
   (if @gp/gpu-available?
@@ -251,6 +245,56 @@
   (if @opencl/opencl-available?
     (run-scalar-gradient-case :ocl:0)
     (opencl/opencl-skip! "projected scalar gradient on OpenCL")))
+
+(defn- host-result-failure-and-replay-controls [target]
+  ;; Evaluate the JVM oracle before compilation captures historical definitions.
+  (let [x (double-array [1.25])
+        expected (storage/double-reduction-float-result x)
+        compilation (equation-first/compile #'storage/double-reduction-float-result
+                                            (merge storage/policy {:target target :dtype :double}))
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (with-open [artifact (link/instantiate-host-result! compilation [x])]
+      (let [epoch (:value-epoch @(:execution-state artifact)) callback (atom 0)]
+        (is (= :explicit-host-result-required (reason #(link/run! artifact))))
+        (is (= :explicit-host-result-required
+               (reason #(link/run-ordered-with-inputs! artifact {} (fn [] (swap! callback inc))))))
+        (is (= 0 @callback))
+        (is (= epoch (:value-epoch @(:execution-state artifact)))))
+      (is (= expected (link/run-host-result! artifact)))
+      (is (= :explicit-host-result-required (reason #(link/outputs artifact))))
+      (aset-double x 0 2.5)
+      (is (= (float 2.5) (link/run-host-result! artifact)) "dynamic inputs refresh on replay")
+      (aset-double x 0 Double/MAX_VALUE)
+      (is (thrown? IllegalArgumentException (link/run-host-result! artifact)))
+      (is (= 2 @(:completed-replays artifact)) "overflow does not publish a successful replay")
+      (is (false? @(:output-ready? artifact)))
+      (is (= :link-execution-poisoned (reason #(link/output-lease! artifact)))))
+    (with-open [artifact (link/instantiate-host-result! compilation [x])]
+      ;; Simulate an internal execution path returning without its required
+      ;; terminal publication. This must fail inside the replay failure boundary.
+      (with-redefs-fn {#'link/run-ordered-invocation! (fn [_] nil)}
+        #(is (= :link-host-result-unavailable (reason (fn [] (link/run-host-result! artifact))))))
+      (is (zero? @(:completed-replays artifact)))
+      (is (false? @(:output-ready? artifact)))
+      (is (= :link-execution-poisoned (reason #(link/output-lease! artifact)))))
+    (aset-double x 0 1.25)
+    (with-open [artifact (link/instantiate-host-result! compilation [x])]
+      ;; A source helper is allowed to have effects, including reentrant owner
+      ;; activity. It cannot authorize publication from the old stage state.
+      (with-redefs [source-owner/invoke-terminal-result
+                    (fn [& _] (#'link/begin-mutation! artifact) (float 1.25))]
+        (is (= :link-terminal-result-reentrancy (reason #(link/run-host-result! artifact)))))
+      (is (zero? @(:completed-replays artifact)))
+      (is (false? @(:output-ready? artifact)))
+      (is (= :link-execution-poisoned (reason #(link/output-lease! artifact)))))))
+
+(deftest host-result-observation-is-explicit-and-failure-prevents-publication
+  (if @gp/gpu-available?
+    (host-result-failure-and-replay-controls :ze:0)
+    (gp/gpu-skip! "host-result failure and replay on Level Zero"))
+  (if @opencl/opencl-available?
+    (host-result-failure-and-replay-controls :ocl:0)
+    (opencl/opencl-skip! "host-result failure and replay on OpenCL")))
 
 (deftest level-zero-mixed-storage-public-compilers-match-jvm
   (if @gp/gpu-available?

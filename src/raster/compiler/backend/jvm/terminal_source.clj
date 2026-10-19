@@ -6,6 +6,7 @@
             [raster.compiler.core.ordered-call :as ordered]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util])
   (:import [java.lang.reflect Method]))
 
@@ -22,7 +23,7 @@
         (map (fn [operation]
                [operation (entry/emission-definition-snapshot (resolve operation))]))
         (conj (into #{} (filter #(and (= "clojure.core" (namespace %))
-                                      (= 'float (descriptor/cast-result-tag %))))
+                                      (contains? #{'float 'double} (descriptor/cast-result-tag %))))
                     (keys descriptor/cast-ops))
               'clojure.core/nil?)))
 
@@ -34,19 +35,25 @@
                       {:reason :terminal-intrinsic-definition-mismatch :operation operation})))))
 
 (defn- source-hints!
-  [expression object-local? source-ns]
+  [expression local-carrier source-ns]
   (let [metadata (meta expression)
         tag (:tag metadata)
         ;; Compiler.IfExpr/LetExpr/BodyExpr derive their carrier from their
         ;; children, not form metadata. Keep that metadata on the projection;
         ;; never use it to manufacture a primitive carrier for the region.
         control? (and (seq? expression) (contains? #{'if 'let* 'do} (first expression)))
-        object-tag? (and object-local?
+        ;; Completion is reserved IR, not a source Var call. Its existing
+        ;; projection owns the physical context and deliberately drops :tag;
+        ;; a later logical annotation cannot override that contract.
+        completion? (some? (completion/canonical-parts expression))
+        object-tag? (and (= Object local-carrier)
                          (or (identical? Object tag)
                              (and (symbol? tag)
-                                  (identical? Object (ns-resolve source-ns tag)))))]
+                                  (identical? Object (ns-resolve source-ns tag)))))
+        primitive-tag? (and local-carrier (.isPrimitive ^Class local-carrier)
+                            (= local-carrier (get types/tag->java-class tag)))]
     (when (or (contains? metadata :param-tags)
-              (and (contains? metadata :tag) (not (or control? object-tag?))))
+              (and (contains? metadata :tag) (not (or control? completion? object-tag? primitive-tag?))))
       (fail! "terminal JVM source hint needs its own carrier correspondence"
              {:expression expression :source-metadata metadata}))))
 
@@ -81,15 +88,16 @@
                   (when-not (contains? @references class)
                     (vswap! captures conj {:port port :value class})
                     (vswap! references assoc class port)))
-                {:source (list 'let* (:bindings normalized) (:invocation normalized))
-                 :carrier (.getReturnType method)}))
+                (let [carrier (.getReturnType method)]
+                  (cond-> {:source (list 'let* (:bindings normalized) (:invocation normalized))
+                           :carrier carrier}
+                    (.isPrimitive carrier)
+                    (assoc :boxed-carrier (get types/primitive-info
+                                               (symbol (.getName carrier))) :non-null? true)))))
             (static-call [class method carriers args]
               (resolved (.getMethod ^Class class method (into-array Class carriers)) nil args))
-            (go [expression env]
-              (source-hints! expression
-                             (and (symbol? expression) (= Object (:carrier (get env expression))))
-                             source-ns)
-              (when (seq? expression) (source-hints! (first expression) false source-ns))
+            (go* [expression env]
+              (when (seq? expression) (source-hints! (first expression) nil source-ns))
               (cond
                 (symbol? expression)
                 (or (when-let [value (get env expression)]
@@ -99,15 +107,16 @@
                       {:source (capture! @v) :carrier Object}))
                 (or (nil? expression) (string? expression) (keyword? expression))
                 {:source expression :carrier Object}
-                (instance? Double expression) {:source expression :carrier Double/TYPE}
-                (instance? Long expression) {:source expression :carrier Long/TYPE}
-                (boolean? expression) {:source expression :carrier Boolean/TYPE}
+                (instance? Double expression) {:source expression :carrier Double/TYPE :boxed-carrier Double :non-null? true}
+                (instance? Long expression) {:source expression :carrier Long/TYPE :boxed-carrier Long :non-null? true}
+                (boolean? expression) {:source expression :carrier Boolean/TYPE :boxed-carrier Boolean :non-null? true}
                 (vector? expression) {:source (mapv #(-> (go % env) :source) expression) :carrier Object}
                 (completion/canonical-parts expression)
                 (let [{:keys [contract operand]} (completion/canonical-parts expression)]
                   (when-not (= completion/object-input-contract contract)
                     (fail! "terminal completion needs a separate owned projection" {}))
-                  {:source (completion/complete-value contract (:source (go operand env))) :carrier Object})
+                  (let [value (go operand env)]
+                    (assoc value :source (completion/complete-value contract (:source value)) :carrier Object)))
                 (seq? expression)
                 (let [[head & args] expression]
                   (cond
@@ -119,9 +128,12 @@
                                  (.isPrimitive ^Class (:carrier then))
                                  (.isPrimitive ^Class (:carrier else)))
                         (fail! "mixed primitive join needs its actual source carrier" {}))
-                      {:source (with-meta (list 'if (:source test) (:source then) (:source else))
+                      (cond-> {:source (with-meta (list 'if (:source test) (:source then) (:source else))
                                          (meta expression))
-                       :carrier (if (= (:carrier then) (:carrier else)) (:carrier then) Object)})
+                               :carrier (if (= (:carrier then) (:carrier else)) (:carrier then) Object)}
+                        (and (:boxed-carrier then) (= (:boxed-carrier then) (:boxed-carrier else))
+                             (:non-null? then) (:non-null? else))
+                        (assoc :boxed-carrier (:boxed-carrier then) :non-null? true)))
                     (= 'let* head)
                     (let [[bindings & body] args]
                       (when-not (and (vector? bindings) (even? (count bindings)) (= 1 (count body)))
@@ -130,17 +142,22 @@
                             (reduce (fn [{:keys [bindings env]} [id init]]
                                       (when-not (symbol? id) (fail! "terminal binder is not a symbol" {}))
                                       (let [value (go init env)]
-                                        (source-hints! id (= Object (:carrier value)) source-ns)
-                                        {:bindings (conj bindings id (:source value))
-                                         :env (assoc env id {:source id :carrier (:carrier value)})}))
+                                        (source-hints! id (:carrier value) source-ns)
+                                        ;; Raster permits an exact primitive declaration on
+                                        ;; a primitive initializer; Clojure let* rejects the
+                                        ;; redundant JVM hint. Its equality was proved above.
+                                        (let [id (if (.isPrimitive ^Class (:carrier value))
+                                                   (vary-meta id dissoc :tag) id)]
+                                          {:bindings (conj bindings id (:source value))
+                                           :env (assoc env id (assoc value :source id))})))
                                     {:bindings [] :env env} (partition 2 bindings))
                             result (go (first body) env)]
                         (assoc result :source (with-meta (list 'let* bindings (:source result))
                                                         (meta expression)))))
                     (= 'do head)
                     (let [body (mapv #(go % env) args)]
-                      {:source (with-meta (list* 'do (map :source body)) (meta expression))
-                       :carrier (or (:carrier (last body)) Object)})
+                      (assoc (or (last body) {:carrier Object})
+                             :source (with-meta (list* 'do (map :source body)) (meta expression))))
                     :else
                     (let [v (when (and (symbol? head) (not (contains? env head))) (resolve-var head))
                           metadata (meta v)
@@ -149,14 +166,18 @@
                       (cond
                         (:macro metadata)
                         (fail! "terminal macro has no owned projection" {:head head})
-                        (and (= 'float (descriptor/cast-result-tag operation)) (= 1 (count arguments)))
+                        (and (contains? #{'float 'double} (descriptor/cast-result-tag operation))
+                             (= 1 (count arguments)))
                         (let [{:keys [source carrier]} (first arguments)
                               _ (intrinsic-current! v operation)
                               input (if (contains? #{Double/TYPE Float/TYPE Long/TYPE Integer/TYPE} carrier)
                                       carrier Object)
                               ieee? (or (= :ieee (descriptor/cast-floating-narrowing operation))
                                         (not (false? (:unchecked-math policy))))]
-                          (static-call clojure.lang.RT (if ieee? "uncheckedFloatCast" "floatCast") [input] [source]))
+                          (static-call clojure.lang.RT
+                                       (if (= 'double (descriptor/cast-result-tag operation))
+                                         "doubleCast" (if ieee? "uncheckedFloatCast" "floatCast"))
+                                       [input] [source]))
                         (and (= 'clojure.core/nil? operation) (= 1 (count arguments)))
                         (do (intrinsic-current! v operation)
                             (static-call java.util.Objects "isNull" [Object] [(:source (first arguments))]))
@@ -173,7 +194,13 @@
                             (fail! "terminal helper needs its actual Object invocation ABI" {:head head}))
                           (resolved (.getMethod clojure.lang.IFn "invoke" (into-array Class (repeat arity Object)))
                                     (capture! @v) (mapv :source arguments)))))))
-                :else (fail! "terminal literal has no owned source projection" {:class (class expression)})))]
+                :else (fail! "terminal literal has no owned source projection" {:class (class expression)})))
+            (go [expression env]
+              (let [result (go* expression env)]
+                ;; Validate hints against the actual projected Method/local
+                ;; carrier, never use the hint to select that carrier.
+                (source-hints! expression (:carrier result) source-ns)
+                result))]
       (let [input (fresh "terminal_inputs__")
             projected
             (mapv (fn [index {:keys [symbol dtype]}]
@@ -181,9 +208,10 @@
                           value (static-call clojure.lang.RT (case dtype :double "doubleCast" :long "longCast")
                                              [Object] [(:source read)])]
                       [symbol value])) (range) (:parameters contract))
-            env (into {} (map (fn [[id value]] [id {:source (with-meta id nil) :carrier (:carrier value)}])) projected)
+            env (into {} (map (fn [[id value]] [id (assoc value :source (with-meta id nil))])) projected)
             result (go (:body contract) env)]
         {:params [input]
          :source (list 'let* (vec (mapcat (fn [[id value]] [(with-meta id nil) (:source value)]) projected))
                        (:source result))
+         :result-facts (select-keys result [:carrier :boxed-carrier :non-null?])
          :captures @captures :methods @methods :reference-bindings @references}))))

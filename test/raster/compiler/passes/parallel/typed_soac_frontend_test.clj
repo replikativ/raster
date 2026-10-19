@@ -21,6 +21,28 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
+(deftest terminal-host-region-retains-the-complete-ordered-scalar-suffix
+  (let [source '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                      converted (clojure.core/float total)
+                      unused-check (clojure.core/long total)] converted)
+        normalized (frontend/terminal-host-source source {:dtype :double :array-types {'x :double}
+                                                           :scalar-types {'n :long}})]
+    (is (= (subvec (second source) 0 2) (second normalized)))
+    (is (= (list 'let* (subvec (second source) 2) 'converted) (last normalized)))
+    (is (= normalized (frontend/terminal-host-source source {:dtype :double :array-types {'x :double}
+                                                         :scalar-types {'n :long 'float :double}}))
+        "an unqualified local does not capture the retained qualified cast")))
+
+(deftest terminal-host-region-never-hides-a-later-parallel-consumer-or-extra-body
+  (let [options {:dtype :double :array-types {'x :double 'out :double} :scalar-types {'n :long}}
+        consumer '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                         converted (clojure.core/float total)
+                         later (raster.par/map! out j n double (* converted (aget x j)))] later)
+        bodies '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                       converted (clojure.core/float total)] converted nil)]
+    (is (= consumer (frontend/terminal-host-source consumer options)))
+    (is (= bodies (frontend/terminal-host-source bodies options)))))
+
 (deftest shared-scalar-projector-retains-result-type-and-ordered-captures
   (let [expression (with-meta '(clojure.core/+ z a) {:raster.type/tag 'float})
         equation (frontend/scalar-equation {:id :scalar-result :sym 'answer :expr expression}

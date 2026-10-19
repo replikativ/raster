@@ -123,6 +123,9 @@
     (when-not plan
       (fail! :resident-projection-invocation
              "resident emitted-program projection requires its typed invocation plan" {}))
+    (when (get-in plan [:attributes :terminal-host-result])
+      (fail! :explicit-host-result-required
+             "resident marker projection cannot discard terminal host observation" {}))
     (let [operations (numerical-operations program)
           dispatches (mapv (comp dispatch/with-registration-key graph-dispatch) (range) operations)
           graphs (mapv dispatch/default-alternative dispatches)

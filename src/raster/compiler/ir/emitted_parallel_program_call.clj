@@ -851,7 +851,7 @@
           (evaluate-host-equations program projections buffers scalars evaluate-host))]
     (assoc inputs :scalars scalars :host-steps host-steps)))
 
-(defn ^:no-doc make-equation-call
+(defn ^:no-doc make-equation-call-with-contracts
   "Bind one retained numerical equation using the ordinary checked ABI/dispatch path.
    No host equation is evaluated and no driver resource is acquired. This proves the selected
    call, not that preceding source work completed: the enclosing invocation cursor owns order,
@@ -866,7 +866,14 @@
       (fail! :emitted-program-ready-equation
              "one numerical equation call requires an existing non-loop numerical equation"
              {:equation equation-id}))
-    (prepare-equation-call equation (:values program) buffers scalars result-views projections)))
+    (assoc (prepare-equation-call equation (:values program) buffers scalars result-views projections)
+           :projection (emitted-program/operation-projection projections (first (:operations equation))))))
+
+(defn ^:no-doc make-equation-call
+  "Bind one numerical equation, retaining the ordinary checked ABI/dispatch path."
+  [parallel-program equation-id buffers scalar-values result-views caller-options]
+  (dissoc (make-equation-call-with-contracts parallel-program equation-id buffers scalar-values
+                                            result-views caller-options) :projection))
 
 (defn ^:no-doc make-host-equation-step
   "Evaluate only the selected retained host equation through the ordinary checked binding path.

@@ -694,6 +694,59 @@
                 :else nil))]
       (project expression))))
 
+(defn- terminal-source-program
+  "Keep a contiguous scalar source suffix in the terminal host region.
+   Only already-certified scalar equations may leave the numerical spine; no
+   reduction/map/loop or earlier source action is moved. All suffix bindings,
+   including unused exceptional computations, remain in their original order."
+  [parallel-program]
+  (let [_ (when-not (= 3 (count (:source parallel-program)))
+            (fail! :structured-control-source-result
+                   "terminal observation requires exactly one retained return expression" {}))
+        [head bindings body] (:source parallel-program)
+        pairs (mapv vec (partition 2 bindings))
+        shape-dependencies (into (required-shape-scalars parallel-program)
+                                 (mapcat #(mapcat util/free-syms (:shape %)))
+                                 (vals (:values parallel-program)))
+        claimed (reduce (fn [claims equation]
+                          (if (= :binding (first (:site equation)))
+                            (let [symbol (second (:site equation))]
+                              (when (contains? claims symbol)
+                                (fail! :structured-control-terminal-source-site
+                                       "terminal extraction requires unambiguous source binding ownership"
+                                       {:binding symbol :site (:site equation)}))
+                              (assoc claims symbol equation))
+                            claims))
+                        {} (:equations parallel-program))
+        suffix (->> (rseq pairs)
+                    (take-while
+                     (fn [[symbol expression]]
+                       (and (not (contains? shape-dependencies symbol))
+                            (if-let [equation (get claimed symbol)]
+                              (and (= equation (program/equation-for-binding parallel-program symbol expression))
+                                   (some? (invocation-source/scalar-equation-expression equation)))
+                              (nil? (invocation-source/realization-equation parallel-program symbol expression))))))
+                    reverse vec)
+        removed (set (map first suffix))
+        equations (filterv #(not (and (= :binding (first (:site %)))
+                                      (contains? removed (second (:site %)))))
+                           (:equations parallel-program))
+        inputs (program/infer-inputs equations)]
+    (when (seq (set/intersection removed (set inputs)))
+      (fail! :structured-control-terminal-consumer
+             "a terminal source binding still has a numerical consumer" {}))
+    (if (empty? suffix)
+      parallel-program
+      (-> parallel-program
+          (assoc :source (with-meta
+                           (list head (vec (mapcat identity (subvec pairs 0 (- (count pairs) (count suffix)))))
+                                 (list 'let* (vec (mapcat identity suffix)) body))
+                           (meta (:source parallel-program)))
+                 :equations equations :inputs inputs
+                 :outputs (filterv #(not (contains? removed %)) (:outputs parallel-program))
+                 :effects (reduce set/union #{} (map :effects equations)))
+          (update :values #(apply dissoc % removed))))))
+
 (defn- validate-source-result!
   "Island live-outs are not evidence that the complete source return was lowered.
    Prove the return against logical results and the existing physical-storage relation
@@ -708,19 +761,34 @@
         body (drop 2 source)
         projection (when (= 1 (count body))
                      (source-result-projection parallel-program options (first body)))]
-    (when-not projection
-      (fail! :structured-control-source-result
-             "the complete source return is not represented by the typed program outputs"
-             {:source-result (last body) :source-body (vec body)
-              :program-outputs (:outputs parallel-program)
-              :site [:return] :source-meta (meta (last body))}))
     ;; Island outputs include host live-outs and conservative terminal values. Public
     ;; promotion changes only their escape boundary, never the equations/effects that
     ;; compute them. All returned leaves must have a typed producer or storage alias.
-    (assoc parallel-program :outputs
-           (if (= 'void return-tag)
-             []
-             (vec (distinct (:outputs projection)))))))
+    (if projection
+      (assoc parallel-program :outputs
+             (if (= 'void return-tag) [] (vec (distinct (:outputs projection)))))
+      ;; This describes the complete terminal computation, not its execution.
+      ;; The public compiler must construct its private source owner before
+      ;; publishing a compilation; only the explicit host-result executor may
+      ;; observe its physical exports. Resident entry points refuse it.
+      (let [_ (when (= 'void return-tag)
+                (fail! :structured-control-source-result
+                       "a Void source result needs its retained discard completion, not an Object terminal" {}))
+            parallel-program (terminal-source-program parallel-program)
+            contract
+            (try
+              (invocation/terminal-source-result
+               parallel-program {:source-policy (:source-policy options)
+                                 :source-namespace (some-> (:source-ns options) ns-name)})
+              (catch clojure.lang.ExceptionInfo e
+                (throw (ex-info "the complete source return has no supported terminal boundary"
+                                {:reason :structured-control-source-result
+                                 :source-result (last body) :source-body (vec body)
+                                 :program-outputs (:outputs parallel-program)
+                                 :site [:return] :cause (ex-data e)} e))))]
+        (-> parallel-program
+            (assoc :outputs (mapv :value (:parameters contract)))
+            (assoc-in [:attributes :terminal-host-result] contract))))))
 
 (defn- validate-host-coverage!
   "Host-controlled bindings may remain in an island's retained source, but a complete
@@ -867,7 +935,9 @@
                        values))
                    program-values binding-values)
         parallel-program (assoc parallel-program :values program-values)
-        promoted (assoc parallel-program :dialect :typed-parallel)
+        promoted (cond-> (assoc parallel-program :dialect :typed-parallel)
+                   (get-in parallel-program [:attributes :terminal-host-result])
+                   (update :effects conj :ordered-host-observation))
         public-set (set public-parameters)
         external-result-storage
         (->> (:equations parallel-program)
@@ -887,10 +957,14 @@
                :program-inputs (:inputs parallel-program)
                :program-storage external-result-storage
                :program-outputs (:outputs parallel-program)
-               :attributes {:source-dialect :closed-clojure
+               :attributes (cond-> {:source-dialect :closed-clojure
                             :algorithm-dialect (:dialect parallel-program)
-                            :target-dialect :typed-invocation}})]
+                            :target-dialect :typed-invocation}
+                             (get-in parallel-program [:attributes :terminal-host-result])
+                             (assoc :terminal-host-result
+                                    (get-in parallel-program [:attributes :terminal-host-result])))})]
     (-> promoted
+        (update :attributes dissoc :terminal-host-result)
         (update :attributes assoc
                 :host-control :typed-invocation
                 :invocation-plan (invocation/validate-against! plan promoted))

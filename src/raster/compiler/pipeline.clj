@@ -913,6 +913,7 @@
                     :resident-initialization? (device/gpu-target? (:target-device opts))
                     :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
                     :segmented-plans? (true? (:segmented-plans? opts))
+                    :terminal-host-results? (true? (:terminal-host-results? opts))
                     :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
                     :values values

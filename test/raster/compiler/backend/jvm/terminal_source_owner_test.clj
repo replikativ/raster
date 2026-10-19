@@ -10,8 +10,10 @@
             [raster.compiler.ir.parallel-program :as program]))
 
 (core/deftm source-definition [value :- Double] :- Object (float value))
+(core/deftm primitive-source-definition [value :- Double] :- Float (float value))
 (def source-effects (atom 0))
 (defn observed-helper [value] (swap! source-effects inc) (float value))
+(defn observed-identity [value] (swap! source-effects inc) value)
 
 (defn- reason [thunk]
   (try (thunk) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
@@ -260,3 +262,26 @@
   (let [v (source) id (with-meta 'local {:tag 'Object})
         p (boundary (list 'let* [id '(clojure.core/float total)] id)) c (contract p v)]
     (is (= :unclosed-terminal-source-projection (reason #(compile-owned p c v))))))
+
+(deftest terminal-return-adaptation-is-not-guessed-from-a-declared-tag
+  (let [v (core/resolve-deftm-var #'primitive-source-definition {:dtype :double})]
+    (doseq [body ['total '(if true nil (float total))
+                 '(raster.compiler.backend.jvm.terminal-source-owner-test/observed-helper total)]]
+      (let [p (boundary body) c (contract p v)]
+        (is (= :terminal-source-return-completion (reason #(compile-owned p c v))))))
+    (let [id (with-meta 'projected {:tag 'float})
+          p (boundary (list 'let* [id '(float total)] id)) c (contract p v)
+          {:keys [owner]} (compile-owned p c v)]
+      (is (= [:value Float (Float/floatToRawIntBits (float 1.25))]
+             (outcome #(owner/invoke-terminal-result owner p c [%]) 1.25)))
+      (is (= [:error IllegalArgumentException]
+             (outcome #(owner/invoke-terminal-result owner p c [%]) Double/MAX_VALUE))))))
+
+(deftest unused-terminal-check-retains-effects-and-exception-order
+  (let [body '(let* [before (raster.compiler.backend.jvm.terminal-source-owner-test/observed-identity total)
+                    unused (clojure.core/float total)
+                    after (raster.compiler.backend.jvm.terminal-source-owner-test/observed-identity total)] after)
+        v (source) p (boundary body) c (contract p v) {:keys [owner]} (compile-owned p c v)
+        before @source-effects]
+    (is (thrown? IllegalArgumentException (owner/invoke-terminal-result owner p c [Double/MAX_VALUE])))
+    (is (= (inc before) @source-effects) "the earlier effect occurs; the later effect does not")))

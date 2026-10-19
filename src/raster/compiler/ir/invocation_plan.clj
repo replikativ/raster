@@ -319,6 +319,7 @@
         (fail! :invocation-terminal-free-values
                "terminal observation requires a numerical producer dependency" {}))
       (let [contract {:kind :terminal-host-result :site [:return]
+                      :effects #{:ordered-host-observation}
                       :parameters parameters :body expression
                       :source-policy source-policy :source-namespace source-namespace}]
         ;; No runtime object, private completion Class or executable may enter
@@ -873,6 +874,14 @@
               :expected-shape-projections expected-projections
               :external-dimensions declared-dimensions
               :expected-external-dimensions expected-dimensions}))
+    (when-let [contract (get-in plan [:attributes :terminal-host-result])]
+      (validate-terminal-source-result! contract parallel-program
+                                        (select-keys contract [:source-policy :source-namespace]))
+      (when-not (contains? (:effects parallel-program) :ordered-host-observation)
+        (fail! :invocation-terminal-effects "terminal observation cannot be declared effect-free" {}))
+      (when-not (= (:program-outputs plan) (mapv :value (:parameters contract)))
+        (fail! :invocation-terminal-outputs
+               "terminal dependencies must be the exact numerical export boundary" {})))
     (when (contains? (:attributes plan) :source-order)
       (let [actual (derive-source-order plan parallel-program)]
         (when-not (semantic/equivalent? actual (get-in plan [:attributes :source-order]))
@@ -979,6 +988,7 @@
                  realization (assoc :realization (:id realization))
                  allocation? (assoc :storage symbol))))
            (range) pairs)
+          terminal (get-in plan [:attributes :terminal-host-result])
           body-order
           (mapv
            (fn [index expression]
@@ -986,14 +996,23 @@
                             #(and (or (= [:body index] (:site %))
                                       (and (= index (dec (count body))) (= [:return] (:site %))))
                                   (semantic/equivalent? expression (:source %)))
-                            (:equations program))]
+                            (:equations program))
+                   observation? (and terminal (= index (dec (count body)))
+                                     (semantic/equivalent? expression (:body terminal)))]
+               (when (and terminal (not observation?))
+                 (fail! :invocation-terminal-order
+                        "terminal observation must be the exact final source body" {}))
                (when (> (count matches) 1)
                  (fail! :invocation-source-order-ambiguous
                         "one body position cannot execute several equations" {:body-index index}))
-               (when-not (or (seq matches) (effects/removable-expr? expression))
+               (when (and observation? (seq matches))
+                 (fail! :invocation-terminal-order
+                        "a terminal observation cannot also execute a numerical equation" {}))
+               (when-not (or observation? (seq matches) (effects/removable-expr? expression))
                  (fail! :invocation-source-order-uncovered
                         "retained source body has no ordered equation producer" {:body-index index}))
                (cond-> {:position (+ (count pairs) index) :body-index index}
+                 observation? (assoc :terminal-result [:return])
                  (seq matches) (assoc :equation (:id (first matches))))))
            (range) body)
           order (into binding-order body-order)
