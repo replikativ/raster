@@ -310,6 +310,28 @@ the draft PR is not ready to merge. No source arithmetic contract was relaxed.
 
 ### Residency consolidation: ordered host observation
 
+Definition-policy prerequisite (October 19): named `deftm`, parametric templates
+and their concrete specializations now retain the actual producer's
+`*unchecked-math*` context, sharing the existing anonymous-function policy schema.
+Frontend facts and equation-first options transport it separately from dtype.
+Lazy JIT uses the pending specification's policy; renewal uses the original
+lineage; specialization uses its template. Source metadata must correspond before
+walking, and a policy-bearing plan must capture a genuine source entry rather
+than silently downgrade to unowned emission. Missing, changed and removed policy
+metadata are rejection controls; a deterministic mutation during capture checks
+that the pending implementation and JIT spec remain untouched on failure.
+
+The affected warm REPL gate passes seven namespaces, 50 tests / 426 assertions
+(source policy, source-entry lineage, required JIT walking, parametric dispatch,
+specialization returns, anonymous AOT and JVM source-owner compilation). This is
+bounded ownership/transport evidence, not device execution or a green integration
+gate. The separate Object-array `specialize.clj` path, mixed-policy helper
+inlining, general policy-aware target lowering and terminal host observation are
+not established by this receipt. Policy-less legacy walking retains its prior
+behavior without acquiring source ownership; old pending JIT specs with missing
+policy fail closed. Sequential source guards do not claim general concurrent
+metadata mutation/ABA protection. All eight campaign obligations remain open.
+
 The independent residency review distinguishes established physical contracts
 from an incomplete source-level phase boundary. AbstractValue/LinkValue separate
 logical values from physical leaves; LinkPlan checks overlapping writes and

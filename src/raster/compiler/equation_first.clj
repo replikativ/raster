@@ -141,6 +141,7 @@
             :active-params parameters
             :public-parameters parameters
             :source-ns source-ns
+            :source-policy (:source-policy frontend)
             :return-tag (:return-tag frontend)
             :array-types (:array-types parameter-types)
             :scalar-types (:scalar-types parameter-types)}

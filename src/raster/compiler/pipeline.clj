@@ -21,6 +21,7 @@
   (:require [clojure.string]
             [clojure.pprint :as pp]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.scalar.dce :as dce]
@@ -160,7 +161,8 @@
                 element-dtype (or dtype (infer-dtype resolved))
                 ;; Available source is authoritative. A failed fresh walk is a compiler failure,
                 ;; not permission to execute a stale definition-time body with older type facts.
-                walked (walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype)]
+                walked (source-policy/call-with-owner
+                        m #(walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype))]
             ;; SSA-normalize let* rebindings (seeded with the params) BEFORE the
             ;; pass pipeline: a rebinding like `x = (alloc-op x)` otherwise
             ;; conflates the op's input and freshly-allocated output buffer in
@@ -220,6 +222,7 @@
      :param-env param-env
      :param-specs (mapv (fn [p] {:sym p :tag (get param-env p)}) parameters)
      :effective-dtype effective-dtype :source-ns source-ns
+     :source-policy (:raster.core/source-policy metadata)
      :return-tag (:raster.core/return-tag metadata)}))
 
 ;; ================================================================

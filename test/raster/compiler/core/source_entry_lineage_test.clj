@@ -75,7 +75,8 @@
           (core/do-bytecode-upgrade! receiver (:source-name lineage) (:params lineage)
                                     (:tags lineage) (:return-tag lineage) nil
                                     (:source-ns lineage) (:typed-interface lineage)
-                                    :annotations (:annotations lineage) :source-body (:source-body lineage))
+                                    :annotations (:annotations lineage) :source-body (:source-body lineage)
+                                    :source-policy (:source-policy lineage))
           (is (identical? populated (:raster.core/deftm-walked-body (meta source)))))))))
 
 (deftest missing-or-mismatched-entry-lineage-abstains
@@ -88,6 +89,7 @@
       (doseq [[field value] [[:mangled-sym 'missing]
                               [:params '[wrong]] [:tags '[double]] [:annotations '[Object]]
                               [:source-body '(nil)] [:source-ns-name 'missing]
+                              [:source-policy {:unchecked-math true}]
                               [:typed-iface-name 'missing] [:return-tag 'Object]]]
         (reset-meta! receiver (assoc-in original [:raster.core/jit-spec field] value))
         (is (nil? (projection selected)) (pr-str field)))
@@ -101,6 +103,8 @@
                          (assoc-in warm [:raster.core/bytecode-emission :implementation] (Object.))
                          (assoc-in warm [:raster.core/bytecode-emission :typed-interface] 'missing)
                          (assoc-in warm [:raster.core/bytecode-emission :source-entry :source-var] #'body-calls)
+                         (assoc-in warm [:raster.core/bytecode-emission :source-entry :source-policy]
+                                   {:unchecked-math true})
                          (assoc-in warm [:raster.core/bytecode-emission :source-entry :source-body] '(nil))]]
           (reset-meta! receiver changed)
           (is (nil? (projection selected))))

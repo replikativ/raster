@@ -14,6 +14,7 @@
             [clojure.walk]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.specialize :as specialize]))
 
 ;; ================================================================
@@ -1288,14 +1289,18 @@
    params: [a b] — parameter names
    fn-name: qualified symbol
    source-ns: namespace"
-  [fn-name type-vars annotations ret-annotation params body source-ns]
+  ([fn-name type-vars annotations ret-annotation params body source-ns]
+   (register-parametric! fn-name type-vars annotations ret-annotation params body source-ns
+                         (source-policy/capture)))
+  ([fn-name type-vars annotations ret-annotation params body source-ns policy]
+  (source-policy/unchecked-math policy)
   (let [new-entry {:type-vars (set type-vars)
                    :type-var-list (vec type-vars)
                    :annotations (vec annotations)
                    :ret-annotation ret-annotation
                    :params (vec params)
                    :body body
-                   :source-ns source-ns}
+                   :source-ns source-ns :source-policy policy}
         anns-key (vec annotations)
         ;; Derived methods belong to a template signature, not merely to a dtype.
         ;; Keep explicit overloads intact and rebuild only materialized bindings of
@@ -1322,7 +1327,7 @@
       (bump-compiler-definition-revision!)
       (doseq [bindings materialized]
         (@parametric-register fn-name new-entry bindings []))
-      registered)))
+      registered))))
 
 ;; Callback for parametric specialization. Set by core.clj during loading.
 ;; Breaks the dispatch↔core cycle: dispatch defines the protocol,

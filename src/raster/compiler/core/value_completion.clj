@@ -5,7 +5,8 @@
    explicit primitive input context preserves the original expected-parameter
    conversion under a retained source compilation policy. Neither is inferred
    from a scalar tag or permission to reorder calls or enable an AD rule."
-  (:require [raster.compiler.core.util :as util]))
+  (:require [raster.compiler.core.util :as util]
+            [raster.compiler.core.source-policy :as source-policy]))
 
 (def completion-symbol
   ;; Reserved IR syntax, deliberately not this namespace's constructor Var.
@@ -22,8 +23,7 @@
   "The retained Clojure source policy relevant to implicit primitive inputs.
    It is supplied by source compilation, never inferred from ambient state."
   [policy]
-  (and (map? policy) (= #{:unchecked-math} (set (keys policy)))
-       (contains? #{false true :warn-on-boxed} (:unchecked-math policy))))
+  (source-policy/valid? policy))
 
 (defn- primitive-carrier? [carrier]
   (and (class? carrier) (.isPrimitive ^Class carrier) (not= Void/TYPE carrier)))

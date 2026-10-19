@@ -49,6 +49,7 @@
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.specialize :as specialize]
@@ -419,19 +420,35 @@
   TC-quality devirtualization. Required source walking must succeed before
   optional bytecode compilation; never uses a stale body after a failed walk."
   [impl-var mangled-sym params tags return-tag walked-body source-ns typed-iface-name
-   & {:keys [annotations source-body]}]
-  (let [;; Create compilation DCL if not already in a compilation scope.
+   & {:keys [annotations source-body source-policy] :as options}]
+  (let [source-var (ns-resolve source-ns mangled-sym)
+        retained-policy? (contains? options :source-policy)
+        source-metadata (meta source-var)
+        _ (when retained-policy? (source-policy/unchecked-math source-policy))
+        _ (when (and (or retained-policy? (contains? source-metadata ::source-policy))
+                     (or (not retained-policy?)
+                         (not (contains? source-metadata ::source-policy))
+                         (not= source-policy (::source-policy source-metadata))))
+            (throw (ex-info "Bytecode compilation lost its definition-owned source policy"
+                            {:reason :source-policy-mismatch :source source-var})))
+        ;; Create compilation DCL if not already in a compilation scope.
         ;; Required walking retains the same loader as subsequent emission.
           needs-cl? (nil? me/*compilation-classloader*)
           cl (when needs-cl?
                (clojure.lang.DynamicClassLoader.
                 (.getContextClassLoader (Thread/currentThread))))]
-    (binding [me/*compilation-classloader* (or me/*compilation-classloader* cl)]
-      (let [source-var (ns-resolve source-ns mangled-sym)
-            source-entry (me/capture-source-entry
+    (binding [me/*compilation-classloader* (or me/*compilation-classloader* cl)
+              *unchecked-math* (if retained-policy?
+                                (source-policy/unchecked-math source-policy)
+                                *unchecked-math*)]
+      (let [source-entry (me/capture-source-entry
                           source-var {:params params :tags tags :annotations annotations
                                       :source-body source-body :source-ns source-ns
+                                      :source-policy source-policy
                                       :typed-interface typed-iface-name :return-tag return-tag})
+            _ (when (and retained-policy? (nil? source-entry))
+                (throw (ex-info "Bytecode source ownership changed before lineage capture"
+                                {:reason :unclosed-bytecode-source-entry :source source-var})))
             fresh-body (if (and source-body annotations)
                          (jit-walk-with-tc (vec source-body) params tags annotations source-ns)
                          walked-body)]
@@ -558,7 +575,8 @@
         (do-bytecode-upgrade!
          impl-var (:mangled-sym spec) (:params spec) (:tags spec) (:return-tag spec)
          (:walked-body spec) (the-ns (:source-ns-name spec)) (:typed-iface-name spec)
-         :annotations (:annotations spec) :source-body (:source-body spec))
+         :annotations (:annotations spec) :source-body (:source-body spec)
+         :source-policy (:source-policy spec))
         (alter-meta! impl-var dissoc ::jit-spec)))))
 
 (clojure.core/defn ^:no-doc ensure-current-owned-bytecode!
@@ -608,7 +626,8 @@
                       *jit-silent-fallback?* false]
               (do-bytecode-upgrade! impl-var source-name params tags return-tag nil
                                     source-ns typed-interface
-                                    :annotations annotations :source-body source-body))
+                                    :annotations annotations :source-body source-body
+                                    :source-policy (:source-policy lineage)))
             (let [fresh (::bytecode-emission (meta impl-var))]
               (when-not (and (not (identical? fresh emission))
                              (not (identical? (:implementation fresh) (:implementation emission)))
@@ -669,11 +688,12 @@
                           (throw (ex-info "Retained source namespace is unavailable"
                                           {:reason :missing-deftm-source-namespace
                                            :var v :source-ns (::deftm-source-ns m)})))
-                      walked (jit-walk-with-tc (vec src)
+                      walked (source-policy/call-with-owner
+                              m #(jit-walk-with-tc (vec src)
                                                (::deftm-params m)
                                                (::deftm-tags m)
                                                (::deftm-annotations m)
-                                               source-ns)]
+                                               source-ns))]
                   (alter-meta! v assoc ::deftm-walked-body (vec walked))
                   (vec walked))))))))
 
@@ -690,7 +710,8 @@
 
   Exported as `defn` — use (:refer-clojure :exclude [defn]) in ns form."
   [name & fdecl]
-  (let [;; Parse optional docstring
+  (let [policy (source-policy/capture)
+        ;; Parse optional docstring
         [docstring fdecl] (if (string? (first fdecl))
                             [(first fdecl) (rest fdecl)]
                             [nil fdecl])
@@ -744,6 +765,7 @@
                               ::deftm-walked-body (:walked-body reg#)
                               ::deftm-raw-body (:source-body reg#)
                               ::deftm-source-ns '~(symbol (str *ns*))
+                              ::source-policy '~policy
                               ::deftm-params '~(vec clean-params)
                               ::deftm-tags '~tags))
                (dispatch/bump-compiler-definition-revision!)
@@ -753,11 +775,14 @@
           `(do ~defn-form
                (alter-meta! (var ~name) assoc
                             ::deftm-source-ns '~(symbol (str *ns*))
+                            ::source-policy '~policy
                             ::deftm-params '~(vec clean-params)
                             ::deftm-tags '~tags)
                (dispatch/bump-compiler-definition-revision!)
                (var ~name))
-          defn-form)))))
+          `(do ~defn-form
+               (alter-meta! (var ~name) assoc ::source-policy '~policy)
+               (var ~name)))))))
 
 ;; Export as `defn` — consumers use (:refer-clojure :exclude [defn])
 (def ^{:macro true
@@ -806,7 +831,8 @@
   {:arglists '([name [params...] :- RetType & body]
                [name docstring [params...] & body])}
   [fn-name & args]
-  (let [;; Auto-qualify: if fn-name is unqualified but resolves to a generic function
+  (let [policy (source-policy/capture)
+        ;; Auto-qualify: if fn-name is unqualified but resolves to a generic function
         ;; var from another namespace (via :refer), use the qualified name so that
         ;; deftm extends the existing dispatch table instead of shadowing it.
         ;; This is the Julia semantics: `+(a::MyType, b::MyType) = ...` extends Base.+
@@ -908,7 +934,7 @@
               '~(or ret-type 'Object)
               '~(vec params)
               '~(if (= 1 (count body)) (first body) (cons 'do body))
-              *ns*)
+              *ns* '~policy)
            ;; Generate concrete double specialization so the dispatch table
            ;; has a concrete overload for AD inline expansion and compilation
              (deftm ~fn-name ~concrete-params
@@ -986,6 +1012,7 @@
                           ::deftm-tags '~tags
                           ::deftm-annotations '~(vec annotations)
                           ::deftm-source-ns '~(symbol (str *ns*))
+                          ::source-policy '~policy
                           ::deftm-source-body (:source-body reg#)
                           ::deftm-walked-body (:walked-body reg#)
                           ::deftm-walked-body-typed (:walked-body-typed reg#)
@@ -1001,6 +1028,7 @@
                                         :annotations '~annotations
                                         :return-tag '~(or ret-tag 'Object)
                                         :source-body (:source-body reg#)
+                                        :source-policy '~policy
                                         :source-ns *ns* :typed-interface nil
                                         :clojure-body (:walked-body reg#)})]
                  (alter-meta! source# assoc ::clojure-source-entry lineage#)))
@@ -1038,6 +1066,7 @@
                                                 :tags '~tags
                                                 :annotations '~annotations
                                                 :return-tag '~(or ret-tag 'Object)
+                                                :source-policy '~policy
                                                 :source-body (:source-body reg#)
                                                 :walked-body (or (:walked-body-typed reg#) (:walked-body reg#))
                                                 :source-ns-name '~(ns-name *ns*)
@@ -1749,7 +1778,8 @@
   the invoke(Object) path is a bytecoded unboxing bridge (like manual deftm),
   not a Clojure-compiled fn with TC type hints that break array interop."
   [fn-name template bindings args]
-  (binding [dispatch/*installing-derived-specialization* true]
+  (binding [dispatch/*installing-derived-specialization* true
+            *unchecked-math* (source-policy/unchecked-math (:source-policy template))]
     (let [{:keys [annotations ret-annotation params body source-ns]} template
         ;; Specialize parametric value types (defvalue with All [T])
         ;; Value-class specialization tag: any NON-double binding (float/int/long
@@ -1935,6 +1965,7 @@
                            ::return-tag ret-tag
                            ::deftm-walked-body walked-body
                            ::deftm-source-body body-forms
+                           ::source-policy (:source-policy template)
                            ::deftm-annotations concrete-anns
                            ::deftm-source-ns (ns-name source-ns))
                 ;; Bytecode compile: creates invk (typed) + invoke(Object) bridge
@@ -1943,7 +1974,8 @@
                  impl-var mangled-sym params tags ret-tag
                  walked-body source-ns typed-iface-name
                  :annotations concrete-anns
-                 :source-body body-forms)
+                 :source-body body-forms
+                 :source-policy (:source-policy template))
                 ;; Register in dispatch table
                 ;; Match ordinary deftm registration: MethodEntry contains
                 ;; concrete function/implementation objects, not a name and a

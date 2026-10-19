@@ -17,7 +17,8 @@
   Previously a defrecord, now a plain map to avoid classloader conflicts.
   Maps use value equality across classloaders, eliminating ClassCastException
   when compiled (eval'd) code calls back into dispatch."
-  (:require [raster.compiler.core.types :as types]))
+  (:require [raster.compiler.core.types :as types]
+            [raster.compiler.core.source-policy :as source-policy]))
 
 (defn var-snapshot
   "Observe an existing Var's effective value and retained definition metadata.
@@ -373,11 +374,13 @@
    A plain Clojure producer may additionally freeze its exact compiled body.
    Nil means the supplied plan does not correspond to this retained definition."
   [source-var {:keys [params tags annotations source-body source-ns typed-interface return-tag
-                     clojure-body]}]
+                     clojure-body] :as source}]
   (when (and (var? source-var) (bound? source-var)
              (instance? clojure.lang.Namespace source-ns))
     (let [{:keys [value metadata]} (var-snapshot source-var)]
       (when (and (:raster.core/deftm metadata)
+                 (source-policy/valid? (:source-policy source))
+                 (= (:source-policy source) (:raster.core/source-policy metadata))
                  (identical? source-ns (:ns metadata))
                  (= (ns-name source-ns) (:raster.core/deftm-source-ns metadata))
                  (= params (:raster.core/deftm-params metadata))
@@ -389,6 +392,7 @@
                  (or (some? typed-interface) (vector? clojure-body)))
         (cond-> {:source-var source-var :source-root value :source-name (:name metadata)
                  :params params :tags tags :annotations annotations :source-body source-body
+                 :source-policy (:source-policy source)
                  :source-ns source-ns :typed-interface typed-interface :return-tag return-tag}
           (vector? clojure-body) (assoc :clojure-body clojure-body))))))
 
