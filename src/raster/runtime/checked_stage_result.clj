@@ -4,7 +4,8 @@
    This function neither submits work nor proves completion, storage ownership or
    initialization. The enclosing execution owner must hold the exact bound graph
    and its temporary lifetimes through synchronous completion and observation.
-   Ordinary binding/publication gates remain closed until that owner is wired."
+   Ordinary resident binding/publication gates remain closed; the confined binder
+   must retain the actual temporary owner through this observation."
   (:require [raster.compiler.ir.emitted-parallel-equation :as emitted]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.passes.parallel.checked-map-stage :as checked]))

@@ -46,6 +46,7 @@
             [raster.gpu.invocation-observation :as observation]
             [raster.gpu.runtime-backend :as runtime-backend]
             [raster.gpu.resident-value :as resident-value]
+            [raster.runtime.checked-stage-result :as checked-result]
             [raster.gpu.resource-cleanup :as cleanup])
   (:import [java.lang AutoCloseable]))
 
@@ -1982,7 +1983,7 @@
                      vec)]
     (release-event! sess event)))
 
-(defn bind-kernel-graph!
+(defn- bind-kernel-graph-internal!
   "Bind an emitted KernelGraph for repeated resident execution.
 
    `buffer-keys` maps every external GraphBuffer identity to an existing session-buffer key or a
@@ -2001,10 +2002,9 @@
    A linker that will record these prepared kernels in an enclosing graph may set
    :record? false; that handle remains bindable/releasable but cannot be submitted alone."
   ([sess graph-key graph buffer-keys scalar-values]
-   (bind-kernel-graph! sess graph-key graph buffer-keys scalar-values {}))
+   (bind-kernel-graph-internal! sess graph-key graph buffer-keys scalar-values {}))
   ([sess graph-key graph buffer-keys scalar-values {:keys [profile? record?]
                                                     :or {profile? false record? true}}]
-   (stage-result/refuse-unobserved! graph :bind-kernel-graph)
    (with-session-use sess
      (let [{:keys [device-id closed?]} @sess
            graph (kexec/validate! graph)
@@ -2093,6 +2093,17 @@
                                    :temporary-owners (:temporary-owners @construction)
                                    :temporary-buffers (:temporary-buffers @construction)} e)
              (throw e))))))))
+
+(defn bind-kernel-graph!
+  "Bind an ordinary emitted graph over resident buffer keys/views and typed scalars.
+   The graph owns its temporary allocations, prepared handles and recording.
+   Options :profile? and :record? retain the existing graph-binding contract.
+   Checked-result stages require their confined synchronous observer instead."
+  ([sess graph-key graph buffer-keys scalar-values]
+   (bind-kernel-graph! sess graph-key graph buffer-keys scalar-values {}))
+  ([sess graph-key graph buffer-keys scalar-values options]
+   (stage-result/refuse-unobserved! graph :bind-kernel-graph)
+   (bind-kernel-graph-internal! sess graph-key graph buffer-keys scalar-values options)))
 
 (defn bind-kernel-call!
   "Bind one emitted KernelArtifact over session-resident arguments as a replayable graph.
@@ -2509,6 +2520,66 @@
       (destroy-kernel-graph-entry! (:device-id @sess) entry)
       (swap! sess update :kernel-graphs dissoc (:key handle))))
   nil)
+
+(defn ^:no-doc execute-checked-equation!
+  "Execute and observe one validated fresh-output checked stage synchronously.
+
+   Internal ordered-owner seam: output bindings must remain private until this
+   function succeeds. The enclosing owner, not this function, guards historical
+   source definitions and credits success-conditional initialized views. No graph
+   handles, diagnostic buffers or initialization certificates escape. Binding,
+   execution, observation and cleanup share the session lifetime monitor."
+  ([sess equation buffer-keys scalar-values]
+   (execute-checked-equation! sess equation buffer-keys scalar-values {}))
+  ([sess equation buffer-keys scalar-values caller-options]
+   (stage-result/call-with-checked-binding-validation
+    equation caller-options
+    (fn [report]
+      (let [graph (get-in report [:boundary :graph])
+            obligation (first (:stage-results report))
+            length (kgcall/resolve-integer scalar-values (:extent obligation))]
+        (when-not (<= 0 length Long/MAX_VALUE)
+          (throw (ex-info "checked stage requires a nonnegative concrete extent"
+                          {:reason :checked-stage-binding-contract :extent length})))
+        (with-session-use sess
+          (let [handle (bind-kernel-graph-internal!
+                        sess [::checked-stage (random-uuid)] graph buffer-keys scalar-values {})
+                primary (volatile! nil)]
+            (try
+              (when (pos? length) (run-kernel-graph! sess handle))
+              (let [entry (resolve-kernel-graph-entry sess handle)
+                    device-id (:device-id @sess)
+                    temporaries (:temporary-buffers entry)
+                    allowed {(:status obligation) :int (:diagnostics obligation) :double}]
+                (cleanup/assert-live! (::cleanup/owner entry))
+                (when-not (identical? graph (get-in entry [:graph-call :graph]))
+                  (throw (ex-info "checked observation lost its exact bound graph"
+                                  {:reason :checked-stage-binding-contract})))
+                (checked-result/observe!
+                 equation scalar-values
+                 (fn [{:keys [buffer dtype offset elements]}]
+                   (let [current (resolve-kernel-graph-entry sess handle)
+                         temporary (get temporaries buffer)
+                         destination (case dtype :int (int-array elements)
+                                                 :double (double-array elements))]
+                     (cleanup/assert-live! (::cleanup/owner current))
+                     (when-not (and (identical? entry current)
+                                    (= dtype (get allowed buffer))
+                                    temporary (= dtype (:dtype temporary))
+                                    (<= (*' (+ offset elements) (dtype/bytes-of dtype))
+                                        (:byte-size temporary)))
+                       (throw (ex-info "checked snapshot lost its owned temporary range"
+                                       {:reason :checked-stage-binding-contract :buffer buffer})))
+                     ((rt-resolve device-id "download-range!")
+                      temporary destination {:src-element offset :dst-element 0 :elements elements})
+                     destination)) caller-options))
+              (catch Throwable error (vreset! primary error) (throw error))
+              (finally
+                (try (release-kernel-graph! sess handle)
+                     (catch Throwable error
+                       (if-let [failure @primary]
+                         (when-not (identical? failure error) (.addSuppressed failure error))
+                         (throw error)))))))))))))
 
 ;; ================================================================
 ;; Resident GPU programs (Option A: pipeline → bound-dispatch path)

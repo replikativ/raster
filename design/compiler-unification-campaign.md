@@ -14,8 +14,8 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `23f1948a` is draft, not qualified for merge.
-Setup 32529/build 32530 passed; emission 32532 failed. Unit 32531 and OpenCL 32535
+Current integration hold: PR #1539 at `1fc7a331` is draft, not qualified for merge.
+Setup 32536/build 32537 passed; emission 32540 failed. Unit 32539 and OpenCL 32538
 were still running at the latest observation. The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
@@ -29,7 +29,7 @@ Do not erase the check or assume that parallel partial writes preserve failure o
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|
 | Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |
-| Checked numerical map result | A source-derived refinement now compiles public `mixed-scale` into guarded KernelBody across OpenCL/CUDA/HIP; actual CUDA/HIP source compilation passes locally. Execution, initialization, composition and persistence refuse pending observation support. | Observe completion/status before initialization/consumer/publication; derive private diagnostic access from the exact validated equation and ownership contract. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
+| Checked numerical map result | Source-derived `mixed-scale` compiles across OpenCL/CUDA/HIP. A confined internal binder now executes and observes the actual generated equation on local OpenCL/Level Zero, with source Float results/exceptions and cleanup. Ordinary invocation, initialization, composition and persistence still refuse. | Integrate historical source ownership, private output nonescape and success-conditional coverage into the ordered executor. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
 | Training scalar source coverage | Unit 32520 and warm local reproduction reject `local-gradient-sum`: nested reduce/divide and later scale scalar carry mandatory source evaluation | Close source-order/carrier evidence without dropping preservation flags or duplicating evaluation; retain the actual distributed-training composition oracle. |
 | Existing AD/native/fusion integration | Exact-head unit logs still contain native refusals, closed-product AD gaps and fusion/terminal-conversion failures | Classify actual semantic gaps versus obsolete structural expectations; preserve numerical/failure oracles. Updating tests must not substitute for implementation. |
 | Distributed and durable workload acceptance | Original obligations remain below; training composition currently blocked by the scalar row above | Complete their unchanged workload gates after shared compiler fixes. Local co-location/simulation is not multi-host performance evidence. |
@@ -43,18 +43,26 @@ validator reconstructs from the semantic source even if a witness label is mutat
 Review caught and closed both a label-dispatch bypass and an overbroad conversion trigger.
 Structural graph/ABI tests now use Double storage rather than claiming that an arbitrary
 fixture-only schedule implements checked narrowing; the real checked-source tests remain.
-This is compile-only progress, not production checked-map execution or campaign completion.
+Compiler reconstruction alone is not production checked-map execution or campaign completion.
 
 The next observation component independently reconstructs the emitted obligation and
 interprets completed status snapshots in bounded chunks. It selects the first failing
 source lane and reads only that lane's initialized original-Double diagnostic; it reruns
 the immutable checked conversion rather than the operand computation. Empty stages do
 no reads; malformed protocols refuse. This component returns no initialization proof
-and cannot enable execution. The remaining integration is a confined graph-binding scope
-with exact temporary ownership/lifetimes, followed by observation before ordered cursor
-advance and success-conditional write coverage. Ordinary bind/composition/persistence
-gates stay closed. Review confirms this distinction; callback-only tests are not device
-completion, private-buffer ownership or production acceptance evidence.
+and cannot independently enable execution. The confined binder reuses the existing graph
+binder privately, retains the actual bound graph generation/temporary cleanup owner through
+completion and observation, and releases everything on success and failure. Only exact
+artifact KernelCall validation is admitted in an expiring owning-thread scope; ordinary
+public graph binding, composition and persistence still refuse. Scope tests cover escaped
+bound functions and future inheritance. Actual local device tests cover source result bits,
+failure before a consumer, changed inputs, empty extents, checked exceptions and injected
+observation-failure cleanup. The remaining integration is historical source ownership,
+private output nonescape, ordered cursor advance and success-conditional write coverage.
+Review explicitly does not treat the confined seam as ordinary invocation activation.
+The five-namespace affected gate passes 76 tests / 563 assertions, including actual
+OpenCL and Level Zero execution. The original hardware-free C-family compilation
+receipts remain separate; no CUDA/HIP execution or performance claim is implied.
 
 ### Historical integration receipts (not the current acceptance status)
 

@@ -1,0 +1,85 @@
+(ns raster.gpu.checked-equation-test
+  "The actual source-derived checked-map schedule through confined graph ownership."
+  (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.mixed-storage :as storage]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as opencl]
+            [raster.runtime.checked-stage-result :as observation]
+            [raster.dl.gpu-grad-parity :as level-zero]))
+
+(defn- equation [target]
+  (->> (:equations (:emitted (equation-first/compile
+                             #'storage/mixed-scale
+                             (merge storage/policy {:target target :dtype :double}))))
+       (remove #(get-in % [:attributes :host-only])) first :operations first))
+
+(defn- thrown-description [f]
+  (try (f) nil (catch Throwable error [(class error) (.getMessage error)])))
+
+(defn- check-device [target]
+  (let [equation (equation target)
+        graph (:graph equation)
+        {:keys [extent]} (first (:stage-results (emitted/validate-with-result-contracts equation)))
+        input (:id (first (:inputs graph)))
+        output (:id (first (:outputs graph)))
+        coefficient (:id (first (filter #(= :double (:dtype %)) (:scalars graph))))
+        width 4
+        consumer (atom 0)]
+    (gpu/with-gpu-session [session target]
+      (gpu/alloc! session {:input [:float width nil] :output [:float width nil]})
+      (doseq [[factor values] [[2.0 [1.5 -2.0 0.0 -0.0]]
+                               [2.0 [Float/MAX_VALUE 1.0 (- Float/MAX_VALUE) 0.0]]
+                               [0.5 [Float/MAX_VALUE Float/MIN_VALUE Float/NaN -0.0]]
+                               [Double/POSITIVE_INFINITY [1.0 -1.0 0.0 1.0]]
+                               [1.0 [3.0 4.0 5.0 6.0]]]]
+        (let [input-array (float-array values)
+              expected-error (thrown-description
+                              #(mapv (fn [x] (float (* (double factor) (double x)))) input-array))
+              before @consumer]
+          (gpu/upload! session :input input-array)
+          (let [actual-error
+                (thrown-description
+                 #(do
+                    (let [result (gpu/execute-checked-equation!
+                                  session equation {input :input output :output}
+                                  {coefficient {:type :double :value factor}
+                                   extent {:type :long :value width}})]
+                      (is (nil? result)))
+                    (swap! consumer inc)))]
+            (is (= expected-error actual-error) (str target " factor=" factor))
+            (is (= (+ before (if expected-error 0 1)) @consumer))
+            (when-not actual-error
+              (is (= (mapv #(Float/floatToRawIntBits (float (* (double factor) (double %)))) input-array)
+                     (mapv #(Float/floatToRawIntBits %) (gpu/download session :output))))))
+          (is (empty? (:kernel-graphs @session)) "no private graph/temporary owner escapes")
+          (is (empty? (:events @session)) "completion events retire before return")))
+      (let [failure (ex-info "injected observation failure" {:reason :injected-observation-failure})]
+        (with-redefs [observation/observe! (fn [& _] (throw failure))]
+          (is (identical?
+               failure
+               (try
+                 (gpu/execute-checked-equation!
+                  session equation {input :input output :output}
+                  {coefficient {:type :double :value 1.0}
+                   extent {:type :long :value width}})
+                 nil
+                 (catch Throwable error error)))))
+        (is (empty? (:kernel-graphs @session)) "observation failure retires private storage")
+        (is (empty? (:events @session)) "observation failure retains no event"))
+      ;; Empty logical maps do not launch or read an uninitialized status lane.
+      (with-redefs [gpu/run-kernel-graph! (fn [& _] (throw (AssertionError. "empty stage launched")))]
+        (is (nil? (gpu/execute-checked-equation!
+                   session equation {input :input output :output}
+                   {coefficient {:type :double :value 2.0}
+                    extent {:type :long :value 0}}))))
+      (is (empty? (:kernel-graphs @session))))))
+
+(deftest actual-checked-map-observation-preserves-source-results-and-failure-order
+  (if @level-zero/gpu-available?
+    (check-device :ze:0)
+    (level-zero/gpu-skip! "source-derived checked equation on Level Zero"))
+  (if @opencl/opencl-available?
+    (check-device :ocl:0)
+    (opencl/opencl-skip! "source-derived checked equation on OpenCL")))

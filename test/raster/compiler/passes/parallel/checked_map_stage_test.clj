@@ -220,3 +220,31 @@
     (is (= [{:buffer status :dtype :int :offset 0 :elements 16384}
             {:buffer status :dtype :int :offset 16384 :elements 16384}
             {:buffer diagnostics :dtype :double :offset 16391 :elements 1}] @reads))))
+
+(deftest binding-validation-scope-is-exact-thread-local-and-nonescaping
+  (let [equation (numerical-equation (compilation (first targets)))
+        graph (:graph equation)
+        artifact (get-in graph [:nodes 0 :operation])
+        escaped
+        (result/call-with-checked-binding-validation
+         equation {}
+         (fn [_]
+           (is (identical? artifact (result/refuse-unobserved! artifact :kernel-call)))
+           (is (= :checked-stage-observation-required
+                  (reason #(result/refuse-unobserved! (assoc artifact :unrelated true) :kernel-call))))
+           (is (= :checked-stage-observation-required
+                  (reason #(result/refuse-unobserved! graph :bind-kernel-graph))))
+           (is (= :checked-stage-observation-required
+                  @(future (reason #(result/refuse-unobserved! artifact :kernel-call)))))
+           (bound-fn [] (result/refuse-unobserved! artifact :kernel-call))))]
+    (is (= :checked-stage-observation-required (reason escaped)))
+    (is (= :checked-stage-observation-required
+           (reason #(result/refuse-unobserved! artifact :kernel-call))))
+    (let [captured (atom nil)]
+      (is (= :injected-scope-failure
+             (reason #(result/call-with-checked-binding-validation
+                       equation {}
+                       (fn [_]
+                         (reset! captured (bound-fn [] (result/refuse-unobserved! artifact :kernel-call)))
+                         (throw (ex-info "scope failure" {:reason :injected-scope-failure})))))))
+      (is (= :checked-stage-observation-required (reason @captured))))))
