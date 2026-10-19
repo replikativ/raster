@@ -3,9 +3,9 @@
   tangent-typed template emission.
 
   (i)   tangent-tag (Π) — identity on differentiable tags, nil on ⊥/unknown
-  (ii)  a grads-fn emission from tagged primal args produces Π-tagged
-        binding LHS syms, tagged call forms, and emission-time
-        devirtualization when all arg tags are known
+  (ii)  a grads-fn emission from tagged primal args closes Π-typed output
+        ports by projection; raw expressions use independent value evidence
+        for tagging and emission-time devirtualization
   (iii) an emission with UNtagged primal args is byte-identical to the
         pre-change emission — tags are carried, never guessed."
   (:require [clojure.test :refer [deftest testing is]]
@@ -29,6 +29,71 @@
 (defn- tag-of [x] (some-> x meta :raster.type/tag))
 
 (defn- tagged [sym tag] (with-meta sym {:raster.type/tag tag}))
+
+(defn- compile-scalar-ports [template tags incoming]
+  (let [parameters (mapv #(tagged (symbol (str "parameter" %1)) %2) (range) tags)
+        [ctx ports] (tmpl/instantiate-template-ctx template parameters nil incoming (make-test-ctx))]
+    {:bindings (:bindings ctx) :ports ports
+     :invoke (eval (list 'fn '[dy choose]
+                         (list 'let* (:bindings ctx) ports)))}))
+
+(deftest scalar-template-ports-materialize-their-declared-tangent-dtypes
+  (let [{:keys [invoke ports]} (compile-scalar-ports
+                              (tmpl/get-template 'clojure.core/double)
+                              '[float] (tagged 'dy 'double))
+        input (+ 1.0 (Math/scalb 1.0 (int -24)))
+        output (first (invoke input false))]
+    (is (= '[float] (mapv tag-of ports)))
+    (is (= Float (class output)))
+    (is (= (Float/floatToRawIntBits (float input)) (Float/floatToRawIntBits output)))
+    (is (= [nil] (invoke nil false)))
+    (is (thrown? IllegalArgumentException (invoke Double/MAX_VALUE false))))
+  (let [template {:grads-fn (fn [ctx _ _ dy gs]
+                             (let [g (gs "raw" 'float)]
+                               [(update ctx :bindings into [g dy]) [g]]))}
+        {:keys [invoke bindings ports]} (compile-scalar-ports template '[float] (tagged 'dy 'double))]
+    (is (= 'double (tag-of (first bindings))) "raw source declaration is not the desired port dtype")
+    (is (= 'float (tag-of (first ports))))
+    (is (= Float (class (first (invoke 2.0 false)))))))
+
+(deftest shared-template-sources-are-projected-per-port-not-retagged
+  (doseq [local? [false true]]
+   (let [incoming (tagged 'dy 'double)
+        template {:grads-fn (fn [ctx _ _ dy gs]
+                             (if local?
+                               (let [g (gs "shared" 'float)]
+                                 [(update ctx :bindings into [g dy]) [g g g]])
+                               [ctx [dy dy dy]]))}
+        {:keys [invoke ports]} (compile-scalar-ports template '[float double float] incoming)
+        values (invoke 2.0 false)]
+    (is (= '[float double float] (mapv tag-of ports)))
+    (is (= [Float Double Float] (mapv class values)))
+    (is (= [nil nil nil] (invoke nil false)))
+    (is (= 'double (tag-of incoming)))
+    (is (not= (first ports) (last ports)))))
+  (let [template {:grads-fn (fn [ctx _ _ dy _] [ctx [nil dy]])}
+        {:keys [invoke]} (compile-scalar-ports template '[double float] (tagged 'dy 'double))]
+    (is (= [nil (float 2.0)] (invoke 2.0 false)))
+    (is (= Float (class (second (invoke 2.0 false)))))))
+
+(deftest conditional-dispatch-unification-is-not-a-value-conversion-proof
+  (let [template {:grads-fn (fn [ctx _ _ dy gs]
+                             (let [g (gs "conditional" 'double)]
+                               [(update ctx :bindings into [g (list 'if 'choose dy 0.0)]) [g]]))}
+        {:keys [invoke ports]} (compile-scalar-ports template '[double] 'dy)]
+    (is (= '[double] (mapv tag-of ports)))
+    (is (= [Double] (mapv class (invoke (float 2.0) true))))
+    (is (= [2.0] (invoke (float 2.0) true)))
+    (is (= [0.0] (invoke (float 2.0) false)))
+    (is (= [nil] (invoke nil true)))))
+
+(deftest contradictory-shared-array-output-contracts-refuse
+  (doseq [tags ['[float floats] '[floats doubles]]]
+    (is (= :ad-template-output-interface-conflict
+           (try (compile-scalar-ports
+                 {:grads-fn (fn [ctx _ _ dy _] [ctx [dy dy]])} tags 'dy)
+                nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (deftest intermediate-expression-facts-reach-subsequent-call-selection
   (let [[template _] (tmpl/resolve-template 'raster.dl.loss/mse-loss)
@@ -55,8 +120,9 @@
         call (list 'raster.dl.loss/mse-grad pred target 'scale 'count)
         resolve-bindings
         (fn [prefix]
-          (first (#'tmpl/stamp-emitted-bindings
-                   (into prefix [gradient call]) [pred target] [gradient nil])))]
+          (first (#'tmpl/close-template-output-ports
+                   (into prefix [gradient call]) [pred target] [gradient nil]
+                   (:gensym-fn (make-test-ctx)))))]
     (is (= '.invk (first (last (resolve-bindings
                                 ['count '(clojure.core/long n)
                                  'scale '(clojure.core/double dy)])))))
@@ -240,20 +306,23 @@
           [_ grad-syms] (tmpl/instantiate-template-ctx template [x y] nil dy (make-test-ctx))]
       (is (= '[doubles doubles] (mapv tag-of grad-syms)))))
 
-  (testing "unresolvable-but-tagged emission stamps the call form itself"
-    ;; min/max emit (if (<= ...) dy 0.0) — no deftm call to resolve, but the
-    ;; grad binding carries Π and the census/downstream read the LHS tag.
+  (testing "conditional scalar ports are projected rather than labeled as converted"
     (let [[template _] (tmpl/resolve-template 'Math/min)
           x  (tagged 'x0 'double)
           y  (tagged 'y0 'double)
           dy (tagged 'dy0 'double)
           [ctx grad-syms] (tmpl/instantiate-template-ctx template [x y] nil dy (make-test-ctx))
-          pairs (partition 2 (:bindings ctx))]
+          pairs (partition 2 (:bindings ctx))
+          bindings (into {} (map vec pairs))
+          invoke (eval (list 'fn '[x0 y0 dy0]
+                             (list 'let* (:bindings ctx) grad-syms)))]
       (is (= '[double double] (mapv tag-of grad-syms)))
-      (doseq [[s rhs] pairs]
-        (is (= 'if (first rhs)))
-        (is (= (tag-of s) (tag-of rhs))
-            "emitted (non-deftm) call form carries the binding's tag"))))
+      (is (every? #(= 'if (first (second %))) (take 2 pairs)))
+      (doseq [port grad-syms]
+        (is (= 'let* (first (get bindings port))))
+        (is (= 'double (tag-of (get bindings port)))))
+      (is (= [1.5 0.0] (invoke 2.0 3.0 1.5)))
+      (is (= [0.0 2.5] (invoke 4.0 3.0 2.5)))))
 
   (testing "mixed known/⊥ primal args: only differentiable slots are tagged"
     ;; aget: (arr idx) — d_arr gets Π(floats)=floats, idx slot grad is nil.
@@ -302,7 +371,7 @@
 ;; ================================================================
 ;; Phase 1d — external :grads-fn registration sites mint tagged syms
 ;; (dl/nn, dl/array-ops, dl/attention, raster.nn) at the mint site,
-;; independent of the positional net in stamp-emitted-bindings.
+;; independent of output-port closure in close-template-output-ports.
 ;; ================================================================
 
 (defn- instantiate

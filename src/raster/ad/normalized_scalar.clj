@@ -119,6 +119,15 @@
       (fail! :ad-normalized-operation {:expression expression :operation operation}))
     (assoc call :template (if unary? forward-template template)
            :template-identity (if unary? forward-owner template-identity)
+           ;; Template arguments cross out of the typed program here. Retain
+           ;; their owning value declarations, not desired gradient-port tags.
+           :arguments (mapv (fn [argument]
+                              (if-let [dt (expression-dtype values argument)]
+                                (let [retained (:raster.type/tag (meta argument))]
+                                  (when (and retained (not= retained (tag dt)))
+                                    (fail! :ad-normalized-value-declaration
+                                           {:argument argument :declared (tag dt) :retained retained}))
+                                  (tagged argument dt)) argument)) arguments)
            :canonical (if unary? :nonlinear-unary canonical) :cast-tag cast-tag)))
 
 (defn- equation-expression [equation]

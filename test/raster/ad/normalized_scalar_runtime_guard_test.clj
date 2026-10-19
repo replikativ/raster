@@ -27,6 +27,20 @@
 (def ^:dynamic receiver nil)
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+
+(deftest template-arguments-retain-the-owning-programs-declarations
+  (let [value (av/tensor {:dtype :double :shape []})
+        reference (with-meta 'x {:tag 'Object})
+        call (#'normalized/call! {'x value} (list 'raster.numeric/* reference reference))]
+    (is (= '[double double] (mapv #(-> % meta :raster.type/tag) (:arguments call))))
+    (is (= '[Object Object] (mapv #(-> % meta :tag) (:arguments call))))
+    (is (= {:tag 'Object} (meta reference)))
+    (is (= :ad-normalized-value-declaration
+           (reason #(#'normalized/call!
+                     {'x value}
+                     (list 'raster.numeric/*
+                           (with-meta 'x {:raster.type/tag 'float}) reference)))))))
+
 (defn- constructors []
   [[#(reverse/value+grad #'public/square :representation :normalized-scalar)
     [3.0] [9.0 6.0] #'reverse/make-runtime-value+grad-fn]

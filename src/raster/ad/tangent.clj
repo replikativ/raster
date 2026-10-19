@@ -146,12 +146,12 @@
     (let [tag (descriptor/cast-result-tag (descriptor/semantic-op expression))]
       (when (contains? scalar-tag->dtype tag) tag))))
 
-(defn- expr-manifest-tag
+(defn ^:no-doc scalar-value-tag
   "The statically KNOWN scalar tag of an IR expression — carried or manifest,
   never guessed from the target primal: a carried :raster.type/tag stamp,
   explicit cast, literal, or the approved optional sum's retained result facet.
   nil when the expression's type is not statically known."
-  ([expr] (expr-manifest-tag expr {}))
+  ([expr] (scalar-value-tag expr {}))
   ([expr binding-map]
    (letfn [(known-tag [expr seen]
              (or (cond
@@ -195,7 +195,7 @@
   ([tag cotangent-expr {:keys [materialized? binding-map]}]
   (let [{:keys [kind dtype]} (tangent-kind tag)]
     (if (= kind :scalar)
-      (let [ct (tangent-kind (expr-manifest-tag cotangent-expr binding-map))
+      (let [ct (tangent-kind (scalar-value-tag cotangent-expr binding-map))
             cast-tag (case dtype :float 'float :double 'double)
             cast-op (symbol "clojure.core" (name cast-tag))]
         (cond

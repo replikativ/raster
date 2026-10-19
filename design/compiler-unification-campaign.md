@@ -275,7 +275,7 @@ forward-failure control explicitly asserts invoked AOT status and passes 1 test 
 Reviewed next repair: close every scalar template output at the shared
 `instantiate-template-ctx` boundary, for static and handwritten rules alike.
 Keep actual RHS dtype evidence separate from the desired input tangent-space
-declaration. Current `stamp-emitted-bindings` creates circular evidence by stamping
+declaration. The former `stamp-emitted-bindings` created circular evidence by stamping
 the desired LHS tag onto the RHS and publishing `(or desired inferred)` as its
 actual dtype. Preserve independently established intermediate/array declarations,
 but do not feed an unfulfilled scalar output declaration into its own inference.
@@ -288,7 +288,25 @@ not mutation of that shared source's metadata. Keep kernel/SOAC RHSs flat.
 Acceptance includes the four existing Float laws, checked overflow/rounding,
 nil preservation, shared mixed-target outputs, static/custom rules and nested AD.
 This is a producer-contract repair, not per-operation dispatch or a change to
-AD algebra. It is planned, not yet implemented or qualified.
+AD algebra. The local implementation replaces that stamping path with
+`close-template-output-ports`, sharing the existing scalar projection's retained
+value-evidence helper. Dispatch inference may widen conditional branches; it
+therefore remains distinct from exact dtype evidence used to elide conversion.
+The normalized scalar owner also transports its existing argument declarations
+into template calls, with a conflict refusal rather than silent metadata override.
+Contradictory shared scalar/array or distinct-array-dtype ports refuse; mixed
+Float/Double scalar ports receive independent projections. No global tags or
+existing array/intermediate declarations are erased.
+
+Warm qualification passes nine affected namespaces (131 tests / 900 assertions)
+and five existing Float/HVP/derivative-pipeline tests (83 assertions). Added
+declaration-conflict and incompatible-interface controls pass in a subsequent
+four-namespace gate (46 tests / 410 assertions). These are source/JVM results,
+not device/performance evidence. Final fresh-JVM qualification passes nine affected
+namespaces (133 tests / 906 assertions) and five Float/HVP/derivative-pipeline
+tests (83 assertions): 138 tests / 989 assertions total. Static review found no
+confirmed remaining bounded defect. Integration CI qualification remains required;
+the draft PR is not ready to merge. No source arithmetic contract was relaxed.
 
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
