@@ -720,8 +720,8 @@
     (collective-combine/validate! algebra 37 emitted)
     (get-in emitted [:graph :nodes 0 :operation])))
 
-(defn emit-target!
-  [root target]
+(defn- emit-target-with-public!
+  [root target public-artifacts]
   (let [{:keys [suffix descriptor]} (get targets target)
         dialect (gpu-target/kernel-body-c-dialect descriptor)
         _ (when-not dialect
@@ -750,8 +750,7 @@
                    plan pipelined-schedule dialect descriptor)
         swizzled-pipelined (attention-emit/emit-fp16-pipelined
                             plan swizzled-pipelined-schedule dialect descriptor)
-        tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
-        public-artifacts (equation-first-artifacts target descriptor)]
+        tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)]
     (into [(write-artifact! directory suffix "reference-attention" reference)
            (write-artifact! directory suffix "typed-collective-sum"
                             (collective-combine-artifact '+ 0.0 dialect descriptor))
@@ -1027,9 +1026,26 @@
               (write-artifact! directory suffix (str "tiled-" index) artifact))
             (executable/artifacts tiled))))))
 
+(defn emit-target!
+  [root target]
+  (emit-target-with-public! root target
+                            (equation-first-artifacts target (get-in targets [target :descriptor]))))
+
+(defn emit-all!
+  "Check both public target groups before private fixture generation can fail.
+   The enclosing report preserves their refusals if later generation also fails."
+  [root]
+  (report/collect!
+   #(let [public-groups (mapv (fn [target]
+                                [target (equation-first-artifacts
+                                         target (get-in targets [target :descriptor]))])
+                              [:cuda :hip])]
+      (mapcat (fn [[target artifacts]] (emit-target-with-public! root target artifacts))
+              public-groups))))
+
 (defn -main
   [& [root]]
   (let [root (or root "gpu-compile-gates")
-        files (report/collect! #(mapcat (fn [target] (emit-target! root target)) [:cuda :hip]))]
+        files (emit-all! root)]
     (doseq [file files]
       (println file))))

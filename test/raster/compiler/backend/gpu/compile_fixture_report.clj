@@ -52,12 +52,27 @@
   (if *report*
     (vec (emit!))
     (binding [*report* (atom {:passed 0 :failures [] :first-error nil})]
-    (let [artifacts (vec (emit!))
+    (let [outcome (try {:artifacts (vec (emit!))}
+                       (catch Exception error
+                         (when (or (abort-cause? error)
+                                   (.isInterrupted (Thread/currentThread)))
+                           (throw error))
+                         {:generation-error error}))
+          {:keys [artifacts generation-error]} outcome
           {:keys [passed failures first-error]} @*report*]
       (when (seq failures)
-        (throw (ex-info (str (count failures) " public GPU compile fixtures failed")
-                        {:reason :gpu-public-fixture-failures
-                         :attempted (+ passed (count failures)) :passed passed
-                         :failures failures}
-                        first-error)))
+        (let [aggregate (ex-info (str (count failures) " public GPU compile fixtures failed"
+                                      (when generation-error "; fixture generation also failed"))
+                                 (cond-> {:reason :gpu-public-fixture-failures
+                                          :attempted (+ passed (count failures)) :passed passed
+                                          :failures failures}
+                                   generation-error
+                                   (assoc :generation-failure
+                                          (merge {:exception (.getName (class generation-error))}
+                                                 (select-keys (ex-data generation-error) [:reason :pass]))))
+                                 first-error)]
+          (when (and generation-error (not (identical? first-error generation-error)))
+            (.addSuppressed aggregate generation-error))
+          (throw aggregate)))
+      (when generation-error (throw generation-error))
       artifacts))))

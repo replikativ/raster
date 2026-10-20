@@ -105,3 +105,53 @@
            (mapv :reason (:failures (ex-data error)))))
     (is (= 3 (:attempted (ex-data error))))
     (is (= 1 (:passed (ex-data error))))))
+
+(deftest later-generation-failure-preserves-collected-public-refusals
+  (let [public-error (ex-info "public refusal" {:reason :public-refusal})
+        generation-error (ex-info "private generation refusal" {:reason :private-refusal})
+        error (try
+                (report/collect!
+                 #(do (report/attempt! {:target :cuda} (fn [] (throw public-error)))
+                      (throw generation-error)))
+                nil (catch Exception error error))]
+    (is (= :gpu-public-fixture-failures (:reason (ex-data error))))
+    (is (= [:public-refusal] (mapv :reason (:failures (ex-data error)))))
+    (is (= :private-refusal (get-in (ex-data error) [:generation-failure :reason])))
+    (is (identical? public-error (.getCause error)))
+    (is (= [generation-error] (vec (.getSuppressed error)))))
+  (let [generation-error (ex-info "private only" {:reason :private-refusal})]
+    (is (identical? generation-error
+                    (try (report/collect! #(throw generation-error))
+                         nil (catch Exception error error)))))
+  (let [cancelled (ex-info "cancelled generation" {} (InterruptedException.))]
+    (is (identical? cancelled
+                    (try
+                      (report/collect!
+                       #(do (report/attempt! {} (fn [] (throw (ex-info "refused" {}))))
+                            (throw cancelled)))
+                      nil (catch Exception error error))))))
+
+(deftest both-public-target-groups-precede-private-generation
+  (require 'raster.compiler.backend.gpu.kernel-body-compile-fixtures)
+  (let [fixture-ns 'raster.compiler.backend.gpu.kernel-body-compile-fixtures
+        public-var (ns-resolve fixture-ns 'equation-first-artifacts)
+        private-var (ns-resolve fixture-ns 'emit-target-with-public!)
+        emit-all (ns-resolve fixture-ns 'emit-all!)
+        seen (atom [])
+        error
+        (with-redefs-fn
+          {public-var (fn [target _]
+                        (swap! seen conj [:public target])
+                        (report/collect!
+                         #(vector (report/attempt!
+                                   {:target target :function :test-fixture}
+                                   (fn [] (throw (ex-info "public refusal" {:reason :public-refusal})))))))
+           private-var (fn [_ target _]
+                         (swap! seen conj [:private target])
+                         (throw (ex-info "private refusal" {:reason :private-refusal})))}
+          #(try (emit-all "unused-test-root")
+                nil (catch Exception error error)))]
+    (is (= [[:public :cuda] [:public :hip] [:private :cuda]] @seen))
+    (is (= 2 (:attempted (ex-data error))))
+    (is (= [:cuda :hip] (mapv :target (:failures (ex-data error)))))
+    (is (= :private-refusal (get-in (ex-data error) [:generation-failure :reason])))))

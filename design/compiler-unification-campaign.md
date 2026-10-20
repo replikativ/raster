@@ -79,6 +79,16 @@ pass 30 assertions; a real six-compilation smoke emits four successful workloads
 reports the checked-exponential refusal on both targets and reaches the later
 Long-state workload on each. This improves feedback, not vendor qualification;
 private body-fixture generation and actual vendor compilation retain their own gates.
+The first aggregate CI run (`e8ef4837`, emission 32706) exposed a phase-order gap:
+a private segmented-reduction conversion refusal escaped after CUDA's public group,
+hiding its accumulated failures and preventing HIP's public group from running.
+Both public groups are now realized before private generation. If private generation
+then fails, the public aggregate remains primary and retains the independent private
+failure as suppressed evidence; cancellation/VM failures still abort immediately.
+Seven reporting controls pass 41 assertions. Holding both artifact vectors is an
+explicit CI-memory tradeoff, not permission to omit workloads. At `e8ef4837`, setup
+and build passed; emission 32706, unit 32709 and OpenCL 32710 all failed. All eight
+campaign obligations and the unchanged training/source-admission work remain open.
 
 The latest normalization correction replaces recursive reduction discovery and
 equality substitution with an occurrence-specific strict evaluation context.
