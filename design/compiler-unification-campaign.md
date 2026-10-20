@@ -59,6 +59,17 @@ The unchanged hardware-free topology/cost/compute/storage/math-request gate fres
 passes 84 tests / 660 assertions. It does not establish device transport or measured
 fabric performance, and items 6–8 retain their remaining integration obligations.
 
+The original bytecode reduction observer now supplies a shared normal-return
+`:result-fact` from its authenticated carry-load/exit conversion. Float/Double
+carries remain an **Object** result with an exact present builtin payload at the
+divergent-if boxing boundary; neither the carry tag nor its slot is a primitive
+region-return proof. Owned AD uses this same fact instead of duplicating that
+boxing-path test. Initializer/count/recurrence/read/replay obligations are unchanged.
+The affected source-owner and runtime/AOT AD gates pass 43 tests / 559 assertions,
+including actual Float MSE, empty domains, malformed/copied observations and stale
+definitions. This is original-region completion evidence, not permission to copy
+it onto alpha-renamed/generated training source or erase a box with arbitrary uses.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;
@@ -89,6 +100,14 @@ Seven reporting controls pass 41 assertions. Holding both artifact vectors is an
 explicit CI-memory tradeoff, not permission to omit workloads. At `e8ef4837`, setup
 and build passed; emission 32706, unit 32709 and OpenCL 32710 all failed. All eight
 campaign obligations and the unchanged training/source-admission work remain open.
+The `4203ffcc` emission run (32714) now confirms both public groups were attempted:
+172 attempts, 140 passed, 32 refused, plus the separately preserved private
+segmented-reduction conversion failure. Repeated target pairs expose missing
+target graph lowering (norms, quantizers, RoPE and attention), checked map-stage
+conversions, a dense-backward allocation proof and a contraction specialization
+owner/dtype mismatch. These are an actionable debt inventory, not successful
+vendor-toolchain execution. Unit 32713 also failed; OpenCL 32717 was still running
+when this checkpoint was written.
 
 The latest normalization correction replaces recursive reduction discovery and
 equality substitution with an occurrence-specific strict evaluation context.

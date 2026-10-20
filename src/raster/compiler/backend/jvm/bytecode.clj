@@ -697,10 +697,27 @@
                                           {:status :ambiguous} record))))
         expanded))))
 
+(defn- reduction-result-fact
+  "Normal-return fact for the observed carry load and divergent-if boxing path.
+   A primitive slot is not a primitive region result. Unknown exit routes abstain."
+  [exit]
+  (let [carry-type (get-in exit [:local :type])
+        payload (case carry-type :float Float :double Double nil)]
+    (when (and payload (= :ref (:result-type exit))
+               (or (= carry-type (:input-type exit))
+                   ;; emit-result-form may have boxed the primitive load already;
+                   ;; this is legal only in its explicitly observed Object context.
+                   (and (= :ref (:input-type exit))
+                        (true? (get-in exit [:context :object-result?])))))
+      {:carrier Object :presence :present :builtin-class payload})))
+
 (defn ^:no-doc retained-reduction-emission
   "Collect actual expansion/slot/backedge observations for an ORIGINAL region.
    This is not permission to reparse source or differentiate arbitrary loops.
-   A consumer still owes count/init/control, read, replay and step proofs."
+   :result-fact, when present, describes only the actual normal-return carrier
+   and boxed FP payload. It proves neither successful evaluation nor numerical
+   equivalence to another reduction. A consumer still owes count/init/control,
+   read, replay and step proofs, and must retain this emission's source owner."
   [emission original]
   (let [token (::reduction-occurrence (meta original))
         expansion (get (:reduction-expansions emission) token)
@@ -730,7 +747,9 @@
                (some? (:label-id loop-entry))
                (identical? (:label-id loop-entry) (:label-id backedge)))
       (me/assert-emission-inputs-current! emission)
-      {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge :exit exit})))
+      (let [result-fact (reduction-result-fact exit)]
+        (cond-> {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge :exit exit}
+          result-fact (assoc :result-fact result-fact))))))
 
 (defn- retain-binding-context! [ctx binding-count index binder initializer before after]
   (when-let [token (::binding-scope-occurrence ctx)]

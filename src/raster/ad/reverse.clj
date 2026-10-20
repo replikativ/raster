@@ -6623,7 +6623,6 @@
                     [_ _ init-source _ bound-source] expression
                     bound (:bound observed)
                     init (get-in observed [:loop :initializers 1])
-                    exit (:exit observed)
                     bound-facts (get-in env [bound-source :facts])]
                 ;; First integration: source primitive count/local and primitive
                 ;; Double seed only. Compound seeds/counts need their own entry
@@ -6636,14 +6635,12 @@
                                (= bound-source (second (:initializer bound)))
                                (= :double (:input-type init) (:completed-type init) (get-in init [:after :type]))
                                (= init-source (:initializer init))
-                               ;; Actual canonical loop exit loads the Double
-                               ;; carry, then boxes it at the divergent-if merge.
-                               ;; Never infer physical result from logical dtype.
-                               (= :double (get-in exit [:local :type]))
-                               (= :ref (:result-type exit))
-                               (or (= :double (:input-type exit))
-                                   (and (= :ref (:input-type exit))
-                                        (get-in exit [:context :object-result?])))
+                               ;; The original emitter owns the carry-load/boxing
+                               ;; correspondence; logical Double is not a primitive
+                               ;; region result. Keep that completion fact separate
+                               ;; from the initializer and replay proofs above.
+                               (= {:carrier Object :presence :present :builtin-class Double}
+                                  (:result-fact observed))
                                (or (instance? Double init-source)
                                    (and (symbol? init-source)
                                         (not= init-source (nth expression 3))

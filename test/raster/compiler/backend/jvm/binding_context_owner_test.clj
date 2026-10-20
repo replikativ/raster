@@ -4,6 +4,7 @@
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as n]
             [raster.par :as par]
+            [raster.dl.loss :as loss]
             [raster.compiler.core.util :as util]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
@@ -141,6 +142,60 @@
     (is (some? observed))
     (is (= [:int :float] (mapv #(get-in observed [:loop :locals % :type])
                               (get-in observed [:loop :variables]))))))
+
+(deftest reduction-completion-retains-the-object-carrier-and-exact-fp-payload
+  (doseq [[function payload] [[#'weighted-reduction Double] [#'float-reduced Float]]]
+    (let [emission (emitted function)
+          source (first (vals (:reduction-catalog emission)))
+          observed (bytecode/retained-reduction-emission emission source)
+          witness (get-in observed [:expansion :witness])
+          exit-path [:reduction-contexts [witness :exit]]]
+      (is (= {:carrier Object :presence :present :builtin-class payload}
+             (:result-fact observed)))
+      ;; These are malformed/copy observations, not alternative source routes.
+      ;; Neither a logical annotation nor an impossible boxing path creates facts.
+      (doseq [changed [(assoc-in emission (conj exit-path :result-type) :double)
+                       (assoc-in emission (conj exit-path :input-type) :long)
+                       (-> emission
+                           (assoc-in (conj exit-path :input-type) :ref)
+                           (assoc-in (conj exit-path :context :object-result?) false))]]
+        (is (nil? (:result-fact (bytecode/retained-reduction-emission changed source)))))
+      (is (nil? (:result-fact
+                 (bytecode/retained-reduction-emission
+                  emission (with-meta (apply list source) (meta source))))))))
+  (doseq [count [0 1 3]]
+    (is (instance? Double (weighted-reduction (double-array [1.0 2.0 3.0]) 2.0 count)))
+    (is (instance? Float (float-reduced (float-array [1.0 2.0 3.0]) count)))))
+
+(deftest mse-source-completion-does-not-confuse-the-float-checkpoint-and-double-quotient
+  (let [source-var (core/resolve-deftm-var #'loss/mse-loss {:dtype :float})
+        receiver (ns-resolve (.ns source-var) (symbol (str (:name (meta source-var)) "-impl")))
+        _ (core/ensure-bytecode-implementation! receiver)
+        emission (:raster.core/bytecode-emission (meta receiver))
+        source (first (vals (:reduction-catalog emission)))
+        observed (bytecode/retained-reduction-emission emission source)]
+    (is (some? observed))
+    (is (= {:carrier Object :presence :present :builtin-class Float}
+           (:result-fact observed)))
+    (is (instance? Double (loss/mse-loss (float-array [4096.0 1.0 1.0 1.0]) (float-array 4) 4)))
+    (is (Double/isNaN (double (loss/mse-loss (float-array 0) (float-array 0) 0))))
+    ;; Completion is conditional: bad reads must still fail in source order.
+    (is (thrown? ArrayIndexOutOfBoundsException
+                 (loss/mse-loss (float-array [1.0]) (float-array 0) 1)))))
+
+(deftest reduction-completion-keeps-the-historical-definition-guard
+  (let [emission (emitted #'weighted-reduction)
+        source (first (vals (:reduction-catalog emission)))
+        dependency (:var (first (:dependency-snapshots emission)))
+        metadata (meta dependency)]
+    (is (var? dependency))
+    (try
+      (alter-meta! dependency assoc ::completion-probe (Object.))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (bytecode/retained-reduction-emission emission source)))
+      (finally (reset-meta! dependency metadata)))
+    (is (= {:carrier Object :presence :present :builtin-class Double}
+           (:result-fact (bytecode/retained-reduction-emission emission source))))))
 
 (deftest observed-reduction-retains-count-before-initializer-order
   (doseq [cnt [-1 0 2]]
