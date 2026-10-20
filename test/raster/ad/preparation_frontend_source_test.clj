@@ -103,6 +103,21 @@
       (is (identical? prepared (reverse/assert-prepared-program-source! prepared)))
       (is (= expected (compiled 3.0 4.0))))))
 
+(deftest prepared-compilation-retains-history-in-an-enclosing-owner
+  (let [prepared (reverse/prepare-value+grad #'squared-loss [0])
+        parent (atom {:static [] :values []})]
+    (binding [entry/*emission-inputs* parent]
+      (is (= [9.0 6.0] (result prepared 3.0))))
+    (is (seq (:definition-proofs @parent)))
+    (is (entry/assert-definition-inputs-current! @parent))
+    (let [revision (templates/registry-revision) before @parent]
+      (with-redefs [templates/registry-revision (constantly (inc revision))]
+        (binding [entry/*emission-inputs* parent]
+          (is (= :ad-prepared-program-stale-rules
+                 (try (reverse/adopt-prepared-program-inputs! prepared) nil
+                      (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+      (is (identical? before @parent)))))
+
 (deftest cold-preparation-observes-the-producer-without-running-its-numeric-body
   (let [source (core/resolve-deftm-var #'cold-squared-loss)
         receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))

@@ -90,6 +90,24 @@
   (and (var-reference-current? snapshot)
        (var-value-current? snapshot)))
 
+(defn- retain-definition-observation [inputs v snapshot]
+  (if-let [prior (get-in inputs [:definition-proofs v])]
+    (do
+      (when-not (same-var-snapshot? prior snapshot)
+        (throw (ex-info "definition changed while deriving a compiler proof"
+                        {:reason :unstable-definition-proof-input :source v})))
+      (let [updated (update prior :lookups into (:lookups snapshot))]
+        (-> inputs
+            (assoc-in [:definition-proofs v] updated)
+            ;; Emission artifacts serialize :values, not the request-local
+            ;; proof index. Preserve unrelated entries and every lookup edge.
+            (update :values
+                    (fn [values]
+                      (mapv #(if (identical? prior %) updated %) values))))))
+    (-> inputs
+        (assoc-in [:definition-proofs v] snapshot)
+        (update :values (fnil conj []) snapshot))))
+
 (defn observe-definition-input!
   "Retain a definition actually consulted by a normalization proof.
    Return false without a collecting owner: optional analysis must then decline.
@@ -98,24 +116,7 @@
   (when *emission-inputs*
     (let [snapshot (assoc (emission-definition-snapshot v)
                           :lookups #{[lookup-ns lookup-symbol]})]
-      (swap! *emission-inputs*
-             (fn [inputs]
-               (if-let [prior (get-in inputs [:definition-proofs v])]
-                 (do
-                   (when-not (same-var-snapshot? prior snapshot)
-                     (throw (ex-info "definition changed while deriving a compiler proof"
-                                     {:reason :unstable-definition-proof-input :source v})))
-                   (let [updated (update prior :lookups into (:lookups snapshot))]
-                     (-> inputs
-                         (assoc-in [:definition-proofs v] updated)
-                         ;; Emission artifacts serialize :values, not the
-                         ;; request-local proof index. Retain every lookup edge.
-                         (update :values
-                                 (fn [values]
-                                   (mapv #(if (identical? prior %) updated %) values))))))
-                 (-> inputs
-                     (assoc-in [:definition-proofs v] snapshot)
-                     (update :values (fnil conj []) snapshot)))))
+      (swap! *emission-inputs* retain-definition-observation v snapshot)
       true)))
 
 (defn observe-source-body-input!
@@ -161,6 +162,31 @@
           (throw (ex-info "compiler proof owner changed during optional analysis"
                           {:reason :unstable-definition-proof-input}))))
       result)))
+
+(defn adopt-definition-inputs!
+  "Import a producer's retained observations into an enclosing compiler owner.
+   Caller authenticates the producer; this map alone is not a certificate.
+   Never reobserve definitions or replace an earlier observation. Preserve all
+   lookup edges and unclosed imports. Without a collector, abstain."
+  [historical]
+  (when *emission-inputs*
+    (let [owner *emission-inputs*
+          prior-inputs @owner
+          _ (assert-definition-inputs-current! historical)
+          _ (assert-definition-inputs-current! prior-inputs)
+          merged
+          (reduce-kv retain-definition-observation
+                     prior-inputs (or (:definition-proofs historical) {}))
+          merged (reduce (fn [inputs key]
+                           (if-let [facts (seq (get historical key))]
+                             (update inputs key (fnil into #{}) facts)
+                             inputs))
+                         merged [:source-body-inputs :unclosed-source-imports])]
+      (assert-definition-inputs-current! merged)
+      (when-not (compare-and-set! owner prior-inputs merged)
+        (throw (ex-info "compiler proof owner changed during historical adoption"
+                        {:reason :unstable-definition-proof-input})))
+      true)))
 
 (defn prepare-pending-definition-inputs!
   "Prepare observed pending JIT receivers before publishing a long-lived artifact.

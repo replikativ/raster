@@ -125,6 +125,17 @@ separate obligations; the inliner still records prepared reverse AD as unclosed.
 At `903c6061`, setup/build passed but unit, emission and OpenCL gates failed.
 The preparation gate does not supersede those failures.
 
+Prepared reverse AD now adopts its authenticated indexed definition history into
+an enclosing compilation, using the same first-observation merge as ordinary
+definition discovery. Adoption never resnapshots, preserves unrelated serialized
+inputs, unions lookup/source-import edges and commits once or rejects a competing
+collector update. Legacy compilation and inlining both use this handoff. The
+reviewed affected gate passes 70 tests / 354 assertions, including stale parent
+and child histories, alias removal after handoff and unchanged training refusal.
+This is not adoption of static-artifact history or template-epoch authority;
+those producer guards and the actual semantic projection must still reach the
+consumer before the prepared import can be closed. No fallback was restored.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;

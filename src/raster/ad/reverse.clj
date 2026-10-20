@@ -5918,6 +5918,14 @@
                           {:reason :ad-prepared-program-stale-rules})))
         prepared))))
 
+(defn ^:no-doc adopt-prepared-program-inputs!
+  "Retain authenticated preparation history in the enclosing compiler owner.
+   This does not close the generated program's portable/execution projection."
+  [prepared]
+  (when (assert-prepared-program-source! prepared)
+    (let [^GeneratedPreparationOwner owner (::generated-program-owner prepared)]
+      (method-entry/adopt-definition-inputs! (.-observations owner)))))
+
 (defn- freeze-generated-preparation [program frontend template-revision parameter-plan]
   (if-not frontend
     program
@@ -7100,7 +7108,7 @@
   (if-not (contains? prepared :source-owner)
     ;; Legacy public source projection only. Never rewrite an owned program:
     ;; its original operations and completion order belong to its producer.
-    (let [_ (assert-prepared-program-source! prepared)
+    (let [_ (adopt-prepared-program-inputs! prepared)
           body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
                                      (first walked-body))
           compile! #(eval (value-completion/project-to-jvm-source (runtime-function-form params body)))

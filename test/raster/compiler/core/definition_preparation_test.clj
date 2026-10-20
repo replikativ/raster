@@ -9,6 +9,98 @@
 (defn- observe! [v]
   (entry/observe-definition-input! v (:ns (meta v)) (:name (meta v))))
 
+(defn- observed-inputs [v]
+  (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+    (observe! v)
+    @entry/*emission-inputs*))
+
+(deftest historical-adoption-retains-first-observations-and-all-lookup-edges
+  (let [historical (-> (observed-inputs #'input-a)
+                       (assoc :source-body-inputs #{[#'input-a :var]}
+                              :unclosed-source-imports #{[:test-unclosed #'input-a]}))
+        sentinel (Object.)
+        parent (atom (-> (observed-inputs #'input-b)
+                         (update :values conj sentinel)
+                         (assoc :unclosed-source-imports #{[:parent-unclosed]})))
+        own-ns (:ns (meta #'input-a))
+        qualified (symbol (str (ns-name own-ns)) "input-a")]
+    (binding [entry/*emission-inputs* parent]
+      (entry/observe-definition-input! #'input-a (the-ns 'clojure.core) qualified)
+      (let [prior (get-in @parent [:definition-proofs #'input-a])]
+        (with-redefs [entry/emission-definition-snapshot
+                      (fn [_] (throw (AssertionError. "historical adoption reobserved a definition")))]
+          (is (true? (entry/adopt-definition-inputs! historical))))
+        (let [adopted (get-in @parent [:definition-proofs #'input-a])]
+          (is (identical? (:value prior) (:value adopted)))
+          (is (identical? (:metadata prior) (:metadata adopted)))
+          (is (= #{[(the-ns 'clojure.core) qualified]
+                   [(:ns (meta #'input-a)) 'input-a]} (:lookups adopted)))
+          (is (= 3 (count (:values @parent))))
+          (is (some #(identical? sentinel %) (:values @parent)))
+          (is (some #(identical? adopted %) (:values @parent)))
+          (is (= (:source-body-inputs historical) (:source-body-inputs @parent)))
+          (is (= (conj (:unclosed-source-imports historical) [:parent-unclosed])
+                 (:unclosed-source-imports @parent))))))))
+
+(deftest historical-adoption-does-not-overwrite-a-competing-owner-update
+  (let [historical (observed-inputs #'input-a)
+        parent (atom {:static [] :values []})
+        validate entry/assert-definition-inputs-current!
+        calls (atom 0)]
+    (binding [entry/*emission-inputs* parent]
+      (with-redefs [entry/assert-definition-inputs-current!
+                    (fn [inputs]
+                      (let [result (validate inputs)]
+                        (when (= 3 (swap! calls inc))
+                          (swap! parent assoc :another-input true))
+                        result))]
+        (is (= :unstable-definition-proof-input
+               (try (entry/adopt-definition-inputs! historical) nil
+                    (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+    (is (:another-input @parent))
+    (is (empty? (:definition-proofs @parent)))))
+
+(deftest stale-historical-adoption-cannot-refresh-or-partially-update-the-parent
+  (let [historical (observed-inputs #'input-a)
+        parent (atom (observed-inputs #'input-b))
+        before @parent]
+    (binding [entry/*emission-inputs* parent]
+      (with-redefs [input-a (fn [] ::changed)]
+        (is (= :stale-definition-proof-input
+               (try (entry/adopt-definition-inputs! historical) nil
+                    (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+    (is (identical? before @parent))))
+
+(deftest adoption-does-not-refresh-a-stale-parent-with-newer-history
+  (let [parent (atom (observed-inputs #'input-a)) before @parent]
+    (with-redefs [input-a (fn [] ::changed)]
+      (let [newer (observed-inputs #'input-a)]
+        (binding [entry/*emission-inputs* parent]
+          (is (= :stale-definition-proof-input
+                 (try (entry/adopt-definition-inputs! newer) nil
+                      (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
+    (is (identical? before @parent))))
+
+(deftest historical-adoption-abstains-without-an-owner
+  (binding [entry/*emission-inputs* nil]
+    (is (nil? (entry/adopt-definition-inputs! (observed-inputs #'input-a))))))
+
+(deftest adopted-lookup-edges-remain-required-after-handoff
+  (let [scope (create-ns (gensym "raster.adoption-lookup."))
+        historical (atom {:static [] :values []})
+        parent (atom {:static [] :values []})]
+    (try
+      (binding [*ns* scope] (alias 'chosen (ns-name (:ns (meta #'input-a)))))
+      (binding [entry/*emission-inputs* historical]
+        (entry/observe-definition-input! #'input-a scope 'chosen/input-a))
+      (binding [entry/*emission-inputs* parent]
+        (is (true? (entry/adopt-definition-inputs! @historical))))
+      (ns-unalias scope 'chosen)
+      (is (= :stale-definition-proof-input
+             (try (entry/assert-definition-inputs-current! @parent) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest refused-optional-analysis-does-not-retain-speculative-dependencies
   (let [owner (atom {:static [] :values []})]
     (binding [entry/*emission-inputs* owner]
