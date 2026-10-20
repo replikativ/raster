@@ -35,9 +35,10 @@ The next vertical must keep these obligations separate:
 
 Implementation/landing sequence:
 
-0. **Establish the gate and baseline.** The exact PR #1539 head `11852323` currently
-   has setup/build success and failing unit, emission and OpenCL checks. It remains
-   draft and unqualified; absent vendor successes cannot be assumed. Classify those
+0. **Establish the gate and baseline.** At the planning checkpoint, exact PR #1539
+   head `11852323` had setup/build success and failing unit, emission and OpenCL checks.
+   The evolving branch remains draft and unqualified; each later head needs its own
+   qualification, and absent vendor successes cannot be assumed. Classify those
    failures and repair affected gates before enabling new admission. Strengthen the
    existing training oracle's paired `map` comparison: unequal lengths must fail,
    and this finite fixture must explicitly reject nonfinite expected/actual values.
@@ -217,6 +218,31 @@ evaluation obligation. This is not closure of the AD-generated training reductio
 its selected calls and other non-core shapes may still abstain. The fresh bounded
 REPL's affected scalar-region, physical-return and equation-first diagnostic suites
 pass 79 tests / 851 assertions. Full draft qualification remains open.
+
+The next physical-context review confirms that the first real training quotient
+still lacks an authenticated result-context relation for its imported/generated
+reduction. Audit whether that source occurrence is still directly owned and
+observable through `frontend-reduction-emission`; use its actual result fact only
+when the exact occurrence relation holds. An AD-generated or alpha-renamed source
+needs a relation established by its prepared producer, not syntax equality or a
+global guessed reduction-return rule. Preserve Object/Float at the quotient's
+source operand and the denominator's actual Double conversion. Only then may
+`checked-core-fp-evaluation` justify the enclosing Double arithmetic and existing
+singleton resident scheduling realize it. Object payload elimination additionally
+needs all uses/aliases closed. Original count/init/read/evaluation obligations and
+the larger prepared-AD semantic-import gate remain independent.
+
+Two warm, coverage-refused training observations after this slice took 1.361 and
+1.214 seconds (11 observed phases, SOAC transforms 268 and 209 ms). Both retained
+the same four scalar refusals and produced no conditional reduction summaries:
+the actual selected-call shape is deliberately still outside the first subset.
+These loaded-process samples establish neither speedup nor a successful training
+compile, and are not marketing cold-worker measurements.
+
+The shared loop-plan/JVM-consumer deduplication was also extracted onto clean main
+as PR #1545 for independent qualification. Review found unchanged slot joins and
+initializer coercions; arithmetic and unchanged loop-carrier suites pass 27 tests /
+634 assertions in the campaign REPL. CI remains the clean-process authority.
 
 This vertical advances original items 3 and 5 and validates parts of 6 and 7. It does
 not replace items 1, 2, 4 or 8, finish general AD migration/lifetimes, establish SOTA
