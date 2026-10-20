@@ -14,6 +14,19 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
+CI timing artifacts now also distinguish a completed runner invocation (which may
+have failing assertions) from an aborted load/report invocation. The existing
+`:outcomes` assertion/skip counters remain complete; each test retains at most
+eight small failure diagnostics with source location, exception class and
+keyword-only compiler reason/rule fields. Runtime compiler objects, inputs and
+formatted expected/actual values are not serialized. These additive fields keep
+the timing schema and planner inputs unchanged. Reporter tests cover unchanged
+events/counters, a real failing assertion, bounded samples, aborted loads and
+output/reporter failures. The process exit/native-crash gate remains authoritative:
+a completed diagnostic artifact alone is not a passing CI or coverage receipt.
+Exact-head b1d94dc5 still has failing unit and emission jobs; their failures remain
+open compiler/fixture obligations, not a new accepted baseline.
+
 The loop-carrier join and contextual Float-literal initializer plan now live in
 the shared source-arithmetic authority; JVM loop emission consumes that same plan.
 This extracts the existing implementation without changing slot selection or
