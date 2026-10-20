@@ -997,6 +997,7 @@
               (source-owner/assert-portable-source! prepared-body))
             ((requiring-resolve 'raster.ad.reverse/project-owned-value+grad-call) prepared-body args mode))
           (let [_ (source-owner/assert-portable-source! prepared-body)
+            _ ((requiring-resolve 'raster.ad.reverse/assert-prepared-program-source!) prepared-body)
             ;; This derived program can come from an earlier AD preparation.
             ;; Its caller's checked policy does not authenticate transitive
             ;; source history. Leave ordinary AD import unchanged, but record

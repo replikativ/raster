@@ -111,6 +111,20 @@ implementation. An earlier warm run hit anonymous-class collisions after backend
 reload; restarting only the owned bounded REPL removed those errors. This is not
 a whole-suite qualification or a fix for generated-program lifecycle ownership.
 
+The next preparation-only owner now seals the exact generated fields, normalized
+parameter plan, original frontend, immutable consumed-definition observations and
+AD template epoch. Generation and legacy compilation use the definition's source
+policy rather than the caller's policy. Altered fields (including symbol metadata),
+stale rules and rules changed during generation refuse. The affected gate passes
+39 tests / 220 assertions, including inactive checked conversions and selected
+parameter gradient slots. This owner is checked at preparation/compilation/import,
+not on every invocation. It does not close transitive imports or authenticate the
+legacy `alength` source rewrite as an execution projection. Historical adoption,
+benign JIT renewal semantics, structural domains and Float checkpoints remain
+separate obligations; the inliner still records prepared reverse AD as unclosed.
+At `903c6061`, setup/build passed but unit, emission and OpenCL gates failed.
+The preparation gate does not supersede those failures.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;

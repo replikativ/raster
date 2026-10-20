@@ -35,6 +35,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.call-boundary :as call-boundary]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.scalar-conversion :as conversion]
@@ -5891,6 +5892,47 @@
                    "globally unique.")
               {:var f-var :duplicates dups :kind :ad-gensym-counter-collision})))))
 
+(deftype ^:private GeneratedPreparationOwner [program frontend observations template-revision parameter-plan])
+
+(defn ^:no-doc assert-prepared-program-source!
+  "Guard the exact shared generated program and its original source history.
+   This does not close transitive imports, grant portability or prove a numeric
+   realization. Missing legacy ownership abstains; altered/stale ownership fails."
+  [prepared]
+  (when (contains? prepared ::generated-program-owner)
+    (let [owner (::generated-program-owner prepared)]
+      (when-not (instance? GeneratedPreparationOwner owner)
+        (throw (ex-info "generated AD preparation has no original producer"
+                        {:reason :ad-prepared-program-owner})))
+      (let [^GeneratedPreparationOwner owner owner
+            program (.-program owner)
+            frontend (.-frontend owner)]
+        (when-not (and (= (set (keys prepared)) (conj (set (keys program)) ::generated-program-owner))
+                       (every? (fn [[key value]] (identical? value (get prepared key))) program))
+          (throw (ex-info "generated AD program differs from its producer"
+                          {:reason :ad-prepared-program-mismatch})))
+        (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+        (method-entry/assert-definition-inputs-current! (.-observations owner))
+        (when-not (= (.-template-revision owner) (tmpl/registry-revision))
+          (throw (ex-info "generated AD rules changed after preparation"
+                          {:reason :ad-prepared-program-stale-rules})))
+        prepared))))
+
+(defn- freeze-generated-preparation [program frontend template-revision parameter-plan]
+  (if-not frontend
+    program
+    (do
+      (when-not (= template-revision (tmpl/registry-revision))
+        ;; Retry the whole producer, never attach the final epoch to mixed rules.
+        (throw (ex-info "AD rules changed during preparation"
+                        {:reason :stale-definition-proof-input :phase :reverse-ad-rules})))
+      (let [observations (select-keys @method-entry/*emission-inputs*
+                                     [:definition-proofs :source-body-inputs :unclosed-source-imports])
+            prepared (assoc program ::generated-program-owner
+                            (GeneratedPreparationOwner. program frontend observations
+                                                        template-revision parameter-plan))]
+        (assert-prepared-program-source! prepared)))))
+
 (defn- build-grad-walked-body
   "Build the AD-transformed walked body for a deftm var.
   Returns {:walked-body [form], :params [sym ...], :source-ns ns}
@@ -5905,13 +5947,18 @@
   ;; in the flat let* → the second SHADOWS the first → a template backward reads
   ;; the wrong dimension (gqa dW came out [hd,in] not [nq*hd,in]). Sharing one
   ;; monotonic counter keeps every generated name globally unique.
-  (with-ad-gensym
-    (let [resolved (resolve-deftm-var f-var)
+  (let [resolved (resolve-deftm-var f-var)
           ;; AD is another compiler consumer of the original semantic frontend,
           ;; not an owner of the replaceable walked-body metadata cache. Prepare
           ;; the producer before observing it, just like ordinary inlining.
           _ (rcore/prepare-deftm-frontend! resolved)
-          frontend (method-entry/original-source-frontend resolved)
+        frontend (method-entry/original-source-frontend resolved)]
+    (binding [*unchecked-math* (if frontend
+                                (source-policy/unchecked-math
+                                 (get-in frontend [:source-entry :source-policy]))
+                                *unchecked-math*)]
+      (with-ad-gensym
+        (let [template-revision (tmpl/registry-revision)
           m (meta resolved)
           params (deftm-params-or-throw f-var resolved)
           walked-body (or (:body frontend)
@@ -5961,8 +6008,7 @@
         ;; into flat ANF) — see ad-prepare, shared with the JVP path.
           hoisted (binding [*ns* source-ns
                             *constant-gradient-arrays* constant-gradient-arrays]
-                    (ad-prepare qualified-source
-                                (zipmap all-params tags)))
+                    (ad-prepare qualified-source (zipmap all-params tags)))
         ;; transform-body delegates binding-position loops to gen-reverse-let's
         ;; activity-aware routing; inactive loops remain in the primal prefix.
           ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays
@@ -5994,12 +6040,14 @@
               (assert-unique-ad-minted-binds! bindings f-var)
               (list op bindings output-vec)))]
       (when flat
-        {:walked-body [padded-form]
+        (freeze-generated-preparation
+         {:walked-body [padded-form]
          :params all-params
          :tags tags
          :source-ns source-ns
          :result-sym (:result-sym flat)
-         :param-adj-syms (:param-adj-syms flat)}))))
+          :param-adj-syms (:param-adj-syms flat)}
+         frontend template-revision parameter-plan)))))))
 
 (defn- runtime-function-form
   [params body]
@@ -7052,9 +7100,19 @@
   (if-not (contains? prepared :source-owner)
     ;; Legacy public source projection only. Never rewrite an owned program:
     ;; its original operations and completion order belong to its producer.
-    (let [body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
-                                     (first walked-body))]
-      (eval (value-completion/project-to-jvm-source (runtime-function-form params body))))
+    (let [_ (assert-prepared-program-source! prepared)
+          body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
+                                     (first walked-body))
+          compile! #(eval (value-completion/project-to-jvm-source (runtime-function-form params body)))
+          owner (::generated-program-owner prepared)
+          execute (if owner
+                    (binding [*ns* (:source-ns prepared)]
+                      (source-policy/call-with-policy
+                       (get-in (.-frontend ^GeneratedPreparationOwner owner) [:source-entry :source-policy])
+                       compile!))
+                    (compile!))]
+      (assert-prepared-program-source! prepared)
+      execute)
     (let [execute (if (= :jvm-bytecode (:backend source-owner))
                     (compile-bytecode-preparation prepared)
                     (source-owner/compile-function
