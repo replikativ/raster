@@ -199,6 +199,15 @@
                [p a])))
          params)))
 
+(defn ^:no-doc prepare-call-arguments
+  "Use the shared call-by-value planner for an internal whole-call projection.
+   Result bindings retain actual source argument types, not formal coercions."
+  [callee params args source-env]
+  (check-inline-arity! callee params args {:callee callee :args args})
+  (let [bindings (atom [])
+        substitutions (argument-substitution params args nil source-env #(swap! bindings conj %))]
+    {:bindings @bindings :substitutions substitutions}))
+
 (defn- safe-to-inline?
   "Check if a resolved deftm body is safe to inline.
    Previously rejected bodies with scopes + non-primitive params, but
@@ -415,7 +424,7 @@
       (vary-meta replacement merge (meta expr))
       replacement)))
 
-(defn- subst-syms
+(defn ^:no-doc subst-syms
   "Capture-avoiding symbol substitution — delegates to the unified
    `util/subst-syms` (generic over form/scope-info, so it correctly handles
    EVERY closed-core binder incl. all par variants — map2!/map-void!/scan/
@@ -996,75 +1005,8 @@
                            (= :jvm-bytecode (get-in prepared-body [:source-owner :backend])))
               (source-owner/assert-portable-source! prepared-body))
             ((requiring-resolve 'raster.ad.reverse/project-owned-value+grad-call) prepared-body args mode))
-          (let [_ (source-owner/assert-portable-source! prepared-body)
-            _ ((requiring-resolve 'raster.ad.reverse/adopt-prepared-program-inputs!) prepared-body)
-            ;; This derived program can come from an earlier AD preparation.
-            ;; Its caller's checked policy does not authenticate transitive
-            ;; source history. Leave ordinary AD import unchanged, but record
-            ;; the missing lineage for source-owned checked-result admission.
-            _ (when method-entry/*emission-inputs*
-                (swap! method-entry/*emission-inputs* update :unclosed-source-imports
-                       (fnil conj #{}) [:prepared-reverse-ad var-sym]))
-            params (:params prepared-body)
-            prepared-form (inf/qualify-body-symbols
-                           (first (:walked-body prepared-body))
-                           (:source-ns prepared-body) (set params))
-            prepared-elements (last prepared-form)]
-        (when prepared-body
-          (let [flat-result {:form prepared-form :result-sym (first prepared-elements)
-                             :param-adj-syms (vec (rest prepared-elements))}]
-            (when flat-result
-              (let [{:keys [form result-sym param-adj-syms]} flat-result
-                    ;; form is the retained flat let* with a padded [primal grads...] tail.
-                    ;; Extract bindings
-                    [_ bindings-vec] form
-                    pairs (partition 2 bindings-vec)
-                    ;; Substitute actual args for formal params
-                    param-names (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil)
-                                      params)
-                    _ (check-inline-arity! var-sym param-names args vg-info)
-                    argument-bindings (atom [])
-                    ;; AD consumes the same call-by-value boundary as ordinary inlining.
-                    ;; A prepared pullback may use an argument repeatedly or not at all;
-                    ;; neither permits duplicating or dropping its evaluation.
-                    param-subst (argument-substitution
-                                 param-names args nil param-env
-                                 #(swap! argument-bindings conj %))
-                    ;; Rename internal symbols to avoid conflicts, and substitute params
-                    renamed-pairs
-                    (let [subst (atom param-subst)]
-                      (mapv (fn [[sym expr]]
-                              (let [base (if (contains? (set param-names) sym)
-                                           sym ;; don't rename param bindings
-                                           (gensym (str (name sym) "_")))
-                                    ;; Preserve metadata (AD type tags etc.)
-                                    new-sym (if (and (not (identical? base sym)) (meta sym))
-                                              (with-meta base (meta sym))
-                                              base)
-                                    substed-expr (subst-syms @subst expr)]
-                                (when-not (= sym new-sym)
-                                  (swap! subst assoc sym new-sym))
-                                [new-sym substed-expr]))
-                            pairs))
-                    ;; The loss symbol after substitution
-                    final-subst (reduce (fn [m [old [new _]]]
-                                          (if (= old new) m (assoc m old new)))
-                                        param-subst
-                                        (map vector
-                                             (map first pairs)
-                                             renamed-pairs))
-                    loss-sym (get final-subst result-sym result-sym)
-                    grad-syms (mapv #(get final-subst % %) param-adj-syms)
-                    ;; Elements: loss + all gradient syms (DCE handles dead ones)
-                    elements (if (= mode :value+grad)
-                               (vec (cons loss-sym grad-syms))
-                               (vec grad-syms))]
-                {:bindings (into @argument-bindings renamed-pairs)
-                 :result-sym nil
-                 :loss-sym loss-sym
-                 :grad-syms grad-syms
-                 :scalar-result? (and (= :grad mode) (= 1 (count grad-syms)))
-                 :elements elements}))))))))))
+          ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
+           prepared-body args mode param-env))))))
 
 (defn- inline-one-pass
   "Single pass of deftm inlining over a let* form's bindings."

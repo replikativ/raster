@@ -160,6 +160,27 @@ The focused real-emission/normal-return gate passes 36 tests / 237 assertions,
 including the CI throwing-producer case and an explicitly stale unrelated owner.
 This fixes isolation, not a waiver for stale executable reuse.
 
+Whole-call AD projection now lives beside its preparation producer. It checks
+the flat program/padded slots against the sealed parameter plan, uses the existing
+call-by-value argument planner, then applies shared whole-form alpha conversion
+and capture-avoiding substitution. The inliner's independent top-level renaming
+map is removed. Rejected shapes/arities do not adopt dependencies; the projection
+operation itself records its still-unclosed import. Focused preparation/inliner
+checks pass 40 tests / 203 assertions before the extra failure-atomicity controls;
+the final preparation namespace passes 16 / 63. The broader 119-test / 771-assertion
+gate has zero failures and one resident-reduction error. An A/B run with the
+committed versus working inliner gives the same
+`:scalar-reduction-requires-typed-graph` refusal; this is not a passing resident
+training gate. No projection receipt or public map is granted ownership authority.
+
+Next shared scope consolidation is evidence-driven: a REPL probe confirms that
+`qualify-body-symbols` rewrites quoted symbols and mistakes `par/reduce` binders
+for same-named namespace Vars. It must use the common `form/scope-info` authority,
+preserve literal data, and retain structural class qualification. Named lambda
+self-binding is also missing from the common scope descriptor, so it needs a
+central fix rather than a qualifier-only exception. These remain open; stronger
+portable AD projection cannot rely on the current qualifier as complete.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;

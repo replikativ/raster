@@ -5932,6 +5932,59 @@
       (method-entry/adopt-definition-inputs!
        (update (.-observations owner) :producer-inputs (fnil conj []) owner)))))
 
+(defn ^:no-doc project-prepared-value+grad-call
+  "Instantiate the shared flat preparation at one compiler call site.
+   Validate the producer's padded result boundary before whole-form hygiene and
+   the ordinary call-by-value substitution. No operation is rewritten here.
+   This structural projection does not close JVM conversions or device semantics."
+  [{:keys [walked-body params source-ns] :as prepared} arguments mode param-env]
+  (source-owner/assert-portable-source! prepared)
+  (assert-prepared-program-source! prepared)
+  (let [source (first walked-body)
+        [_ bindings results] (when (seq? source) source)
+        owner (::generated-program-owner prepared)]
+    (when-not (and (contains? #{:value+grad :grad} mode)
+                   (vector? walked-body) (= 1 (count walked-body))
+                   (seq? source) (= 'let* (first source)) (= 3 (count source))
+                   (vector? params) (every? symbol? params)
+                   (vector? bindings) (even? (count bindings))
+                   (every? symbol? (take-nth 2 bindings))
+                   (vector? results) (= (inc (count params)) (count results)))
+      (throw (ex-info "prepared AD call needs its whole flat program and padded result slots"
+                      {:reason :ad-prepared-call-projection})))
+    (when owner
+      (let [plan (.-parameter-plan ^GeneratedPreparationOwner owner)
+            active (:candidate-params plan)
+            adjoints (:param-adj-syms prepared)
+            slots (zipmap active adjoints)]
+        (when-not (and (= (count active) (count adjoints))
+                       (= results (into [(:result-sym prepared)] (map slots params))))
+          (throw (ex-info "prepared AD results differ from their normalized parameter plan"
+                          {:reason :ad-prepared-call-results})))))
+    (let [{argument-bindings :bindings :keys [substitutions]}
+          (inline/prepare-call-arguments
+           (if owner (get-in (.-frontend ^GeneratedPreparationOwner owner) [:source-entry :source-var])
+               :prepared-reverse-ad)
+           params arguments param-env)
+          qualified (inf/qualify-body-symbols source source-ns (set params))
+          projected (inline/subst-syms substitutions (util/alpha-convert qualified))
+          [_ bindings results] projected
+          gradients (vec (rest results))
+          projection {:bindings (into argument-bindings (mapv vec (partition 2 bindings)))
+                      :result-sym nil :loss-sym (first results) :grad-syms gradients
+                      :scalar-result? (and (= :grad mode) (= 1 (count gradients)))
+                      :elements (if (= mode :value+grad) results gradients)}]
+      ;; Commit input history only after successful shape/arity/projection work.
+      ;; Hygiene is not an entry/return conversion or device realization proof.
+      (adopt-prepared-program-inputs! prepared)
+      (when method-entry/*emission-inputs*
+        (swap! method-entry/*emission-inputs* update :unclosed-source-imports
+               (fnil conj #{}) [:prepared-reverse-ad
+                               (if owner (get-in (.-frontend ^GeneratedPreparationOwner owner)
+                                                 [:source-entry :source-var])
+                                   :unowned-preparation)]))
+      projection)))
+
 (defn- freeze-generated-preparation [program frontend template-revision parameter-plan]
   (if-not frontend
     program

@@ -1,9 +1,11 @@
 (ns raster.ad.preparation-frontend-source-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.set :as set]
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as numeric]
             [raster.ad.reverse :as reverse]
             [raster.ad.templates :as templates]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.core.method-entry :as entry]))
 
 (deftm squared-loss [x :- Double] :- Double (numeric/* x x))
@@ -132,6 +134,82 @@
       (is (= :ad-prepared-program-stale-rules
              (try (entry/assert-definition-inputs-current! @parent) nil
                   (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
+
+(deftest whole-call-projection-uses-shared-nested-scope-hygiene
+  ;; Exercise the structural legacy path without manufacturing an opaque owner.
+  ;; Existing public AD tests separately exercise authenticated preparations.
+  (let [loss (with-meta 'loss {:raster.type/tag 'double :projection-marker :kept})
+        source (list 'let*
+                     [loss '(let* [reused x
+                                   f (fn* [x] (clojure.core/* x 2.0))
+                                   walked (loop* [x 0 total reused]
+                                            (if (clojure.core/< x 2)
+                                              (recur (clojure.core/inc x)
+                                                     (clojure.core/+ total (clojure.core/inc x)))
+                                              total))]
+                              (clojure.core/+ (f reused) walked))
+                      'gradient 'x]
+                     [loss 'gradient])
+        prepared {:walked-body [source] :params '[x] :source-ns (the-ns 'clojure.core)}
+        project #(reverse/project-prepared-value+grad-call prepared '[reused] :value+grad {})
+        first-call (project)
+        second-call (project)
+        source-of #(list 'let* (vec (mapcat identity (:bindings %))) (:elements %))
+        binders (fn [expression]
+                  (set (mapcat #(mapcat :binders (:scopes (form/scope-info %)))
+                               (tree-seq coll? seq expression))))
+        first-binders (binders (source-of first-call))]
+    (is (= [12.0 3.0] ((eval (list 'fn* '[reused] (source-of first-call))) 3.0)))
+    (is (empty? (set/intersection first-binders (binders (source-of second-call)))))
+    (is (empty? (set/intersection first-binders '#{loss reused f walked x total gradient})))
+    (is (= :kept (:projection-marker (meta (:loss-sym first-call)))))
+    (is (nil? (reverse/assert-prepared-program-source! prepared)))
+    (is (= 2 (count (:elements first-call))))))
+
+(deftest whole-call-projection-retains-owned-padding-and-rejects-stale-inputs
+  (doseq [[wrt expected] [[[] [25.0 nil nil]] [[0] [25.0 6.0 nil]] [[1] [25.0 nil 8.0]]]]
+    (let [prepared (reverse/prepare-value+grad #'two-squared-loss wrt)
+          projection (reverse/project-prepared-value+grad-call prepared '[a b] :value+grad {})
+          execute (eval (list 'fn* '[a b]
+                              (list 'let* (vec (mapcat identity (:bindings projection)))
+                                    (:elements projection))))]
+      (is (= expected (execute 3.0 4.0)))
+      (is (= 3 (count (:elements projection))))))
+  (let [prepared (reverse/prepare-value+grad #'squared-loss [0])
+        revision (templates/registry-revision)]
+    (with-redefs [templates/registry-revision (constantly (inc revision))]
+      (is (= :ad-prepared-program-stale-rules
+             (try (reverse/project-prepared-value+grad-call prepared '[x] :value+grad {}) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+    (is (= :ad-prepared-program-mismatch
+           (try (reverse/project-prepared-value+grad-call
+                 (assoc prepared :walked-body '[(let* [] [0.0 0.0])]) '[x] :value+grad {}) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
+(deftest whole-call-projection-rejects-private-or-malformed-source
+  (doseq [source '[42 (let* [] [0.0]) (let* [a] [0.0 0.0]) (let* [] [0.0 0.0] 9.0)]]
+    (is (= :ad-prepared-call-projection
+           (try (reverse/project-prepared-value+grad-call
+                 {:walked-body [source] :params '[x] :source-ns (the-ns 'clojure.core)}
+                 '[x] :value+grad {}) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+  (is (= :unprojected-jvm-source-owner
+         (try (reverse/project-prepared-value+grad-call
+               {:source-owner nil :walked-body '[(let* [] [0.0 0.0])]
+                :params '[x] :source-ns (the-ns 'clojure.core)}
+               '[x] :value+grad {}) nil
+              (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+
+(deftest whole-call-boundary-retains-its-own-unclosed-marker-only-on-success
+  (let [prepared (reverse/prepare-value+grad #'squared-loss [0])
+        parent (atom {:static [] :values []}) before @parent]
+    (binding [entry/*emission-inputs* parent]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (reverse/project-prepared-value+grad-call prepared '[] :value+grad {})))
+      (is (identical? before @parent))
+      (reverse/project-prepared-value+grad-call prepared '[x] :value+grad {})
+      (is (seq (:producer-inputs @parent)))
+      (is (some #(= :prepared-reverse-ad (first %)) (:unclosed-source-imports @parent))))))
 
 (deftest lazy-jit-gradient-root-retains-its-actual-ad-producer
   (let [scope (create-ns (gensym "raster.ad-preparation-jit."))]
