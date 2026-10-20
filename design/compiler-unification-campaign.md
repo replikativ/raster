@@ -26,21 +26,47 @@ per-element checked conversions into global host effects.
 
 This is conservation/ordering evidence, not original-source authentication,
 totality, initialized storage, or observed runtime completion. Original source
-ownership and scheduled-stage completion remain independently required. Late
-scalar admission stays closed until its resident executor and completion protocol
-are connected. The reviewed affected gate passes 199 tests / 1,281 assertions;
-five focused fusion controls add 30 assertions, including ordinary fusion away
-from the boundary and a fused-prefix host projection. No device performance,
-complete training vertical, or broad CI acceptance follows from these checks.
+ownership and scheduled-stage completion remain independently required. The explicit
+TypedSOAC path now retains unused required scalar roots, projects audited singleton
+payload reads, and revalidates the earlier writer and closed uses at scheduling.
+Flattened graphs containing required evaluations have an explicit source-order
+dependency chain; pure graphs retain their hazard-only DAG. The reviewed affected
+gate passes 23 tests / 204 assertions, including OpenCL/Level Zero payload replay,
+checked integer/narrowing refusals and real OpenCL invocation failure fencing.
+Late *source* admission remains closed until source-to-ScalarIR correspondence is
+proved; resident storage and logical dtype alone do not prove an original JVM carrier.
+
+Completion analysis now requires the actual producer namespace for core operations,
+including casts. Authenticating the canonical `clojure.core` Var in another namespace
+was insufficient: a producer can mask that qualifier. Missing lookup context abstains;
+changed definitions and masked qualifiers refuse. The shared Double-anchored arithmetic
+summary reuses existing carrier/totality authorities and grants no removability,
+argument completion or source motion. Its focused and adjacent gates pass 69 tests /
+684 assertions, including independent Clojure IEEE edge cases and AD-generated scope
+contexts. A primitive Double operand can also anchor the exact source overload when
+the other operand is a proved present Float/Double reference payload; the source
+planner still sees that reference, and the producer's physical facts stay unchanged.
+Float-only and reference-only calls remain outside this proof. Independent Clojure
+Object/Double overload oracles cover both operand orders and IEEE edge cases.
+No device performance, complete training vertical or broad CI acceptance
+follows from these checks.
+
+The actual specialized MSE source has also been checked separately from raw Clojure
+macro fallback: precision-sensitive inputs retain a Float accumulation checkpoint
+before the Double quotient; an empty domain reaches IEEE zero division. This is a
+producer regression, not permission to infer that checkpoint from a result tag.
+The unchanged hardware-free topology/cost/compute/storage/math-request gate freshly
+passes 84 tests / 660 assertions. It does not establish device transport or measured
+fabric performance, and items 6–8 retain their remaining integration obligations.
 
 Current integration hold: PR #1539 is draft, not qualified for merge.
-At `c101748f`, setup/build passed; emission, unit and OpenCL gates failed.
-At `a1279e4e`, setup/build passed, emission failed, and unit/OpenCL were still
-running at the latest observation. These are not acceptance evidence for CUDA/HIP.
-At `ac98bd33`, setup/build passed and emission, unit and OpenCL failed.
-The earlier head's 16 unit shards finished (15 failed, one passed);
-this is not a green compiler baseline. Dependent CUDA/HIP
-jobs are not acceptance evidence. The following table takes precedence over
+At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
+Emission still refuses target-library `exp` inside a checked Float narrowing stage;
+exception stability near the overflow boundary remains unproved. That refusal must
+not be repaired with a totality flag or numerical tolerance waiver. At `577ca631`,
+setup/build passed and emission, unit and OpenCL failed again. These
+are not acceptance evidence for CUDA/HIP. This is not a green compiler baseline.
+Dependent CUDA/HIP jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
 
 The latest normalization correction replaces recursive reduction discovery and

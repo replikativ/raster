@@ -2,8 +2,24 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.distributed-training :as training]
+            [raster.dl.loss :as loss]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.pipeline :as pipeline]))
+
+(deftest training-loss-keeps-its-float-checkpoint-before-the-double-quotient
+  ;; Returning a Double does not mean that the sum was accumulated in Double.
+  ;; These exact Float inputs distinguish the source specialization from an
+  ;; accidentally widened accumulation without choosing a parallel tree order.
+  (let [prediction (float-array [4096.0 1.0 1.0 1.0])
+        target (float-array 4)
+        result (loss/mse-loss prediction target 4)
+        double-reference (/ (+ 16777216.0 1.0 1.0 1.0) 4.0)
+        legal-float-results #{4194304.0 4194304.5 4194305.0}]
+    (is (instance? Double result))
+    (is (contains? legal-float-results result))
+    (is (not= double-reference result))
+    (is (Double/isNaN (double (loss/mse-loss (float-array 0) (float-array 0) 0)))
+        "an empty reduction still reaches its IEEE Double zero-denominator quotient")))
 
 (deftest coverage-reports-the-actual-normalized-admission-refusal
   (let [attempt (atom nil)

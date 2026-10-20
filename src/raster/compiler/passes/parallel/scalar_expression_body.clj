@@ -1651,9 +1651,10 @@
 (defn checked-core-fp-evaluation
   "Summarize one original core arithmetic/comparison call AFTER its operands complete.
    Reuses the selected-body carrier planner and totality check, not inferred tags.
-   Only present primitive Double operands are admitted; Float source contexts,
-   Object payloads, integral arithmetic, casts, lexical calls and unauthenticated
-   spellings abstain. Float needs its original emitter's promotion context.
+   One actual primitive Double operand fixes the source's Double computation.
+   The other may be primitive FP or a proved present builtin FP payload behind
+   its actual reference carrier. Input carrier facts are never upgraded. Calls
+   without that Double anchor, integral arithmetic, casts and lexical calls abstain.
    This grants neither operand completion nor permission to move/remove the call."
   [expression argument-facts source-ns]
   (method-entry/call-with-optional-definition-inputs
@@ -1666,16 +1667,27 @@
                   (= semantic-op (first expression)) (not lexical-callee)
                   (symbol? semantic-op) (= "clojure.core" (namespace semantic-op))
                   (= 2 (count arguments) (count argument-facts))
-                  (every? #(= :present (:presence %)) argument-facts)
-                  (every? #{Double/TYPE} carriers)
+                  (some #{Double/TYPE} carriers)
+                  (every? #(completed-fp-argument? % Double/TYPE) argument-facts)
                   (or (= :cmp (:kind intrinsic))
                       (and (= :infix (:kind intrinsic))
                            (source-arithmetic/binary-operator? (:c intrinsic)))))
          (when (intrinsic-source/observe-original! source-ns semantic-op)
            (let [parameters '[core-left core-right]
                  body (apply list semantic-op parameters)
-                 actual (completed-fp-body-carrier body (zipmap parameters carriers))]
-             (when actual
+                 source-carriers (mapv #(if (.isPrimitive ^Class %)
+                                          (keyword (.getName ^Class %)) :ref) carriers)
+                 source-result (if (= :cmp (:kind intrinsic)) Boolean/TYPE
+                                   (case (:result-carrier
+                                          (apply source-arithmetic/binary-plan
+                                                 (:c intrinsic) source-carriers))
+                                     :double Double/TYPE nil))
+                 ;; The original source overload still sees reference ports.
+                 ;; Present Float/Double payloads make its Double conversion exact;
+                 ;; only the arithmetic proof uses the resulting numeric carriers.
+                 arithmetic-carriers (mapv #(if (.isPrimitive ^Class %) % Double/TYPE) carriers)
+                 actual (completed-fp-body-carrier body (zipmap parameters arithmetic-carriers))]
+             (when (and source-result (= source-result actual))
                {:result-carrier actual :scope :completed-fp-scalar :presence :present
                 :builtin-class (get types/primitive-info (symbol (.getName ^Class actual)))
                 :nonthrowing? true}))))))))

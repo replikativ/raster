@@ -33,9 +33,19 @@
           summarize #(entry/call-with-definition-inputs
                       (fn [] (scalar/checked-core-fp-evaluation expression % source-ns)))]
       (is (= result (:result-carrier (summarize [primitive-double primitive-double]))))
+      (doseq [floating [primitive-float boxed-float boxed-double]
+              arguments [[primitive-double floating] [floating primitive-double]]]
+        (is (= result (:result-carrier (summarize arguments)))))
       (doseq [unknown [nil {:dtype :double} {:carrier Double/TYPE}
-                       boxed-double primitive-float {:carrier Long/TYPE :presence :present}]]
+                       {:carrier Object :presence :unknown :builtin-class Double}
+                       {:carrier String :presence :present :builtin-class Double}
+                       {:carrier Object :presence :present :builtin-class Number}
+                       {:carrier Long/TYPE :presence :present}]]
         (is (nil? (summarize [primitive-double unknown]))))
+      (is (nil? (summarize [primitive-float primitive-float]))
+          "Float-only source promotion needs a separate original emission context")
+      (is (nil? (summarize [boxed-double boxed-double]))
+          "numeric payloads do not turn reference overloads into primitive result carriers")
       (is (nil? (summarize (list primitive-double primitive-double))))
       (is (= {:carrier result :presence :present
               :builtin-class (if (= result Boolean/TYPE) Boolean Double)}
@@ -99,6 +109,30 @@
                                                    {'x primitive-double 'y primitive-double}
                                                    source-ns))]
       (is (= expected-class (class actual) (:builtin-class completed))))))
+
+(deftest core-double-anchor-has-independent-reference-overload-oracles
+  (doseq [[operation left-reference right-reference expected-class]
+          [['clojure.core/+ (fn [x ^double y] (clojure.core/+ x y))
+            (fn [^double x y] (clojure.core/+ x y)) Double]
+           ['clojure.core/- (fn [x ^double y] (clojure.core/- x y))
+            (fn [^double x y] (clojure.core/- x y)) Double]
+           ['clojure.core/* (fn [x ^double y] (clojure.core/* x y))
+            (fn [^double x y] (clojure.core/* x y)) Double]
+           ['clojure.core// (fn [x ^double y] (clojure.core// x y))
+            (fn [^double x y] (clojure.core// x y)) Double]
+           ['clojure.core/< (fn [x ^double y] (clojure.core/< x y))
+            (fn [^double x y] (clojure.core/< x y)) Boolean]]
+          [payload fact] [[(float 1.25) boxed-float] [(float -0.0) boxed-float]
+                          [(float Float/POSITIVE_INFINITY) boxed-float]
+                          [Double/NaN boxed-double] [Double/MAX_VALUE boxed-double]]
+          [execute x y facts] [[left-reference payload 0.0 [fact primitive-double]]
+                               [right-reference -0.0 payload [primitive-double fact]]]]
+    (let [actual (execute x y)
+          completed (entry/call-with-definition-inputs
+                     #(normal/completed-scalar-fact (list operation 'x 'y)
+                                                   (zipmap '[x y] facts) source-ns))]
+      (is (= expected-class (class actual) (:builtin-class completed)))
+      (is (= Object (:carrier fact)) "numeric use never upgrades its reference producer"))))
 
 (deftest completion-is-separate-from-presence-and-the-object-result-carrier
   (is (= {:type :double}
