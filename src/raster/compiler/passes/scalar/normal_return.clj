@@ -8,6 +8,7 @@
   (:require [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
@@ -254,13 +255,19 @@
           (descriptor/call-description expression)]
       (when-not (or lexical-callee (contains? lexical-facts implementation-op))
         (if (and (= semantic-op (first expression))
-                 (symbol? semantic-op) (= "clojure.core" (namespace semantic-op))
+                 (symbol? semantic-op)
+                 (or (= "clojure.core" (namespace semantic-op))
+                     (and (nil? (namespace semantic-op))
+                          (not (contains? util/*shadowing-locals* semantic-op))))
                  (= 1 (count arguments)) (descriptor/cast-op? semantic-op))
           ;; Conditional on successful source evaluation. A nullable operand
           ;; can still throw; this fact cannot discharge that evaluation.
           (when (and method-entry/*emission-inputs*
                      (instance? clojure.lang.Namespace source-ns)
-                     (intrinsic-source/observe-original! source-ns semantic-op))
+                     (intrinsic-source/observe-original!
+                      source-ns semantic-op
+                      (if (namespace semantic-op) semantic-op
+                          (symbol "clojure.core" (name semantic-op)))))
             (some-> semantic-op descriptor/cast-result-tag types/tag->java-class
                     primitive-completion-fact))
           (when method-entry/*emission-inputs*
@@ -278,10 +285,10 @@
    Object results remain Object, with a separate exact builtin payload class.
    Missing/nullable/opaque evidence returns nil. This neither executes source
    nor proves that its argument evaluation succeeds, authorizes motion, removes
-   evaluation flags, or supplies a kernel/payload lowering recipe. Qualified
-   core casts/arithmetic require the explicit producer namespace, bootstrap definition
-   and source owner; bare
-   spellings require their original namespace authority."
+   evaluation flags, or supplies a kernel/payload lowering recipe. Core casts
+   and qualified core arithmetic require the explicit producer namespace,
+   bootstrap definition and source owner. Bare casts retain their original
+   namespace lookup and require an unshadowed lexical scope."
   ([expression] (completed-scalar-fact expression {}))
   ([expression lexical-facts] (completed-scalar-fact expression lexical-facts nil))
   ([expression lexical-facts source-ns]

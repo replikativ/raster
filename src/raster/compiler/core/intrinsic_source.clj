@@ -30,14 +30,17 @@
 
 (defn observe-original!
   "Observe one actual bootstrap intrinsic lookup in the active source owner.
-   A qualified spelling or a fresh snapshot cannot authenticate a replacement."
-  [source-ns operation]
-  (let [v (ns-resolve source-ns operation)]
-    (assert-original! v operation :intrinsic-source-definition-mismatch)
-    (when-not (entry/observe-definition-input! v source-ns operation)
-      (throw (ex-info "intrinsic ownership requires its original definition collector"
-                      {:reason :unowned-intrinsic-source}))))
-  true)
+   A qualified spelling or a fresh snapshot cannot authenticate a replacement.
+   The three-argument form retains the original lookup spelling independently of
+   the canonical bootstrap operation; bare names must not borrow a qualified lookup."
+  ([source-ns operation] (observe-original! source-ns operation operation))
+  ([source-ns lookup operation]
+   (let [v (ns-resolve source-ns lookup)]
+     (assert-original! v operation :intrinsic-source-definition-mismatch)
+     (when-not (entry/observe-definition-input! v source-ns lookup)
+       (throw (ex-info "intrinsic ownership requires its original definition collector"
+                       {:reason :unowned-intrinsic-source}))))
+   true))
 
 (defn observe-originals!
   "Retain original primitive source assumptions in the active producer collector.

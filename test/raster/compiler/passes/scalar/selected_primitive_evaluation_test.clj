@@ -4,6 +4,7 @@
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as n]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.util :as util]
             [raster.compiler.passes.scalar.local-products :as products]
             [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
@@ -22,6 +23,41 @@
 (defn- proof [expression facts]
   (entry/call-with-definition-inputs
    #(scalar/checked-selected-primitive-evaluation expression facts)))
+
+(deftest bare-core-casts-require-the-actual-producer-lookup-and-lexical-scope
+  (doseq [[operation carrier] [['float Float/TYPE] ['double Double/TYPE]
+                               ['long Long/TYPE] ['int Integer/TYPE] ['byte Byte/TYPE]]]
+    (let [expression (list operation 'unknown)
+          completed #(entry/call-with-definition-inputs
+                      (fn [] (normal/completed-scalar-fact expression %1 %2)))
+          expected {:carrier carrier :presence :present
+                    :builtin-class (case operation
+                                     float Float double Double long Long int Integer byte Byte)}]
+      (is (= expected (completed {} source-ns)))
+      (is (nil? (completed {} nil)))
+      (is (nil? (completed {operation nil} source-ns)))
+      (binding [util/*shadowing-locals* #{operation}]
+        (is (nil? (completed {} source-ns))))
+      (binding [entry/*emission-inputs* nil]
+        (is (nil? (normal/completed-scalar-fact expression {} source-ns))))))
+  (let [producer (create-ns (gensym "raster.test.bare-cast-producer."))
+        expression '(float unknown)
+        collector (atom {:static [] :values []})]
+    (try
+      (binding [*ns* producer] (refer 'clojure.core :only '[float]))
+      (binding [entry/*emission-inputs* collector]
+        (is (= Float/TYPE (:carrier (normal/completed-scalar-fact expression {} producer)))))
+      (ns-unmap producer 'float)
+      (intern producer 'float (fn [_] nil))
+      (is (= :stale-definition-proof-input
+             (try (entry/assert-definition-inputs-current! @collector)
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (= :intrinsic-source-definition-mismatch
+             (try (entry/call-with-definition-inputs
+                   #(normal/completed-scalar-fact expression {} producer))
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (finally (remove-ns (ns-name producer))))))
 
 (deftest original-core-fp-completion-reuses-physical-operand-plans
   (doseq [[operation result] [['clojure.core/+ Double/TYPE]

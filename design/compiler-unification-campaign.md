@@ -85,6 +85,16 @@ both ordinary cases. The affected source-completion, scalar-activation and scan
 gate passes 28 tests / 839 assertions. This repairs evidence transport; it does not
 close reduction checkpoint correspondence or grant operand completion/admission.
 
+Bare core casts now use that same bootstrap authority while retaining their
+actual namespace lookup spelling. Successful normal return can establish the
+cast's primitive result carrier; missing context, lexical shadowing and replaced
+namespace mappings do not borrow a canonical core definition. Historical guards
+retain the bare lookup edge, so replacing it invalidates earlier evidence. The
+affected completion/payload/activation gate passes 56 tests / 616 assertions.
+The unchanged training probe still refuses four late scalar bindings, but now
+correctly reports the selected MSE-scale call as an Object with a present Double
+payload. This is not primitive storage, totality, box-erasure or admission evidence.
+
 The actual specialized MSE source has also been checked separately from raw Clojure
 macro fallback: precision-sensitive inputs retain a Float accumulation checkpoint
 before the Double quotient; an empty domain reaches IEEE zero division. This is a
