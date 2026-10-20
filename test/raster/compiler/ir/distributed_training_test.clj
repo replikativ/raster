@@ -13,6 +13,23 @@
                      value-node rounded-gradient-sum max-error expected-updates
                      training-plan analytic-gradient-sum]]))
 
+(deftest finite-training-oracle-rejects-incomplete-and-nonfinite-results
+  (is (zero? (max-error [] [])))
+  (is (zero? (max-error (float-array [1 2]) (double-array [1 2]))))
+  (is (= 0.25 (max-error [1.0 2.0] [1.25 2.0])))
+  (doseq [[expected actual] [[[] [0]] [[0] []] [[1 2] [1]] [[1] [1 2]]]]
+    (is (= {:reason :training-oracle-length
+            :expected (count expected) :actual (count actual)}
+           (try (max-error expected actual) nil
+                (catch clojure.lang.ExceptionInfo error (ex-data error))))))
+  (doseq [value [Double/NaN Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]
+          side [:expected :actual]]
+    (is (= {:reason :training-oracle-nonfinite :side side :index 1}
+           (try (max-error [0.0 (if (= side :expected) value 1.0)]
+                           [0.0 (if (= side :actual) value 1.0)])
+                nil
+                (catch clojure.lang.ExceptionInfo error (ex-data error)))))))
+
 (deftest repeated-local-ad-matches-rounded-independent-oracle
   (doseq [row-counts [[1 3] [1 2 4]]
           theta (cons (initial-theta) (expected-updates row-counts 2))
