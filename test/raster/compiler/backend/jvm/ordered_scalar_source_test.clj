@@ -6,7 +6,12 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.arrays :as arrays]
             [raster.core :as core]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.link :as link]
             [raster.par :as par]))
 
 (core/deftm shadowed-dimension [n :- Long] :- (Array double)
@@ -22,6 +27,25 @@
 
 (core/deftm float-checkpoint [x :- Double] :- Double
   (let [rounded (float x)] (double rounded)))
+
+(core/deftm unprepared-late-dimension
+  [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
+        ^long half (long (/ (long n) 2))
+        out (double-array half)]
+    (par/map! out i half double 1.0)))
+
+(core/deftm direct-length-dimension [xs :- (Array double)] :- (Array double)
+  (let [n (clojure.core/long (clojure.core/alength xs))
+        m (+ (long n) 1)
+        out (double-array m)]
+    (par/map! out i m double 1.0)))
+
+(core/deftm selected-length-dimension [xs :- (Array double)] :- (Array double)
+  (let [n (clojure.core/long (arrays/alength xs))
+        m (+ (long n) 1)
+        out (double-array m)]
+    (par/map! out i m double 1.0)))
 
 (defn- outcome [f]
   (try (let [result (f)] [:value (class result)
@@ -148,3 +172,74 @@
                                         :guard #(entry/assert-definition-inputs-current! @entry/*emission-inputs*)}))]
          (is (= Double/TYPE (get-in projected [:result-facts :carrier])))
          (is (= expected (mapv #(outcome (fn [] (execute [%]))) inputs))))))))
+
+(deftest executor-coverage-is-complete-before-any-capture-or-source-mutation
+  (let [compilation (equation-first/compile #'unprepared-late-dimension
+                                           {:target :ocl:0 :dtype :double})
+        early (double-array [0.0])
+        sessions (atom 0)
+        evaluations (atom 0)]
+    (with-redefs [gpu/make-session (fn [& _] (swap! sessions inc)
+                                   (throw (Exception. "unexpected session")))
+                  owner/evaluate-ordered-invocation-step
+                  (fn [& _] (swap! evaluations inc) (throw (Exception. "unexpected source")))]
+      (is (= :unclosed-ordered-source-executor
+             (reason #(link/instantiate-ordered-invocation!
+                       compilation [(double-array [7.0]) early 6] {}))))
+      (is (= :unclosed-ordered-source-executor
+             (reason #(#'compiled/prepare-ordered-equation-first
+                       compilation [(double-array [7.0]) early 6] {} nil))))
+      (is (zero? @sessions))
+      (is (zero? @evaluations))
+      (is (= [0.0] (vec early))))))
+
+(deftest public-carrier-preflight-precedes-source-and-driver-work
+  (let [compilation (equation-first/compile #'fixture/write-before-shape
+                                           {:target :ocl:0 :dtype :double})]
+    (doseq [n [(int 3)]]
+      (let [arguments [(double-array [7.0]) (double-array [0.0]) n]
+            state (invocation-link/begin-ordered-realization compilation arguments {})]
+        (is (= :unclosed-ordered-source-executor
+               (reason #(owner/assert-ordered-executor-coverage! compilation state arguments))))))
+    (let [arguments [(double-array [7.0]) (double-array [0.0]) 3]
+          state (invocation-link/begin-ordered-realization compilation arguments {})]
+      (is (identical? state (owner/assert-ordered-executor-coverage! compilation state arguments))))))
+
+(deftest length-carriers-come-from-owned-source-not-logical-shape-dtypes
+  (doseq [source [#'direct-length-dimension #'selected-length-dimension]]
+    (let [inputs (mapv double-array [0 1 5])
+          expected (mapv #(long (alength (source %))) inputs)
+          compilation (equation-first/compile source {:target :ocl:0 :dtype :double})
+          plan (get-in compilation [:semantic :attributes :invocation-plan])]
+      (doseq [[xs count] (map vector inputs expected)]
+        (let [state (invocation-link/begin-ordered-realization compilation [xs] {})
+              _ (is (identical? state (owner/assert-ordered-executor-coverage! compilation state [xs])))
+              realized (materialization/materialize
+                        plan [xs] (partial owner/evaluate-ordered-invocation-step compilation))
+              length-value (get-in realized [:values (:id (first (:steps plan))) :value])
+              result (get-in realized [:values (:id (last (:steps plan))) :value])]
+          (is (identical? Long (class length-value)))
+          (is (= count result)))))))
+
+(deftest selected-length-needs-its-actual-computation-and-historical-lookup
+  (let [compilation (equation-first/compile #'selected-length-dimension
+                                           {:target :ocl:0 :dtype :double})
+        program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        step (first (:steps plan))
+        expression (second (second (:source program)))
+        source-facts {(:source step) {:carrier Object :required-array-class (class (double-array 0))}}
+        project @(ns-resolve 'raster.compiler.backend.jvm.source-owner 'owned-long-length-facts)
+        body entry/selected-definition-body]
+    (entry/call-with-definition-inputs
+     (fn []
+       (is (= Long/TYPE (:carrier (project expression step source-facts *ns*))))
+       (doseq [alter [(fn [context] (assoc context :body ['(clojure.core/long 7)]))
+                      (fn [context] (assoc context :body ['(throw (Exception. "not a projection"))]))
+                      (fn [context] (assoc context :pending-source? false :dependency-snapshots []))]]
+         (with-redefs [entry/selected-definition-body
+                       (fn [definition]
+                         (let [context (body definition)]
+                           (if (= 'raster.arrays/alength (:operation definition))
+                             (alter context) context)))]
+           (is (nil? (project expression step source-facts *ns*)))))))))

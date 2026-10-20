@@ -706,6 +706,44 @@
          :pending-source? (boolean (:pending-source? projection))
          :dependency-snapshots (get-in projection [:emission :dependency-snapshots])}))))
 
+(defn original-body-entry-carriers
+  "Actual parameters of the original typed or plain Clojure body entry.
+   Plain invokeStatic signatures come from the historically owned target class,
+   not inferred dtypes. An array source hint on an Object port is an explicit
+   :required-array-class obligation, never an unconditional payload fact: the
+   execution owner must check it before using shape projections or doing work."
+  [operation implementation-op argument-count expected-source-var]
+  (or (selected-source-entry-carriers operation implementation-op argument-count expected-source-var)
+      (call-with-optional-definition-inputs
+       (fn []
+         (when-let [definition (observed-selected-definition :direct operation implementation-op argument-count)]
+           (when (and (identical? expected-source-var (:source-var definition))
+                      (selected-definition-body definition))
+             (let [lineage (:raster.core/clojure-source-entry (meta expected-source-var))
+                   target (:source-root lineage)
+                   methods (when (and target (source-entry-current? lineage))
+                             (filter (fn [^java.lang.reflect.Method method]
+                                       (and (= "invokeStatic" (.getName method))
+                                            (java.lang.reflect.Modifier/isStatic (.getModifiers method))
+                                            (java.lang.reflect.Modifier/isPublic (.getModifiers method))
+                                            (not (.isVarArgs method))
+                                            (= argument-count (.getParameterCount method))))
+                                     (.getDeclaredMethods (class target))))]
+               (when (= 1 (count methods))
+                 (let [method (first methods)
+                       carriers (vec (.getParameterTypes ^java.lang.reflect.Method method))]
+                   (assert-definition-inputs-current! @*emission-inputs*)
+                   {:scope :clojure-source-body-entry :definition definition
+                    :parameters (:parameters definition) :parameter-carriers carriers
+                    :invocation-method method :result-carrier (.getReturnType ^java.lang.reflect.Method method)
+                    :parameter-facts
+                    (into {} (map (fn [symbol ^Class carrier tag]
+                                    [symbol (cond-> {:carrier carrier
+                                                     :presence (if (.isPrimitive carrier) :present :unknown)}
+                                              (and (= Object carrier) (get types/primitive-array-info tag))
+                                              (assoc :required-array-class (get types/primitive-array-info tag)))])
+                                  (:parameters definition) carriers (:tags definition)))})))))))))
+
 (defn observed-body-operation
   "Resolve a nonlexical call only with the selected body's lookup authority.
    Pending source may observe current resolution before its eventual compilation.

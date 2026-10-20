@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
-            [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.core :as core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as ze-probe]
             [raster.gpu.core :as gpu]
@@ -117,14 +117,18 @@
 (defn- check-dense-realization-actions! [target]
   (let [arguments [(double-array [1.0 0.25 -0.5 1.0])
                    (double-array [0.25 -0.125]) (double-array [1.0 -2.0])]
+        ;; The independent JVM oracle can legitimately publish cold helpers.
+        ;; Complete both changed-input oracles before freezing compiler ownership.
+        expected (mapv #(vec (apply dense-fixture/four-layers
+                                    (assoc arguments 2 (double-array %))))
+                       [[1.0 -2.0] [3.0 -2.0]])
         compilation (equation-first/compile #'dense-fixture/four-layers {:target target :dtype :double})
         executable (link/instantiate-ordered-invocation! compilation arguments {})]
     (try
       (dotimes [replay 2]
         (let [output (first (keys (link/run! executable)))
-              expected (vec (apply dense-fixture/four-layers arguments))
               runtime (:ordered @(:execution-state executable))]
-          (is (= expected (vec (link/download executable output))))
+          (is (= (nth expected replay) (vec (link/download executable output))))
           (is (= 7 (count (:roots runtime)))
               "three public inputs plus four source allocations, with no duplicate result roots")
           (is (= 4 (count (:source-realizations (:current runtime)))))
@@ -159,10 +163,10 @@
                                            {:target target :dtype :double})
         executable (link/instantiate-ordered-invocation!
                     compilation [(double-array [7.0]) (double-array 1) 3] {})
-        evaluate scalar/evaluate-invocation-step
+        evaluate source-owner/evaluate-ordered-invocation-step
         calls (atom 0)]
     (try
-      (with-redefs [scalar/evaluate-invocation-step
+      (with-redefs [source-owner/evaluate-ordered-invocation-step
                     (fn [& args] (swap! calls inc) (apply evaluate args))]
         (let [output-id (first (keys (link/run! executable)))]
           (is (= (vec (repeat 9 1.0)) (vec (link/download executable output-id)))))
@@ -324,10 +328,10 @@
           calls (atom 0)
           stage-depth (atom 0)
           mutate! #(do (swap! calls inc) (alter-meta! source assoc ::changed-source true))
-          host scalar/evaluate-invocation-step
+          host source-owner/evaluate-ordered-invocation-step
           stage parallel-program/run-prepared!]
       (try
-        (with-redefs [scalar/evaluate-invocation-step
+        (with-redefs [source-owner/evaluate-ordered-invocation-step
                       (fn [& args]
                         (let [result (apply host args)]
                           (when (= :host site) (mutate!)) result))

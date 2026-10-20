@@ -8,12 +8,14 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.ordered-call :as ordered-call]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.types :as types]
             [raster.compiler.backend.jvm.terminal-source :as terminal-source]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.core.dtype :as dtype]
@@ -190,7 +192,53 @@
       (entry/assert-definition-inputs-current! observations)
       (TerminalResultOwner. program contract execute observations source-ns))))
 
-(deftype ^:private OrderedSourceOwner [program emission observations source-ns scalar-steps])
+(deftype ^:private OrderedSourceOwner [program emission observations source-ns scalar-source])
+
+(defn- owned-long-length-facts
+  "An actual source Long conversion of an authenticated array-length computation.
+   The selected helper's original body must be the projection, not merely carry
+   its nominal descriptor. This never invokes the receiver or supplies fake arrays."
+  [expression step facts source-ns]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (let [leaf (when (and (seq? expression) (= 'clojure.core/long (first expression))
+                            (= 2 (count expression))) (second expression))
+           source (when leaf (invocation-source/shape-projection-source leaf))
+           operand (first (:operands step))
+           fact (get facts (:value operand))
+           carrier (or (:required-array-class fact) (:carrier fact))]
+       (when (and (= source (:symbol operand)) (= 1 (count (:operands step)))
+                  (= 0 (:axis step)) (class? carrier) (.isArray ^Class carrier)
+                  (invocation-source/projection-corresponds? expression (:value step)))
+         (intrinsic-source/observe-original! source-ns 'clojure.core/long)
+         (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+               (descriptor/call-description leaf)
+               direct? (and (= 'clojure.core/alength (first leaf))
+                            (= [source] (vec (rest leaf))))
+               selected
+               (when (and dispatch? (not lexical-callee) (= [source] (vec arguments)))
+                 (when-let [candidate (entry/selected-definition semantic-op implementation-op 1)]
+                   (when-let [selected (entry/selected-source-entry-carriers
+                                        semantic-op implementation-op 1 (:source-var candidate))]
+                     (let [definition (:definition selected)
+                           context (entry/selected-definition-body definition)
+                           body (when (= 1 (count (:body context))) (first (:body context)))
+                           parameters (set (:parameters definition))
+                           length-call (when (and (seq? body) (= 2 (count body))
+                                                  (= 'clojure.core/long
+                                                     (entry/observed-body-operation context (first body) parameters)))
+                                         (second body))]
+                       (when (and (= [carrier] (:parameter-carriers selected))
+                                  (seq? length-call) (= 2 (count length-call))
+                                  (= (first (:parameters definition)) (second length-call))
+                                  (= 'clojure.core/alength
+                                     (entry/observed-body-operation context (first length-call) parameters)))
+                         (intrinsic-source/observe-original! (:source-ns context) 'clojure.core/long)
+                         (intrinsic-source/observe-original! (:source-ns context) 'clojure.core/alength)
+                         true)))))]
+           (when (or direct? selected)
+             (when direct? (intrinsic-source/observe-original! source-ns 'clojure.core/alength))
+             {:carrier Long/TYPE :presence :present})))))))
 
 (defn- prepare-scalar-step [step facts source-ns policy collector]
   (entry/call-with-optional-definition-inputs
@@ -224,13 +272,14 @@
 (defn- prepare-scalar-steps [program frontend source-var source-ns policy collector]
   (let [plan (get-in program [:attributes :invocation-plan])
         definition (:definition frontend)
-        entry (entry/selected-source-entry-carriers
+        source-expressions (into {} (map vec) (partition 2 (second (:source program))))
+        entry (entry/original-body-entry-carriers
                (:operation definition) (:implementation-op definition)
                (count (:parameters definition)) source-var)]
     (if-not (and entry (= (:parameters entry) (mapv :symbol (:parameters plan))))
-      {}
-      (:steps
-       (reduce
+      {:steps {} :entry-ports nil}
+      (assoc
+       (dissoc (reduce
         (fn [{:keys [facts] :as state} step]
           (cond
             (invocation/scalar-compute? step)
@@ -242,13 +291,20 @@
               state)
             (invocation/value-alias? step)
             (assoc-in state [:facts (:id step)] (get facts (:source step)))
-            ;; ShapeProjection is NOT a primitive Long producer proof: an
-            ;; original array-length expression can have a different carrier.
+            (invocation/shape-projection? step)
+            (if-let [fact (owned-long-length-facts (get source-expressions (:symbol step))
+                                                   step facts source-ns)]
+              (-> state (assoc-in [:facts (:id step)] fact)
+                  (update :shapes conj (:id step)))
+              state)
             :else state))
         {:facts (into {} (map (fn [{:keys [id symbol]}]
                                [id (get-in entry [:parameter-facts symbol])])) (:parameters plan))
-         :steps {}}
-        (:steps plan))))))
+         :steps {} :shapes #{}}
+        (:steps plan)) :facts)
+       :entry-ports (mapv (fn [{:keys [symbol]}]
+                            (assoc (get-in entry [:parameter-facts symbol]) :symbol symbol))
+                          (:parameters plan))))))
 
 (defn ordered-source-required?
   "Derive historical source obligations, independently of owner-field presence.
@@ -301,10 +357,10 @@
             (when required?
               (throw (ex-info "ordered source needs checked policy and original import lineage"
                               unavailable)))
-            (let [scalar-steps (prepare-scalar-steps program frontend source-var source-ns policy collector)
+            (let [scalar-source (prepare-scalar-steps program frontend source-var source-ns policy collector)
                   observations @collector]
               (source-history-current! source-ns observations :stale-checked-result-source-namespace)
-              (OrderedSourceOwner. program emission observations source-ns scalar-steps)))))))))
+              (OrderedSourceOwner. program emission observations source-ns scalar-source)))))))))
 
 (defn assert-ordered-source!
   "Guard exact historical semantic/emitted ownership before and after source work."
@@ -332,7 +388,7 @@
    No lookup, compilation, nominal redispatch or expression retry occurs at invocation."
   [{:keys [ordered-source-owner semantic emitted]} step operand-values]
   (let [^OrderedSourceOwner owner (assert-ordered-source! ordered-source-owner semantic emitted)
-        prepared (get (.-scalar-steps owner) (:id step))]
+        prepared (get-in (.-scalar-source owner) [:steps (:id step)])]
     (when-not (and prepared (identical? step (:step prepared)))
       (throw (ex-info "ordered scalar occurrence has no closed source executable"
                       {:reason :unclosed-ordered-scalar-executor :step (:id step)})))
@@ -353,6 +409,83 @@
         (throw (ex-info "source result differs from its prepared physical carrier"
                         {:reason :ordered-scalar-source-result :step (:id step)})))
       {:type (dtype/canon (get-in step [:value :dtype])) :value result})))
+
+(defn assert-ordered-executor-coverage!
+  "Preflight the entire validated source order before capture, retirement or source effects.
+   This checks capability and public carriers only; it executes no source expression and
+   grants no completion, allocation or initialized-buffer evidence. Unsupported source
+   contexts refuse the route, never fall back after an earlier action has run."
+  [{:keys [ordered-source-owner semantic] :as compilation} state arguments]
+  (assert-ordered-compilation-source! compilation)
+  (let [plan (get-in semantic [:attributes :invocation-plan])
+        source-free? (invocation/source-free-program? semantic)
+        _ (invocation/validate-against! plan semantic)
+        order (when-not source-free? (invocation/source-order plan semantic))
+        source-actions (invocation/source-host-actions plan semantic)
+        steps (into {} (map (juxt :id identity)) (:steps plan))
+        equations (into {} (map (juxt :id identity)) (:equations semantic))
+        scalar-source (when ordered-source-owner (.-scalar-source ^OrderedSourceOwner ordered-source-owner))
+        refuse! (fn [entry context]
+                  (throw (ex-info "ordered source occurrence has no closed executor"
+                                  {:reason :unclosed-ordered-source-executor
+                                   :entry entry :context context})))]
+    (when-not (and (identical? plan (get-in state [:materialization :plan]))
+                   (if source-free? (empty? (:source-order state)) (= order (:source-order state)))
+                   (= (count (:parameters plan)) (count arguments)))
+      (refuse! nil :source-order))
+    ;; Body-entry facts do not authorize arbitrary public wrapper adaptation.
+    ;; Require the actual primitive wrapper before any device/caller mutation.
+    ;; Explicit source-free projection plans have no Clojure body-entry ports;
+    ;; validate-against! above rechecks their own closed prefix contract.
+    (doseq [[parameter argument port] (map vector (:parameters plan) arguments
+                                           (or (:entry-ports scalar-source)
+                                               (repeat (count (:parameters plan)) nil)))
+            :when (seq source-actions)]
+      (when-let [array-class (:required-array-class port)]
+        (when-not (identical? array-class (class argument))
+          (refuse! nil {:public-array-parameter (:symbol parameter)})))
+      (when (empty? (get-in parameter [:value :shape]))
+       (let [carrier (:carrier port)
+            boxed (when carrier (get types/primitive-info (symbol (.getName ^Class carrier))))]
+        (when-not (and (= (:symbol parameter) (:symbol port))
+                       (or (= Object carrier) (and boxed (identical? boxed (class argument)))))
+          (refuse! nil {:public-parameter (:symbol parameter)})))))
+    (reduce
+     (fn [available source-entry]
+       (let [step (get steps (:invocation-step source-entry))
+             equation (get equations (:equation source-entry))
+             host? (true? (get-in equation [:attributes :host-only]))
+             realization (when (:realization source-entry)
+                           (invocation-source/realization-action semantic source-entry))
+             allocation (when-let [destination (:storage source-entry)]
+                          (some #(when (= destination (:destination %)) %)
+                                (get-in semantic [:attributes :allocations])))
+             expression (or (:source-expression allocation)
+                            (when (= :result-allocation (:kind realization)) (:expression realization)))]
+         (when (invocation/scalar-compute? step)
+           (when-not (identical? step (get-in scalar-source [:steps (:id step) :step]))
+             (refuse! source-entry :scalar-compute)))
+         (when (and (invocation/shape-projection? step)
+                    (not (contains? (:shapes scalar-source) (:id step))))
+           (refuse! source-entry :shape-projection))
+         (when (and host? (not (or (invocation/scalar-compute? step)
+                                   (invocation/shape-projection? step))))
+           (refuse! source-entry :standalone-host-equation))
+         (when (or allocation (= :result-allocation (:kind realization)))
+           (let [extent (:extent (invocation-source/allocation-source expression (:values semantic)))]
+             (when-not (or (instance? Long extent)
+                            (and (symbol? extent) (contains? available extent)))
+               (refuse! source-entry :allocation-extent))))
+         (cond-> available
+           (and step (empty? (get-in step [:value :shape]))
+                (or (invocation/scalar-compute? step)
+                         (invocation/shape-projection? step)
+                         (invocation/value-alias? step)))
+           (conj (:binding source-entry)))))
+     (into #{} (keep #(when (empty? (get-in % [:value :shape])) (:symbol %)))
+           (:parameters plan))
+     order)
+    state))
 
 (defn assert-terminal-result-owner!
   "Preflight exact source ownership without observing any numerical value or executing source."

@@ -2900,7 +2900,13 @@
 (defn- is-clojure-core? [head ctx]
   (and (symbol? head)
        (let [src-ns (or (:source-ns ctx) *ns*)]
-         (or (= (namespace head) "clojure.core")
+         (or (when (= (namespace head) "clojure.core")
+               ;; Qualified intrinsics also belong to the original lookup
+               ;; history. Later source-body analyses cannot recreate an edge
+               ;; omitted by this producer after the helper is already warm.
+               (when-let [v (ns-resolve src-ns head)]
+                 (when (var? v) (me/observe-definition-input! v src-ns head)))
+               true)
              (and (nil? (namespace head))
                   (when-let [v (ns-resolve src-ns head)]
                     (when (var? v)

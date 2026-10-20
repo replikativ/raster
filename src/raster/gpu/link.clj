@@ -1196,6 +1196,7 @@
         caller-options (caller-math-options opts)
         initial (invocation-link/validate-ordered-source-actions!
                  (invocation-link/begin-ordered-realization compilation arguments caller-options))
+        _ (source-owner/assert-ordered-executor-coverage! compilation initial arguments)
         entry-roles (invocation-link/ordered-entry-roles initial (:entry-roles opts))
         entry-layout (invocation-link/ordered-entry-layout initial entry-roles)
         execution-state (atom {:value-epoch 0
@@ -1552,9 +1553,11 @@
     (when (seq prepared)
       (throw (ex-info "ordered invocation still owns an unfinished prepared stage"
                       {:reason :link-ordered-prepared-stage})))
-    (when observe-checked? (retire-checked-private-generation! executable))
-    (let [initial (assoc (invocation-link/begin-ordered-realization compilation arguments caller-options)
+    (let [initial (assoc (invocation-link/validate-ordered-source-actions!
+                         (invocation-link/begin-ordered-realization compilation arguments caller-options))
                          :entry-roles entry-roles :entry-refresh entry-refresh)
+          _ (source-owner/assert-ordered-executor-coverage! compilation initial arguments)
+          _ (when observe-checked? (retire-checked-private-generation! executable))
           captured (into #{} (keep (fn [[id role]] (when (not= :input role) id))) entry-refresh)
           initialized (vec (distinct (filter #(contains? captured (get-in % [:allocation :id]))
                                              initialized)))]
@@ -1580,8 +1583,8 @@
                                                                             caller-options))
                   (or (:invocation-step entry) equation)
                   (invocation-link/advance-host-source
-                   state (partial scalar/evaluate-invocation-step (:source-ns compilation))
-                   (partial scalar/evaluate-host-equation (:source-ns compilation)) caller-options)
+                   state (partial source-owner/evaluate-ordered-invocation-step compilation)
+                   nil caller-options)
                   :else (update state :source-cursor inc))]
             (assert-ordered-source! compilation)
             (ensure-live! executable :ordered-source-completion)
@@ -1616,6 +1619,7 @@
        (let [epoch (:value-epoch @execution-state)
              initial (invocation-link/begin-ordered-realization compilation arguments caller-options)
              checked (invocation-link/ordered-input-arguments initial arguments entry-roles replacements)]
+         (source-owner/assert-ordered-executor-coverage! compilation initial checked)
          (when before-mutation! (before-mutation!))
          (assert-ordered-source! compilation)
          (ensure-live! executable :run-ordered-with-inputs!)

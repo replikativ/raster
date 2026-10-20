@@ -14,7 +14,7 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `95feab6d` is draft, not qualified for merge.
+Current integration hold: PR #1539 at `36c32cc4` is draft, not qualified for merge.
 Exact-head setup/build passed; emission, unit and OpenCL gates failed.
 The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
@@ -201,6 +201,30 @@ passes 45 tests / 351 assertions in the existing 900 MiB REPL.
 Runtime activation is still gated: require complete executor
 coverage before any earlier source/device mutation; do not discover missing host
 capabilities halfway through an accepted route. No training or performance claim.
+
+The following activation has local qualification, not broad acceptance: ordered
+invocation now preflights every source occurrence before session creation/capture,
+replay retirement and input handoff. ScalarCompute uses its prepared source
+executable directly, including shared host-equation producers; no interpreter
+fallback runs after earlier work. Standalone host equations and compound allocation
+extents still refuse upfront. Allocations retain their original count conversion,
+failure order and existing storage/initialization checks.
+
+Shape carriers need independent source correspondence. A checked Long cast around
+an array-length projection is admitted only for a bootstrap core leaf or an actual
+selected helper whose authenticated original body computes that projection. A
+nominal alength descriptor, interface result or logical shape dtype is insufficient.
+Bytecode emission now records qualified core-intrinsic lookups as well as bare
+ones; missing historical lookup edges in an old helper remain unsupported, not
+recreated by consumers. Plain Clojure body-entry signatures use the owned generated
+target class; Object-array hints remain conditional runtime class requirements.
+Explicit source-free TypedSOAC projections retain their separately revalidated
+closed contract, without inventing a Clojure source owner. Pure numerical routes
+with no host source actions do not acquire irrelevant body-entry obligations.
+The adjacent twelve-namespace gate passes 120 tests / 1,737 assertions; the final
+preparation-fence gate adds 16 tests / 188 assertions after reloading Compiled.
+Both local device probes report true. These receipts do not close the integration
+hold, training admission, cross-vendor execution or any of the eight obligations.
 
 Training admission will keep two execution modes under the same source-order
 owner: host-only checked dimensions as original ordered host actions, and
