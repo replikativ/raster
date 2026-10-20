@@ -14,6 +14,25 @@
   ;; assertions: a passing marker proves an honest skip, not numerical device execution.
   #{"opencl-skip-marker" "gpu-skip-marker" "gpu-capability-skip-marker"})
 
+(defn- exception-diagnostic
+  "Keep bounded portable classifier data, never compiler objects or printed inputs."
+  [error]
+  (when (instance? Throwable error)
+    (let [data (ex-data error)]
+      (into {:class (.getName (class error))}
+            (keep (fn [key]
+                    (let [value (get data key)]
+                      (when (keyword? value) [key value]))))
+            [:reason :missing-rule :rule :fallback :compiler :front-end]))))
+
+(defn- failure-diagnostic
+  [event]
+  (cond-> (select-keys event [:type])
+    (string? (:file event)) (assoc :file (:file event))
+    (integer? (:line event)) (assoc :line (:line event))
+    (instance? Throwable (:actual event))
+    (assoc :exception (exception-diagnostic (:actual event)))))
+
 (defn- record-outcome!
   [timings selected event]
   (let [v (or (:var event) (first test/*testing-vars*))
@@ -30,6 +49,12 @@
         (swap! timings
                (fn [report]
                  (cond-> (update-in report [:outcomes id :assertions type] (fnil inc 0))
+                   ;; Assertion counts remain complete. Retain only eight small examples per
+                   ;; test so a failing randomized loop cannot inflate the diagnostic artifact.
+                   (and (contains? #{:fail :error} type)
+                        (< (count (get-in report [:outcomes id :diagnostics])) 8))
+                   (update-in [:outcomes id :diagnostics] (fnil conj [])
+                              (failure-diagnostic event))
                    (and (= :pass type) (contains? skip-marker-messages (:message event)))
                    (update-in [:outcomes id :skip-markers (:message event)] (fnil inc 0)))))))))
 
@@ -44,7 +69,8 @@
 (defn run-timed!
   [options report-file]
   (let [started (System/nanoTime)
-        timings (atom {:schema-version 1 :namespaces {} :vars {} :outcomes {}
+        timings (atom {:schema-version 1 :run-state :running
+                       :namespaces {} :vars {} :outcomes {}
                        :load-order [] :test-order []})
         selected (:namespace options)
         require* clojure.core/require
@@ -79,7 +105,16 @@
                           (measured timings [:vars (symbol (str (ns-name ns)) (str name))]
                                     #(test-var* v))
                           (test-var* v))))]
-        (runner/test options))
+        (let [summary (runner/test options)]
+          ;; A complete run can fail assertions. Do not equate completion with passing,
+          ;; or a partial report written during unwinding with complete coverage.
+          (swap! timings assoc :run-state :completed
+                 :summary (select-keys summary [:test :pass :fail :error]))
+          summary))
+      (catch Throwable error
+        (swap! timings assoc :run-state :aborted
+               :runner-error (exception-diagnostic error))
+        (throw error))
       (finally
         (try
           (io/make-parents report-file)
