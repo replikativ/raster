@@ -69,6 +69,17 @@ are not acceptance evidence for CUDA/HIP. This is not a green compiler baseline.
 Dependent CUDA/HIP jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
 
+Public vendor-fixture emission now collects independent compiler refusals across
+CUDA and HIP instead of stopping at the first public workload. Each diagnostic
+identifies function, target, dtype and requested schedule; empty compiler artifact
+lists are failures, not omissions. Any refusal still fails the whole gate. Progress
+goes to stderr while successful stdout remains the emitted-file list. Cancellation
+and VM failures, including wrapped causes, abort immediately. Five reporting controls
+pass 30 assertions; a real six-compilation smoke emits four successful workloads,
+reports the checked-exponential refusal on both targets and reaches the later
+Long-state workload on each. This improves feedback, not vendor qualification;
+private body-fixture generation and actual vendor compilation retain their own gates.
+
 The latest normalization correction replaces recursive reduction discovery and
 equality substitution with an occurrence-specific strict evaluation context.
 Extraction follows only the first operand of bootstrap-authenticated inline core
