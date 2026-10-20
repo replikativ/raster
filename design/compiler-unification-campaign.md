@@ -57,6 +57,22 @@ Implementation/landing sequence:
    their separate contracts. A permuting tree requires commutativity as well as
    associativity. Checkpoint tests are not bitwise equivalence claims for FP trees.
 
+   The follow-up implementation review fixes the query boundary as
+   `(owned original reduction, actual operand/storage facts, constructed reduction
+   region) -> conditional value/checkpoint correspondence`. It must not invent a
+   primitive JVM exit carrier: a Float value can still leave the JVM reduction
+   boxed as Object. Physical exit facts remain with the separate actual-emission
+   observer. Start with one FP carry, sequential lexical locals, declared primitive
+   array reads and authenticated core FP arithmetic/conversions. Compare against
+   the actual `ProductReduction` component and lower its region through the existing
+   `make-lowerer`; retain source Int-count conversion and zero-trip initialization.
+   Unknown storage, nullable scalar inputs, user calls, forged retained widths,
+   mismatched narrowing checkpoints, integral/multi-carry/data-dependent loops and
+   unsupported count domains abstain initially. Expose successful correspondence
+   separately in diagnostics, not as a `:normal-completion :carrier`, nonthrowing
+   fact or new admission permission. Reuse maps and the existing dependency owner;
+   no new rule/type registry, bytecode materialization or origin propagation is needed.
+
 2. **Scalar consumers through existing representations.** Realize the Float MSE
    result followed by its Double quotient without narrowing Double intermediates.
    Use existing required-evaluation catalogs and singleton resident scalar scheduling;
@@ -138,6 +154,16 @@ accounted for 18.2, 16.7 and 15.5 ms. This is one loaded-machine probe, not a ma
 profile, cold-start benchmark, stable speedup or device execution receipt. Artifact
 publication remained explicitly refused. Keep cache misses and work repeated on hits
 as separate profiling targets.
+
+After the source-discovery lifecycle correction, the unchanged local training
+gradient diagnostic still refuses at the same four scalar boundaries (Double
+loss quotient, Object/Double scale and two checked dimension products). One loaded
+REPL observation took 1.019 seconds, with inclusive transform times around 502 ms
+in fixpoint, 209 ms in late cleanup, 180 ms in SOAC fusion and 117 ms in DCE. This is
+a single coverage-refused analysis under background load, not a successful training
+compile, isolated CPU profile or marketing performance measurement. It confirms
+that source discovery no longer masks those refusals with an unrelated stale-AD
+module error; it does not demonstrate cache sufficiency or remove those refusals.
 
 Use one focused independent reviewer for the authority/admission changes and another
 review pass over the integrated workload/deletion diff; reuse reviewers rather than
