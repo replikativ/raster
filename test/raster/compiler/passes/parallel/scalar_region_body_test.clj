@@ -5,6 +5,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.reduction :as reduction]
@@ -65,6 +66,8 @@
                                  :accumulator float-acc :arrays {'x :float}))))
   (doseq [step [(with-meta '(clojure.core/+ acc (clojure.core/aget x i))
                           {:raster.type/tag 'double})
+                (with-meta '(clojure.core/+ acc (clojure.core/aget x i))
+                  {:raster.type/tag 'float :tag 'double})
                 '(clojure.core/+ acc 1.0)
                 '(let* [d (clojure.core/double (clojure.core/aget x i))]
                    (clojure.core/+ acc d))]]
@@ -114,6 +117,65 @@
                   nil
                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
       (finally (remove-ns (ns-name caller)) (remove-ns (ns-name foreign))))))
+
+(deftest conditional-reduction-bare-casts-own-their-actual-lookup
+  (let [step '(let* [d (clojure.core/- (float (clojure.core/aget x i))
+                                     (float (clojure.core/aget y i)))]
+                (clojure.core/+ acc (clojure.core/* d d)))
+        prove #(fp-correspondence :float '(float 0.0) step :arrays {'x :float 'y :float})]
+    (is (= :float (:dtype (prove))))
+    (is (= :float
+           (:dtype (fp-correspondence
+                     :float '(float 0.0) step :arrays {'x :float 'y :float}
+                     :actual-step '(clojure.core/+ acc
+                                    (let* [d (clojure.core/- (float (clojure.core/aget x i))
+                                                            (float (clojure.core/aget y i)))]
+                                      (clojure.core/* d d)))))))
+    (binding [util/*shadowing-locals* #{'float}]
+      (is (nil? (prove))))
+    (is (nil? (fp-correspondence :float (float 0.0) '(float acc)
+                                 :facts {'float {:carrier Object :presence :unknown}})))
+    (is (nil? (fp-correspondence :float (float 0.0)
+                                 '(let* [float (clojure.core/float 1.0)] (float acc)))))
+    (let [caller (create-ns (gensym "raster.correspondence.cast-lookup."))]
+      (try
+        (intern caller 'float (fn [& _] (throw (AssertionError. "analysis executed a replacement"))))
+        (is (= :intrinsic-source-definition-mismatch
+               (try (fp-correspondence :float '(float 0.0) step
+                                       :source-ns caller :arrays {'x :float 'y :float})
+                    nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+        (finally (remove-ns (ns-name caller)))))
+    (let [before (meta #'clojure.core/float)]
+      (try
+        (alter-meta! #'clojure.core/float assoc :inline (fn [& _] (throw (AssertionError. "replacement inline"))))
+        (is (= :intrinsic-source-definition-mismatch
+               (try (prove) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+        (finally (reset-meta! #'clojure.core/float before))))))
+
+(deftest conditional-reduction-administrative-equivalence-keeps-read-order-and-count
+  (doseq [[source actual]
+          [['(let* [u (clojure.core/aget x i) v (clojure.core/aget y i)]
+               (clojure.core/+ acc (clojure.core/* u v)))
+            '(clojure.core/+ acc (let* [v (clojure.core/aget y i) u (clojure.core/aget x i)]
+                                  (clojure.core/* u v)))]
+           ['(let* [u (clojure.core/aget x i)] (clojure.core/+ acc (clojure.core/* u u)))
+            '(clojure.core/+ acc (clojure.core/* (clojure.core/aget x i) (clojure.core/aget x i)))]
+           ['(let* [unused (clojure.core/aget x i)] (clojure.core/+ acc (clojure.core/aget y i)))
+            '(clojure.core/+ acc (clojure.core/aget y i))]]]
+    (is (nil? (fp-correspondence :float (float 0.0) source
+                                 :arrays {'x :float 'y :float} :actual-step actual)))))
+
+(deftest conditional-reduction-literal-comparison-retains-exact-floating-bits
+  (doseq [[type positive negative] [[:float (float 0.0) (float -0.0)] [:double 0.0 -0.0]]]
+    (is (nil? (fp-correspondence type positive (list 'clojure.core/* 'acc positive)
+                                 :actual-step (list 'clojure.core/* 'acc negative)))))
+  (let [nan-a (Double/longBitsToDouble 9221120237041090561)
+        nan-b (Double/longBitsToDouble 9221120237041090561)]
+    (is (= :double (:dtype (fp-correspondence
+                            :double 0.0 (list 'clojure.core/* 'acc nan-a)
+                            :actual-step (list 'clojure.core/* 'acc nan-b)))))))
 
 (deftest comparison-operands-retain-independent-source-widths
   (doseq [strict? [false true]

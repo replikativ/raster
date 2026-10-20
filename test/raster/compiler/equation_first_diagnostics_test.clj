@@ -74,6 +74,16 @@
     (is (= :typed-soac-source-coverage (:reason actual)))
     (is (= actual (:coverage (ex-data error)))
         "report the refusal from the same pass that decided legality")
-    (is (seq (:bindings actual)))
+    (is (= 4 (count (:bindings actual))))
+    (let [correspondences (:reduction-value-correspondences actual)
+          proof (:value-correspondence (first correspondences))]
+      (is (= 1 (count correspondences)))
+      (is (= :conditional-fp-reduction-correspondence (:scope proof)))
+      (is (= :float (:dtype proof)))
+      (is (= {:conversion :checked-int :evaluation :original-position}
+             (:source-count-obligation proof)))
+      (is (not-any? #(contains? proof %) [:carrier :nonthrowing? :removable?]))
+      (is (every? #(contains? (:source-evaluation-flags %) :preserve-source-evaluation)
+                  (:bindings actual))))
     (is (zero? @repeated-analyses)
         "do not replace actual admission evidence with a second source analysis")))

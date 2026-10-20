@@ -244,6 +244,36 @@ as PR #1545 for independent qualification. Review found unchanged slot joins and
 initializer coercions; arithmetic and unchanged loop-carrier suites pass 27 tests /
 634 assertions in the campaign REPL. CI remains the clean-process authority.
 
+The next concrete audit refines the diagnosis above. The owned `local-loss` AD
+preparation contains a selected MSE helper call, not a generated reduction. That
+helper's frozen original frontend still has an exactly observed reduction with
+Object/present-Float result. Ordinary helper inlining subsequently renames and
+substitutes it. This case therefore needs a local helper-boundary/context
+projection, not global reduction-origin tracing through every AD transformation.
+Do not attach the original observation to a copied expression by equality.
+
+The actual inlined step was core FP arithmetic with bare `float` casts. Conditional
+correspondence now authenticates those casts through their original namespace
+lookups, retaining lexical shadowing, remapping and bootstrap inline guards. Its
+constructor also moves a `let*` from around the recurrence into its element;
+ordered deterministic SSA comparison accepts that administrative difference
+without accepting reordered/duplicated/dropped reads. Exact semantic comparison
+retains raw FP bits rather than Clojure numeric equality (including signed zero
+and NaN payloads). Both retained dtype hints are independently checked before
+canonicalization. The unchanged training diagnostic now has one conditional Float
+correspondence and still exactly four required-evaluation refusals. The affected
+gate passes 82 tests / 871 assertions; no execution admission changed.
+
+One important context observation prevents a shortcut in the next implementation:
+the MSE reduction's emitted exit returns a reference, but its original
+`:object-result?` and `:object-call-result?` are false. Its reference result comes
+from the actual branch/exit boxing path. An Object result fact alone therefore
+does not justify relabeling the original evaluation with `object-input-contract`.
+Preserve the emitter-owned evaluation/result context, any actual primitive return
+conversion, and public helper boxing separately. If existing completion terms do
+not express that exact result context, extend the shared completion algebra or
+refuse; do not borrow a different input contract merely because both end in Object.
+
 This vertical advances original items 3 and 5 and validates parts of 6 and 7. It does
 not replace items 1, 2, 4 or 8, finish general AD migration/lifetimes, establish SOTA
 performance, or qualify real multi-host execution. All eight obligations below stay
