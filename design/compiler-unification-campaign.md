@@ -14,6 +14,123 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
+#### Reviewed next vertical: source correspondence through resident training
+
+This is the October 20 planning checkpoint, not a new implementation or qualification
+receipt. A read-only independent review studied the actual scalar, AD import, resident
+scheduling and training-fixture machinery. It corrected the earlier sequence: closing
+the four scalar diagnostics is necessary but insufficient. Prepared reverse AD still
+records an unclosed semantic import, which ordered source compilation must reject.
+
+The next vertical must keep these obligations separate:
+
+| Boundary | Required evidence | Evidence that is insufficient |
+|---|---|---|
+| Source ownership | Original lookup, definition/rule history, parameter plan and source policy | Equal syntax, current tags or a refreshed snapshot |
+| Source to typed computation | Corresponding operations, actual input/storage facts and all conversion/checkpoint positions | A successful typed lowerer alone |
+| Conditional result | Value domain after original evaluation completes | Proof that reads, unboxing or conversions cannot fail |
+| Scheduling | Required-evaluation occurrence/order, legal numerical association and dependency graph | Unused result, read permission or logical dtype |
+| Physical realization | Actual JVM carrier or explicit resident payload representation | A logical Float/Double result annotation |
+| Lifetime | Exact views, initialized storage, ownership and completion/lease evidence | Allocation existence or nonblocking completion observation |
+
+Implementation/landing sequence:
+
+0. **Establish the gate and baseline.** The exact PR #1539 head `11852323` currently
+   has setup/build success and failing unit, emission and OpenCL checks. It remains
+   draft and unqualified; absent vendor successes cannot be assumed. Classify those
+   failures and repair affected gates before enabling new admission. Strengthen the
+   existing training oracle's paired `map` comparison: unequal lengths must fail,
+   and this finite fixture must explicitly reject nonfinite expected/actual values.
+   Preserve independent analytic and rounded FP32 oracles and existing tolerances.
+
+1. **Bounded reduction correspondence, without new admission.** Use original owned
+   expressions and authoritative primitive array/parameter facts to validate the
+   element, sequential lexical locals, initializer, recurrence and exit. Reuse
+   `core/source-arithmetic`'s binary/loop plans and the ordinary scalar lowerer;
+   do not add a parallel inference engine or carry original bytecode occurrences
+   through every AD alpha conversion. Keep `completed-fp-body-carrier`'s existing
+   restricted completion contract: array loads must not acquire a nonthrowing proof.
+   Retained-type validation checks consistency, not original-source authentication.
+   Preserve bound evaluation/conversion, including the surface reduction's Int count,
+   and zero-trip initialization. Only already-certified parallel reductions can
+   regroup/interleave; per-element arithmetic/checkpoints and ordered folds retain
+   their separate contracts. A permuting tree requires commutativity as well as
+   associativity. Checkpoint tests are not bitwise equivalence claims for FP trees.
+
+2. **Scalar consumers through existing representations.** Realize the Float MSE
+   result followed by its Double quotient without narrowing Double intermediates.
+   Use existing required-evaluation catalogs and singleton resident scalar scheduling;
+   do not put device reduction results into host-only scalar preparation. Selected
+   Object/Double loss-scale results need the existing owned computation recipe plus
+   use-closed payload projection; their physical source carrier stays Object.
+   Checked Long dimension products must execute at their original ordered host sites
+   when their operands originate there. Late device-dependent exceptional work stays
+   unsupported without an explicit completion/transport contract. These may be
+   separate focused PRs, but must share the same evidence boundaries.
+
+3. **Close the bounded prepared-AD semantic import.** Reuse its existing generated
+   owner and definition collector. Freshness and hygiene alone cannot clear
+   `:prepared-reverse-ad`. Validate argument evaluation and entry conversions in their
+   original order; the sealed active/inactive parameter plan and padded result slots;
+   all input/result conversions, narrowing checkpoints and observable Object uses;
+   required evaluations; supported operation correspondence; and retained definition,
+   source-policy and AD-rule dependencies. Clear only the exact import whose complete
+   bounded projection is checked. Unknown operations and transitive unclosed imports
+   remain refusals. The opt-in normalized device subset is not an already-complete
+   replacement for this generic prepared path. Do not add another AD rule registry.
+
+4. **Qualify the unchanged public training fixture.** Run source/runtime AD controls,
+   hardware-free assembly, then OpenCL and Level Zero forward/gradient/collective/SGD
+   execution for unequal batches, changed arrays/parameters and multiple updates.
+   Check initialized views, allocation budgets, source fences, lease/cleanup behavior
+   and stale preparation rejection. Respect the existing finite unrolled plan's
+   single-run boundary; changed-input tests must not assume unsupported replay.
+   Co-located execution is not multi-device fabric or overlap evidence.
+
+5. **Consolidate before expanding.** Review the final authority/consumer graph,
+   remove only actually superseded implementations/tests, and publish a compact
+   supported/refused boundary matrix. Do not weaken numerical tolerances, restore
+   source-shaped fallbacks, or count more helper tests as workload closure. Land only
+   exact-head green changes; compile-only vendor checks and runtime/performance
+   receipts remain distinct. A read-only planning review does not qualify code.
+
+Every implementation boundary needs positive and refusal tests. The cross-boundary
+negative set includes forged dtype tags, lexical/namespace shadowing and remapping,
+stale AD rules/definitions, nullable or escaping Object results, explicit narrowing,
+wider recurrences, checked overflow, empty/negative/count-overflow domains, Float
+cancellation checkpoints, and missing/duplicated/reordered required evaluations.
+Storage/range safety and operand evaluation remain separately checked even when a
+conditional value correspondence succeeds.
+
+Compile latency is an explicit acceptance axis of this vertical, not deferred until
+more backends land. Retain one bounded marketing density and the unchanged training
+fixture. Separate fresh-process startup/loading, frontend/dispatch, AD preparation,
+SOAC/fusion/effect analysis, emission/materialization, executable preparation and JVM
+warm-up; record phase counts, allocations and cache hits/misses as well as elapsed
+time. Compare fresh, loaded-first, same-signature repeated preparation, changed data
+with fixed shape, changed shape and changed-definition/rule cases. These distinguish
+unnecessary recompilation from intrinsically excessive analysis and startup cost.
+Optimize repeated work before adding cache layers. Reuse immutable owned analysis
+results only under their actual source/rule/policy/target dependencies; do not suppress
+freshness guards, persist process-local owners or assume a bounded cache bounds
+generated-class/native-memory lifetime. Cross-process artifact reuse needs its own
+portable identity/validation boundary. Set numerical budgets from measured baselines;
+do not report whole-worker or sampling time as pure compiler time. Requalify cold/warm
+costs after the vertical closes, independently of execution throughput.
+
+Use one focused independent reviewer for the authority/admission changes and another
+review pass over the integrated workload/deletion diff; reuse reviewers rather than
+launching recurring broad surveys. Ask each review to identify duplicated authorities,
+unvalidated consumers and counterexamples, not merely approve the written design.
+Keep focused REPL feedback local, full suites in CI, and cold-load/lifecycle tests
+where they specifically matter. Each PR records its invariant, affected consumers,
+negative gate, workload evidence and explicit nonclaims.
+
+This vertical advances original items 3 and 5 and validates parts of 6 and 7. It does
+not replace items 1, 2, 4 or 8, finish general AD migration/lifetimes, establish SOTA
+performance, or qualify real multi-host execution. All eight obligations below stay
+open until their own acceptance gates close.
+
 CI timing artifacts now also distinguish a completed runner invocation (which may
 have failing assertions) from an aborted load/report invocation. The existing
 `:outcomes` assertion/skip counters remain complete; each test retains at most

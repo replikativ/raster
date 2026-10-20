@@ -1,5 +1,14 @@
 # Normalized AD design proposal
 
+Reading guide (2026-10-20): distinguish the intended normalized algebra from implemented
+families. Start with [Current implementation boundary](#current-implementation-boundary) for
+the opt-in host/device matrix. Source/default AD, JVM-owned numerical regions and normalized
+host/device families are not interchangeable execution paths. Sections describing an initial
+Double-carry domain or a particular helper vertical qualify that family, not all loop AD.
+Fresh ownership, source projection, numerical correspondence and device execution are separate
+gates; the [current campaign](compiler-unification-campaign.md#reviewed-next-vertical-source-correspondence-through-resident-training)
+keeps the prepared reverse-AD semantic import explicitly open until its bounded projection closes.
+
 ## Ordered generated-call source owner
 
 The shared `core/ordered-call` consumer normalizes an already-resolved JVM
