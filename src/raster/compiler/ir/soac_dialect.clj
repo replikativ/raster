@@ -86,7 +86,15 @@
    destination is explicit, every effect carries either an injectivity proof or a checked
    commutative-reduction contract, and source order is retained within a logical work item. They
    are not treated as pure maps or admitted to algebraic fusion without a later effect proof.
-   Scan results use the same result-storage relation when materialized into caller-owned buffers."
+   Scan results use the same result-storage relation when materialized into caller-owned buffers.
+
+   Invocation-level scalar evaluations can be mandatory even when their values are unused.
+   Program facts retain a `:required-evaluations` catalog and each scalar executor has a matching
+   `:required-evaluation` claim. Source positions are local to the retained source projection;
+   deliberate projection/rebasing preserves the catalog, while whole-program fusion must conserve
+   occurrences and their ordering. This contract denies erasure/motion; it authenticates neither
+   imported source nor exceptional/numerical completion. Those require the existing source owner
+   and scheduled-stage authorities. It does not classify every element of a map as a host effect."
   (:require [clojure.set :as set]
             [clojure.walk :as walk]
             [pattern.nanopass.dialect :as dialect
@@ -2611,6 +2619,69 @@
                    {:equation equation-id :result result :destination destination
                     :logical logical :physical physical})))))))
 
+(defn required-evaluation
+  "The invocation-level source evaluation owned by an equation, if any.
+   This is a conservation/ordering obligation, never totality or execution evidence.
+   Per-element exceptional completion remains a separate scheduled-stage contract."
+  [program equation-id]
+  (get-in (facts program) [:attributes :required-evaluations equation-id]))
+
+(defn- validate-required-evaluations!
+  [program-facts equation-forms]
+  (let [catalog (get-in program-facts [:attributes :required-evaluations] {})
+        claims (into {}
+                     (keep (fn [[id fact]]
+                             (when (contains? (:attributes fact) :required-evaluation)
+                               [id (get-in fact [:attributes :required-evaluation])])))
+                     (:equations program-facts))
+        by-id (into {} (map (juxt second identity)) equation-forms)
+        equation-positions (zipmap (map second equation-forms) (range))]
+    (doseq [[id fact] (:equations program-facts)
+            nested (mapcat #(tree-seq (fn [f] (seq (get-in f [:attributes :fusion/constituents])))
+                                     (fn [f] (vals (get-in f [:attributes :fusion/constituents]))) %)
+                           (vals (get-in fact [:attributes :fusion/constituents])))
+            :when (contains? (:attributes nested) :required-evaluation)]
+      (fail! :typed-soac-required-evaluation
+             "a required scalar evaluation cannot be hidden inside fusion constituents"
+             {:equation id}))
+    (when-not (and (map? catalog) (= catalog claims))
+      (fail! :typed-soac-required-evaluation
+             "required source evaluations must have exactly matching catalog entries and executor claims"
+             {:catalog catalog :claims claims}))
+    (let [occurrences (map :source-binding-id (vals catalog))]
+      (when-not (= (count occurrences) (count (distinct occurrences)))
+        (fail! :typed-soac-required-evaluation
+               "one required source occurrence cannot have multiple executors"
+               {:catalog catalog})))
+    (doseq [[id obligation] catalog]
+      (when-not (and (map? obligation)
+                     (= #{:source-binding-id :flags :ordering} (set (keys obligation)))
+                     (= :source (:ordering obligation))
+                     (set? (:flags obligation)) (seq (:flags obligation))
+                     (every? keyword? (:flags obligation))
+                     (integer? (:source-binding-id obligation))
+                     (<= 0 (:source-binding-id obligation))
+                     (= (:source-binding-id obligation)
+                        (get-in program-facts [:equations id :provenance :source-binding-id]))
+                     (= 'scalar (some-> (get by-id id) operation-kind)))
+        (fail! :typed-soac-required-evaluation
+               "required evaluation must name its exact scalar source occurrence"
+               {:equation id :obligation obligation})))
+    (doseq [[id obligation] catalog
+            [index equation] (map-indexed vector equation-forms)
+            :let [required-index (get equation-positions id)
+                  fact (get-in program-facts [:equations (second equation)])
+                  constituents (tree-seq #(seq (get-in % [:attributes :fusion/constituents]))
+                                         #(vals (get-in % [:attributes :fusion/constituents])) fact)
+                  positions (keep #(get-in % [:provenance :source-binding-id]) constituents)]]
+      (when-not (and (seq positions)
+                     (every? #(and (integer? %) (<= 0 %)
+                                   (= (compare % (:source-binding-id obligation))
+                                      (compare index required-index))) positions))
+        (fail! :typed-soac-required-evaluation-order
+               "equation placement crosses a required source evaluation"
+               {:required id :equation (second equation) :positions (vec positions)})))))
+
 (defn validate!
   "Validate syntax, typed value references, ordered SSA definitions and explicit effects.
    Returns the input program unchanged."
@@ -2646,6 +2717,7 @@
       (fail! :typed-soac-equation-facts
              "equation fact keys must exactly match the expression spine"
              {:facts equation-fact-ids :equations (set equation-ids)}))
+    (validate-required-evaluations! program-facts equations)
     (doseq [equation equations]
       (validate-equation! equation)
       (validate-equation-types! values equation)
@@ -2708,6 +2780,88 @@
   [program-facts equation-forms program-outputs]
   (validate! (list 'soac-program program-facts (vec equation-forms) (vec program-outputs))))
 
+(defn- represented-equation-ids
+  [equation-id equation-facts]
+  (into #{equation-id}
+        (mapcat (fn [fact] (keys (get-in fact [:attributes :fusion/constituents]))))
+        (tree-seq #(seq (get-in % [:attributes :fusion/constituents]))
+                  #(vals (get-in % [:attributes :fusion/constituents])) equation-facts)))
+
+(defn assert-required-evaluations-preserved!
+  "Check a whole-program rewrite against its retained producer, not a fresh self-description.
+   Required scalar occurrences currently stay intact. A future refinement that discharges or
+   relocates one needs its own execution/completion proof; deleting both claim and catalog is
+   not such a proof. Both envelopes must separately pass validate!. Deliberate equation projection
+   uses its separate parent/member boundary."
+  [producer rewritten]
+  (let [expected (get-in (facts producer) [:attributes :required-evaluations] {})
+        actual (get-in (facts rewritten) [:attributes :required-evaluations] {})]
+    (when (or (seq expected) (seq actual))
+      (let [producer-equations (into {} (map (juxt second identity)) (equations producer))
+            rewritten-equations (into {} (map (juxt second identity)) (equations rewritten))
+            original-positions (zipmap (map second (equations producer)) (range))
+            positions (zipmap (map second (equations rewritten)) (range))]
+        (when-not (and (= expected actual)
+                       (every? #(semantic/equivalent? (get producer-equations %)
+                                                      (get rewritten-equations %))
+                               (keys expected)))
+          (fail! :typed-soac-required-evaluation-refinement
+                 "whole-program rewrite must conserve each required source evaluation"
+                 {:expected expected :actual actual}))
+        (doseq [required (keys expected)
+                equation (equations rewritten)
+                original (represented-equation-ids
+                          (second equation)
+                          (get-in (facts rewritten) [:equations (second equation)]))
+                :when (contains? original-positions original)]
+          (when-not (= (compare (get original-positions original) (get original-positions required))
+                       (compare (get positions (second equation)) (get positions required)))
+            (fail! :typed-soac-required-evaluation-refinement
+                   "whole-program rewrite moved work across a required source evaluation"
+                   {:required required :crossed original})))))
+    rewritten))
+
+(defn project-equation-facts
+  "Select exact equation-owned facts for a deliberate parent/member projection.
+   This does not discharge omitted evaluations in the parent program."
+  [program-facts equation-ids]
+  (when-not (set/subset? (set equation-ids) (set (keys (:equations program-facts))))
+    (fail! :typed-soac-equation-projection "projection references an unknown equation"
+           {:equations equation-ids}))
+  (cond-> (update program-facts :equations select-keys equation-ids)
+    (contains? (:attributes program-facts) :required-evaluations)
+    (update-in [:attributes :required-evaluations] select-keys equation-ids)))
+
+(defn rebase-source-bindings
+  "Rebase exact occurrence positions while constructing a new source projection.
+   Values, scalar bodies and executor identities are unchanged; claims and catalog
+   follow the same explicit position mapping as provenance, including fused constituents.
+   This changes local source coordinates, not retained executor identity or original-source
+   ownership, and grants no motion proof."
+  [program positions]
+  (validate! program)
+  (when-not (and (map? positions)
+                 (= (set (keys positions)) (set (map second (equations program))))
+                 (= (count positions) (count (distinct (vals positions))))
+                 (every? #(and (integer? %) (<= 0 %)) (vals positions)))
+    (fail! :typed-soac-equation-projection "source rebasing must cover the exact equation set"
+           {:positions positions}))
+  (letfn [(rebase-fact [fact position]
+            (cond-> (assoc-in fact [:provenance :source-binding-id] position)
+              (seq (get-in fact [:attributes :fusion/constituents]))
+              (update-in [:attributes :fusion/constituents]
+                         #(update-vals % (fn [child] (rebase-fact child position))))))]
+  (let [projected (reduce-kv
+                   (fn [f id position]
+                     (cond-> (update-in f [:equations id] rebase-fact position)
+                       (required-evaluation program id)
+                       (-> (assoc-in [:equations id :attributes :required-evaluation :source-binding-id]
+                                     position)
+                           (assoc-in [:attributes :required-evaluations id :source-binding-id]
+                                     position))))
+                   (facts program) positions)]
+    (make projected (equations program) (outputs program)))))
+
 (defn- declared-dimension-value
   "Only canonical direct value dimensions identify retained facts. Opaque shape algebra does
    not grant permission to treat its symbols or callable heads as logical value dependencies."
@@ -2734,7 +2888,7 @@
         shape-value-ids (keep declared-dimension-value
                               (mapcat #(get-in source-facts [:values % :shape]) direct-value-ids))
         value-ids (into direct-value-ids shape-value-ids)
-        program-facts (-> source-facts
+        program-facts (-> (project-equation-facts source-facts [equation-id])
                           (assoc :values (select-keys (:values source-facts) value-ids)
                                  :inputs inputs :equations {equation-id equation-facts}
                                  :effects (:effects equation-facts)))]
@@ -2962,7 +3116,10 @@
    :attributes attributes})
 
 (defn- composition-contract [program-facts]
-  (dissoc program-facts :values :inputs :equations :diagnostics :provenance :aliases))
+  (-> (dissoc program-facts :values :inputs :equations :diagnostics :provenance :aliases)
+      ;; Recognized occurrence catalogs compose by disjoint equation identity below.
+      ;; Other unknown facets still require exact agreement.
+      (update :attributes dissoc :required-evaluations)))
 
 (defn- contract-without-source-arithmetic [contract]
   (update contract :attributes dissoc :source-arithmetic))
@@ -3063,5 +3220,10 @@
                          :inputs (vec (remove definitions (distinct (concat (:inputs pf) (:inputs cf)))))
                          :equations (merge (:equations pf) (:equations cf))
                          :diagnostics (into (vec (:diagnostics pf)) (:diagnostics cf))
-                         :provenance (merge-exact :provenance (:provenance pf) (:provenance cf))))
+                         :provenance (merge-exact :provenance (:provenance pf) (:provenance cf)))
+                  (cond-> (or (contains? (:attributes pf) :required-evaluations)
+                              (contains? (:attributes cf) :required-evaluations))
+                    (assoc-in [:attributes :required-evaluations]
+                              (merge (get-in pf [:attributes :required-evaluations])
+                                     (get-in cf [:attributes :required-evaluations])))))
               combined-equations program-outputs)))))

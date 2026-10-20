@@ -567,11 +567,9 @@
                                        (cond-> {:raster.type/tag tag} array? (assoc :tag tag)))])))
                       (:values facts))
         projected (dialect/remap-values program symbols)
-        projected (dialect/make
-                   (reduce (fn [facts [index equation]]
-                             (assoc-in facts [:equations (second equation) :provenance :source-binding-id] index))
-                           (dialect/facts projected) (map-indexed vector (dialect/equations projected)))
-                   (dialect/equations projected) (dialect/outputs projected))
+        projected (dialect/rebase-source-bindings
+                   projected (into {} (map-indexed (fn [index equation] [(second equation) index]))
+                                   (dialect/equations projected)))
         pairs (mapcat #(let [equation-id (second %)]
                          (:pairs (realize-equation projected %
                                                    (contains? fresh-segmented-reductions
@@ -1461,7 +1459,7 @@
         ;; An allocator extent can be computed in an earlier component and absent from every
         ;; numerical operand/axis here. Prior source definitions are incoming values, not local
         ;; host bindings still waiting to execute. Keep current/later definitions unavailable.
-        facts (-> source-facts
+        facts (-> (dialect/project-equation-facts source-facts equation-ids)
                   (assoc :inputs inputs :equations equation-facts :effects effects)
                   (update-in [:attributes :source-bindings]
                              #(filterv (complement prior-definitions) %))

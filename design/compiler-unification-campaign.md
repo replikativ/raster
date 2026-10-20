@@ -14,10 +14,30 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
+Required invocation-level scalar evaluations now have an explicit TypedSOAC contract:
+a program catalog and an exact executor claim per source occurrence. Validation
+rejects missing/duplicate claims, missing executors, hidden claims in fusion
+constituents and placement across a required evaluation. Whole-program fusion
+also compares the retained producer, so deleting both claim and catalog cannot
+silently erase the requirement. Source projection/rebasing uses shared dialect
+helpers, including fused constituent coordinates; sequential spine composition
+requires distinct explicit source occurrences. These constraints do not turn
+per-element checked conversions into global host effects.
+
+This is conservation/ordering evidence, not original-source authentication,
+totality, initialized storage, or observed runtime completion. Original source
+ownership and scheduled-stage completion remain independently required. Late
+scalar admission stays closed until its resident executor and completion protocol
+are connected. The reviewed affected gate passes 199 tests / 1,281 assertions;
+five focused fusion controls add 30 assertions, including ordinary fusion away
+from the boundary and a fused-prefix host projection. No device performance,
+complete training vertical, or broad CI acceptance follows from these checks.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `c101748f`, setup/build passed; emission, unit and OpenCL gates failed.
 At `a1279e4e`, setup/build passed, emission failed, and unit/OpenCL were still
 running at the latest observation. These are not acceptance evidence for CUDA/HIP.
+At `ac98bd33`, setup/build passed and emission, unit and OpenCL failed.
 The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over

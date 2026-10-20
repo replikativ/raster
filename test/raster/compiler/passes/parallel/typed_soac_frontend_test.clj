@@ -1937,6 +1937,28 @@
       (is (some #(= 'unused-forward-loss (:binding %))
                 (get-in attempt [:declined :bindings]))))))
 
+(deftest unused-prefix-scalar-owns-an-explicit-required-evaluation
+  (let [expression (with-meta '(clojure.core/* gain gain)
+                     {:tag 'double :raster.type/tag 'double
+                      :raster.effect/preserve-evaluation true})
+        source (list 'let* ['unused expression
+                           'y '(raster.par/pmap i n double (clojure.core/aget x i))] 'y)
+        program (frontend/form->program
+                 source {:dtype :double :array-types {'x :double}
+                         :scalar-types {'gain :double 'n :long}})
+        equation (first (dialect/equations program))
+        obligation (dialect/required-evaluation program (second equation))]
+    (is (= '[unused] (nth equation 2)))
+    (is (= {:source-binding-id 0 :flags #{:preserve-source-evaluation} :ordering :source}
+           obligation))
+    (is (= obligation (get-in (dialect/facts program)
+                             [:equations (second equation) :attributes :required-evaluation])))
+    (is (not (some #{'unused} (dialect/outputs program))))
+    (is (= program (dialect/validate! program)))
+    (is (some? (:program (route/attempt source :double {'x :double}
+                                      {:scalar-types {'gain :double 'n :long}})))
+        "ordinary prefix source projection must retain its required evaluation")))
+
 (deftest functional-map-result-casts-become-typed-conversion-terms
   (doseq [[cast overflow] [['int :trap] ['unchecked-int :wrap]]]
     (let [source (list 'let*

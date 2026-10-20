@@ -6454,7 +6454,9 @@
               equation-facts
               (into {}
                     (map (fn [description]
-                           (let [storage (:result-storage description)]
+                           (let [storage (:result-storage description)
+                                 flags (when (= :scalar (:kind description))
+                                         (:flags (effects/descriptor (:expr description))))]
                              [(:id description)
                               (cond-> (dialect/default-equation-facts
                                        {:front-end :analyzed-source
@@ -6462,6 +6464,10 @@
                                 true
                                 (update :attributes assoc
                                         :source-prefix? (boolean (:source-prefix? description)))
+                                (seq flags)
+                                (assoc-in [:attributes :required-evaluation]
+                                          {:source-binding-id (:id description)
+                                           :flags flags :ordering :source})
                                 (contains? graph-shape-scalar-ids (:sym description))
                                 (update :attributes assoc :graph-shape-definition true)
                                 storage
@@ -6478,6 +6484,10 @@
                                             {:result-storage storage
                                              :host-binding (:host-binding description)})))]))
                          equation-descriptions))
+              required-evaluations
+              (into {} (keep (fn [[id fact]]
+                               (when-let [obligation (get-in fact [:attributes :required-evaluation])]
+                                 [id obligation]))) equation-facts)
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
               ;; Protected markers stay in the reconstructed host form until their existing plan
               ;; becomes a scheduled equation. Keeping the source binding is provenance and
@@ -6495,7 +6505,7 @@
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects
                       :provenance {:front-end :analyzed-source}
-                      :attributes {:source-dialect :closed-clojure
+                      :attributes (cond-> {:source-dialect :closed-clojure
                                    :source-bindings (mapv first pairs)
                                    :host-binding-ids host-binding-ids
                                    :host-read-values host-read-values
@@ -6505,7 +6515,9 @@
                                             :values (set (filter #(contains? values %)
                                                                  (util/free-syms expr)))})
                                          host-control-descriptions)
-                                   :allocations allocations}})]
+                                   :allocations allocations}
+                                    (seq required-evaluations)
+                                    (assoc :required-evaluations required-evaluations))})]
           (let [segmented? (boolean (seq swr-descriptions))
                 ;; For a mixed projection this is an equation catalog used to build maximal
                 ;; ordinary SOAC chunks. Its broad outputs prevent validation from discarding a

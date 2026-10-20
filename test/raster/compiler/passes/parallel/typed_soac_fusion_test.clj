@@ -5,6 +5,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as typed-fusion]
+            [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
 
 (def ^:private map-map-source
@@ -896,16 +897,18 @@
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
     (is (= 2 (count (dialect/equations result))))))
 
-(deftest completed-reduction-fuses-a-pure-scalar-consumer
-  (let [program
-        (frontend/form->program
+(defn- reduction-scalar-program []
+  (frontend/form->program
          '(let* [total (raster.par/reduce acc 0.0 i n
                                           (+ acc (clojure.core/aget x i)))
                  ^double scaled (* ^double total ^double scale)]
                 scaled)
          {:dtype :double
           :array-types {'x :double}
-          :scalar-types {'scale :double}})
+          :scalar-types {'scale :double}}))
+
+(deftest completed-reduction-fuses-a-pure-scalar-consumer
+  (let [program (reduction-scalar-program)
         fold-before (-> program dialect/equations first typed-fusion/equation-info :body-results)
         [result stats] (typed-fusion/fusion-fixpoint program)
         equation (first (dialect/equations result))
@@ -931,6 +934,76 @@
     (is (not (contains? remapped-attributes :segment-axes))
         "remapping a full reduction must not invent segmented axes")
     (is (= result (dialect/validate! result)))))
+
+(defn- with-required-scalar [base equation-id]
+  (let [source-id (get-in (dialect/facts base)
+                          [:equations equation-id :provenance :source-binding-id])
+        obligation {:source-binding-id source-id :flags #{:preserve-source-evaluation}
+                    :ordering :source}
+        facts (-> (dialect/facts base)
+                  (assoc-in [:equations equation-id :attributes :required-evaluation] obligation)
+                  (assoc-in [:attributes :required-evaluations equation-id] obligation))
+        program (dialect/make facts (dialect/equations base) (dialect/outputs base))]
+    program))
+
+(deftest required-scalar-completion-is-not-a-reduction-epilogue
+  (let [base (reduction-scalar-program)
+        equation-id (second (second (dialect/equations base)))
+        program (with-required-scalar base equation-id)
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (zero? (:vertical stats)))
+    (is (= program result))
+    (is (= 2 (count (dialect/equations result))))
+    (is (= (dialect/required-evaluation program equation-id)
+           (dialect/required-evaluation result equation-id)))))
+
+(deftest maps-do-not-fuse-across-required-scalar-completion
+  (let [base (frontend/form->program
+              '(let* [y (raster.par/pmap i n double (* (clojure.core/aget x i) 2.0))
+                      ^double marker (* ^double gain ^double gain)
+                      z (raster.par/pmap j n double (+ (clojure.core/aget y j) marker))] z)
+              {:dtype :double :array-types {'x :double}
+               :scalar-types {'n :long 'gain :double}})
+        program (with-required-scalar base 1)
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= program result))
+    (is (zero? (:vertical stats)))
+    (is (= 3 (count (dialect/equations result))))))
+
+(deftest required-scalar-prefix-does-not-disable-later-map-fusion
+  (let [base (frontend/form->program
+              '(let* [^double marker (* ^double gain ^double gain)
+                      y (raster.par/pmap i n double (* (clojure.core/aget x i) marker))
+                      z (raster.par/pmap j n double (+ (clojure.core/aget y j) 1.0))] z)
+              {:dtype :double :array-types {'x :double}
+               :scalar-types {'n :long 'gain :double}})
+        program (with-required-scalar base 0)
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= 1 (:vertical stats)))
+    (is (= 2 (count (dialect/equations result))))
+    (is (= (first (dialect/equations program)) (first (dialect/equations result))))
+    (is (= (dialect/required-evaluation program 0) (dialect/required-evaluation result 0)))))
+
+(deftest fused-prefix-projection-rebases-all-source-coordinates
+  (let [base (frontend/form->program
+              '(let* [y (raster.par/pmap i n double (* (clojure.core/aget x i) 2.0))
+                      z (raster.par/pmap j n double (+ (clojure.core/aget y j) 1.0))
+                      ^double marker (* ^double gain ^double gain)
+                      out (raster.par/pmap k n double (+ (clojure.core/aget z k) marker))] out)
+              {:dtype :double :array-types {'x :double}
+               :scalar-types {'n :long 'gain :double}})
+        [program stats] (typed-fusion/fusion-fixpoint (with-required-scalar base 2))
+        positions (into {} (map-indexed (fn [position equation] [(second equation) position]))
+                        (dialect/equations program))
+        projected (dialect/rebase-source-bindings program positions)]
+    (is (= 1 (:vertical stats)))
+    (is (= 3 (count (dialect/equations projected))))
+    (is (= 1 (:source-binding-id (dialect/required-evaluation projected 2))))
+    (is (every? zero? (map #(get-in % [:provenance :source-binding-id])
+                          (vals (get-in (dialect/facts projected)
+                                        [:equations 1 :attributes :fusion/constituents])))))
+    (is (seq (:body (#'route/host-projection program [] (dialect/outputs program)))))
+    (is (= projected (dialect/validate! projected)))))
 
 (deftest completed-reduction-conversion-preserves-the-accumulator-precision
   (let [program (frontend/form->program
