@@ -24,6 +24,7 @@
             [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.passes.parallel.staged-contraction-admission :as staged-admission]
             [raster.compiler.passes.parallel.staged-scalar-body :as scalar-stage-body]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.ir.index-algebra :as index-algebra]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -3047,6 +3048,10 @@
           (set/difference (util/free-syms init) (:inputs io)
                           (set [symbol acc idx]) descriptor/aget-ops descriptor/aset-ops)]
       (merge {:kind :reduce :id id :sym symbol :results [symbol] :index idx :extent bound
+              ;; Diagnostic correspondence retains the constructor's own inputs,
+              ;; not an inferred physical return carrier or an admission witness.
+              :source-expression expression
+              :source-array-types (select-keys array-types (:inputs io))
               :product (reduction/scalar
                         ;; Explicit contextual narrowing wins; otherwise the accumulator's
                         ;; retained initializer/binder type owns its carrier, not kernel dtype.
@@ -4756,8 +4761,17 @@
         ;; Only diagnose a refused source. These are normal-completion facts,
         ;; not admission evidence, and no logical scalar tags seed the scope.
         (let [completed (normal-return/completed-scalar-bindings
-                         (mapv (juxt :sym :expr) descriptions) {} source-ns)]
-          {:reason :typed-soac-source-coverage
+                         (mapv (juxt :sym :expr) descriptions) {} source-ns)
+              correspondence
+              (into []
+                    (keep (fn [{:keys [id sym kind product source-expression source-array-types]}]
+                            (when (= :reduce kind)
+                              (when-let [proof (scalar-body/check-reduction-fp-correspondence
+                                                source-expression product
+                                                {:source-ns source-ns :array-types source-array-types})]
+                                {:id id :binding sym :value-correspondence proof}))))
+                    descriptions)]
+          (cond-> {:reason :typed-soac-source-coverage
            :bindings
            (mapv (fn [{:keys [id sym kind expr]}]
                    (cond-> {:id id
@@ -4784,7 +4798,8 @@
                               (into {} (map (fn [[key value]]
                                               [key (if (class? value) (.getName ^Class value) value)]))
                                     fact)))))
-                 declined)})))))
+                 declined)}
+            (seq correspondence) (assoc :reduction-value-correspondences correspondence)))))))
 
 (defn- element-symbols [n] (mapv #(symbol (str "%element" %)) (range n)))
 (defn- capture-symbols [n] (mapv #(symbol (str "%capture" %)) (range n)))

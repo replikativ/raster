@@ -6,6 +6,27 @@
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.pipeline :as pipeline]))
 
+(deftest conditional-reduction-diagnostic-neither-admits-nor-invents-a-physical-carrier
+  (let [step '(clojure.core/+ acc (clojure.core/aget x i))
+        reduce-form (with-meta (list 'raster.par/reduce 'acc (float 0.0) 'i 'count step)
+                      {:raster.type/elem-type :float})
+        quotient (with-meta '(clojure.core// sum 2.0)
+                   {:raster.effect/preserve-evaluation true :raster.type/tag 'double})
+        source (list 'let* ['sum reduce-form 'result quotient] 'result)
+        report (binding [raster.compiler.core.method-entry/*emission-inputs*
+                         (atom {:static [] :values []})]
+                 (frontend/coverage-decline
+                  source {:dtype :float :array-types {'x :float} :scalar-types {'count :long}
+                          :source-ns (the-ns 'raster.compiler.equation-first-diagnostics-test)}))
+        proof (get-in report [:reduction-value-correspondences 0 :value-correspondence])]
+    (is (= :typed-soac-source-coverage (:reason report)))
+    (is (= :conditional-fp-reduction-correspondence (:scope proof)))
+    (is (= :float (:dtype proof)))
+    (is (not-any? #(contains? proof %) [:carrier :nonthrowing? :removable?]))
+    (is (= :uncertified-host-scalar (get-in report [:bindings 0 :reason])))
+    (is (contains? (get-in report [:bindings 0 :source-evaluation-flags]) :preserve-source-evaluation))
+    (is (nil? (get-in report [:bindings 0 :normal-completion])))))
+
 (deftest training-loss-keeps-its-float-checkpoint-before-the-double-quotient
   ;; Returning a Double does not mean that the sum was accumulated in Double.
   ;; These exact Float inputs distinguish the source specialization from an

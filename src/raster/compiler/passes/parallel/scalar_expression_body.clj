@@ -16,6 +16,8 @@
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -1817,3 +1819,166 @@
             :operation (intrinsics/canonical operation)
             :parameter-carriers carriers :result-carrier (:result-carrier entry)
             :payload-carrier actual}))))))
+
+(defn check-reduction-fp-correspondence
+  "Conditional FP value/checkpoint correspondence at an owning reduction constructor.
+
+   `original` must be the owner's source occurrence; `product` is its actual
+   constructed ProductReduction. Storage and primitive scalar facts are supplied
+   by that owner, never inferred from desired result tags. Only one FP carry,
+   direct index reads, sequential let* and authenticated core FP arithmetic are covered.
+   Selected calls abstain: a boxed payload is not its parent's operand carrier.
+   This query does not establish source ownership, a physical JVM result carrier,
+   operand/count completion, bounds, purity or permission to reorder a reduction.
+   The returned source-count obligation retains the original checked Int conversion;
+   it is not evidence that a symbolic bound or its conversion completes.
+   Unknown correspondence abstains; definition-ownership failures still propagate."
+  [original product {:keys [source-ns array-types scalar-facts]}]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and method-entry/*emission-inputs*
+                (instance? clojure.lang.Namespace source-ns)
+                (seq? original) (= 6 (bounded-count 7 original))
+                (= 'raster.par/reduce (first original)))
+       (reduction/validate! product)
+       (let [abstain! (fn [& _]
+                        (throw (ex-info "Outside conditional FP reduction correspondence"
+                                        {:reason ::reduction-correspondence-decline})))
+             fp? #{:float :double}
+             tag-of (fn [x]
+                      (let [tag (or (:raster.type/tag (meta x)) (:tag (meta x)))]
+                        (or (when (and (keyword? tag) (dtype/known? tag)) (dtype/canon tag))
+                            (dtype/dtype-for-scalar-tag tag))))
+             typed (fn [x type]
+                     (when-let [retained (tag-of x)]
+                       (when-not (= retained type) (abstain!)))
+                     (if (instance? clojure.lang.IObj x)
+                       (with-meta x (assoc (meta x) :raster.type/tag
+                                          (dtype/scalar-tag-for-dtype type))) x))]
+         (try
+           ;; Bound analysis cost and recursion before either the correspondence
+           ;; traversal or the existing scalar lowerer visits an expression.
+           (loop [pending [[original 0] [(:results (:step product)) 0]] visits 0]
+             (when-let [[node depth] (peek pending)]
+               (when (or (>= visits 10000) (> depth 128)) (abstain!))
+               (let [remaining (pop pending)
+                     capacity (- 10000 visits (count remaining))]
+                 ;; Bound child realization BEFORE growing the work stack; a
+                 ;; wide or lazy collection must not evade the visit budget.
+                 (when (and (coll? node)
+                            (> (bounded-count (inc capacity) node) capacity)) (abstain!))
+                 (recur (if (coll? node)
+                          (into remaining (map #(vector % (inc depth)) node))
+                          remaining)
+                        (inc visits)))))
+           (let [{:keys [acc init idx bound body]} (par/extract-par-reduce-info original)
+                 component (first (:components product))
+                 region (reduction/fold-region product)
+                 target (:dtype component)
+                 scalar-types (into {}
+                                    (keep (fn [[id {:keys [carrier presence]}]]
+                                            (when (and (= :present presence)
+                                                       (contains? #{Float/TYPE Double/TYPE} carrier))
+                                              [id (if (= carrier Float/TYPE) :float :double)])))
+                                    scalar-facts)]
+             (when-not (and (= 1 (count (:components product))) (fp? target)
+                            (= acc (:accumulator component)) (= idx (:index product))
+                            (symbol? acc) (symbol? idx) (not= acc idx) (empty? (:bindings region))
+                            (= 1 (count (:results region)))
+                            ;; Initializers are retained by the actual constructor. Equal
+                            ;; numeric values must not substitute a different source width.
+                            (identical? init (:neutral component))
+                            (or (symbol? bound)
+                                (and (integer? bound) (<= Integer/MIN_VALUE bound Integer/MAX_VALUE))))
+               (abstain!))
+             (letfn [(check [expression env]
+                       (let [[type normalized]
+                             (cond
+                               (instance? Float expression) [:float expression]
+                               (instance? Double expression) [:double expression]
+                               (symbol? expression)
+                               (when-let [type (get env expression)] [type expression])
+
+                               (and (seq? expression) (= 'let* (first expression)))
+                               (let [[_ bindings & bodies] expression]
+                                 (when-not (and (vector? bindings) (even? (count bindings))
+                                                (= 1 (count bodies))) (abstain!))
+                                 (let [[scope bindings]
+                                       (reduce (fn [[scope out] [id value]]
+                                                 (when-not (and (symbol? id) (not= idx id)) (abstain!))
+                                                 (let [[type value] (check value scope)]
+                                                   [(assoc scope id type)
+                                                    (conj out (typed id type) value)]))
+                                               [env []] (partition 2 bindings))
+                                       [type body] (check (first bodies) scope)]
+                                   [type (with-meta (list 'let* bindings body) (meta expression))]))
+
+                               (seq? expression)
+                               (let [{:keys [semantic-op arguments lexical-callee implementation-op]}
+                                     (descriptor/call-description expression)
+                                     core? (and (= semantic-op (first expression))
+                                                (= "clojure.core" (namespace semantic-op)))]
+                                 (when (or lexical-callee (contains? env implementation-op)) (abstain!))
+                                 (cond
+                                   (and core? (= 'clojure.core/aget semantic-op)
+                                        (= 2 (count arguments)) (= idx (second arguments))
+                                        (symbol? (first arguments))
+                                        (not (contains? env (first arguments))))
+                                   (let [type (get array-types (first arguments))]
+                                     (when-not (fp? type) (abstain!))
+                                     (intrinsic-source/observe-original! source-ns semantic-op)
+                                     [type expression])
+
+                                   (and core? (descriptor/cast-op? semantic-op)
+                                        (= 1 (count arguments)))
+                                   (let [[source operand] (check (first arguments) env)
+                                         target (dtype/dtype-for-scalar-tag
+                                                 (descriptor/cast-result-tag semantic-op))]
+                                     (when-not (fp? target) (abstain!))
+                                     (intrinsic-source/observe-original! source-ns semantic-op)
+                                     (when-not (or (= source target) (= target :double)
+                                                   (numeric-constant/source-value expression))
+                                       (abstain!))
+                                     [target (with-meta (list semantic-op operand) (meta expression))])
+
+                                   :else
+                                   (let [_ (when-not core? (abstain!))
+                                         intrinsic (intrinsics/descriptor semantic-op)
+                                         checked (mapv #(check % env) arguments)
+                                         types (mapv first checked)]
+                                     (when-not (and (= 2 (count checked)) (= :infix (:kind intrinsic))
+                                                    (source-arithmetic/binary-operator? (:c intrinsic))
+                                                    (every? fp? types))
+                                       (abstain!))
+                                     (intrinsic-source/observe-original! source-ns semantic-op)
+                                     (let [plan (apply source-arithmetic/binary-plan (:c intrinsic) types)
+                                           type (:result-carrier plan)
+                                           op (symbol "clojure.core" (:c intrinsic))]
+                                       (when-not (= :primitive (:kind plan)) (abstain!))
+                                       [type (with-meta (apply list op (map second checked))
+                                                       (meta expression))]))))
+                               :else nil)]
+                         (when-not (fp? type) (abstain!))
+                         [type (typed normalized type)]))]
+               (let [[initial-type _] (check init scalar-types)
+                     env (assoc (dissoc scalar-types idx) acc target)
+                     [update-type source-step] (check body env)
+                     plan (source-arithmetic/loop-initializer-plan acc init initial-type update-type)
+                     [_ actual-step] (check (first (:results region)) env)]
+                 (when-not (and (= target update-type (:slot-carrier plan))
+                                (= source-step actual-step)) (abstain!))
+                 (let [options {:array-types array-types :arrays (set (keys array-types))
+                                :scalar-types env :index-scope #{idx}
+                                :source-region [source-step actual-step] :require-source-types? true
+                                :id-prefix "fp-correspondence" :decline! abstain!
+                                :lower-index (fn [coordinate _]
+                                               (if (= coordinate idx) idx (abstain!)))}
+                       lower (fn [expression]
+                               ((:lower (make-lowerer options)) expression target env))]
+                   (when-not (= (lower source-step) (lower actual-step)) (abstain!))
+                   {:scope :conditional-fp-reduction-correspondence :dtype target
+                    :checkpoints-preserved? true :zero-trip :initializer
+                    :source-count-obligation {:conversion :checked-int :evaluation :original-position}}))))
+           (catch clojure.lang.ExceptionInfo error
+             (when-not (= ::reduction-correspondence-decline (:reason (ex-data error)))
+               (throw error)))))))))

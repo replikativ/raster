@@ -179,6 +179,12 @@ share transform/result extraction/validation; timing separates transform and
 validation without clock reads on the unobserved path. This supplies measurement
 infrastructure, not evidence that marketing preparation is fast enough.
 
+The independent finite-oracle hardening landed as PR #1544 after all seven
+corrected-head contexts succeeded. Its first unit run correctly caught the
+exact-membership shard guard still expecting eight training cases; that guard
+now explicitly includes the ninth oracle regression and still checks uniqueness.
+No tolerance, workload case or required CI context was removed.
+
 The next independently reviewed lifecycle correction separates authenticated
 original-frontend discovery from freshness of a previously generated module.
 Original source can seed a new preparation after an AD-rule revision; the old
@@ -189,6 +195,28 @@ the source nor upgrades its bytecode. Focused source/lifecycle tests pass 25 tes
 123 assertions in the existing REPL; the combined affected gate previously passed
 36 / 201. This does not establish stale-module renewal, portable owner persistence,
 new effect admission, or the complete marketing fresh-worker lifecycle.
+
+Step 1 now has a bounded diagnostic-only first subset in shared scalar machinery:
+`check-reduction-fp-correspondence` checks the actual constructor source/product
+pair, owned primitive storage facts, one FP carry, sequential locals and qualified
+bootstrap-authenticated core FP arithmetic. It reuses the source arithmetic and
+initializer plans, then compares two deterministic invocations of the existing
+scalar lowerer. Original initializer identity and conversion/checkpoint agreement
+are separate checks. Node/depth and child-enumeration limits bound analysis, even
+for a lazy unbounded input. Required count conversion remains explicitly named
+`:source-count-obligation`, not a proof of successful conversion or bounds.
+
+Independent review caught and removed an attempted boxed-payload/primitive-operand
+conflation. The first subset now abstains on all selected calls; supporting a known
+Float payload behind Object still needs the planned physical-context projection.
+The real selected Object/Float and Object/Double cases have refusal regressions.
+Coverage reporting exposes successful results under
+`:reduction-value-correspondences`, never as `:normal-completion` or admission
+evidence. A synthetic preserved post-reduction quotient remains refused with its
+evaluation obligation. This is not closure of the AD-generated training reduction:
+its selected calls and other non-core shapes may still abstain. The fresh bounded
+REPL's affected scalar-region, physical-return and equation-first diagnostic suites
+pass 79 tests / 851 assertions. Full draft qualification remains open.
 
 This vertical advances original items 3 and 5 and validates parts of 6 and 7. It does
 not replace items 1, 2, 4 or 8, finish general AD migration/lifetimes, establish SOTA

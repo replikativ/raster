@@ -8,6 +8,7 @@
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
@@ -228,7 +229,22 @@
                 (is (= [carrier carrier] (:parameter-carriers proof)))
                 (is (= Object (:result-carrier proof)))
                 (is (= carrier (:payload-carrier proof)))
-                (is (not (contains? proof :nonthrowing?)))))))
+                (is (not (contains? proof :nonthrowing?)))
+                ;; A real selected Object/Float or Object/Double result is not
+                ;; a primitive operand for its enclosing core overload.
+                (let [init (if (= carrier Float/TYPE) (float 0.0) 0.0)
+                      type (if (= carrier Float/TYPE) :float :double)
+                      step (list 'clojure.core/+ 'acc call)
+                      source (list 'raster.par/reduce 'acc init 'i 'count step)
+                      product (reduction/make
+                               {:components [{:id :sum :accumulator 'acc :neutral init
+                                              :dtype type :result 'sum}]
+                                :index 'i :step (reduction/->ReductionRegion [] [step] {})})]
+                  (is (nil? (entry/call-with-definition-inputs
+                             #(scalar/check-reduction-fp-correspondence
+                               source product {:source-ns scope :array-types {}
+                                               :scalar-facts {'a {:carrier carrier :presence :present}
+                                                              'b {:carrier carrier :presence :present}}})))))))))
         (finally (remove-ns (ns-name scope)))))))
 
 (deftest canonical-operation-does-not-follow-a-nominal-multiply-name

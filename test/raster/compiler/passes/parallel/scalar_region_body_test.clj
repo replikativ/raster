@@ -4,8 +4,10 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.scalar-conversion :as conversion]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index]
@@ -20,6 +22,98 @@
      {:array-types {'x :float} :arrays #{'x} :scalar-types {'i :int}
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
+
+(defn- fp-correspondence
+  [type init step & {:keys [arrays facts accumulator actual-step bound source-ns]
+                    :or {arrays {} facts {} accumulator 'acc bound 'count
+                         source-ns (the-ns 'raster.compiler.passes.parallel.scalar-region-body-test)}}]
+  (let [source (list 'raster.par/reduce accumulator init 'i bound step)
+        product (reduction/make
+                 {:components [{:id :sum :accumulator accumulator :neutral init :dtype type :result 'sum}]
+                  :index 'i :step (reduction/->ReductionRegion [] [(or actual-step step)] {})})]
+    (entry/call-with-definition-inputs
+     #(scalar/check-reduction-fp-correspondence
+       source product {:source-ns source-ns :array-types arrays :scalar-facts facts}))))
+
+(deftest conditional-reduction-correspondence-is-not-a-completion-or-schedule-proof
+  (doseq [[type init] [[:float (float 0.0)] [:double 0.0]]
+          bound [-1 0 1 'count]]
+    (let [proof (fp-correspondence type init '(clojure.core/+ acc (clojure.core/aget x i))
+                                   :arrays {'x type} :bound bound)]
+      (is (= {:scope :conditional-fp-reduction-correspondence :dtype type
+              :checkpoints-preserved? true :zero-trip :initializer
+              :source-count-obligation {:conversion :checked-int :evaluation :original-position}}
+             proof))
+      (is (not-any? #(contains? proof %) [:carrier :nonthrowing? :removable? :algebra]))))
+  (is (some? (fp-correspondence :float (float 0.0)
+                                '(let* [d (clojure.core/- (clojure.core/aget x i)
+                                                        (clojure.core/aget y i))]
+                                   (clojure.core/+ acc (clojure.core/* d d)))
+                                :arrays {'x :float 'y :float})))
+  (is (some? (fp-correspondence :double 0.0 '(clojure.core/+ acc value)
+                                :facts {'value {:carrier Double/TYPE :presence :present}}))))
+
+(deftest conditional-reduction-retains-source-width-and-initializer-checkpoints
+  (let [float-acc (with-meta 'acc {:raster.type/tag 'float})]
+    (is (some? (fp-correspondence :float 0.0 '(clojure.core/+ acc (clojure.core/aget x i))
+                                  :accumulator float-acc :arrays {'x :float})))
+    (doseq [init [0.0 '(clojure.core/double 0.0)]]
+      (is (nil? (fp-correspondence :float init '(clojure.core/+ acc (clojure.core/aget x i))
+                                   :arrays {'x :float}))))
+    (is (nil? (fp-correspondence :float '(clojure.core/double 0.0)
+                                 '(clojure.core/+ acc (clojure.core/aget x i))
+                                 :accumulator float-acc :arrays {'x :float}))))
+  (doseq [step [(with-meta '(clojure.core/+ acc (clojure.core/aget x i))
+                          {:raster.type/tag 'double})
+                '(clojure.core/+ acc 1.0)
+                '(let* [d (clojure.core/double (clojure.core/aget x i))]
+                   (clojure.core/+ acc d))]]
+    (is (nil? (fp-correspondence :float (float 0.0) step :arrays {'x :float}))))
+  (is (nil? (fp-correspondence :float (float 0.0)
+                               '(clojure.core/+ acc (clojure.core/aget x i))
+                               :arrays {'x :float}
+                               :actual-step '(clojure.core/float
+                                              (clojure.core/+ (clojure.core/double acc)
+                                                              (clojure.core/double (clojure.core/aget x i))))))))
+
+(deftest conditional-reduction-abstains-on-unknown-storage-calls-and-index-uses
+  (doseq [[step arrays facts]
+          [['(clojure.core/+ acc (clojure.core/aget x i)) {} {}]
+           ['(clojure.core/+ acc (clojure.core/aget x (clojure.core/+ i 1))) {'x :float} {}]
+           ['(clojure.core/+ acc i) {} {'i {:carrier Float/TYPE :presence :present}}]
+           ['(clojure.core/+ acc value) {} {'value {:carrier Double/TYPE :presence :unknown}}]
+           ['(clojure.core/+ acc (opaque value)) {} {}]
+           ['(+ acc (clojure.core/aget x i)) {'x :float} {}]
+           ['(let* [x (clojure.core/float 1.0)] (clojure.core/aget x i)) {'x :float} {}]
+           ['(let* [i (clojure.core/float 1.0)] (clojure.core/aget x i)) {'x :float} {}]]]
+    (is (nil? (fp-correspondence :float (float 0.0) step :arrays arrays :facts facts))))
+  (is (nil? (fp-correspondence :double 0.0 '(clojure.core/+ acc 1.0)
+                               :bound (inc (long Integer/MAX_VALUE)))))
+  (is (nil? (fp-correspondence :double 0.0
+                               (nth (iterate #(list 'clojure.core/double %) 'acc) 130))))
+  (is (nil? (fp-correspondence :double 0.0 (cons 'clojure.core/+ (repeat 1.0)))))
+  (is (nil? (fp-correspondence
+             :double 0.0
+             (list 'let* (vec (mapcat #(vector (symbol (str "x" %)) 1.0) (range 4000))) 'acc))))
+  (is (nil? (fp-correspondence
+             :double 0.0
+             (with-meta '(clojure.core/+ acc 1.0) {:raster.op/lexical-callee true}))))
+  (binding [entry/*emission-inputs* nil]
+    (is (nil? (scalar/check-reduction-fp-correspondence
+               '(raster.par/reduce acc 0.0 i 1 (clojure.core/+ acc 1.0)) nil
+               {:source-ns *ns*})))))
+
+(deftest conditional-reduction-does-not-authenticate-a-remapped-qualified-operation
+  (let [caller (create-ns (gensym "raster.correspondence.caller."))
+        foreign (create-ns (gensym "raster.correspondence.foreign."))]
+    (try
+      (intern foreign '+ (fn [& _] (throw (AssertionError. "analysis must not execute it"))))
+      (binding [*ns* caller] (alias 'clojure.core (ns-name foreign)))
+      (is (= :intrinsic-source-definition-mismatch
+             (try (fp-correspondence :double 0.0 '(clojure.core/+ acc 1.0) :source-ns caller)
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (finally (remove-ns (ns-name caller)) (remove-ns (ns-name foreign))))))
 
 (deftest comparison-operands-retain-independent-source-widths
   (doseq [strict? [false true]
