@@ -1129,7 +1129,8 @@
                                   :emit-region materialize-locals})))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
-                (bc/desugar-invk (or typed-region-body (:lambda segmap))))]
+                (bc/desugar-invk
+                 (soac-dialect/scalar-converts->source (or typed-region-body (:lambda segmap)))))]
       (list 'let* [n-sym (list 'int bound)]
             (list 'loop* [j-sym '(int 0)]
                   (list 'if (ix< j-sym n-sym)

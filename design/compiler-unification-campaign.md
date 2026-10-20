@@ -186,6 +186,17 @@ These are closed-core fixes, not arbitrary unexpanded-macro coverage or new
 authentication of type-hint metadata. They do not close numerical realization,
 entry/return conversions or the prepared import's portable admission obligation.
 
+The JVM scheduled effect-map boundary now uses the existing canonical-conversion
+source projection before desugaring calls. Previously a retained conversion term
+could execute as its IR constructor, returning a list where a number was needed.
+All four reproduced continuation failures are fixed; the reviewed JVM carry/region/
+branch gate passes 28 tests / 551 assertions. An overflow control confirms earlier
+writes survive and the later store is absent when checked Float narrowing fails.
+The wider six-namespace check remains red (65 tests / 886 assertions: one failure,
+five errors) on GPU checked narrowing, carried integer-width admission, a bound
+diagnostic expectation and source-ordered multilevel composition. Those are retained
+debts, not waived by the passing JVM projection gate.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;

@@ -62,6 +62,18 @@
     (is (= [2.5] (vec scales)))
     (is (= [-77.0] (vec sums)))))
 
+(deftest checked-floating-continuation-keeps-the-original-failure-boundary
+  (let [source (replace-form fixture/source '(aset sums row (float sum))
+                             '(let* [^float v (float sum)] (aset sums row v)))
+        execute (execute-source source)
+        packed (float-array [-77 -77]) scales (float-array [-77]) sums (float-array [-77])]
+    (is (thrown? IllegalArgumentException
+                 (execute (float-array [Float/MAX_VALUE Float/MAX_VALUE])
+                          packed scales sums 1 2 (float 2.5))))
+    (is (= [Float/MAX_VALUE Float/MAX_VALUE] (vec packed)))
+    (is (= [2.5] (vec scales)))
+    (is (= [-77.0] (vec sums)))))
+
 (deftest computed-continuation-bound-scopes-over-its-store-loop
   (let [form (replace-form fixture/source '(aset sums row (float sum))
                            '(let* [^long stop ^{:raster.type/tag long} (clojure.core/+ width 1)]
