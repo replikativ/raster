@@ -14,6 +14,18 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
+The loop-carrier join and contextual Float-literal initializer plan now live in
+the shared source-arithmetic authority; JVM loop emission consumes that same plan.
+This extracts the existing implementation without changing slot selection or
+conversion placement. Unknown/reference initializers remain nonprimitive, explicit
+Double expressions are not narrowed from tags, and wider recurrences still widen
+the slot. The focused arithmetic/actual JVM loop gate passes 27 tests / 617
+assertions after reconnecting to the bounded REPL. This is representation planning,
+not a normal-return proof, reassociation permission or new SOAC admission. The next
+training obligation is to validate structural reduction arithmetic and checkpoint
+correspondence before deriving a conditional numeric value domain for its consumers;
+physical carriers and required source evaluations must remain separate facts.
+
 Required invocation-level scalar evaluations now have an explicit TypedSOAC contract:
 a program catalog and an exact executor claim per source occurrence. Validation
 rejects missing/duplicate claims, missing executors, hidden claims in fusion
