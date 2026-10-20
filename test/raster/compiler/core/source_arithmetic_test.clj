@@ -25,8 +25,9 @@
   (doseq [initial [:int :long :float :double :ref]
           recurrence [nil :ref]]
     (is (= initial (arithmetic/loop-carrier-join initial recurrence))))
-  (doseq [recurrence [:int :long :float :double]]
-    (is (= :ref (arithmetic/loop-carrier-join :ref recurrence)))))
+  (doseq [initial [nil :unknown :ref]
+          recurrence [nil :unknown :ref :int :long :float :double]]
+    (is (= initial (arithmetic/loop-carrier-join initial recurrence)))))
 
 (deftest contextual-loop-literal-narrowing-is-not-a-general-tag-coercion
   (let [binder (with-meta 'acc {:raster.type/tag 'float})
