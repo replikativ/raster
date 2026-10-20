@@ -93,14 +93,15 @@
             (recur (conj names (second form)))
             :else (recur names)))))))
 
-(deftest training-partition-preserves-all-eight-cases-once
+(deftest training-partition-preserves-all-nine-cases-once
   (let [compiler (declared-tests "test/raster/compiler/ir/distributed_training_test.clj")
         device (declared-tests "test/raster/gpu/distributed_training_device_test.clj")
         all (concat compiler device)]
-    (is (= 4 (count compiler)))
+    (is (= 5 (count compiler)))
     (is (= 4 (count device)))
-    (is (= 8 (count (distinct all))))
-    (is (= '#{repeated-local-ad-matches-rounded-independent-oracle
+    (is (= 9 (count (distinct all))))
+    (is (= '#{finite-training-oracle-rejects-incomplete-and-nonfinite-results
+              repeated-local-ad-matches-rounded-independent-oracle
               finite-training-composition-retains-parameters-and-orders-updates
               unequal-batch-local-ad-producers-match-independent-analytic-gradients
               differentiated-training-assembly-certifies-without-device-resources
