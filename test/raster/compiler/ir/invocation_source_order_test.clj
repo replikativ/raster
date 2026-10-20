@@ -5,6 +5,7 @@
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as auxiliary]
@@ -25,6 +26,12 @@
   (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
         out (arrays/zeros-like x n)
         result (par/map! out i n double (+ (aget out i) 1.0))]
+    result))
+
+(deftm write-then-functional-map
+  [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
+        result (par/map [i n] (aget x i))]
     result))
 
 (defn- compilation [v dtype]
@@ -78,6 +85,67 @@
     (is (some? (:equation square)) "one host definition has two representations")
     (is (= (mapv :id (:equations program)) (into [] (keep :equation) order)))
     (is (= (count (:steps plan)) (count (keep :invocation-step order))))))
+
+(deftest eager-lowering-cannot-run-a-late-checked-source-action
+  (let [compilation (equation-first/compile #'write-before-shape {:target :ocl:0 :dtype :double})
+        program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        actions (invocation/ordered-host-actions plan program)
+        materializations (atom 0)
+        first-output (double-array [0.0])]
+    (is (some #(= 'square (:binding %)) actions))
+    (is (every? #(pos? (:position %)) actions))
+    (with-redefs [materialization/materialize
+                  (fn [& _] (swap! materializations inc)
+                    (throw (AssertionError. "late host calculation reached eager materialization")))]
+      (is (= :ordered-source-execution-required
+             (reason #(equation-first/lower compilation
+                                            [(double-array [1.0]) first-output Long/MAX_VALUE])))))
+    (is (zero? @materializations))
+    (is (= [0.0] (vec first-output)))
+    ;; Independent source oracle: the write happens BEFORE checked overflow.
+    ;; The eager path must neither execute the overflow early nor claim success.
+    (is (thrown? ArithmeticException
+                 (write-before-shape (double-array [1.0]) first-output Long/MAX_VALUE)))
+    (is (= [2.0] (vec first-output)))
+    (let [changed (assoc-in plan [:attributes :source-order]
+                            (vec (reverse (invocation/source-order plan program))))]
+      (is (= :invocation-source-order-mismatch
+             (reason #(invocation/ordered-host-actions changed program)))))))
+
+(deftest late-source-allocation-still-requires-ordered-execution
+  (let [compilation (equation-first/compile #'helper-source-zero-observed
+                                           {:target :ocl:0 :dtype :double})
+        program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        allocations (filter :storage (invocation/ordered-host-actions plan program))
+        first-output (double-array [0.0])
+        materializations (atom 0)]
+    (is (some #(= 'out (:binding %)) allocations))
+    (with-redefs [materialization/materialize
+                  (fn [& _] (swap! materializations inc)
+                    (throw (AssertionError. "late source allocation reached eager materialization")))]
+      (is (= :ordered-source-execution-required
+             (reason #(equation-first/lower compilation
+                                            [(double-array [1.0]) first-output -1])))))
+    (is (zero? @materializations))
+    (is (= [0.0] (vec first-output)))
+    (is (thrown? NegativeArraySizeException
+                 (helper-source-zero-observed (double-array [1.0]) first-output -1)))
+    (is (= [2.0] (vec first-output)))))
+
+(deftest generated-result-allocation-without-a-host-step-is-an-ordering-obligation
+  (let [compilation (equation-first/compile #'write-then-functional-map
+                                           {:target :ocl:0 :dtype :double})
+        program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        actions (invocation/ordered-host-actions plan program)
+        generated (filter #(and (:realization %) (nil? (:invocation-step %))) actions)]
+    (is (seq generated))
+    (is (every? #(= :result-allocation (:kind (source/realization-action program %))) generated))
+    (is (= :ordered-source-execution-required
+           (reason #(equation-first/lower compilation
+                                          [(double-array [1.0]) (double-array 1) 1]))))))
 
 (deftest source-order-attests-typed-producers-not-just-local-names
   (let [[program plan] (compilation #'write-before-shape :double)

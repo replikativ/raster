@@ -101,6 +101,33 @@ further concrete issue. Actual training refusal now reports the MSE scale's norm
 completion as Object containing Double. It still refuses retained evaluation:
 neither qualification nor completion grants motion, erasure or GPU admission.
 
+The next admission prerequisite closes an eager-execution ordering hole. Invocation
+materialization used to evaluate all host steps before numerical execution, even
+when their source positions follow an earlier kernel. The eager compiler entry now
+rederives source order and refuses late host computations/allocations before any
+materialization. This includes explicit storage and generated result allocations
+whose host steps were pruned; exact aliases remain exempt. Validated source-free
+programs retain their separate explicit prefix contract. The ordered executor is
+the intended continuation, not permission to hoist or delete these operations.
+Automatic Compiled activation and remaining generic entry-path audits stay open.
+
+The affected seven-namespace gate passes 93 tests / 1,106 assertions, including
+source-free compilation and actual local OpenCL/Level Zero ordered execution.
+Independent JVM oracles write before late overflow/negative-size exceptions;
+the eager refusal invokes no materialization callback and changes no output.
+Review caught the missing allocation-action family before commit. One initial test
+mistakenly assumed an explicit helper allocation had no host step; the actual
+missing-step case is now a separate functional-map allocation test. A renamed old
+test Var was explicitly removed from the warm REPL before the final passing gate.
+
+Training admission will keep two execution modes under the same source-order
+owner: host-only checked dimensions as original ordered host actions, and
+device-dependent total FP values as resident evaluate-once scalar stages. Required
+unused forward loss remains an execution root. Entry carrier evidence must come
+from original retained source ownership and the actual selected interface, not
+logical dtype options. Scalar use closure, publication and eager/generic binding
+gates must be proved before broader frontend admission; none is waived here.
+
 | Boundary | Current evidence | Next acceptance requirement |
 |---|---|---|
 | Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |

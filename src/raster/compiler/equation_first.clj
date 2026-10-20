@@ -800,6 +800,12 @@
         _ (when (get-in invocation-plan [:attributes :terminal-host-result])
             (fail! :explicit-host-result-required
                    "terminal host observation requires the ordered host-result executor" {}))
+        ordered-host-actions (invocation/ordered-host-actions invocation-plan (:semantic compilation))
+        _ (when (seq ordered-host-actions)
+            (fail! :ordered-source-execution-required
+                   "host actions after numerical work require source-ordered execution, not eager materialization"
+                   {:actions (mapv #(select-keys % [:position :binding :invocation-step :equation])
+                                   ordered-host-actions)}))
         unsupported-host-evaluation
         (fn [& _]
           (fail! :equation-first-source-free-host-evaluation

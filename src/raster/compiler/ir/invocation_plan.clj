@@ -1044,3 +1044,37 @@
     (if (contains? (:attributes plan) :source-order)
       (get-in plan [:attributes :source-order])
       (derive-source-order plan program))))
+
+(defn ordered-host-actions
+  "Derive host actions which cannot be eagerly materialized before numerical work.
+
+   Revalidates the exact source/plan correspondence; an attribute or a caller's
+   ordering hint is not authority. This is an execution obligation, not proof
+   that an action throws. Even an otherwise pure late scalar must stay ordered
+   until a separate motion proof establishes that moving it is unobservable."
+  [plan program]
+  (if (source-free-program? program)
+    ;; Explicit source-free shape projections have no Clojure occurrence order;
+    ;; the existing closed source-free validator owns their prefix contract.
+    (do (validate-against! plan program) [])
+    (let [order (source-order plan program)
+          equations (into {} (map (juxt :id identity)) (:equations program))
+          steps (into {} (map (juxt :id identity)) (:steps plan))]
+      (:actions
+       (reduce
+        (fn [{:keys [numerical?] :as state} entry]
+          (let [equation (get equations (:equation entry))
+                host-equation? (true? (get-in equation [:attributes :host-only]))
+                step (get steps (:invocation-step entry))
+                realization (when (:realization entry)
+                              (invocation-source/realization-action program entry))
+                ;; Allocation occurrences may have been pruned from the host
+                ;; prefix. Their source checks still cannot move before writes.
+                ;; Exact lexical/storage aliases themselves evaluate nothing.
+                host-action? (or host-equation? (:storage entry)
+                                 (= :result-allocation (:kind realization))
+                                 (and step (not (value-alias? step))))]
+            (cond-> state
+              (and numerical? host-action?) (update :actions conj entry)
+              (and equation (not host-equation?)) (assoc :numerical? true))))
+        {:numerical? false :actions []} order)))))
