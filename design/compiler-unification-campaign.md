@@ -136,6 +136,22 @@ This is not adoption of static-artifact history or template-epoch authority;
 those producer guards and the actual semantic projection must still reach the
 consumer before the prepared import can be closed. No fallback was restored.
 
+The existing historical-input validator now also retains process-local producer
+dependencies separately from Var snapshots and portable values. Prepared AD's
+own frontend/template guard survives adoption, optional transactions and frozen
+ordered-source observations. JVM root/static emission payloads and their prepared
+reuse guards retain the same dependency. A review found that root AD expansion
+previously happened before the emitter's fresh collector; lazy-JIT transformation
+and emission now share one historical transaction before publication. Emission
+inherits those original observations rather than resnapshotting around transformed
+code. An actual first-JIT gradient root, not only injected emitter fixtures, proves
+the retained epoch guard. The reviewed affected gate passes 87 tests / 484 assertions.
+This connects freshness checks, not general per-call dispatch instrumentation or
+the inliner's semantic projection. The prepared import remains unclosed; actual
+Float reduction realization, selected loss scaling and checked dimension products
+still block unchanged resident training. CI at `39dd672e` has setup/build success
+and fixture-emission failure; the other gates were still pending when checked.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;

@@ -6207,6 +6207,7 @@
                          {:source-snapshot source-snapshot
                           :body walked-body :params params :tags tags :return-tag return-tag
                           :dependency-snapshots (into dependency-snapshots (:values @emitted-inputs))
+                          :producer-inputs (:producer-inputs @emitted-inputs)
                           :static-inputs (:static @emitted-inputs)
                           :definition-revision definition-revision
                           :completed-definition-revision (dispatch/compiler-definition-revision)})

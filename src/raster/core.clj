@@ -375,7 +375,7 @@
    Lazy materialization can change dependency metadata on the first attempt;
    retry the emission, not its certificate, using the same bounded policy as
    static bytecode production. No numeric body executes here."
-  [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym]
+  [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym & [preparation-inputs]]
   (loop [attempt 0]
     (let [{owned-body :body invocation-catalog :catalog binding-catalog :binding-catalog
            reduction-catalog :reduction-catalog reduction-input-origins :reduction-input-origins}
@@ -383,7 +383,12 @@
           dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/emission-input-snapshots)
                         body source-ns)
           revision (dispatch/compiler-definition-revision)
-          inputs (atom {:static [] :values [] :reduction-sources reduction-catalog})
+          inputs (atom (assoc (merge {:static [] :values []}
+                                     (select-keys preparation-inputs
+                                                  [:static :values :definition-proofs :source-body-inputs
+                                                   :unclosed-source-imports :producer-inputs]))
+                              :reduction-sources reduction-catalog))
+          _ (me/assert-definition-inputs-current! @inputs)
           implementation
           (binding [me/*emission-inputs* inputs]
             (emitter (str class-name (gensym "__owned")) params tags return-tag
@@ -405,6 +410,7 @@
                     :invocation-contexts (:invocation-contexts @inputs)
                     :typed-interface typed-interface
                     :dependency-snapshots (into dependencies (:values @inputs))
+                    :producer-inputs (:producer-inputs @inputs)
                     :static-inputs (:static @inputs) :definition-revision revision
                     :completed-definition-revision (dispatch/compiler-definition-revision)}
           failure (when implementation
@@ -523,26 +529,31 @@
                                    metadata
                                    (assoc metadata ::deftm-walked-body (vec fresh-body)))))
                   (me/assert-source-entry-current! source-entry))
-              ;; Re-walk from source body with TC for better devirtualization
-              effective-body fresh-body
-              ;; Use the same retained AD program as AOT, without expanding ordinary
-              ;; helper boundaries or rewalking its typed conversions. Lazy resolution
-              ;; avoids the scalar.inline -> raster.core namespace cycle.
-              effective-body
-              (if (some '#{raster.ad.reverse/value+grad raster.ad.reverse/grad}
-                        (tree-seq coll? seq effective-body))
-                (binding [*ns* (or source-ns *ns*)]
-                  (mapv #(@inline-ad-applications-fn % (zipmap params tags)) effective-body))
-                effective-body)
-              ;; Vectorize par/map + par/reduce out of the box (scalar fallback inside).
-              effective-body (simd-expand-jit-body effective-body source-ns)
-              class-name (str "raster.compiled.DT_"
-                              (.replace (str mangled-sym) "." "_")
-                              "_" (bit-and (hash effective-body) 0x7FFFFFFF)
-                              "_" (mod (System/nanoTime) 1000000))
               {:keys [implementation emission]}
-              (emit-owned-bytecode! @compile-typed-impl-fn class-name params tags return-tag
-                                    effective-body source-ns typed-iface-name mangled-sym)
+              ;; Transformation and emission share a historical input owner.
+              ;; Retrying emission alone cannot refresh a transformed AD body.
+              ;; Publication below happens only after this whole producer passes.
+              (me/call-with-definition-inputs
+               (fn []
+                 (let [effective-body fresh-body
+                       ;; Use retained AD, without expanding ordinary helpers or
+                       ;; rewalking conversions. Lazy lookup avoids a namespace cycle.
+                       effective-body
+                       (if (some '#{raster.ad.reverse/value+grad raster.ad.reverse/grad}
+                                 (tree-seq coll? seq effective-body))
+                         (binding [*ns* (or source-ns *ns*)]
+                           (mapv #(@inline-ad-applications-fn % (zipmap params tags)) effective-body))
+                         effective-body)
+                       effective-body (simd-expand-jit-body effective-body source-ns)
+                       class-name (str "raster.compiled.DT_"
+                                       (.replace (str mangled-sym) "." "_")
+                                       "_" (bit-and (hash effective-body) 0x7FFFFFFF)
+                                       "_" (mod (System/nanoTime) 1000000))
+                       result
+                       (emit-owned-bytecode! @compile-typed-impl-fn class-name params tags return-tag
+                                             effective-body source-ns typed-iface-name mangled-sym
+                                             @me/*emission-inputs*)]
+                   result)))
               impl implementation]
           (when impl
             ;; Original source lineage was captured BEFORE walking. The emitted

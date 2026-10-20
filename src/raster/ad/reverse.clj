@@ -5892,7 +5892,16 @@
                    "globally unique.")
               {:var f-var :duplicates dups :kind :ad-gensym-counter-collision})))))
 
-(deftype ^:private GeneratedPreparationOwner [program frontend observations template-revision parameter-plan])
+(deftype ^:private GeneratedPreparationOwner [program frontend observations template-revision parameter-plan]
+  method-entry/RetainedProducerInput
+  (assert-producer-current! [this]
+    ;; Own freshness only: historical definitions and earlier producer inputs
+    ;; are adopted flat into the consumer, never recursively reobserved here.
+    (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+    (when-not (= template-revision (tmpl/registry-revision))
+      (throw (ex-info "generated AD rules changed after preparation"
+                      {:reason :ad-prepared-program-stale-rules})))
+    this))
 
 (defn ^:no-doc assert-prepared-program-source!
   "Guard the exact shared generated program and its original source history.
@@ -5905,17 +5914,13 @@
         (throw (ex-info "generated AD preparation has no original producer"
                         {:reason :ad-prepared-program-owner})))
       (let [^GeneratedPreparationOwner owner owner
-            program (.-program owner)
-            frontend (.-frontend owner)]
+            program (.-program owner)]
         (when-not (and (= (set (keys prepared)) (conj (set (keys program)) ::generated-program-owner))
                        (every? (fn [[key value]] (identical? value (get prepared key))) program))
           (throw (ex-info "generated AD program differs from its producer"
                           {:reason :ad-prepared-program-mismatch})))
-        (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+        (method-entry/assert-producer-current! owner)
         (method-entry/assert-definition-inputs-current! (.-observations owner))
-        (when-not (= (.-template-revision owner) (tmpl/registry-revision))
-          (throw (ex-info "generated AD rules changed after preparation"
-                          {:reason :ad-prepared-program-stale-rules})))
         prepared))))
 
 (defn ^:no-doc adopt-prepared-program-inputs!
@@ -5924,7 +5929,8 @@
   [prepared]
   (when (assert-prepared-program-source! prepared)
     (let [^GeneratedPreparationOwner owner (::generated-program-owner prepared)]
-      (method-entry/adopt-definition-inputs! (.-observations owner)))))
+      (method-entry/adopt-definition-inputs!
+       (update (.-observations owner) :producer-inputs (fnil conj []) owner)))))
 
 (defn- freeze-generated-preparation [program frontend template-revision parameter-plan]
   (if-not frontend
@@ -5935,7 +5941,7 @@
         (throw (ex-info "AD rules changed during preparation"
                         {:reason :stale-definition-proof-input :phase :reverse-ad-rules})))
       (let [observations (select-keys @method-entry/*emission-inputs*
-                                     [:definition-proofs :source-body-inputs :unclosed-source-imports])
+                                     [:definition-proofs :source-body-inputs :unclosed-source-imports :producer-inputs])
             prepared (assoc program ::generated-program-owner
                             (GeneratedPreparationOwner. program frontend observations
                                                         template-revision parameter-plan))]

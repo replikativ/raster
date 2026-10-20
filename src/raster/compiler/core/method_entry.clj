@@ -53,6 +53,27 @@
    for dynamic execution). This is neither a registry nor a cache."
   nil)
 
+(defprotocol RetainedProducerInput
+  "Process-local compiler dependency, separate from portable IR and Var snapshots.
+   Validate this immutable producer's own freshness. Transitive dependencies are
+   flattened into the enclosing collector, not recursively rediscovered."
+  (assert-producer-current! [producer]))
+
+(defn- assert-producer-inputs-current! [inputs]
+  (doseq [producer (:producer-inputs inputs)]
+    (when-not (satisfies? RetainedProducerInput producer)
+      (throw (ex-info "compiler input has no retained producer guard"
+                      {:reason :unowned-producer-input})))
+    (assert-producer-current! producer))
+  true)
+
+(defn- retain-producer-inputs [inputs producers]
+  (reduce (fn [inputs producer]
+            (if (some #(identical? producer %) (:producer-inputs inputs))
+              inputs
+              (update inputs :producer-inputs (fnil conj []) producer)))
+          inputs producers))
+
 (defn- var-reference-current?
   "Match historical Var identity and original lookup sites.
    A detached Var can retain its old root after ns-unmap/reintern or namespace
@@ -141,6 +162,7 @@
     (when-not (var-snapshot-current? snapshot)
       (throw (ex-info "compiler proof inputs changed before publication or execution"
                       {:reason :stale-definition-proof-input :source (:var snapshot)}))))
+  (assert-producer-inputs-current! inputs)
   true)
 
 (defn call-with-optional-definition-inputs
@@ -181,7 +203,8 @@
                            (if-let [facts (seq (get historical key))]
                              (update inputs key (fnil into #{}) facts)
                              inputs))
-                         merged [:source-body-inputs :unclosed-source-imports])]
+                         merged [:source-body-inputs :unclosed-source-imports])
+          merged (retain-producer-inputs merged (:producer-inputs historical))]
       (assert-definition-inputs-current! merged)
       (when-not (compare-and-set! owner prior-inputs merged)
         (throw (ex-info "compiler proof owner changed during historical adoption"
@@ -292,6 +315,7 @@
                                                      (str (:name (meta var))))) changed)}))))
   (doseq [{:keys [source-var artifact]} static-inputs]
     (validate-static-emission! source-var artifact seen))
+  (assert-producer-inputs-current! emission)
   emission)
 
 (defn- validate-static-emission!
@@ -337,6 +361,10 @@
               (let [snapshots (:dependency-snapshots inputs)]
                 (swap! checks conj
                        (fn [] (every? var-snapshot-current? snapshots))))
+              (let [producers (:producer-inputs inputs)]
+                (when (seq producers)
+                  (swap! checks conj
+                         (fn [] (assert-producer-inputs-current! {:producer-inputs producers})))))
               (doseq [{:keys [source-var artifact]} (:static-inputs inputs)]
                 (let [nested (:raster.compiler/emission-inputs artifact)
                       snapshot (:source-snapshot nested)]

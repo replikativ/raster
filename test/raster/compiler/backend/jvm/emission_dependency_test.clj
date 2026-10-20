@@ -51,6 +51,47 @@
           (finally (reset-meta! dependency original))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest actual-root-and-static-emissions-retain-producer-inputs
+  (let [scope (create-ns (gensym "raster.producer-emission."))
+        current (atom true)
+        producer (reify method-entry/RetainedProducerInput
+                   (assert-producer-current! [this]
+                     (when-not @current
+                       (throw (ex-info "test producer changed" {:reason :test-stale-producer})))
+                     this))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm square [x :- Double] :- Double
+                 (raster.numeric/* x x))))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'square))
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            _ (core/ensure-bytecode-implementation! receiver)
+            {:keys [params tags return-tag body typed-interface]}
+            (:raster.core/bytecode-emission (meta receiver))
+            retain! #(method-entry/adopt-definition-inputs! {:producer-inputs [producer]})
+            {:keys [implementation emission]}
+            (#'core/emit-owned-bytecode!
+             (fn [& arguments] (retain!) (apply bytecode/compile-typed-impl! arguments))
+             "raster.compiled.ProducerInput" params tags return-tag body scope
+             typed-interface (:name (meta source)))
+            compile-static bytecode/compile-deftm-method!
+            artifact (with-redefs [bytecode/compile-deftm-method!
+                                  (fn [& arguments] (retain!) (apply compile-static arguments))]
+                       (#'bytecode/compile-and-cache-deftm! source))]
+        (is (= 9.0 (implementation 3.0)))
+        (is (= [producer] (:producer-inputs emission)))
+        (is (= [producer] (get-in artifact [:raster.compiler/emission-inputs :producer-inputs])))
+        (let [root-guard (method-entry/prepare-emission-input-guard! emission)
+              static-guard (method-entry/prepare-emission-input-guard!
+                            (:raster.compiler/emission-inputs artifact))]
+          (reset! current false)
+          (doseq [guard [root-guard static-guard]]
+            (is (= :test-stale-producer
+                   (try (guard) nil
+                        (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest emission-inputs-retain-transitive-static-source-observations
   (let [scope (create-ns (gensym "raster.emission-dependencies."))]
     (try
@@ -231,6 +272,28 @@
         (.bindRoot v original-root)
         (reset-meta! v original-meta)
         (remove-ns (ns-name scope))))))
+
+(deftest emission-guards-retain-process-local-producer-dependencies
+  (let [current (atom true)
+        checks (atom 0)
+        producer (reify method-entry/RetainedProducerInput
+                   (assert-producer-current! [this]
+                     (swap! checks inc)
+                     (when-not @current
+                       (throw (ex-info "test producer changed" {:reason :test-stale-producer})))
+                     this))
+        emission {:dependency-snapshots [] :static-inputs [] :producer-inputs [producer]
+                  :definition-revision 1 :completed-definition-revision 1}
+        guard (method-entry/prepare-emission-input-guard! emission)]
+    (is (identical? emission (guard)))
+    (reset! checks 0)
+    (guard)
+    (is (= 1 @checks) "the prepared fast guard must not skip a producer dependency")
+    (reset! current false)
+    (doseq [invoke [guard #(method-entry/assert-emission-inputs-current! emission)]]
+      (is (= :test-stale-producer
+             (try (invoke) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
 
 (deftest prepared-emission-guards-preserve-historical-live-checks
   (let [scope (create-ns (gensym "raster.prepared-emission."))

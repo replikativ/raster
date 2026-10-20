@@ -101,6 +101,31 @@
                   (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest optional-transactions-retain-producer-guards-only-on-success
+  (let [checks (atom 0)
+        producer (reify entry/RetainedProducerInput
+                   (assert-producer-current! [this] (swap! checks inc) this))
+        parent (atom {:static [] :values []})]
+    (binding [entry/*emission-inputs* parent]
+      (is (nil? (entry/call-with-optional-definition-inputs
+                 #(do (entry/adopt-definition-inputs! {:producer-inputs [producer]}) nil))))
+      (is (empty? (:producer-inputs @parent)))
+      (is (= :accepted (entry/call-with-optional-definition-inputs
+                        #(do (entry/adopt-definition-inputs! {:producer-inputs [producer]}) :accepted))))
+      (is (= [producer] (:producer-inputs @parent)))
+      (is (empty? (:values @parent)))
+      (reset! checks 0)
+      (is (entry/assert-definition-inputs-current! @parent))
+      (is (= 1 @checks)))))
+
+(deftest arbitrary-objects-cannot-act-as-producer-guards
+  (let [parent (atom {:static [] :values []}) before @parent]
+    (binding [entry/*emission-inputs* parent]
+      (is (= :unowned-producer-input
+             (try (entry/adopt-definition-inputs! {:producer-inputs [(Object.)]}) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+    (is (identical? before @parent))))
+
 (deftest refused-optional-analysis-does-not-retain-speculative-dependencies
   (let [owner (atom {:static [] :values []})]
     (binding [entry/*emission-inputs* owner]

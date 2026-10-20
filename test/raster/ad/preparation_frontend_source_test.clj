@@ -109,6 +109,7 @@
     (binding [entry/*emission-inputs* parent]
       (is (= [9.0 6.0] (result prepared 3.0))))
     (is (seq (:definition-proofs @parent)))
+    (is (= 1 (count (:producer-inputs @parent))))
     (is (entry/assert-definition-inputs-current! @parent))
     (let [revision (templates/registry-revision) before @parent]
       (with-redefs [templates/registry-revision (constantly (inc revision))]
@@ -117,6 +118,44 @@
                  (try (reverse/adopt-prepared-program-inputs! prepared) nil
                       (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
       (is (identical? before @parent)))))
+
+(deftest enclosing-owner-retains-the-preparations-template-guard
+  (let [prepared (reverse/prepare-value+grad #'squared-loss [0])
+        parent (atom {:static [] :values []})
+        revision (templates/registry-revision)]
+    (binding [entry/*emission-inputs* parent]
+      (reverse/adopt-prepared-program-inputs! prepared)
+      (reverse/adopt-prepared-program-inputs! prepared))
+    (is (= 1 (count (:producer-inputs @parent))))
+    (is (every? #(not (satisfies? entry/RetainedProducerInput %)) (:values @parent)))
+    (with-redefs [templates/registry-revision (constantly (inc revision))]
+      (is (= :ad-prepared-program-stale-rules
+             (try (entry/assert-definition-inputs-current! @parent) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
+
+(deftest lazy-jit-gradient-root-retains-its-actual-ad-producer
+  (let [scope (create-ns (gensym "raster.ad-preparation-jit."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm square [x :- Double] :- Double (raster.numeric/* x x)))
+        (eval '(raster.core/deftm gradient [x :- Double] :- Double
+                 (let [vg ((raster.ad.reverse/value+grad (var square)) x)]
+                   (clojure.core/nth vg 1)))))
+      (let [root (ns-resolve scope 'gradient)
+            _ (is (= 6.0 (binding [core/*jit-silent-fallback?* false] (root 3.0))))
+            source (core/resolve-deftm-var root)
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            emission (:raster.core/bytecode-emission (meta receiver))
+            revision (templates/registry-revision)]
+        (is (seq (:producer-inputs emission))
+            "a real JIT root retains preparation consumed before bytecode emission")
+        (let [guard (entry/prepare-emission-input-guard! emission)]
+          (with-redefs [templates/registry-revision (constantly (inc revision))]
+            (is (= :ad-prepared-program-stale-rules
+                   (try (guard) nil
+                        (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest cold-preparation-observes-the-producer-without-running-its-numeric-body
   (let [source (core/resolve-deftm-var #'cold-squared-loss)
