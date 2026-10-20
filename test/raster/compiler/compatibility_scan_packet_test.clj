@@ -66,10 +66,11 @@
            (is (= [:before :after] @events))))))))
 
 (deftest scan-decline-boundary-preserves-options-and-fail-fast-exceptions
-  (doseq [mode [:inclusive :exclusive]]
+  (doseq [mode [:inclusive :exclusive]
+          source-ns [nil (the-ns 'raster.compiler.compatibility-scan-packet-test)]]
     (let [scan (scan-form mode :double 'n)
           source (list 'let* ['result scan] 'result)
-          opts (options :double)
+          opts (cond-> (options :double) source-ns (assoc :source-ns source-ns))
           refusal {:reason :typed-soac-unbound-scalar :details {:value 'n}}
           observed (atom nil)]
       (reject-legacy-scans
@@ -82,7 +83,7 @@
                     (get-in result [:stats :segops-declined])))
              (is (= source (get-in result [:form :source])))))))
       (is (= [source :double (:array-types opts)
-              {:scalar-types (:scalar-types opts) :values (:values opts)
+              {:scalar-types (:scalar-types opts) :source-ns source-ns :values (:values opts)
                :resident-reductions? false}] @observed))
       (doseq [failure [(ex-info "compiler invariant" {:reason :raster/bug})
                        (NullPointerException. "unexpected analysis failure")]]
