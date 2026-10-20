@@ -243,7 +243,18 @@
           (range 17))))
 
 (defn max-error [expected actual]
-  (reduce max 0.0 (map #(Math/abs (- (double %1) (double %2))) expected actual)))
+  (let [expected (vec expected)
+        actual (vec actual)]
+    (when-not (= (count expected) (count actual))
+      (throw (ex-info "Training oracle requires equal result lengths"
+                      {:reason :training-oracle-length
+                       :expected (count expected) :actual (count actual)})))
+    (doseq [[side values] [[:expected expected] [:actual actual]]
+            [index value] (map-indexed vector values)]
+      (when-not (Double/isFinite (double value))
+        (throw (ex-info "Finite training oracle received a nonfinite value"
+                        {:reason :training-oracle-nonfinite :side side :index index}))))
+    (reduce max 0.0 (map #(Math/abs (- (double %1) (double %2))) expected actual))))
 
 (defn- expected-update [row-counts]
   (let [contributions (mapv analytic-gradient-sum (batches row-counts))
