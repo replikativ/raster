@@ -2,8 +2,10 @@
   "Lower a typed scalar S-expression region to target-neutral KernelBody SSA.
 
    This is shared by ordinary maps and ordered fold-maps. The caller supplies authoritative
-   storage/scalar dtypes, index lowering, participation, and its own structured decline function;
-   this pass performs no source-level type or function inference."
+   storage/scalar dtypes, index lowering, participation, and its own structured decline function.
+   The region lowerer does not infer source types or functions. Owner-facing bounded
+   correspondence queries separately validate original arithmetic against those facts;
+   a desired result dtype cannot supply the missing evidence."
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
@@ -1820,7 +1822,7 @@
             :parameter-carriers carriers :result-carrier (:result-carrier entry)
             :payload-carrier actual}))))))
 
-(defn check-reduction-fp-correspondence
+(defn ^:no-doc check-reduction-fp-correspondence
   "Conditional FP value/checkpoint correspondence at an owning reduction constructor.
 
    `original` must be the owner's source occurrence; `product` is its actual
