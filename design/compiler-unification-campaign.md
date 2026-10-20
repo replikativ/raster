@@ -256,6 +256,24 @@ fails CI: the inspected distributed-training shard reports the same four
 preserve-evaluation scalar refusals plus the new conditional Float correspondence.
 This checkpoint neither fixes those refusals nor qualifies resident AD training.
 
+The next reviewed implementation boundary is one local helper projection
+transaction, not unconditional insertion in `resolve-walked-body-input`. That
+resolver also serves pre-AD, source-JVM and native C; the JVM-only completion would
+break those consumers and could make an ordinary import fail only after warming.
+Before hygiene, use the exact original frontend reduction/quotient and actual
+emission history to jointly check root context, conditional FP recurrence,
+Object/Float payload, Double denominator conversion, enclosing core arithmetic,
+closed numerical uses and required evaluation. Reuse optional definition-input
+transactions so abstention does not leak dependencies. Activate only with a
+target-neutral recipe that accounts for the wrapper's physical behavior, followed
+by existing whole-form hygiene and call-by-value substitution. Do not publish an
+unused sidecar, silently force JIT from a query, or infer physical helper ABI from
+its declared return tag. Missing evidence preserves ordinary expansion and the
+strict coverage refusal. Target precision/capabilities remain checked: a Double
+quotient cannot silently become Float arithmetic merely because its eventual
+storage is Float. Count/read/initialization and prepared-AD import checks remain
+separate from this transaction.
+
 Two warm, coverage-refused training observations after this slice took 1.361 and
 1.214 seconds (11 observed phases, SOAC transforms 268 and 209 ms). Both retained
 the same four scalar refusals and produced no conditional reduction summaries:

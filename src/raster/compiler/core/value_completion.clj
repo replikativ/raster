@@ -3,8 +3,10 @@
 
    Object input completion preserves source boxing/reference identity. An
    explicit primitive input context preserves the original expected-parameter
-   conversion under a retained source compilation policy. Neither is inferred
-   from a scalar tag or permission to reorder calls or enable an AD rule."
+   conversion under a retained source compilation policy. Bytecode result
+   completion replays an observed region context without converting its value.
+   None is inferred from a scalar tag or permission to reorder calls or enable
+   an AD rule."
   (:require [raster.compiler.core.util :as util]
             [raster.compiler.core.source-policy :as source-policy]))
 
@@ -233,7 +235,7 @@
        (if-let [{:keys [contract operand]} (canonical-parts form)]
          (with-meta (case (:source-context contract)
                       (:jvm-bytecode-floating-input :jvm-bytecode-result-context)
-                      (throw (ex-info "Bytecode-owned input completion requires its bytecode consumer"
+                      (throw (ex-info "Bytecode-owned completion requires its bytecode consumer"
                                       {:reason :unsupported-value-completion-source-context
                                        :contract contract}))
                       :jvm-object-input (list '. (list 'do Object) (list 'cast operand))
