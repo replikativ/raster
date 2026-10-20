@@ -3,7 +3,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as ze-probe]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as ocl-probe]
@@ -313,13 +313,52 @@
       (is (empty? (:buffers @@session)) "captured entry roots are released by the same owner")
       (is (nil? @escaped) "no executable or completed output boundary escapes failed capture"))))
 
+(defn- check-ordinary-source-mutation! [target]
+  (doseq [site [:host :stage]]
+    (let [compilation (equation-first/compile #'fixture/write-before-shape
+                                             {:target target :dtype :double})
+          source (core/resolve-deftm-var #'fixture/write-before-shape {:dtype :double})
+          metadata (meta source)
+          executable (link/instantiate-ordered-invocation!
+                      compilation [(double-array [7.0]) (double-array 1) 1] {})
+          calls (atom 0)
+          stage-depth (atom 0)
+          mutate! #(do (swap! calls inc) (alter-meta! source assoc ::changed-source true))
+          host scalar/evaluate-invocation-step
+          stage parallel-program/run-prepared!]
+      (try
+        (with-redefs [scalar/evaluate-invocation-step
+                      (fn [& args]
+                        (let [result (apply host args)]
+                          (when (= :host site) (mutate!)) result))
+                      parallel-program/run-prepared!
+                      (fn [& args]
+                        ;; A source stage may contain nested prepared graphs.
+                        ;; Change source after the entire source action completes,
+                        ;; not after every internal graph executor invocation.
+                        (swap! stage-depth inc)
+                        (try
+                          (let [result (apply stage args)]
+                            (when (and (= :stage site) (= 1 @stage-depth)) (mutate!))
+                            result)
+                          (finally (swap! stage-depth dec))))]
+          (is (= :stale-definition-proof-input (reason #(link/run! executable)))))
+        (is (= 1 @calls))
+        (is (nil? (:resident-boundary @(:execution-state executable))))
+        (is (zero? @(:completed-replays executable)))
+        (is (false? @(:output-ready? executable)))
+        (is (= :link-execution-poisoned (reason #(link/run! executable))))
+        (finally
+          (reset-meta! source metadata)
+          (link/close! executable))))))
+
 (deftest opencl-owned-root-obeys-source-order-and-replay
   (if @ocl-probe/opencl-available?
     (do (check-owned-root! :ocl:0) (check-failed-root! :ocl:0)
         (check-shared-check-and-admission! :ocl:0) (check-math-request! :ocl:0)
         (check-release-failure! :ocl:0) (check-captured-entry-replay! :ocl:0)
         (check-capture-failure! :ocl:0) (check-dense-realization-actions! :ocl:0)
-        (check-source-alias-actions! :ocl:0))
+        (check-source-alias-actions! :ocl:0) (check-ordinary-source-mutation! :ocl:0))
     (ocl-probe/opencl-skip! "owned source-ordered invocation root")))
 
 (deftest level-zero-owned-root-obeys-source-order-and-replay
@@ -328,5 +367,5 @@
         (check-shared-check-and-admission! :ze:0) (check-math-request! :ze:0)
         (check-release-failure! :ze:0) (check-captured-entry-replay! :ze:0)
         (check-capture-failure! :ze:0) (check-dense-realization-actions! :ze:0)
-        (check-source-alias-actions! :ze:0))
+        (check-source-alias-actions! :ze:0) (check-ordinary-source-mutation! :ze:0))
     (ze-probe/gpu-skip! "owned source-ordered invocation root")))

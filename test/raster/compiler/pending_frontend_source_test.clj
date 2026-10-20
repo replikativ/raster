@@ -11,24 +11,36 @@
             [raster.runtime.hardware :as hardware]))
 
 (def target :ocl:pending-frontend-source-test)
+(declare ^:private fresh-sources!)
 (use-fixtures :each hardware-fixture/isolated
   (fn [f]
     (hardware/register-target-device!
      target {:name "Synthetic pending frontend target"
              :capabilities {:total-eus 32 :subgroup-sizes [16]
                             :max-workgroup-size 1024 :shared-local-memory 65536}})
+    (fresh-sources!)
     (f)))
 
 (defmacro factor-expression [factor] `(* ~factor 2.0))
-(core/deftm gpu-first [factor :- Double xs :- (Array float)] :- (Array float)
-  (par/scale (factor-expression factor) xs))
-(core/deftm concurrent-source [x :- Double] :- Double (+ x 2.0))
-(core/deftm failed-source [x :- Double] :- Double (+ x 3.0))
 (def helper-expansions (atom 0))
 (defmacro counted-helper-expression [x]
   (swap! helper-expansions inc)
   `(+ ~x 4.0))
-(core/deftm cold-helper [x :- Double] :- Double (counted-helper-expression x))
+(def ^:private source-definitions
+  '[(core/deftm gpu-first [factor :- Double xs :- (Array float)] :- (Array float)
+      (par/scale (factor-expression factor) xs))
+    (core/deftm concurrent-source [x :- Double] :- Double (+ x 2.0))
+    (core/deftm failed-source [x :- Double] :- Double (+ x 3.0))
+    (core/deftm cold-helper [x :- Double] :- Double (counted-helper-expression x))])
+
+(defn- fresh-sources! []
+  ;; Cold-state assertions need genuinely new definitions, not a cleared cache
+  ;; on already-published implementations. This also permits repeated warm-REPL runs.
+  (binding [*ns* (the-ns 'raster.compiler.pending-frontend-source-test)
+            *unchecked-math* false]
+    (doseq [definition source-definitions] (eval definition))))
+
+(fresh-sources!)
 
 (defn- source [v] (core/resolve-deftm-var v {:dtype :double}))
 (defn- receiver [v]
@@ -82,7 +94,7 @@
                                                          {:preserve-declared-array-storage? true}))
               compiled (equation-first/compile #'gpu-first
                          {:target target :dtype :double :preserve-declared-array-storage? true})
-              owner (:checked-result-source-owner compiled)]
+              owner (:ordered-source-owner compiled)]
           (is (some? owner))
           (alter-var-root #'factor-expression
                           (constantly (fn [_ _ factor] (list 'clojure.core/* factor 7.0))))
@@ -90,7 +102,7 @@
           (is (= [(float 4.0)] (vec (gpu-first 2.0 (float-array [1.0])))))
           (is (= 1 @walks) "JVM publication reuses, rather than re-walks, the frontend")
           (is (= :stale-definition-proof-input
-                 (reason #(source-owner/assert-checked-result-source!
+                 (reason #(source-owner/assert-ordered-source!
                            owner (:semantic compiled) (:emitted compiled)))))
           (let [after (entry/call-with-definition-inputs
                        #(pipeline/retained-frontend-source #'gpu-first v :double
@@ -100,7 +112,7 @@
             (is (identical? (:source-frontend before) (:source-frontend after)))
             (is (identical? (:body before) (:body after)))
             (is (not (identical? (:source-owner before) (:source-owner after))))
-            (is (some? (:checked-result-source-owner recompiled))))))
+            (is (some? (:ordered-source-owner recompiled))))))
       (finally (alter-var-root #'factor-expression (constantly original-macro))))))
 
 (deftest concurrent-target-requests-share-one-frontend-producer

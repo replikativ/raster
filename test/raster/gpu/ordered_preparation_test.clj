@@ -5,6 +5,7 @@
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.gpu.compiled :as compiled]
@@ -17,6 +18,45 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest ordinary-source-owner-cannot-be-removed-or-copied-before-resource-acquisition
+  (doseq [[v arguments] [[#'fixture/shape-before-write [(double-array [7.0]) 1]]
+                        [#'fixture/write-before-shape [(double-array [7.0]) (double-array 1) 1]]]]
+    (let [compilation (equation-first/compile v {:target :ocl:0 :dtype :double})
+          other (equation-first/compile v {:target :ocl:0 :dtype :double})
+          sessions (atom 0)
+          forbidden (fn [& _] (swap! sessions inc)
+                      (throw (AssertionError. "unowned source touched a device")))]
+      (is (some? (:ordered-source-owner compilation)))
+      (doseq [changed [(dissoc compilation :ordered-source-owner)
+                       (assoc compilation :ordered-source-owner (:ordered-source-owner other))]]
+        (with-redefs [gpu/make-session forbidden]
+          (is (= :ordered-source-owner-mismatch
+                 (reason #(link/instantiate-ordered-invocation! changed arguments {}))))
+          (is (= :ordered-source-owner-mismatch
+                 (reason #(#'compiled/prepare-ordered-equation-first changed arguments {} nil))))))
+      (is (zero? @sessions)))))
+
+(deftest unsupported-ordered-policy-does-not-disable-eager-compilation
+  (let [source (binding [*ns* (the-ns 'raster.gpu.ordered-preparation-test)
+                         *unchecked-math* true]
+                 (eval (list 'raster.core/deftm (gensym "unchecked-prefix")
+                             '[n :- Long] ':- '(Array double)
+                             '(let [out (double-array n)]
+                                (raster.par/map! out i n double 2.0)))))
+        compilation (equation-first/compile source {:target :ocl:0 :dtype :double})
+        sessions (atom 0)]
+    (is (nil? (:ordered-source-owner compilation)))
+    (is (seq (invocation/source-host-actions
+              (get-in compilation [:semantic :attributes :invocation-plan]) (:semantic compilation))))
+    (is (empty? (invocation/ordered-host-actions
+                 (get-in compilation [:semantic :attributes :invocation-plan]) (:semantic compilation))))
+    (with-redefs [gpu/make-session (fn [& _] (swap! sessions inc)
+                                   (throw (AssertionError. "compile/lower touched a device")))]
+      (is (some? (link-plan/validate! (equation-first/lower compilation [1]))))
+      (is (= :ordered-source-owner-mismatch
+             (reason #(link/instantiate-ordered-invocation! compilation [1] {})))))
+    (is (zero? @sessions))))
 
 (deftest source-action-coverage-is-shared-before-preparation-and-native-capture
   (let [compilation (equation-first/compile #'fixture/write-before-shape {:target :ocl:0 :dtype :double})

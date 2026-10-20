@@ -38,6 +38,7 @@
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.pipeline :as pl]
             [raster.compiler.source-dependencies :as source-dependencies]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.core :as rcore]
             [raster.gpu.core :as gpu]
             [raster.gpu.invocation-observation :as observation]
@@ -1049,6 +1050,7 @@
    must land before ordinary lowering may select it."
   [compilation args opts template-report]
   (let [started (System/nanoTime)
+        _ (source-owner/assert-ordered-compilation-source! compilation)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
         _ (when (or (get-in invocation-plan [:attributes :parameter-projection])
                     (some seq ((juxt :donate :outputs :taps) opts))

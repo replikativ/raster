@@ -66,7 +66,7 @@
           body (get-in equation [:graph :nodes 0 :operation :attributes :kernel-body])
           loop (first (filter #(= "raster.compiler.ir.kernel_body.ForLoop" (some-> % class .getName))
                               (tree-seq coll? seq body)))]
-      (is (some? (:checked-result-source-owner compilation)))
+      (is (some? (:ordered-source-owner compilation)))
       (is (= :invocation-private (:output-ownership obligation)))
       (is (= :trap (get-in obligation [:source-conversion :overflow])))
       (is (= :ordered (get-in loop [:attributes :association])))

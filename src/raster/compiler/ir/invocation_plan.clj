@@ -1045,23 +1045,16 @@
       (get-in plan [:attributes :source-order])
       (derive-source-order plan program))))
 
-(defn ordered-host-actions
-  "Derive host actions which cannot be eagerly materialized before numerical work.
-
-   Revalidates the exact source/plan correspondence; an attribute or a caller's
-   ordering hint is not authority. This is an execution obligation, not proof
-   that an action throws. Even an otherwise pure late scalar must stay ordered
-   until a separate motion proof establishes that moving it is unobservable."
+(defn- classify-source-host-actions
   [plan program]
   (if (source-free-program? program)
     ;; Explicit source-free shape projections have no Clojure occurrence order;
     ;; the existing closed source-free validator owns their prefix contract.
-    (do (validate-against! plan program) [])
+    (do (validate-against! plan program) {:all [] :ordered []})
     (let [order (source-order plan program)
           equations (into {} (map (juxt :id identity)) (:equations program))
           steps (into {} (map (juxt :id identity)) (:steps plan))]
-      (:actions
-       (reduce
+      (reduce
         (fn [{:keys [numerical?] :as state} entry]
           (let [equation (get equations (:equation entry))
                 host-equation? (true? (get-in equation [:attributes :host-only]))
@@ -1075,6 +1068,24 @@
                                  (= :result-allocation (:kind realization))
                                  (and step (not (value-alias? step))))]
             (cond-> state
-              (and numerical? host-action?) (update :actions conj entry)
+              host-action? (update :all conj entry)
+              (and numerical? host-action?) (update :ordered conj entry)
               (and equation (not host-equation?)) (assoc :numerical? true))))
-        {:numerical? false :actions []} order)))))
+        {:numerical? false :all [] :ordered []} order))))
+
+(defn source-host-actions
+  "All executable host occurrences under exact validated source/plan correspondence.
+   Includes prefix computations and allocations, unlike the ordered-routing subset.
+   Source-free projections retain their separately validated prefix contract."
+  [plan program]
+  (:all (classify-source-host-actions plan program) []))
+
+(defn ordered-host-actions
+  "Derive host actions which cannot be eagerly materialized before numerical work.
+
+   Revalidates the exact source/plan correspondence; an attribute or a caller's
+   ordering hint is not authority. This is an execution obligation, not proof
+   that an action throws. Even an otherwise pure late scalar must stay ordered
+   until a separate motion proof establishes that moving it is unobservable."
+  [plan program]
+  (:ordered (classify-source-host-actions plan program) []))

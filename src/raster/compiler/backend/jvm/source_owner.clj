@@ -14,6 +14,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.backend.jvm.terminal-source :as terminal-source]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.form :as form])
   (:import [java.lang.reflect Method]))
 
@@ -187,48 +188,81 @@
       (entry/assert-definition-inputs-current! observations)
       (TerminalResultOwner. program contract execute observations source-ns))))
 
-(deftype ^:private CheckedResultSourceOwner [program emission observations source-ns])
+(deftype ^:private OrderedSourceOwner [program emission observations source-ns])
 
-(defn compile-checked-result-source
-  "Freeze source ownership after checked-stage emission under the original producer.
+(defn ordered-source-required?
+  "Derive historical source obligations, independently of owner-field presence.
+   Prefix host work needs ownership too; only its late subset needs ordered routing.
+   Source-free projections are exempt only through their validated closed contract."
+  [program emission]
+  (let [actions (invocation/source-host-actions
+                 (get-in program [:attributes :invocation-plan]) program)]
+    (boolean (or (seq actions) (stage-result/requires-observation? emission)))))
+
+(defn compile-ordered-source
+  "Freeze source ownership after emission under the original producer.
    This grants no physical binding, completion or initialization. The compiler
-   producer owes source-to-semantic correspondence; consumers cannot refresh it."
-  [program emission source-var frontend]
-  (entry/assert-frontend-source! frontend source-var)
-  (let [{:keys [collector source-ns policy]} (original-source-context! source-var :unowned-checked-result-source)]
-    (when-not (false? (:unchecked-math policy))
-      (throw (ex-info "checked result source requires its retained checked compilation policy"
-                      {:reason :unsupported-checked-result-source-policy :source-policy policy})))
-    (intrinsic-source/observe-originals! source-ns)
-    (let [observations @collector]
-      (doseq [[v origin] (:source-body-inputs observations)]
-        (let [snapshot (get-in observations [:definition-proofs v])
-              metadata (case origin :var (:metadata snapshot) :value (meta (:value snapshot)) nil)
-              imported-policy (:raster.core/source-policy metadata)]
-          (when-not (and snapshot (completion/source-policy? imported-policy)
-                         (false? (:unchecked-math imported-policy)))
-            (throw (ex-info "checked result source cannot import a body with unknown or unchecked policy"
-                            {:reason :unsupported-checked-result-import-policy
-                             :source v :origin origin :source-policy imported-policy})))))
-      (when (seq (:unclosed-source-imports observations))
-        (throw (ex-info "checked result source needs original lineage for body imports"
-                        {:reason :unclosed-checked-result-source-imports
-                         :imports (:unclosed-source-imports observations)})))
-      (source-history-current! source-ns observations :stale-checked-result-source-namespace)
-      (CheckedResultSourceOwner. program emission observations source-ns))))
+   producer owes source-to-semantic correspondence; consumers cannot refresh it.
+   The existing checked-policy restriction remains; this grants no new policy.
+   Optional mode returns nil ONLY for unsupported policy/import capabilities so an
+   ordinary eager compile need not acquire ordered execution. Invalid/stale source
+   always throws. Checked stages use required mode; ordered runtime rederives need."
+  ([program emission source-var frontend]
+   (compile-ordered-source program emission source-var frontend true))
+  ([program emission source-var frontend required?]
+   (entry/call-with-optional-definition-inputs
+    (fn []
+      (entry/assert-frontend-source! frontend source-var)
+      (let [{:keys [collector source-ns policy]}
+            (original-source-context! source-var :unowned-checked-result-source)]
+        (intrinsic-source/observe-originals! source-ns)
+        (let [observations @collector
+              unsupported-import
+              (some (fn [[v origin]]
+                      (let [snapshot (get-in observations [:definition-proofs v])
+                            metadata (case origin :var (:metadata snapshot)
+                                                  :value (meta (:value snapshot)) nil)
+                            imported-policy (:raster.core/source-policy metadata)]
+                        (when-not (and snapshot (completion/source-policy? imported-policy)
+                                       (false? (:unchecked-math imported-policy)))
+                          {:reason :unsupported-checked-result-import-policy
+                           :source v :origin origin :source-policy imported-policy})))
+                    (:source-body-inputs observations))
+              unavailable (cond
+                            (not (false? (:unchecked-math policy)))
+                            {:reason :unsupported-checked-result-source-policy :source-policy policy}
+                            unsupported-import unsupported-import
+                            (seq (:unclosed-source-imports observations))
+                            {:reason :unclosed-checked-result-source-imports
+                             :imports (:unclosed-source-imports observations)})]
+          ;; Capability abstention must not mask a concurrent invalidation.
+          (source-history-current! source-ns observations :stale-checked-result-source-namespace)
+          (if unavailable
+            (when required?
+              (throw (ex-info "ordered source needs checked policy and original import lineage"
+                              unavailable)))
+            (OrderedSourceOwner. program emission observations source-ns))))))))
 
-(defn assert-checked-result-source!
+(defn assert-ordered-source!
   "Guard exact historical semantic/emitted ownership before and after source work."
   [owner program emission]
-  (when-not (and (instance? CheckedResultSourceOwner owner)
-                 (identical? program (.-program ^CheckedResultSourceOwner owner))
-                 (identical? emission (.-emission ^CheckedResultSourceOwner owner)))
-    (throw (ex-info "checked result owner belongs to another source/program boundary"
-                    {:reason :checked-result-source-owner-mismatch})))
-  (source-history-current! (.-source-ns ^CheckedResultSourceOwner owner)
-                           (.-observations ^CheckedResultSourceOwner owner)
+  (when-not (and (instance? OrderedSourceOwner owner)
+                 (identical? program (.-program ^OrderedSourceOwner owner))
+                 (identical? emission (.-emission ^OrderedSourceOwner owner)))
+    (throw (ex-info "ordered source owner belongs to another source/program boundary"
+                    {:reason :ordered-source-owner-mismatch})))
+  (source-history-current! (.-source-ns ^OrderedSourceOwner owner)
+                           (.-observations ^OrderedSourceOwner owner)
                            :stale-checked-result-source-namespace)
   owner)
+
+(defn assert-ordered-compilation-source!
+  "Fence an ordered compilation, including attempts to remove its required owner.
+   An existing opaque owner authenticates the exact validated program identities;
+   if absent, independently rederive the obligation rather than granting a bypass."
+  [{:keys [ordered-source-owner semantic emitted]}]
+  (when (or ordered-source-owner (ordered-source-required? semantic emitted))
+    (assert-ordered-source! ordered-source-owner semantic emitted)))
 
 (defn assert-terminal-result-owner!
   "Preflight exact source ownership without observing any numerical value or executing source."

@@ -29,7 +29,9 @@
   (binding [inline/*inline-scalar-bodies?* true]
     ((deref (ns-resolve 'raster.compiler.passes.scalar.inline 'try-resolve-walked-body)) v)))
 
-(defn- compile-owned [v]
+(defn- compile-owned
+  ([v] (compile-owned v true))
+  ([v required?]
   ;; These opaque identities model only the compiler-producer ownership seam.
   ;; They grant no semantic validation, device completion or initialized storage.
   (let [program (Object.) emission (Object.)]
@@ -39,21 +41,21 @@
          (entry/observe-definition-input! public (:ns (meta public)) (:name (meta public)))
          (is (some? (import! v)))
          {:program program :emission emission :collector entry/*emission-inputs*
-          :owner (owner/compile-checked-result-source program emission public (frontend public))})))))
+          :owner (owner/compile-ordered-source program emission public (frontend public) required?)}))))))
 
 (deftest imported-policy-is-owned-at-the-actual-body-extraction
   (let [v (helper)
         {:keys [owner program emission collector]} (compile-owned v)]
     (is (contains? (:source-body-inputs @collector) [v :var]))
-    (is (identical? owner (owner/assert-checked-result-source! owner program emission)))
-    (is (= :checked-result-source-owner-mismatch
-           (reason #(owner/assert-checked-result-source! owner (Object.) emission))))
+    (is (identical? owner (owner/assert-ordered-source! owner program emission)))
+    (is (= :ordered-source-owner-mismatch
+           (reason #(owner/assert-ordered-source! owner (Object.) emission))))
     (let [original @v]
       (try
         (alter-var-root v (constantly (fn [_] :replaced)))
         (reset! collector {})
         (is (= :stale-definition-proof-input
-               (reason #(owner/assert-checked-result-source! owner program emission))))
+               (reason #(owner/assert-ordered-source! owner program emission))))
         (finally (alter-var-root v (constantly original)))))))
 
 (deftest unknown-and-unchecked-imports-cannot-borrow-the-public-policy
@@ -69,7 +71,18 @@
       (is (Float/isInfinite (oracle Double/MAX_VALUE)) "independent unchecked source oracle")
       (is (Float/isInfinite (checked-caller oracle Double/MAX_VALUE))
           "independent primitive-source composition; boxed operands have different cast semantics")
-      (is (= :unsupported-checked-result-import-policy (reason #(compile-owned v))))))
+      (is (= :unsupported-checked-result-import-policy (reason #(compile-owned v))))
+      (is (nil? (:owner (compile-owned v false)))
+          "ordinary eager compilation may lack the strict ordered capability")
+      (entry/call-with-definition-inputs
+       (fn []
+         (entry/observe-definition-input! v (:ns (meta v)) (:name (meta v)))
+         (let [original-frontend (pipeline/retained-frontend-source generic v :double)]
+           (is (nil? (owner/compile-ordered-source
+                      (Object.) (Object.) v original-frontend false)))
+           (is (= :unsupported-checked-result-source-policy
+                  (reason #(owner/compile-ordered-source
+                            (Object.) (Object.) v original-frontend)))))))))
   (let [v (helper) original (meta v)]
     (try
       (alter-meta! v dissoc :raster.core/source-policy)
@@ -81,6 +94,7 @@
 (deftest function-value-body-retains-its-own-policy-origin
   (is (= :unclosed-checked-result-source-imports (reason #(compile-owned #'value-helper)))
       "a retained policy alone cannot authenticate a generated function's body")
+  (is (nil? (:owner (compile-owned #'value-helper false))))
   (let [original @#'value-helper]
     (try
       (alter-var-root #'value-helper #(with-meta % (dissoc (meta %) :raster.core/source-policy)))
@@ -95,6 +109,26 @@
                   #(do (import! (helper)) nil))))
        (is (= before @entry/*emission-inputs*))))))
 
+(deftest optional-source-capability-abstains-without-masking-stale-evidence
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [public (source)]
+       (entry/observe-definition-input! public (:ns (meta public)) (:name (meta public)))
+       (is (some? (import! #'value-helper)))
+       (let [original-frontend (frontend public)
+             before @entry/*emission-inputs*
+             metadata (meta public)]
+         (is (nil? (owner/compile-ordered-source
+                    (Object.) (Object.) public original-frontend false)))
+         (is (= before @entry/*emission-inputs*)
+             "unavailable owner capability retains no speculative observations")
+         (try
+           (alter-meta! public assoc ::changed-source true)
+           (is (= :stale-definition-proof-input
+                  (reason #(owner/compile-ordered-source
+                            (Object.) (Object.) public original-frontend false))))
+           (finally (reset-meta! public metadata))))))))
+
 (deftest derived-source-without-transitive-history-is-not-certified-by-its-caller
   (entry/call-with-definition-inputs
    (fn []
@@ -102,7 +136,7 @@
        (entry/observe-definition-input! public (:ns (meta public)) (:name (meta public)))
        (swap! entry/*emission-inputs* assoc :unclosed-source-imports #{[:prepared-reverse-ad 'loss]})
        (is (= :unclosed-checked-result-source-imports
-              (reason #(owner/compile-checked-result-source (Object.) (Object.) public
+              (reason #(owner/compile-ordered-source (Object.) (Object.) public
                                                            (frontend public)))))))))
 
 (deftest missing-original-frontend-cannot-acquire-a-checked-source-owner
@@ -111,7 +145,7 @@
      (let [public (source)]
        (entry/observe-definition-input! public (:ns (meta public)) (:name (meta public)))
        (is (= :unowned-checked-result-frontend
-              (reason #(owner/compile-checked-result-source (Object.) (Object.) public nil))))))))
+              (reason #(owner/compile-ordered-source (Object.) (Object.) public nil))))))))
 
 (deftest checked-owner-cannot-authenticate-replaced-bootstrap-intrinsics
   ;; Materialize original fixtures BEFORE replacing a bootstrap dependency.
@@ -122,5 +156,5 @@
        (let [original-frontend (frontend public)]
          (with-redefs [clojure.core/float (fn [_] :replaced)]
            (is (= :intrinsic-source-definition-mismatch
-                  (reason #(owner/compile-checked-result-source
+                  (reason #(owner/compile-ordered-source
                             (Object.) (Object.) public original-frontend))))))))))

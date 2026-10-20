@@ -14,7 +14,7 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `2a582ddd` is draft, not qualified for merge.
+Current integration hold: PR #1539 at `1499616d` is draft, not qualified for merge.
 Exact-head setup/build passed; emission, unit and OpenCL gates failed.
 The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
@@ -139,6 +139,39 @@ automatic routing: logical-dtype local/result coercions still require independen
 source correspondence, and buffer-shape stand-ins cannot be passed to original
 array-taking code without an audited shape projection. The callback itself grants
 no ownership authority. Do not catch a partial interpreter refusal and retry it.
+
+Historical source fencing now uses one `OrderedSourceOwner` for both ordinary
+and checked ordered execution; the checked-only type/API/field is removed. One
+validated occurrence classifier supplies all host actions for ownership and only
+their late subset for routing. Prefix actions therefore cannot bypass ownership.
+Missing/cross-program owners fail before preparation, device creation or captured
+uploads, with the obligation independently rederived when the owner is absent.
+Live/source/epoch fences cover each source action, completed stages before
+initialization credit, allocation before acquisition, input handoff and publication.
+Checked observation and private-generation retirement remain distinct obligations.
+
+The existing strict source-policy/import restriction is not broadened into an
+ordinary eager-compilation refusal. Unobserved compilation may explicitly abstain
+from acquiring an unsupported ordered capability; frontend/bootstrap/history
+failures still throw, and speculative observations roll back. Ordered entry then
+independently refuses the absent owner. An unchecked prefix-allocation fixture
+still compiles and lowers to a validated eager LinkPlan without touching a device.
+No automatic routing or new unchecked source execution is enabled.
+
+Cold frontend tests now create fresh definitions per test instead of assuming a
+fresh JVM; two consecutive runs pass in the same REPL. A neighboring call-count
+probe also exposed public multi-arity self-delegation being intercepted twice;
+both invocation-step arities now share a private implementation. This changes
+neither the scalar expression nor its evaluation count. Nested prepared-graph
+mutation tests fence the completed outer source action, not each internal graph.
+The final affected eleven-namespace gate passes 104 tests / 1,566 assertions,
+including actual OpenCL and Level Zero execution and source-free compilation.
+Review found no remaining concrete blocker in this bounded consolidation. Earlier
+combined rerun failed only the eight cold-state assertions before their fixtures
+were made fresh; the final gate retains those assertions unchanged. Independent
+ordinary stage/host-action source-mutation probes poison the owner, grant no replay
+credit and expose no resident result boundary. This is not broad CI acceptance or
+training admission; all eight campaign obligations remain open.
 
 Training admission will keep two execution modes under the same source-order
 owner: host-only checked dimensions as original ordered host actions, and

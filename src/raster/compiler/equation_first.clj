@@ -477,10 +477,11 @@
                   :schedule resolved-schedule))
           emission)
         invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
-        checked-owner (when (and source-var retained-frontend
-                                 (stage-result/requires-observation? (:program emission)))
-                        (source-owner/compile-checked-result-source
-                         semantic (:program emission) source-var retained-frontend))]
+        ordered-owner (when (and source-var retained-frontend
+                                 (source-owner/ordered-source-required? semantic (:program emission)))
+                        (source-owner/compile-ordered-source
+                         semantic (:program emission) source-var retained-frontend
+                         (boolean (stage-result/requires-observation? (:program emission)))))]
     (when-not invocation-plan
       (fail! :equation-first-invocation
              "equation-first semantic program has no retained public invocation plan"
@@ -501,7 +502,7 @@
       :emission (:stats emission)
       :fallback :none})
       terminal-owner (assoc :terminal-source-owner terminal-owner)
-      checked-owner (assoc :checked-result-source-owner checked-owner))))
+      ordered-owner (assoc :ordered-source-owner ordered-owner))))
 
 (def ^:private typed-compilation-options
   #{:target :schedule :scalar-math :resident-outputs})

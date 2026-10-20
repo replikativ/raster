@@ -105,6 +105,6 @@
   (let [compiled (equation-first/compile
                   #'mixed-scalar {:target target :dtype :double
                                   :preserve-declared-array-storage? true})]
-    (is (some? (:checked-result-source-owner compiled)))
+    (is (some? (:ordered-source-owner compiled)))
     (is (= :float (get-in compiled [:options :array-types 'xs])))
     (is (= :double (get-in compiled [:options :scalar-types 'factor])))))

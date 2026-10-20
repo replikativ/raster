@@ -98,9 +98,9 @@
       (with-redefs [gpu/make-session (fn [& _] (throw (AssertionError. "premature driver contact")))]
         (is (= :checked-stage-observation-required
                (reason #(link/instantiate-ordered-invocation! compilation [2.0 input] {}))))
-        (is (= :checked-result-source-owner-mismatch
+        (is (= :ordered-source-owner-mismatch
                (reason #(link/instantiate-checked-invocation!
-                         (dissoc compilation :checked-result-source-owner) [2.0 input])))))
+                         (dissoc compilation :ordered-source-owner) [2.0 input])))))
       (let [first-result (link/run! executable)
             output (first (keys first-result))
             old-view (get first-result output)

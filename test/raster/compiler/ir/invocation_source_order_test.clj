@@ -21,6 +21,13 @@
     (par/map! out i square double 1.0)
     out))
 
+(deftm shape-before-write
+  [x :- (Array double), n :- Long] :- (Array double)
+  (let [^long square (* (long n) (long n))
+        out (double-array square)]
+    (par/map! out i square double (+ (aget x i) 1.0))
+    out))
+
 (deftm helper-source-zero-observed
   [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
   (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
@@ -40,6 +47,19 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest prefix-source-ownership-is-distinct-from-late-routing
+  (let [[program plan] (compilation #'shape-before-write :double)
+        all (invocation/source-host-actions plan program)]
+    (is (some #(= 'square (:binding %)) all))
+    (is (empty? (invocation/ordered-host-actions plan program)))
+    (is (= all (invocation/source-host-actions
+                (assoc-in plan [:attributes :host-actions] []) program))
+        "caller-provided action lists cannot remove the reconstructed obligation")
+    (is (= :invocation-source-order-mismatch
+           (reason #(invocation/source-host-actions
+                     (assoc-in plan [:attributes :source-order]
+                               (vec (reverse (invocation/source-order plan program)))) program))))))
 
 (deftest helper-allocation-correspondence-is-retained-and-independently-rederived
   (let [[program plan] (compilation #'helper-source-zero-observed :double)

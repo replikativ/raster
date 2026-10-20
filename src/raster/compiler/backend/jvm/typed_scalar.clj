@@ -223,11 +223,8 @@
                                     (evaluate-expression source-ns environment expression execute-source))})
             body-results result-dtypes)))))
 
-(defn evaluate-invocation-step
-  "InvocationMaterialization evaluator for one closed ScalarCompute step."
-  ([source-ns step operand-values]
-   (evaluate-invocation-step source-ns step operand-values nil))
-  ([source-ns step operand-values execute-source]
+(defn- evaluate-invocation-step*
+  [source-ns step operand-values execute-source]
   (let [{:keys [parameters]} (soac/lambda-parts (:region step))
         operands (mapv (fn [parameter]
                          (or (get operand-values parameter)
@@ -236,7 +233,14 @@
                                     {:parameter parameter :available (set (keys operand-values))})))
                        parameters)]
     (first (evaluate-region source-ns (:region step) operands
-                            [(get-in step [:value :dtype])] execute-source)))))
+                            [(get-in step [:value :dtype])] execute-source))))
+
+(defn evaluate-invocation-step
+  "InvocationMaterialization evaluator for one closed ScalarCompute step."
+  ([source-ns step operand-values]
+   (evaluate-invocation-step* source-ns step operand-values nil))
+  ([source-ns step operand-values execute-source]
+   (evaluate-invocation-step* source-ns step operand-values execute-source)))
 
 (defn evaluate-host-equation
   "EmittedParallelProgramCall evaluator for one host-only TypedSOAC equation.

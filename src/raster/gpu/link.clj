@@ -1164,9 +1164,8 @@
   (parallel-program/release-prepared! prepared)
   (swap! execution-state update-in [:ordered :prepared] dissoc position))
 
-(defn- assert-ordered-checked-source! [compilation]
-  (source-owner/assert-checked-result-source!
-   (:checked-result-source-owner compilation) (:semantic compilation) (:emitted compilation)))
+(defn- assert-ordered-source! [compilation]
+  (source-owner/assert-ordered-compilation-source! compilation))
 
 (defn- instantiate-ordered-invocation-in-context!
   "Internal owned-root vertical for source-ordered invocation execution. No source-created
@@ -1179,8 +1178,9 @@
       (when-not (stage-result/requires-observation? compilation)
         (throw (ex-info "checked invocation requires an observed numerical stage"
                         {:reason :link-checked-invocation-contract})))
-      (assert-ordered-checked-source! compilation))
+      (assert-ordered-source! compilation))
     (stage-result/refuse-unobserved! compilation :instantiate-ordered-invocation))
+  (assert-ordered-source! compilation)
   (when (or (:session opts) (:profile? opts)
             (seq (set/difference (set (keys opts)) #{:scalar-math :profile? :entry-roles :result-mode})))
     (throw (ex-info "ordered invocation activation currently requires an owned unprofiled session"
@@ -1216,7 +1216,7 @@
                                                 (get-in initial [:program :outputs])))
                                          :execution-id (random-uuid) :roots {} :node-views {}
                                          :prepared {} :ledger (volatile! []) :timings (volatile! {})}})
-        _ (when observe-checked? (assert-ordered-checked-source! compilation))
+        _ (assert-ordered-source! compilation)
         session (gpu/make-session (:target compilation))
         owner (cleanup/owner
                [{:id :programs
@@ -1233,7 +1233,7 @@
                            (atom 0) (atom 0) (atom false) execution-state)
                        owner)]
         (capture-ordered-entries! executable entry-layout)
-        (when observe-checked? (assert-ordered-checked-source! compilation))
+        (assert-ordered-source! compilation)
         executable)
      nil)))
 
@@ -1359,7 +1359,7 @@
   (let [execution-state (:execution-state executable)
         {:keys [compilation caller-options]} (:ordered @execution-state)
         epoch (:value-epoch @execution-state)
-        _ (assert-ordered-checked-source! compilation)
+        _ (assert-ordered-source! compilation)
         _ (link-plan/validate-pending-observed-entry! pending caller-options)
         layout (:layout pending)
         contract (:entry-contract pending)
@@ -1382,7 +1382,7 @@
     (gpu/execute-checked-equation! (:session executable) (:equation pending)
                                    buffers (:scalar-values call) caller-options)
     (ensure-live! executable :checked-stage-completion)
-    (assert-ordered-checked-source! compilation)
+    (assert-ordered-source! compilation)
     (when-not (= epoch (:value-epoch @execution-state))
       (throw (ex-info "checked observation was invalidated by reentrant owner activity"
                       {:reason :link-checked-observation-reentrancy})))
@@ -1401,13 +1401,13 @@
       next-state)))
 
 (defn- run-ordered-stage! [executable ready]
-  (when (some-> executable :execution-state deref :ordered :observe-checked?)
-    (assert-ordered-checked-source!
-     (get-in @(:execution-state executable) [:ordered :compilation])))
+  (assert-ordered-source!
+   (get-in @(:execution-state executable) [:ordered :compilation]))
   (if-let [pending (:pending-observed-entry ready)]
     (run-ordered-observed-stage! executable ready pending)
   (let [execution-state (:execution-state executable)
-        {:keys [execution-id ledger caller-options]} (:ordered @execution-state)
+        {:keys [execution-id ledger caller-options compilation]} (:ordered @execution-state)
+        epoch (:value-epoch @execution-state)
         plan (:stage-plan ready)
         storage (acquire-ordered-storage! executable (:nodes plan) (:aliases plan))
         initialized (get-in @execution-state [:ordered :initialized])
@@ -1436,6 +1436,11 @@
                  (throw error))))))
     ;; run-prepared! is synchronous. Only now may the source cursor and initialized postcondition
     ;; advance; having bound a graph or acquired its storage never supplies this evidence.
+    (ensure-live! executable :ordered-stage-completion)
+    (assert-ordered-source! compilation)
+    (when-not (= epoch (:value-epoch @execution-state))
+      (throw (ex-info "ordered stage was invalidated by reentrant owner activity"
+                      {:reason :link-ordered-source-reentrancy})))
     (swap! execution-state update-in [:ordered :initialized] into
            (map #(get-in plan [:nodes % :view]) (get-in ready [:entry-contract :full-produces])))
     (-> (:state ready)
@@ -1445,12 +1450,17 @@
 
 (defn- run-ordered-allocation! [executable state]
   (let [execution-state (:execution-state executable)
+        epoch (:value-epoch @execution-state)
         compilation (get-in @execution-state [:ordered :compilation])
         request (get-in @execution-state [:ordered :caller-options])
         prepared (invocation-link/prepare-source-allocation
                   state (fn [expression scalars]
                           (scalar/evaluate-array-size (:source-ns compilation)
                                                        (update-vals scalars :value) expression)) request)
+        _ (assert-ordered-source! compilation)
+        _ (when-not (= epoch (:value-epoch @execution-state))
+            (throw (ex-info "source allocation was invalidated before acquisition"
+                            {:reason :link-ordered-source-reentrancy})))
         storage (acquire-ordered-storage! executable (:nodes prepared) #{})
         token (:storage prepared)
         view (get-in storage [:node-views token])]
@@ -1465,8 +1475,8 @@
         epoch (:value-epoch @execution-state)
         {:keys [compilation observe-checked? observed caller-options roots execution-id ledger timings initialized]}
         (:ordered @execution-state)
+        _ (assert-ordered-source! compilation)
         _ (when observe-checked?
-            (assert-ordered-checked-source! compilation)
             (let [expected (update-vals (invocation-link/ordered-observation-occurrences state)
                                         #(assoc % :epoch (:value-epoch @execution-state)))]
               (when-not (= expected observed)
@@ -1490,12 +1500,12 @@
                       {:reason :link-ordered-incomplete-storage})))
     (let [storage (realize-plan-storage! plan (:session executable) execution-id groups {}
                                         ledger timings roots)]
-      (when observe-checked?
-        (ensure-live! executable :checked-result-publication)
-        (assert-ordered-checked-source! compilation)
-        (when-not (= epoch (:value-epoch @execution-state))
-          (throw (ex-info "checked output publication was invalidated by reentrant owner activity"
-                          {:reason :link-checked-observation-reentrancy}))))
+      (ensure-live! executable :ordered-result-publication)
+      (assert-ordered-source! compilation)
+      (when-not (= epoch (:value-epoch @execution-state))
+        (throw (ex-info "ordered output publication was invalidated by reentrant owner activity"
+                        {:reason (if observe-checked? :link-checked-observation-reentrancy
+                                     :link-ordered-source-reentrancy)})))
       (swap! execution-state assoc :resident-boundary {:plan plan :node-views (:node-views storage)}))))
 
 (defn- run-ordered-terminal! [executable state]
@@ -1535,9 +1545,10 @@
 
 (defn- run-ordered-invocation! [executable]
   (let [execution-state (:execution-state executable)
+        epoch (:value-epoch @execution-state)
         {:keys [compilation observe-checked? arguments caller-options prepared entry-roles entry-refresh initialized]}
         (:ordered @execution-state)]
-    (when observe-checked? (assert-ordered-checked-source! compilation))
+    (assert-ordered-source! compilation)
     (when (seq prepared)
       (throw (ex-info "ordered invocation still owns an unfinished prepared stage"
                       {:reason :link-ordered-prepared-stage})))
@@ -1549,7 +1560,7 @@
                                              initialized)))]
       (swap! execution-state update :ordered assoc :current initial :initialized initialized :observed {})
       (loop [state initial]
-        (when observe-checked? (assert-ordered-checked-source! compilation))
+        (assert-ordered-source! compilation)
         (swap! execution-state assoc-in [:ordered :current] state)
         (if-let [entry (nth (:source-order state) (:source-cursor state) nil)]
           (let [equation (when-let [id (:equation entry)]
@@ -1572,6 +1583,11 @@
                    state (partial scalar/evaluate-invocation-step (:source-ns compilation))
                    (partial scalar/evaluate-host-equation (:source-ns compilation)) caller-options)
                   :else (update state :source-cursor inc))]
+            (assert-ordered-source! compilation)
+            (ensure-live! executable :ordered-source-completion)
+            (when-not (= epoch (:value-epoch @execution-state))
+              (throw (ex-info "source action was invalidated by reentrant owner activity"
+                              {:reason :link-ordered-source-reentrancy})))
             (recur next-state))
           (do
             (finish-ordered-invocation! executable state)
@@ -1596,10 +1612,12 @@
        (when-not (or (nil? before-mutation!) (ifn? before-mutation!))
          (throw (ex-info "ordered handoff callback must be callable"
                          {:reason :link-ordered-input-callback})))
+       (assert-ordered-source! compilation)
        (let [epoch (:value-epoch @execution-state)
              initial (invocation-link/begin-ordered-realization compilation arguments caller-options)
              checked (invocation-link/ordered-input-arguments initial arguments entry-roles replacements)]
          (when before-mutation! (before-mutation!))
+         (assert-ordered-source! compilation)
          (ensure-live! executable :run-ordered-with-inputs!)
          (ensure-no-output-leases! executable :run-ordered-with-inputs!)
          (when-not (and (= epoch (:value-epoch @execution-state))
