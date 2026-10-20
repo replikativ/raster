@@ -4363,27 +4363,6 @@
                                 (MethodTypeDesc/of obj-cd (into-array ClassDesc [obj-cd])))
               :ref))))))
 
-(defn- widen-loop-type
-  "Slot type for a loop var = LUB(init type, recur-value type), promoting only in
-  the value-preserving numeric direction (never narrowing). This matters because
-  explicit int seeds may recur with long values. Without unification the var
-  would round-trip i2l…l2i each iteration, defeating counted-loop recognition.
-  Ordinary source Long seeds already start as long; backend-owned int literals
-  or explicit casts retain their narrower carrier. Returns init-t when no safe
-  widening applies."
-  [init-t recur-t]
-  (let [num? #{:int :long :float :double}
-        rank {:int 0 :long 1 :float 2 :double 3}]
-    (cond
-      (or (nil? recur-t) (= init-t recur-t)) init-t
-      (not (and (num? init-t) (num? recur-t))) init-t
-      ;; long and float can't represent each other exactly → promote to double
-      (or (= init-t :double) (= recur-t :double)) :double
-      (or (and (= init-t :long) (= recur-t :float))
-          (and (= init-t :float) (= recur-t :long))) :double
-      (> (rank recur-t) (rank init-t)) recur-t
-      :else init-t)))
-
 (defn- loop-recur-value-type
   "A recurrence may join different numeric branch widths even when the emitted
    if is boxed. Preserve that numeric join without changing general if emission."
@@ -4403,7 +4382,7 @@
         (= a b) a
         (and (contains? #{:int :long :float :double} a)
              (contains? #{:int :long :float :double} b))
-        (widen-loop-type a b)))
+        (source-arithmetic/loop-carrier-join a b)))
 
     :else (infer-arg-stack-type form locals)))
 
@@ -4414,7 +4393,7 @@
   [body n locals]
   (let [acc (atom (vec (repeat n nil)))
         widest (fn [a b] (cond (nil? a) b (nil? b) a
-                               :else (widen-loop-type a b)))]
+                               :else (source-arithmetic/loop-carrier-join a b)))]
     (letfn [(scan [form ls]
               (cond
                 (and (seq? form) (= 'recur (first form)))
@@ -4446,14 +4425,14 @@
       (let [types (loop-recur-arg-types body (count pairs) ls)
             widened (reduce (fn [env [[sym _] rt]]
                               (if-let [t (:type (get env sym))]
-                                (assoc-in env [sym :type] (widen-loop-type t rt))
+                                (assoc-in env [sym :type] (source-arithmetic/loop-carrier-join t rt))
                                 env))
                             ls (map vector pairs types))]
         (if (= ls widened)
           (mapv (fn [[sym _] rt]
                   (let [t (:type (get widened sym))]
                     (if (contains? #{:int :long :float :double} t)
-                      (widen-loop-type t rt) rt)))
+                      (source-arithmetic/loop-carrier-join t rt) rt)))
                 pairs types)
           (recur widened))))))
 
@@ -4477,25 +4456,21 @@
                                                     :preserve-source-call-results? true)
                              t (emit-form code init locs initializer-ctx)
                              emitted-type t
-                             stamp-t (some->> (:raster.type/tag (meta sym))
-                                              (get {'double :double 'float :float
-                                                    'long :long 'int :int}))
+                             plan (source-arithmetic/loop-initializer-plan sym init t rt)
                              ;; The walker contextually types a bare floating
                              ;; seed as Float. A Double LDC must realize that
                              ;; retained type before the slot LUB, including
                              ;; helper chunks whose typed calls became arithmetic.
                              ;; Never narrow explicit casts/nonliteral values or
                              ;; a genuinely wider recurrence from a stamp alone.
-                             t (if (and (= t :double) (= stamp-t :float)
-                                        (instance? Double init)
-                                        (= rt :float))
+                             t (if (:contextual-float-literal? plan)
                                  (do (emit-coerce code :double :float) :float)
                                  t)
                              ;; A scalar declaration does not prove a boxed
                              ;; source initializer has primitive slot semantics.
                              ;; Preserve its reference; conversions remain at
                              ;; actual consumers and explicit source casts.
-                             slot-t (widen-loop-type t rt)]
+                             slot-t (:slot-carrier plan)]
                          ;; A2 differential: the walker stamps loop-var types
                          ;; (TC-fed); this backend still derives its own via
                          ;; LUB(init, recur). A PRIMITIVE mismatch between the
