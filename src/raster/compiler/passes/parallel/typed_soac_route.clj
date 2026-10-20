@@ -1733,11 +1733,12 @@
    (attempt form dtype array-types {}))
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
                                    resident-uniform-input-loads?
-                                   scalar-types values abstract-machine segmented-plans?
+                                   scalar-types values abstract-machine segmented-plans? source-ns
                                    preserve-declared-array-storage? host-scalars? terminal-host-results?]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form {:array-types array-types
+                                                 :source-ns source-ns
                                                  :scalar-types scalar-types})]
        (try
          (let [frontend-options {:dtype dtype :array-types array-types

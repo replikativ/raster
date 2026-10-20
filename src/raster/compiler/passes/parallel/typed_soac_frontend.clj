@@ -10,6 +10,8 @@
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
@@ -3934,16 +3936,48 @@
                (meta expression)))))))
    expression))
 
-(defn- nested-scalar-reductions
-  "Return scalar reductions nested inside an expression, without entering a reduction body."
+(declare contains-parallel-form?)
+
+(def ^:dynamic ^:private *normalization-source-ns* nil)
+
+(defn- original-inline-core-call?
   [expression]
-  (letfn [(sites [value]
-            (cond
-              (par/par-reduce-form? value) [value]
-              (seq? value) (mapcat sites value)
-              (vector? value) (mapcat sites value)
-              :else []))]
-    (vec (sites expression))))
+  (let [operation (first expression)]
+    (and (symbol? operation)
+         *normalization-source-ns*
+         (= "clojure.core" (namespace operation))
+         (descriptor/scalar-op? operation)
+         (not (contains? util/*shadowing-locals* operation))
+         (let [v (ns-resolve *normalization-source-ns* operation)]
+           (and (var? v) (:inline (meta v))
+                (try
+                  (intrinsic-source/assert-original!
+                   v operation :intrinsic-source-definition-mismatch)
+                  (when entry/*emission-inputs*
+                    (intrinsic-source/observe-original! *normalization-source-ns* operation))
+                  true
+                  (catch clojure.lang.ExceptionInfo _ false)))))))
+
+(defn- first-strict-scalar-reduction
+  "Find a reduction only along the first operand of original inline core calls.
+   This is an evaluation context, not a tree search: control/binding/quoted scopes,
+   collections, computed callees and later operands are not unconditional prefixes.
+   The replacement closure rebuilds precisely that occurrence, preserving metadata."
+  [expression]
+  (cond
+    (par/par-reduce-form? expression) {:reduction expression :replace identity}
+    (and (seq? expression)
+         (not (form/scope-info expression))
+         (not (:raster.op/lexical-callee (meta expression)))
+         (original-inline-core-call? expression))
+    (let [position 1]
+      (when (< position (count expression))
+        (when-let [{:keys [reduction replace]}
+                   (first-strict-scalar-reduction (nth expression position))]
+          {:reduction reduction
+           :replace #(util/remake-from expression
+                                       (assoc (vec expression) position (replace %)))})))
+    :else nil))
 
 (defn- lift-nested-scalar-reductions
   "Give a single nested scalar reduction its own SSA binding.
@@ -3951,8 +3985,10 @@
    TypedSOAC already fuses an adjacent pure scalar equation into a reduction result-transform,
    but analyzed Clojure can retain `(scalar-op (reduce ...))` as one initializer.  Lifting that
    value exposes the existing algebra without teaching the frontend about individual scalar
-   functions.  The surrounding expression must be removable after substitution, may not read
-   mutable array storage, and the reduction must carry its walker-provided result type."
+   functions. Extraction follows only an authenticated strict first-operand context: selected
+   helper calls need their own call-context proof and are deliberately not traversed. The
+   surrounding expression must be removable after substitution, may not read mutable array
+   storage, and the reduction must carry its walker-provided result type."
   [source]
   (if-not (and (seq? source) (contains? #{'let 'let*} (first source)))
     source
@@ -3961,20 +3997,18 @@
           lifted
           (mapcat
            (fn [[symbol expression]]
-             (let [sites (nested-scalar-reductions expression)]
-               (if (and (= 1 (count sites))
-                        (not (par/par-reduce-form? expression)))
-                 (let [reduction (first sites)
-                       reduction-tag (types/sym-type-tag reduction)
+             (let [{:keys [reduction replace]} (first-strict-scalar-reduction expression)]
+               (if (and reduction (not (par/par-reduce-form? expression)))
+                 (let [reduction-tag (types/sym-type-tag reduction)
                        value-id (with-meta (gensym "rstr_reduction_value_")
                                   (cond-> {}
                                     reduction-tag
                                     (assoc :tag reduction-tag :raster.type/tag reduction-tag)))
-                       outer (walk/postwalk #(if (= % reduction) value-id %) expression)]
+                       outer (replace value-id)]
                    (if (and reduction-tag
                             (effects/removable-expr? outer)
                             (empty? (par/collect-aget-arrays outer))
-                            (empty? (nested-scalar-reductions outer)))
+                            (not (contains-parallel-form? outer)))
                      [[value-id reduction] [symbol outer]]
                      [[symbol expression]]))
                  [[symbol expression]])))
@@ -4667,7 +4701,7 @@
    This normalization inserts an ordinary typed scalar binding immediately before its operation,
    so the same expression remains visible to JVM materialization and runtime specialization."
   ([source] (normalize-source source {}))
-  ([source {:keys [array-types scalar-types]}]
+  ([source {:keys [array-types scalar-types source-ns]}]
    ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
    ;; binder an array, exactly as the walker stamps them.
    (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
@@ -4675,6 +4709,9 @@
          tagged (fn [kind?]
                   (set (filter #(kind? (types/sym-type-tag %)) binders)))]
      (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
+               *normalization-source-ns* (cond
+                                          (instance? clojure.lang.Namespace source-ns) source-ns
+                                          (symbol? source-ns) (find-ns source-ns))
                *region-local-counter* (atom -1)
                *region-local-source-symbols* (source-symbols source)
                *declared-kinds*

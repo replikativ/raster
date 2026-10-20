@@ -942,6 +942,7 @@
                     :terminal-host-results? (true? (:terminal-host-results? opts))
                     :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
+                    :source-ns (:source-ns opts)
                     :values values
                     :abstract-machine abstract-machine})
             ;; Mixed source construction shares the ordinary frontend but cannot depend on

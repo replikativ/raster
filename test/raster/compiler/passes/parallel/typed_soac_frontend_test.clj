@@ -1820,8 +1820,8 @@
                                  (clojure.core/aget grads i))))
                     {:tag 'float :raster.type/tag 'float :raster.type/elem-type :float})
         norm-expression
-        (with-meta (list '.invk 'raster.numeric/sqrt_m_float-impl reduction)
-          {:tag 'float :raster.type/tag 'float :raster.op/original 'raster.numeric/sqrt})
+        (with-meta (list 'clojure.core/float reduction)
+          {:tag 'float :raster.type/tag 'float})
         norm (with-meta 'norm {:tag 'float :raster.type/tag 'float})
         source
         (list 'let*
@@ -1836,7 +1836,8 @@
               'grads)
         program (:program
                  (route/attempt source :float {'grads :float}
-                                {:scalar-types {'n :long 'max-norm :double}}))
+                                {:source-ns *ns*
+                                 :scalar-types {'n :long 'max-norm :double}}))
         algorithms (mapv :algorithm (:equations program))
         equations (mapv (comp first dialect/equations) algorithms)
         reduction-operation (dialect/operation-parts (first equations))]
@@ -1845,6 +1846,65 @@
     (is (dialect/result-transform? (get-in reduction-operation
                                            [:attributes :result-transform])))
     (is (every? true? (map = algorithms (map dialect/validate! algorithms))))))
+
+(deftest nested-reductions-do-not-cross-source-evaluation-contexts
+  (let [reduction (with-meta
+                    '(raster.par/reduce sum 0.0 i n
+                       (+ sum (clojure.core/aget xs i)))
+                    {:tag 'double :raster.type/tag 'double})
+        normalize (fn [expression]
+                    (frontend/normalize-source
+                     (list 'let* ['result expression] 'result)
+                     {:source-ns *ns* :array-types {'xs :double}
+                      :scalar-types {'n :long 'choose? :boolean}}))]
+    (doseq [expression [(list 'if 'choose? reduction 0.0)
+                        (list 'quote reduction)
+                        (list 'let* ['local 1] reduction)
+                        (list 'loop* ['iteration 0] reduction)
+                        (list 'fn [] reduction)
+                        [reduction]
+                        (list 'clojure.core/+ '(clojure.core/long nullable) reduction)
+                        (with-meta
+                          (list '.invk 'raster.numeric/sqrt_m_double-impl reduction)
+                          {:tag 'double :raster.op/original 'raster.numeric/sqrt})]]
+      (is (= (list 'let* ['result expression] 'result) (normalize expression))
+          (str "must not extract from " (pr-str expression))))
+    (let [expression (list 'clojure.core/+ reduction 1.0)
+          normalized (normalize expression)
+          [_ bindings] normalized
+          [temporary extracted result outer] bindings]
+      (is (= reduction extracted))
+      (is (= 'result result))
+      (is (= (list 'clojure.core/+ temporary 1.0) outer)))
+    (let [expression (list 'if 'choose? reduction 0.0)
+          source (list 'let* ['result expression] 'result)
+          compile-source (fn [body]
+                           (eval (list 'fn ['choose? (with-meta 'xs {:tag 'doubles}) 'n]
+                                       body)))
+          original (compile-source source)
+          normalized (compile-source (normalize expression))]
+      (is (= 0.0 (original false (double-array 0) 1)
+                 (normalized false (double-array 0) 1)))
+      (is (thrown? ArrayIndexOutOfBoundsException
+                   (original true (double-array 0) 1)))
+      (is (thrown? ArrayIndexOutOfBoundsException
+                   (normalized true (double-array 0) 1))))))
+
+(deftest reduction-extraction-needs-the-actual-source-lookup
+  (let [reduction (with-meta '(raster.par/reduce sum 0.0 i n
+                              (+ sum (clojure.core/aget xs i)))
+                    {:tag 'double :raster.type/tag 'double})
+        source (list 'let* ['result (list 'clojure.core/+ reduction 1.0)] 'result)
+        options {:array-types {'xs :double} :scalar-types {'n :long}}
+        masked (create-ns (gensym "masked_core_"))]
+    (try
+      (binding [*ns* masked]
+        (alias 'clojure.core 'clojure.set))
+      (is (= source (frontend/normalize-source source options))
+          "no producer namespace is not evidence for canonical core lookup")
+      (is (= source (frontend/normalize-source source (assoc options :source-ns masked)))
+          "a qualified spelling can be masked in the actual source namespace")
+      (finally (remove-ns (ns-name masked))))))
 
 (deftest functional-map-result-casts-become-typed-conversion-terms
   (doseq [[cast overflow] [['int :trap] ['unchecked-int :wrap]]]
