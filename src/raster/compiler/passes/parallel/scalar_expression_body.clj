@@ -1834,8 +1834,9 @@
    Selected calls abstain: a boxed payload is not its parent's operand carrier.
    This query does not establish source ownership, a physical JVM result carrier,
    operand/count completion, bounds, purity or permission to reorder a reduction.
-   The returned source-count obligation retains the original checked Int conversion;
-   it is not evidence that a symbolic bound or its conversion completes.
+   The enclosing extent is not part of ProductReduction. An opaque original bound
+   remains an obligation: its evaluation, checked Int conversion, ordering and
+   domain correspondence are NOT proved by operator/checkpoint correspondence.
    Unknown correspondence abstains; definition-ownership failures still propagate."
   [original product {:keys [source-ns array-types scalar-facts]}]
   (method-entry/call-with-optional-definition-inputs
@@ -1876,7 +1877,7 @@
                           (into remaining (map #(vector % (inc depth)) node))
                           remaining)
                         (inc visits)))))
-           (let [{:keys [acc init idx bound body]} (par/extract-par-reduce-info original)
+           (let [{:keys [acc init idx body]} (par/extract-par-reduce-info original)
                  component (first (:components product))
                  region (reduction/fold-region product)
                  target (:dtype component)
@@ -1892,9 +1893,7 @@
                             (= 1 (count (:results region)))
                             ;; Initializers are retained by the actual constructor. Equal
                             ;; numeric values must not substitute a different source width.
-                            (identical? init (:neutral component))
-                            (or (symbol? bound)
-                                (and (integer? bound) (<= Integer/MIN_VALUE bound Integer/MAX_VALUE))))
+                            (identical? init (:neutral component)))
                (abstain!))
              (letfn [(check [expression env]
                        (let [[type normalized]
@@ -1998,7 +1997,8 @@
                      (abstain!))
                    {:scope :conditional-fp-reduction-correspondence :dtype target
                     :checkpoints-preserved? true :zero-trip :initializer
-                    :source-count-obligation {:conversion :checked-int :evaluation :original-position}}))))
+                    :source-count-obligation {:conversion :checked-int :evaluation :original-position
+                                              :domain-correspondence :unproved}}))))
            (catch clojure.lang.ExceptionInfo error
              (when-not (= ::reduction-correspondence-decline (:reason (ex-data error)))
                (throw error)))))))))

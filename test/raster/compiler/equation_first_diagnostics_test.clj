@@ -80,7 +80,8 @@
       (is (= 1 (count correspondences)))
       (is (= :conditional-fp-reduction-correspondence (:scope proof)))
       (is (= :float (:dtype proof)))
-      (is (= {:conversion :checked-int :evaluation :original-position}
+      (is (= {:conversion :checked-int :evaluation :original-position
+              :domain-correspondence :unproved}
              (:source-count-obligation proof)))
       (is (not-any? #(contains? proof %) [:carrier :nonthrowing? :removable?]))
       (is (every? #(contains? (:source-evaluation-flags %) :preserve-source-evaluation)

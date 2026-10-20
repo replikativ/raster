@@ -1,5 +1,7 @@
 (ns raster.compiler.passes.parallel.scalar-region-body-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :as core]
+            [raster.dl.loss :as loss]
             [raster.compiler.backend.gpu.kernel-body-opencl :as emit]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.dtype :as dtype]
@@ -15,6 +17,7 @@
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segred-body :as segred]
             [raster.compiler.passes.parallel.scalar-region-lower :as result-region]
+            [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- lowerer []
@@ -36,6 +39,54 @@
      #(scalar/check-reduction-fp-correspondence
        source product {:source-ns source-ns :array-types arrays :scalar-facts facts}))))
 
+(deftest original-mse-operator-and-quotient-have-separate-owned-facts
+  (loss/mse-loss (float-array [1.0]) (float-array 1) 1)
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [source (core/resolve-deftm-var #'loss/mse-loss {:dtype :float})
+           frontend (entry/original-source-frontend source)
+           quotient (first (:body frontend))
+           original (second quotient)
+           observed (entry/frontend-reduction-emission frontend original)
+           product (reduction/make
+                    {:components [{:id :sum :accumulator (nth original 1)
+                                   :neutral (nth original 2) :dtype :float :result 'sum}]
+                     :index (nth original 3)
+                     :step (reduction/->ReductionRegion [] [(nth original 5)] {})})
+           source-ns (:ns (meta source))
+           operator (scalar/check-reduction-fp-correspondence
+                      original product {:source-ns source-ns
+                                        :array-types {'pred :float 'target :float}})
+           denominator (normal/completed-scalar-fact (nth quotient 2) {} source-ns)
+           parent (scalar/checked-core-fp-evaluation
+                    quotient [(:result-fact observed) denominator] source-ns)]
+       (is (some? (:root-result observed)))
+       (is (= {:carrier Object :presence :present :builtin-class Float} (:result-fact observed)))
+       (is (= :float (:dtype operator)))
+       (is (= :unproved (get-in operator [:source-count-obligation :domain-correspondence])))
+       (is (= Double/TYPE (:carrier denominator)))
+       (is (= Double/TYPE (:result-carrier parent)))
+       (is (not (contains? operator :carrier)))
+       (is (not (contains? parent :count)))))))
+
+(def ^:private opaque-count-evaluations (atom 0))
+
+(defn observable-count-probe []
+  (swap! opaque-count-evaluations inc)
+  2)
+
+(deftest opaque-original-count-is-an-obligation-not-a-domain-proof
+  (reset! opaque-count-evaluations 0)
+  (doseq [bound [(inc (long Integer/MAX_VALUE))
+                '(clojure.core/aget counts 0)
+                '(raster.compiler.passes.parallel.scalar-region-body-test/observable-count-probe)]]
+    (let [proof (fp-correspondence :double 0.0 '(clojure.core/+ acc 1.0) :bound bound)]
+      (is (= :conditional-fp-reduction-correspondence (:scope proof)))
+      (is (= {:conversion :checked-int :evaluation :original-position
+              :domain-correspondence :unproved} (:source-count-obligation proof)))
+      (is (not-any? #(contains? proof %) [:extent :count :nonthrowing? :removable? :algebra]))))
+  (is (zero? @opaque-count-evaluations)))
+
 (deftest conditional-reduction-correspondence-is-not-a-completion-or-schedule-proof
   (doseq [[type init] [[:float (float 0.0)] [:double 0.0]]
           bound [-1 0 1 'count]]
@@ -43,7 +94,8 @@
                                    :arrays {'x type} :bound bound)]
       (is (= {:scope :conditional-fp-reduction-correspondence :dtype type
               :checkpoints-preserved? true :zero-trip :initializer
-              :source-count-obligation {:conversion :checked-int :evaluation :original-position}}
+              :source-count-obligation {:conversion :checked-int :evaluation :original-position
+                                        :domain-correspondence :unproved}}
              proof))
       (is (not-any? #(contains? proof %) [:carrier :nonthrowing? :removable? :algebra]))))
   (is (some? (fp-correspondence :float (float 0.0)
@@ -90,8 +142,6 @@
            ['(let* [x (clojure.core/float 1.0)] (clojure.core/aget x i)) {'x :float} {}]
            ['(let* [i (clojure.core/float 1.0)] (clojure.core/aget x i)) {'x :float} {}]]]
     (is (nil? (fp-correspondence :float (float 0.0) step :arrays arrays :facts facts))))
-  (is (nil? (fp-correspondence :double 0.0 '(clojure.core/+ acc 1.0)
-                               :bound (inc (long Integer/MAX_VALUE)))))
   (is (nil? (fp-correspondence :double 0.0
                                (nth (iterate #(list 'clojure.core/double %) 'acc) 130))))
   (is (nil? (fp-correspondence :double 0.0 (cons 'clojure.core/+ (repeat 1.0)))))

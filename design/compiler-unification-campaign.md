@@ -274,6 +274,24 @@ quotient cannot silently become Float arithmetic merely because its eventual
 storage is Float. Count/read/initialization and prepared-AD import checks remain
 separate from this transaction.
 
+The count audit found that the original MSE bound is an array-length helper call,
+whereas the normalized training form already has a bound symbol. ProductReduction
+does not store either iteration extent. The diagnostic operator/checkpoint query
+therefore now permits an opaque original bound within its existing traversal
+budget, and explicitly reports `:domain-correspondence :unproved` alongside checked
+Int conversion and original-position obligations. This does not execute or infer
+the bound, prove a valid count, transport a hoist, or change admission. Even an
+out-of-range literal can have matching operator arithmetic without a successful
+source count conversion. The local transaction must separately retain original
+bound evaluation exactly once before initialization and match the converted
+target extent, including nonpositive domains. Reuse authenticated array-length /
+shape projection rather than a new helper-name rule.
+Independent review found no admission widening; its test-quality suggestion was
+applied using a resolvable count probe with an observable counter. A fresh single
+900 MiB REPL passes the nine affected namespaces: 159 tests / 1,510 assertions.
+This also joins the real MSE helper's original root observation, Float operator,
+Double denominator and Double quotient without asserting source-to-target closure.
+
 Two warm, coverage-refused training observations after this slice took 1.361 and
 1.214 seconds (11 observed phases, SOAC transforms 268 and 209 ms). Both retained
 the same four scalar refusals and produced no conditional reduction summaries:
