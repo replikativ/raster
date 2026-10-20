@@ -76,6 +76,15 @@ Object/Double overload oracles cover both operand orders and IEEE edge cases.
 No device performance, complete training vertical or broad CI acceptance
 follows from these checks.
 
+The production route now forwards that same producer namespace beyond source
+normalization into frontend analysis. It previously dropped this context from the
+frontend option map, making otherwise available normal-completion diagnostics
+abstain. A before/after regression checks missing versus actual namespace, rejects
+a masked `clojure.core` qualifier, and keeps the late required scalar refused in
+both ordinary cases. The affected source-completion, scalar-activation and scan
+gate passes 28 tests / 839 assertions. This repairs evidence transport; it does not
+close reduction checkpoint correspondence or grant operand completion/admission.
+
 The actual specialized MSE source has also been checked separately from raw Clojure
 macro fallback: precision-sensitive inputs retain a Float accumulation checkpoint
 before the Double quotient; an empty domain reaches IEEE zero division. This is a

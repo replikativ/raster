@@ -1748,6 +1748,7 @@
                                                  :scalar-types scalar-types})]
        (try
          (let [frontend-options {:dtype dtype :array-types array-types
+                                 :source-ns source-ns
                                  :scalar-types scalar-types :values values
                                  :host-scalars? host-scalars?
                                  :segmented-plans? segmented-plans?

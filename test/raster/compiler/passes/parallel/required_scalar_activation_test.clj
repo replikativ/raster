@@ -1,11 +1,46 @@
 (ns raster.compiler.passes.parallel.required-scalar-activation-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.fixtures.required-scalar :as fixture]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as graphs]
             [raster.compiler.passes.parallel.segop-lower-pass :as schedule]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
+
+(deftest declined-source-keeps-the-producer-namespace-without-granting-admission
+  (let [quotient (with-meta '(clojure.core// (clojure.core/double n) 2.0)
+                   {:raster.effect/preserve-evaluation true :raster.type/tag 'double})
+        source (list 'let*
+                     ['effect '(raster.par/map! out i n double (clojure.core/aget input i))
+                      'quotient quotient]
+                     'out)
+        attempt (fn [source-ns]
+                  (entry/call-with-definition-inputs
+                   #(route/attempt source :double {'input :double 'out :double}
+                                   {:scalar-types {'n :long} :source-ns source-ns
+                                    :resident-reductions? true})))
+        unknown (attempt nil)
+        known (attempt (the-ns 'raster.compiler.passes.parallel.required-scalar-activation-test))
+        refused (fn [result] (first (get-in result [:declined :bindings])))]
+    (doseq [result [unknown known]]
+      (is (= :typed-soac-source-coverage (get-in result [:declined :reason])))
+      (is (not (contains? result :program)))
+      (is (= #{:preserve-source-evaluation} (:source-evaluation-flags (refused result)))))
+    (is (nil? (:normal-completion (refused unknown))))
+    (is (= {:carrier "double" :presence :present :builtin-class "java.lang.Double"}
+           (:normal-completion (refused known)))
+        "normal completion is diagnostic evidence, not operand completion or source motion")
+    (let [masked (create-ns (gensym "raster.test.masked-core."))
+          producer (create-ns (gensym "raster.test.required-scalar-producer."))]
+      (try
+        (intern masked 'double (fn [_] nil))
+        (binding [*ns* producer] (alias 'clojure.core (ns-name masked)))
+        (is (= :intrinsic-source-definition-mismatch
+               (try (attempt producer) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "the forwarded context must authenticate the actual qualifier lookup")
+        (finally (remove-ns (ns-name producer)) (remove-ns (ns-name masked)))))))
 
 (def target-descriptor
   {:subgroup-size 16 :max-workgroup-size 256 :max-warps-per-sm 16
