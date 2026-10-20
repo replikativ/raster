@@ -16,6 +16,38 @@
     (= [:float :float] [left right]) :float
     :else :double))
 
+(defn loop-carrier-join
+  "The JVM loop-slot join over actual initializer and recurrence carriers.
+   Unknown/reference carries do not become primitive from a declaration. This
+   plans representation, not operand completion or source numeric equivalence."
+  [initializer recurrence]
+  (let [numeric? #{:int :long :float :double}
+        rank {:int 0 :long 1 :float 2 :double 3}]
+    (cond
+      (or (nil? recurrence) (= initializer recurrence)) initializer
+      (not (and (numeric? initializer) (numeric? recurrence))) initializer
+      (or (= initializer :double) (= recurrence :double)) :double
+      (or (= [initializer recurrence] [:long :float])
+          (= [initializer recurrence] [:float :long])) :double
+      (> (rank recurrence) (rank initializer)) recurrence
+      :else initializer)))
+
+(defn loop-initializer-plan
+  "Plan the existing contextual Float-literal checkpoint before the slot join.
+   `input` is the actually emitted initializer carrier; `recurrence` must come
+   from the loop's recurrence plan. A retained Float binder can contextualize a
+   bare Double literal only when the recurrence is Float. Explicit expressions,
+   reference initializers and wider recurrences are never narrowed from a tag.
+   This does not prove a loop's normal-return carrier or reassociation legality."
+  [binder initializer input recurrence]
+  (let [contextual? (and (= input :double) (= recurrence :float)
+                         (= 'float (:raster.type/tag (meta binder)))
+                         (instance? Double initializer))
+        completed (if contextual? :float input)]
+    {:input-carrier input :completed-carrier completed
+     :slot-carrier (loop-carrier-join completed recurrence)
+     :contextual-float-literal? (boolean contextual?)}))
+
 (defn binary-plan
   "Plan one step of the source inline left fold for +, -, *, or /.
    Inputs are actual stack carriers, never logical dtype annotations. Callers

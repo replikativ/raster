@@ -15,6 +15,40 @@
   (is (< (float 16777216) (int 16777217)))
   (is (< (float 16777216) (long 16777217))))
 
+(deftest loop-slot-joins-preserve-reference-and-widening-boundaries
+  (doseq [[initial expected] [[:int [:int :long :float :double]]
+                             [:long [:long :long :double :double]]
+                             [:float [:float :double :float :double]]
+                             [:double [:double :double :double :double]]]
+          [recurrence result] (map vector [:int :long :float :double] expected)]
+    (is (= result (arithmetic/loop-carrier-join initial recurrence))))
+  (doseq [initial [:int :long :float :double :ref]
+          recurrence [nil :ref]]
+    (is (= initial (arithmetic/loop-carrier-join initial recurrence))))
+  (doseq [initial [nil :unknown :ref]
+          recurrence [nil :unknown :ref :int :long :float :double]]
+    (is (= initial (arithmetic/loop-carrier-join initial recurrence)))))
+
+(deftest contextual-loop-literal-narrowing-is-not-a-general-tag-coercion
+  (let [binder (with-meta 'acc {:raster.type/tag 'float})
+        plan #(arithmetic/loop-initializer-plan binder %1 %2 %3)]
+    (is (= {:input-carrier :double :completed-carrier :float :slot-carrier :float
+            :contextual-float-literal? true}
+           (plan 0.0 :double :float)))
+    (doseq [[initializer input recurrence expected]
+            [['(clojure.core/double 0.0) :double :float :double]
+             ['value :ref :float :ref]
+             [0.0 :double :double :double]
+             [0.0 :double nil :double]
+             [0 :long :float :double]
+             [(float 0.0) :float :double :double]]]
+      (let [actual (plan initializer input recurrence)]
+        (is (false? (:contextual-float-literal? actual)))
+        (is (= input (:completed-carrier actual)))
+        (is (= expected (:slot-carrier actual)))))
+    (is (false? (:contextual-float-literal?
+                 (arithmetic/loop-initializer-plan 'untyped 0.0 :double :float))))))
+
 (deftest primitive-recipes-preserve-existing-widths
   ;; Ordered rows/columns are actual int, long, float, double carriers.
   (doseq [operator ["+" "-" "*"]
