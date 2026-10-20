@@ -7,6 +7,21 @@
   (try (thunk) nil (catch clojure.lang.ExceptionInfo exception
                      (:reason (ex-data exception)))))
 
+(deftest selected-and-lexical-calls-cannot-borrow-generic-scalar-semantics
+  (let [selected (with-meta '(.invk not-a-live-receiver missing-a missing-b)
+                   {:raster.op/original 'clojure.core/*})
+        lexical (with-meta '(.invk local-receiver missing-a missing-b)
+                  {:raster.op/lexical-callee true})]
+    (doseq [expression [selected (list 'clojure.core/+ 1.0 selected)]]
+      (is (= :typed-scalar-owned-source-required
+             (reason-of #(scalar/evaluate-expression
+                          'raster.compiler.backend.jvm.typed-scalar-test {} expression)))))
+    ;; An unauthenticated lexical receiver has no purity evidence either. Reject
+    ;; it at that earlier boundary; do not weaken purity merely to reach dispatch.
+    (is (= :typed-scalar-effect
+           (reason-of #(scalar/evaluate-expression
+                        'raster.compiler.backend.jvm.typed-scalar-test {} lexical))))))
+
 (deftest source-array-size-uses-the-actual-constructor-count-conversion
   (let [outcome (fn [f]
                   (try {:elements (f)}
@@ -75,6 +90,41 @@
           (soac/lambda-form '[x] '[(Math/sqrt x)])
           [{:type :double :value 9.0}]
           [:double]))))
+
+(deftest source-executor-retains-explicit-region-checkpoints-and-failure-order
+  ;; These dtypes are explicit region conversions, not inferred source carriers.
+  ;; A source executor must not erase the Float local's rounding or exception.
+  (let [initialize '(clojure.core/+ x 1.0)
+        finish '(clojure.core/- rounded x)
+        region (soac/lambda-form
+                '[x] [(soac/local-value 'rounded :float initialize)] [finish])
+        source (fn [x]
+                 (let [rounded (float (+ (double x) 1.0))]
+                   (- (double rounded) (double x))))
+        calls (atom [])
+        execute (fn [expression environment]
+                  (swap! calls conj expression)
+                  (cond
+                    (identical? initialize expression) (+ (double (get environment 'x)) 1.0)
+                    (identical? finish expression)
+                    (do (is (instance? Float (get environment 'rounded)))
+                        (- (double (get environment 'rounded)) (double (get environment 'x))))
+                    :else (throw (ex-info "unexpected source fragment" {}))))]
+    (doseq [x [16777216.0 2.0 -2.0]]
+      (reset! calls [])
+      (is (= [{:type :double :value (source x)}]
+             (scalar/evaluate-region
+              'raster.compiler.backend.jvm.typed-scalar-test region
+              [{:type :double :value x}] [:double] execute)))
+      (is (= [initialize finish] @calls)))
+    (reset! calls [])
+    (is (thrown? IllegalArgumentException (source Double/MAX_VALUE)))
+    (is (thrown? IllegalArgumentException
+                 (scalar/evaluate-region
+                  'raster.compiler.backend.jvm.typed-scalar-test region
+                  [{:type :double :value Double/MAX_VALUE}] [:double] execute)))
+    (is (= [initialize] @calls)
+        "failed local completion cannot run the suffix or retry the initializer")))
 
 (deftest typed-region-fails-on-unbound-effectful-or-unrepresentable-values
   (testing "SSA closure is checked at execution as well as IR validation"

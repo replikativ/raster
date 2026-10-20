@@ -14,7 +14,7 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `fdbaef58` is draft, not qualified for merge.
+Current integration hold: PR #1539 at `2a582ddd` is draft, not qualified for merge.
 Exact-head setup/build passed; emission, unit and OpenCL gates failed.
 The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
@@ -119,6 +119,26 @@ Review caught the missing allocation-action family before commit. One initial te
 mistakenly assumed an explicit helper allocation had no host step; the actual
 missing-step case is now a separate functional-map allocation test. A renamed old
 test Var was explicitly removed from the warm REPL before the final passing gate.
+
+The host scalar reference backend also had a selected-call correspondence defect:
+it could discard an actual `.invk` receiver and invoke the nominal generic operator.
+An explicit retained-receiver fixture independently returns division while the
+nominal operator multiplies. This is an internal host-evaluation counterexample,
+not evidence that ordinary public dispatch selected the wrong implementation.
+Selected calls now refuse without their original source execution context. An
+optional execution seam receives the whole expression and raw environment, rather
+than already-evaluated arguments; its producer must prepare the executable under
+the existing source owner and freeze historical guards. Existing source compilation
+preserves the receiver, source policy and original argument completion order.
+
+The focused gate passes 19 tests / 165 assertions: changed-input receiver oracles,
+null completion before a later arithmetic failure, nested/lexical refusals, and
+explicit region Float rounding/overflow checkpoints without suffix execution or
+retry. Independent review found no further required correction. This is not
+automatic routing: logical-dtype local/result coercions still require independent
+source correspondence, and buffer-shape stand-ins cannot be passed to original
+array-taking code without an audited shape projection. The callback itself grants
+no ownership authority. Do not catch a partial interpreter refusal and retry it.
 
 Training admission will keep two execution modes under the same source-order
 owner: host-only checked dimensions as original ordered host actions, and

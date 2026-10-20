@@ -5,6 +5,9 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
+            [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
@@ -270,6 +273,81 @@
                          nil)
                        (catch clojure.lang.ExceptionInfo error
                          (or (:rule (ex-data error)) (ex-data error))))))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest selected-source-host-call-does-not-redispatch-its-nominal-operation
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.selected-host-source." '(clojure.core// x y))]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (core/ensure-bytecode-implementation! receiver)
+          (is (= 2.0 (clojure.lang.Reflector/invokeInstanceMethod
+                       @receiver "invk" (object-array [4.0 2.0]))))
+          (is (= :typed-scalar-owned-source-required
+                 (try (typed-scalar/evaluate-expression scope {'a 4.0 'b 2.0} call)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+          (is (= :typed-scalar-owned-source-required
+                 (try (typed-scalar/evaluate-expression scope {} call)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+              "do not begin argument evaluation before refusing a missing source context")
+          (entry/call-with-definition-inputs
+           (fn []
+             (let [projection (entry/selected-parameter-carriers 'raster.numeric/* (second call) 2)
+                   method (:invocation-method projection)
+                   policy (:raster.core/source-policy (meta (:source fixture)))
+                   collector entry/*emission-inputs*
+                   execute (source-owner/compile-function
+                            '[a b] call (fn [parameters body] (list 'fn* parameters body))
+                            {:source-policy policy :source-ns scope :captures []
+                             :reference-bindings {} :methods [method]
+                             :guard #(entry/assert-definition-inputs-current! @collector)})
+                   observations @collector
+                   evaluate-source (fn [expression environment]
+                                     (assert (identical? call expression))
+                                     (entry/assert-definition-inputs-current! observations)
+                                     (let [result (execute (get environment 'a) (get environment 'b))]
+                                       (entry/assert-definition-inputs-current! observations)
+                                       result))
+                   region (soac/lambda-form '[a b] [call])]
+               (doseq [[a b] [[4.0 2.0] [-9.0 3.0] [0.0 2.0]]]
+                 (let [expected (clojure.lang.Reflector/invokeInstanceMethod
+                                 @receiver "invk" (object-array [a b]))]
+                   (is (= expected (typed-scalar/evaluate-expression
+                                    scope {'a a 'b b} call evaluate-source)))
+                   (is (= [{:type :double :value expected}]
+                          (typed-scalar/evaluate-region
+                           scope region [{:type :double :value a} {:type :double :value b}]
+                           [:double] evaluate-source)))))
+               (is (thrown? NullPointerException
+                            (typed-scalar/evaluate-expression
+                             scope {'a nil 'b 2.0} call evaluate-source)))
+               (let [ordered (with-meta
+                               (list '.invk (second call) '(clojure.core/double a)
+                                     '(clojure.core// 1 0))
+                               (meta call))
+                     execute-ordered (source-owner/compile-function
+                                      '[a] ordered (fn [parameters body] (list 'fn* parameters body))
+                                      {:source-policy policy :source-ns scope :captures []
+                                       :reference-bindings {} :methods [method]
+                                       :guard #(entry/assert-definition-inputs-current! @collector)})
+                     ordered-observations @collector
+                     evaluate-ordered (fn [expression environment]
+                                        (assert (identical? ordered expression))
+                                        (entry/assert-definition-inputs-current! ordered-observations)
+                                        (try (execute-ordered (get environment 'a))
+                                             (finally
+                                               (entry/assert-definition-inputs-current!
+                                                ordered-observations))))]
+                 (is (thrown? NullPointerException
+                              (typed-scalar/evaluate-expression
+                               scope {'a nil} ordered evaluate-ordered)))
+                 (is (thrown? ArithmeticException
+                              (typed-scalar/evaluate-expression
+                               scope {'a 1.0} ordered evaluate-ordered)))))))))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest scalar-lowering-refuses-an-actually-selected-noncanonical-implementation
