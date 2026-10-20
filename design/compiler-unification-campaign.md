@@ -14,7 +14,7 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `1499616d` is draft, not qualified for merge.
+Current integration hold: PR #1539 at `95feab6d` is draft, not qualified for merge.
 Exact-head setup/build passed; emission, unit and OpenCL gates failed.
 The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
@@ -172,6 +172,35 @@ were made fresh; the final gate retains those assertions unchanged. Independent
 ordinary stage/host-action source-mutation probes poison the owner, grant no replay
 credit and expose no resident result boundary. This is not broad CI acceptance or
 training admission; all eight campaign obligations remain open.
+
+The shared source projection now prepares optional owner-local ScalarCompute
+executables using actual selected-entry carrier facts and invocation IDs. This
+reuses the terminal projector's walker and existing source compiler, not another
+interpreter, function registry or expression-string cache. Source policy, exact
+Methods and dependency history are guarded; history freezes after compilation.
+Execution requires the exact source step, exact boxed ports/results, and an
+independent physical-result/ABI comparison. It performs no typed-region coercions
+and no lookup, recompilation or retry. Unknown capabilities remain absent.
+
+This first slice covers checked Long add/subtract/multiply, identity Long casts
+and existing compatible Double/cast fragments, including explicit Float checkpoints.
+It deliberately refuses selected calls, Long division, unproved casts/joins and
+shape-derived carrier assumptions. Ordinary Clojure Long division returns Ratio
+where an actual typed entry can return Double; a Method signature or logical dtype
+cannot erase this execution-context distinction. Physical Boolean-to-Double also
+needs its original context. Warm bytecode outlining already has owned input-region
+APIs; cold source lowering must not manufacture those emitter contexts.
+
+The affected fourteen-namespace gate passes 140 tests / 1,874 assertions, including
+actual local device/source-free gates. Final focused controls additionally verify
+the original typed entry versus ordinary Clojure separately, shadowed invocation
+IDs, stale source, nullable Object conversion before later overflow, signed zero,
+NaN and Float rounding/overflow (new namespace: 5 / 40). The terminal adapters remain
+on the same projector. The final four-namespace gate, rerun after the interruption,
+passes 45 tests / 351 assertions in the existing 900 MiB REPL.
+Runtime activation is still gated: require complete executor
+coverage before any earlier source/device mutation; do not discover missing host
+capabilities halfway through an accepted route. No training or performance claim.
 
 Training admission will keep two execution modes under the same source-order
 owner: host-only checked dimensions as original ordered host actions, and

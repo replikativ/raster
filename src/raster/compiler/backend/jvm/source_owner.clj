@@ -15,6 +15,8 @@
             [raster.compiler.backend.jvm.terminal-source :as terminal-source]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.stage-result :as stage-result]
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.form :as form])
   (:import [java.lang.reflect Method]))
 
@@ -188,7 +190,65 @@
       (entry/assert-definition-inputs-current! observations)
       (TerminalResultOwner. program contract execute observations source-ns))))
 
-(deftype ^:private OrderedSourceOwner [program emission observations source-ns])
+(deftype ^:private OrderedSourceOwner [program emission observations source-ns scalar-steps])
+
+(defn- prepare-scalar-step [step facts source-ns policy collector]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (let [{:keys [parameters locals body-results]} (soac/lambda-parts (:region step))
+           ports (mapv (fn [{:keys [symbol value]}]
+                         (when-let [fact (get facts value)]
+                           (assoc fact :symbol symbol))) (:operands step))]
+       (when (and (empty? locals) (= 1 (count body-results))
+                  (= parameters (mapv :symbol ports)) (every? some? ports))
+         (let [expression (first body-results)
+               projection
+               (try (terminal-source/project-scalar expression ports source-ns policy)
+                    (catch clojure.lang.ExceptionInfo error
+                      (if (= :unclosed-terminal-source-projection (:reason (ex-data error)))
+                        nil
+                        (throw error))))
+               actual (get-in projection [:result-facts :carrier])
+               expected (some-> (:value step) :dtype dtype/scalar-tag-for-dtype types/tag->java-class)]
+           ;; This is a result ABI comparison, not an inference of source facts.
+           ;; Keep coercions inside the source executable; never repair a mismatch.
+           (when (and projection (= expected actual) (.isPrimitive ^Class actual))
+             (let [execute (compile-function
+                            (:params projection) (:source projection)
+                            (fn [params body] (list 'fn* params body))
+                            (merge projection {:source-policy policy :source-ns source-ns
+                                               :guard #(entry/assert-definition-inputs-current! @collector)}))]
+               {:step step :expression expression :ports ports :execute execute
+                :result-facts (:result-facts projection)}))))))))
+
+(defn- prepare-scalar-steps [program frontend source-var source-ns policy collector]
+  (let [plan (get-in program [:attributes :invocation-plan])
+        definition (:definition frontend)
+        entry (entry/selected-source-entry-carriers
+               (:operation definition) (:implementation-op definition)
+               (count (:parameters definition)) source-var)]
+    (if-not (and entry (= (:parameters entry) (mapv :symbol (:parameters plan))))
+      {}
+      (:steps
+       (reduce
+        (fn [{:keys [facts] :as state} step]
+          (cond
+            (invocation/scalar-compute? step)
+            (if-let [prepared (prepare-scalar-step step facts source-ns policy collector)]
+              (-> state
+                  (assoc-in [:steps (:id step)] prepared)
+                  (assoc-in [:facts (:id step)]
+                            {:carrier (get-in prepared [:result-facts :carrier]) :presence :present}))
+              state)
+            (invocation/value-alias? step)
+            (assoc-in state [:facts (:id step)] (get facts (:source step)))
+            ;; ShapeProjection is NOT a primitive Long producer proof: an
+            ;; original array-length expression can have a different carrier.
+            :else state))
+        {:facts (into {} (map (fn [{:keys [id symbol]}]
+                               [id (get-in entry [:parameter-facts symbol])])) (:parameters plan))
+         :steps {}}
+        (:steps plan))))))
 
 (defn ordered-source-required?
   "Derive historical source obligations, independently of owner-field presence.
@@ -241,7 +301,10 @@
             (when required?
               (throw (ex-info "ordered source needs checked policy and original import lineage"
                               unavailable)))
-            (OrderedSourceOwner. program emission observations source-ns))))))))
+            (let [scalar-steps (prepare-scalar-steps program frontend source-var source-ns policy collector)
+                  observations @collector]
+              (source-history-current! source-ns observations :stale-checked-result-source-namespace)
+              (OrderedSourceOwner. program emission observations source-ns scalar-steps)))))))))
 
 (defn assert-ordered-source!
   "Guard exact historical semantic/emitted ownership before and after source work."
@@ -263,6 +326,33 @@
   [{:keys [ordered-source-owner semantic emitted]}]
   (when (or ordered-source-owner (ordered-source-required? semantic emitted))
     (assert-ordered-source! ordered-source-owner semantic emitted)))
+
+(defn evaluate-ordered-invocation-step
+  "Execute one prepared original source occurrence without typed-region coercions.
+   No lookup, compilation, nominal redispatch or expression retry occurs at invocation."
+  [{:keys [ordered-source-owner semantic emitted]} step operand-values]
+  (let [^OrderedSourceOwner owner (assert-ordered-source! ordered-source-owner semantic emitted)
+        prepared (get (.-scalar-steps owner) (:id step))]
+    (when-not (and prepared (identical? step (:step prepared)))
+      (throw (ex-info "ordered scalar occurrence has no closed source executable"
+                      {:reason :unclosed-ordered-scalar-executor :step (:id step)})))
+    (let [arguments
+          (mapv (fn [{:keys [symbol carrier]}]
+                  (let [value (:value (get operand-values symbol))
+                        boxed (get types/primitive-info (clojure.core/symbol (.getName ^Class carrier)))]
+                    (when-not (and (contains? operand-values symbol)
+                                   (contains? (get operand-values symbol) :value)
+                                   (or (= Object carrier) (and boxed (identical? boxed (class value)))))
+                      (throw (ex-info "source operand differs from its actual body-entry carrier"
+                                      {:reason :ordered-scalar-source-arguments :symbol symbol})))
+                    value)) (:ports prepared))
+          result (try ((:execute prepared) arguments)
+                      (finally (assert-ordered-source! owner semantic emitted)))
+          expected (get-in prepared [:result-facts :boxed-carrier])]
+      (when-not (identical? expected (class result))
+        (throw (ex-info "source result differs from its prepared physical carrier"
+                        {:reason :ordered-scalar-source-result :step (:id step)})))
+      {:type (dtype/canon (get-in step [:value :dtype])) :value result})))
 
 (defn assert-terminal-result-owner!
   "Preflight exact source ownership without observing any numerical value or executing source."

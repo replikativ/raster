@@ -1,5 +1,6 @@
 (ns raster.compiler.backend.jvm.terminal-source
-  "Project a closed terminal region to owned JVM calls, without macro/inline expansion.
+  "Shared owned JVM source projection for terminal exports and scalar fragments.
+   Closed regions become exact calls without macro/inline expansion.
    Carrier propagation here is physical: ports, literal carriers and resolved Method returns.
    This is backend source projection, not a new function/type registry or interpreter."
   (:require [raster.compiler.core.method-entry :as entry]
@@ -41,12 +42,8 @@
       (fail! "terminal JVM source hint needs its own carrier correspondence"
              {:expression expression :source-metadata metadata}))))
 
-(defn project
-  "Project under the actual source producer's namespace/policy and definition collector.
-   Unsupported macro/inline calls and original class/member syntax refuse. Direct helper calls
-   require an unhinted fixed Object ABI; their actual IFn values become private captures.
-   Source-to-semantic-program correspondence remains with the enclosing producer."
-  [contract source-ns]
+(defn- project*
+  [contract source-ns typed-context?]
   (let [policy (:source-policy contract)
         used (volatile! #{})
         _ (util/postwalk-preserving-meta
@@ -108,6 +105,8 @@
                     (= 'if head)
                     (let [[test then else] (mapv #(go % env) args)]
                       (when-not (= 3 (count args)) (fail! "terminal conditional arity" {}))
+                      (when (and typed-context? (not= (:carrier then) (:carrier else)))
+                        (fail! "typed scalar join needs its original physical merge context" {}))
                       (when (and (not= (:carrier then) (:carrier else))
                                  (.isPrimitive ^Class (:carrier then))
                                  (.isPrimitive ^Class (:carrier else)))
@@ -150,17 +149,27 @@
                       (cond
                         (:macro metadata)
                         (fail! "terminal macro has no owned projection" {:head head})
-                        (and (contains? #{'float 'double} (descriptor/cast-result-tag operation))
+                        (and (contains? (if typed-context? #{'long 'float 'double} #{'float 'double})
+                                        (descriptor/cast-result-tag operation))
                              (= 1 (count arguments)))
                         (let [{:keys [source carrier]} (first arguments)
+                              target (descriptor/cast-result-tag operation)
                               _ (intrinsic-current! v operation)
+                              _ (when (and typed-context? (= 'long target) (not= Long/TYPE carrier))
+                                  (fail! "typed Long cast lacks its original bytecode completion context"
+                                         {:head head :carrier carrier}))
+                              _ (when (and typed-context? (= 'double target) (= Boolean/TYPE carrier))
+                                  (fail! "typed Boolean-to-Double conversion differs from core source"
+                                         {:head head :carrier carrier}))
                               input (if (contains? #{Double/TYPE Float/TYPE Long/TYPE Integer/TYPE} carrier)
                                       carrier Object)
                               ieee? (or (= :ieee (descriptor/cast-floating-narrowing operation))
                                         (not (false? (:unchecked-math policy))))]
                           (static-call clojure.lang.RT
-                                       (if (= 'double (descriptor/cast-result-tag operation))
-                                         "doubleCast" (if ieee? "uncheckedFloatCast" "floatCast"))
+                                       (case target
+                                         long "longCast"
+                                         double "doubleCast"
+                                         float (if ieee? "uncheckedFloatCast" "floatCast"))
                                        [input] [source]))
                         (and (= 'clojure.core/nil? operation) (= 1 (count arguments)))
                         (do (intrinsic-current! v operation)
@@ -173,17 +182,19 @@
                           ;; guess. Other carriers/arity need their own exact source
                           ;; overload/completion projection before admission.
                           (when-not (and (= 2 (count arguments))
-                                         (every? #(= Double/TYPE (:carrier %)) arguments)
-                                         (= :double (:result-carrier
-                                                     (source-arithmetic/binary-plan
-                                                      (name operation) :double :double))))
+                                         (or (every? #(= Double/TYPE (:carrier %)) arguments)
+                                             (and typed-context? (false? (:unchecked-math policy))
+                                                  (not= "/" (name operation))
+                                                  (every? #(= Long/TYPE (:carrier %)) arguments))))
                             (fail! "terminal arithmetic needs its exact primitive source carriers"
                                    {:head head :carriers (mapv :carrier arguments)}))
                           (static-call clojure.lang.Numbers
                                        (source-arithmetic/numbers-method-name (name operation))
-                                       [Double/TYPE Double/TYPE] (mapv :source arguments)))
+                                       (mapv :carrier arguments) (mapv :source arguments)))
                         (or (:macro metadata) (:inline metadata) (nil? v))
                         (fail! "terminal call has no owned non-expanding projection" {:head head})
+                        typed-context?
+                        (fail! "typed scalar helper lacks its original invocation context" {:head head})
                         :else
                         (let [arity (count arguments)
                               signature (some (fn [signature]
@@ -204,10 +215,16 @@
                 result))]
       (let [input (fresh "terminal_inputs__")
             projected
-            (mapv (fn [index {:keys [symbol dtype]}]
+            (mapv (fn [index {:keys [symbol carrier]}]
                     (let [read (static-call clojure.lang.RT "nth" [Object Integer/TYPE] [input (int index)])
-                          value (static-call clojure.lang.RT (case dtype :double "doubleCast" :long "longCast")
-                                             [Object] [(:source read)])]
+                          value (cond
+                                  (= Object carrier) read
+                                  (= Long/TYPE carrier)
+                                  (static-call clojure.lang.RT "longCast" [Object] [(:source read)])
+                                  (= Double/TYPE carrier)
+                                  (static-call clojure.lang.RT "doubleCast" [Object] [(:source read)])
+                                  :else (fail! "source port has no audited physical projection"
+                                               {:symbol symbol :carrier carrier}))]
                       [symbol value])) (range) (:parameters contract))
             env (into {} (map (fn [[id value]] [id (assoc value :source (with-meta id nil))])) projected)
             result (go (:body contract) env)]
@@ -216,3 +233,29 @@
                        (:source result))
          :result-facts (select-keys result [:carrier :boxed-carrier :non-null?])
          :captures @captures :methods @methods :reference-bindings @references}))))
+
+(defn project
+  "Project the audited terminal export contract under its original source owner.
+   Direct helper calls retain an unhinted Object ABI; private captures are not portable IR."
+  [contract source-ns]
+  (let [parameters (mapv (fn [{:keys [symbol dtype]}]
+                           {:symbol symbol :carrier (case dtype :double Double/TYPE :long Long/TYPE)})
+                         (:parameters contract))]
+    (project* (assoc contract :parameters parameters) source-ns false)))
+
+(defn project-scalar
+  "Project one closed scalar fragment from actual physical body-entry facts.
+   Parameters carry :symbol and actual :carrier Class, never a logical dtype.
+   Only checked Long arithmetic and the existing Double arithmetic/casts have
+   source/typed-bytecode correspondence here. Long division, unknown helpers,
+   unproved input conversions and buffer-shaped ports refuse. This is source
+   projection, not proof that the surrounding typed region's coercions agree."
+  [expression parameters source-ns source-policy]
+  (when-not (= {:unchecked-math false} source-policy)
+    (fail! "typed scalar source policy has no audited projection" {:source-policy source-policy}))
+  (when-not (and (vector? parameters)
+                 (every? #(and (symbol? (:symbol %)) (class? (:carrier %))) parameters)
+                 (= (count parameters) (count (distinct (map :symbol parameters)))))
+    (fail! "scalar source requires independently owned physical ports" {}))
+  (project* {:body expression :source-policy source-policy :parameters parameters}
+            source-ns true))
