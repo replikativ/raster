@@ -210,7 +210,7 @@
     {:carrier carrier :presence :present
      :builtin-class (get types/primitive-info (symbol (.getName carrier)))}))
 
-(defn- completed-scalar-fact* [expression lexical-facts]
+(defn- completed-scalar-fact* [expression lexical-facts source-ns]
   (cond
     (symbol? expression)
     ;; Only independently supplied producer facts, never a symbol's dtype tag.
@@ -227,7 +227,7 @@
 
     (completion/canonical-parts expression)
     (let [{:keys [contract operand]} (completion/canonical-parts expression)
-          fact (completed-scalar-fact* operand lexical-facts)]
+          fact (completed-scalar-fact* operand lexical-facts source-ns)]
       (case (:source-context contract)
         :jvm-object-input (when fact (assoc fact :carrier Object))
         ;; An input conversion target is not the term's result carrier:
@@ -242,12 +242,12 @@
           {:keys [binders inits body]} (first scopes)]
       (when (and sequential? (= 1 (count scopes)) (every? symbol? binders))
         (let [scope (reduce (fn [scope [id init]]
-                              (assoc scope id (completed-scalar-fact* init scope)))
+                              (assoc scope id (completed-scalar-fact* init scope source-ns)))
                             lexical-facts (map vector binders inits))]
-          (completed-scalar-fact* (last body) scope))))
+          (completed-scalar-fact* (last body) scope source-ns))))
 
     (= 'do (first expression))
-    (completed-scalar-fact* (last (rest expression)) lexical-facts)
+    (completed-scalar-fact* (last (rest expression)) lexical-facts source-ns)
 
     :else
     (let [{:keys [semantic-op arguments lexical-callee implementation-op]}
@@ -259,13 +259,14 @@
           ;; Conditional on successful source evaluation. A nullable operand
           ;; can still throw; this fact cannot discharge that evaluation.
           (when (and method-entry/*emission-inputs*
-                     (intrinsic-source/observe-original! (the-ns 'clojure.core) semantic-op))
+                     (instance? clojure.lang.Namespace source-ns)
+                     (intrinsic-source/observe-original! source-ns semantic-op))
             (some-> semantic-op descriptor/cast-result-tag types/tag->java-class
                     primitive-completion-fact))
           (when method-entry/*emission-inputs*
-            (when-let [proof (scalar-body/checked-selected-primitive-evaluation
-                             expression
-                             (mapv #(completed-scalar-fact* % lexical-facts) arguments))]
+            (when-let [proof (let [facts (mapv #(completed-scalar-fact* % lexical-facts source-ns) arguments)]
+                              (or (scalar-body/checked-core-fp-evaluation expression facts source-ns)
+                                  (scalar-body/checked-selected-primitive-evaluation expression facts)))]
               {:carrier (:result-carrier proof) :presence (:presence proof)
                :builtin-class (:builtin-class proof)})))))))
 
@@ -278,19 +279,22 @@
    Missing/nullable/opaque evidence returns nil. This neither executes source
    nor proves that its argument evaluation succeeds, authorizes motion, removes
    evaluation flags, or supplies a kernel/payload lowering recipe. Qualified
-   core casts require their bootstrap definition and source owner; bare
+   core casts/arithmetic require the explicit producer namespace, bootstrap definition
+   and source owner; bare
    spellings require their original namespace authority."
   ([expression] (completed-scalar-fact expression {}))
-  ([expression lexical-facts]
+  ([expression lexical-facts] (completed-scalar-fact expression lexical-facts nil))
+  ([expression lexical-facts source-ns]
    (method-entry/call-with-optional-definition-inputs
-    #(completed-scalar-fact* expression lexical-facts))))
+    #(completed-scalar-fact* expression lexical-facts source-ns))))
 
 (defn completed-scalar-bindings
   "Normal-completion facts for sequential lexical producers. Unknown producers
    shadow earlier facts; inputs must already have independent carrier evidence.
    This does not execute, reorder, or certify evaluation of any binding."
   ([pairs] (completed-scalar-bindings pairs {}))
-  ([pairs lexical-facts]
+  ([pairs lexical-facts] (completed-scalar-bindings pairs lexical-facts nil))
+  ([pairs lexical-facts source-ns]
    (reduce (fn [facts [id expression]]
-             (assoc facts id (completed-scalar-fact expression facts)))
+             (assoc facts id (completed-scalar-fact expression facts source-ns)))
            lexical-facts pairs)))

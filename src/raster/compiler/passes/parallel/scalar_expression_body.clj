@@ -1648,6 +1648,38 @@
                 (or (= target Double/TYPE) (= builtin-class Float))
                 (.isAssignableFrom ^Class carrier ^Class builtin-class)))))
 
+(defn checked-core-fp-evaluation
+  "Summarize one original core arithmetic/comparison call AFTER its operands complete.
+   Reuses the selected-body carrier planner and totality check, not inferred tags.
+   Only present primitive Double operands are admitted; Float source contexts,
+   Object payloads, integral arithmetic, casts, lexical calls and unauthenticated
+   spellings abstain. Float needs its original emitter's promotion context.
+   This grants neither operand completion nor permission to move/remove the call."
+  [expression argument-facts source-ns]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (let [{:keys [semantic-op arguments lexical-callee]} (descriptor/call-description expression)
+           intrinsic (intrinsics/descriptor semantic-op)
+           carriers (mapv :carrier argument-facts)]
+       (when (and method-entry/*emission-inputs* (instance? clojure.lang.Namespace source-ns)
+                  (seq? expression) (vector? argument-facts)
+                  (= semantic-op (first expression)) (not lexical-callee)
+                  (symbol? semantic-op) (= "clojure.core" (namespace semantic-op))
+                  (= 2 (count arguments) (count argument-facts))
+                  (every? #(= :present (:presence %)) argument-facts)
+                  (every? #{Double/TYPE} carriers)
+                  (or (= :cmp (:kind intrinsic))
+                      (and (= :infix (:kind intrinsic))
+                           (source-arithmetic/binary-operator? (:c intrinsic)))))
+         (when (intrinsic-source/observe-original! source-ns semantic-op)
+           (let [parameters '[core-left core-right]
+                 body (apply list semantic-op parameters)
+                 actual (completed-fp-body-carrier body (zipmap parameters carriers))]
+             (when actual
+               {:result-carrier actual :scope :completed-fp-scalar :presence :present
+                :builtin-class (get types/primitive-info (symbol (.getName ^Class actual)))
+                :nonthrowing? true}))))))))
+
 (defn checked-selected-primitive-evaluation
   "Prove a bounded selected scalar call has no source arithmetic/conversion failure.
    Argument facts describe independently proved, ALREADY completed operands in call

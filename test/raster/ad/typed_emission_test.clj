@@ -137,7 +137,7 @@
                            (eval (list 'let* (into ['n n 'dy 1.0] prefix) result)))))))
       (method-entry/call-with-definition-inputs
        #(let [facts (normal-return/completed-scalar-bindings
-                     (into [['dy '(clojure.core/double 1.0)]] (partition 2 prefix)))]
+                     (into [['dy '(clojure.core/double 1.0)]] (partition 2 prefix)) {} scope)]
           (is (= Long/TYPE (:carrier (get facts (first prefix)))))
           (is (= {:carrier Object :presence :present :builtin-class Double}
                  (get facts result)))

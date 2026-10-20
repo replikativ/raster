@@ -13,15 +13,17 @@
 (defn- selected [op implementation & args]
   (with-meta (list* '.invk implementation args) {:raster.op/original op}))
 
+(def ^:private source-ns (the-ns 'raster.compiler.passes.scalar.scalar-completion-test))
+
 (deftest facts-describe-successful-evaluation-not-its-safety
   (let [cast '(clojure.core/double nullable)
-        fact (normal/completed-scalar-fact cast)]
+        fact (normal/completed-scalar-fact cast {} source-ns)]
     (is (= {:carrier Double/TYPE :presence :present :builtin-class Double} fact))
     (is (not (contains? fact :nonthrowing?)))
     (is (thrown? NullPointerException (eval (list 'let* ['nullable nil] cast))))
     (is (= {:carrier Object :presence :present :builtin-class Double}
            (normal/completed-scalar-fact
-            (completion/complete-value completion/object-input-contract cast))))
+            (completion/complete-value completion/object-input-contract cast) {} source-ns)))
     (is (= {:presence :unknown} (normal/result-fact 'unknown)))
     (is (nil? (normal/completed-scalar-fact (with-meta 'unknown {:tag 'double}))))
     (is (nil? (normal/completed-scalar-fact '(double nullable)))
@@ -53,7 +55,7 @@
         owner (atom {:static [] :values []})]
     (binding [entry/*emission-inputs* owner]
       (is (= {:carrier Object :presence :present :builtin-class Double}
-             (normal/completed-scalar-fact source)))
+             (normal/completed-scalar-fact source {} source-ns)))
       (is (seq (:definition-proofs @owner)))
       (entry/assert-definition-inputs-current! @owner))
     (binding [entry/*emission-inputs* nil]
@@ -94,6 +96,6 @@
       (try
         (alter-meta! #'clojure.core/double assoc :inline (fn [& _] nil))
         (is (= :intrinsic-source-definition-mismatch
-               (try (normal/completed-scalar-fact expression) nil
+               (try (normal/completed-scalar-fact expression {} source-ns) nil
                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
         (finally (reset-meta! #'clojure.core/double original))))))

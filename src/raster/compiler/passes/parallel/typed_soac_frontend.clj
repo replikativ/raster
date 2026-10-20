@@ -4741,7 +4741,7 @@
     (coverage-decline* source options)))
 
 (defn- coverage-decline*
-  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage?]
+  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage? source-ns]
            :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings] source
@@ -4756,7 +4756,7 @@
         ;; Only diagnose a refused source. These are normal-completion facts,
         ;; not admission evidence, and no logical scalar tags seed the scope.
         (let [completed (normal-return/completed-scalar-bindings
-                         (mapv (juxt :sym :expr) descriptions))]
+                         (mapv (juxt :sym :expr) descriptions) {} source-ns)]
           {:reason :typed-soac-source-coverage
            :bindings
            (mapv (fn [{:keys [id sym kind expr]}]

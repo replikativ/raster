@@ -17,10 +17,88 @@
 (def ^:private primitive-float {:carrier Float/TYPE :presence :present})
 (def ^:private boxed-double {:carrier Object :presence :present :builtin-class Double})
 (def ^:private boxed-float {:carrier Object :presence :present :builtin-class Float})
+(def ^:private source-ns (the-ns 'raster.compiler.passes.scalar.selected-primitive-evaluation-test))
 
 (defn- proof [expression facts]
   (entry/call-with-definition-inputs
    #(scalar/checked-selected-primitive-evaluation expression facts)))
+
+(deftest original-core-fp-completion-reuses-physical-operand-plans
+  (doseq [[operation result] [['clojure.core/+ Double/TYPE]
+                              ['clojure.core/- Double/TYPE]
+                              ['clojure.core/* Double/TYPE]
+                              ['clojure.core// Double/TYPE]
+                              ['clojure.core/< Boolean/TYPE]]]
+    (let [expression (list operation 'x 'y)
+          summarize #(entry/call-with-definition-inputs
+                      (fn [] (scalar/checked-core-fp-evaluation expression % source-ns)))]
+      (is (= result (:result-carrier (summarize [primitive-double primitive-double]))))
+      (doseq [unknown [nil {:dtype :double} {:carrier Double/TYPE}
+                       boxed-double primitive-float {:carrier Long/TYPE :presence :present}]]
+        (is (nil? (summarize [primitive-double unknown]))))
+      (is (nil? (summarize (list primitive-double primitive-double))))
+      (is (= {:carrier result :presence :present
+              :builtin-class (if (= result Boolean/TYPE) Boolean Double)}
+             (entry/call-with-definition-inputs
+              #(normal/completed-scalar-fact expression {'x primitive-double 'y primitive-double} source-ns))))))
+  (is (nil? (entry/call-with-definition-inputs
+             #(scalar/checked-core-fp-evaluation '(+ x y)
+                                                [primitive-double primitive-double] source-ns))))
+  (is (nil? (entry/call-with-definition-inputs
+             #(normal/completed-scalar-fact '(clojure.core/+ x y)
+                                            {'x primitive-double 'y primitive-double
+                                             'clojure.core/+ primitive-double} source-ns))))
+  (binding [entry/*emission-inputs* nil]
+    (is (nil? (scalar/checked-core-fp-evaluation '(clojure.core// x y)
+                                               [primitive-double primitive-double] source-ns))))
+  (with-redefs-fn {#'clojure.core/- (fn [& _] 42.0)}
+    #(is (= :intrinsic-source-definition-mismatch
+            (try (entry/call-with-definition-inputs
+                  (fn [] (scalar/checked-core-fp-evaluation '(clojure.core/- x y)
+                                                           [primitive-double primitive-double] source-ns)))
+                 nil
+                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+  (let [expression '(clojure.core// x y)
+        facts {'x primitive-double 'y primitive-double}]
+    (entry/call-with-definition-inputs
+     #(let [completed (normal/completed-scalar-fact expression facts source-ns)]
+        (is (= Double/TYPE (:carrier completed)))
+        (is (not (contains? completed :nonthrowing?)))
+        (is (not (contains? completed :removable?)))))))
+
+(deftest core-completion-requires-the-actual-producer-lookup
+  (let [masked (create-ns (gensym "raster.test.masked-core."))
+        producer (create-ns (gensym "raster.test.core-producer."))]
+    (try
+      (intern masked '+ (fn [& _] nil))
+      (intern masked 'double (fn [& _] nil))
+      (binding [*ns* producer] (alias 'clojure.core (ns-name masked)))
+      (doseq [expression ['(clojure.core/+ 1.0 2.0) '(clojure.core/double nullable)]]
+        (is (nil? (entry/call-with-definition-inputs
+                   #(normal/completed-scalar-fact expression))))
+        (is (= :intrinsic-source-definition-mismatch
+               (try (entry/call-with-definition-inputs
+                     #(normal/completed-scalar-fact expression {} producer))
+                    nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+      (finally (remove-ns (ns-name producer)) (remove-ns (ns-name masked))))))
+
+(deftest core-double-completion-has-independent-clojure-edge-case-oracles
+  (doseq [[operation execute expected-class]
+          [['clojure.core/+ (fn [^double x ^double y] (clojure.core/+ x y)) Double]
+           ['clojure.core/- (fn [^double x ^double y] (clojure.core/- x y)) Double]
+           ['clojure.core/* (fn [^double x ^double y] (clojure.core/* x y)) Double]
+           ['clojure.core// (fn [^double x ^double y] (clojure.core// x y)) Double]
+           ['clojure.core/< (fn [^double x ^double y] (clojure.core/< x y)) Boolean]]
+          [x y] [[0.0 -0.0] [1.0 0.0] [-1.0 0.0]
+                 [Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]
+                 [Double/NaN 1.0] [Double/MAX_VALUE Double/MAX_VALUE]]]
+    (let [actual (execute x y)
+          completed (entry/call-with-definition-inputs
+                     #(normal/completed-scalar-fact (list operation 'x 'y)
+                                                   {'x primitive-double 'y primitive-double}
+                                                   source-ns))]
+      (is (= expected-class (class actual) (:builtin-class completed))))))
 
 (deftest completion-is-separate-from-presence-and-the-object-result-carrier
   (is (= {:type :double}
