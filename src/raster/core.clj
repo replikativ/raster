@@ -533,7 +533,11 @@
               ;; Transformation and emission share a historical input owner.
               ;; Retrying emission alone cannot refresh a transformed AD body.
               ;; Publication below happens only after this whole producer passes.
-              (me/call-with-definition-inputs
+              ;; Materialization is its own producer, not an extension of an
+              ;; unrelated analysis or caller's historical proof transaction.
+              ;; Callers still detect any promotion against THEIR old inputs.
+              (binding [me/*emission-inputs* nil]
+               (me/call-with-definition-inputs
                (fn []
                  (let [effective-body fresh-body
                        ;; Use retained AD, without expanding ordinary helpers or
@@ -553,7 +557,7 @@
                        (emit-owned-bytecode! @compile-typed-impl-fn class-name params tags return-tag
                                              effective-body source-ns typed-iface-name mangled-sym
                                              @me/*emission-inputs*)]
-                   result)))
+                   result))))
               impl implementation]
           (when impl
             ;; Original source lineage was captured BEFORE walking. The emitted

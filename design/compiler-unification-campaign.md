@@ -152,6 +152,14 @@ Float reduction realization, selected loss scaling and checked dimension product
 still block unchanged resident training. CI at `39dd672e` has setup/build success
 and fixture-emission failure; the other gates were still pending when checked.
 
+CI then exposed an ownership-scope regression: independent root materialization
+inherited a caller's unrelated, already-stale analysis collector. Root AD/SIMD
+transformation and emission now run in their own historical transaction; outer
+observations are neither overwritten nor refreshed and still reject promotion.
+The focused real-emission/normal-return gate passes 36 tests / 237 assertions,
+including the CI throwing-producer case and an explicitly stale unrelated owner.
+This fixes isolation, not a waiver for stale executable reuse.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;

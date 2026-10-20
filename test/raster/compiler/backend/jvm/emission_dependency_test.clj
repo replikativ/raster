@@ -92,6 +92,26 @@
                         (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest root-materialization-is-independent-of-an-unrelated-stale-analysis
+  (let [scope (create-ns (gensym "raster.independent-materialization."))
+        dependency (intern scope 'observed (Object.))
+        parent (atom {:static [] :values []})]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm square [x :- Double] :- Double (raster.numeric/* x x))))
+      (binding [method-entry/*emission-inputs* parent]
+        (method-entry/observe-definition-input! dependency scope 'observed)
+        (let [before @parent]
+          (with-redefs-fn {dependency (Object.)}
+            #(do
+               (is (= 9.0 ((ns-resolve scope 'square) 3.0)))
+               (is (identical? before @parent))
+               (is (= :stale-definition-proof-input
+                      (try (method-entry/assert-definition-inputs-current! @parent) nil
+                           (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest emission-inputs-retain-transitive-static-source-observations
   (let [scope (create-ns (gensym "raster.emission-dependencies."))]
     (try
