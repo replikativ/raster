@@ -661,7 +661,34 @@
            (observe-source-body-input! source-var :var)
            (assert-definition-inputs-current! @*emission-inputs*)
            (merge {:source-entry lineage :definition (or (:definition projection) direct)
-                   :source-owner owner :implementation implementation} frontend)))))))
+                   :source-owner owner :implementation implementation
+                   :emission emission} frontend)))))))
+
+(defn frontend-reduction-emission
+  "Observe an unchanged frozen frontend reduction through its actual emitter.
+   Source ownership, input occurrence identity and emitted completion are separate
+   proofs. Cold/legacy entries and transformed emitter inputs abstain; this query
+   never materializes bytecode or infers correspondence from equal expressions."
+  [frontend original]
+  (let [{:keys [emission implementation source-owner source-entry body definition]} frontend
+        ;; The opaque origin relation seals bodies, not editable observation maps.
+        ;; Reuse the ALREADY observed receiver metadata, never refresh it around
+        ;; a caller-supplied emission or an older materialized implementation.
+        historical (when *emission-inputs*
+                     (get-in @*emission-inputs*
+                             [:definition-proofs (:receiver-var definition)
+                              :metadata :raster.core/bytecode-emission]))]
+    (assert-frontend-source! frontend (:source-var source-entry))
+    (when (and emission (identical? emission historical)
+               (identical? implementation (:implementation emission))
+               (identical? source-owner (:frontend-source-owner emission))
+               (identical? source-entry (:source-entry emission)))
+      (assert-definition-inputs-current! @*emission-inputs*)
+      (let [observed
+            ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-reduction-emission)
+             emission body original)]
+        (assert-definition-inputs-current! @*emission-inputs*)
+        observed))))
 
 (defn original-source-frontend
   "Optional original frontend for an exact already-resolved deftm source Var.

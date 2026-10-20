@@ -616,13 +616,15 @@
     (vector? form) (with-meta (mapv desugar-invk form) (meta form))
     :else form))
 
+(deftype ^:private ReductionInputOrigins [input-body emitted-body pairs])
+
 (defn ^:no-doc retain-invocation-occurrences
   "Give each executable call occurrence an emission-local identity.
    Run after semantic source transforms, before backend macroexpansion. This
    catalog is private to the owning emission, not a source/cache identity or
    authority reconstructed by comparing expressions. Quoted values stay opaque."
   [body]
-  (let [catalog (atom {}) scopes (atom {}) reductions (atom {})]
+  (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) origins (atom [])]
     (letfn [(visit [expression]
               (if (and (seq? expression)
                        (contains? #{'quote 'clojure.core/quote} (first expression)))
@@ -638,6 +640,7 @@
                     (let [token (Object.)
                           owned (vary-meta node assoc ::reduction-occurrence token)]
                       (swap! reductions assoc token owned)
+                      (swap! origins conj [expression owned])
                       owned)
                     (form-ir/binding-form? node)
                     (let [token (Object.)
@@ -651,7 +654,9 @@
                       (swap! catalog assoc token owned)
                       owned)))))]
       (let [owned (with-meta (mapv visit body) {::body-occurrence (Object.)})]
-        {:body owned :catalog @catalog :binding-catalog @scopes :reduction-catalog @reductions}))))
+        {:body owned :catalog @catalog :binding-catalog @scopes :reduction-catalog @reductions
+         :reduction-input-origins (when (seq @origins)
+                                    (ReductionInputOrigins. body owned @origins))}))))
 
 (defn- retain-reduction-observation! [ctx role observation]
   (when (and me/*emission-inputs* (= role (::reduction-role ctx)))
@@ -750,6 +755,22 @@
       (let [result-fact (reduction-result-fact exit)]
         (cond-> {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge :exit exit}
           result-fact (assoc :result-fact result-fact))))))
+
+(defn ^:no-doc retained-input-reduction-emission
+  "Follow a producer-retained input occurrence to its actual emitted reduction.
+   Requires the EXACT emitter input body and a unique original object occurrence.
+   This does not match equal source, cross AD/SIMD rewrites, or authenticate a
+   frozen frontend by itself; its caller must retain that frontend's source owner."
+  [emission input-body original]
+  (when-let [origins (:reduction-input-origins emission)]
+    (when (and (instance? ReductionInputOrigins origins)
+               (identical? input-body (.-input-body ^ReductionInputOrigins origins))
+               (identical? (:body emission) (.-emitted-body ^ReductionInputOrigins origins)))
+      (let [matches (filterv #(identical? original (first %))
+                             (.-pairs ^ReductionInputOrigins origins))]
+        (when (= 1 (count matches))
+          (when-let [observed (retained-reduction-emission emission (second (first matches)))]
+            (assoc observed :source-input original)))))))
 
 (defn- retain-binding-context! [ctx binding-count index binder initializer before after]
   (when-let [token (::binding-scope-occurrence ctx)]

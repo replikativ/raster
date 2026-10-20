@@ -70,6 +70,20 @@ including actual Float MSE, empty domains, malformed/copied observations and sta
 definitions. This is original-region completion evidence, not permission to copy
 it onto alpha-renamed/generated training source or erase a box with arbitrary uses.
 
+An owner-private producer relation now links exact unchanged emitter-input reduction
+occurrences to their freshly owned emitted occurrences. The frozen frontend query
+requires its existing opaque source owner AND exact emission-map identity in the
+already-retained receiver definition observation. An edited emission map cannot
+borrow genuine body/occurrence identities to manufacture different completion facts.
+Equal-but-distinct reductions stay distinct; one input object reused at multiple
+occurrences abstains. Copied bodies, missing legacy evidence and AD/SIMD-replaced
+emitter inputs also abstain. Cold queries never force bytecode materialization,
+and reduction-free bodies retain no extra input-body owner. The affected source,
+completion and frontend/import gates pass 52 tests / 306 assertions, including a
+concrete edited-observation attack. This closes the unchanged frontend→emission
+edge only: hygienic inlining/substitution, AD forward preservation and strict loss
+extraction still owe their own correspondence before training admission can widen.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;
