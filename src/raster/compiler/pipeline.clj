@@ -1276,6 +1276,63 @@
   [result]
   (if (map? result) (:form result) result))
 
+(def ^:dynamic *pass-observer*
+  "Opt-in, source-free timing of actual pass execution and boundary validation.
+   Events contain inclusive host timings, not IR/stats or whole-compiler/JIT time.
+   An arrow precondition failure emits no event because the pass never starts.
+   Observer failures propagate, but cannot replace an original compiler failure."
+  nil)
+
+(defn- execute-pass
+  [source pass-key pass-fn target opts validation-start]
+  (let [result (binding [inline/*owned-jvm-calls?* (boolean (:owned-jvm-calls? opts))
+                         inline/*inline-scalar-bodies?*
+                         (or inline/*inline-scalar-bodies?*
+                             (device/gpu-target? (:target-device opts)))]
+                 (pass-fn source opts))
+        transformed (pass-result-form result)]
+    ;; Validation intentionally remains outside the transform's inline bindings.
+    (when validation-start (vreset! validation-start (System/nanoTime)))
+    (validate-dialect! target transformed pass-key opts)
+    [transformed target result]))
+
+(defn- observe-pass! [observer event primary]
+  (try (observer event)
+       (catch Throwable reporting
+         (if primary
+           (when-not (identical? primary reporting)
+             (.addSuppressed ^Throwable primary reporting))
+           (throw reporting)))))
+
+(defn- run-one-pass [source dialect pass-key opts]
+  (let [{:keys [from to] pass-fn :fn} (get pass-specs pass-key)]
+    (assert (or (= :* from) (= dialect from))
+            (str "Pass :" pass-key " expects :" from " but pipeline is at :" dialect
+                 ". Check pass ordering."))
+    (if-let [observer *pass-observer*]
+      (let [started (System/nanoTime)
+            validation-start (volatile! nil)
+            outcome (try {:value (execute-pass source pass-key pass-fn to opts validation-start)}
+                         (catch Throwable primary {:error primary}))
+            finished (System/nanoTime)
+            primary (:error outcome)
+            validation @validation-start
+            event (cond-> {:pass pass-key :from dialect :to to
+                           :status (if primary :failure :success)
+                           :timing-source :host-monotonic :timing-scope :inclusive
+                           :transform-ns (- (or validation finished) started)
+                           :validation-ns (if validation (- finished validation) 0)}
+                    primary (assoc :failure-phase (if validation :validation :transform)
+                                   :error-class (.getName (class primary)))
+                    (keyword? (:reason (ex-data primary)))
+                    (assoc :reason (:reason (ex-data primary))))]
+        ;; Notify outside the compiler catch: an observer error after success is
+        ;; instrumentation failure, not a second failed-pass notification.
+        (observe-pass! observer event primary)
+        (if primary (throw primary) (:value outcome)))
+      ;; No clock reads, timing maps or exception wrappers on the ordinary path.
+      (execute-pass source pass-key pass-fn to opts nil))))
+
 (defn run-passes
   "Reduce a form through a sequence of passes, validating arrow types.
   Passes with :from :* accept any input dialect (flexible).
@@ -1291,19 +1348,7 @@
   ([form passes opts start-dialect]
    (first
     (reduce (fn [[f dialect] pass-key]
-              (let [{:keys [from to]} (get pass-specs pass-key)
-                    pass-fn (:fn (get pass-specs pass-key))
-                    _ (assert (or (= :* from) (= dialect from))
-                              (str "Pass :" pass-key " expects :" from " but pipeline is at :" dialect
-                                   ". Check pass ordering."))
-                    result (binding [inline/*owned-jvm-calls?* (boolean (:owned-jvm-calls? opts))
-                                     inline/*inline-scalar-bodies?*
-                                     (or inline/*inline-scalar-bodies?*
-                                         (device/gpu-target? (:target-device opts)))]
-                             (pass-fn f opts))
-                    f' (pass-result-form result)]
-                ;; Validate output against target dialect (fails hard)
-                (validate-dialect! to f' pass-key opts)
+              (let [[f' to] (run-one-pass f dialect pass-key opts)]
                 [f' to]))
             [form start-dialect] passes))))
 
@@ -1409,19 +1454,7 @@
    (run-passes-diagnostic form passes opts :walked))
   ([form passes opts start-dialect]
    (reduce (fn [acc pass-key]
-             (let [{:keys [from to]} (get pass-specs pass-key)
-                   pass-fn (:fn (get pass-specs pass-key))
-                   current-dialect (:dialect acc)
-                   _ (assert (or (= :* from) (= current-dialect from))
-                             (str "Pass :" pass-key " expects :" from " but pipeline is at :"
-                                  current-dialect))
-                   result (binding [inline/*owned-jvm-calls?* (boolean (:owned-jvm-calls? opts))
-                                    inline/*inline-scalar-bodies?*
-                                    (or inline/*inline-scalar-bodies?*
-                                        (device/gpu-target? (:target-device opts)))]
-                            (pass-fn (:form acc) opts))
-                   new-form (pass-result-form result)]
-               (validate-dialect! to new-form pass-key opts)
+             (let [[new-form to result] (run-one-pass (:form acc) (:dialect acc) pass-key opts)]
                (-> acc
                    (assoc :form new-form :dialect to)
                    (assoc-in [:stages to] new-form)

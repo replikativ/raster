@@ -247,6 +247,132 @@
         (finally
           (alter-var-root #'pipeline/pass-specs (constantly original-specs)))))))
 
+(defn- runner-probe [runner transform validate observer opts]
+  (with-redefs-fn
+    {#'pipeline/pass-specs {:probe {:from :walked :to :lowered :fn transform}}
+     #'pipeline/validate-dialect! validate}
+    #(binding [pipeline/*pass-observer* observer]
+       (runner [:input] [:probe] opts))))
+
+(defn- caught-runner-error [f]
+  (try (f) nil (catch Throwable error error)))
+
+(deftest pass-runners-share-execution-without-leaking-results-to-observers
+  (doseq [runner [pipeline/run-passes #'pipeline/run-passes-diagnostic]
+          wrapped? [false true]]
+    (let [calls (atom []) events (atom [])
+          result (runner-probe
+                  runner
+                  (fn [source _]
+                    (swap! calls conj :transform)
+                    (if wrapped? {:form (conj source :output) :stats {:private (Object.)}}
+                        (conj source :output)))
+                  (fn [& _] (swap! calls conj :validation))
+                  #(swap! events conj %) {})
+          event (first @events)]
+      (is (= [:input :output] (if (= runner pipeline/run-passes) result (:form result))))
+      (is (= [:transform :validation] @calls))
+      (is (= 1 (count @events)))
+      (is (= #{:pass :from :to :status :timing-source :timing-scope
+               :transform-ns :validation-ns} (set (keys event))))
+      (is (= {:pass :probe :from :walked :to :lowered :status :success
+              :timing-source :host-monotonic :timing-scope :inclusive}
+             (dissoc event :transform-ns :validation-ns)))
+      (is (every? #(and (integer? %) (<= 0 %))
+                  ((juxt :transform-ns :validation-ns) event))))))
+
+(deftest shared-runner-keeps-diagnostic-metadata-and-stage-overwrite-semantics
+  (with-redefs-fn
+    {#'pipeline/pass-specs
+     {:first {:from :custom :to :lowered
+              :fn (fn [source _] {:form (conj source :first) :stats {:count 1}
+                                  :backend :gpu :kernels [:kernel]
+                                  :emitted-program :program :cuda-result :cuda})}
+      :second {:from :* :to :lowered :fn (fn [source _] (conj source :second))}}
+     #'pipeline/validate-dialect! (fn [& _])}
+    #(let [result (#'pipeline/run-passes-diagnostic [:input] [:first :second] {} :custom)]
+       (is (= [:input :first :second] (:form result)))
+       (is (= (:form result) (get-in result [:stages :lowered])))
+       (is (= {:lowered {:count 1}} (:stats result)))
+       (is (= {:backend-type :gpu :kernels [:kernel]
+               :emitted-program :program :cuda-result :cuda}
+              (dissoc (:stages result) :lowered)))
+       (is (= (:form result)
+              (pipeline/run-passes [:input] [:first :second] {} :custom))))))
+
+(deftest shared-runner-retains-transform-only-inline-binding-scope
+  (doseq [runner [pipeline/run-passes #'pipeline/run-passes-diagnostic]
+          observer [nil (fn [_])]
+          [opts inherited expected]
+          [[{} false [false false]]
+           [{:owned-jvm-calls? true} false [true false]]
+           [{:target-device :ocl:probe} false [false true]]
+           [{} true [false true]]]]
+    (let [seen (atom [])]
+      (binding [inline/*owned-jvm-calls?* true
+                inline/*inline-scalar-bodies?* inherited]
+        (runner-probe runner
+                      (fn [source _]
+                        (swap! seen conj [inline/*owned-jvm-calls?* inline/*inline-scalar-bodies?*])
+                        source)
+                      (fn [& _]
+                        (swap! seen conj [inline/*owned-jvm-calls?* inline/*inline-scalar-bodies?*]))
+                      observer opts))
+      (is (= [expected [true inherited]] @seen)))))
+
+(deftest pass-observer-preserves-original-failures-and-the-failing-phase
+  (doseq [runner [pipeline/run-passes #'pipeline/run-passes-diagnostic]
+          phase [:transform :validation]
+          reason [:probe-failure (Object.)]]
+    (let [primary (ex-info "compiler failure" {:reason reason :private (Object.)})
+          events (atom []) calls (atom [])
+          error (caught-runner-error
+                 #(runner-probe
+                   runner
+                   (fn [source _]
+                     (swap! calls conj :transform)
+                     (if (= phase :transform) (throw primary) source))
+                   (fn [& _] (swap! calls conj :validation) (throw primary))
+                   (fn [event] (swap! events conj event)) {}))
+          event (first @events)]
+      (is (identical? primary error))
+      (is (= (if (= phase :transform) [:transform] [:transform :validation]) @calls))
+      (is (= 1 (count @events)))
+      (is (= (cond-> {:status :failure :failure-phase phase
+                      :error-class "clojure.lang.ExceptionInfo"}
+               (keyword? reason) (assoc :reason reason))
+             (select-keys event [:status :failure-phase :reason :error-class])))
+      (is (not (contains? event :private)))
+      (when (= phase :transform) (is (zero? (:validation-ns event)))))))
+
+(deftest pass-observer-errors-never-mask-compiler-errors-or-notify-twice
+  (doseq [runner [pipeline/run-passes #'pipeline/run-passes-diagnostic]
+          situation [:compiler-fails :compiler-succeeds :same-throwable]]
+    (let [primary (ex-info "compiler" {})
+          reporting (if (= situation :same-throwable) primary (ex-info "observer" {}))
+          notifications (atom 0)
+          error (caught-runner-error
+                 #(runner-probe runner
+                                (fn [source _]
+                                  (if (= situation :compiler-succeeds) source (throw primary)))
+                                (fn [& _])
+                                (fn [_] (swap! notifications inc) (throw reporting)) {}))]
+      (is (identical? (if (= situation :compiler-succeeds) reporting primary) error))
+      (is (= 1 @notifications))
+      (is (= (if (= situation :compiler-fails) [reporting] [])
+             (vec (.getSuppressed ^Throwable primary)))))))
+
+(deftest pass-arrow-preconditions-run-before-transformation-and-observation
+  (doseq [runner [pipeline/run-passes #'pipeline/run-passes-diagnostic]]
+    (let [calls (atom [])]
+      (with-redefs-fn
+        {#'pipeline/pass-specs {:probe {:from :custom :to :lowered
+                                       :fn (fn [& _] (swap! calls conj :transform))}}}
+        #(binding [pipeline/*pass-observer* (fn [_] (swap! calls conj :observer))]
+           (is (instance? AssertionError
+                          (caught-runner-error (fn [] (runner [:input] [:probe] {})))))))
+      (is (empty? @calls)))))
+
 (deftest valid-walked-test
   (testing "walked forms are recognized"
     (is (dialects/valid-walked?
