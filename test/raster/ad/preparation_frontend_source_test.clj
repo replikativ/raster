@@ -15,6 +15,12 @@
 (deftm two-squared-loss [x :- Double y :- Double] :- Double
   (numeric/+ (numeric/* x x) (numeric/* y y)))
 
+(deftm gradient-calling-root [x :- Double] :- Double
+  (let [vg ((reverse/value+grad (var squared-loss) :wrt [0]) x)]
+    (clojure.core/nth vg 1)))
+
+(deftm same-signature-owner-donor [x :- Double] :- Double (numeric/+ x 1.0))
+
 (defn- result [prepared x]
   (((deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad)) prepared) x))
 
@@ -90,6 +96,57 @@
       (let [prepared (reverse/prepare-value+grad #'squared-loss [0])]
         (is (nil? (reverse/assert-prepared-program-source! prepared)))
         (is (seq (:unclosed-source-imports @entry/*emission-inputs*)))))))
+
+(deftest frozen-source-remains-available-when-a-transformed-module-has-stale-ad-rules
+  (is (= 6.0 (gradient-calling-root 3.0)))
+  (let [source (core/resolve-deftm-var #'gradient-calling-root)
+        receiver (ns-resolve (:ns (meta source))
+                             (symbol (str (:name (meta source)) "-impl")))
+        implementation (var-get receiver)
+        emission (:raster.core/bytecode-emission (meta receiver))
+        old (reverse/prepare-value+grad #'squared-loss [0])
+        revision (templates/registry-revision)]
+    (is (= :jvm-bytecode (:backend emission)))
+    (is (seq (:producer-inputs emission)) "the real emitted root retains its generated AD owner")
+    (with-redefs [templates/registry-revision (constantly (inc revision))]
+      (is (= :ad-prepared-program-stale-rules
+             (try (entry/assert-emission-inputs-current! emission) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (= :ad-prepared-program-stale-rules
+             (try (reverse/assert-prepared-program-source! old) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frontend (entry/original-source-frontend source)]
+           (is (some? frontend))
+           (is (identical? frontend (entry/assert-frontend-source! frontend source)))
+           (is (identical? implementation (var-get receiver)))
+           (is (= :ad-prepared-program-stale-rules
+                  (try (entry/frontend-reduction-emission frontend (first (:body frontend))) nil
+                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+      (let [fresh (reverse/prepare-value+grad #'squared-loss [0])]
+        (is (identical? fresh (reverse/assert-prepared-program-source! fresh)))
+        (is (= [9.0 6.0] (result fresh 3.0)))))))
+
+(deftest frozen-source-rejects-a-same-signature-owner-from-another-implementation
+  (is (= 9.0 (squared-loss 3.0)))
+  (is (= 4.0 (same-signature-owner-donor 3.0)))
+  (let [source (core/resolve-deftm-var #'squared-loss)
+        receiver-for (fn [source]
+                       (ns-resolve (:ns (meta source))
+                                   (symbol (str (:name (meta source)) "-impl"))))
+        receiver (receiver-for source)
+        donor (receiver-for (core/resolve-deftm-var #'same-signature-owner-donor))
+        foreign (get-in (meta donor) [:raster.core/bytecode-emission :frontend-source-owner])
+        before (meta receiver)]
+    (is (some? foreign))
+    (try
+      (alter-meta! receiver assoc-in [:raster.core/bytecode-emission :frontend-source-owner] foreign)
+      (is (= :retained-frontend-owner-mismatch
+             (try (entry/call-with-definition-inputs #(entry/original-source-frontend source)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (finally (reset-meta! receiver before)))
+    (is (some? (entry/call-with-definition-inputs #(entry/original-source-frontend source))))))
 
 (deftest inactive-checked-conversion-keeps-its-definition-policy
   (let [compiled (binding [*unchecked-math* true]

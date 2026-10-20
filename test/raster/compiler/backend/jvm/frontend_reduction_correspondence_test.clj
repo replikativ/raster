@@ -12,7 +12,10 @@
 (deftm source-float-sum [xs :- (Array float) count :- Long] :- Float
   (par/reduce acc (float 0.0) i count (+ acc (aget xs i))))
 
+(defonce ^:private cold-source-evaluations (atom 0))
+
 (deftm cold-sum [xs :- (Array double) count :- Long] :- Double
+  (swap! cold-source-evaluations inc)
   (par/reduce acc 0.0 i count (+ acc (aget xs i))))
 
 (use-fixtures :each
@@ -125,8 +128,13 @@
         implementation (receiver source)
         _ (core/prepare-deftm-frontend! source)
         before (var-get implementation)
-        frontend (entry/original-source-frontend source)
+        evaluations @cold-source-evaluations
+        frontend (with-redefs [core/do-bytecode-upgrade!
+                              (fn [& _] (throw (ex-info "cold source query emitted code" {})))]
+                   (entry/original-source-frontend source))
         original (first (reduction-forms (:body frontend)))]
+    (is (some? frontend))
+    (is (= evaluations @cold-source-evaluations))
     (is (some? (:raster.core/jit-spec (meta implementation))))
     (is (nil? (:emission frontend)))
     (is (nil? (entry/frontend-reduction-emission frontend original)))

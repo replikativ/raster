@@ -567,6 +567,13 @@
         false
         (throw failure)))))
 
+(defn- source-entry-matches-selection?
+  [lineage {:keys [source-var parameters tags entry]} expected-source-var]
+  (and lineage (identical? expected-source-var source-var)
+       (identical? source-var (:source-var lineage))
+       (= parameters (:params lineage)) (= tags (:tags lineage))
+       (= (str (:typed-iface entry)) (str (:typed-interface lineage)))))
+
 (defn selected-source-entry-carriers
   "Project primitive formal facts INSIDE an exact retained typed source entry.
    Cold jit-spec and warm owned emission must correspond to the same source Var
@@ -598,9 +605,7 @@
                 (when (and (source-entry-current? (:source-entry emission))
                            (usable-emission? emission))
                   (:source-entry emission)))))]
-      (when (and lineage (identical? source-var (:source-var lineage))
-                 (= parameters (:params lineage)) (= tags (:tags lineage))
-                 (= (str (:typed-iface entry)) (str (:typed-interface lineage))))
+      (when (source-entry-matches-selection? lineage definition expected-source-var)
         (assert-definition-inputs-current! @*emission-inputs*)
         (assoc projection :scope :typed-source-body-entry :source-entry lineage
                :pending-source? (boolean spec) :emission (when-not spec emission)
@@ -686,31 +691,39 @@
     frontend))
 
 (defn selected-frontend-source
-  "Original typed frontend of an actually published specialization.
-   Reuses receiver/implementation/source-entry correspondence; never substitutes
-   transformed emission :body or an unattested walked-metadata cache. Nil means
-   cold/legacy evidence is absent, not permission for source-owned execution."
+  "Original typed frontend of an exactly selected specialization.
+   Its opaque original owner authenticates source independently of any transformed
+   module's freshness. This permits new source compilation, not invocation of an
+   old module or observed-bytecode analysis. Optional :emission is an unvalidated
+   observation; every emission consumer must check its own historical guard.
+   Missing cold/legacy ownership abstains without walking or emitting code."
   [operation implementation-op argument-count source-var expected-dtype]
   (call-with-optional-definition-inputs
    (fn []
-     (let [projection (selected-source-entry-carriers
-                       operation implementation-op argument-count source-var)
+     (let [projection (selected-parameter-carriers operation implementation-op argument-count)
            direct-op (symbol (str (:ns (meta source-var))) (str (:name (meta source-var))))
            direct (when-not projection
                     (observed-selected-definition :direct operation direct-op argument-count))
-           pending? (:pending-source? projection)
+           spec (some-> projection :definition :receiver-var meta :raster.core/jit-spec)
+           pending? (boolean spec)
            receiver (get-in projection [:definition :receiver-var])
-           pending-owner (when pending? (get-in (meta receiver) [:raster.core/jit-spec :frontend-source-owner]))
-           pending-input (when pending-owner (frontend-source-input! pending-owner (var-get receiver)))
-           lineage (if projection (or (:source-entry pending-input) (:source-entry projection))
-                       (when (identical? source-var (:source-var direct))
-                         (:raster.core/clojure-source-entry (meta source-var))))
-           emission (:emission projection)
-           owner (if projection (or pending-owner (:frontend-source-owner emission))
+           emission (when (and projection (not pending?))
+                      (:raster.core/bytecode-emission (meta receiver)))
+           owner (if projection (if pending? (:frontend-source-owner spec)
+                                   (:frontend-source-owner emission))
                      (:raster.core/frontend-source-owner (meta source-var)))
-           implementation (if projection (if pending? (var-get receiver) (:implementation emission))
-                              (when direct (var-get source-var)))]
-       (when (and lineage (or (not pending?) pending-input))
+           ;; Authenticate against the actual selected receiver, never an
+           ;; implementation identity asserted by an editable emission map.
+           implementation (if projection (get-in projection [:definition :entry :typed-impl])
+                              (when direct (var-get source-var)))
+           original (when (and owner implementation)
+                      (frontend-source-input! owner implementation))
+           lineage (if projection (:source-entry original)
+                       (when (identical? source-var (:source-var direct))
+                         (:raster.core/clojure-source-entry (meta source-var))))]
+       (when (and lineage
+                  (or (not projection)
+                      (source-entry-matches-selection? lineage (:definition projection) source-var)))
          (when-let [frontend (original-frontend owner lineage implementation expected-dtype)]
            (observe-source-body-input! source-var :var)
            (assert-definition-inputs-current! @*emission-inputs*)
@@ -737,6 +750,9 @@
                (identical? implementation (:implementation emission))
                (identical? source-owner (:frontend-source-owner emission))
                (identical? source-entry (:source-entry emission)))
+      ;; Source availability did not attest this transformed module. Actual
+      ;; instruction/occurrence consumers still owe its complete input history.
+      (assert-emission-inputs-current! emission)
       (assert-definition-inputs-current! @*emission-inputs*)
       (let [observed
             ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-reduction-emission)

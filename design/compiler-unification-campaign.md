@@ -147,6 +147,23 @@ Keep focused REPL feedback local, full suites in CI, and cold-load/lifecycle tes
 where they specifically matter. Each PR records its invariant, affected consumers,
 negative gate, workload evidence and explicit nonclaims.
 
+The shared pass executor and opt-in phase observer landed as PR #1543 after all
+seven exact-head CI contexts succeeded. Production and diagnostic pipelines now
+share transform/result extraction/validation; timing separates transform and
+validation without clock reads on the unobserved path. This supplies measurement
+infrastructure, not evidence that marketing preparation is fast enough.
+
+The next independently reviewed lifecycle correction separates authenticated
+original-frontend discovery from freshness of a previously generated module.
+Original source can seed a new preparation after an AD-rule revision; the old
+preparation and actual emitted-code consumers still reject stale rules. The
+opaque source owner is checked against the actual selected implementation,
+including rejection of a same-signature foreign owner. Cold lookup neither runs
+the source nor upgrades its bytecode. Focused source/lifecycle tests pass 25 tests /
+123 assertions in the existing REPL; the combined affected gate previously passed
+36 / 201. This does not establish stale-module renewal, portable owner persistence,
+new effect admission, or the complete marketing fresh-worker lifecycle.
+
 This vertical advances original items 3 and 5 and validates parts of 6 and 7. It does
 not replace items 1, 2, 4 or 8, finish general AD migration/lifetimes, establish SOTA
 performance, or qualify real multi-host execution. All eight obligations below stay
