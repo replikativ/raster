@@ -5907,10 +5907,21 @@
   ;; monotonic counter keeps every generated name globally unique.
   (with-ad-gensym
     (let [resolved (resolve-deftm-var f-var)
+          ;; AD is another compiler consumer of the original semantic frontend,
+          ;; not an owner of the replaceable walked-body metadata cache. Prepare
+          ;; the producer before observing it, just like ordinary inlining.
+          _ (rcore/prepare-deftm-frontend! resolved)
+          frontend (method-entry/original-source-frontend resolved)
           m (meta resolved)
           params (deftm-params-or-throw f-var resolved)
-          walked-body (or (rcore/ensure-walked-body! resolved)
+          walked-body (or (:body frontend)
+                          (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body on var" {:var f-var})))
+          ;; Legacy input remains available to existing non-owning AD. It must
+          ;; not silently acquire historical source authority from this caller.
+          _ (when (and method-entry/*emission-inputs* (nil? frontend))
+              (swap! method-entry/*emission-inputs* update :unclosed-source-imports
+                     (fnil conj #{}) [:unowned-ad-frontend resolved]))
           tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
           _ (assert-scalar-loss-result-admissible!
              f-var resolved walked-body params tags)
@@ -7574,7 +7585,8 @@
   "Prepare the existing typed reverse-gradient program without compiling a runtime wrapper.
    Both runtime construction and compiler inlining consume this retained program/slot boundary."
   [f-var wrt]
-  (or (try (build-grad-walked-body f-var wrt)
+  (method-entry/call-with-definition-inputs
+   #(or (try (build-grad-walked-body f-var wrt)
            (catch clojure.lang.ExceptionInfo error
              (if (= :ad-unowned-derived-pullback (:reason (ex-data error)))
                ;; Reenter from the actual selected emission, never certify the
@@ -7594,7 +7606,7 @@
                    "a fixed-point solve (adjoint-of-fixed-point rule), or a "
                    "registered op (e.g. a loss deftm with an AD template). "
                    "Runtime construction and compiled AD calls share this preparation gate.")
-              {:var f-var :reason :flatten-failed}))))
+              {:var f-var :reason :flatten-failed})))))
 
 (declare value+grad)
 

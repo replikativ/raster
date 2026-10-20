@@ -84,6 +84,33 @@ concrete edited-observation attack. This closes the unchanged frontend→emissio
 edge only: hygienic inlining/substitution, AD forward preservation and strict loss
 extraction still owe their own correspondence before training admission can widen.
 
+Review refined the training route: do **not** make bytecode-occurrence tracing
+through every alpha-renaming pass the primary AD→TypedSOAC architecture. The shared
+AD producer still assembles transformed source forms, and the inliner explicitly
+records its prepared reverse-AD import as unclosed. Close that producer once using
+authenticated SourceFrontend inputs and its actually consumed historical definitions,
+then validate its structural ParIR reductions. Original-bytecode occurrence links
+remain useful for original source observations, not a substitute typed AD pipeline.
+
+The first producer correction makes shared reverse preparation consume the frozen
+frontend rather than replaceable walked-body caches, under the existing definition
+collector transaction. Missing root lineage stays explicitly unclosed. This does
+not yet seal generated-program fields, source policy or template revisions for later
+reuse; the inliner's unclosed import marker remains. The next owner must bind the
+exact generated body, params/tags, namespace, result/gradient slots and normalized
+active-parameter selection, plus immutable historical observations and original
+source policy. Historical adoption must not refresh snapshots. Retain any unclosed
+transitive imports, and distinguish template invalidation from harmless later cache
+materialization. Structural-domain and accumulation/checkpoint proofs follow; the
+unchanged Float MSE training workload remains the end-to-end acceptance case.
+The root-input change passes a fresh-REPL affected gate of 33 tests / 199 assertions
+(preparation, source/loop projection, owned array AD, frontend imports and unchanged
+training-refusal diagnostics). It rejects poisoned derived walk-cache input and
+detects a source change during preparation without materializing a cold numeric
+implementation. An earlier warm run hit anonymous-class collisions after backend
+reload; restarting only the owned bounded REPL removed those errors. This is not
+a whole-suite qualification or a fix for generated-program lifecycle ownership.
+
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
 Emission still refuses target-library `exp` inside a checked Float narrowing stage;
