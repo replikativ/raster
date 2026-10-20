@@ -158,12 +158,20 @@
                                  :equation equation-id :results results})))
             result (first results)
             result-dtype (:dtype (get values result))
+            resident? (resident/resident-scalar-value? (get values result))
+            ;; Host materialization and target scheduling share the exact payload transport.
+            ;; A resident rank-zero capture is an array here, not a scalar ABI argument.
+            physical (when resident?
+                       (device-scalar/projection (dialect/equation-subprogram program equation)))
+            locals (if physical
+                     (mapv #(update % :init projection/scalar-folds->source) (:locals physical))
+                     region-locals)
+            body (if physical (projection/scalar-folds->source (:body physical)) (first bodies))
             ;; The shared dtype vocabulary rejects storage-only/unknown JVM scalar types.
             scalar-tag (dtype/scalar-tag-for-dtype result-dtype)
             source (materialize-region
-                    region-locals
-                    (invocation-source/typed-store-value (symbol "clojure.core" (name scalar-tag)) (first bodies)))
-            resident? (resident/resident-scalar-value? (get values result))]
+                    locals
+                    (invocation-source/typed-store-value (symbol "clojure.core" (name scalar-tag)) body))]
         (if resident?
           (let [effect (gensym (str "typed_soac_scalar_" equation-id "__"))
                 store (list 'clojure.core/aset result 0 source)]

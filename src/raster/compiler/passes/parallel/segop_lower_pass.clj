@@ -594,8 +594,10 @@
                                    (or (not= 1 (count contextual))
                                        (not (semantic/equivalent? algorithm
                                                                   (:algorithm (first contextual))))
-                                       (nil? (resident/validated-terminal-resident-output
-                                              context (first (:results equation)))))))
+                                       (not (or (resident/validated-terminal-resident-output
+                                                 context (first (:results equation)))
+                                                (resident/validated-required-resident-output
+                                                 context (first (:results equation))))))))
                         (throw (ex-info "resident scalar lacks its enclosing placement and storage proof"
                                         {:reason :typed-soac-device-scalar-activation
                                          :equation (:id equation)})))

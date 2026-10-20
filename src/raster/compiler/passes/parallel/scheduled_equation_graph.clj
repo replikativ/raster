@@ -831,10 +831,23 @@
              ;; Derived scalar definitions are deliberately absent here.  They are proof terms
              ;; in the retained ParallelProgram prefix, not descriptive graph attributes.
              :attributes attributes})
+           ;; A graph's DAG, not the backend's current queue discipline, owns ordering.
+           ;; Conservatively retain the selected source sequence in regions containing a
+           ;; required evaluation. Pure regions keep their ordinary hazard-only DAG.
+           ordered-nodes (if (seq (get-in (soac/facts algorithm)
+                                         [:attributes :required-evaluations]))
+                           (mapv (fn [index node]
+                                   (if (zero? index) node
+                                     (update node :dependencies
+                                             #(vec (distinct
+                                                    (conj % (:id (nth (:nodes kernel-graph)
+                                                                     (dec index)))))))))
+                                 (range) (:nodes kernel-graph))
+                           (:nodes kernel-graph))
            nodes (mapv (fn [node certificate]
                          (cond-> node certificate
                            (assoc :read-capacity-certificate certificate)))
-                       (:nodes kernel-graph) read-capacity-certificates)]
+                       ordered-nodes read-capacity-certificates)]
        (graph/validate! (assoc kernel-graph :nodes nodes))))))
 
 (defn validate-projection!
@@ -881,6 +894,8 @@
         algorithms (mapv (comp soac/validate! :algorithm) equations)
         equation-forms (vec (mapcat soac/equations algorithms))
         equation-facts (apply merge (map (comp :equations soac/facts) algorithms))
+        required-evaluations (apply merge (map #(get-in (soac/facts %) [:attributes :required-evaluations])
+                                               algorithms))
         inputs (program/infer-inputs equations)
         outputs (region-outputs parallel-program equations indices)
         effects (reduce set/union #{} (map (comp :effects soac/facts) algorithms))]
@@ -892,7 +907,8 @@
        :effects effects
        :provenance {:source-dialect :typed-soac
                     :pass :scheduled-equation-region}
-       :attributes {:equation-region (mapv :id equations)}})
+       :attributes (cond-> {:equation-region (mapv :id equations)}
+                     (seq required-evaluations) (assoc :required-evaluations required-evaluations))})
      equation-forms outputs)))
 
 (defn make-for-equations
