@@ -118,6 +118,27 @@ portable identity/validation boundary. Set numerical budgets from measured basel
 do not report whole-worker or sampling time as pure compiler time. Requalify cold/warm
 costs after the vertical closes, independently of execution throughput.
 
+The first execution increment hardens the finite training oracle (3 focused tests /
+38 assertions) and diagnoses an actual artifact boundary regression. A real ordinary
+map compilation carries an `OrderedSourceOwner`; archival fingerprinting refuses that
+process-local object. Sealing now explicitly refuses attached or independently required
+ordered owners before serialization, and bounded store diagnostics retain the keyword
+reason through the outer exact-evidence error. Dropping an owner cannot manufacture
+portability. Focused refusal/diagnostic checks pass 2 tests / 10 assertions; adjacent
+source-owner/fingerprint checks pass 13 / 45. This does NOT restore portable evidence
+or PDE capture: a producer-owned portable payload plus authenticated source-executor
+reconstruction remains required, including exact decoded semantic/emitted identities,
+historical dependencies and executor coverage. No opaque-owner fingerprint exemption
+or process-local identity fallback is allowed for durable restore.
+
+A warm REPL diagnostic on a tiny synthetic-target map compiled once and recorded
+three process-cache hits: loaded-first preparation 348.6 ms; identical, changed-data
+and changed-dynamic-size preparations 19.8, 18.1 and 17.0 ms. Hit-path equation lowering
+accounted for 18.2, 16.7 and 15.5 ms. This is one loaded-machine probe, not a marketing
+profile, cold-start benchmark, stable speedup or device execution receipt. Artifact
+publication remained explicitly refused. Keep cache misses and work repeated on hits
+as separate profiling targets.
+
 Use one focused independent reviewer for the authority/admission changes and another
 review pass over the integrated workload/deletion diff; reuse reviewers rather than
 launching recurring broad surveys. Ask each review to identify duplicated authorities,

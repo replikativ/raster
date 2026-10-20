@@ -6,6 +6,7 @@
    the outer identity and payload bytes before Boring may reconstruct typed compiler records."
   (:require [boring.core :as boring]
             [boring.records :as records]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-plan :as invocation]
@@ -139,6 +140,10 @@
             (get-in compilation [:semantic :attributes :invocation-plan :attributes :terminal-host-result]))
     (fail! "terminal host regions require reconstruction of their process-local source owner"
            :equation-artifact-terminal-owner {}))
+  (when (or (:ordered-source-owner compilation)
+            (source-owner/ordered-source-required? (:semantic compilation) (:emitted compilation)))
+    (fail! "ordered source regions require reconstruction of their process-local source owner"
+           :equation-artifact-ordered-owner {}))
   (when-not (and (symbol? (:function compilation))
                  (keyword? (:target compilation))
                  (keyword? (:dtype compilation))

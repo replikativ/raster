@@ -404,6 +404,60 @@
          (reason-of #(artifact/seal identity
                                     (assoc @compilation :options {:callback (fn [] nil)}))))))
 
+(deftest ordered-source-ownership-requires-explicit-artifact-reconstruction
+  (let [original @compilation]
+    (is (some? (:ordered-source-owner original)))
+    (doseq [candidate [original (dissoc original :ordered-source-owner)]]
+      (is (= :equation-artifact-ordered-owner
+             (reason-of #(artifact/seal identity candidate)))
+          "dropping an owner cannot erase the independently derived source requirement"))))
+
+(deftest artifact-store-refusal-retains-bounded-diagnostics-not-source-objects
+  (let [key {:kind ::refused-store-diagnostics
+             :semantic-fingerprint "refused-store-diagnostics"
+             :persistent-cache-eligible? true
+             :semantic-request {:compiler-build-fingerprint "compiler-build"
+                                :source {:source-dependency-fingerprint "source-dependencies"}
+                                :target {:descriptor-fingerprint "target-descriptor"}}}
+        report (atom nil)]
+    (compiled/clear-compilation-cache!)
+    (try
+      (with-redefs [store/load-artifact (fn [& _] {:status :miss :reason :not-found})
+                    store/store-artifact!
+                    (fn [& _]
+                      (throw (ex-info "private source must not be serialized"
+                                      {:reason :equation-artifact-ordered-owner
+                                       :private-source (Object.)})))]
+        (binding [compiled/*compilation-template-observer* #(reset! report %)]
+          (is (= ::compiled-value
+                 (#'compiled/cached-compilation-template key :equation-first
+                                                        (constantly ::compiled-value)))))
+        (is (= {:status :write-failed
+                :error-class "clojure.lang.ExceptionInfo"
+                :artifact-reason :equation-artifact-ordered-owner}
+               (select-keys (:persistent-artifact @report)
+                            [:status :error-class :artifact-reason])))
+        (is (not (contains? (:persistent-artifact @report) :private-source)))
+        (is (= {} (:retained-artifact @report)))
+        (let [data (try (#'compiled/exact-artifact-evidence nil
+                         {:kind :equation-first :template @report}) nil
+                        (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+          (is (= :compiled-execution-identity-incomplete (:reason data)))
+          (is (= {:status :write-failed
+                  :error-class "clojure.lang.ExceptionInfo"
+                  :artifact-reason :equation-artifact-ordered-owner}
+                 (:artifact-store-report data))))
+        (with-redefs [store/store-artifact!
+                      (fn [& _] (throw (ex-info "opaque reason" {:reason (Object.)})))]
+          (binding [compiled/*compilation-template-observer* #(reset! report %)]
+            (#'compiled/cached-compilation-template
+             (assoc key :semantic-fingerprint "opaque-store-diagnostics") :equation-first
+             (constantly ::compiled-value)))
+          (is (= {:status :write-failed :error-class "clojure.lang.ExceptionInfo"}
+                 (select-keys (:persistent-artifact @report)
+                              [:status :error-class :artifact-reason])))))
+      (finally (compiled/clear-compilation-cache!)))))
+
 (deftest atomic-store-round-trips-bounds-and-reports-corruption
   (with-temporary-directory
     (fn [directory]

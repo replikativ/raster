@@ -376,7 +376,9 @@
                   (equation-artifact-store/store-artifact!
                    *equation-artifact-store* (:semantic-fingerprint key) identity value caller-options))
                 (catch Exception error
-                  {:status :write-failed :error-class (.getName (class error))})))]
+                  (cond-> {:status :write-failed :error-class (.getName (class error))}
+                    (keyword? (:reason (ex-data error)))
+                    (assoc :artifact-reason (:reason (ex-data error)))))))]
         (reset! persistent-report
                 (cond
                   (not persistent?) {:status :ineligible}
@@ -1337,6 +1339,9 @@
                         {:reason :compiled-execution-identity-incomplete
                          :persistence-blockers persistence-blockers
                          :source-dependency-blockers source-dependency-blockers
+                         :artifact-store-report
+                         (select-keys (:persistent-artifact (:template report))
+                                      [:status :artifact-reason :error-class])
                          :retained-artifact? (boolean (seq retained-artifact))})))
       (if caller-options
         (invocation-link/verify! lowering caller-options)
