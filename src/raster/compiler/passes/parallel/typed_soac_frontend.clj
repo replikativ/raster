@@ -3987,8 +3987,10 @@
    value exposes the existing algebra without teaching the frontend about individual scalar
    functions. Extraction follows only an authenticated strict first-operand context: selected
    helper calls need their own call-context proof and are deliberately not traversed. The
-   surrounding expression must be removable after substitution, may not read mutable array
-   storage, and the reduction must carry its walker-provided result type."
+   surrounding expression must be externally pure after substitution, may not read mutable
+   array storage, and the reduction must carry its walker-provided result type. This is not
+   erasure or fusion permission: metadata and exceptional completion obligations remain on
+   the rebuilt scalar binding for the ordinary admission and scheduling checks."
   [source]
   (if-not (and (seq? source) (contains? #{'let 'let*} (first source)))
     source
@@ -4006,7 +4008,7 @@
                                     (assoc :tag reduction-tag :raster.type/tag reduction-tag)))
                        outer (replace value-id)]
                    (if (and reduction-tag
-                            (effects/removable-expr? outer)
+                            (= :pure (effects/analyze-effect outer))
                             (empty? (par/collect-aget-arrays outer))
                             (not (contains-parallel-form? outer)))
                      [[value-id reduction] [symbol outer]]

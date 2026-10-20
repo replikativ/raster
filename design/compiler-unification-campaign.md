@@ -14,12 +14,37 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
-Current integration hold: PR #1539 at `36c32cc4` is draft, not qualified for merge.
-Exact-head setup/build passed; emission, unit and OpenCL gates failed.
+Current integration hold: PR #1539 is draft, not qualified for merge.
+At `c101748f`, setup/build passed; emission, unit and OpenCL gates failed.
+At `a1279e4e`, setup/build passed, emission failed, and unit/OpenCL were still
+running at the latest observation. These are not acceptance evidence for CUDA/HIP.
 The earlier head's 16 unit shards finished (15 failed, one passed);
 this is not a green compiler baseline. Dependent CUDA/HIP
 jobs are not acceptance evidence. The following table takes precedence over
 historical receipts below; do not infer broad qualification from focused gates.
+
+The latest normalization correction replaces recursive reduction discovery and
+equality substitution with an occurrence-specific strict evaluation context.
+Extraction follows only the first operand of bootstrap-authenticated inline core
+calls resolved in the actual producer namespace. It never crosses conditional,
+binding, quoted, collection, selected-helper or later-operand contexts. Missing
+producer context withholds extraction. This deliberately narrows speculative
+helper extraction until its call-context proof exists; no legacy fallback returns.
+The focused gate passes 134 tests / 744 assertions. The adjacent route namespace
+remains red, with the same failure-event inventory under the committed extractor
+and corrected extractor; that comparison is not a passing integration gate.
+
+The follow-up separates normalization from removability. A strict first-operand
+reduction can be exposed while its externally pure surrounding scalar retains
+all source metadata, checked-completion obligations and preserve-evaluation flags.
+The training-shaped unused forward-loss quotient remains an explicit binding;
+coverage and the actual route still refuse it after parallel work. The focused
+gate passes 135 tests / 754 assertions; the unchanged training diagnostic passes
+1 test / 5 assertions. Review confirms fail-closed admission today, but metadata
+alone is not a general fusion barrier. Before broadening admission, represent and
+enforce the scalar's completion/ordering obligation through TypedSOAC fusion and
+the ordered executable boundary. Do not turn preserved evaluations into dead
+values or claim that normalization alone activates training.
 
 The next reviewed slice admits checked Double-to-Float after a finite literal-bound
 ordered fold, including an exact write-only destination with runtime-proven private

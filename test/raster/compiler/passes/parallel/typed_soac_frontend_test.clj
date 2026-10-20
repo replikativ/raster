@@ -1906,6 +1906,37 @@
           "a qualified spelling can be masked in the actual source namespace")
       (finally (remove-ns (ns-name masked))))))
 
+(deftest strict-reduction-extraction-retains-scalar-completion-obligations
+  (let [reduction (with-meta '(raster.par/reduce sum 0.0 i n
+                              (+ sum (clojure.core/aget xs i)))
+                    {:tag 'double :raster.type/tag 'double})
+        metadata {:tag 'double :raster.type/tag 'double
+                  :file "retained-training-loss.clj" :line 26 :column 22
+                  :raster.effect/preserve-evaluation true}
+        expression (with-meta (list 'clojure.core// reduction '(clojure.core/double rows))
+                     metadata)
+        source (list 'let* ['unused-forward-loss expression] 'xs)
+        options {:source-ns *ns* :array-types {'xs :double}
+                 :scalar-types {'n :long 'rows :long}}
+        normalized (frontend/normalize-source
+                    source options)
+        [_ [temporary extracted result outer]] normalized]
+    (is (= reduction extracted))
+    (is (= 'unused-forward-loss result))
+    (is (= (list 'clojure.core// temporary '(clojure.core/double rows)) outer))
+    (is (= metadata (meta outer)))
+    (is (contains? (:flags (effects/descriptor outer)) :preserve-source-evaluation))
+    (is (not (effects/removable-expr? outer)))
+    (is (= 'xs (last normalized)))
+    (is (some #(and (= 'unused-forward-loss (:binding %))
+                    (contains? (:source-evaluation-flags %) :preserve-source-evaluation))
+              (:bindings (frontend/coverage-decline normalized options)))
+        "exposing the reduction must not silently admit or discard the preserved scalar")
+    (let [attempt (route/attempt source :double (:array-types options) options)]
+      (is (nil? (:program attempt)))
+      (is (some #(= 'unused-forward-loss (:binding %))
+                (get-in attempt [:declined :bindings]))))))
+
 (deftest functional-map-result-casts-become-typed-conversion-terms
   (doseq [[cast overflow] [['int :trap] ['unchecked-int :wrap]]]
     (let [source (list 'let*
