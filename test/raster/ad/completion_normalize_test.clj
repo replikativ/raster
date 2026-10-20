@@ -10,6 +10,16 @@
 
 (def policy {:unchecked-math false})
 
+(deftest result-context-does-not-acquire-an-identity-transpose
+  (let [term (completion/complete-value
+               (completion/bytecode-result-context-contract
+                (completion/bytecode-operand-context {}) :ref) 'input)]
+    (doseq [owner [nil {:backend :jvm-bytecode}]]
+      (binding [rev/*generated-product-context* owner]
+        (is (= :ad-unclosed-completion-transpose
+               (try (#'rev/structural-completion? term) :accepted
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
+
 (deftm quoted-scale [x :- Double] :- Double
   (let [data '(let* [inner 7.0] inner)
         scale (double (count data))]

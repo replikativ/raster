@@ -380,6 +380,9 @@
    inputs and checked references still belong to their explicit source owner."
   [expression]
   (when-let [{:keys [contract]} (value-completion/canonical-parts expression)]
+    (when (= :jvm-bytecode-result-context (:source-context contract))
+      (throw (ex-info "Bytecode result context has no owned structural transpose"
+                      {:reason :ad-unclosed-completion-transpose})))
     (or (= value-completion/object-input-contract contract)
         (some? *generated-product-context*))))
 

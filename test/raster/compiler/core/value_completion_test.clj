@@ -5,6 +5,28 @@
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
 
+(deftest bytecode-result-context-is-not-an-object-input-or-numeric-proof
+  (let [context (completion/bytecode-operand-context {})
+        contract (completion/bytecode-result-context-contract context :ref)
+        term (completion/complete-value contract (with-meta 'x {:tag 'double :raster.type/tag 'float}))]
+    (is (completion/canonical-form? term))
+    (is (empty? (meta term)))
+    (is (nil? (completion/object-value-declaration term)))
+    (is (completion/contains-completion? term))
+    (is (= :unsupported-value-completion-source-context
+           (try (completion/project-to-jvm-source term) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (doseq [changed [(assoc contract :result-carrier :float)
+                     (assoc contract :payload Float)
+                     (assoc contract :presence :present)
+                     (update contract :operand-context dissoc :void-context)
+                     (assoc-in contract [:operand-context :void-context] nil)
+                     (assoc-in contract [:operand-context :extra] false)]]
+      (is (not (completion/canonical-contract? changed))))
+    (doseq [carrier [:float :void :diverge Object]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (completion/bytecode-result-context-contract context carrier))))))
+
 (deftest retained-context-barrier-is-quote-opaque-and-includes-invalid-terms
   (let [term (completed 'x)
         malformed (list completion/completion-symbol {:source-context :unknown} 'x)]

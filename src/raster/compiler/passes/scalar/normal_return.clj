@@ -142,6 +142,9 @@
     (let [{:keys [contract operand]} (completion/canonical-parts expression)
           fact (summary operand env visited body-context)]
       (case (:source-context contract)
+        ;; Retaining a physical evaluation context says nothing about value
+        ;; presence or a target-neutral producer. Await a separate projection.
+        :jvm-bytecode-result-context unknown
         ;; These contexts preserve the actual reference, including nil. A
         ;; desired CHECKCAST class does not establish a producer array carrier.
         (:jvm-object-input :jvm-checkcast) fact

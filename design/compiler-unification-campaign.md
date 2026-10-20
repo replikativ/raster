@@ -232,6 +232,30 @@ singleton resident scheduling realize it. Object payload elimination additionall
 needs all uses/aliases closed. Original count/init/read/evaluation obligations and
 the larger prepared-AD semantic-import gate remain independent.
 
+The root-context follow-up now records the actual generated reduction root's
+result flags and emitted carrier after its body is emitted. It does not substitute
+the nested exit's context: a real Float-reduction/core-quotient regression has
+`preserve-source-call-results?` false at the root and true at the exit. The query
+exposes this observation only alongside the owned expansion and exact single loop
+child, matching physical carrier and complete boolean context. Missing root data,
+copied regions and malformed contexts abstain; no payload, normal-completion,
+source/native projection or new admission follows from this observation alone.
+The independently reviewed result-context completion now represents exactly the
+saved four flags plus a reference result carrier. Its JVM consumer evaluates once
+under that context, requires the actual reference carrier and returns that same
+reference without adding conversion or boxing. Primitive metadata cannot change
+its physical carrier. Source/native projection and structural AD explicitly
+refuse it; scalar analysis gains no presence/payload fact. A joined producer /
+consumer regression compares actual observed reduction results, count failures,
+bad reads and initializer effect order with the original. This is the mechanism,
+not yet the authority bridge: helper projection must still establish exact
+pre-hygiene occurrence and historical source ownership before using the contract.
+The combined affected gate passes 86 tests / 725 assertions in the bounded REPL;
+the independent review found no blocking issue. Draft #1539 at `5b5ece57` still
+fails CI: the inspected distributed-training shard reports the same four
+preserve-evaluation scalar refusals plus the new conditional Float correspondence.
+This checkpoint neither fixes those refusals nor qualifies resident AD training.
+
 Two warm, coverage-refused training observations after this slice took 1.361 and
 1.214 seconds (11 observed phases, SOAC transforms 268 and 209 ms). Both retained
 the same four scalar refusals and produced no conditional reduction summaries:
@@ -243,6 +267,8 @@ The shared loop-plan/JVM-consumer deduplication was also extracted onto clean ma
 as PR #1545 for independent qualification. Review found unchanged slot joins and
 initializer coercions; arithmetic and unchanged loop-carrier suites pass 27 tests /
 634 assertions in the campaign REPL. CI remains the clean-process authority.
+PR #1545 subsequently squash-merged as `acfa349d` after all seven exact-head
+CircleCI contexts passed.
 
 The next concrete audit refines the diagnosis above. The owned `local-loss` AD
 preparation contains a selected MSE helper call, not a generated reduction. That

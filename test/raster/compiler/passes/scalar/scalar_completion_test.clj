@@ -45,6 +45,13 @@
          (normal/completed-scalar-bindings [['x 1.0] ['x 'unknown] ['y 'x]]))
       "an unknown sequential producer shadows an earlier known carrier"))
 
+(deftest result-context-alone-does-not-prove-a-numerical-producer
+  (let [term (completion/complete-value
+               (completion/bytecode-result-context-contract
+                (completion/bytecode-operand-context {}) :ref) 1.0)]
+    (is (= {:presence :unknown} (normal/result-fact term)))
+    (is (nil? (normal/completed-scalar-fact term)))))
+
 (deftest sequential-selected-calls-retain-their-object-carrier
   (let [multiply (selected 'raster.numeric/* 'raster.numeric/_star__m_double_double-impl
                            2.0 'seed)

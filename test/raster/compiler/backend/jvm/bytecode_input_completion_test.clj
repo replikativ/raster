@@ -35,6 +35,28 @@
   (try [:value (Float/floatToIntBits (f x))]
        (catch Exception e [:exception (class e)])))
 
+(deftest result-context-preserves-the-existing-reference-without-coercion
+  (let [contract (completion/bytecode-result-context-contract
+                  (completion/bytecode-operand-context {}) :ref)
+        term (completion/complete-value contract 'input)
+        f (compiled ['input] term)
+        tagged (compiled ['input] (with-meta term {:tag 'double :raster.type/tag 'float}))
+        ordered (compiled ['input 'events]
+                          (completion/complete-value
+                           contract '(do (clojure.core/swap! events clojure.core/conj :once) input)))]
+    (doseq [input [nil false (Object.) (Double/valueOf -0.0)
+                   (Float/valueOf (Float/intBitsToFloat 2143289410)) (double-array [1.0])]]
+      (is (identical? input (f input)))
+      (is (identical? input (tagged input)))
+      (let [events (atom [])]
+        (is (identical? input (ordered input events)))
+        (is (= [:once] @events))))
+    (is (= :ref (#'bytecode/infer-arg-stack-type
+                 (with-meta term {:tag 'double :raster.type/tag 'float}) {})))
+    (is (= :bytecode-result-context-carrier-mismatch
+           (try (compiled [] (completion/complete-value contract 1.25)) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest checked-float-preserves-core-source-overloads
   (doseq [[tag values] [['double [0.0 -0.0 Math/PI Double/MAX_VALUE
                                  Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]

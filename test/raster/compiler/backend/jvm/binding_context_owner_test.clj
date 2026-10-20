@@ -6,6 +6,7 @@
             [raster.par :as par]
             [raster.dl.loss :as loss]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
 (deftm response [a :- Double k :- Double x :- Double] :- Double
@@ -25,6 +26,10 @@
   (n/* coefficient (par/reduce acc 0.0 i cnt (n/+ acc (aget xs i)))))
 (deftm initialized-reduction [xs :- (Array double) events :- (Array long) cnt :- Long] :- Double
   (par/reduce acc (double (do (aset events 0 (long 1)) (aget xs 0))) i cnt (n/+ acc 1.0)))
+(deftm root-context-reduction [xs :- (Array float) cnt :- Long] :- Double
+  (clojure.core//
+    (par/reduce acc (float 0.0) i cnt (clojure.core/+ acc (float (aget xs i))))
+    (double cnt)))
 
 (use-fixtures :once (fn [run] (response 0.8 0.7 1.0) (run)))
 
@@ -142,6 +147,65 @@
     (is (some? observed))
     (is (= [:int :float] (mapv #(get-in observed [:loop :locals % :type])
                               (get-in observed [:loop :variables]))))))
+
+(deftest reduction-root-context-is-observed-at-the-whole-region
+  (let [emission (emitted #'root-context-reduction)
+        source (first (vals (:reduction-catalog emission)))
+        observed (bytecode/retained-reduction-emission emission source)
+        root (:root-result observed)
+        path [:reduction-contexts [(get-in observed [:expansion :witness]) :bound-scope] :root-result]]
+    (is (some? root))
+    (is (= :ref (:result-type root)))
+    ;; This real quotient distinguishes the premise the consumer needs: the
+    ;; loop emitter strengthens its inner context, but the root did not start
+    ;; with that flag. Copying the exit's context would be wrong.
+    (is (false? (get-in root [:context :preserve-source-call-results?])))
+    (is (true? (get-in observed [:exit :context :preserve-source-call-results?])))
+    (is (= #{:object-result? :object-call-result? :preserve-source-call-results? :void-context}
+           (set (keys (:context root)))))
+    (is (every? boolean? (vals (:context root))))
+    (is (some #(identical? (get-in observed [:loop :expression]) %) (:body root)))
+    (is (not (contains? root :result-fact)))
+    ;; Exit facts alone cannot manufacture root evidence. Equal copied regions
+    ;; and a mismatched physical result likewise fail the root relation.
+    (doseq [changed [(update-in emission (pop path) dissoc :root-result)
+                     (assoc-in emission (conj path :body)
+                               (mapv #(with-meta (apply list %) (meta %)) (:body root)))
+                     (assoc-in emission (conj path :result-type) :float)
+                     (update-in emission (conj path :context) dissoc :void-context)
+                     (assoc-in emission (conj path :context :void-context) nil)
+                     (assoc-in emission (conj path :context :invented) false)]]
+      (let [result (bytecode/retained-reduction-emission changed source)]
+        (is (some? result))
+        (is (nil? (:root-result result)))))
+    (is (= 2.0 (root-context-reduction (float-array [1.0 3.0]) 2)))))
+
+(deftest observed-root-context-replays-original-count-and-initializer-effects
+  (let [emission (emitted #'initialized-reduction)
+        source (first (vals (:reduction-catalog emission)))
+        root (:root-result (bytecode/retained-reduction-emission emission source))
+        contract (completion/bytecode-result-context-contract (:context root) (:result-type root))
+        artifact (bytecode/compile-specialized-class!
+                   "raster.compiled.ReductionRootContext"
+                   [{:name 'run :params [(with-meta 'xs {:tag 'doubles})
+                                        (with-meta 'events {:tag 'longs})
+                                        (with-meta 'cnt {:tag 'long})]
+                     :return-tag 'Object
+                     :walked-body [(completion/complete-value contract source)]
+                     :source-ns (the-ns 'raster.compiler.backend.jvm.binding-context-owner-test)}])
+        method (get-in artifact [:methods 'run])
+        replay (fn [xs events cnt]
+                 (try (.invoke ^java.lang.reflect.Method method nil (object-array [xs events cnt]))
+                      (catch java.lang.reflect.InvocationTargetException e (throw (.getCause e)))))
+        outcome (fn [f xs cnt]
+                  (let [events (long-array [0])]
+                    [(try [:value (Double/doubleToRawLongBits (double (f xs events cnt)))]
+                          (catch Exception e [:error (class e)]))
+                     (vec events)]))]
+    (is (some? root))
+    (doseq [xs [(double-array [3.0]) (double-array 0)]
+            count [-1 0 2 Long/MAX_VALUE]]
+      (is (= (outcome initialized-reduction xs count) (outcome replay xs count))))))
 
 (deftest reduction-completion-retains-the-object-carrier-and-exact-fp-payload
   (doseq [[function payload] [[#'weighted-reduction Double] [#'float-reduced Float]]]

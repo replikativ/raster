@@ -272,6 +272,10 @@
     (false? form) :bool
     (number? form) (numeric-literal-stack-type form)
     (and (seq? form)
+         (= :jvm-bytecode-result-context
+            (get-in (completion/canonical-parts form) [:contract :source-context])))
+    :ref
+    (and (seq? form)
          (= :jvm-bytecode-floating-input
             (get-in (completion/canonical-parts form) [:contract :source-context])))
     ;; The completed carrier is an explicit physical result of this validated
@@ -669,6 +673,21 @@
                  (assoc contexts key (if (contains? contexts key)
                                        {:status :ambiguous} record))))))))
 
+(defn- retain-reduction-root-result! [ctx body result-type]
+  ;; The initializer and nested exit contexts are not the region-entry context.
+  ;; Attach this observation only to the exact root whose bound was emitted.
+  (when (and me/*emission-inputs* (= :bound-scope (::reduction-role ctx)))
+    (when-let [witness (::reduction-witness ctx)]
+      (swap! me/*emission-inputs* update-in [:reduction-contexts [witness :bound-scope]]
+             (fn [record]
+               (if (and (= :known (:status record))
+                        (identical? (::call-expression ctx) (:expression record))
+                        (not (contains? record :root-result)))
+                 (assoc record :root-result
+                        {:body body :context (completion/bytecode-operand-context ctx)
+                         :result-type result-type})
+                 {:status :ambiguous}))))))
+
 (defn- reduction-label-id! [label]
   ;; Label implementations may retain the entire mutable CodeBuilder. Retain
   ;; only an opaque identity in published observations; this request-local
@@ -754,6 +773,12 @@
       (me/assert-emission-inputs-current! emission)
       (let [result-fact (reduction-result-fact exit)]
         (cond-> {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge :exit exit}
+          (and (= 1 (count (get-in bound [:root-result :body])))
+               (identical? (:expression loop-entry) (first (get-in bound [:root-result :body])))
+               (= (get-in bound [:root-result :context])
+                  (completion/bytecode-operand-context (get-in bound [:root-result :context])))
+               (= (:result-type exit) (get-in bound [:root-result :result-type])))
+          (assoc :root-result (:root-result bound))
           result-fact (assoc :result-fact result-fact))))))
 
 (defn ^:no-doc retained-input-reduction-emission
@@ -3747,6 +3772,7 @@
                     locals pairs)]
     (let [result-type (emit-body code body new-locals ctx)]
       (retain-terminal-context! ctx (count pairs) body new-locals result-type)
+      (retain-reduction-root-result! ctx body result-type)
       result-type)))
 
 (defn- comparison-pred-parts
@@ -5134,6 +5160,18 @@
                         {:reason :jvm-literal-owner-initialized})))
       (.set field nil (object-array values)))))
 
+(defn- emit-bytecode-result-completion
+  "Replay the observed region context, without completing or coercing its value."
+  [code {:keys [contract operand]} locals ctx]
+  (let [original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
+                                (:operand-context contract))
+        actual (emit-form code operand locals original-context)]
+    (when-not (= (:result-carrier contract) actual)
+      (throw (ex-info "Bytecode result context produced a different physical carrier"
+                      {:reason :bytecode-result-context-carrier-mismatch
+                       :expected (:result-carrier contract) :actual actual})))
+    actual))
+
 (defn- emit-bytecode-floating-completion
   "Use precisely the original bytecode invocation's argument/conversion path.
    Never reinterpret a Clojure source-policy contract as this context."
@@ -5172,6 +5210,7 @@
                               {:reason :unsupported-jvm-object-literal})))
             parts (case (get-in parts [:contract :source-context])
                     :jvm-object-input (emit-object-value code (:operand parts) locals ctx)
+                    :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx)
                     :jvm-bytecode-floating-input (emit-bytecode-floating-completion code parts locals ctx)
                     (throw (ex-info "JVM completion consumer has no input-conversion authority"
                                     {:reason :unsupported-jvm-value-completion :contract (:contract parts)})))
@@ -5239,8 +5278,9 @@
       (and (seq? form) (= completion/completion-symbol (first form)))
       (if (completion/canonical-form? form)
         (let [parts (completion/canonical-parts form)]
-          (if (= :jvm-bytecode-floating-input (get-in parts [:contract :source-context]))
-            (emit-bytecode-floating-completion code parts locals ctx)
+          (case (get-in parts [:contract :source-context])
+            :jvm-bytecode-floating-input (emit-bytecode-floating-completion code parts locals ctx)
+            :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx)
             (emit-object-value code form locals ctx)))
         (throw (ex-info "Malformed reserved JVM value completion"
                         {:reason :invalid-value-completion :expression form})))
