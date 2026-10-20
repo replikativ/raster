@@ -1170,8 +1170,9 @@
 (defn- instantiate-ordered-invocation-in-context!
   "Internal owned-root vertical for source-ordered invocation execution. No source-created
    storage or suffix graph is acquired here. Captured public entries are initialized at binding; dynamic
-   inputs refresh on replay. Attached sessions and profiling need their own activation
-   tests before this path is exposed by Compiled; the ordinary eager instantiator is unchanged."
+   inputs refresh on replay. Compiled exposes only this owned, unprofiled subset;
+   attached sessions and profiling still require separate activation. The ordinary
+   eager instantiator is unchanged."
   [compilation arguments opts observe-checked?]
   (if observe-checked?
     (do

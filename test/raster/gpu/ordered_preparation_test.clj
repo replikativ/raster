@@ -1,5 +1,7 @@
 (ns raster.gpu.ordered-preparation-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :refer [deftm]]
+            [raster.par :as par]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
@@ -18,6 +20,66 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftm late-captured-entry-replay
+  [x :- (Array double), weights :- (Array double), state :- (Array double),
+   out :- (Array double)] :- (Array double)
+  (let [updated (par/map! state i 1 double (+ (aget state i) 1.0))
+        temporary (double-array 1)
+        computed (par/map! temporary i 1 double (+ (aget x i) (aget weights i)))]
+    (par/map! out i 1 double (aget computed i))))
+
+(deftest public-lowering-selects-ordered-semantics-only-for-late-actions
+  (let [target :ocl:0
+        options {:compiler :equation-first :target target :dtype :double}
+        arguments [(double-array [7.0]) (double-array 1) Long/MAX_VALUE]
+        late (equation-first/compile #'fixture/write-before-shape (dissoc options :compiler))
+        prefix (equation-first/compile #'fixture/shape-before-write (dissoc options :compiler))
+        forbidden (fn [& _] (throw (AssertionError. "public preparation executed source or acquired a device")))]
+    (with-redefs [scalar/evaluate-invocation-step forbidden scalar/evaluate-host-equation forbidden
+                  gpu/make-session forbidden equation-first/lower forbidden
+                  equation-first/compile (fn [& _] late)]
+      (let [prepared (compiled/lower #'fixture/write-before-shape arguments options)]
+        (is (compiled/prepared? prepared))
+        (is (identical? late (get-in prepared [:ordered-invocation :compilation])))
+        (is (nil? (:lowering prepared)))
+        (is (= :ordered-source (get-in prepared [:descriptor :execution-phase])))
+        (is (some? (get-in prepared [:preparation-report :template])))
+        (is (= :compiled-deferred-phase (reason #(compiled/plan prepared))))
+        (is (= :compiled-deferred-phase (reason #(compiled/certificate prepared))))
+        (is (= :compiled-ordered-entry-intent
+               (reason #(compiled/instantiate! prepared {:entry-roles {}}))))
+        (is (= :compiled-prepared-math-request
+               (reason #(compiled/instantiate!
+                          prepared {:scalar-math {:overrides {[:exp :float] :f64-target-library-rte-f32}}}))))
+        (is (= :compiled-ordered-owner (reason #(compiled/instantiate! (assoc prepared :target :other))))))
+      (doseq [intent [{:donate '[x]} {:outputs '[first-output]} {:taps '[x]}
+                      {:profile? true} {:session :borrowed}]]
+        (is (= :compiled-ordered-capability
+               (reason #(compiled/lower #'fixture/write-before-shape arguments (merge options intent)))))))
+    ;; The eager path is still selected for prefix-only source work; its real
+    ;; lowering may evaluate that prefix, but never a late action prematurely.
+    (with-redefs [gpu/make-session forbidden equation-first/compile (fn [& _] prefix)]
+      (let [prepared (compiled/lower #'fixture/shape-before-write [(double-array [7.0]) 1] options)]
+        (is (nil? (:ordered-invocation prepared)))
+        (is (some? (compiled/plan prepared)))))))
+
+(deftest public-ordered-lowering-keeps-owner-and-result-observation-gates
+  (let [options {:compiler :equation-first :target :ocl:0 :dtype :double}
+        arguments [(double-array [7.0]) (double-array 1) 1]
+        compilation (equation-first/compile #'fixture/write-before-shape (dissoc options :compiler))
+        forbidden (fn [& _] (throw (AssertionError. "refused preparation touched source or device")))]
+    (with-redefs [gpu/make-session forbidden scalar/evaluate-invocation-step forbidden
+                  scalar/evaluate-host-equation forbidden equation-first/lower forbidden]
+      (doseq [[changed expected]
+              [[(dissoc compilation :ordered-source-owner) :ordered-source-owner-mismatch]
+               [(assoc compilation :attributes {:checked-stage-result true}) :checked-stage-observation-required]]]
+        ;; The existing template key includes the actual compile function;
+        ;; each replacement below therefore owns its own template observation.
+        (with-redefs [equation-first/compile (fn [& _] changed)]
+          (is (= expected
+                 (reason #(compiled/lower #'fixture/write-before-shape arguments
+                                          options)))))))))
 
 (deftest ordinary-source-owner-cannot-be-removed-or-copied-before-resource-acquisition
   (doseq [[v arguments] [[#'fixture/shape-before-write [(double-array [7.0]) 1]]
@@ -145,11 +207,12 @@
              (reason #(link/instantiate-ordered-invocation! compilation args {})))))))
 
 (defn- check-callable-ordered-preparation! [target]
-  (let [compilation (equation-first/compile #'root-fixture/captured-entry-replay
-                                           {:target target :dtype :double})
-        x (double-array [7.0]) weights (double-array [3.0]) state (double-array 1)
-        prepared (#'compiled/prepare-ordered-equation-first
-                  compilation [x weights state (double-array 1)] {:constants '[weights]} nil)
+  (let [x (double-array [7.0]) weights (double-array [3.0]) state (double-array 1)
+        prepared (compiled/lower #'late-captured-entry-replay
+                                 [x weights state (double-array 1)]
+                                 {:compiler :equation-first :target target :dtype :double
+                                  :constants '[weights]})
+        _ (assert (:ordered-invocation prepared) "fixture must retain a genuine late host action")
         c (compiled/instantiate! prepared)]
     (try
       (aset weights 0 50.0) (aset state 0 100.0)
@@ -179,9 +242,9 @@
       (is (= 3 @(:completed-replays (:executable c))))
       (is (= [100.0] (vec state)))
       (finally (compiled/close! c))))
-  (let [compilation (equation-first/compile #'fixture/write-before-shape {:target target :dtype :double})
-        prepared (#'compiled/prepare-ordered-equation-first
-                  compilation [(double-array [7.0]) (double-array 1) Long/MAX_VALUE] {} nil)
+  (let [prepared (compiled/lower #'fixture/write-before-shape
+                                 [(double-array [7.0]) (double-array 1) Long/MAX_VALUE]
+                                 {:compiler :equation-first :target target :dtype :double})
         c (compiled/instantiate! prepared)]
     (try
       (is (instance? ArithmeticException (try (c) nil (catch Throwable error error))))
@@ -189,12 +252,12 @@
       (is (zero? @(:completed-replays (:executable c))))
       (is (= :link-execution-poisoned (reason #(c))))
       (finally (compiled/close! c))))
-  (let [compilation (equation-first/compile #'root-fixture/captured-entry-replay
-                                           {:target target :dtype :double})
-        shared (double-array [7.0])
-        prepared (#'compiled/prepare-ordered-equation-first
-                  compilation [shared shared (double-array 1) (double-array 1)]
-                  {:constants '[weights]} nil)
+  (let [shared (double-array [7.0])
+        prepared (compiled/lower #'late-captured-entry-replay
+                                 [shared shared (double-array 1) (double-array 1)]
+                                 {:compiler :equation-first :target target :dtype :double
+                                  :constants '[weights]})
+        _ (assert (:ordered-invocation prepared) "fixture must retain a genuine late host action")
         c (compiled/instantiate! prepared)]
     (try
       (is (= [14.0] (vec (value/->host (:result (c))))))
