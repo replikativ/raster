@@ -1,6 +1,68 @@
 (ns raster.compiler.core.inference-test
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.core.inference :as inf]))
+            [raster.compiler.core.inference :as inf]
+            [raster.par]))
+
+(deftest source-qualification-keeps-literals-and-parallel-binders-lexical
+  (let [scope (create-ns (gensym "raster.qualified-scopes."))
+        source '(raster.par/reduce acc 0.0 i 2 (clojure.core/+ acc (double i)))
+        quoted (with-meta '(quote [acc i]) {:literal-marker :kept})]
+    (try
+      (doseq [name '[acc i]] (intern scope name 100))
+      (is (identical? quoted (inf/qualify-body-symbols quoted scope #{})))
+      (is (= source (inf/qualify-body-symbols source scope #{})))
+      (is (= 1.0 (eval (inf/qualify-body-symbols source scope #{}))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest source-qualification-threads-sequential-and-recursive-scopes
+  (let [scope (create-ns (gensym "raster.qualified-sequential."))]
+    (try
+      (doseq [[name value] [['x 100] ['y 7] ['self (Object.)] ['n (Object.)]]]
+        (intern scope name value))
+      (let [bindings (with-meta '[before x x 2 after x] {:binding-marker :kept})
+            source (list 'let* bindings (with-meta '[before after y] {:product-marker :kept}))
+            projected (inf/qualify-body-symbols source scope #{})]
+        (is (= [100 2 7] (eval projected)))
+        (is (= :kept (:binding-marker (meta (second projected)))))
+        (is (= :kept (:product-marker (meta (last projected))))))
+      (let [source '(fn* self [n]
+                      (if (clojure.core/zero? n) 0
+                        (clojure.core/inc (self (clojure.core/dec n)))))
+            projected (inf/qualify-body-symbols source scope #{})]
+        (is (= source projected))
+        (is (= 3 ((eval projected) 3))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest source-qualification-preserves-free-reference-metadata
+  (let [scope (create-ns (gensym "raster.qualified-reference."))
+        reference (with-meta 'external {:raster.type/tag 'double :reference-marker :kept})]
+    (try
+      (intern scope 'external 3.0)
+      (let [projected (inf/qualify-body-symbols reference scope #{})]
+        (is (= (symbol (str (ns-name scope)) "external") projected))
+        (is (= (meta reference) (meta projected))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest structural-classes-move-across-namespaces-without-changing-method-names
+  (let [scope (create-ns (gensym "raster.qualified-classes."))]
+    (try
+      (doseq [class [java.io.IOException java.util.ArrayList java.util.Collections java.util.function.IntUnaryOperator]]
+        (.importClass ^clojure.lang.Namespace scope class))
+      (doseq [name '[this x applyAsInt e]] (intern scope name (Object.)))
+      (let [project #(inf/qualify-body-symbols % scope #{})
+            caught (project '(try (throw (new IOException)) (catch IOException e 7)))
+            operator (project '(reify* [IntUnaryOperator]
+                                 (applyAsInt [this x] (int (clojure.core/+ x 3)))))
+            object (eval operator)]
+        (is (= 7 (eval caught)))
+        (is (= 'java.io.IOException (second (last caught))))
+        (is (= 'applyAsInt (first (nth operator 2))))
+        (is (= 7 (.applyAsInt ^java.util.function.IntUnaryOperator object 4)))
+        (is (instance? java.util.ArrayList (eval (project '(new ArrayList)))))
+        (is (instance? java.util.ArrayList
+                       ((eval (project '(fn* [ArrayList] (new ArrayList)))) :not-a-class)))
+        (is (= [] (eval (project '(Collections/emptyList))))))
+      (finally (remove-ns (ns-name scope))))))
 
 ;; Helper to build a minimal type-env for infer-binding-tag
 (defn- type-env

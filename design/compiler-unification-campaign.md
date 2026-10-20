@@ -173,13 +173,18 @@ committed versus working inliner gives the same
 `:scalar-reduction-requires-typed-graph` refusal; this is not a passing resident
 training gate. No projection receipt or public map is granted ownership authority.
 
-Next shared scope consolidation is evidence-driven: a REPL probe confirms that
-`qualify-body-symbols` rewrites quoted symbols and mistakes `par/reduce` binders
-for same-named namespace Vars. It must use the common `form/scope-info` authority,
-preserve literal data, and retain structural class qualification. Named lambda
-self-binding is also missing from the common scope descriptor, so it needs a
-central fix rather than a qualifier-only exception. These remain open; stronger
-portable AD projection cannot rely on the current qualifier as complete.
+Shared scope consolidation follows two reproduced defects: qualification rewrote
+quoted symbols and mistook `par/reduce` binders for same-named namespace Vars.
+Qualification now uses `form/scope-info` for sequential/recursive/parallel scopes,
+leaves quoted data opaque and preserves metadata. Named lambda self-binding is
+one enclosing scope across anonymous arities, shared by free-variable analysis,
+alpha conversion and substitution. Imported catch/reify/constructor classes use
+a separate class-only structural projection; method names stay unchanged. The
+reviewed scope/qualification/AD gate passes 164 tests / 973 assertions, including
+cross-namespace class execution, recursive capture and existing AD scope controls.
+These are closed-core fixes, not arbitrary unexpanded-macro coverage or new
+authentication of type-hint metadata. They do not close numerical realization,
+entry/return conversions or the prepared import's portable admission obligation.
 
 Current integration hold: PR #1539 is draft, not qualified for merge.
 At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.

@@ -9,6 +9,29 @@
 ;; free-syms: scoped free variable collection
 ;; ================================================================
 
+(deftest named-lambda-self-is-one-shared-scope-across-arities
+  (let [source '(fn* self
+                 ([n] (self n 0))
+                 ([n acc] (if (clojure.core/zero? n) acc
+                            (self (clojure.core/dec n) (clojure.core/+ acc n)))))
+        renamed (util/alpha-convert source)
+        substituted (util/subst-syms {'self 'unrelated} source)]
+    (is (= #{} (util/free-syms source)))
+    (is (= source substituted) "the recursive name is not a free callee")
+    (is (not= 'self (second renamed)))
+    (is (= 21 ((eval source) 6) ((eval renamed) 6)))
+    (is (= 13 ((eval renamed) 4 3)))
+    (is (= #{} (util/free-syms renamed)))))
+
+(deftest named-lambda-self-does-not-capture-a-substituted-outer-value
+  (let [source '(fn* self [n]
+                 (clojure.core/+ x (if (clojure.core/zero? n) 0
+                                    (self (clojure.core/dec n)))))
+        projected (util/subst-syms {'x 'self} source)]
+    (is (not= 'self (second projected)))
+    (is (= #{'self} (util/free-syms projected)))
+    (is (= 16 ((eval (list 'fn* '[self] (list projected 3))) 4)))))
+
 (deftest lexical-vector-rewrites-retain-runtime-product-metadata
   (let [marker {:origin :source-product}
         product (with-meta ['x (with-meta ['x] marker)] marker)]

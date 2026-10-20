@@ -1834,9 +1834,17 @@ stable physical-leaf order on every backend."}
 
 (defn qualify-body-symbols
   "Qualify unqualified symbols in a walked body to their source namespace.
-	Skips: params, special forms, Java classes, already-qualified symbols."
+   Lexical scopes come from form/scope-info; quoted data is opaque. Structural
+   classes use class-only qualification, independently of lexical binders."
   [body source-ns param-set]
-  (let [;; Symbols that should not be namespace-qualified: form heads,
+  (let [class-symbol (fn [value]
+                       (if (symbol? value)
+                         (let [resolved (try (ns-resolve source-ns value) (catch Exception _ nil))]
+                           (if (class? resolved)
+                             (with-meta (symbol (.getName ^Class resolved)) (meta value))
+                             value))
+                         value))
+        ;; Symbols that should not be namespace-qualified: form heads,
         ;; cast/alloc/array ops, and special literals. Uses centralized
         ;; registries so adding a new form/op automatically excludes it.
         non-qualifiable?
@@ -1850,7 +1858,7 @@ stable physical-leaf order on every backend."}
         qualify (fn qualify [expr bound]
                   (cond
                     (symbol? expr)
-                    (cond
+                    (with-meta (cond
                       (or (contains? param-set expr)
                           (contains? bound expr)
                           (non-qualifiable? expr))
@@ -1895,43 +1903,31 @@ stable physical-leaf order on every backend."}
                           ;; -> (new X a), exposing X): qualify to its FQN
                           (class? v) (symbol (.getName ^Class v))
                           :else expr)
-                        expr))
+                        expr)) (meta expr))
+                    (and (seq? expr) (contains? #{'quote 'clojure.core/quote} (first expr))) expr
                     (seq? expr)
-                    (let [h (first expr)]
-                      (case (when (symbol? h) (symbol (name h)))
-                        (let* loop*)
-                        (let [bindings (second expr)
-                              pairs (partition 2 bindings)
-                              new-bindings
-                              (loop [ps (seq pairs) b bound acc []]
-                                (if-not ps
-                                  (vec (mapcat identity acc))
-                                  (let [[sym init] (first ps)
-                                        qinit (qualify init b)
-                                        b' (conj b sym)]
-                                    (recur (next ps) b' (conj acc [sym qinit])))))
-                              new-bound (into bound (map first pairs))
-                              body-forms (drop 2 expr)
-                              qbody (map #(qualify % new-bound) body-forms)]
-                          (with-meta (apply list h new-bindings qbody) (meta expr)))
-                        fn*
-                        (let [arities (rest expr)
-                              qualify-arity
-                              (fn [arity]
-                                (let [params-vec (first arity)
-                                      fn-bound (into bound (filter symbol? params-vec))
-                                      qbody (map #(qualify % fn-bound) (rest arity))]
-                                  (apply list params-vec qbody)))]
-                          (with-meta
-                            (if (vector? (first arities))
-                              (let [params-vec (first arities)
-                                    fn-bound (into bound (filter symbol? params-vec))
-                                    qbody (map #(qualify % fn-bound) (rest arities))]
-                                (apply list h params-vec qbody))
-                              (apply list h (map qualify-arity arities)))
-                            (meta expr)))
+                    (let [expr (form/map-structural-classes class-symbol expr)]
+                      (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expr)]
+                        (let [scope! (fn [{:keys [binders inits body aux] :as scope}]
+                                       (let [[body-bound inits]
+                                             (if sequential?
+                                               (reduce (fn [[bound rewritten] [binder init]]
+                                                         [(cond-> bound (symbol? binder) (conj binder))
+                                                          (conj rewritten (qualify init bound))])
+                                                       [bound []] (map vector binders inits))
+                                               (let [inner (into bound (filter symbol? binders))]
+                                                 [inner (mapv #(qualify % (if rec? inner bound)) inits)]))]
+                                         (cond-> (assoc scope :inits inits :body (mapv #(qualify % body-bound) body))
+                                           aux (assoc :aux (mapv #(qualify % body-bound) aux)))))]
+                          (rebuild (mapv scope! scopes) (mapv #(qualify % bound) outer)))
                         (with-meta (apply list (map #(qualify % bound) expr)) (meta expr))))
-                    (vector? expr) (mapv #(qualify % bound) expr)
+                    (vector? expr) (with-meta (mapv #(qualify % bound) expr) (meta expr))
+                    (record? expr) (reduce-kv (fn [result key value]
+                                               (assoc result key (qualify value bound))) expr expr)
+                    (map? expr) (with-meta (into (empty expr) (map (fn [[key value]]
+                                                                   [(qualify key bound) (qualify value bound)])) expr)
+                                          (meta expr))
+                    (set? expr) (with-meta (into (empty expr) (map #(qualify % bound)) expr) (meta expr))
                     :else expr))]
     (qualify body #{})))
 

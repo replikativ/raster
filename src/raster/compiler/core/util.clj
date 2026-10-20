@@ -73,7 +73,7 @@
      (symbol? e) (if (free-leaf? e bound) #{e} #{})
 
      ;; quote is opaque — its contents are data, not code
-     (and (seq? e) (= 'quote (first e))) #{}
+     (and (seq? e) (contains? #{'quote 'clojure.core/quote} (first e))) #{}
 
      (seq? e)
      (if-let [{:keys [scopes outer sequential? rec?]} (form/scope-info e)]
