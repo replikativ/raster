@@ -773,7 +773,7 @@
       record)))
 
 (defn ^:no-doc retained-typed-return-bridge
-  "Observe an actual unguarded FP-static-return → Object invk boxing edge.
+  "Observe an actual unguarded primitive-static-return → Object invk boxing edge.
    This is payload correspondence, not permission to erase an Object use or
    change a parent's arithmetic overload. Missing/legacy/split emissions abstain.
    Actual body emission must already match its primitive return without a hidden
@@ -789,8 +789,8 @@
       (let [{:keys [kind payload-carrier result-carrier interface invocation-method
                     compute-method parameter-carriers compute-parameter-carriers] :as bridge}
             (first candidates)]
-        (when (and (= :boxed-fp-static-return kind)
-                   (contains? #{Double/TYPE Float/TYPE} payload-carrier)
+        (when (and (= :boxed-primitive-static-return kind)
+                   (contains? #{Double/TYPE Float/TYPE Long/TYPE} payload-carrier)
                    (identical? Object result-carrier)
                    (class? interface) (.isInterface ^Class interface)
                    (.isInstance ^Class interface implementation)
@@ -806,7 +806,7 @@
                    (= parameter-carriers compute-parameter-carriers
                       (vec (.getParameterTypes ^java.lang.reflect.Method invocation-method))
                       (vec (.getParameterTypes ^java.lang.reflect.Method compute-method)))
-                   (every? #{Double/TYPE Float/TYPE} parameter-carriers)
+                   (every? #{Double/TYPE Float/TYPE Long/TYPE} parameter-carriers)
                    (= (count (:params emission)) (count parameter-carriers))
                    (every? true? (map (fn [parameter carrier]
                                        (= (class-type->stack carrier)
@@ -6320,10 +6320,10 @@
                                                        ;; Record this actual unguarded wrapper edge,
                                                        ;; not a logical return-tag interpretation.
                                                        (when (and (= ret-cd obj-cd)
-                                                                  (contains? #{Double/TYPE Float/TYPE}
+                                                                  (contains? #{Double/TYPE Float/TYPE Long/TYPE}
                                                                              (.getReturnType compute-method)))
                                                          (reset! return-bridge
-                                                                 {:kind :boxed-fp-static-return
+                                                                 {:kind :boxed-primitive-static-return
                                                                   :payload-carrier (.getReturnType compute-method)
                                                                   :result-carrier Object}))
                                                        (let [crd (.descriptorString ^ClassDesc compute-ret-cd)]
