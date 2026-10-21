@@ -21,6 +21,11 @@
   (scalar-helper (arrays/aget xs index)))
 (deftm let-array-input [xs :- (Array double) index :- Long] :- Double
   (let [copy xs] (scalar-helper (arrays/aget copy index))))
+(deftm unused-input-helper [x :- Double xs :- (Array double)] :- Long 7)
+(deftm unused-input-call [x :- Double xs :- (Array double)] :- Long
+  (unused-input-helper x xs))
+(deftm nested-input-call [x :- Double] :- Double
+  (scalar-helper (scalar-helper x)))
 
 (use-fixtures :once
   (fn [run]
@@ -74,6 +79,62 @@
     ;; is Object-carried, whereas the original parameter is primitive.
     (is (= {:double 1 :ref 1} (frequencies (map :type ports))))
     (is (= 2 (count (set (map :slot ports)))))))
+
+(deftest actual-input-completions-do-not-confuse-ports-with-emitted-carriers
+  (let [emitted (emission #'shadowed-calls)
+        records (mapv #(bytecode/retained-invocation-context emitted %) (helper-occurrences emitted))]
+    (is (= #{:identity :coerce}
+           (set (map #(get-in % [:input-completions 0 :adaptation]) records))))
+    (doseq [record records]
+      (let [input (first (:inputs record)) completion (first (:input-completions record))]
+        (is (identical? (:operand input) (:operand completion)))
+        (is (= Double/TYPE (:parameter-carrier completion)))
+        (is (= (:type (first (vals (:ports input)))) (:emitted-type completion))))))
+  (let [emitted (emission #'narrowing-call)
+        call (first (filter #(= 'raster.compiler.backend.jvm.invocation-context-owner-test/float-helper
+                                (:raster.op/original (meta %)))
+                            (vals (:invocation-catalog emitted))))
+        completion (first (:input-completions (bytecode/retained-invocation-context emitted call)))]
+    (is (= :float (:emitted-type completion)))
+    (is (= Float/TYPE (:parameter-carrier completion)))
+    (is (= :identity (:adaptation completion))
+        "identity AFTER emitting the explicit checked cast does not erase that cast")))
+
+(deftest actual-input-completions-include-unused-reference-and-primitive-formals
+  (let [emitted (emission #'unused-input-call)
+        call (first (filter #(= 'raster.compiler.backend.jvm.invocation-context-owner-test/unused-input-helper
+                                (:raster.op/original (meta %)))
+                            (vals (:invocation-catalog emitted))))
+        record (bytecode/retained-invocation-context emitted call)
+        completions (:input-completions record)]
+    (is (= 7 (unused-input-call 3.0 (double-array 0))))
+    (is (= 7 (unused-input-call 3.0 nil)) "reference checks preserve null")
+    (is (= 2 (count completions)))
+    (is (= [:double :ref] (mapv :emitted-type completions)))
+    (is (= [Double/TYPE (class (double-array 0))] (mapv :parameter-carrier completions)))
+    (is (= [:identity :checkcast] (mapv :adaptation completions)))
+    (is (every? true? (map #(identical? (:operand %1) (:operand %2))
+                          (:inputs record) completions)))))
+
+(deftest nested-input-completions-belong-to-their-own-invocations
+  (let [emitted (emission #'nested-input-call)
+        calls (vec (helper-occurrences emitted))
+        records (mapv #(bytecode/retained-invocation-context emitted %) calls)]
+    (is (= 81.0 (nested-input-call 3.0)))
+    (is (= 2 (count records)))
+    (doseq [record records]
+      (is (some? record))
+      (is (= 1 (count (:input-completions record))))
+      (is (identical? (get-in record [:inputs 0 :operand])
+                      (get-in record [:input-completions 0 :operand])))
+      (is (= Double/TYPE (get-in record [:input-completions 0 :parameter-carrier]))))
+    (is (not (identical? (get-in records [0 :input-completions 0 :operand])
+                         (get-in records [1 :input-completions 0 :operand]))))
+    (let [outer (first (filter #(seq? (get-in % [:inputs 0 :operand])) records))
+          inner (first (remove #(identical? outer %) records))]
+      (is (some? outer))
+      (is (identical? (get-in outer [:input-completions 0 :operand]) (:expression inner))
+          "the actual emitted child, not its pre-expansion catalog form, supplies the operand"))))
 
 (deftest outlined-inputs-preserve-the-original-physical-lexical-abi
   (let [emitted (emission #'shadowed-calls)]
@@ -185,6 +246,8 @@
       (is (= 1 (count (:invocation-contexts @inputs))))
       (is (= :unsupported (:status record)))
       (is (= :runtime-selected-input-context (:reason record)))
+      (is (not (contains? record :input-completions))
+          "the guarded typed fast path does not describe the IFn fallback")
       (is (= :guarded-local-typed-interface (:invocation-mode record)))
       (is (= :ref (get-in record [:receiver-input :ports local :type])))
       (is (false? (get-in record [:receiver-input :ports local :verified]))))))
@@ -206,7 +269,8 @@
                      (vals (:invocation-contexts @inputs))))]
     (let [records (compile! (list 'let* ['a call 'b call] 'b))]
       (is (= 1 (count records)))
-      (is (= :ambiguous (:status (first records)))))
+      (is (= :ambiguous (:status (first records))))
+      (is (not (contains? (first records) :input-completions))))
     (let [records (compile! (list 'let* ['a call] [call]))]
       (is (= 1 (count records)))
       (is (= :ambiguous (:status (first records))))

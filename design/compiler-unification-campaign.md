@@ -75,7 +75,9 @@ receipts establish source behavior, not a reduction-domain or training proof.
 PR #1552 is squash-merged as `c389b458` after all seven contexts passed on exact
 head `050e635f`. The draft also adopts main's identical scoped unit APT setup and
 bounded OpenCL retries, keeping infrastructure failures separate from compiler
-failures. PR #1553 requires its own complete exact-head CI qualification.
+failures. PR #1553 subsequently passed all seven contexts at exact head
+`a93d6f91` and squash-merged as `5baa8b30`; this focused source-cast landing
+does not qualify the broad draft.
 
 After `ab49dcb6`, a fresh capped REPL compiles the unchanged public `local-loss`
 fixture through equation-first to portable OpenCL source, with semantic/scheduled
@@ -135,6 +137,35 @@ No global origin registry, generated-name search, post-hoc syntax equality or
 metadata safety flag can replace this chain. A diagnostic-only count certificate
 would not close the unchanged gradient. The checked-cast repair is complete at
 its own source boundary; these reconstruction/composition obligations remain.
+
+The first actual normalization edge is implemented in `bf0e5dae`: the original
+uniquifier retains exact constructed occurrences and lexical environments, and
+the prefix consumer uses that local witness instead of rematching the normalized
+root. Copied/ambiguous occurrences abstain; historical source identity is adopted
+by downstream owners. Its 16-namespace gate passed 240 tests / 2,408 assertions,
+with two additional artifact portability controls passing nine assertions. This
+does not yet connect helper substitution or later reduction lifting.
+
+The next prerequisite records actual typed invocation argument completions in
+the existing JVM emitter observation. Three identical emission loops share one
+implementation; each observed input retains its exact emitted operand, stack
+category, reflected parameter Class and identity/coercion/checkcast branch.
+Every formal is represented, including unused ones. Guarded IFn fallbacks supply
+no such evidence, and duplicate occurrences remain ambiguous. Identity means
+identity AFTER operand emission: explicit casts, effects and Object boxing inside
+that operand remain mandatory. This is not Clojure source input conversion and
+does not authorize substitution or return conversion. New nested, unused-formal,
+physical-port and ambiguity controls pass 12 tests / 109 assertions; the final
+six-namespace affected gate passes 62 tests / 481 assertions. The independent
+review found no factoring blocker.
+
+Fresh broad-draft CI at `bf0e5dae` is NOT green: emission job 33367 reports 145
+of 172 public fixtures passing and 27 failures, including definition-observation
+instability (`raster.math/log_m_float-impl`) and portable map/fold-map lowering
+refusals. This supersedes describing the draft's remaining vendor gate as a
+single known running-variance refusal. No fixture was skipped or permission
+relaxed; the full failure inventory and source preparation/lowering repairs
+remain required before broad landing.
 
 ### October 21 ordered host-integral qualification
 

@@ -988,7 +988,7 @@
       record)))
 
 (defn- retain-invocation-context!
-  [method receiver arguments mode return-carrier locals ctx]
+  [method receiver arguments mode return-carrier completions locals ctx]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
       (let [visible (set (keys locals))
@@ -1007,6 +1007,8 @@
                     :invocation-mode mode :return-carrier return-carrier
                     :element-type (:element-type ctx)
                     :inputs (mapv input arguments)}
+                     (and (not guarded?) completions)
+                     (assoc :input-completions completions)
                      guarded? (assoc :reason :runtime-selected-input-context))]
         (retain-call-observation! ctx :invocation-contexts record
                                   :repeated-emitted-invocation-context)))))
@@ -3084,6 +3086,27 @@
     (emit-object-value code expression locals ctx)
     (emit-form code expression locals ctx)))
 
+(defn- emit-typed-call-arguments
+  "Emit the actual typed invocation's inputs once, in order. Optional owner-local
+   observations describe the conversion AFTER operand emission, not inferred
+   source types or permission to omit the operand's own evaluation/boxing."
+  [code arguments parameter-types locals ctx observe?]
+  (let [observations (when observe? (volatile! []))]
+    (doseq [[argument ^Class carrier] (map vector arguments parameter-types)]
+      (let [actual (emit-argument-value code argument carrier locals ctx)
+            target (class-type->stack carrier)
+            adaptation (cond (not= actual target) :coerce
+                             (and (= actual :ref) (not= carrier Object)) :checkcast
+                             :else :identity)]
+        (case adaptation
+          :coerce (emit-coerce code actual target)
+          :checkcast (.checkcast code (class-desc-of carrier))
+          :identity nil)
+        (when observations
+          (vswap! observations conj {:operand argument :emitted-type actual
+                                     :parameter-carrier carrier :adaptation adaptation}))))
+    (when observations @observations)))
+
 (defn- emit-java-static-call
   "Emit bytecode for Java static method calls (e.g. Math/sin, System/arraycopy).
   Resolves the class and method via reflection, disambiguates overloads by
@@ -4100,25 +4123,16 @@
                                     (void Void)       Void/TYPE
                                     nil))
             is-var? (and (namespace obj) (not (get locals obj)))
-            _ (retain-invocation-context!
-               method obj (vec method-args)
-               (cond is-var? :global-typed-indy
-                     (:verified (get locals obj)) :local-typed-interface
-                     :else :guarded-local-typed-interface)
-               (if is-var? (or prim-ret-class ret-class) ret-class) locals ctx)]
+            completions (volatile! nil)]
         (if is-var?
           ;; Var reference (e.g. raster.numeric/_plus__m_double_double-impl)
           ;; → emit args first, then invokedynamic (static-like, no receiver).
           ;; Uses primitive return type when available → bootstrap targets compute_prim
           ;; for zero-boxing cross-function calls.
           (let [^Class indy-ret-class (or prim-ret-class ret-class)]
-            (doseq [[arg ^Class pt] (map vector method-args param-types)]
-              (let [t (emit-argument-value code arg pt locals ctx)
-                    target (class-type->stack pt)]
-                (if (not= t target)
-                  (emit-coerce code t target)
-                  (when (and (= t :ref) (not (.equals pt Object)))
-                    (.checkcast code (class-desc-of pt))))))
+            (vreset! completions
+                     (emit-typed-call-arguments code method-args param-types locals ctx
+                                                (boolean me/*emission-inputs*)))
             (ensure-bootstrap-class!)
             (let [call-mt (MethodTypeDesc/of (class-desc-of indy-ret-class)
                                              (into-array ClassDesc (mapv class-desc-of param-types)))
@@ -4145,13 +4159,9 @@
               ;; The method signature guarantees f is IFn__. C2 devirtualizes
               ;; via type profiling — zero instanceof overhead.
               (do (emit-form code obj locals ctx)
-                  (doseq [[arg ^Class pt] (map vector method-args param-types)]
-                    (let [t (emit-argument-value code arg pt locals ctx)
-                          target (class-type->stack pt)]
-                      (if (not= t target)
-                        (emit-coerce code t target)
-                        (when (and (= t :ref) (not (.equals pt Object)))
-                          (.checkcast code (class-desc-of pt))))))
+                  (vreset! completions
+                           (emit-typed-call-arguments code method-args param-types locals ctx
+                                                      (boolean me/*emission-inputs*)))
                   (.invokeinterface code iface-cd "invk" call-mt))
               ;; === UNVERIFIED: instanceof guard with boxed fallback ===
               (let [fast-label (.newLabel code)
@@ -4173,15 +4183,15 @@
                 ;; FAST PATH: typed .invk with primitives
                 (.labelBinding code fast-label)
                 (.checkcast code iface-cd)
-                (doseq [[arg ^Class pt] (map vector method-args param-types)]
-                  (let [t (emit-argument-value code arg pt locals ctx)
-                        target (class-type->stack pt)]
-                    (if (not= t target)
-                      (emit-coerce code t target)
-                      (when (and (= t :ref) (not (.equals pt Object)))
-                        (.checkcast code (class-desc-of pt))))))
+                (emit-typed-call-arguments code method-args param-types locals ctx false)
                 (.invokeinterface code iface-cd "invk" call-mt)
                 (.labelBinding code end-label)))))
+        (retain-invocation-context!
+         method obj (vec method-args)
+         (cond is-var? :global-typed-indy
+               (:verified (get locals obj)) :local-typed-interface
+               :else :guarded-local-typed-interface)
+         (if is-var? (or prim-ret-class ret-class) ret-class) @completions locals ctx)
         ;; Stack type: primitive for invokedynamic with compute_prim, :ref for local path
         (if (and is-var? prim-ret-class)
           (class-type->stack prim-ret-class)
