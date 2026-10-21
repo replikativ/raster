@@ -47,7 +47,9 @@
   [coefficient :- Double values :- (Array float) rows :- Long columns :- Long] :- (Array float)
   (let [out (float-array (* rows columns))]
     (par/map-void! i (* rows columns)
-      (aset out i (float (* coefficient (double (aget values i))))))
+      (let [row (quot i columns)
+            column (rem i columns)]
+        (aset out i (float (* coefficient (double (aget values (+ (* row columns) column))))))))
     out))
 
 (deftm checked-scale-effect!

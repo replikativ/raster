@@ -12,6 +12,7 @@
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.stage-result :as result]
             [raster.compiler.passes.parallel.checked-map-stage :as checked]
+            [raster.compiler.passes.parallel.map-read-requirements :as reads]
             [raster.compiler.passes.parallel.resident-program-projection :as resident]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.gpu.core :as gpu]
@@ -302,6 +303,19 @@
                        (catch clojure.lang.ExceptionInfo error error))]
         (is (= :checked-map-stage-declined (:reason (ex-data error))))
         (is (= requirement (:requirement (ex-data error))))))))
+
+(deftest address-projection-must-preserve-the-outer-conversion-contract
+  (let [equation (numerical-equation (compilation (first targets)))
+        source (equation-graph/make (:algorithm equation) (:body equation))
+        original reads/validate-and-project-addresses]
+    (with-redefs [reads/validate-and-project-addresses
+                  (fn [& arguments]
+                    (update-in (apply original arguments) [:scalar-region :result]
+                               #(list (first %) (assoc (second %) :overflow :ieee) (nth % 2))))]
+      (let [error (try (checked/plan (:algorithm equation) source {}) nil
+                       (catch clojure.lang.ExceptionInfo error error))]
+        (is (= :checked-map-stage-declined (:reason (ex-data error))))
+        (is (= :projected-result-conversion (:requirement (ex-data error))))))))
 
 (deftest completed-status-protocol-is-bounded-and-empty-safe
   (let [equation (numerical-equation (compilation (first targets)))

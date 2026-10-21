@@ -192,7 +192,7 @@
         node (first (:nodes source-graph))
         operation (:operation node)
         region (:scalar-region operation)
-        {:keys [attributes operand]} (conversion/canonical-parts (:result region))
+        {:keys [attributes]} (conversion/canonical-parts (:result region))
         output (:out-sym operation)
         {index :name bound :bound} (first (get-in operation [:space :dims]))
         unmet (cond
@@ -219,6 +219,12 @@
             (decline! "checked map requires a single write-only outer Double-to-Float result"
                       {:operation (:id operation) :conversion attributes :requirement unmet}))
         projected (reads/validate-and-project-addresses operation node source-graph)
+        projected-conversion (conversion/canonical-parts
+                              (get-in projected [:scalar-region :result]))
+        _ (when-not (= attributes (:attributes projected-conversion))
+            (decline! "map address projection changed its outer conversion contract"
+                      {:requirement :projected-result-conversion}))
+        projected-operand (:operand projected-conversion)
         requirements (get-in node [:read-capacity-certificate :requirements])
         _ (when-not (set/subset? (:inputs operation) (set (keys requirements)))
             (decline! "checked map requires a complete independent source read-domain proof"
@@ -229,10 +235,12 @@
                         "checked_above_" "checked_float_"])
         ;; This private schedule input exposes the original Double producer. No
         ;; unchecked source conversion is invented and no target emits this
-        ;; intermediate value as the source result.
+        ;; intermediate value as the source result. Use the projected operand:
+        ;; certified address locals may already have been expanded and pruned.
+        ;; Restoring the pre-projection operand would reintroduce unbound locals.
         producer (-> projected
                      (assoc :dtype :double :cast-fn nil)
-                     (assoc-in [:scalar-region :result] operand))
+                     (assoc-in [:scalar-region :result] projected-operand))
         scalar-types (merge (:scalar-types options)
                             (into {} (map (juxt :id :dtype)) (:scalars source-graph)))
         shapes (into {} (map (fn [buffer] [(:id buffer) [(:elements buffer)]]))

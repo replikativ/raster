@@ -114,6 +114,30 @@ now reaches a distinct map-body index-scope refusal (`rstr_local_7` undeclared).
 That is the next source/lowering investigation, not a qualified RMS execution
 claim. Internal checked conversions and the draft's broader red gates remain.
 
+### October 21 preserve the projected checked-map operand
+
+The subsequent index-scope refusal was a concrete cross-pass bug: read-address
+projection expanded and pruned certified quotient/remainder locals correctly,
+then checked-map planning restored the conversion operand captured before that
+projection. The producer now takes both locals and operand from the same
+projected region and explicitly requires unchanged outer conversion attributes.
+No scalar rule, numerical permission or source correspondence was invented.
+
+The product-shaped map fixture now reconstructs an input coordinate from explicit
+quotient/remainder locals. Before the fix it reproduced an undeclared-local
+refusal; afterward the existing changed-input/zero-domain/failure-publication
+tests execute it on both OpenCL and Level Zero. A mutation control rejects changed
+conversion semantics. The five affected address/extent/checked-stage/reporting/
+device namespaces pass 55 tests / 800 assertions; review found no blocker.
+
+Unchanged `rms-norm-chunked` now emits three CUDA source kernels. Actual Level Zero
+checked instantiation still refuses before device execution at
+`:unclosed-ordered-source-executor`, context `:scalar-compute`, for an allocation
+extent introduced through `alloc-like`; no original-source correspondence is
+available for that imported helper step. This is evidence for the already-open
+helper substitution/source-ownership transport, not permission to guess origins
+or use a fallback. Full RMS execution and vendor compilation remain unqualified.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast
