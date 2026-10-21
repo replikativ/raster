@@ -175,6 +175,18 @@ establish resident training composition; the explicit host-result API and all
 ownership/publication guards remain required. Draft CI is still red in broader
 unit/emission qualification; do not merge it based on these local receipts.
 
+The existing ordered-prefix scalar preparation now uses that same authenticated
+entry projection instead of independently consulting editable frontend definition
+fields. Missing physical evidence still abstains after ownership/history checks;
+a nonnil foreign entry still throws. This preserves optional capability behavior
+without treating stale or contradictory evidence as absence. Required executor
+coverage remains the runtime gate; an owner with no prepared scalar executor is
+not permission to execute an unsupported source action. Independent review
+confirmed the shared boundary and caught the needed absence/contradiction split.
+The bounded REPL's four affected lineage/checked-owner/terminal-owner/source-order
+namespaces pass 57 tests / 440 assertions, including both required and optional
+foreign-selection refusal and missing optional physical evidence.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification

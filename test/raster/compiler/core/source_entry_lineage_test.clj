@@ -79,6 +79,9 @@
            (is (= :retained-frontend-entry-mismatch
                   (reason #(entry/frontend-body-entry-carriers
                             (assoc frontend :definition foreign-definition) source))))
+           (with-redefs [entry/original-body-entry-carriers (fn [& _] nil)]
+             (is (nil? (entry/frontend-body-entry-carriers frontend source))
+                 "missing optional physical evidence is not permission to substitute another entry"))
            ;; Also fence the physical projection independently: authenticating
            ;; discovery is not permission to trust a later foreign entry result.
            (with-redefs [entry/original-body-entry-carriers

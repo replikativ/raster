@@ -147,6 +147,23 @@
        (is (= :unowned-checked-result-frontend
               (reason #(owner/compile-ordered-source (Object.) (Object.) public nil))))))))
 
+(deftest checked-owner-authenticates-physical-selection-even-in-optional-mode
+  (let [public (source)]
+    (entry/call-with-definition-inputs
+     (fn []
+       (entry/observe-definition-input! public (:ns (meta public)) (:name (meta public)))
+       (let [original-frontend (frontend public)
+             foreign (assoc-in original-frontend [:definition :parameters] [])]
+         (doseq [required? [true false]]
+           (is (= :retained-frontend-entry-mismatch
+                  (reason #(owner/compile-ordered-source
+                            (Object.) (Object.) public foreign required?)))))
+         (with-redefs [entry/original-body-entry-carriers (fn [& _] nil)]
+           (let [program (Object.) emission (Object.)
+                 prepared (owner/compile-ordered-source program emission public original-frontend false)]
+             (is (some? prepared) "missing optional scalar capability does not invent an invalid owner")
+             (is (identical? prepared (owner/assert-ordered-source! prepared program emission))))))))))
+
 (deftest checked-owner-cannot-authenticate-replaced-bootstrap-intrinsics
   ;; Materialize original fixtures BEFORE replacing a bootstrap dependency.
   ;; Otherwise their genuinely stale emissions must continue refusing afterward.

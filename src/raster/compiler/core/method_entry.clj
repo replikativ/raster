@@ -850,7 +850,7 @@
    Re-observe the registered selection before consulting physical entry facts;
    the editable frontend :definition is never carrier authority. This neither
    emits nor invokes code and requires the enclosing definition owner. Missing
-   or changed correspondence refuses rather than substituting another entry."
+   physical evidence abstains; contradictory or changed ownership throws."
   [frontend source-var]
   (assert-frontend-source! frontend source-var)
   (let [current (original-source-frontend source-var)
@@ -874,10 +874,10 @@
           actual-implementation (if (:receiver-var definition)
                                   (get-in definition [:entry :typed-impl])
                                   (get-in definition [:entry :target-fn]))]
-      (when-not (and physical
-                     (source-entry-matches-selection? (:source-entry frontend) definition source-var)
-                     (identical? (:entry selected) (:entry definition))
-                     (identical? (:implementation frontend) actual-implementation))
+      (when (and physical
+                 (not (and (source-entry-matches-selection? (:source-entry frontend) definition source-var)
+                           (identical? (:entry selected) (:entry definition))
+                           (identical? (:implementation frontend) actual-implementation))))
         (throw (ex-info "physical carrier facts belong to another frontend entry"
                         {:reason :retained-frontend-entry-mismatch})))
       (assert-definition-inputs-current! @*emission-inputs*)

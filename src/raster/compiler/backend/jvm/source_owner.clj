@@ -289,11 +289,8 @@
 
 (defn- prepare-scalar-steps [program frontend source-var source-ns policy collector]
   (let [plan (get-in program [:attributes :invocation-plan])
-        definition (:definition frontend)
         source-expressions (into {} (map vec) (partition 2 (second (:source program))))
-        entry (entry/original-body-entry-carriers
-               (:operation definition) (:implementation-op definition)
-               (count (:parameters definition)) source-var)]
+        entry (entry/frontend-body-entry-carriers frontend source-var)]
     (if-not (and entry (= (:parameters entry) (mapv :symbol (:parameters plan))))
       {:steps {} :entry-ports nil}
       (assoc
