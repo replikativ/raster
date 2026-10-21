@@ -158,6 +158,16 @@ grants no production admission. The next connected implementation must retain
 the actual type-elaboration edge and consume helper intervals in source-prefix
 validation and original source execution; it must not infer provenance by names.
 
+The focused main extraction is PR #1557 at `52a05e5d`, with exactly the shared
+helper, region-copy traversal, and the no-op/quote-safe AD hoister (main did not
+yet have the draft's earlier hoister repair). Independent review of its actual
+six-file diff found no blocker or broad-only API dependency. Its exact 67 on-disk
+test declarations pass 368 assertions in the reused development process; fresh
+exact-head CI remains the merge gate. #1556's apparent status delay was verified
+through CircleCI's workflow API: setup/build succeeded and downstream jobs were
+queued, not absent from configuration. Both exact-head guarded monitors are
+active at this checkpoint; neither PR is recorded as merged or fully qualified.
+
 ### October 21 shared operand outlining retains original method dependencies
 
 A real same-class sibling/global collision reproduced wrong execution in an
