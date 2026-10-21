@@ -135,6 +135,16 @@ assertions. That warm result does not qualify the initial cold failure, which
 remains under investigation. Original selected-call execution and unchanged
 training acceptance remain open; this is correspondence infrastructure only.
 
+The fresh diagnostic confirms the cold fixture's optional selected Method was
+absent while its source policy was valid. That host-execution test no longer
+borrows the global numeric operation's dispatch table: it authenticates its own
+registered fixture operation, retaining the deliberately misleading nominal
+metadata and all original receiver, failure-order and no-redispatch controls.
+The same gate order in a fresh 900 MiB REPL then passes the origin namespace
+(10 tests / 95 assertions) and all four physical-observation namespaces (52 tests /
+539 assertions). No production guard is weakened or extra warm-up lookup added.
+The existing ordered-source namespace separately passes 15 tests / 112 assertions.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long

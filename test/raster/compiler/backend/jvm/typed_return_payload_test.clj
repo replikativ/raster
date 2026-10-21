@@ -28,15 +28,19 @@
       {:scope scope :generic (ns-resolve scope '*) :source source
        :receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))})))
 
+(defn- fixture-call [fixture]
+  ;; Keep deliberately misleading nominal metadata distinct from the actual
+  ;; fixture receiver. Host execution must follow the latter.
+  (with-meta
+    (list '.invk (symbol (str (:scope fixture))
+                         (str (:name (meta (:receiver fixture))))) 'a 'b)
+    {:raster.op/original 'raster.numeric/*}))
+
 (defn- with-selected-fixture [fixture run!]
   ;; Only the original operation's table selects this actual typed call. No
   ;; numerical invocation goes through the temporarily described generic root.
   (let [generic #'n/* original (meta generic)
-        receiver (:receiver fixture)
-        call (with-meta
-               (list '.invk (symbol (str (:scope fixture))
-                                    (str (:name (meta receiver)))) 'a 'b)
-               {:raster.op/original 'raster.numeric/*})]
+        call (fixture-call fixture)]
     (try
       (alter-meta! generic assoc :raster.core/dispatch-table
                    (:raster.core/dispatch-table (meta (:generic fixture))))
@@ -363,9 +367,7 @@
   (let [{:keys [scope receiver] :as fixture}
         (fixture! "raster.selected-host-source." '(clojure.core// x y))]
     (try
-      (with-selected-fixture
-        fixture
-        (fn [call]
+      (let [call (fixture-call fixture)]
           (core/ensure-bytecode-implementation! receiver)
           (is (= 2.0 (clojure.lang.Reflector/invokeInstanceMethod
                        @receiver "invk" (object-array [4.0 2.0]))))
@@ -380,9 +382,14 @@
               "do not begin argument evaluation before refusing a missing source context")
           (entry/call-with-definition-inputs
            (fn []
-             (let [projection (entry/selected-parameter-carriers 'raster.numeric/* (second call) 2)
+             (let [projection (entry/selected-parameter-carriers
+                               (symbol (str (ns-name scope)) "*") (second call) 2)
                    method (:invocation-method projection)
                    policy (:raster.core/source-policy (meta (:source fixture)))
+                   _ (is (instance? java.lang.reflect.Method method)
+                         (pr-str {:missing-selected-host-method (nil? method)
+                                  :projection-present (some? projection)
+                                  :source-policy policy}))
                    collector entry/*emission-inputs*
                    execute (source-owner/compile-function
                             '[a b] call (fn [parameters body] (list 'fn* parameters body))
@@ -431,7 +438,7 @@
                                scope {'a nil} ordered evaluate-ordered)))
                  (is (thrown? ArithmeticException
                               (typed-scalar/evaluate-expression
-                               scope {'a 1.0} ordered evaluate-ordered)))))))))
+                               scope {'a 1.0} ordered evaluate-ordered))))))))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest scalar-lowering-refuses-an-actually-selected-noncanonical-implementation
