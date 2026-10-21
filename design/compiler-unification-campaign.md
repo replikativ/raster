@@ -335,6 +335,17 @@ Acceptance must still rerun unchanged `local-loss` and `local-gradient-sum` with
 changed inputs and independent numerical/device oracles; successful scalar frames
 alone cannot close campaign items 3 or 5.
 
+The unchanged production `local-loss` probe now independently confirms that
+boundary: source compilation succeeds, with 12 actual type-elaboration edges and
+five builder observations. `linear-nb` has an authenticated root caller, unchanged
+argument occurrences and callee import. `mse-loss` has an authenticated root caller
+and callee import, but its numerical prediction argument was actually rewritten,
+so the unchanged-argument query correctly abstains. `alloc-like` and two `oftype`
+calls have authentic callee imports but no root-normalization origin. These are
+hierarchical import/frame and numerical-result correspondence gaps, not evidence
+for weakening a flag or adding a root-prefix special case. No device allocation,
+numerical execution or training/performance claim follows from this source probe.
+
 ### October 21 original reduction count execution and outline hygiene
 
 The shared owned-input outliner now supports an original reduction's WHOLE
