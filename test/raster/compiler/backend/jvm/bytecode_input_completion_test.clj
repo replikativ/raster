@@ -10,12 +10,53 @@
 (deftm retained-caller [x :- Double] :- Double (retained-helper x))
 (deftm nullable-caller [x :- Double] :- Double (nullable-helper x))
 
+(defonce input-calls (atom 0))
+(defn input [value]
+  (swap! input-calls inc)
+  (+ (double value) 1.0))
+
 (defn- typed-helper-call [caller argument]
   (let [source (core/resolve-deftm-var caller)
         body (core/ensure-walked-body! source)
         call (first (filter #(and (seq? %) (= '.invk (first %))) (tree-seq coll? seq body)))]
     (assert call "test requires an actual walked typed invocation")
     (with-meta (list (first call) (second call) argument) (meta call))))
+
+(deftest outlined-input-does-not-capture-a-global-input-function
+  (let [body (typed-helper-call #'retained-caller '(input value))
+        interface (types/ensure-fn-interface! '[double])
+        {:keys [implementation emission]}
+        (#'core/emit-owned-bytecode!
+         bytecode/compile-typed-impl! "raster.compiled.GlobalInputOperand"
+         '[value] '[double] 'double [body]
+         (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+         (:iface-name interface) 'global-input-operand)
+        original (first (:body emission))
+        before @input-calls
+        region (bytecode/compile-invocation-input-region emission original 0)
+        method-name (.getName ^java.lang.reflect.Method (:method region))]
+    (is (= before @input-calls) "outlining does not execute the operand")
+    (is (not= "input" method-name))
+    (is (= (str (get-in region [:spec :name])) method-name))
+    ;; Do not run the old recursively self-capturing method after it fails the
+    ;; name assertion: the failure is already established without stack growth.
+    (when (not= "input" method-name)
+      (doseq [value [-0.0 2.0 -3.5 Double/POSITIVE_INFINITY Double/NaN]]
+        (let [before @input-calls
+              expected (implementation value)
+              actual ((:invoke region) value)]
+          (is (= (+ before 2) @input-calls))
+          (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual))))))))
+
+(deftest outlined-method-name-avoids-qualified-and-bound-source-names
+  (let [choices (atom ['taken 'bound 'fresh])
+        allocate (fn [& _] (let [choice (first @choices)] (swap! choices subvec 1) choice))
+        chosen (with-redefs [clojure.core/gensym allocate]
+                 (#'bytecode/fresh-input-method-name
+                  {:params '[parameter]
+                   :walked-body '[(let* [bound 1] (other/taken bound))]}))]
+    (is (= 'fresh chosen))
+    (is (empty? @choices))))
 
 (defn- compiled
   ([params body] (compiled params body 'Object))
