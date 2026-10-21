@@ -37,6 +37,15 @@ shadowing, forged carriers and missing owners before session/materialization.
 This is a bounded step-2 prerequisite, not qualification of the MSE quotient,
 selected helper payloads, prepared-AD imports or unchanged training workload.
 
+The subsequent emission triage reproduces one fixture-contract mismatch:
+`raster.linalg.contract/contract-mm` declares Double arrays but its vendor gate
+requested Float source specialization. That fixture now requests Double; existing
+generic Float contractions retain their separate gates. The production mismatch
+refusal is unchanged. A retained-frontend namespace gate passes 6 tests / 33
+assertions, including both hardware-free CUDA/HIP emissions, all three Double
+pointer slots and rejection of the Float request. Vendor compilation and runtime
+qualification remain separate; the other aggregate emission refusals remain open.
+
 ### October 21 primitive math completion
 
 Eight audited primitive FP math rows (sqrt, floor, sin, cos, tan, exp, log and

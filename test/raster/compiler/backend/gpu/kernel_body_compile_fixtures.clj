@@ -651,7 +651,9 @@
       (:kernels (compile-public-fixture
                  #'public-c-family-strided-scatter {:target device-id :dtype :float}))
       (:kernels (compile-public-fixture
-                 #'contract/contract-mm {:target device-id :dtype :float}))
+                 ;; This public function declares Double arrays; the generic
+                 ;; Float contractions above provide the separate FP32 gate.
+                 #'contract/contract-mm {:target device-id :dtype :double}))
       (:kernels (compile-public-fixture
                  #'qk/qmatmul-q4k-dp4a-rows! {:target device-id :dtype :float}))
       (:kernels (compile-public-fixture

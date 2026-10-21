@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [raster.core :as core]
             [raster.par :as par]
+            [raster.linalg.contract :as contract]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.core.method-entry :as entry]
@@ -68,6 +69,28 @@
       (is (= :retained-frontend-dtype-mismatch
              (reason #(entry/call-with-definition-inputs
                        (fn [] (pipeline/retained-frontend-source #'scaled resolved :float)))))))))
+
+(deftest declared-double-contraction-is-not-a-float-specialization
+  (doseq [backend [:cuda :hip]]
+    (let [device (keyword (str (name backend) ":declared-contraction-precision"))]
+      (hardware/register-target-device!
+       device {:type backend :name "Synthetic declared contraction precision"
+               :capabilities (cond-> {:subgroup-sizes [32] :warp-size 32
+                                     :max-workgroup-size 1024 :shared-local-memory 65536
+                                     :total-eus 64}
+                               (= :cuda backend) (assoc :compute-capability [8 0])
+                               (= :hip backend) (assoc :gfx-arch :gfx1100))})
+      (is (= :retained-frontend-dtype-mismatch
+             (reason #(equation-first/compile #'contract/contract-mm
+                                             {:target device :dtype :float}))))
+      (let [compilation (equation-first/compile #'contract/contract-mm
+                                              {:target device :dtype :double})
+            artifacts (:kernels compilation)]
+        (is (= 1 (count artifacts)))
+        (is (= (if (= :cuda backend) :cuda-c :hip-cpp) (:target (first artifacts))))
+        (is (= [:double :double :double]
+               (mapv :dtype (filter #(contains? #{:input :output} (:kind %))
+                                    (:abi (first artifacts))))))))))
 
 (deftest frontend-map-edits-cannot-rewrite-original-producer-evidence
   (scaled (double-array [1.0]))
