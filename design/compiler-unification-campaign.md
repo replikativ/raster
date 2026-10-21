@@ -88,6 +88,16 @@ argument/count/conversion obligations; matching equal forms afterward is not an
 alternative. Determine the remaining quotient's exact prerequisite before adding
 another transport layer.
 
+The follow-up review recommends closing the bounded reduction contract first,
+not starting general caller-occurrence transport merely because that seam exists:
+retain the original count conversion and its domain/failure position, the array
+read bounds/failure obligations, and the physical Float accumulator payload as
+distinct from the Double quotient context. Count evidence alone must not grant
+quotient completion. Prepared-AD semantic import closure is a separate obligation;
+the body-import witness does not discharge it. Keep both quotient refusals until
+their own evidence closes. Resume more general caller transport only where the
+current unchanged workload demonstrates that it is the missing prerequisite.
+
 ### October 21 ordered host-integral qualification
 
 Late checked integral computations may now remain opaque ordered host actions
