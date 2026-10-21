@@ -264,6 +264,56 @@
       (is (= [16.0] (vec (value/->host (:result (c {:x (double-array [9.0])}))))))
       (finally (compiled/close! c)))))
 
+(defn- check-late-integral-host-boundary! [target]
+  (doseq [[rows width] [[2 3] [0 2] [-1 1] [Long/MAX_VALUE 2] [(inc (long Integer/MAX_VALUE)) 1]]]
+    (let [x (double-array [7.0]) state (double-array 1)
+          arguments [x state rows width]
+          oracle-state (double-array 1)
+          oracle (try {:values (vec (fixture/write-before-checked-integral-shape x oracle-state rows width))}
+                      (catch Exception error {:error (class error)}))
+          prepared (compiled/lower #'fixture/write-before-checked-integral-shape arguments
+                                   {:compiler :equation-first :target target :dtype :double})
+          compilation (get-in prepared [:ordered-invocation :compilation])
+          initial (invocation-link/begin-ordered-realization compilation arguments nil)
+          layout (invocation-link/ordered-entry-layout initial (invocation-link/ordered-entry-roles initial nil))
+          state-id (:id (first (filter #(identical? state (:source %)) (:nodes layout))))
+          c (compiled/instantiate! prepared)
+          executable (:executable c)
+          session (:session executable)]
+      (try
+        (is (some? state-id))
+        (let [actual (try {:values (vec (value/->host (:result (c))))}
+                          (catch Exception error {:error (class error)}))
+              resident-state (double-array 1)
+              view (get-in @(:execution-state executable) [:ordered :node-views state-id])]
+          (is (= oracle actual))
+          ;; Privileged regression inspection, not a public output from a failed invocation.
+          ;; The session still owns these buffers until close, even when replay is poisoned.
+          (gpu/download-range! session view resident-state {:elements 1})
+          (is (= (vec oracle-state) (vec resident-state)) "earlier device write precedes the host check")
+          (is (= [0.0] (vec state)) "resident mutation does not invent host copyback")
+          (when (:error oracle)
+            (is (nil? @(:live-outputs c)))
+            (is (zero? @(:completed-replays executable)))
+            (is (= 2 (count (:buffers @session))) "failed size check acquires no suffix buffer")
+            (is (= :link-execution-poisoned (reason #(c)))))
+          (when (= [2 3] [rows width])
+            (is (= (vec (repeat 18 13.0))
+                   (vec (value/->host (:result (c {:x (double-array [11.0])})))))))
+          (is (empty? (:events @session)))
+          (is (empty? (get-in @(:execution-state executable) [:ordered :prepared]))))
+        (finally (compiled/close! c)))
+      (is (true? (:closed? @session)))
+      (is (empty? (:buffers @session))))))
+
+(deftest late-integral-host-checks-preserve-source-order-on-local-backends
+  (if @ocl-probe/opencl-available?
+    (check-late-integral-host-boundary! :ocl:0)
+    (ocl-probe/opencl-skip! "late integral host boundary"))
+  (if @ze-probe/gpu-available?
+    (check-late-integral-host-boundary! :ze:0)
+    (ze-probe/gpu-skip! "late integral host boundary")))
+
 (deftest opencl-callable-preparation-preserves-defaults-and-output-lifetimes
   (if @ocl-probe/opencl-available?
     (check-callable-ordered-preparation! :ocl:0)

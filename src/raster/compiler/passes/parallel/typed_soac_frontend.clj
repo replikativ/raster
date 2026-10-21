@@ -4639,11 +4639,13 @@
            ;; parallel equation (for example a checked source cast after an
            ;; allocation) is a valid host boundary: retaining it at its source
            ;; position preserves exceptional control transfer. Once device work has
-           ;; occurred, the same scalar remains a decline until the graph represents
-           ;; the required device-to-host sequencing explicitly.
+           ;; occurred, device-dependent exceptional scalars remain a decline.
+           ;; The separate public-scalar dependency closure may retain a host-only
+           ;; integral computation, but never moves its original source position.
            (not (contains-parallel-form? (:expr description)))
            (or (not (requires-ordered-evaluation? (:expr description)))
-               (and (:before-parallel? description)
+               (and (or (:before-parallel? description)
+                        (:host-input-scalar? description))
                     ;; This value becomes a typed input of the following island. Its
                     ;; source declaration/metadata must therefore attest the ABI; the
                     ;; extent use is not permission to guess `long`.
@@ -4653,6 +4655,40 @@
   [descriptions]
   (let [physical-outputs (physical-output-symbols descriptions)]
     (every? #(admitted-description? physical-outputs %) descriptions)))
+
+(defn- retain-host-input-scalars
+  "Retain integral computations over declared public scalars as ordered HOST boundaries.
+   Dependency closure is not a completion/carrier proof or permission to hoist. A late
+   checked computation stays opaque to numerical ScalarIR and needs the existing source
+   owner/executor at its original position. Local type hints cannot seed this closure."
+  [descriptions scalar-types public-parameters]
+  (:descriptions
+   (reduce
+    (fn [{:keys [available host-types] :as state} {:keys [kind sym expr scalar-dtype] :as description}]
+      (let [host? (and (= :scalar kind)
+                       (contains? #{:int :long} scalar-dtype)
+                       ;; A stale public/local declaration on a shadowed binder
+                       ;; cannot turn a Double initializer into an integral port.
+                       (= scalar-dtype (some-> (retained-scalar-dtype expr host-types) dtype/canon))
+                       (ordered-scalar-expression? expr)
+                       (not (contains? (:flags (effects/descriptor expr)) :unclosed-source-obligations))
+                       (set/subset? (util/free-syms expr) available)
+                       (not-any? #(and (seq? %)
+                                       (or (par/par-form? %)
+                                           (descriptor/aget-op? (descriptor/semantic-op %))
+                                           (descriptor/alength-op? (descriptor/semantic-op %))))
+                                 (tree-seq coll? seq expr)))]
+        (-> state
+            (update :descriptions conj (cond-> description host? (assoc :host-input-scalar? true)))
+            ;; Every binder shadows the old identity, including parallel results
+            ;; and declarations that still carry an integral hint.
+            (assoc :available (cond-> (disj available sym) host? (conj sym))
+                   :host-types (cond-> (dissoc host-types sym) host? (assoc sym scalar-dtype))))))
+    {:descriptions []
+     :available (into #{} (filter #(contains? #{:int :long} (get scalar-types %)))
+                      public-parameters)
+     :host-types (select-keys scalar-types public-parameters)}
+    descriptions)))
 
 (defn- copy-allocation-source
   [expression]
@@ -4750,14 +4786,16 @@
     (coverage-decline* source options)))
 
 (defn- coverage-decline*
-  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage? source-ns]
+  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage? source-ns public-parameters]
            :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          descriptions (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
-                                          shape-equalities values)
+          descriptions (retain-host-input-scalars
+                        (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
+                                           shape-equalities values)
+                        scalar-types public-parameters)
           physical-outputs (physical-output-symbols descriptions)
           declined (remove #(admitted-description? physical-outputs %) descriptions)
           parallel? (some #(not= :scalar (:kind %)) descriptions)]
@@ -5903,7 +5941,7 @@
    and derives the generated binding dtype only from that description. Unsupported returns remain
    unchanged so complete-source validation keeps its existing refusal boundary."
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
-                  preserve-declared-array-storage?]
+                  preserve-declared-array-storage? public-parameters]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source))
              (= 1 (count (drop 2 source))))
@@ -5920,7 +5958,7 @@
                   describe (fn [pairs]
                              (:descriptions
                               (source-storage-analysis pairs dtype array-types scalar-types
-                                                       segmented-plans? values shape-equalities)))
+                                                       segmented-plans? values shape-equalities public-parameters)))
                   descriptions (describe pairs)
                   physical-outputs (physical-output-symbols descriptions)
                   dependencies (set (util/free-syms expression))
@@ -5997,10 +6035,12 @@
   "Establish allocation-owned extents before a consumer can infer element shapes.
    Allocation capacity is not permission to flatten a declared logical layout. Reuse the same
    allocation contracts for initialization later; no consumer extent may become its own producer."
-  [pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
-  (let [descriptions (normalize-extents
-                      (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
-                      shape-equalities values)
+  [pairs dtype array-types scalar-types segmented-plans? values shape-equalities public-parameters]
+  (let [descriptions (retain-host-input-scalars
+                      (normalize-extents
+                       (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
+                       shape-equalities values)
+                      scalar-types public-parameters)
         source-scalar-types
         (reduce (fn [types {:keys [kind sym scalar-dtype]}]
                   (if (and (= :scalar kind) scalar-dtype)
@@ -6029,7 +6069,7 @@
    Uses the same source descriptions/admission rules as the numerical frontend. It neither
    accepts an unsupported parallel leaf nor authorizes execution of the retained host region."
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
-                  preserve-declared-array-storage?]
+                  preserve-declared-array-storage? public-parameters]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types values)
             *region-local-counter* (atom -1)
@@ -6040,7 +6080,7 @@
           pairs (mapv vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
           descriptions (:descriptions (source-storage-analysis pairs dtype array-types scalar-types
-                                                               segmented-plans? values shape-equalities))
+                                                               segmented-plans? values shape-equalities public-parameters))
           suffix (vec (reverse (take-while #(= :scalar (:kind %)) (reverse descriptions))))
           split (- (count pairs) (count suffix))
           physical (physical-output-symbols descriptions)]
@@ -6232,7 +6272,7 @@
 
 (defn- form->program*
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
-                 preserve-declared-array-storage? host-scalars?]
+                 preserve-declared-array-storage? host-scalars? public-parameters]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [_ (validate-declared-array-values! array-types values)
@@ -6241,7 +6281,7 @@
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
           {descriptions :descriptions storage-values :values allocations :allocations}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
-                                   values shape-equalities)]
+                                   values shape-equalities public-parameters)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)

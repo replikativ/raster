@@ -21,6 +21,51 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
+(deftest late-host-integral-boundaries-require-public-scalar-dependency-closure
+  (let [checked (with-meta 'checked {:raster.type/tag 'int})
+        input (with-meta 'n {:raster.type/tag 'long})
+        make-source (fn [middle expression]
+                      (list 'let*
+                            (into ['early '(raster.par/map! out i 1 double 1.0)]
+                                  (concat middle
+                                          [checked expression
+                                           'later '(raster.par/map! out j checked double 2.0)]))
+                            'later))
+        options {:dtype :double :array-types {'out :double 'x :double}
+                 :scalar-types {'n :long 'hinted-local :long}
+                 :public-parameters '[n]}
+        form (make-source [] (list 'clojure.core/int input))
+        program (frontend/form->program form options)
+        facts (dialect/facts program)]
+    (is (some? program))
+    (is (some #{1} (get-in facts [:attributes :host-binding-ids])))
+    (is (not-any? #(some #{checked} (nth % 2)) (dialect/equations program))
+        "the new boundary is not a device scalar equation")
+    (is (= form (frontend/terminal-host-source form options)))
+    (is (nil? (frontend/form->program form (dissoc options :public-parameters)))
+        "a local type map alone cannot seed host availability")
+    (let [describe effects/descriptor]
+      (with-redefs [effects/descriptor
+                    (fn [expression]
+                      (cond-> (describe expression)
+                        (= expression (list 'clojure.core/int input))
+                        (update :flags conj :unclosed-source-obligations)))]
+        (is (nil? (frontend/form->program form options))
+            "unknown completion obligations are not a host-closure permission")))
+    (doseq [[middle expression]
+            [[[] '(clojure.core/int hinted-local)]
+             [[] '(clojure.core/int (clojure.core/aget x 0))]
+             [[] '(clojure.core/int (clojure.core/alength x))]
+             [['n '(clojure.core/double 1.0)] '(clojure.core/int n)]
+             [[(with-meta 'alias {:raster.type/tag 'long}) 'n
+               'n '(clojure.core/double 1.0)
+               'alias 'n] '(clojure.core/int alias)]
+             [['n '(raster.par/reduce acc 0.0 i 1
+                                     (+ acc (clojure.core/aget x i)))]
+              '(clojure.core/int n)]]]
+      (is (nil? (frontend/form->program (make-source middle expression) options))
+          (str "not a public integral host closure: " expression)))))
+
 (deftest terminal-host-region-retains-the-complete-ordered-scalar-suffix
   (let [source '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
                       converted (clojure.core/float total)

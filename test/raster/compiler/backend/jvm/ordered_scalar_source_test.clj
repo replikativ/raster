@@ -25,6 +25,14 @@
 
 (core/deftm typed-long-division [n :- Long] :- Double (/ (long n) 2))
 
+(core/deftm typed-unchecked-narrow [n :- Long] :- Long
+  (long (clojure.core/unchecked-int n)))
+
+(core/deftm typed-checked-narrow [n :- Long] :- Long
+  (long (clojure.core/int n)))
+
+(defn plain-checked-narrow ^long [^long n] (long (int n)))
+
 (core/deftm float-checkpoint [x :- Double] :- Double
   (let [rounded (float x)] (double rounded)))
 
@@ -91,10 +99,18 @@
   (let [actual (typed-long-division 1)]
     (is (= Double (class actual)))
     (is (= 0.5 actual)))
+  (is (= -1 (typed-unchecked-narrow Long/MAX_VALUE)))
+  (is (thrown? ArithmeticException (typed-checked-narrow Long/MAX_VALUE)))
+  (is (thrown? ArithmeticException (plain-checked-narrow Long/MAX_VALUE)))
   (doseq [[expression ports policy]
           [['(clojure.core// n 2) [{:symbol 'n :carrier Long/TYPE}] {:unchecked-math false}]
            ['(clojure.core/* n n) [{:symbol 'n :carrier Object}] {:unchecked-math false}]
            ['(clojure.core/long n) [{:symbol 'n :carrier Double/TYPE}] {:unchecked-math false}]
+           ['(clojure.core/int n) [{:symbol 'n :carrier Object}] {:unchecked-math false}]
+           ['(clojure.core/int n) [{:symbol 'n :carrier Double/TYPE}] {:unchecked-math false}]
+           ['(clojure.core/int n) [{:symbol 'n :carrier Float/TYPE}] {:unchecked-math false}]
+           ['(clojure.core/int n) [{:symbol 'n :carrier Boolean/TYPE}] {:unchecked-math false}]
+           ['(clojure.core/unchecked-int n) [{:symbol 'n :carrier Long/TYPE}] {:unchecked-math false}]
            ['(clojure.core/double true) [] {:unchecked-math false}]
            ['(if true n 2.0) [{:symbol 'n :carrier Long/TYPE}] {:unchecked-math false}]
            ['(clojure.core/* n n) [{:symbol 'n :carrier Long/TYPE}] {:unchecked-math true}]
@@ -102,6 +118,25 @@
     (is (= :unclosed-terminal-source-projection
            (reason #(entry/call-with-definition-inputs
                      (fn [] (projection/project-scalar expression ports *ns* policy))))))))
+
+(deftest integral-projection-matches-plain-and-typed-primitive-oracles
+  (let [method (.getMethod (class @#'plain-checked-narrow) "invokeStatic" (into-array Class [Long/TYPE]))
+        ports [{:symbol 'n :carrier (first (.getParameterTypes method))}]
+        values [0 -1 Integer/MAX_VALUE (inc (long Integer/MAX_VALUE)) Long/MAX_VALUE]]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [projected (projection/project-scalar '(clojure.core/long (clojure.core/int n))
+                                                  ports *ns* {:unchecked-math false})
+             execute (owner/compile-function
+                      (:params projected) (:source projected)
+                      (fn [params body] (list 'fn* params body))
+                      (merge projected {:source-policy {:unchecked-math false} :source-ns *ns*
+                                        :guard #(entry/assert-definition-inputs-current! @entry/*emission-inputs*)}))]
+         (is (= Long/TYPE (:carrier (first ports))))
+         (doseq [n values]
+           (is (= (outcome #(plain-checked-narrow n))
+                  (outcome #(typed-checked-narrow n))
+                  (outcome #(execute [n]))))))))))
 
 (deftest prepared-steps-follow-invocation-identities-through-shadowed-bindings
   (let [expected (mapv #(vec (shadowed-dimension %)) [0 2 5])
@@ -121,6 +156,35 @@
                (reason #(owner/evaluate-ordered-invocation-step
                          compilation first-step {'n {:type :long :value 2}}))))
         (finally (reset-meta! source metadata))))))
+
+(deftest late-integral-executors-retain-actual-ports-and-transitive-int-results
+  (let [compilation (equation-first/compile #'fixture/write-before-checked-integral-shape
+                                           {:target :ocl:0 :dtype :double})
+        steps (get-in compilation [:semantic :attributes :invocation-plan :steps])
+        first-step (first (filter #(= 'elements (:symbol %)) steps))
+        next-step (first (filter #(= 'count (:symbol %)) steps))
+        operands {'rows {:type :long :value 2} 'width {:type :long :value 3}}
+        result (owner/evaluate-ordered-invocation-step compilation first-step operands)]
+    (is (= Integer (class (:value result))))
+    (is (= 6 (:value result)))
+    (is (= 18 (:value (owner/evaluate-ordered-invocation-step
+                       compilation next-step {'elements result 'width {:type :long :value 3}}))))
+    (doseq [wrong [nil 2.0 (int 2)]]
+      (is (= :ordered-scalar-source-arguments
+             (reason #(owner/evaluate-ordered-invocation-step
+                       compilation first-step (assoc-in operands ['rows :value] wrong))))))
+    (is (= :ordered-scalar-source-arguments
+           (reason #(owner/evaluate-ordered-invocation-step
+                     compilation next-step {'elements {:type :int :value (long 6)}
+                                            'width {:type :long :value 3}}))))
+    (let [effects (atom 0)]
+      (with-redefs [gpu/make-session (fn [& _] (swap! effects inc))
+                    materialization/materialize (fn [& _] (swap! effects inc))]
+        (is (= :ordered-source-owner-mismatch
+               (reason #(link/instantiate-ordered-invocation!
+                         (dissoc compilation :ordered-source-owner)
+                         [(double-array [7.0]) (double-array 1) 2 3] {}))))
+        (is (zero? @effects))))))
 
 (deftest nullable-object-ports-preserve-explicit-conversion-and-operand-order
   ;; Both oracles are actual source executions, not results from the new walker.

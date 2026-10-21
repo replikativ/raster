@@ -150,14 +150,19 @@
                       (cond
                         (:macro metadata)
                         (fail! "terminal macro has no owned projection" {:head head})
-                        (and (contains? (if typed-context? #{'long 'float 'double} #{'float 'double})
+                        (and (contains? (if typed-context? #{'int 'long 'float 'double} #{'float 'double})
                                         (descriptor/cast-result-tag operation))
                              (= 1 (count arguments)))
                         (let [{:keys [source carrier]} (first arguments)
                               target (descriptor/cast-result-tag operation)
                               _ (intrinsic-current! v operation)
-                              _ (when (and typed-context? (= 'long target) (not= Long/TYPE carrier))
-                                  (fail! "typed Long cast lacks its original bytecode completion context"
+                              _ (when (and typed-context? (= 'int target)
+                                           (not= :reject (descriptor/cast-integral-narrowing operation)))
+                                  (fail! "typed wrapping Int cast needs a separate exact projection"
+                                         {:head head :operation operation}))
+                              _ (when (and typed-context? (contains? #{'int 'long} target)
+                                           (not (contains? #{Integer/TYPE Long/TYPE} carrier)))
+                                  (fail! "typed integral cast lacks its original bytecode completion context"
                                          {:head head :carrier carrier}))
                               _ (when (and typed-context? (= 'double target) (= Boolean/TYPE carrier))
                                   (fail! "typed Boolean-to-Double conversion differs from core source"
@@ -166,12 +171,19 @@
                                       carrier Object)
                               ieee? (or (= :ieee (descriptor/cast-floating-narrowing operation))
                                         (not (false? (:unchecked-math policy))))]
-                          (static-call clojure.lang.RT
+                          (if (and typed-context? (= 'int target) (= Long/TYPE carrier))
+                            ;; Match emit-intrinsic's explicit checked Int(Long)
+                            ;; conversion, including its ArithmeticException.
+                            ;; Paired actual Clojure/typed oracles qualify the
+                            ;; supported dependency's primitive Long overload.
+                            (static-call Math "toIntExact" [Long/TYPE] [source])
+                            (static-call clojure.lang.RT
                                        (case target
+                                         int "intCast"
                                          long "longCast"
                                          double "doubleCast"
                                          float (if ieee? "uncheckedFloatCast" "floatCast"))
-                                       [input] [source]))
+                                       [input] [source])))
                         (and (= 'clojure.core/nil? operation) (= 1 (count arguments)))
                         (do (intrinsic-current! v operation)
                             (static-call java.util.Objects "isNull" [Object] [(:source (first arguments))]))
@@ -222,6 +234,8 @@
                                   (= Object carrier) read
                                   (= Long/TYPE carrier)
                                   (static-call clojure.lang.RT "longCast" [Object] [(:source read)])
+                                  (= Integer/TYPE carrier)
+                                  (static-call clojure.lang.RT "intCast" [Object] [(:source read)])
                                   (= Double/TYPE carrier)
                                   (static-call clojure.lang.RT "doubleCast" [Object] [(:source read)])
                                   :else (fail! "source port has no audited physical projection"
@@ -247,7 +261,8 @@
 (defn project-scalar
   "Project one closed scalar fragment from actual physical body-entry facts.
    Parameters carry :symbol and actual :carrier Class, never a logical dtype.
-   Only checked Long arithmetic and the existing Double arithmetic/casts have
+   Only checked Long arithmetic, explicit Int/Long conversions over primitive
+   integral values, and the existing Double arithmetic/casts have
    source/typed-bytecode correspondence here. Long division, unknown helpers,
    unproved input conversions and buffer-shaped ports refuse. This is source
    projection, not proof that the surrounding typed region's coercions agree."

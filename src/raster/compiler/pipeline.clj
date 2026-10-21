@@ -940,6 +940,7 @@
                     :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
                     :segmented-plans? (true? (:segmented-plans? opts))
                     :terminal-host-results? (true? (:terminal-host-results? opts))
+                    :public-parameters (:public-parameters common)
                     :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
                     :source-ns (:source-ns opts)

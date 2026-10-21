@@ -10,6 +10,7 @@
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as auxiliary]
             [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
@@ -29,6 +30,15 @@
   (let [^long square (* (long n) (long n))
         out (double-array square)]
     (par/map! out i square double (+ (aget x i) 1.0))
+    out))
+
+(deftm write-before-checked-integral-shape
+  [x :- (Array double), first-output :- (Array double), rows :- Long, width :- Long] :- (Array double)
+  (let [written (par/map! first-output i 1 double (+ (aget x i) 1.0))
+        elements (int (* (long rows) (long width)))
+        count (int (* (long elements) (long width)))
+        out (double-array count)]
+    (par/map! out i count double (+ (aget first-output 0) 1.0))
     out))
 
 (deftm helper-source-zero-observed
@@ -195,6 +205,36 @@
                             (vec (reverse (invocation/source-order plan program))))]
       (is (= :invocation-source-order-mismatch
              (reason #(invocation/ordered-host-actions changed program)))))))
+
+(deftest late-integral-checks-remain-owned-host-actions
+  (let [compiled (equation-first/compile #'write-before-checked-integral-shape {:target :ocl:0 :dtype :double})
+        program (:semantic compiled)
+        plan (get-in program [:attributes :invocation-plan])
+        actions (invocation/ordered-host-actions plan program)
+        host-bindings (set (map :binding actions))
+        output (double-array 1)
+        called (atom 0)]
+    (is (contains? host-bindings 'elements))
+    (is (contains? host-bindings 'count) "transitive host dependency remains at its own source site")
+    (is (not-any? #(some #{'elements} (:results %)) (:equations program))
+        "the newly retained checked computation is not numerical ScalarIR")
+    (is (every? #(true? (get-in % [:attributes :host-only]))
+                (filter #(some #{'count} (:results %)) (:equations program))))
+    (is (some? (:ordered-source-owner compiled)))
+    (with-redefs-fn {#'frontend/retain-host-input-scalars (fn [descriptions _ _] descriptions)}
+      (fn []
+        (is (= :equation-first-coverage
+               (reason #(equation-first/compile #'write-before-checked-integral-shape
+                                                {:target :ocl:0 :dtype :double}))))))
+    (is (identical? plan (invocation/validate-against! plan program)))
+    (with-redefs [materialization/materialize (fn [& _] (swap! called inc))]
+      (is (= :ordered-source-execution-required
+             (reason #(equation-first/lower compiled [(double-array [7.0]) output Long/MAX_VALUE 2])))))
+    (is (zero? @called))
+    (is (= [0.0] (vec output)))
+    (is (thrown? ArithmeticException
+                 (write-before-checked-integral-shape (double-array [7.0]) output Long/MAX_VALUE 2)))
+    (is (= [8.0] (vec output)))))
 
 (deftest late-source-allocation-still-requires-ordered-execution
   (let [compilation (equation-first/compile #'helper-source-zero-observed

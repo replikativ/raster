@@ -1740,7 +1740,8 @@
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
                                    resident-uniform-input-loads?
                                    scalar-types values abstract-machine segmented-plans? source-ns
-                                   preserve-declared-array-storage? host-scalars? terminal-host-results?]
+                                   preserve-declared-array-storage? host-scalars? terminal-host-results?
+                                   public-parameters]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form {:array-types array-types
@@ -1750,6 +1751,7 @@
          (let [frontend-options {:dtype dtype :array-types array-types
                                  :source-ns source-ns
                                  :scalar-types scalar-types :values values
+                                 :public-parameters public-parameters
                                  :host-scalars? host-scalars?
                                  :segmented-plans? segmented-plans?
                                  :preserve-declared-array-storage? preserve-declared-array-storage?}

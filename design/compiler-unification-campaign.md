@@ -8,6 +8,35 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### October 21 ordered host-integral qualification
+
+Late checked integral computations may now remain opaque ordered host actions
+when their dependencies close over explicitly identified public integral scalar
+parameters and earlier such actions. Local type hints cannot seed that closure;
+every binder shadows the previous identity. Retained expression/result types must
+agree, and array reads, lengths, parallel results and unclosed source obligations
+do not acquire this admission. Classification is shared with diagnostics. This
+does not move checks earlier, establish normal completion, or insert them into
+device ScalarIR. The existing source owner and actual-carrier executor still have
+to close each action before session capture.
+
+The executor projects checked Int narrowing and integral widening only from
+actual primitive Integer/Long carriers. Wrapping `unchecked-int`, unknown Object
+ports and floating inputs refuse rather than borrowing checked semantics. Actual
+plain Clojure, typed-bytecode and projected oracles agree on supported values and
+overflow exception classes with the pinned dependency; no extra backend-origin
+parameter or type registry is needed.
+
+Three complete affected namespaces pass 39 tests / 445 assertions, plus the
+frontend closure test's 12 assertions. Actual OpenCL and Level Zero checks cover
+valid, empty, negative and overflowing dimensions, transitive Int results, prior
+resident writes before host failure, changed-input replay, no suffix allocation
+after failure, replay poisoning and event/buffer retirement. Public host arrays
+are not implicitly copied back. Negative controls cover absent public provenance,
+shadowing, forged carriers and missing owners before session/materialization.
+This is a bounded step-2 prerequisite, not qualification of the MSE quotient,
+selected helper payloads, prepared-AD imports or unchanged training workload.
+
 ### October 21 independent fusion robustness
 
 Optional map-to-reduction/scan fusion now retains the original materialized
