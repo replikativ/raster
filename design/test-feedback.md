@@ -4,6 +4,20 @@ The fast loop is focused tests in a correctly configured reusable JVM. Full corr
 run in isolated CI processes. Do not parallelize test vars inside one JVM: tests redefine Vars
 and share runtime/dispatch state. Keep local JVM concurrency bounded by available memory.
 
+## Separate infrastructure failures from test results
+
+Inspect the failed step before classifying a red job. A dependency-installation
+HTTP 503 is not a compiler test failure, but it is also not a passing test run.
+The unit and OpenCL jobs give apt package/index fetches three bounded transport
+retries. Repository URLs, package/runtime selection and fatal installation exit
+handling remain unchanged; exhausted retries still fail the job.
+
+Qualification requires the complete expected check set for the exact PR head:
+setup, build, unit tests, GPU source emission, OpenCL execution, CUDA compilation
+and HIP compilation. Absent/pending checks and successful checks from older heads
+do not qualify a new head. Keep infrastructure retry evidence separate from
+compiler correctness and actual-device/performance evidence.
+
 ## Measure before repartitioning
 
 `scripts/ci-test-shard.sh` balances four processes with reviewed load+test timing weights.

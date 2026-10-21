@@ -94,7 +94,9 @@ jobs:
       - install-clojure
       - run:
           name: Install OpenBLAS + clang
-          command: sudo apt-get update && sudo apt-get install -y libopenblas-dev liblapacke-dev clang
+          # Bounded transport retries for transient repository HTTP 503s.
+          # Exhausted retries remain fatal; tests must not run without dependencies.
+          command: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libopenblas-dev liblapacke-dev clang
       - run:
           name: Run deterministic test subshards
           command: >-
@@ -176,8 +178,8 @@ jobs:
       - run:
           name: Install OpenBLAS, clang and a CPU OpenCL runtime
           command: |
-            sudo apt-get update
-            sudo apt-get install -y ca-certificates curl gnupg libopenblas-dev liblapacke-dev \
+            sudo apt-get -o Acquire::Retries=3 update
+            sudo apt-get -o Acquire::Retries=3 install -y ca-certificates curl gnupg libopenblas-dev liblapacke-dev \
               clang gdb ocl-icd-libopencl1 clinfo
             if [ "${RASTER_CI_OPENCL_RUNTIME:-pocl}" = "intel" ]; then
               sudo update-ca-certificates
@@ -185,10 +187,10 @@ jobs:
                 | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
               echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
                 | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
-              sudo apt-get update
-              sudo apt-get install -y intel-oneapi-runtime-opencl
+              sudo apt-get -o Acquire::Retries=3 update
+              sudo apt-get -o Acquire::Retries=3 install -y intel-oneapi-runtime-opencl
             else
-              sudo apt-get install -y pocl-opencl-icd
+              sudo apt-get -o Acquire::Retries=3 install -y pocl-opencl-icd
             fi
             clinfo -l
       - run:
