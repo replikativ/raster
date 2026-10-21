@@ -1,5 +1,6 @@
 (ns raster.nn-test
   (:require [clojure.test :refer [deftest testing is]]
+            [raster.core :as core]
             [raster.nn :as nn]))
 
 ;; ================================================================
@@ -64,6 +65,63 @@
           s (nn/softmax x)]
       (is (< (aget ^doubles s 0) (aget ^doubles s 1)))
       (is (< (aget ^doubles s 1) (aget ^doubles s 2))))))
+
+(defn- reference-softmax [values]
+  (if (empty? values)
+    []
+    (let [maximum (apply max values)
+          weights (mapv #(Math/exp (- (double %) (double maximum))) values)
+          total (reduce + weights)]
+      (mapv #(/ % total) weights))))
+
+(deftest softmax-retained-source-has-a-valid-typed-identity
+  ;; Execute the retained expression with the ordinary Clojure compiler, too.
+  ;; An unchecked backend d2f must not hide a checked `(float ##-Inf)` seed.
+  (doseq [[dtype make-array] [[:float float-array] [:double double-array]]]
+    (let [implementation (core/resolve-deftm-var #'nn/softmax {:dtype dtype})
+          metadata (meta implementation)
+          source (binding [*ns* (:ns metadata)]
+                   (eval (list* 'fn (:raster.core/deftm-params metadata)
+                                (:raster.core/deftm-walked-body metadata))))]
+      (doseq [values [[] [0.0 1.0] [1000.0 1001.0]]]
+        (let [input (make-array values)
+              output (source input)]
+          (is (= (class input) (class output)))
+          (is (= (count values) (count output)))
+          (is (every? true? (map #(approx= %1 %2 2e-6)
+                                (reference-softmax (vec input)) output)))))))
+  (testing "checked source narrowing remains checked"
+    (let [narrow (fn [^double value] (float value))]
+      (is (thrown? IllegalArgumentException (narrow Double/NEGATIVE_INFINITY))))))
+
+(deftest softmax-typed-identities-and-changed-inputs
+  (doseq [[dtype make-array tolerance]
+          [[:float float-array 2e-6] [:double double-array 1e-12]]
+          values [[] [0.0] [0.0 1.0 2.0] [1000.0 1001.0 1002.0]
+                  [-1002.0 -1001.0 -1000.0] [10000.0 9999.0 -10000.0]]]
+    (testing (str dtype " " values)
+      (let [input (make-array values)
+            before (vec input)
+            output (nn/softmax input)
+            expected (reference-softmax before)]
+        (is (= (class input) (class output)))
+        (is (= before (vec input)) "softmax must not mutate its input")
+        (is (= (count expected) (count output)))
+        (doseq [[wanted actual] (map vector expected output)]
+          (is (Double/isFinite (double actual)))
+          (is (approx= wanted actual tolerance)))
+        (when (seq expected)
+          (is (approx= 1.0 (reduce + output) tolerance))))))
+  (doseq [make-array [float-array double-array]]
+    (let [input (make-array [0.0 1.0 2.0])
+          before (vec (nn/softmax input))]
+      (if (instance? (class (float-array 0)) input)
+        (aset ^floats input 0 (float 4.0))
+        (aset ^doubles input 0 (double 4.0)))
+      (let [after (vec (nn/softmax input))]
+        (is (not= before after))
+        (is (every? true? (map #(approx= %1 %2 2e-6)
+                              (reference-softmax (vec input)) after)))))))
 
 (deftest cross-entropy-doubles-test
   (testing "Cross-entropy with double[]"
