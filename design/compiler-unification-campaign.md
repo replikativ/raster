@@ -48,7 +48,6 @@ selection, ordering, empty/warm behavior, ownership and retry; they do not prove
 actual bytecode renewal, source correspondence or execution admission. Fresh
 clean-branch qualification also passes 12 tests / 61 assertions in a 256 MiB JVM.
 Exact-head CI qualification remains a separate gate.
-
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long
