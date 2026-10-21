@@ -130,6 +130,47 @@ initializers and changed-data Float results are covered. This advances the produ
 transport prerequisite of items 3/5; full draft CI and the end-to-end training
 acceptance remain outstanding.
 
+### October 21 shared operand outlining retains original method dependencies
+
+A real same-class sibling/global collision reproduced wrong execution in an
+owned invocation input outline: original operand `local-value(-2.0)` selected
+the original class's sibling and returned -1.0; the detached outline selected an
+unchanged same-named global, returned 100.0 and incremented its counter. Historical
+Var/module guards and hygienic NEW method names do not prove preservation of the
+ORIGINAL class's method environment.
+
+All operand families now capture dependency closure under the actual original
+emitter context. Invocation inputs, array indices, allocation counts and terminal
+tails share physical-operand-input for lexical ports, full scalar context and
+the conservative sibling-dependency facet; reduction counts forward their actual
+bound observation to the same outliner guard. Missing/nonboolean evidence refuses.
+Same-class sibling candidates refuse until their original executable dependencies
+can be transported; they are not re-resolved as globals. The scanner follows the
+actual typed (namespace-insensitive name) and ordinary (full spelling) emitter
+lookup keys, treats quoted data as opaque and checks nested executable bodies.
+It is denial evidence, not a new dispatch registry or proof of purity.
+
+Independent review caught the fifth shared caller, terminal-result outlining;
+the expanded affected gate also reported seven terminal errors before its
+producer/consumer path was covered. That path now captures its dependency facet
+under the original complete terminal emitter context, never defaults it from
+the reduced retained context, and keeps original return/Method/history guards.
+All five collision fixtures refuse without executing the unrelated global;
+positive ordinary-global and terminal controls retain original execution.
+No runtime submission or numerical performance improvement is claimed.
+
+The current on-disk affected gate spans ten namespaces, 133 tests / 1,557
+assertions, zero failures/errors in the reused capped REPL. The focused main
+extraction's exact four test declarations pass 28 assertions in that same
+process; this is not fresh isolated main qualification. The independent reviewer
+checked the actual extracted source/test diff and found no blocker. Fresh CI
+remains mandatory before landing.
+
+The focused main extraction omits terminal/reduction APIs not yet present there;
+it retains the same mandatory shared closure for every existing main caller.
+This closes a prerequisite for executing original helper argument outlines, not
+the ordered argument/result interval transport or full training acceptance.
+
 ### October 21 original reduction count execution and outline hygiene
 
 The shared owned-input outliner now supports an original reduction's WHOLE

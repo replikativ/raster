@@ -174,7 +174,7 @@
           observed (bytecode/retained-reduction-emission emission original)]
       (is (= (float 3.0) (implementation 0)))
       (is (true? (get-in observed [:bound :unretained-sibling-calls?])))
-      (is (= :unsupported-bytecode-reduction-count-callees
+      (is (= :unsupported-bytecode-input-callees
              (try (bytecode/compile-reduction-count-region emission original) nil
                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
       (is (= before @count-global-calls) "neither original execution nor outlining calls the colliding global"))))
