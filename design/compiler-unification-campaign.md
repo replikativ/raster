@@ -142,16 +142,38 @@ The complete affected invocation/source-order/terminal-owner namespaces also pas
 The source oracle is JIT-settled before its owner is captured; an earlier warm REPL
 also retained an obsolete fixture signature, so only the fresh receipt qualifies.
 
-Next terminal extension, kept separate: distinguish numerical-result exports from
-public scalar argument ports. Current terminal ports are all downloaded device
-exports; merely allowing a free public symbol would be unsound. Establish the
-authenticated original public parameter order/carriers before building the
-terminal contract, rederive the two origins at validation/owner compilation, and
-bind public scalars from validated invocation arguments without device copying.
-Initially bound this to Double/Long plus at least one numerical dependency;
-refuse arrays, arbitrary captures and shadowed/private identities. Gate ordinal
-tampering, carriers, owner invalidation, changed inputs, zero rows and overflow.
-No public-scalar terminal support is claimed by the constant-scale oracle above.
+The next bounded terminal extension now distinguishes numerical-result exports
+from public scalar argument ports. Existing `:parameters` remain exactly the
+numerical export/output vector; optional `:public-scalar-parameters` carry the
+original argument ordinal and declared Double/Long dtype. Semantic revalidation
+derives those ports from the actual InvocationPlan parameters, never the contract's
+own assertions. At least one numerical dependency remains required; arrays,
+unsupported carriers, arbitrary captures and shadowed public captures refuse.
+
+Owner compilation authenticates the retained frontend's exact implementation,
+full parameter order and actual primitive body-entry carriers. Independent review
+caught an initial reliance on editable frontend `:definition`; the shared
+`frontend-body-entry-carriers` helper now binds physical facts back to the opaque
+owned implementation and independently selected entry. Same-source/order foreign
+entries and a real Object-ABI input with a claimed logical Double type refuse.
+No new type registry or runtime carrier inference was introduced.
+
+Projection and invocation share numerical-then-public argument order. Runtime
+checks all public carriers before requesting numerical exports, then downloads
+only numerical results. Ordered host/numerical calls now share the static path's
+declared-program scalar projection: public source-only arguments remain in the
+invocation environment, not the emitted ABI. Undeclared-port checks remain intact.
+
+The fresh-process focused gate passes five tests / 186 assertions, including
+OpenCL and Level Zero mixed Long/Double arguments across an array slot, zero rows,
+changed-input replay, checked overflow and exactly one numerical download per run.
+Four complete affected ownership/lineage/invocation namespaces pass 58 tests /
+451 assertions, including malformed ordinal/type/symbol and pre-export rejection.
+The Object-ABI negative was added in that same fresh process without changing any
+existing fixture signature. These receipts do not qualify the full draft or
+establish resident training composition; the explicit host-result API and all
+ownership/publication guards remain required. Draft CI is still red in broader
+unit/emission qualification; do not merge it based on these local receipts.
 
 #### Reviewed next vertical: source correspondence through resident training
 

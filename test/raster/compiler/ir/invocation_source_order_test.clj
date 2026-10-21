@@ -1,16 +1,19 @@
 (ns raster.compiler.ir.invocation-source-order-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.backend.jvm.source-owner :as owner]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as auxiliary]
             [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
+            [raster.gpu.link :as gpu-link]
             [raster.par :as par]))
 
 (deftm write-before-shape
@@ -47,6 +50,66 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest terminal-public-scalars-retain-public-provenance-not-numerical-exports
+  (let [[program plan] (compilation #'storage/public-scaled-reduction-float-roundtrip :double)
+        contract (get-in plan [:attributes :terminal-host-result])
+        context {:source-policy (:source-policy contract)
+                 :source-namespace (:source-namespace contract)
+                 :public-parameters (:parameters plan)}]
+    (is (= [{:symbol 'coefficient :dtype :double :parameter-position 0}]
+           (:public-scalar-parameters contract)))
+    (is (= (:outputs program) (:program-outputs plan) (mapv :value (:parameters contract))))
+    (is (= ['total 'coefficient] (mapv :symbol (invocation/terminal-parameters contract))))
+    (is (identical? plan (invocation/validate-against! plan program)))
+    (is (= [1.5] (owner/terminal-public-arguments contract [1.5 (double-array 0)])))
+    (doseq [arguments [[(float 1.5) (double-array 0)] [nil (double-array 0)]
+                       [1 (double-array 0)] [] (list 1.5 (double-array 0))]]
+      (is (= :terminal-source-public-arguments
+             (reason #(owner/terminal-public-arguments contract arguments)))))
+    (let [exports (atom 0)
+          executable {:execution-state
+                      (atom {:ordered {:compilation {:semantic program}
+                                       :result-mode :host-result
+                                       :arguments [(float 1.5) (double-array 0)]}})}]
+      ;; This mocks only the already-owned preflight, not an ownership proof.
+      ;; A malformed public carrier must refuse before even requesting exports.
+      (with-redefs [owner/assert-terminal-result-owner! (fn [& _] :owned)
+                    invocation-link/terminal-export-layout (fn [& _] (swap! exports inc))]
+        (is (= :terminal-source-public-arguments
+               (reason #(#'gpu-link/run-ordered-terminal! executable {}))))
+        (is (zero? @exports))))
+    (doseq [port [{:symbol 'coefficient :dtype :double :parameter-position 1}
+                 {:symbol 'coefficient :dtype :long :parameter-position 0}
+                 {:symbol 'values :dtype :double :parameter-position 1}]]
+      (is (= :invocation-terminal-correspondence
+             (reason #(invocation/validate-against!
+                       (assoc-in plan [:attributes :terminal-host-result :public-scalar-parameters] [port])
+                       program)))
+          "contract fields cannot certify their own public parameter origin"))
+    (doseq [parameters [(assoc-in (:parameters plan) [0 :value :shape] [1])
+                        (assoc-in (:parameters plan) [0 :value :dtype] :float)
+                        []]]
+      (is (contains? #{:invocation-terminal-public-carrier :invocation-terminal-free-values}
+                     (reason #(invocation/terminal-source-result program
+                                                                (assoc context :public-parameters parameters))))))
+    (is (= :invocation-terminal-public-carrier
+           (reason #(invocation/terminal-source-result
+                     (assoc program :source
+                            (let [[head bindings body] (:source program)]
+                              (list head (into bindings '[coefficient 1.5]) body))) context))))))
+
+(deftest terminal-public-port-order-preserves-original-ordinals-across-arrays
+  (let [[program plan] (compilation #'storage/public-affine-reduction-float-roundtrip :double)
+        contract (get-in plan [:attributes :terminal-host-result])]
+    (is (= [{:symbol 'offset :dtype :long :parameter-position 0}
+            {:symbol 'coefficient :dtype :double :parameter-position 2}]
+           (:public-scalar-parameters contract)))
+    (is (= [7 1.5] (owner/terminal-public-arguments contract [7 (double-array 0) 1.5])))
+    (is (= ['total 'offset 'coefficient] (mapv :symbol (invocation/terminal-parameters contract))))
+    (is (= :terminal-source-public-arguments
+           (reason #(owner/terminal-public-arguments contract [7.0 (double-array 0) 1.5]))))
+    (is (identical? plan (invocation/validate-against! plan program)))))
 
 (deftest prefix-source-ownership-is-distinct-from-late-routing
   (let [[program plan] (compilation #'shape-before-write :double)

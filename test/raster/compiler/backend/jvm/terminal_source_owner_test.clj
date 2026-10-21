@@ -11,6 +11,8 @@
 
 (core/deftm source-definition [value :- Double] :- Object (float value))
 (core/deftm primitive-source-definition [value :- Double] :- Float (float value))
+(core/deftm object-port-source-definition [value :- Double, coefficient :- Object] :- Object
+  (float (* value (double coefficient))))
 (def source-effects (atom 0))
 (defn observed-helper [value] (swap! source-effects inc) (float value))
 (defn observed-identity [value] (swap! source-effects inc) value)
@@ -46,6 +48,27 @@
 (defn- outcome [f x]
   (try (let [value (f x)] [:value (class value) (Float/floatToRawIntBits value)])
        (catch Exception e [:error (class e)])))
+
+(deftest terminal-public-port-never-borrows-a-primitive-carrier-from-logical-dtype
+  (object-port-source-definition 1.0 1.5)
+  (let [v (core/resolve-deftm-var #'object-port-source-definition {:dtype :double})
+        parameters [{:symbol 'value :value (av/tensor {:dtype :double :shape []})}
+                    {:symbol 'coefficient :value (av/tensor {:dtype :double :shape []})}]
+        p (assoc-in (boundary '(float (* total coefficient)))
+                    [:attributes :invocation-plan :parameters] parameters)
+        c (invocation/terminal-source-result
+           p {:source-policy (:raster.core/source-policy (meta v))
+              :source-namespace (ns-name (:ns (meta v))) :public-parameters parameters})]
+    ;; The semantic fixture deliberately claims Double. Actual original source
+    ;; accepts Object, so this must fail before the generated source is compiled.
+    (entry/call-with-definition-inputs
+     (fn []
+       (entry/observe-definition-input! v (:ns (meta v)) (:name (meta v)))
+       (let [frontend (entry/original-source-frontend v)]
+         (is (= Object (get-in (entry/frontend-body-entry-carriers frontend v)
+                               [:parameter-facts 'coefficient :carrier])))
+         (is (= :terminal-source-public-entry
+                (reason #(owner/compile-terminal-result p c v frontend)))))))))
 
 (deftest generated-terminal-owner-preserves-checked-float-and-object-completion
   (let [body (list 'if '(clojure.core/nil? total) '(float 0.0)

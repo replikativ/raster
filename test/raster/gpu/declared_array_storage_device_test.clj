@@ -11,6 +11,7 @@
             [raster.dl.gpu-grad-parity :as gp]
             [raster.nn :as nn]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
             [raster.gpu.runtime-backend :as backend]
             [raster.gpu.device-probe :as opencl]
@@ -275,6 +276,41 @@
         (when (= 1 n)
           (aset-double input 0 Double/MAX_VALUE)
           (is (thrown? IllegalArgumentException (link/run-host-result! artifact))))))))
+
+(defn- run-public-terminal-scalar-case [target]
+  (doseq [[f arguments] [[#'storage/public-scaled-reduction-float-roundtrip
+                          (fn [coefficient input] [coefficient input])]
+                         [#'storage/public-affine-reduction-float-roundtrip
+                          (fn [coefficient input] [7 input coefficient])]]]
+   (let [_ (apply f (arguments 1.5 (double-array [16777217.0])))
+        compilation (equation-first/compile f
+                                            (merge storage/policy {:target target :dtype :double}))]
+    (doseq [n [0 1] coefficient [1.5 -0.5]]
+      (let [input (double-array (take n [16777217.0]))]
+        (with-open [artifact (link/instantiate-host-result! compilation (arguments coefficient input))]
+          (doseq [value [16777217.0 16777219.0]]
+            (when (= n 1) (aset-double input 0 value))
+            (let [downloads (atom 0)
+                  download gpu/download-range!
+                  actual (with-redefs [gpu/download-range! (fn [& arguments]
+                                                             (swap! downloads inc)
+                                                             (apply download arguments))]
+                           (link/run-host-result! artifact))
+                  expected (apply f (arguments coefficient input))]
+              (is (= 1 @downloads) "only the numerical scalar is downloaded, never the public coefficient")
+              (is (= Double (class actual)))
+              (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual)))))
+          (when (= n 1)
+            (aset-double input 0 Double/MAX_VALUE)
+            (is (thrown? IllegalArgumentException (link/run-host-result! artifact))))))))))
+
+(deftest terminal-public-scalars-compose-with-completed-device-results
+  (if @opencl/opencl-available?
+    (run-public-terminal-scalar-case :ocl:0)
+    (opencl/opencl-skip! "public terminal scalars on OpenCL"))
+  (if @gp/gpu-available?
+    (run-public-terminal-scalar-case :ze:0)
+    (gp/gpu-skip! "public terminal scalars on Level Zero")))
 
 (deftest checked-terminal-roundtrips-preserve-rounding-and-overflow
   (if @opencl/opencl-available?

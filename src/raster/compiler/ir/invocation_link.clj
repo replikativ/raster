@@ -73,6 +73,12 @@
             {}
             (concat (:parameters plan) (:steps plan)))))
 
+(defn- program-call-scalars
+  "Project the larger invocation environment onto declared numerical program values.
+   Public source-only arguments remain invocation-owned, never emitted runtime ports."
+  [program scalars]
+  (select-keys scalars (keys (:values program))))
+
 (defn- concrete-shape
   [id abstract scalars buffers storage]
   (mapv
@@ -767,7 +773,8 @@
           ;; host callback. The host constructor validates that same result, not a second eval.
           host-step (when equation
                       (program-call/make-host-equation-step
-                       (:program state) (:id equation) buffers scalars
+                       (:program state) (:id equation) buffers
+                       (program-call-scalars (:program state) scalars)
                        (if step
                          (fn [_ _] {(first (:results equation))
                                     (get-in (run-step!) [:values (:id step)])})
@@ -952,7 +959,8 @@
                                             (:values program) scalars (:projections state))
           result-views (into {} (keep :result-view) (vals (:storage realized)))
           {:keys [call buffers]} (program-call/make-equation-call
-                                 program equation-id (:buffers realized) scalars result-views caller-options)
+                                 program equation-id (:buffers realized) (program-call-scalars program scalars)
+                                 result-views caller-options)
           _ (when (seq (:result-views call))
               (fail! :invocation-ordered-result-views
                      "ready graph stages must retain logical prefix-result contracts before admission"
@@ -1080,7 +1088,7 @@
                                                     (:values parallel-program) shape-scalars
                                                     (:projections retained-validation))
                            initial (:equations parallel-program)))
-        call-scalars (select-keys shape-scalars (keys (:values parallel-program)))
+        call-scalars (program-call-scalars parallel-program shape-scalars)
         ;; Shape-only invocation scalars are part of the physical program contract even when no
         ;; kernel ABI consumes them. Retain them in the call so logical N-D values can be proved
         ;; element-equivalent to flattened result storage at the LinkPlan boundary.

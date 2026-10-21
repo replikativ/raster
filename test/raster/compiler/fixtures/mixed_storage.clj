@@ -45,6 +45,16 @@
                           (+ acc (aget values i)))]
     (double (float total))))
 
+(deftm public-scaled-reduction-float-roundtrip
+  [coefficient :- Double, values :- (Array double)] :- Double
+  (let [total (par/reduce acc 0.0 i (alength values) (+ acc (aget values i)))]
+    (double (float (* total coefficient)))))
+
+(deftm public-affine-reduction-float-roundtrip
+  [offset :- Long, values :- (Array double), coefficient :- Double] :- Double
+  (let [total (par/reduce acc 0.0 i (alength values) (+ acc (aget values i)))]
+    (double (float (+ (* total coefficient) (double offset))))))
+
 (deftm scaled-reduction-float-roundtrip
   [values :- (Array double)] :- Double
   (let [total (par/reduce acc 0.0 i (alength values)

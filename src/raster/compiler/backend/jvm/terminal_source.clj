@@ -10,7 +10,8 @@
             [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.types :as types]
-            [raster.compiler.core.util :as util])
+            [raster.compiler.core.util :as util]
+            [raster.compiler.ir.invocation-plan :as invocation])
   (:import [java.lang.reflect Method]))
 
 (defn- fail! [message data]
@@ -240,7 +241,7 @@
   [contract source-ns]
   (let [parameters (mapv (fn [{:keys [symbol dtype]}]
                            {:symbol symbol :carrier (case dtype :double Double/TYPE :long Long/TYPE)})
-                         (:parameters contract))]
+                         (invocation/terminal-parameters contract))]
     (project* (assoc contract :parameters parameters) source-ns false)))
 
 (defn project-scalar

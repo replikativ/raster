@@ -442,7 +442,8 @@
            "program is outside the direct TypedSOAC/structured-control vertical"
            {:function function-id :dialect (:dialect semantic) :fallback :none}))
   (let [terminal (get-in semantic [:attributes :invocation-plan :attributes :terminal-host-result])
-        terminal-owner (when terminal (source-owner/compile-terminal-result semantic terminal source-var))
+        terminal-owner (when terminal (source-owner/compile-terminal-result semantic terminal source-var
+                                                                           retained-frontend))
         {:keys [target-descriptor resolved-schedule
                 dispatch-reassociated? dispatch-contractions?]} context
         scheduled (structured-route/schedule-program semantic compiler-options)

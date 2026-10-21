@@ -163,10 +163,28 @@
    This compiles the region's source Object result context, not an arbitrary
    original bytecode method's return descriptor. It grants no physical export,
    producer completion, device observation or whole-invocation result proof."
-  [program contract source-var]
+  ([program contract source-var]
+   (compile-terminal-result program contract source-var nil))
+  ([program contract source-var frontend]
   (let [{:keys [collector metadata source-ns policy]} (original-source-context! source-var :unowned-terminal-source)]
+    ;; A logical dtype is not evidence of the actual source method's carrier.
+    ;; Authenticate the frontend and full original argument order independently
+    ;; before projecting any public scalar as a primitive source value.
+    (when (seq (:public-scalar-parameters contract))
+      (let [physical (entry/frontend-body-entry-carriers frontend source-var)
+            parameters (get-in program [:attributes :invocation-plan :parameters])]
+        (when-not (and physical (= (:parameters physical) (mapv :symbol parameters))
+                       (every? (fn [{:keys [symbol dtype parameter-position]}]
+                                 (and (integer? parameter-position) (<= 0 parameter-position)
+                                      (= symbol (:symbol (get parameters parameter-position)))
+                                      (= (case dtype :double Double/TYPE :long Long/TYPE nil)
+                                         (get-in physical [:parameter-facts symbol :carrier]))))
+                               (:public-scalar-parameters contract)))
+          (throw (ex-info "terminal public scalars lack exact original body-entry carriers"
+                          {:reason :terminal-source-public-entry})))))
     (invocation/validate-terminal-source-result!
-     contract program {:source-policy policy :source-namespace (ns-name source-ns)})
+     contract program {:source-policy policy :source-namespace (ns-name source-ns)
+                       :public-parameters (get-in program [:attributes :invocation-plan :parameters])})
     (let [projection (terminal-source/project contract source-ns)
           return-tag (get metadata :raster.core/return-tag 'Object)
           result-facts (:result-facts projection)
@@ -190,7 +208,7 @@
           ;; refresh an already-emitted function's historical observations.
           observations @collector]
       (entry/assert-definition-inputs-current! observations)
-      (TerminalResultOwner. program contract execute observations source-ns))))
+      (TerminalResultOwner. program contract execute observations source-ns)))))
 
 (deftype ^:private OrderedSourceOwner [program emission observations source-ns scalar-source])
 
@@ -498,6 +516,23 @@
   (terminal-owner-current! owner)
   owner)
 
+(defn- terminal-carrier? [dtype value]
+  (case dtype :double (instance? Double value) :long (instance? Long value) false))
+
+(defn terminal-public-arguments
+  "Select exact public source scalars before observing any resident export.
+   The caller must first authenticate the contract's terminal source owner."
+  [contract arguments]
+  (mapv (fn [{:keys [dtype parameter-position]}]
+          (when-not (and (vector? arguments) (integer? parameter-position)
+                         (<= 0 parameter-position) (< parameter-position (count arguments))
+                         (terminal-carrier? dtype (get arguments parameter-position)))
+            (throw (ex-info "terminal public argument differs from its original scalar carrier"
+                            {:reason :terminal-source-public-arguments
+                             :parameter-position parameter-position})))
+          (get arguments parameter-position))
+        (:public-scalar-parameters contract)))
+
 (defn invoke-terminal-result
   "Evaluate one owned terminal region using completed, ordered scalar exports.
    The runtime caller owes export/completion evidence BEFORE this boundary.
@@ -506,12 +541,11 @@
   [owner program contract arguments]
   (assert-terminal-result-owner! owner program contract)
   (let [^TerminalResultOwner owner owner
-        parameters (:parameters contract)]
+        parameters (invocation/terminal-parameters contract)]
     (when-not (and (vector? arguments) (= (count parameters) (count arguments))
                    (every? true?
                            (map (fn [{:keys [dtype]} value]
-                                  (case dtype :double (instance? Double value)
-                                              :long (instance? Long value)))
+                                  (terminal-carrier? dtype value))
                                 parameters arguments)))
       (throw (ex-info "terminal arguments differ from their actual scalar carriers"
                       {:reason :terminal-source-arguments})))

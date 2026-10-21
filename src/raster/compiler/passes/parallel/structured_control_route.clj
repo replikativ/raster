@@ -788,7 +788,14 @@
             (try
               (invocation/terminal-source-result
                parallel-program {:source-policy (:source-policy options)
-                                 :source-namespace (some-> (:source-ns options) ns-name)})
+                                 :source-namespace (some-> (:source-ns options) ns-name)
+                                 :public-parameters
+                                 (mapv (fn [symbol]
+                                         {:symbol symbol
+                                          :value (declared-parameter-value
+                                                  (:values parallel-program)
+                                                  (:array-types options) (:scalar-types options) symbol)})
+                                       (or (:public-parameters options) (:active-params options)))})
               (catch clojure.lang.ExceptionInfo e
                 (throw (ex-info "the complete source return has no supported terminal boundary"
                                 {:reason :structured-control-source-result

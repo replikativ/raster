@@ -51,6 +51,42 @@
       (is (= Object (:result-carrier warm)))
       (is (= before @body-calls)))))
 
+(deftest frontend-physical-carriers-remain-bound-to-the-opaque-implementation
+  (let [{:keys [receiver source]} (fresh-entry)
+        before @body-calls]
+    (core/prepare-implementation-frontend! receiver)
+    (doseq [warm? [false true]]
+      (when warm? (core/ensure-bytecode-implementation! receiver))
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frontend (entry/original-source-frontend source)
+               physical (entry/frontend-body-entry-carriers frontend source)
+               foreign-implementation (Object.)
+               foreign-definition (assoc-in (:definition physical) [:entry :typed-impl]
+                                            foreign-implementation)
+               reason (fn [f]
+                        (try (f) nil
+                             (catch clojure.lang.ExceptionInfo failure
+                               (:reason (ex-data failure)))))]
+           (is (= ['values 'count 'scale 'reference] (:parameters physical)))
+           (is (= Double/TYPE (get-in physical [:parameter-facts 'scale :carrier])))
+           (is (= Long/TYPE (get-in physical [:parameter-facts 'count :carrier])))
+           (is (= Object (get-in physical [:parameter-facts 'reference :carrier])))
+           ;; Same source Var, formal order, nominal interface and carrier facts
+           ;; do not authorize borrowing another specialization's implementation.
+           (is (identical? source (:source-var foreign-definition)))
+           (is (= (:parameters (:definition frontend)) (:parameters foreign-definition)))
+           (is (= :retained-frontend-entry-mismatch
+                  (reason #(entry/frontend-body-entry-carriers
+                            (assoc frontend :definition foreign-definition) source))))
+           ;; Also fence the physical projection independently: authenticating
+           ;; discovery is not permission to trust a later foreign entry result.
+           (with-redefs [entry/original-body-entry-carriers
+                         (fn [& _] (assoc physical :definition foreign-definition))]
+             (is (= :retained-frontend-entry-mismatch
+                    (reason #(entry/frontend-body-entry-carriers frontend source)))))
+           (is (= before @body-calls))))))))
+
 (deftest bytecode-publishes-source-walking-before-dependencies-are-sealed
   (let [{:keys [receiver source]} (fresh-entry)]
     (core/ensure-bytecode-implementation! receiver)

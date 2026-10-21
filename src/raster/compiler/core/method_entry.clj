@@ -845,6 +845,44 @@
                                               (assoc :required-array-class (get types/primitive-array-info tag)))])
                                   (:parameters definition) carriers (:tags definition)))})))))))))
 
+(defn frontend-body-entry-carriers
+  "Actual body-entry carriers for this exact opaque original frontend.
+   Re-observe the registered selection before consulting physical entry facts;
+   the editable frontend :definition is never carrier authority. This neither
+   emits nor invokes code and requires the enclosing definition owner. Missing
+   or changed correspondence refuses rather than substituting another entry."
+  [frontend source-var]
+  (assert-frontend-source! frontend source-var)
+  (let [current (original-source-frontend source-var)
+        selected (:definition current)
+        claimed (:definition frontend)
+        selection-matches?
+        (and current
+             (every? #(identical? (get frontend %) (get current %))
+                     [:source-frontend :source-owner :implementation :source-entry])
+             (= (select-keys claimed [:operation :implementation-op :parameters :tags])
+                (select-keys selected [:operation :implementation-op :parameters :tags]))
+             (every? #(identical? (get claimed %) (get selected %))
+                     [:source-var :generic-var :receiver-var :entry]))]
+    (when-not selection-matches?
+      (throw (ex-info "frontend physical entry differs from its original producer"
+                      {:reason :retained-frontend-entry-mismatch})))
+    (let [physical (original-body-entry-carriers
+                    (:operation selected) (:implementation-op selected)
+                    (count (:parameters selected)) source-var)
+          definition (:definition physical)
+          actual-implementation (if (:receiver-var definition)
+                                  (get-in definition [:entry :typed-impl])
+                                  (get-in definition [:entry :target-fn]))]
+      (when-not (and physical
+                     (source-entry-matches-selection? (:source-entry frontend) definition source-var)
+                     (identical? (:entry selected) (:entry definition))
+                     (identical? (:implementation frontend) actual-implementation))
+        (throw (ex-info "physical carrier facts belong to another frontend entry"
+                        {:reason :retained-frontend-entry-mismatch})))
+      (assert-definition-inputs-current! @*emission-inputs*)
+      physical)))
+
 (defn observed-body-operation
   "Resolve a nonlexical call only with the selected body's lookup authority.
    Pending source may observe current resolution before its eventual compilation.

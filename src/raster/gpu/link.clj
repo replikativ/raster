@@ -1512,13 +1512,14 @@
 
 (defn- run-ordered-terminal! [executable state]
   (let [execution-state (:execution-state executable)
-        {:keys [compilation result-mode initialized node-views]} (:ordered @execution-state)
+        {:keys [compilation result-mode initialized node-views arguments]} (:ordered @execution-state)
         contract (get-in compilation [:semantic :attributes :invocation-plan :attributes :terminal-host-result])
         _ (when-not (= :host-result result-mode)
             (throw (ex-info "resident execution cannot observe a terminal host region"
                             {:reason :explicit-host-result-required})))
         owner (source-owner/assert-terminal-result-owner! (:terminal-source-owner compilation)
                                                          (:semantic compilation) contract)
+        public-arguments (source-owner/terminal-public-arguments contract arguments)
         {:keys [nodes exports]} (invocation-link/terminal-export-layout state)
         nodes (into {} (map (juxt :id identity)) nodes)]
     ;; Validate every dependency before downloading any of them. Neither a
@@ -1535,7 +1536,8 @@
                                                    destination {:elements 1})
                               (java.lang.reflect.Array/get destination 0))) exports)
           epoch (:value-epoch @execution-state)
-          result (source-owner/invoke-terminal-result owner (:semantic compilation) contract arguments)]
+          result (source-owner/invoke-terminal-result owner (:semantic compilation) contract
+                                                     (into arguments public-arguments))]
       ;; Source helpers may call back into the owner through external references.
       ;; The lifetime lock is reentrant; it cannot by itself preserve this state.
       (ensure-live! executable :terminal-result)

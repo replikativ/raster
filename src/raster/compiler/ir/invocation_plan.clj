@@ -258,6 +258,12 @@
   [value]
   (and (= :tensor (:kind value)) (seq (:shape value))))
 
+(defn terminal-parameters
+  "Ordered source arguments: numerical exports, then independently owned public scalars.
+   Public ports are never numerical exports or program outputs."
+  [contract]
+  (into (vec (:parameters contract)) (:public-scalar-parameters contract)))
+
 (defn terminal-source-result
   "Describe the exact terminal source region and its logical producer ports.
 
@@ -267,13 +273,15 @@
    A later owner must establish physical exports, compile under that retained
    context, guard dependencies, await completion and explicitly observe results.
 
-   The initial boundary is one return expression over produced Double/Long
-   scalars. Nested scopes and canonical completions remain intact; prefix
-   computations, public inputs, array reads and private captures are not silently
+   The boundary is one return expression over produced Double/Long scalars,
+   optionally using declared public Double/Long scalars at their original
+   argument positions. Public-port declarations are not physical carrier proof.
+   Nested scopes and canonical completions remain intact; prefix
+   computations, array reads and private captures are not silently
    acquired as terminal parameters. Portable encoding does not prove purity or
    callee legality; logical producer IDs do not certify producer semantics.
    Existing resident APIs remain unchanged."
-  [program {:keys [source-policy source-namespace]}]
+  [program {:keys [source-policy source-namespace public-parameters]}]
   (parallel-program/validate! program)
   (source-policy/unchecked-math source-policy)
   (let [[head bindings & body] (:source program)]
@@ -288,7 +296,7 @@
               (fail! :invocation-terminal-source
                      "terminal observation requires distinct lexical source identities" {}))
           expression (first body)
-          lexical (into (set symbols) (:inputs program))
+          lexical (into (into (set symbols) (:inputs program)) (map :symbol public-parameters))
           free (binding [util/*shadowing-locals* (into util/*shadowing-locals* lexical)]
                  (util/free-syms expression))
           producers (into {} (mapcat (fn [equation]
@@ -310,7 +318,23 @@
                             {:symbol result :value result :dtype (:dtype value)
                              :producer-equation (:id equation) :result-position position}))))
                 (mapcat :results (:equations program)))
-          missing (set/difference free (set (map :value parameters)))]
+          public-ports
+          (into []
+                (keep-indexed
+                 (fn [position {:keys [symbol value]}]
+                   (when (and (contains? free symbol) (not (contains? producers symbol)))
+                     (when-not (and (not (contains? (set symbols) symbol))
+                                    (scalar-value? value)
+                                    (contains? #{:double :long} (:dtype value)))
+                       (fail! :invocation-terminal-public-carrier
+                              "terminal public port requires an unshadowed declared scalar"
+                              {:symbol symbol :abstract value}))
+                     {:symbol symbol :dtype (:dtype value) :parameter-position position})))
+                public-parameters)
+          _ (when-not (= (count public-parameters) (count (distinct (map :symbol public-parameters))))
+              (fail! :invocation-terminal-public-parameters
+                     "terminal public parameter identities must be distinct" {}))
+          missing (set/difference free (set (concat (map :value parameters) (map :symbol public-ports))))]
       (when (seq missing)
         (fail! :invocation-terminal-free-values
                "terminal source depends on values without retained numerical producers"
@@ -318,10 +342,11 @@
       (when (empty? parameters)
         (fail! :invocation-terminal-free-values
                "terminal observation requires a numerical producer dependency" {}))
-      (let [contract {:kind :terminal-host-result :site [:return]
-                      :effects #{:ordered-host-observation}
-                      :parameters parameters :body expression
-                      :source-policy source-policy :source-namespace source-namespace}]
+      (let [contract (cond-> {:kind :terminal-host-result :site [:return]
+                             :effects #{:ordered-host-observation}
+                             :parameters parameters :body expression
+                             :source-policy source-policy :source-namespace source-namespace}
+                       (seq public-ports) (assoc :public-scalar-parameters public-ports))]
         ;; No runtime object, private completion Class or executable may enter
         ;; this portable semantic boundary. Such owners need a separate path.
         (semantic/canonical-bytes contract)
@@ -876,7 +901,8 @@
               :expected-external-dimensions expected-dimensions}))
     (when-let [contract (get-in plan [:attributes :terminal-host-result])]
       (validate-terminal-source-result! contract parallel-program
-                                        (select-keys contract [:source-policy :source-namespace]))
+                                        (assoc (select-keys contract [:source-policy :source-namespace])
+                                               :public-parameters (:parameters plan)))
       (when-not (contains? (:effects parallel-program) :ordered-host-observation)
         (fail! :invocation-terminal-effects "terminal observation cannot be declared effect-free" {}))
       (when-not (= (:program-outputs plan) (mapv :value (:parameters contract)))
