@@ -420,6 +420,20 @@
       (with-meta (apply list children) m)
       (apply list children))))
 
+(defn remake-if-changed
+  "Rebuild a source seq/vector only when an ordered child object changes.
+   Retain original metadata and collection kind. Equality is insufficient:
+   equal symbols with changed type metadata are distinct construction inputs.
+   This preserves occurrence identity on a no-op; it grants no source proof."
+  [original children]
+  (when-not (or (seq? original) (vector? original))
+    (throw (IllegalArgumentException. "Source reconstruction requires a seq or vector")))
+  (if (and (= (count original) (count children))
+           (every? true? (map identical? original children)))
+    original
+    (with-meta (if (vector? original) (vec children) (apply list children))
+      (meta original))))
+
 (defn remake-from
   "Construct a new list form from a seq of children, preserving metadata from orig."
   [orig children]

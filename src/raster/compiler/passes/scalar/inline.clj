@@ -477,6 +477,12 @@
    {:bindings <flat vec> :body <seq of body exprs> :changed? bool}."
   [bindings-vec body-exprs]
   (let [changed? (atom false)
+        hoist-barrier? (fn [expression]
+                         (and (seq? expression)
+                              (or (contains? '#{quote clojure.core/quote} (first expression))
+                                  (form/introduces-scope? expression)
+                                  (form/binding-form? expression))))
+        rebuild util/remake-if-changed
         lift-in (fn lift-in [expr]
                   ;; walk expr; lift nested vg apps. `expr` is NEVER the top-level
                   ;; init here (caller passes children), so any vg-app found is nested.
@@ -488,20 +494,17 @@
                                    (swap! lifted conj [g f])
                                    (reset! changed? true)
                                    g)
+                                 ;; Quoted forms are data, not AD applications.
                                  ;; Do NOT cross a scope boundary (inner let*/loop*/
                                  ;; fn*/par body): lifting a vg app that closes over an
                                  ;; inner-bound var to the outer level would break scope.
                                  ;; Leave it — the fail-loud backstop catches anything the
                                  ;; hoist can't safely reach.
-                                 (and (seq? f)
-                                      (or (form/introduces-scope? f)
-                                          (form/binding-form? f))) f
+                                 (hoist-barrier? f) f
                                  (seq? f)
-                                 (let [r (apply list (map walk f))]
-                                   (if-let [m (meta f)] (with-meta r m) r))
+                                 (rebuild f (mapv walk f))
                                  (vector? f)
-                                 (let [r (mapv walk f)]
-                                   (if-let [m (meta f)] (with-meta r m) r))
+                                 (rebuild f (mapv walk f))
                                  :else f))
                         new-expr (walk expr)]
                     [@lifted new-expr]))
@@ -509,17 +512,15 @@
         ;; handles it); otherwise recurse into its children lifting nested apps.
         process-init (fn [init]
                        (if (or (value+grad-call? init)
-                               (and (seq? init)
-                                    (or (form/introduces-scope? init)
-                                        (form/binding-form? init))))
+                               (hoist-barrier? init))
                          [[] init]
                          (if (seq? init)
                            (let [[lifted children] (reduce (fn [[ls acc] child]
                                                              (let [[l c] (lift-in child)]
                                                                [(into ls l) (conj acc c)]))
                                                            [[] []] init)
-                                 r (apply list children)]
-                             [lifted (if-let [m (meta init)] (with-meta r m) r)])
+                                 r (rebuild init children)]
+                             [lifted r])
                            (lift-in init))))
         new-bindings (reduce (fn [acc [sym init]]
                                (let [[lifted new-init] (process-init init)]
