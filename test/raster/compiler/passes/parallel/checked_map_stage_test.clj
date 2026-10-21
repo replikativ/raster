@@ -176,6 +176,41 @@
       (is (seq (get-in equation [:refinement :source :nodes 0 :read-capacity-certificate :requirements])))
       (is (empty? (:complete-write-domains report))))))
 
+(deftest checked-map-volume-equality-requires-its-causal-scheduled-body
+  (doseq [target targets]
+    (let [compilation (equation-first/compile #'storage/checked-product-shaped-map
+                                             (merge storage/policy {:target target :dtype :double}))
+          equation (numerical-equation compilation)
+          algorithm (:algorithm equation)
+          scheduled-body (:body equation)
+          source (equation-graph/make algorithm scheduled-body)
+          output (first (:outputs source))
+          bound (get-in source [:nodes 0 :operation :space :dims 0 :bound])
+          numerical (last (:equations scheduled-body))
+          prefix (vec (butlast (:equations scheduled-body)))
+          obligation (first (:stage-results (emitted/validate-with-result-contracts equation)))]
+      (is (not= bound (:elements output)) "the former syntactic equality is insufficient")
+      (is (= :conditional-on-success (:initialization obligation)))
+      (is (= :invocation-private (:output-ownership obligation)))
+      (is (= :checked-map-stage-declined (reason #(checked/plan algorithm source {}))))
+      (is (= :checked-map-stage-declined
+             (reason #(checked/plan algorithm source {:scheduled-equation-body scheduled-body})))
+          "caller options cannot supply source authority")
+      (is (= 1 (count (:stage-results (checked/plan algorithm source {} scheduled-body)))))
+      (is (= :checked-map-stage-declined
+             (reason #(checked/plan algorithm
+                                   (assoc-in source [:nodes 0 :read-capacity-certificate :scalar-definitions]
+                                             {bound (:elements output)}) {})))
+          "attached certificate definitions cannot supply missing causal context")
+      (doseq [changed [(assoc scheduled-body :equations (into [numerical] prefix))
+                       (update-in scheduled-body [:equations 0] dissoc :algorithm)
+                       (assoc-in scheduled-body [:equations 0 :effects] #{:memory/write})
+                       (assoc-in scheduled-body [:values 'rows :dtype] :int)]]
+        (is (thrown? clojure.lang.ExceptionInfo (checked/plan algorithm source {} changed))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (checked/plan algorithm (assoc-in source [:outputs 0 :elements] 17)
+                                 {} scheduled-body))))))
+
 (deftest physical-refinement-does-not-authorize-unobserved-consumers
   (let [compilation (compilation (first targets))
         equation (numerical-equation compilation)

@@ -90,7 +90,7 @@
             (fail! :checked-map-stage-refinement
                    "checked source requires its source-derived checked stage refinement" {}))
         checked (when checked?
-                  (checked-stage/validate-reconstruction! algorithm expected refinement caller-options))
+                  (checked-stage/validate-reconstruction! algorithm expected refinement caller-options body))
         mixed (when mixed?
                 (mixed-validation/validate-reconstruction! algorithm expected refinement caller-options))
         refinement (when refinement

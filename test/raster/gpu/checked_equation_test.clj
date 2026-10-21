@@ -326,3 +326,41 @@
   (if @opencl/opencl-available?
     (check-dynamic-fold-device :ocl:0)
     (opencl/opencl-skip! "dynamic checked ordered fold on OpenCL")))
+
+(defn- check-product-domain-device [target]
+  (let [values [0.25 -0.5 1.0 2.0 -4.0 0.0]
+        expected (into {} (for [rows [0 2] offset [0.0 0.125]]
+                            [[rows offset]
+                             (vec (storage/checked-product-shaped-map
+                                   2.0 (float-array (map #(+ % offset) values)) rows 3))]))
+        compiled (equation-first/compile #'storage/checked-product-shaped-map
+                                         (merge storage/policy {:target target :dtype :double}))]
+    (doseq [rows [0 2]]
+      (let [input (float-array values)
+            executable (link/instantiate-checked-invocation! compiled [2.0 input rows 3])
+            session (:session executable)]
+        (try
+          (doseq [offset [0.0 0.125]]
+            (dotimes [i 6] (aset input i (float (+ (nth values i) offset))))
+            (let [output (first (keys (link/run! executable)))]
+              (is (= (get expected [rows offset]) (vec (link/download executable output))))))
+          (is (= 2 @(:completed-replays executable)))
+          (when (pos? rows)
+            (aset input 0 Float/MAX_VALUE)
+            (is (thrown? IllegalArgumentException (link/run! executable)))
+            (is (= 2 @(:completed-replays executable)))
+            (is (false? @(:output-ready? executable)))
+            (is (empty? (get-in @(:execution-state executable) [:ordered :observed])))
+            (is (= :link-execution-poisoned (reason #(link/outputs executable))))
+            (is (empty? (:kernel-graphs @session)))
+            (is (empty? (:events @session))))
+          (finally (link/close! executable)))
+        (is (true? (:closed? @session)))))))
+
+(deftest checked-map-with-independent-product-extents-executes-on-local-devices
+  (if @level-zero/gpu-available?
+    (check-product-domain-device :ze:0)
+    (level-zero/gpu-skip! "checked product-shaped map on Level Zero"))
+  (if @opencl/opencl-available?
+    (check-product-domain-device :ocl:0)
+    (opencl/opencl-skip! "checked product-shaped map on OpenCL")))

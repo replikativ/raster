@@ -9,6 +9,7 @@
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.scalar-conversion :as conversion]
+            [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.numerical-contract :as numerics]
@@ -18,6 +19,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.map-read-requirements :as reads]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segmap-body :as map-body]))
 
 (def kind :checked-float-map)
@@ -154,13 +156,35 @@
          (contains? #{:buffer :effect} host-return)
          (= [{:destination output :access :write :host-return host-return}] storage))))
 
+(defn- same-output-domain?
+  [algorithm source-graph scheduled-body bound output]
+  (or (= bound (:elements output))
+      (when scheduled-body
+        ;; The body, not a certificate's attached definitions, owns the causal
+        ;; scalar equations. Reconstruct its entire source graph before using
+        ;; the original storage shape as a volume witness. Scalar execution and
+        ;; its checked overflow remain in the program, not in this proof.
+        (let [expected (equation-graph/make
+                        algorithm scheduled-body
+                        (select-keys source-graph [:provenance :attributes]))
+              numerical (filterv #(not (true? (get-in % [:attributes :host-only])))
+                                 (:equations scheduled-body))
+              equation (first numerical)]
+          (and (semantic/equivalent? expected source-graph)
+               (= 1 (count numerical))
+               (semantic/equivalent? algorithm (:algorithm equation))
+               (extent-proof/same-volume?
+                (extent-proof/parallel-environment-before scheduled-body equation)
+                bound (get-in scheduled-body [:values (:id output) :shape])))))))
+
 (defn plan
   "Derive one checked result obligation and its complete physical schedule.
    A single-result map, either functional or an exact write-only destination,
    retains an explicit invocation-private output requirement. The managed owner
    must prove that requirement before execution; roles/effects alone do not.
    Unsupported candidates retain their original semantic operation."
-  [algorithm source-graph options]
+  ([algorithm source-graph options] (plan algorithm source-graph options nil))
+  ([algorithm source-graph options scheduled-body]
   (let [algorithm (soac/validate! algorithm)
         source-graph (graph/validate! source-graph)
         equation (first (soac/equations algorithm))
@@ -181,7 +205,8 @@
                 (not (and (= 1 (count (:outputs source-graph)))
                           (= output (:id (first (:outputs source-graph))))
                           (= :output (:role (first (:outputs source-graph))))
-                          (= bound (:elements (first (:outputs source-graph)))))) :single-output-boundary
+                          (same-output-domain? algorithm source-graph scheduled-body bound
+                                               (first (:outputs source-graph))))) :single-output-boundary
                 (not (or (and (empty? (:effects facts)) (empty? (:aliases facts))
                               (empty? (get-in facts [:attributes :result-storage])))
                          (private-result-storage? facts equation output))) :private-result-storage
@@ -290,16 +315,19 @@
                                   :numerics (:numerics certificate)})]
     (scheduled/validate-against-node! certificate (first (:nodes checked-graph)) checked-graph)
     {:refinement witness :graph checked-graph :stage-bodies [certificate]
-     :stage-results [obligation]}))
+     :stage-results [obligation]})))
 
 (defn validate-reconstruction!
   "Reconstruct from the original semantic operation and source graph. Caller
    metadata or an emitted ABI never substitutes for this complete comparison."
-  [algorithm source-graph witness options]
+  ([algorithm source-graph witness options]
+   (validate-reconstruction! algorithm source-graph witness options nil))
+  ([algorithm source-graph witness options scheduled-body]
   (refinement/validate-against! witness source-graph)
   (let [expected (plan algorithm source-graph
-                       (assoc options :workgroup-size (get-in witness [:schedule :workgroup-size])))]
+                       (assoc options :workgroup-size (get-in witness [:schedule :workgroup-size]))
+                       scheduled-body)]
     (when-not (semantic/equivalent? (:refinement expected) witness)
       (throw (ex-info "checked stage refinement changed its exact source-derived schedule"
                       {:reason :checked-map-stage-refinement})))
-    expected))
+    expected)))

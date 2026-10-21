@@ -42,6 +42,14 @@
   [coefficient :- Double values :- (Array float)] :- (Array float)
   (par/scale coefficient values))
 
+(deftm checked-product-shaped-map
+  "Independent allocation and map extent definitions retain checked Long products."
+  [coefficient :- Double values :- (Array float) rows :- Long columns :- Long] :- (Array float)
+  (let [out (float-array (* rows columns))]
+    (par/map-void! i (* rows columns)
+      (aset out i (float (* coefficient (double (aget values i))))))
+    out))
+
 (deftm checked-scale-effect!
   "A checked write-only map whose public result is Void, not the destination."
   [coefficient :- Double values :- (Array float) out :- (Array float) n :- Long] :- Void

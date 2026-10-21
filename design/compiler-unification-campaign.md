@@ -89,6 +89,31 @@ and features. This requires the existing causal extent evidence, not weakened
 equality or a norm-specific exception. Internal checked conversions, complete
 training/source correspondence, and the broad draft's red CI remain open.
 
+### October 21 causal checked-map volume correspondence
+
+Checked-map emission and independent emitted-equation reconstruction now pass
+the retained dependency-closed scheduled body explicitly. When iteration extent
+and output elements differ syntactically, the planner reconstructs the complete
+source graph, requires its exact match and unique numerical algorithm, then uses
+the existing predecessor-only `extent-proof` environment to compare the iteration
+extent with the retained physical output shape. It does not manufacture source
+arithmetic from KernelLaunch products, trust read-certificate definitions or accept
+caller-option assertions. Original scalar evaluations and overflow checks remain.
+Callers without the causal body retain exact-equality-only admission.
+
+A product-shaped source map now compiles for OpenCL/CUDA/HIP and executes on both
+local backends, with zero-size output, changed-input replay, checked failure and
+ownership cleanup. Forged attached definitions, future or malformed predecessor
+bodies, changed effects/types and changed output storage remain refused. The
+shared extent-proof tests also cover narrowing, wrapping multiplication and
+guarded negative domains. The affected four namespaces pass 39 tests / 743
+assertions; independent review found no blocker.
+
+Unchanged `rms-norm-chunked` passes the former single-output-boundary refusal and
+now reaches a distinct map-body index-scope refusal (`rstr_local_7` undeclared).
+That is the next source/lowering investigation, not a qualified RMS execution
+claim. Internal checked conversions and the draft's broader red gates remain.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast

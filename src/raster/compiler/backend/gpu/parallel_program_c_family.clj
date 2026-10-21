@@ -192,7 +192,7 @@
       (let [{:keys [body graph]} (equation-graph/make-for-equation
                                   parallel-program equation)
             checked (when (checked-stage/candidate? algorithm graph)
-                      (checked-stage/plan algorithm graph opts))
+                      (checked-stage/plan algorithm graph opts body))
             scheduled-graph (or (:graph checked) graph)
             ;; Multi-phase schedules retain family-independent decisions (algebra, phase
             ;; decomposition, tuning choice) on their certified graph. Rebuilding the physical
