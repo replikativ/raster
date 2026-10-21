@@ -1354,8 +1354,9 @@
                             :shape (get-in resident [:view :shape])}))))
 
 (defn- run-ordered-observed-stage! [executable ready pending]
-  (when-not (and executable (:owns-session? executable)
-                 (get-in @(:execution-state executable) [:ordered :observe-checked?]))
+  (when-not (and (linked-executable? executable) (true? (:owns-session? executable))
+                 (instance? clojure.lang.Atom (:execution-state executable))
+                 (true? (get-in @(:execution-state executable) [:ordered :observe-checked?])))
     (throw (ex-info "checked ordered entry still requires its historical source and output owner"
                     {:reason :link-checked-entry-owner-required})))
   (let [execution-state (:execution-state executable)
@@ -1403,12 +1404,11 @@
       next-state)))
 
 (defn- run-ordered-stage! [executable ready]
-  (assert-ordered-source!
-   (get-in @(:execution-state executable) [:ordered :compilation]))
   (if-let [pending (:pending-observed-entry ready)]
     (run-ordered-observed-stage! executable ready pending)
   (let [execution-state (:execution-state executable)
         {:keys [execution-id ledger caller-options compilation]} (:ordered @execution-state)
+        _ (assert-ordered-source! compilation)
         epoch (:value-epoch @execution-state)
         plan (:stage-plan ready)
         storage (acquire-ordered-storage! executable (:nodes plan) (:aliases plan))

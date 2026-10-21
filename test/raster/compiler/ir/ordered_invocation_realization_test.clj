@@ -96,8 +96,25 @@
     (is (identical? pending (link-plan/validate-pending-observed-entry! pending)))
     (is (= :checked-stage-observation-required
            (reason #(link-plan/validate! (:stage-layout ready)))))
-    (is (= :link-checked-entry-owner-required
-           (reason #(#'gpu-link/run-ordered-stage! nil ready))))
+    (let [acquisitions (atom 0)]
+      (with-redefs-fn {#'gpu-link/acquire-ordered-storage!
+                      (fn [& _] (swap! acquisitions inc) (throw (AssertionError. "unowned stage acquired storage")))}
+        (fn []
+          (doseq [executable [nil {} {:owns-session? true}
+                              (gpu-link/map->LinkedExecutable {:owns-session? true})
+                              (gpu-link/map->LinkedExecutable
+                               {:owns-session? :truthy :execution-state (atom {:ordered {:observe-checked? true}})})
+                              (gpu-link/map->LinkedExecutable
+                               {:owns-session? true :execution-state (atom {:ordered {:observe-checked? :truthy}})})]]
+            (is (= :link-checked-entry-owner-required
+                   (reason (fn [] (#'gpu-link/run-ordered-stage! executable ready))))))
+          (let [unowned (gpu-link/map->LinkedExecutable
+                         {:owns-session? true
+                          :execution-state (atom {:ordered {:observe-checked? true
+                                                            :compilation (dissoc compilation :ordered-source-owner)}})})]
+            (is (= :ordered-source-owner-mismatch
+                   (reason #(#'gpu-link/run-ordered-stage! unowned ready)))))))
+      (is (zero? @acquisitions)))
     (is (= :invocation-ordered-pending
            (reason #(invocation-link/realize-ready-equation (:state ready) (:equation entry) nil))))
     (is (= :invocation-ordered-incomplete

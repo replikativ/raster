@@ -58,6 +58,17 @@ assertions; the final pure metadata-update form passes the focused lifecycle gat
 again (17 / 175). This repairs reproduced failures, not the remaining AD import,
 checked-conversion or full-draft qualification categories.
 
+The next reproduced ordered-realization failure was preflight ordering, not a
+missing observation capability: `run-ordered-stage!` dereferenced a nil executor
+before delegating the checked entry's owner guard. Checked entries now validate
+record/state shape and literal-true ownership/observation flags first; actual
+historical source ownership still precedes storage acquisition. Ordinary entries
+retain their source guard before acquisition. Negative tests forbid acquisition
+for malformed executors and for a structurally plausible record missing its source
+owner. The affected realization/checked-execution gate passes 12 tests / 271
+assertions, including real OpenCL and Level Zero success, failure-order and private
+generation checks. This is guard repair, not a new checked-conversion family.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification
