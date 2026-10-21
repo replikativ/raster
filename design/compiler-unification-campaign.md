@@ -112,6 +112,30 @@ the body-import witness does not discharge it. Keep both quotient refusals until
 their own evidence closes. Resume more general caller transport only where the
 current unchanged workload demonstrates that it is the missing prerequisite.
 
+That prerequisite is now explicit from review of the actual count machinery:
+InputOrigins relates original frontend input to JVM emission, BodyImport relates
+the callee's body transformation, and PrefixCorrespondence covers unchanged flat
+prefixes. None recovers the original count site after uniquification, helper
+substitution and nested-reduction lifting. The minimal next implementation chain
+therefore extends the existing owner-local source-transport machinery:
+
+1. Retain actual occurrence/lexical-scope reconstruction at `util/uniquify*`, for
+   both early source normalization and later TypedSOAC normalization.
+2. Connect BodyImport to actual helper substitution with all formal completions
+   checked independently; initially admit identity completions only.
+3. Retain the actual site-to-generated-binding relation in
+   `lift-nested-scalar-reductions`. It preserves the reduction node itself, so
+   requires no new interpretation or search for equal contents.
+4. Reuse ordered scalar-input normalization to bind checked raw count and separate
+   nonnegative extent to those exact source occurrences.
+5. Compose the retained count/read obligations with physical result context and
+   quotient evidence; prepared-AD semantic import closure stays independent.
+
+No global origin registry, generated-name search, post-hoc syntax equality or
+metadata safety flag can replace this chain. A diagnostic-only count certificate
+would not close the unchanged gradient. The checked-cast repair is complete at
+its own source boundary; these reconstruction/composition obligations remain.
+
 ### October 21 ordered host-integral qualification
 
 Late checked integral computations may now remain opaque ordered host actions
