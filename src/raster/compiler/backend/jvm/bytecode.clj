@@ -2620,6 +2620,38 @@
         ;; Already a typed array on the stack
         (do (.arraylength code) :int)))))
 
+(defn- emit-source-integral-cast
+  "Checked source conversions, not method/array ABI coercions. Select the
+   Clojure runtime overload from the actual emitted operand carrier."
+  [code head-name args locals ctx]
+  (when (= 1 (count args))
+    (let [input (emit-form code (first args) locals ctx)
+          result (if (= "int" head-name) :int :long)]
+      (if (= :diverge input)
+        :diverge
+        (do
+          (cond
+            (= input result) nil
+            (= [input result] [:int :long]) (.i2l code)
+            ;; Keep the existing checked primitive Long narrowing, including
+            ;; its ArithmeticException behavior, distinct from unchecked-int.
+            (= [input result] [:long :int])
+            (.invokestatic code math-cd "toIntExact"
+                           (MethodTypeDesc/of I-cd (into-array ClassDesc [J-cd])))
+            :else
+            (let [descriptor (case input
+                               :float F-cd :double D-cd :ref obj-cd
+                               ;; Boolean's int-shaped stack slot is not a number.
+                               :bool (do (emit-box-to-ref code input) obj-cd)
+                               ;; A void operand completes its effects, then yields nil.
+                               :void (do (.aconst_null code) obj-cd))]
+              (.invokestatic code rt-cd (str head-name "Cast")
+                             (MethodTypeDesc/of (if (= :int result) I-cd J-cd)
+                                                (into-array ClassDesc [descriptor])))))
+          (when (contains? #{:int :long} input)
+            (retain-primitive-index-route! ctx :integer-cast result))
+          result)))))
+
 (defn- emit-core-intrinsic
   "Emit bytecode for clojure.core intrinsic functions."
   [code head-name args locals ctx]
@@ -2799,22 +2831,7 @@
             (.invokestatic code rt-cd (if (= "float" head-name) "floatCast" "uncheckedFloatCast")
                            (MethodTypeDesc/of F-cd (into-array ClassDesc [input])))
             :float))))
-    "int"    (let [t (emit-form code (first args) locals ctx)
-                   result (case t
-                 :int :int
-                 ;; `int` is a checked source conversion. Keep this distinct from the raw JVM
-                 ;; coercions used to satisfy array-store and method descriptors, and from the
-                 ;; explicitly wrapping `clojure.core/unchecked-int` operation.
-                 :long (do (.invokestatic code math-cd "toIntExact"
-                                          (MethodTypeDesc/of I-cd
-                                                             (into-array ClassDesc [J-cd])))
-                           :int)
-                 (do (emit-coerce code t :int) :int))]
-               (when (contains? #{:int :long} t) (retain-primitive-index-route! ctx :integer-cast result))
-               result)
-    "long"   (let [t (emit-form code (first args) locals ctx)]
-               (when (contains? #{:int :long} t) (retain-primitive-index-route! ctx :integer-cast :long))
-               (if (= t :long) t (do (emit-coerce code t :long) :long)))
+    ("int" "long") (emit-source-integral-cast code head-name args locals ctx)
     ;; Arithmetic — dispatched to emit-arithmetic helper
     ("+" "-" "*" "/") (retain-primitive-index-route! ctx :primitive-arithmetic
                                                        (emit-arithmetic code head-name args locals ctx))
