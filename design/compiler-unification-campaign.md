@@ -395,6 +395,53 @@ JVM outputs, zero source calls while binding, exactly one per replay and closed
 sessions. No device test was skipped. These bounded receipts do not qualify the
 broad draft's unrelated CI or unchanged-training refusals.
 
+The complete affected ordered-root namespace subsequently passes 4 tests / 462
+assertions on these real devices, covering existing source allocation, failure
+ordering and replay controls as well as the new selected-prefix tests.
+
+An unchanged training recheck confirms that `local-loss` still refuses its first
+helper-expanded scalar occurrence: `rows * 1` imported from `linear-nb`. The final
+ScalarCompute contains a logical Long conversion around the selected call, but
+has no original-root prefix correspondence. `local-gradient-sum` separately
+refuses two retained source evaluations (core division and numeric division),
+while retaining its conditional Float reduction correspondence and unproved
+source-count-domain obligation. These are failures, not qualified training results.
+
+### Next producer-owned helper-expansion transport
+
+Independent review of the actual inliner locates the missing relation:
+`resolve-walked-body-input` owns the callee's authentic frontend transiently, then
+returns a hygienic/qualified body without retaining its owner or renaming recipe.
+`inline-invk` and the binding inliner apply call-by-value substitution, but that
+mechanism preserves actual argument types, not formal argument completion.
+Primitive/array symbols may be directly substituted, including unused formals.
+Neither generated binder names nor structural expression equality recover the
+original call's semantics after this boundary.
+
+The next slice must retain an owner-local expansion transaction at construction:
+
+1. Keep the exact original caller occurrence, selected callee frontend and actual
+   hygienic renaming/substitution recipe. Compose nested witnesses through their
+   immediate parent rather than globally searching for matching expressions.
+2. Reuse shared scope utilities, argument-substitution mechanics and ordered-call
+   contracts, while checking argument order, single evaluation and **all** formal
+   completions independently. Initially admit identity-completion cases only;
+   conversions and unsupported/effectful arguments remain explicit obligations.
+3. Validate the constructed expansion before connecting exact final invocation
+   steps to original callee occurrences through the existing prefix authority.
+   Carry caller/callee historical guards in the existing observation collector;
+   do not add an executable registry, mutable public form certificate or hash
+   match that can authorize copied source.
+4. First qualify diagnostic-only transport with unused failing conversion,
+   reordered/duplicated arguments, shadowed locals, copied expansion and stale
+   callee counterexamples. Then use the existing source executor/count path for
+   execution and rerun unchanged `local-loss` and training composition oracles.
+
+This is one staged relation for ordinary helper composition, not a special
+`linear-nb`/MSE rewrite, a permission to simplify checked multiplication by one,
+or a relaxation of prepared-AD import closure. Real training acceptance remains
+the gate; diagnostic provenance alone does not close campaign items 3 or 5.
+
 PR #1551 (bounded apt acquisition retries, without softening failed prerequisites)
 is squash-merged as `4bb40cb1` after all seven exact-head CircleCI contexts passed.
 PR #1550 now includes that prerequisite at head `0c0af56f`; its new CI run must be
