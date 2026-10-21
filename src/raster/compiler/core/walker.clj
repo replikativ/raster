@@ -1127,7 +1127,8 @@
                       long :long
                       :double)]
       (with-meta
-        (list 'raster.par/reduce acc-sym walked-init i-sym walked-bound (walk body-expr body-ctx))
+        (list 'raster.par/reduce (stamp-type-meta acc-sym acc-tag)
+              walked-init i-sym walked-bound (walk body-expr body-ctx))
         {:tag acc-tag :raster.type/tag acc-tag :raster.type/elem-type elem-type}))))
 
 (defmethod walk-form :par-product-reduce

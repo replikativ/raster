@@ -16,6 +16,21 @@
   ([form] (walker/walk-body form {:type-env {}}))
   ([form flat-env] (walker/walk-body form {:type-env (te flat-env)})))
 
+(deftest reduction-accumulator-type-survives-initializer-lowering
+  (doseq [[tag initializer lowered]
+          [['float '(float 0.0) 'java.lang.Float/NEGATIVE_INFINITY]
+           ['double '(double 0.0) 'java.lang.Double/NEGATIVE_INFINITY]]]
+    (let [once (wb (list 'raster.par/reduce 'acc initializer 'i 0 'acc))
+          ;; Inlining can expose a static field instead of a typed call. The
+          ;; binder's already inferred type must survive without re-inference.
+          rewritten (with-meta (apply list (assoc (vec once) 2 lowered)) (meta once))
+          twice (wb rewritten)]
+      (is (= tag (:raster.type/tag (meta (second once)))))
+      (is (nil? (:tag (meta (second once))))
+          "do not introduce a Clojure primitive local hint")
+      (is (= tag (:raster.type/tag (meta twice))))
+      (is (= lowered (nth twice 2))))))
+
 (deftest contextual-loop-seed-retains-canonical-source-and-binding-type
   (let [body (walker/walk-body '(loop* [seed 0.0 i 0]
                                (if (< i 1) (recur (raster.numeric/+ seed x) (inc i)) seed))
