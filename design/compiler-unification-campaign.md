@@ -235,6 +235,43 @@ unchanged. The namespace passes 9 tests / 65 assertions; independent review foun
 no blocker. This repairs CI accounting without admitting native replay guards or
 claiming a production AD fix. Remaining broad CI failures are still open.
 
+The distinct private-destination guard fixture has the same earlier refusal and
+now requires its completion plus original alias message/reason to survive too.
+Its existing successful private-write and opaque-alias runtime controls are
+unchanged. Both namespaces together pass 14 tests / 85 assertions; review found
+no blocker. These four corrected stale assertions are not evidence that the
+remaining draft failure clusters below have been resolved.
+
+### October 21 full draft CI failure baseline
+
+The complete test job **33431**, head **e93adb6f**, is substantially broader
+evidence than the earlier abbreviated shard inspection: its sixteen failed-shard
+summaries total **7,429 tests / 88,348 assertions, 117 FAIL headers and 172 ERROR
+headers**. These are that job's logged totals, not a fresh run of later heads.
+The reviewed replay-test updates above do not qualify the other failures.
+
+The principal shared boundaries are checked floating conversion in numerical
+maps, original source/ordered-host execution, prepared output/donation contracts,
+artifact serialization and contextual method ownership. Additional failures
+include AD structural completion, counted reductions and stale structural
+expectations. Failure locations are diagnostic clusters, not a proof that every
+member has the same cause: 43 ERROR headers originate at `segmap_body.clj`, 23 at
+`equation_first.clj`, 17 at `method_entry.clj`, 12 at `source_owner.clj`, 12 at
+`compiled.clj` and 9 at `equation_artifact.clj`. Keep public workloads and both
+positive and negative tests enabled while repairing these mechanisms.
+
+The immediate connected repair remains the actual inliner expansion transaction:
+one builder used by binding expansion and `.invk` expansion must consume the
+authenticated callee import while constructing argument bindings, substitutions,
+callee bindings and results. Retain construction edges there, not after the fact
+by generated names. Its caller occurrence and full positional ABI completion
+must be authenticated, and source-prefix correspondence must describe ordered
+call intervals rather than require an unchanged binding count. Argument-only
+evidence authorizes only the original call's ordered argument prefix; callee
+allocation/local evaluation and normal return require independent closure before
+RMS or training execution is admitted. No weaker fallback or restamped history
+is an acceptable route to a green campaign.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast
