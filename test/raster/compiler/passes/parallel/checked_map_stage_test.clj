@@ -6,6 +6,7 @@
             [raster.compiler.ir.emitted-parallel-equation :as emitted]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.stage-result :as result]
             [raster.compiler.passes.parallel.checked-map-stage :as checked]
             [raster.compiler.passes.parallel.resident-program-projection :as resident]
@@ -56,6 +57,23 @@
       (is (result/requires-observation? compilation))
       (is (= (:stage-results report)
              (:stage-results (emitted/validate-with-result-contracts equation)))))))
+
+(deftest primitive-library-producer-retains-checked-storage-and-library-accuracy
+  (doseq [target targets]
+    (let [compilation (equation-first/compile #'storage/double-exponential-float-storage
+                                             (merge storage/policy {:target target :dtype :double}))
+          equation (numerical-equation compilation)
+          obligation (first (:stage-results (emitted/validate-with-result-contracts equation)))
+          kernel-body (get-in equation [:graph :nodes 0 :operation :attributes :kernel-body])
+          expressions (filter #(and (= "raster.compiler.ir.kernel_body.ScalarExpr" (some-> % class .getName))
+                                     (= :exp (:op %)))
+                              (tree-seq coll? seq kernel-body))]
+      (is (= checked/kind (:kind obligation)))
+      (is (= :trap (get-in obligation [:source-conversion :overflow])))
+      (is (= :conditional-on-success (:initialization obligation)))
+      (is (= 1 (count expressions)) "the producer is evaluated once per active lane")
+      (is (= :double (:result-type (first expressions))))
+      (is (= numerics/target-library-math (get-in (first expressions) [:options :math-realization]))))))
 
 (deftest source-ordered-fold-preserves-precision-and-private-write-obligation
   (doseq [target targets]

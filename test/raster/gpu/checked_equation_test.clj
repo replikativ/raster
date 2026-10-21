@@ -10,11 +10,13 @@
             [raster.runtime.checked-stage-result :as observation]
             [raster.dl.gpu-grad-parity :as level-zero]))
 
-(defn- equation [target]
+(defn- equation
+  ([target] (equation target #'storage/mixed-scale))
+  ([target function]
   (->> (:equations (:emitted (equation-first/compile
-                             #'storage/mixed-scale
+                             function
                              (merge storage/policy {:target target :dtype :double}))))
-       (remove #(get-in % [:attributes :host-only])) first :operations first))
+       (remove #(get-in % [:attributes :host-only])) first :operations first)))
 
 (defn- thrown-description [f]
   (try (f) nil (catch Throwable error [(class error) (.getMessage error)])))
@@ -87,6 +89,44 @@
   (if @opencl/opencl-available?
     (check-device :ocl:0)
     (opencl/opencl-skip! "source-derived checked equation on OpenCL")))
+
+(defn- check-library-device [target]
+  (let [equation (equation target #'storage/double-exponential-float-storage)
+        graph (:graph equation)
+        input (:id (first (:inputs graph)))
+        output (:id (first (:outputs graph)))
+        extent (:extent (first (:stage-results (emitted/validate-with-result-contracts equation))))]
+    (gpu/with-gpu-session [session target]
+      (gpu/alloc! session {:input [:float 4 nil] :output [:float 4 nil]})
+      (doseq [values [[-1.0 0.0 1.0 Float/NaN] [0.0 80.0 Float/NEGATIVE_INFINITY 1.0]
+                      [90.0 0.0 -1.0 1.0] [Float/POSITIVE_INFINITY 0.0 -1.0 1.0]]]
+        (let [array (float-array values)
+              oracle #(mapv (fn [x] (float (Math/exp (double x)))) array)
+              expected-error (first (thrown-description oracle))]
+          (gpu/upload! session :input array)
+          (let [actual-error (first (thrown-description
+                                    #(gpu/execute-checked-equation!
+                                      session equation {input :input output :output}
+                                      {extent {:type :long :value 4}})))]
+            (is (= expected-error actual-error))
+            (when-not actual-error
+              ;; The retained target-library realization is implementation-defined,
+              ;; not a bitwise libm promise. The check applies to the actual
+              ;; target result; cases here stay far from the Float threshold.
+              (doseq [[expected actual] (map vector (oracle) (gpu/download session :output))]
+                (is (if (Float/isNaN expected) (Float/isNaN actual)
+                        (<= (Math/abs (- (double expected) (double actual)))
+                            (* 2.0e-6 (max 1.0 (Math/abs (double expected))))))))))
+          (is (empty? (:kernel-graphs @session)))
+          (is (empty? (:events @session))))))))
+
+(deftest primitive-library-math-preserves-checked-observation-on-both-backends
+  (if @level-zero/gpu-available?
+    (check-library-device :ze:0)
+    (level-zero/gpu-skip! "checked exponential on Level Zero"))
+  (if @opencl/opencl-available?
+    (check-library-device :ocl:0)
+    (opencl/opencl-skip! "checked exponential on OpenCL")))
 
 (defn- check-ordered-device [target]
   (let [compilation (equation-first/compile #'storage/mixed-scale

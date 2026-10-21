@@ -218,6 +218,31 @@ source-ownership draft. Remaining production failures include training scalar
 ownership, checked conversion maps and normalized AD/source lifecycle; none is
 declared complete by fixture consolidation.
 
+The independent optional-fusion repair landed as #1547 (`97ea226b`) after all
+seven exact-head CircleCI contexts passed. Its clean-main tests inject missing
+element evidence into otherwise supported Double programs; they do not establish
+clean-main IEEE conversion admission. The draft retains its separate concrete
+IEEE map/reduction/scan regressions.
+
+The next checked-map repair explicitly marks eight audited primitive FP math
+operations (sqrt, floor, sin, cos, tan, exp, log and pow) as nonthrowing only after
+operand completion. It does not mark a descriptor factory, infer source carriers,
+permit Object unboxing, alter target-library accuracy or discharge final checked
+Float storage. KernelBody verifies operand types, exact arity and math realization
+independently; the arity check now precedes analyses requiring nonempty operands,
+so malformed zero-argument intrinsics produce a structured refusal. Independent
+review found no blocker in either boundary.
+
+A fresh 900 MiB REPL passes three complete affected namespaces (28 tests / 459
+assertions), including existing physical-return-payload negatives, plus two actual
+OpenCL/Level Zero checked-equation cases (2 tests / 102 assertions). The latter
+exercise exp with finite values, NaN and overflow, preserve observation before
+publication, and check graph/event retirement. Overflow is checked against the
+actual target result; implementation-defined library accuracy is not a promise
+of identical JVM/device decisions arbitrarily near a conversion threshold. These
+bounded receipts do not close the draft's other conversion, training, persistence
+or AD failures.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification
