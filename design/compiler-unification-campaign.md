@@ -171,6 +171,29 @@ it retains the same mandatory shared closure for every existing main caller.
 This closes a prerequisite for executing original helper argument outlines, not
 the ordered argument/result interval transport or full training acceptance.
 
+The focused fix is PR #1556, reconciled head `13e4da6f` after main's #1555
+landing. The reconciliation adds only the independently qualified naming fix
+and its fixtures; the reviewed dependency-closure diff remains two files. Its
+fresh CI is pending. #1555 passed all seven exact-head contexts at `3dc8ff4e`
+and squash-merged as `0513d222`; the broad draft has merged that main commit
+without dropping its separate ownership work. Neither receipt qualifies the
+broad draft or closes its still-red workload gates.
+
+After reconciling #1555's additional on-disk fixtures, the affected ten-namespace
+gate passes 135 tests / 1,572 assertions in the same capped REPL. This is a
+targeted reuse-process receipt, not the broad CI or a fresh-process benchmark.
+
+A subsequent actual-phase probe refines the interval implementation plan: for
+unchanged `unused-checked-helper-input`, normalization authenticates its root,
+but the first real binding inliner receives a different initializer occurrence.
+Equation-first does not default `:inline?` true; `:lower` first elaborates binding
+types and rebuilds the call, and the helper is expanded later in `:fixpoint`.
+Therefore the normalization-to-type-elaboration construction edge must be
+retained before authenticating the inliner interval. Do not assume the inliner
+sees an unchanged normalized call, weaken identity queries or infer origins from
+equal spellings. This evidence changes the next integration action; it does not
+grant completion/execution permission to the elaborated call.
+
 ### October 21 original reduction count execution and outline hygiene
 
 The shared owned-input outliner now supports an original reduction's WHOLE
