@@ -76,6 +76,12 @@ nested fold precision checks. Checked Double-to-Float still traps; Float-to-Doub
 is exact; unchecked-IEEE and lexical-shadowing controls remain unchanged. Review
 confirmed no removed precision coverage; the focused gate passes 4 tests / 19
 assertions. This test-only correction is not checked-cast execution support.
+Two normalized-AD negative tests also expected later refusal sites. Tampered
+operation metadata now fails operation validation before certificate comparison;
+a wrong-width use-site declaration fails declaration validation before sum-step
+validation. Their exact reasons were updated without accepting alternatives or
+removing malformed cases. Review confirmed the earlier refusals; both full test
+namespaces pass 23 tests / 182 assertions. Production validation is unchanged.
 
 #### Reviewed next vertical: source correspondence through resident training
 
