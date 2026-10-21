@@ -9,6 +9,22 @@
 ;; free-syms: scoped free variable collection
 ;; ================================================================
 
+(deftest no-op-reconstruction-preserves-occurrences-not-just-equality
+  (doseq [original [(with-meta '(callee value) {:line 7 :tag 'double})
+                    (with-meta '[callee value] {:line 7})]]
+    (is (identical? original (util/remake-if-changed original (map identity original))))
+    (let [changed (with-meta (symbol "value") {:tag 'long})
+          result (util/remake-if-changed original [(first original) changed])]
+      (is (= original result) "Clojure equality ignores the changed child metadata")
+      (is (not (identical? original result)))
+      (is (identical? changed (second result)))
+      (is (identical? (meta original) (meta result)))
+      (is (= (vector? original) (vector? result))))
+    (let [longer (conj (vec original) 'extra)]
+      (is (= (count longer) (count (util/remake-if-changed original longer))))))
+  (doseq [empty-form ['() []]]
+    (is (identical? empty-form (util/remake-if-changed empty-form [])))))
+
 (deftest result-effect-branches-bind-only-their-continuation
   (let [source '(effect-region []
                  [(effect out :unique 0 true joined)

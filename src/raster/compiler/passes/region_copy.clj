@@ -103,17 +103,20 @@
               ;; a value nobody reads: a copy here is exactly its loop, and the discarded
               ;; positions inside a conditional or a block are statements too
               (cond
+                (and (seq? expression) (contains? '#{quote clojure.core/quote} (first expression)))
+                expression
+
                 (copy-call expression environment)
                 (expand! (copy-call expression environment))
 
                 (and (seq? expression) (contains? '#{if when} (first expression)))
-                (with-meta (apply list (first expression) (walk (second expression) environment)
-                                  (map #(statement % environment) (nnext expression)))
-                  (meta expression))
+                (util/remake-if-changed
+                 expression (list* (first expression) (walk (second expression) environment)
+                                   (map #(statement % environment) (nnext expression))))
 
                 (and (seq? expression) (= 'do (first expression)))
-                (with-meta (apply list 'do (map #(statement % environment) (rest expression)))
-                  (meta expression))
+                (util/remake-if-changed
+                 expression (cons (first expression) (map #(statement % environment) (rest expression))))
 
                 (form/binding-form? expression)
                 (binding-form expression environment true)
@@ -144,37 +147,39 @@
                             [environment []]
                             (map-indexed vector pairs))
                     body-walker (if discarded-body? statement walk)]
-                (with-meta (apply list head (vec (mapcat identity pairs))
-                                  (map #(body-walker % environment) body))
-                  (meta expression))))
+                (util/remake-if-changed
+                 expression (list* head (util/remake-if-changed bindings (mapcat identity pairs))
+                                   (map #(body-walker % environment) body)))))
             (walk [expression environment]
               (cond
                 (not (seq? expression)) expression
 
+                (contains? '#{quote clojure.core/quote} (first expression)) expression
+
                 (= 'do (first expression))
                 (let [statements (butlast (rest expression))
-                      value (last expression)]
-                  (with-meta (apply list 'do (concat (map #(statement % environment) statements)
-                                                     [(walk value environment)]))
-                    (meta expression)))
+                      value (last (rest expression))]
+                  (util/remake-if-changed
+                   expression (cons (first expression) (concat (map #(statement % environment) statements)
+                                                (when (seq (rest expression))
+                                                  [(walk value environment)])))))
 
                 (= 'dotimes (first expression))
                 (let [[_ bindings & body] expression]
-                  (with-meta (apply list 'dotimes bindings (map #(statement % environment) body))
-                    (meta expression)))
+                  (util/remake-if-changed
+                   expression (list* (first expression) bindings (map #(statement % environment) body))))
 
                 (and (contains? discarded-body-ops (descriptor/semantic-op expression))
                      (= 3 (count (descriptor/call-args expression))))
                 (let [[index bound body] (descriptor/call-args expression)]
-                  (with-meta (list (first expression) index
-                                   (walk bound environment)
-                                   (statement body environment))
-                    (meta expression)))
+                  (util/remake-if-changed
+                   expression [(first expression) index (walk bound environment)
+                               (statement body environment)]))
 
                 (form/binding-form? expression)
                 (binding-form expression environment false)
 
                 :else
-                (with-meta (apply list (map #(walk % environment) expression)) (meta expression))))]
+                (util/remake-if-changed expression (map #(walk % environment) expression))))]
       (let [form (walk form (or param-env {}))]
         {:form form :stats {:region-copies-expanded @expanded}}))))
