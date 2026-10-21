@@ -8,6 +8,24 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### Original campaign obligations
+
+This is the completion checklist. Foundations below are recorded implementation
+history, not fresh qualification of their remaining end-to-end gates. Current work
+on original source-owned host computations and prepared AD composition advances
+items 3 and 5; it does not replace the other six obligations.
+
+| Item | Existing foundation | Remaining completion gate |
+|---|---|---|
+| 1. CI and coverage | Seven CI gates, vendor source compilation, targeted native/differential tests | Reconcile skipped tests and environment prerequisites; partition by affected compiler layer; retain cold-load, negative-admission and CPU/device controls. |
+| 2. Compatibility and debt ledger | Executable compatibility inventory and many bounded retirements | Re-audit reachable production paths and dependent packages; give every remaining adapter an owner and removal gate; remove covered dead code and duplicate tests without losing distinct oracles. |
+| 3. Direct TypedSOAC migration | Typed packets, ordered ABI, graph/body emission, retained dtype/effect/storage evidence | Close remaining source/semantic composition boundaries, bound compilation cost and remove migrated re-lowerings; demonstrate the same numerical intent through JVM/C and GPU routes with precise refusals. |
+| 4. Portable source compilation | OpenCL/Level Zero execution and CUDA/HIP compile gates | Keep actual public workload fixtures portable and distinguish source compilation from runtime/device evidence; coordinate the external CUDA runtime work against the common contracts. Cloud hardware is not a prerequisite for this local campaign. |
+| 5. Reusable training | AD rules, opt-in normalized bundles, artifacts, generated updates, GSDM staged execution | A resident forward/VJP/update composition, normalized AD migration gates, unchanged generated SFT and real-weight numerical acceptance, and measured steady execution. GSDM, Gemma and density/PDE derivatives are complementary controls. |
+| 6. Hardware-free distributed planning | Topology, physical service lanes, route evidence, root/scratch budgets, simulation/certificates | Fresh topology/dependency/capacity/collective/halo/drift counterexamples; independently check cost, numerical intent and ownership witnesses. Analytical forecasts must remain distinct from measured fabric performance. |
+| 7. Data parallelism and halos | Co-located update/collective and numerical halo demonstrations | Close public compiler-to-plan-to-runtime composition with device-scoped views, completion and cleanup; check nonuniform partitions and exact byte accounting. Do not claim multi-host transport or overlap from one laptop. |
+| 8. Durable and multilevel simulation | Manifests, mmap lease tests, checkpoint/restart and AMR provider slices | Fresh-owner restore/publication with producer geometry, time and lineage; numerical restart/branch and declared conservation/convergence/fidelity oracles; reject corrupt, incompatible or prematurely released state. |
+
 ### October 21 DeepSeek inference reference integration
 
 Read-only research verified the official [DeepInfer](https://github.com/deepseek-ai/DeepInfer)
@@ -316,6 +334,32 @@ zero callbacks and no retained speculative selections. The isolated emitter
 lifecycle tests above supply the separate cold/renewal evidence; accepting a warm
 or cold preparation count alone does not prove a cold path ran. Fresh-JVM/full-CI
 qualification and unchanged real training acceptance remain outstanding.
+
+### October 21 original implementation return observation
+
+Original-frontend return bridges now use the same authenticated whole-emission
+observation transaction as calls, bindings and reductions. A successful bridge
+query retains the module's full historical dependency guard; a cold, copied,
+edited or ownerless query abstains without compilation or speculative retention.
+The interface result remains Object, separately from the conditional primitive
+payload observed at its actual boxing edge. No unboxing, purity, totality or
+selected-call execution is granted.
+
+Independent review found no blocker. A single freshly started 900 MiB REPL passes
+the accumulated prefix, preparation, frontend correspondence, ordered/scalar
+source-owner and native-alias gates (103 tests / 720 assertions). A subsequent
+focused test strengthens the bridge-first/empty-owner control (1 test / 10
+assertions). This is fresh local affected-code evidence, not a whole-suite/vendor
+CI or real-training acceptance claim.
+
+The reviewed next executor must consume the original direct initializer, its
+actual invocation result carrier and matching binding completion, the callee's
+owned return bridge and the independently validated Long materialization. An
+Object-returning interface alone is insufficient: actual invokedynamic may return
+a primitive, and a source binding may unbox. Preserve the actual receiver/Method,
+original argument order and returned reference, plus truthful Object/payload facts
+and caller/callee historical guards. Unknown inputs or missing correspondence
+continue to refuse; prepared-AD import closure remains a separate obligation.
 
 ### October 21 primitive boxing-edge correspondence
 
@@ -2522,19 +2566,6 @@ and implementation during extraction; request device verification when the exact
 Multi-GPU execution additionally needs device-scoped roots, peer route admission and transport.
 The existing topology/cost and empirical route contracts should consume those facts; synthetic
 links, NVLink branding or a forecast never grant ownership, numerical permission or measured overlap.
-
-### Original campaign obligations
-
-| Item | Landed foundation | Remaining completion gate |
-|---|---|---|
-| 1. CI and coverage | Seven CI gates, vendor source compilation, targeted native/differential tests | Reconcile skipped tests and environment prerequisites; partition by affected compiler layer; retain cold-load, negative-admission and CPU/device controls. |
-| 2. Compatibility and debt ledger | Executable compatibility inventory and many bounded retirements | Re-audit reachable production paths and dependent packages; give every remaining adapter an owner and removal gate; remove covered dead code and duplicate tests without losing distinct oracles. |
-| 3. Direct TypedSOAC migration | Typed packets, ordered ABI, graph/body emission, retained dtype/effect/storage evidence | Close remaining source/semantic composition boundaries, bound compilation cost and remove migrated re-lowerings; demonstrate the same numerical intent through JVM/C and GPU routes with precise refusals. |
-| 4. Portable source compilation | OpenCL/Level Zero execution and CUDA/HIP compile gates | Keep actual public workload fixtures portable and distinguish source compilation from runtime/device evidence; coordinate the external CUDA runtime work against the common contracts. Cloud hardware is not a prerequisite for this local campaign. |
-| 5. Reusable training | AD rules, opt-in normalized bundles, artifacts, generated updates, GSDM staged execution | A resident forward/VJP/update composition, normalized AD migration gates, unchanged generated SFT and real-weight numerical acceptance, and measured steady execution. GSDM, Gemma and density/PDE derivatives are complementary controls. |
-| 6. Hardware-free distributed planning | Topology, physical service lanes, route evidence, root/scratch budgets, simulation/certificates | Fresh topology/dependency/capacity/collective/halo/drift counterexamples; independently check cost, numerical intent and ownership witnesses. Analytical forecasts must remain distinct from measured fabric performance. |
-| 7. Data parallelism and halos | Co-located update/collective and numerical halo demonstrations | Close public compiler-to-plan-to-runtime composition with device-scoped views, completion and cleanup; check nonuniform partitions and exact byte accounting. Do not claim multi-host transport or overlap from one laptop. |
-| 8. Durable and multilevel simulation | Manifests, mmap lease tests, checkpoint/restart and AMR provider slices | Fresh-owner restore/publication with producer geometry, time and lineage; numerical restart/branch and declared conservation/convergence/fidelity oracles; reject corrupt, incompatible or prematurely released state. |
 
 ### Loop import and vectorization consolidation (October 19 REPL exploration)
 

@@ -218,6 +218,7 @@
     (is (= evaluations @cold-source-evaluations))
     (is (some? (:raster.core/jit-spec (meta implementation))))
     (is (nil? (:emission frontend)))
+    (is (nil? (entry/frontend-return-bridge frontend)))
     (is (nil? (entry/frontend-reduction-emission frontend original)))
     (doseq [expression (tree-seq coll? seq (:body frontend)) :when (seq? expression)]
       (is (nil? (entry/frontend-invocation-context frontend expression)))
@@ -266,6 +267,10 @@
       (let [producer (first (:producer-inputs @parent))]
         (is (satisfies? entry/RetainedProducerInput producer))
         (is (some? (entry/frontend-binding-context frontend scope 0)))
+        (let [bridge (entry/frontend-return-bridge frontend)]
+          (is (= Object (:result-carrier bridge)))
+          (is (= Long/TYPE (:payload-carrier bridge)))
+          (is (identical? (:implementation frontend) (:implementation bridge))))
         (is (= 1 (count (:producer-inputs @parent))))
         (is (identical? producer (first (:producer-inputs @parent))))))
     ;; The query has returned and the request-local collector is no longer bound.
@@ -280,6 +285,20 @@
                     (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
         (finally (reset-meta! dependency metadata)))
       (is (entry/assert-definition-inputs-current! historical)))))
+
+(deftest return-bridge-needs-the-same-authenticated-whole-module
+  (let [frontend (captured #'source-binding)
+        parent (atom {:static [] :values []}) before @parent]
+    (binding [entry/*emission-inputs* parent]
+      (doseq [changed [(assoc frontend :emission (into {} (:emission frontend)))
+                       (assoc-in frontend [:emission :implementation] (Object.))
+                       (assoc-in frontend [:emission :typed-return-bridges] [])]]
+        (is (nil? (entry/frontend-return-bridge changed)))
+        (is (identical? before @parent)))
+      (is (some? (entry/frontend-return-bridge frontend)))
+      (is (= 1 (count (:producer-inputs @parent))))
+      (is (entry/assert-definition-inputs-current! @parent)))
+    (is (nil? (binding [entry/*emission-inputs* nil] (entry/frontend-return-bridge frontend))))))
 
 (deftest refused-physical-observations-retain-no-speculative-inputs
   (let [frontend (captured #'source-binding)

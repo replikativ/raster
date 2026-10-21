@@ -830,11 +830,11 @@
      {:producer-inputs [(FrontendEmissionInput.
                          emission (prepare-emission-input-guard! emission))]})))
 
-(defn- frontend-occurrence-observation [frontend original observer & arguments]
+(defn- frontend-emission-observation [frontend observe!]
   (call-with-optional-definition-inputs
    (fn []
      (when-let [emission (frontend-emission frontend)]
-       (when-let [observed (apply (requiring-resolve observer) emission (:body frontend) original arguments)]
+       (when-let [observed (observe! emission)]
          ;; Physical facts may outlive this query. Retain their entire historical
          ;; module lineage, not just the currently selected caller's definition.
          ;; This proves freshness only: source-import closure and execution
@@ -842,6 +842,20 @@
          (retain-frontend-emission! emission)
          (assert-definition-inputs-current! @*emission-inputs*)
          observed)))))
+
+(defn- frontend-occurrence-observation [frontend original observer & arguments]
+  (frontend-emission-observation
+   frontend #(apply (requiring-resolve observer) % (:body frontend) original arguments)))
+
+(defn frontend-return-bridge
+  "Observe the exact owned implementation's primitive→Object return bridge.
+   The result carrier stays Object. The conditional primitive payload describes
+   normal return only; it grants no unboxing, purity, totality or execution.
+   Cold/legacy/copied emissions abstain without compiling or invoking anything.
+   Successful observations retain the original full emission history."
+  [frontend]
+  (frontend-emission-observation
+   frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge) %)))
 
 (defn frontend-reduction-emission
   "Observe an unchanged frozen frontend reduction through its actual emitter.
