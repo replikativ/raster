@@ -1,13 +1,14 @@
 (ns raster.compiler.core.source-construction-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.walk :as walk]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.par :as par]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.source-prefix-test :as fixture]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.core.util :as util]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.fixtures.distributed-training :as training]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -137,6 +138,13 @@
                   (assoc callee :source-import {}) arguments good)))))))
 
 (deftest unchanged-training-imports-obey-the-nested-substitution-law
+  ;; Preparation compiles the ORIGINAL caller only; it executes no model code.
+  ;; A promoted definition discards the complete owner and is recaptured below.
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [frontend (entry/original-source-frontend (core/resolve-deftm-var #'training/local-loss))]
+       (entry/prepare-owned-definition-inputs! core/ensure-current-owned-bytecode!
+                                              [(get-in frontend [:definition :receiver-var])]))))
   (let [captured (atom nil) construct transport/with-source-construction-history
         target :ocl:training-substitution-test]
     (with-redefs [transport/with-source-construction-history
@@ -157,13 +165,63 @@
                 (set (map #(descriptor/semantic-op (:caller %)) selected))))
          (doseq [event selected]
            (let [construction (:source-construction @captured)
-                 checked (inline/nested-builder-substitution-view construction (:expansion event))]
+                 checked (inline/nested-builder-substitution-view construction (:expansion event))
+                 frame (inline/nested-original-call-frame construction (:expansion event))]
              (is (some? checked) (str (descriptor/semantic-op (:caller event))))
              (is (identical? (:expansion event) (get-in checked [:builder :expansion])))
              (is (nil? (inline/nested-builder-substitution-view construction
                                                               (into {} (:expansion event)))))
              (is (not-any? #(contains? checked %)
-                           [:executor :completion :return-carrier :resident-result])))))))))
+                           [:executor :completion :return-carrier :resident-result]))
+             (is (some? frame))
+             (is (= :unclosed (:return-correspondence frame) (:final-placement frame)))
+             (is (every? #(= :unclosed (:constructed-correspondence %)) (:argument-slots frame)))
+             (is (= (count (:arguments event)) (count (:argument-slots frame))))
+             (is (every? #(contains? (:input-completion %) :adaptation) (:argument-slots frame)))
+             (when (= 'raster.dl.loss/mse-loss (descriptor/semantic-op (:caller event)))
+               (let [slot (first (:argument-slots frame))]
+                 (is (= 'raster.dl.nn/linear-nb (descriptor/semantic-op (:source-operand slot))))
+                 (is (= :checkcast (get-in slot [:input-completion :adaptation])))
+                 (is (.isArray ^Class (get-in slot [:input-completion :parameter-carrier])))
+                 (is (nil? (:executor slot))))))))))))
+
+(deftest selected-call-frames-do-not-outline-or-execute-original-arguments
+  (let [{:keys [source-construction normalization] :as captured} (capture)
+        event (first (:builder-expansions (phase-view captured)))
+        owned (builder-view source-construction (:expansion event))
+        imported (:callee-import owned)
+        callee {:params (:parameters imported) :tags (:tags imported)
+                :walked-body (:walked-body imported) :source-import (:source-import event)}
+        caller (:normalized (:caller-origin owned)) args (vec (descriptor/call-args caller))
+        candidate (history normalization
+                           #(#'inline/build-inline-expansion callee args {} inline/subst-syms nil caller))
+        forbidden (fn [& _] (throw (AssertionError. "call-frame query prepared or executed an argument")))]
+    (with-redefs [entry/prepare-frontend-invocation-input! forbidden
+                  bytecode/compile-invocation-input-region forbidden
+                  core/ensure-current-owned-bytecode! forbidden]
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frame (inline/nested-original-call-frame (:source-construction candidate) (:form candidate))
+               slot (first (:argument-slots frame))]
+           (is (some? frame))
+           (is (= [0] (mapv :ordinal (:argument-slots frame))))
+           (is (= Long/TYPE (get-in slot [:input-completion :parameter-carrier])))
+           (is (= :coerce (get-in slot [:input-completion :adaptation])))
+           (is (nil? (:executor frame)))
+           (is (= :unclosed (:constructed-correspondence slot)))))))
+    (let [foreign (entry/call-with-definition-inputs
+                   #(#'inline/try-resolve-walked-body #'shadowed-substitution-helper_m_long))
+          foreign-candidate (history normalization
+                                     #(#'inline/build-inline-expansion foreign args {} inline/subst-syms nil caller))]
+      (entry/call-with-definition-inputs
+       (fn []
+         (is (some? (inline/nested-builder-substitution-view
+                     (:source-construction foreign-candidate) (:form foreign-candidate))))
+         ;; Use a fresh baseline after the successful substitution query.
+         (let [before @entry/*emission-inputs*]
+           (is (nil? (inline/nested-original-call-frame
+                      (:source-construction foreign-candidate) (:form foreign-candidate))))
+           (is (identical? before @entry/*emission-inputs*))))))))
 
 (deftest actual-source-phase-connects-elaboration-to-the-shared-builder
   (let [{:keys [source-construction compilation] :as captured} (capture)

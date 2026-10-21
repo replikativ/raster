@@ -511,6 +511,28 @@
                       arguments expansion)]
          {:builder event :substitution law})))))
 
+(defn ^:no-doc nested-original-call-frame
+  "Join a checked nested substitution to original selected input completions.
+   Every slot exposes both source and constructed operands; their correspondence
+   is deliberately unresolved. No operand executes here, and no return conversion,
+   non-null array, resident producer or final interval is inferred from its ABI."
+  [construction expansion]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [checked (nested-builder-substitution-view construction expansion)]
+       (when-let [original (source-transport/original-builder-invocation-view construction expansion)]
+         (let [call (:call-context original)
+               slots (mapv (fn [slot source input completed]
+                             (assoc slot :source-operand source :observed-input input
+                                         :input-completion completed
+                                         :constructed-correspondence :unclosed))
+                           (get-in checked [:substitution :argument-slots])
+                           (:source-arguments original) (:inputs call) (:input-completions call))]
+           (when (= (count slots) (count (get-in checked [:substitution :argument-slots])))
+             {:substitution (:substitution checked) :original-invocation original
+              :argument-slots slots :return-correspondence :unclosed
+              :final-placement :unclosed})))))))
+
 (defn- build-inline-expansion
   "Construct argument bindings and the substituted callee in one place.
    A result binder requests the binding inliner's existing flat placement;

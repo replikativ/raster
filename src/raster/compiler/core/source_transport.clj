@@ -307,3 +307,38 @@
                     (every? true? (map identical? arguments original-arguments)))
            (when-let [origin (construction-occurrence input caller)]
              (assoc event :caller-origin origin))))))))
+
+(defn original-builder-invocation-view
+  "Relate one recorded builder's imported callee to an actual original selected call.
+   Rewritten arguments need not be unchanged: this authenticates the ORIGINAL
+   target and its observed input conversions, not their constructed replacements.
+   Import-local callers lacking original occurrence transport still abstain."
+  [input expansion]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [caller callee-import] :as event} (builder-construction-view input expansion)]
+       (when-let [origin (construction-occurrence input caller)]
+         (let [original (:original origin)
+               {:keys [dispatch? lexical-callee semantic-op implementation-op arguments]}
+               (descriptor/call-description original)
+               imported (:frontend callee-import)]
+           (when (and dispatch? (not lexical-callee))
+             (when-let [call (entry/frontend-completed-invocation-context (:frontend origin) original)]
+               (let [selected (entry/selected-parameter-carriers semantic-op implementation-op (count arguments))
+                     definition (:definition selected)
+                     imported-selection (entry/assert-frontend-selection!
+                                         imported (get-in imported [:source-entry :source-var]))]
+                 (when (and selected (= :global-typed-indy (:invocation-mode call))
+                            (= implementation-op (:receiver call) (get-in call [:receiver-input :operand]))
+                            (empty? (get-in call [:receiver-input :ports]))
+                            (= (:method call) (:invocation-method selected))
+                            (= (count arguments) (count (:inputs call)))
+                            (every? true? (map identical? (:parameter-carriers selected)
+                                               (map :parameter-carrier (:input-completions call))))
+                            (every? #(identical? (get definition %) (get imported-selection %))
+                                    [:source-var :receiver-var :entry])
+                            (identical? (get-in definition [:entry :typed-impl]) (:implementation imported)))
+                   (entry/observe-frontend-source-identity! (:frontend origin))
+                   (entry/observe-frontend-source-identity! imported)
+                   {:builder event :caller-origin origin :original-call original
+                    :source-arguments (vec arguments) :call-context call :selected-callee selected}))))))))))

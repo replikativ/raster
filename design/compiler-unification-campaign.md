@@ -776,6 +776,50 @@ builder, consume them in source-prefix call intervals, and prepare only closed
 original argument outlines. Missing callee/allocation/return obligations still
 refuse. The broad draft and the original eight completion gates remain open.
 
+### October 21 original selected invocation frames
+
+The checked nested builder now joins an actual original selected call without
+executing or outlining any operand. The bytecode emitter's complete positional
+conversion validator is shared by the existing input outliner and a new read-only
+observer. MethodEntry retains the original whole-module history. SourceTransport
+checks actual interface Method, global receiver, registered source/receiver/entry,
+implementation identity and parameter Classes against the authenticated callee
+import. Matching descriptor spellings or a compatible ABI alone are insufficient.
+All composed queries retain optional-owner transaction isolation on refusal.
+
+Each frame slot carries the original source operand, observed evaluation context,
+actual emitted carrier/target Class/adaptation and constructed argument/binder.
+Constructed-operand correspondence, return adaptation and final placement remain
+explicitly unclosed. Array CHECKCAST does not prove a nonnull array or permit
+outlining a computed resident prediction. MSE's primitive invokedynamic result is
+not confused with its interface's Object result; return correspondence is not
+inferred from either carrier.
+
+The unchanged `local-loss` initially had no original invocation contexts because
+its CPU implementation was still cold. Explicit non-evaluating preparation of
+that original caller, followed by complete source recapture, exposes the actual
+`linear-nb`/MSE positional conversions. One loaded-process preparation probe took
+15 ms; this is not a cold compiler benchmark or automatic production admission.
+The production-source regression checks both frames and MSE's unresolved resident
+prediction, while another test forbids input outlining/preparation during queries.
+An authentic foreign callee with the same ABI is rejected. Missing/modified unused
+completion descriptors also refuse without publishing partial parent dependencies.
+
+Independent review found no blocker in this nonexecuting scope. Reused-REPL gates:
+61 transport/inliner/construction tests / 436 assertions; six frontend-input tests /
+48 assertions; 136 bytecode/source/AD ownership tests / 1,579 assertions. These
+receipts do not qualify the broad draft or complete training execution.
+
+Fresh CI at previous exact head `528d6686` confirms remaining failures rather than
+assuming the older baseline unchanged: source job **33648** passes **142/172**
+public CUDA/HIP fixtures and reports outstanding checked-floating conversions,
+map-address evidence, allocation extents and softmax host scalar closure. Unit job
+**33650**, inspected shard zero, has two real `local-gradient-sum` errors in five
+tests / 40 assertions, retaining the two known host quotients and original checked
+Int reduction-count obligation. This single shard is not an aggregate suite count.
+The draft remains non-mergeable; no tests, public fixtures or seven-context gates
+are disabled to obtain these targeted results.
+
 ### October 21 checked nested helper substitution
 
 The shared builder now retains indexed formal/actual/binder slots for authenticated

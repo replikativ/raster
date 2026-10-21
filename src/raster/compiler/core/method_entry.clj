@@ -939,6 +939,14 @@
   (frontend-occurrence-observation frontend original
     'raster.compiler.backend.jvm.bytecode/retained-input-invocation-context))
 
+(defn frontend-completed-invocation-context
+  "Read a whole original invocation's actual positional completion descriptors.
+   Does not prepare or execute operands, infer non-nullness or authorize source
+   substitution. The full original emission history remains an owning input."
+  [frontend original]
+  (frontend-occurrence-observation frontend original
+    'raster.compiler.backend.jvm.bytecode/retained-input-completed-invocation-context))
+
 (defn frontend-binding-context
   "Actual sequential binding context of an unchanged original frontend scope."
   [frontend original index]

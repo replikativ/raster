@@ -63,6 +63,27 @@
              (reason #(entry/prepare-frontend-invocation-input! frontend call 1))))
       (is (identical? before @owner)))))
 
+(deftest completed-input-observation-refuses-missing-unused-conversions-transactionally
+  (let [{:keys [frontend call]} (captured)
+        record (entry/call-with-definition-inputs #(entry/frontend-invocation-context frontend call))
+        owner (atom {:static [] :values []})
+        forbidden (fn [& _] (throw (AssertionError. "completion observation outlined an input")))]
+    (is (seq (:input-completions record)))
+    (with-redefs [bytecode/compile-invocation-input-region forbidden]
+      (binding [entry/*emission-inputs* owner]
+        (let [actual (entry/frontend-completed-invocation-context frontend call)]
+          (is (identical? call (:source-input actual)))
+          (is (= (:input-completions record) (:input-completions actual))))))
+    (doseq [bad [(assoc record :input-completions [])
+                 (assoc-in record [:input-completions 0 :parameter-carrier] Double/TYPE)
+                 (assoc-in record [:input-completions 0 :adaptation] :identity)
+                 (assoc-in record [:input-completions 0 :operand] '(foreign-input))]]
+      (let [owner (atom {:static [] :values []}) before @owner]
+        (binding [entry/*emission-inputs* owner]
+          (with-redefs [bytecode/retained-input-invocation-context (fn [& _] bad)]
+            (is (nil? (entry/frontend-completed-invocation-context frontend call)))
+            (is (identical? before @owner))))))))
+
 (deftest prepared-input-retains-raw-source-identity-after-the-query
   (let [{:keys [frontend call]} (captured)
         source (get-in frontend [:source-entry :source-var]) metadata (meta source)

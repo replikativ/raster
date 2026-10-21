@@ -6197,6 +6197,34 @@
                    (guard)
                    value))}))
 
+(defn- completed-invocation-inputs?
+  "Check the actual emitter's complete positional conversions once, shared by
+   observation and outlining. Logical annotations never fill a missing slot."
+  [record]
+  (let [^java.lang.reflect.Method method (:method record)
+        carriers (when (instance? java.lang.reflect.Method method)
+                   (vec (.getParameterTypes method)))
+        inputs (:inputs record) completions (:input-completions record)]
+    (and carriers (vector? inputs) (vector? completions)
+         (= (count carriers) (count inputs) (count completions))
+         (every? true?
+                 (map (fn [original completed carrier]
+                        (let [actual (:emitted-type completed)]
+                          (and (identical? (:operand original) (:operand completed))
+                               (completion/bytecode-operand-context? (:context original))
+                               (identical? carrier (:parameter-carrier completed))
+                               (contains? #{:ref :long :int :float :double :bool} actual)
+                               (= (typed-input-adaptation actual carrier) (:adaptation completed)))))
+                      inputs completions carriers)))))
+
+(defn ^:no-doc retained-input-completed-invocation-context
+  "Observe all actual original-call argument completions without preparing or
+   executing any operand. Selection and constructed-operand correspondence remain
+   the consumer's obligations; reference checks do not prove non-nullness."
+  [emission input-body original]
+  (when-let [record (retained-input-invocation-context emission input-body original)]
+    (when (completed-invocation-inputs? record) record)))
+
 (defn ^:no-doc compile-invocation-input-region
   "Outline one original FP, Int/Long or CHECKCAST input using its bytecode emitter.
    Physical ports and historical guards are preserved; this is not portable
@@ -6213,18 +6241,7 @@
           carriers (when (instance? java.lang.reflect.Method method)
                      (vec (.getParameterTypes method)))
           completions (:input-completions record)
-          _ (when-not (and (vector? completions)
-                           (= (count carriers) (count (:inputs record)) (count completions))
-                           (every? true?
-                                   (map (fn [original completed carrier]
-                                          (let [actual (:emitted-type completed)]
-                                            (and (identical? (:operand original) (:operand completed))
-                                                 (completion/bytecode-operand-context? (:context original))
-                                                 (identical? carrier (:parameter-carrier completed))
-                                                 (contains? #{:ref :long :int :float :double :bool} actual)
-                                                 (= (typed-input-adaptation actual carrier)
-                                                    (:adaptation completed)))))
-                                        (:inputs record) completions carriers)))
+          _ (when-not (completed-invocation-inputs? record)
               (throw (ex-info "Input outlining requires its complete actual positional conversions"
                               {:reason :unclosed-bytecode-input-completion :input-index input-index})))
           carrier (nth carriers input-index)
