@@ -69,6 +69,14 @@ owner. The affected realization/checked-execution gate passes 12 tests / 271
 assertions, including real OpenCL and Level Zero success, failure-order and private
 generation checks. This is guard repair, not a new checked-conversion family.
 
+Two raw-result-cast tests still expected the retired raw cast spelling despite
+the canonical scalar-conversion term. They now assert its exact source/target
+width, source operation, rounding and overflow policy while retaining inner and
+nested fold precision checks. Checked Double-to-Float still traps; Float-to-Double
+is exact; unchecked-IEEE and lexical-shadowing controls remain unchanged. Review
+confirmed no removed precision coverage; the focused gate passes 4 tests / 19
+assertions. This test-only correction is not checked-cast execution support.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification
