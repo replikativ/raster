@@ -772,6 +772,27 @@
                       {:reason :unowned-checked-result-frontend})))
     frontend))
 
+(deftype ^:private FrontendSourceIdentityInput [lineage]
+  RetainedProducerInput
+  (assert-producer-current! [_] (assert-source-entry-current! lineage)))
+
+(defn observe-frontend-source-identity!
+  "Retain exact source-entry identity after authenticating its opaque frontend.
+   This lightweight guard also catches equal-but-copied raw source metadata.
+   It retains no transformed bodies and grants no emission or execution rights."
+  [frontend]
+  (when *emission-inputs*
+    (assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+    (let [lineage (:source-entry frontend)]
+      (swap! *emission-inputs*
+             (fn [inputs]
+               (if (some #(and (instance? FrontendSourceIdentityInput %)
+                               (identical? lineage (.-lineage ^FrontendSourceIdentityInput %)))
+                         (:producer-inputs inputs))
+                 inputs
+                 (retain-producer-inputs inputs [(FrontendSourceIdentityInput. lineage)])))))
+    true))
+
 (defn selected-frontend-source
   "Original typed frontend of an exactly selected specialization.
    Its opaque original owner authenticates source independently of any transformed

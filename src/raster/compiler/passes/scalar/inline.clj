@@ -13,6 +13,7 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -257,9 +258,7 @@
         return-tag (or (:raster.core/return-tag metadata)
                        (:raster.core/return-tag val-metadata))]
     (when (and walked-body params (not (:no-inline metadata)))
-      (let [effective-wb (if (> (count walked-body) 1)
-                           [(apply list 'do walked-body)]
-                           walked-body)]
+      (let [effective-wb (source-transport/effective-body walked-body)]
         ;; Scalar-result helpers may read array inputs without owning array storage. Preserve
         ;; the declared return fact when distinguishing them from array-returning helpers.
         (when (binding [*inline-scalar-bodies?*
@@ -279,29 +278,6 @@
                            (fnil conj #{}) [:unowned-helper-frontend v]))
                 source-ns-sym (symbol (str (.name (.ns v))))
                 source-ns (try (the-ns source-ns-sym) (catch Exception _ nil))
-                param-set (set (map #(if (symbol? %) % (symbol (name %))) params))
-                ;; Qualify non-primitive tags to fully-qualified class names.
-                ;; e.g. DP5Cache → raster.ode.core.DP5Cache so the bytecode
-                ;; backend can resolve them in any namespace context.
-                prim-tags #{'double 'long 'float 'int 'Double 'Long 'Float 'Integer
-                            'doubles 'floats 'longs 'ints 'objects}
-                qualified-tags
-                (when (and tags source-ns)
-                  (mapv (fn [t]
-                          (if (or (nil? t) (prim-tags t)
-                                  (.contains (str t) "."))
-                            t ;; already qualified or primitive
-                            (if-let [cls (let [lookup (symbol (str t))
-                                               result (try (ns-resolve source-ns lookup)
-                                                           (catch Exception _ nil))]
-                                           (method-entry/observe-source-resolution!
-                                            {:kind :symbol-resolution :source-ns source-ns
-                                             :symbol lookup :result result}))]
-                              (if (class? cls)
-                                (symbol (.getName ^Class cls))
-                                t)
-                              t)))
-                        tags))
             ;; Alpha-rename the callee body's INTERNAL binders (let/loop/par
             ;; induction vars, accumulators) to fresh names on EVERY resolve, so a
             ;; splice into a caller cannot capture — or be captured by — a same-named
@@ -311,15 +287,9 @@
             ;; → the index never advances → infinite hang. util/alpha-convert renames
             ;; only bound vars (params stay free for subst); fresh-like preserves the
             ;; name prefix + tags, so name-based heuristics and dtype tags survive.
-                hygienic-wb (mapv util/alpha-convert effective-wb)]
-            (if source-ns
-              {:params params
-               :tags (or qualified-tags tags)
-               :return-tag return-tag
-               :walked-body (mapv #(inf/qualify-body-symbols % source-ns param-set
-                                                           method-entry/observe-source-resolution!)
-                                  hygienic-wb)}
-              {:params params :tags tags :return-tag return-tag :walked-body hygienic-wb})))))))
+                imported (source-transport/prepare-inline-body retained-frontend walked-body params tags source-ns)]
+            (merge {:params params :return-tag return-tag}
+                   imported)))))))
 
 (defn- try-resolve-walked-body [v]
   ;; Rejected inlining candidates do not become executable dependencies.

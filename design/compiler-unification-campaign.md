@@ -440,6 +440,41 @@ now targets main at `1ee2fb0b` and requires its own new seven-gate run. The broa
 draft's emission job `33256` still refuses the known checked Double→Float
 running-variance update conversion; it remains unqualified and must not merge.
 
+### October 21 retained helper-body import
+
+The inliner now uses one shared source-transport transformation for its existing
+multi-form wrapping, alpha-renaming and qualification. An authentic helper frontend
+and active compilation owner retain the exact input/output body objects, ordered
+metadata-preserving binder renamings and import-local dependency history. Legacy
+ownerless transformations remain ownerless; a copied body cannot reconstruct a
+witness. An unrelated enclosing dependency does not contaminate an independently
+adopted helper import.
+
+The imported history includes a lightweight authenticated source-entry identity
+guard, not the intermediate ASTs. This catches equal-but-copied raw body metadata
+even when ordinary metadata equality and direct Var snapshots still agree. The
+downstream publication test checks that refusal without querying the import again.
+Queries never rerun qualification or refresh historical observations.
+
+Independent review finds no blocker. A fresh capped REPL passes the focused
+namespace: 12 tests / 47 assertions. Restarting the previous REPL was necessary
+because reloaded protocol and implementation classes had different interface
+identities; production guards were not relaxed. The complete 12-namespace affected
+gate passes 179 tests / 1,107 assertions in that same fresh REPL, covering source
+qualification, inference/inlining, preparation, ordered source owners and native
+alias execution. Full draft CI and end-to-end training remain separate gates.
+
+This is body-import evidence only. It supplies no formal argument completion,
+call substitution, final-step correspondence or permission to execute an imported
+body. Unchanged training and the draft's checked floating-conversion refusal
+remain open. The next transport below must consume this relation at actual call
+expansion rather than reconstructing it later.
+
+PR #1552's previous head passed six CI gates but its unit gate failed before tests
+on two shards after Git PPA HTTP 503 retries. Commit `050e635f` scopes unit APT
+prerequisites to the image's main source list and makes update failures fatal.
+All seven contexts must pass anew on that exact head before merging.
+
 ### Next producer-owned helper-expansion transport
 
 Independent review of the actual inliner locates the missing relation:
