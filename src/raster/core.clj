@@ -408,7 +408,12 @@
                     :terminal-contexts (:terminal-contexts @inputs)
                     :typed-return-bridges (:typed-return-bridges @inputs)
                     :invocation-contexts (:invocation-contexts @inputs)
-                    :typed-interface typed-interface
+                    ;; The interface registry and method entry use a nominal
+                    ;; symbol. Frozen source serializes that name as a string;
+                    ;; renewal must publish the same nominal representation.
+                    ;; Actual Method/Class and implementation ownership remain
+                    ;; separate identity checks, never inferred from this name.
+                    :typed-interface (some-> typed-interface str symbol)
                     :dependency-snapshots (into dependencies (:values @inputs))
                     :producer-inputs (:producer-inputs @inputs)
                     :static-inputs (:static @inputs) :definition-revision revision

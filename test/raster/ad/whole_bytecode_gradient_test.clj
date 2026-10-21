@@ -392,6 +392,8 @@
           (let [fresh (core/ensure-current-owned-bytecode! receiver)]
             (is (not (identical? old-emission fresh)))
             (is (not (identical? (:implementation old-emission) (:implementation fresh))))
+            (is (symbol? (:typed-interface fresh)))
+            (is (= (:typed-interface old-emission) (:typed-interface fresh)))
             (is (identical? (:implementation fresh) @receiver)))
           (is (thrown? clojure.lang.ExceptionInfo (f 3.0)))
           (let [p (prepared v)

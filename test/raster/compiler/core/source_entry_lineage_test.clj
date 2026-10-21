@@ -141,6 +141,7 @@
       (is (identical? pending (:raster.core/jit-spec (meta receiver))))
       (upgrade! (spelling (:typed-interface lineage)))
       (let [emission (:raster.core/bytecode-emission (meta receiver))]
+        (is (symbol? (:typed-interface emission)))
         (is (= (:typed-interface lineage) (str (:typed-interface emission))))
         (is (= lineage (:source-entry emission)))
         (is (nil? (:raster.core/jit-spec (meta receiver))))

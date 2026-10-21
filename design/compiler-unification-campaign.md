@@ -161,6 +161,20 @@ formal entry conversion. In particular Object-to-Long completion is not identity
 unused arguments and normal-return completion remain separate obligations. This
 prerequisite does not by itself authorize the refused RMS allocation helper.
 
+### October 21 renewed bytecode nominal-interface publication
+
+The broader owned-AD gate exposed a genuine renewal failure: initial emission
+published the interface's registry Symbol, but renewal passed its frozen-source
+String through unchanged. The actual implementation, Method, parameter/return
+signature and namespace checks all passed; only nominal metadata representation
+differed. `emit-owned-bytecode!` now publishes a canonical interface Symbol while
+leaving source lineage, actual emitter arguments and every physical identity
+check unchanged. No AD string-comparison fallback or historical restamping is
+introduced. Both nominal input spellings and actual renewal are covered; old
+artifacts remain stale. Independent review found no blocker. This repair and the
+following operand slice pass the six-namespace affected gate: 72 tests / 1,034
+assertions, not a broader draft qualification.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast
