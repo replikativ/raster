@@ -79,6 +79,35 @@
                                     :source-policy (:source-policy lineage))
           (is (identical? populated (:raster.core/deftm-walked-body (meta source)))))))))
 
+(deftest frozen-interface-spelling-is-nominal-not-a-new-physical-proof
+  (doseq [spelling [identity symbol]]
+    (let [{:keys [receiver source]} (fresh-entry)
+          lineage (:source-entry (core/prepare-implementation-frontend! receiver))
+          before @body-calls
+          implementation @receiver
+          pending (:raster.core/jit-spec (meta receiver))
+          options [:annotations (:annotations lineage) :source-body (:source-body lineage)
+                   :source-policy (:source-policy lineage)]
+          upgrade! (fn [name]
+                     (apply core/do-bytecode-upgrade! receiver (:source-name lineage)
+                            (:params lineage) (:tags lineage) (:return-tag lineage) nil
+                            (:source-ns lineage) name options))]
+      (is (string? (:typed-interface lineage)))
+      (is (= lineage (entry/capture-source-entry
+                       source (update lineage :typed-interface symbol))))
+      (is (= :frontend-emission-source-mismatch
+             (try (upgrade! "unrelated.Interface") nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (identical? implementation @receiver))
+      (is (identical? pending (:raster.core/jit-spec (meta receiver))))
+      (upgrade! (spelling (:typed-interface lineage)))
+      (let [emission (:raster.core/bytecode-emission (meta receiver))]
+        (is (= (:typed-interface lineage) (str (:typed-interface emission))))
+        (is (= lineage (:source-entry emission)))
+        (is (nil? (:raster.core/jit-spec (meta receiver))))
+        (is (identical? emission (core/ensure-current-owned-bytecode! receiver))))
+      (is (= before @body-calls)))))
+
 (deftest missing-or-mismatched-entry-lineage-abstains
   (let [{:keys [receiver source operation implementation] :as selected} (fresh-entry)
         original (meta receiver)]

@@ -599,7 +599,9 @@
                 ;; assertion. Consumers must match the implementation by identity
                 ;; and retain the ordinary selected-definition/dependency guards.
                 ;; Attach only after successful dispatch/callsite publication.
-                (alter-meta! impl-var assoc ::bytecode-emission
+                (alter-meta! impl-var
+                             (fn [metadata published]
+                               (assoc (dissoc metadata ::jit-spec) ::bytecode-emission published))
                              (cond-> emission source-entry
                                (assoc :source-entry source-entry
                                       :frontend-source-owner
@@ -696,7 +698,7 @@
                            (= (.sym ^clojure.lang.Var impl-var) (symbol (str source-name "-impl")))
                            (= params (:params emission)) (= tags (:tags emission))
                            (= return-tag (:return-tag emission))
-                           (= typed-interface (:typed-interface emission)))
+                           (= (str typed-interface) (str (:typed-interface emission))))
               (throw (ex-info "Bytecode renewal lost its original source correspondence"
                               {:reason :unowned-bytecode-renewal :var impl-var})))
             ;; Do not lend an enclosing stale proof owner to dependency

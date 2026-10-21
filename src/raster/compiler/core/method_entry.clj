@@ -463,7 +463,11 @@
         (cond-> {:source-var source-var :source-root value :source-name (:name metadata)
                  :params params :tags tags :annotations annotations :source-body source-body
                  :source-policy (:source-policy source)
-                 :source-ns source-ns :typed-interface typed-interface :return-tag return-tag}
+                 ;; Interface spelling is nominal, not a physical Class proof.
+                 ;; Pending specs use Symbols while emission callers may use
+                 ;; Strings. Keep one representation in frozen source identity;
+                 ;; selected receiver/Class correspondence is checked separately.
+                 :source-ns source-ns :typed-interface (some-> typed-interface str) :return-tag return-tag}
           (vector? clojure-body) (assoc :clojure-body clojure-body))))))
 
 (defn source-entry-current?

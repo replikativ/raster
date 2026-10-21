@@ -14,6 +14,50 @@ The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
 
+#### October 21 qualification-first adjustment
+
+The eight obligations remain unchanged. Broader inspection of draft CI found
+multiple shared failure categories, not just the four training-scalar refusals:
+checked floating conversion realization, late source actions, process-local owner
+archival, normalized AD invocation contexts and source/JIT lifecycle. The review
+does not establish that every CI failure belongs to those categories. Freeze new
+admission families and repair these production boundaries before extending the
+helper-payload projection further.
+
+The public ordered route (`90f13070`) now selects the existing owned executor only
+for reconstructed late host actions. Prefix-only programs remain concrete; source
+owners, executor coverage, role/layout/alias gates and unobserved checked-stage
+refusals remain mandatory. Deferred artifacts do not expose a single static
+LinkPlan/certificate or become generally composable after execution. Local receipt:
+24 tests / 211 assertions, including actual OpenCL and Level Zero replay, changed /
+omitted inputs, state/constant capture, output lifetimes and late checked overflow.
+An initial test incorrectly expected ordered behavior from a prefix-only fixture;
+the corrected fixture has a genuinely late allocation. This is not a performance
+or multi-device receipt.
+
+Do not extract that route alone onto main: the attempted cherry-pick exposed
+missing original-frontend/source-owner and checked-stage prerequisites. It was
+aborted without dropping guards or opening a PR. A safe independent source-ownership
+slice is medium-sized and needs its own clean-main workload qualification. Until
+then, keep activation pending on the draft; first repair broad qualification,
+then checked-result realization, archival reconstruction and helper/AD import
+closure, without replacing checked casts by IEEE conversions.
+
+The next reproduced lifecycle repair distinguishes nominal interface spelling
+from physical receiver evidence. Frozen source identity canonicalizes a Symbol /
+String name, while emitted interface representation remains unchanged for AD
+registry consumers. Direct successful bytecode publication also clears the
+pending JIT spec with its old stub owner in the same metadata update. Rejection
+retains that exact pending spec; neither operation refreshes old observations or
+claims transactional concurrent dispatch publication.
+The interface-registry review caught and rejected a broader emission-field
+normalization: existing AD consumers intentionally retain that representation.
+The final fix changes only nominal lineage/comparison and successful pending-spec
+retirement. Fresh lifecycle plus paired/owned helper tests pass 51 tests / 503
+assertions; the final pure metadata-update form passes the focused lifecycle gate
+again (17 / 175). This repairs reproduced failures, not the remaining AD import,
+checked-conversion or full-draft qualification categories.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification
