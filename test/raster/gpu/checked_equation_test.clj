@@ -197,6 +197,46 @@
     (check-ordered-device :ocl:0)
     (opencl/opencl-skip! "ordered checked result on OpenCL")))
 
+(defn- check-private-void-store! [target]
+  (doseq [n [0 3]
+          coefficient (cond-> [2.0 -0.5] (zero? n) (conj Double/MAX_VALUE))]
+    (let [input (float-array (take n [1.5 -2.0 0.25]))
+          expected (mapv (fn [offset]
+                           (storage/checked-scale-effect-result
+                            coefficient (float-array (map #(+ (double %) offset) input)) n))
+                         [0.0 0.125])
+          compilation (equation-first/compile #'storage/checked-scale-effect-result
+                                               (merge storage/policy {:target target :dtype :float}))
+          executable (link/instantiate-checked-invocation! compilation [coefficient input n])
+          session (:session executable)]
+      (try
+        (doseq [replay [0 1]]
+          (when (= replay 1)
+            (dotimes [index n] (aset input index (float (+ (double (aget input index)) 0.125)))))
+          (let [output (first (keys (link/run! executable)))
+                actual (link/download executable output)]
+            (is (= (class (nth expected replay)) (class actual)))
+            (is (= (vec (nth expected replay)) (vec actual)))
+            (is (= 1 (count (get-in @(:execution-state executable) [:ordered :observed]))))))
+        (when (pos? n)
+          (aset input 0 Float/POSITIVE_INFINITY)
+          (is (thrown? IllegalArgumentException (link/run! executable)))
+          (is (= 2 @(:completed-replays executable)))
+          (is (false? @(:output-ready? executable)))
+          (is (empty? (get-in @(:execution-state executable) [:ordered :observed])))
+          (is (= :link-execution-poisoned (reason #(link/outputs executable))))
+          (is (= :link-execution-poisoned (reason #(link/run! executable)))))
+        (finally (link/close! executable)))
+      (is (true? (:closed? @session))))))
+
+(deftest void-helper-private-output-is-observed-before-publication-on-local-devices
+  (if @level-zero/gpu-available?
+    (check-private-void-store! :ze:0)
+    (level-zero/gpu-skip! "private checked Void store on Level Zero"))
+  (if @opencl/opencl-available?
+    (check-private-void-store! :ocl:0)
+    (opencl/opencl-skip! "private checked Void store on OpenCL")))
+
 (defn- check-fold-device [target]
   ;; Materialize the JVM oracle before retaining historical compilation owners.
   (is (= [1.0] (vec (storage/double-fold-float-storage

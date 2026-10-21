@@ -32,6 +32,19 @@
   [coefficient :- Double values :- (Array float)] :- (Array float)
   (par/scale coefficient values))
 
+(deftm checked-scale-effect!
+  "A checked write-only map whose public result is Void, not the destination."
+  [coefficient :- Double values :- (Array float) out :- (Array float) n :- Long] :- Void
+  (par/map-void! i n
+    (aset out i (float (* coefficient (double (aget values i)))))))
+
+(deftm checked-scale-effect-result
+  "Compose a Void checked helper with a genuinely private returned destination."
+  [coefficient :- Double values :- (Array float) n :- Long] :- (Array float)
+  (let [out (float-array n)]
+    (checked-scale-effect! coefficient values out n)
+    out))
+
 (deftm double-reduction-float-result
   [values :- (Array double)] :- Float
   (let [total (par/reduce acc 0.0 i (alength values)

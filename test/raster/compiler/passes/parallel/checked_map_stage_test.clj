@@ -59,6 +59,28 @@
       (is (= (:stage-results report)
              (:stage-results (emitted/validate-with-result-contracts equation)))))))
 
+(deftest void-write-only-map-retains-the-same-private-checked-obligation
+  (let [input (float-array [2.0 -3.0]) output (float-array [77.0 77.0])]
+    (is (nil? (storage/checked-scale-effect! 1.5 input output 2)))
+    (is (= [3.0 -4.5] (vec output))))
+  (doseq [target targets]
+    (let [compilation (equation-first/compile #'storage/checked-scale-effect!
+                                             (merge storage/policy {:target target :dtype :float}))
+          equation (numerical-equation compilation)
+          report (emitted/validate-with-result-contracts equation)
+          obligation (first (:stage-results report))
+          semantic-equation (first (raster.compiler.ir.soac-dialect/equations (:algorithm equation)))
+          facts (get-in (raster.compiler.ir.soac-dialect/facts (:algorithm equation))
+                        [:equations (second semantic-equation)])]
+      (is (= :effect (get-in facts [:attributes :result-storage 0 :host-return])))
+      (is (= #{:memory/write} (:effects facts)))
+      (is (= checked/kind (:kind obligation)))
+      (is (= :invocation-private (:output-ownership obligation)))
+      (is (= :conditional-on-success (:initialization obligation)))
+      (is (empty? (:complete-write-domains report)))
+      (is (= :checked-stage-observation-required
+             (reason #(result/refuse-unobserved! compilation :ordinary-binding)))))))
+
 (deftest primitive-library-producer-retains-checked-storage-and-library-accuracy
   (doseq [target targets]
     (let [compilation (equation-first/compile #'storage/double-exponential-float-storage
@@ -325,6 +347,33 @@
                    :attributes {:emitted-equation-source
                                 {:program (:emitted compilation) :equation-id (:id numerical)}}})]
      :outputs [:output]}))
+
+(deftest void-checked-write-cannot-publish-or-borrow-its-conditional-destination
+  (let [compilation (equation-first/compile #'storage/checked-scale-effect!
+                                           (merge storage/policy {:target (first targets) :dtype :float}))
+        equation (numerical-equation compilation)
+        request (pending-entry-request compilation equation)
+        pending (link-plan/make-pending-observed-entry equation request)
+        layout (:layout pending)
+        facts (vec (#'link-plan/instance-access-facts layout))
+        output (:output (first (get-in pending [:entry-contract :observations])))
+        submissions (atom 0)]
+    (is (= #{} (get-in pending [:entry-contract :full-produces])))
+    (is (= #{:output} (get-in pending [:entry-contract :success-produces])))
+    (is (= :link-unobserved-result-condition
+           (reason #(#'link-plan/analyze-effects! layout facts))))
+    (is (= #{:input :output}
+           (:requires (#'link-plan/relative-entry-contract
+                       (:nodes layout)
+                       (conj facts {:facts [{:node :output :access :read}]
+                                    :complete-writes #{}})))))
+    (with-redefs [gpu/make-session (fn [& _] (swap! submissions inc) (throw (AssertionError. "driver reached")))]
+      (is (= :checked-stage-observation-required (reason #(link/instantiate! layout))))
+      (doseq [bad [(assoc-in request [:nodes 1 :source] (float-array 4))
+                   (assoc-in request [:nodes 1 :view :allocation :ownership] :borrowed)
+                   (assoc-in request [:instances 0 :bindings output] :input)]]
+        (is (thrown? clojure.lang.ExceptionInfo (link-plan/make-pending-observed-entry equation bad))))
+      (is (zero? @submissions)))))
 
 (deftest checked-write-coverage-remains-conditional-in-an-ordered-entry
   (let [compilation (compilation (first targets))

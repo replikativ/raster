@@ -212,6 +212,19 @@ on failure and resident replay. Cooperative lanes must still all reach barriers.
 Data-dependent internal casts and batch normalization's multiple running-state
 stores remain subsequent general lowering obligations, not exemptions or skips.
 
+One smaller correspondence gap is now closed: a single write-only checked map
+may retain the existing `:host-return :effect` representation as well as `:buffer`.
+TypedSOAC already validates both against the exact physical destination; the
+schedule still requires one closed descriptor, exact write alias, independent
+read domains and one final lane-owned store. Returning Void does not discharge
+output privacy or status observation. The new private-allocation/helper/return
+composition executes through the existing EXPLICIT checked executor on OpenCL
+and Level Zero: 94 assertions cover empty domains (including an otherwise invalid
+coefficient), changed-input replay, overflow poisoning, no failed publication and
+session closure. Ordinary compiled/lower remains deliberately refused. The three
+complete affected namespaces pass 29 tests / 534 assertions. This does not close
+RMS's subsequent loop/read obligations, multiple destinations, or internal casts.
+
 ### October 21 ordered host-integral qualification
 
 Late checked integral computations may now remain opaque ordered host actions

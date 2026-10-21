@@ -105,12 +105,17 @@
                       {:operation operation}))))
 
 (defn- private-result-storage? [facts equation output]
-  (let [results (nth equation 2)]
+  (let [results (nth equation 2)
+        storage (get-in facts [:attributes :result-storage])
+        host-return (:host-return (first storage))]
     (and (= 1 (count results))
          (= #{:memory/write} (:effects facts))
          (= {(first results) output} (:aliases facts))
-         (= [{:destination output :access :write :host-return :buffer}]
-            (get-in facts [:attributes :result-storage])))))
+         ;; Returning the destination or only its effect token does not change
+         ;; the one-store schedule. Neither form proves physical ownership:
+         ;; the same managed observer still owes invocation-private output.
+         (contains? #{:buffer :effect} host-return)
+         (= [{:destination output :access :write :host-return host-return}] storage))))
 
 (defn plan
   "Derive one checked result obligation and its complete physical schedule.
