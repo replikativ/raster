@@ -1315,6 +1315,32 @@
         :use-count (get uses produced 0)
         :placement placement-witness}))))
 
+(defn- recertify-fused-algebra
+  "An optional fusion cannot turn absent element-effect evidence into compilation failure.
+   Abstain only at this exact certification request; invalid algebra, malformed IR and
+   historical/source failures still propagate. No purity or conversion permission is added."
+  [updated]
+  (if (contains? #{:reduce :scan} (:kind updated))
+    (let [{:keys [accumulators identities dtypes]} (:attributes updated)
+          algebra
+          (mapv (fn [accumulator identity component-dtype result]
+                  (let [request {:acc accumulator :init identity
+                                 :lambda (dialect/scalar-converts->source result)}
+                        scan? (= :scan (:kind updated))]
+                    (try
+                      ((if scan? scan/certify scan/certify-reassociation) request component-dtype)
+                      (catch clojure.lang.ExceptionInfo failure
+                        (if (and (= (if scan? :scan-element-impure-or-unknown
+                                             :reduction-element-impure-or-unknown)
+                                    (:reason (ex-data failure)))
+                                 (identical? request (:reduction-op (ex-data failure))))
+                          nil
+                          (throw failure))))))
+                accumulators identities dtypes (:body-results updated))]
+      (when (every? some? algebra)
+        (assoc-in updated [:attributes :algebra] algebra)))
+    updated))
+
 (defn- fuse-vertical-candidate
   [program {:keys [producer-index consumer-index producer consumer produced use-count]
             placement-witness :placement}]
@@ -1386,35 +1412,24 @@
                                                   (:capture-parameters canonical)))
                          :locals (:locals canonical)
                          :body-results (:body-results canonical))
-          updated
-          (if (contains? #{:reduce :scan} (:kind updated))
-            (let [{:keys [accumulators identities dtypes]} (:attributes updated)
-                  algebra (mapv (fn [accumulator identity component-dtype result]
-                                  ((if (= :scan (:kind updated))
-                                     scan/certify
-                                     scan/certify-reassociation)
-                                   {:acc accumulator :init identity
-                                    :lambda (dialect/scalar-converts->source result)}
-                                   component-dtype))
-                                accumulators identities dtypes (:body-results updated))]
-              (assoc-in updated [:attributes :algebra] algebra))
-            updated)
-          retain-producer? (> use-count 1)
-          fused-kind (keyword (str "map-" (name (:kind consumer))))
-          equations (assoc (dialect/equations program) consumer-index (emit-equation updated))
-          equations (if retain-producer?
-                      equations
-                      (->> equations
-                           (keep-indexed (fn [index equation]
-                                           (when-not (= index producer-index) equation)))
-                           vec))
-          facts (if retain-producer?
-                  (record-recomputed-fusion (dialect/facts program)
-                                            (:id producer) (:id consumer)
-                                            fused-kind placement-witness)
-                  (remove-equation-fact (dialect/facts program)
-                                        (:id producer) (:id consumer) fused-kind))]
-      (rebuild-boundary program facts equations)))
+          updated (recertify-fused-algebra updated)]
+      (when updated
+        (let [retain-producer? (> use-count 1)
+              fused-kind (keyword (str "map-" (name (:kind consumer))))
+              equations (assoc (dialect/equations program) consumer-index (emit-equation updated))
+              equations (if retain-producer?
+                          equations
+                          (->> equations
+                               (keep-indexed (fn [index equation]
+                                               (when-not (= index producer-index) equation)))
+                               vec))
+              facts (if retain-producer?
+                      (record-recomputed-fusion (dialect/facts program)
+                                                (:id producer) (:id consumer)
+                                                fused-kind placement-witness)
+                      (remove-equation-fact (dialect/facts program)
+                                            (:id producer) (:id consumer) fused-kind))]
+          (rebuild-boundary program facts equations)))))
 
 (defn- horizontal-placement-index
   "Choose an execution boundary without hoisting destination allocations or crossing readers."
@@ -1609,9 +1624,14 @@
           iterations 0
           placements {}]
      (let [candidates (vertical-candidates program abstract-machine)
-           candidate (first (filter (comp :fuse? :placement) candidates))]
+           [candidate fused]
+           (some (fn [candidate]
+                   (when (get-in candidate [:placement :fuse?])
+                     (when-let [fused (fuse-vertical-candidate program candidate)]
+                       [candidate fused])))
+                 candidates)]
        (if candidate
-         (recur (fuse-vertical-candidate program candidate)
+         (recur fused
                 (inc vertical) horizontal (inc iterations)
                 (remember-placement placements (:placement candidate)))
          (if-let [fused (fuse-map-initialized-segmented-reduce-once program)]

@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as typed-fusion]
@@ -155,10 +156,10 @@
 
 (deftest vertical-candidate-enumeration-checks-each-producer-once
   (let [program (source-program
-                 '(let* [u (raster.par/pmap i n float (+ (aget x i) 1.0))
-                         v (raster.par/pmap j n float (+ (aget u j) 2.0))
-                         w (raster.par/pmap k n float (+ (aget v k) 3.0))
-                         z (raster.par/pmap l n float (+ (aget w l) 4.0))]
+                 '(let* [u (raster.par/pmap i n float (clojure.core/unchecked-float (+ (aget x i) 1.0)))
+                         v (raster.par/pmap j n float (clojure.core/unchecked-float (+ (aget u j) 2.0)))
+                         w (raster.par/pmap k n float (clojure.core/unchecked-float (+ (aget v k) 3.0)))
+                         z (raster.par/pmap l n float (clojure.core/unchecked-float (+ (aget w l) 4.0)))]
                         z)
                  {'x :float})
         calls (atom [])
@@ -208,9 +209,9 @@
 
 (deftest structural-prefilter-preserves-ordered-matching-candidates
   (let [program (source-program
-                 '(let* [u (raster.par/pmap i n float (+ (aget a i) 1.0))
-                         unrelated (raster.par/pmap j n float (+ (aget b j) 2.0))
-                         v (raster.par/pmap k n float (+ (aget u k) 3.0))]
+                 '(let* [u (raster.par/pmap i n float (clojure.core/unchecked-float (+ (aget a i) 1.0)))
+                         unrelated (raster.par/pmap j n float (clojure.core/unchecked-float (+ (aget b j) 2.0)))
+                         v (raster.par/pmap k n float (clojure.core/unchecked-float (+ (aget u k) 3.0)))]
                         [unrelated v])
                  {'a :float 'b :float})
         calls (atom [])
@@ -233,10 +234,10 @@
 
 (deftest horizontal-candidate-enumeration-checks-each-map-once
   (let [program (source-program
-                 '(let* [u (raster.par/pmap i n float (+ (aget a i) 1.0))
-                         v (raster.par/pmap j m float (+ (aget b j) 2.0))
-                         w (raster.par/pmap k k-size float (+ (aget c k) 3.0))
-                         z (raster.par/pmap l l-size float (+ (aget d l) 4.0))]
+                 '(let* [u (raster.par/pmap i n float (clojure.core/unchecked-float (+ (aget a i) 1.0)))
+                         v (raster.par/pmap j m float (clojure.core/unchecked-float (+ (aget b j) 2.0)))
+                         w (raster.par/pmap k k-size float (clojure.core/unchecked-float (+ (aget c k) 3.0)))
+                         z (raster.par/pmap l l-size float (clojure.core/unchecked-float (+ (aget d l) 4.0)))]
                         [u v w z])
                  {'a :float 'b :float 'c :float 'd :float}
                  {'n :long 'm :long 'k-size :long 'l-size :long})
@@ -323,13 +324,13 @@
 (deftest map-scan-fusion-preserves-the-certified-resident-boundary
   (doseq [[source mode result-shape]
           [['(let* [mapped (raster.par/pmap i n float
-                                            (* (clojure.core/aget x i) 2.0))
+                                            (raster.numeric/* (clojure.core/aget x i) (float 2.0)))
                     result (raster.par/scan out acc 0.0 j n float
                                             (+ acc (clojure.core/aget mapped j)))]
                    result)
             :inclusive '[n]]
            ['(let* [mapped (raster.par/pmap i n float
-                                            (* (clojure.core/aget x i) 2.0))
+                                            (raster.numeric/* (clojure.core/aget x i) (float 2.0)))
                     result (raster.par/scan-exclusive out acc 0.0 j n float
                                                       (+ acc (clojure.core/aget mapped j)))]
                    result)
@@ -358,12 +359,19 @@
 
 (deftest map-scan-fusion-declines-an-aliased-destination-read
   (let [source '(let* [mapped (raster.par/pmap i n float
-                                               (* (clojure.core/aget x i) 2.0))
+                                               (raster.numeric/* (clojure.core/aget x i) (float 2.0)))
                        result (raster.par/scan x acc 0.0 j n float
                                                (+ acc (clojure.core/aget mapped j)))]
                       result)
         program (frontend/form->program source {:dtype :float :array-types {'x :float}})
-        [result stats] (typed-fusion/fusion-fixpoint program)]
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        [head bindings result-expression] source
+        [scan-head _ & scan-arguments] (nth bindings 3)
+        nonalias (list head (assoc bindings 3 (list* scan-head 'out scan-arguments)) result-expression)
+        [_ control-stats] (typed-fusion/fusion-fixpoint
+                           (frontend/form->program nonalias
+                                                   {:dtype :float :array-types {'x :float 'out :float}}))]
+    (is (= 1 (:vertical control-stats)) "changing only the destination removes the alias barrier")
     (is (= program result))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
     (is (= 2 (count (dialect/equations result)))
@@ -436,8 +444,8 @@
     (is (not-any? #{'a} (mapcat #(nth % 2) (dialect/equations recomputed))))
     (is (= recomputed (dialect/validate! recomputed)))))
 
-(deftest typed-fusion-rewrites-the-canonical-reduction-region
-  (let [source '(let* [tmp (raster.par/pmap i n float (* (aget x i) 2.0))
+(deftest unproved-conversion-elements-retain-the-materialized-reduction-boundary
+  (let [source '(let* [tmp (raster.par/pmap i n float (clojure.core/unchecked-float (* (aget x i) 2.0)))
                        sum (raster.par/reduce acc 0.0 j n (+ acc (aget tmp j)))]
                       sum)
         program (source-program source {'x :float})
@@ -445,14 +453,75 @@
         reconstructed (dialect/equations fused)
         conversions (filter dialect/scalar-convert-form?
                             (tree-seq coll? seq reconstructed))]
-    (is (not-any? #{'tmp} (flatten reconstructed))
-        "the eliminated map result cannot survive in ProductReduction")
+    (is (= program fused)
+        "unknown source-projected element effects do not abort a legal materialized program")
+    (is (= 2 (count reconstructed)))
     (is (some #(= {:source-dtype :double :target-dtype :float
                    :rounding :nearest-even :overflow :ieee
-                   :source-op 'clojure.core/float}
+                   :source-op 'clojure.core/unchecked-float}
                   (:attributes (dialect/scalar-convert-parts %)))
               conversions)
-        "the materialized map conversion is part of the inlined value semantics")))
+        "the materialized map conversion is part of the inlined value semantics")
+    (let [{:keys [parameters body-results]}
+          (dialect/lambda-parts (:lambda (dialect/operation-parts (first reconstructed))))
+          element (eval (list 'fn parameters (projection/scalar-folds->source (first body-results))))
+          original (eval (list 'fn '[x n] source))]
+      ;; The unchanged materialized producer preserves the actual checkpoint.
+      ;; This is not a claim about fusion or arbitrary parallel reduction trees.
+      (doseq [values [[] [1.25] [Float/MAX_VALUE] [(- Float/MAX_VALUE)] [4097.0]]]
+        (let [input (float-array values)
+              actual (reduce + 0.0 (map element input))
+              expected (original input (alength input))]
+          (is (= (Double/doubleToRawLongBits (double expected))
+                 (Double/doubleToRawLongBits (double actual)))))))))
+
+(deftest unavailable-reassociation-does-not-block-later-legal-fusion
+  (let [source '(let* [tmp (raster.par/pmap i n float (clojure.core/unchecked-float (* (aget x i) 2.0)))
+                       sum (raster.par/reduce acc 0.0 j n (+ acc (aget tmp j)))
+                       a (raster.par/pmap k m double (* (aget d k) 2.0))
+                       b (raster.par/pmap l m double (+ (aget a l) 1.0))]
+                      [sum b])
+        program (source-program source {'x :float 'tmp :float 'd :double 'a :double 'b :double}
+                                {'n :long 'm :long})
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= {:vertical 1 :horizontal 0 :iterations 2} stats))
+    (is (= ['map 'reduce 'map] (mapv dialect/operation-kind (dialect/equations result))))
+    (is (= (first (dialect/equations program)) (first (dialect/equations result))))
+    (is (= result (dialect/validate! result)))))
+
+(deftest unavailable-conversion-evidence-retains-the-original-scan
+  (let [source '(let* [mapped (raster.par/pmap i n float
+                                            (clojure.core/unchecked-float (* (aget x i) 2.0)))
+                       result (raster.par/scan out acc 0.0 j n float (+ acc (aget mapped j)))]
+                      result)
+        program (source-program source {'x :float 'out :float})
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= program result))
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
+    (is (= ['map 'scan] (mapv dialect/operation-kind (dialect/equations result))))))
+
+(deftest unavailable-element-evidence-is-not-an-invalid-algebra-waiver
+  (let [candidate {:kind :reduce
+                   :attributes {:accumulators '[acc] :identities [0.0] :dtypes [:double]}
+                   :body-results '[(+ acc element)]}]
+    (with-redefs [scan/certify-reassociation
+                  (fn [request _]
+                    (throw (ex-info "unavailable" {:reason :reduction-element-impure-or-unknown
+                                                   :reduction-op request})))]
+      (is (nil? (#'typed-fusion/recertify-fused-algebra candidate))))
+    (doseq [reason [:reduction-nonidentity-init :reduction-not-associative :stale-definition-proof-input
+                    :reduction-element-impure-or-unknown]]
+      (let [failure (ex-info "invalid or unrelated" {:reason reason})]
+        (with-redefs [scan/certify-reassociation (fn [& _] (throw failure))]
+          (is (identical? failure
+                          (try (#'typed-fusion/recertify-fused-algebra candidate) nil
+                               (catch clojure.lang.ExceptionInfo actual actual)))))))
+    (is (= :invalid-canonical-scalar-conversion
+           (try (#'typed-fusion/recertify-fused-algebra
+                 (assoc candidate :body-results
+                        '[(+ acc (raster.compiler.ir.soac-dialect/scalar-convert {} element))]))
+                nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
 
 (deftest scalar-bound-dense-result-fuses-with-its-elementwise-consumer
   (let [source '(let* [rows (clojure.core/alength b)
@@ -484,16 +553,24 @@
     (is (= program result))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
 
+(defn- without-middle-write [source]
+  (let [[head bindings result] source]
+    (list head (vec (mapcat identity (remove #(= 'middle (first %)) (partition 2 bindings)))) result)))
+
 (deftest vertical-fusion-does-not-recompute-a-read-after-an-intervening-write
   (let [source '(let* [producer (raster.par/pmap i n float
                                                  (clojure.core/aget x i))
                        middle (raster.par/map! x j n float
-                                               (+ (clojure.core/aget x j) 1.0))
+                                               (clojure.core/unchecked-float (+ (clojure.core/aget x j) 1.0)))
                        consumer (raster.par/pmap k n float
-                                                 (* (clojure.core/aget producer k) 2.0))]
+                                                 (clojure.core/unchecked-float (* (clojure.core/aget producer k) 2.0)))]
                       consumer)
         program (frontend/form->program source {:dtype :float :array-types {'x :float}})
-        [result stats] (typed-fusion/fusion-fixpoint program)]
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        [_ control-stats] (typed-fusion/fusion-fixpoint
+                           (frontend/form->program (without-middle-write source)
+                                                   {:dtype :float :array-types {'x :float}}))]
+    (is (= 1 (:vertical control-stats)) "the source is fusible when only the intervening write is removed")
     (is (= 3 (count (dialect/equations result))))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
     (is (some #{'producer} (flatten (dialect/equations result)))
@@ -501,15 +578,19 @@
 
 (deftest horizontal-fusion-does-not-move-a-read-before-an-intervening-write
   (let [source '(let* [left (raster.par/pmap i n float
-                                             (+ (clojure.core/aget a i) 1.0))
+                                             (clojure.core/unchecked-float (+ (clojure.core/aget a i) 1.0)))
                        middle (raster.par/map! x j n float
-                                               (+ (clojure.core/aget x j) 1.0))
+                                               (clojure.core/unchecked-float (+ (clojure.core/aget x j) 1.0)))
                        right (raster.par/pmap k n float
-                                              (* (clojure.core/aget x k) 2.0))]
+                                              (clojure.core/unchecked-float (* (clojure.core/aget x k) 2.0)))]
                       [left right])
         program (frontend/form->program
                  source {:dtype :float :array-types {'a :float 'x :float}})
-        [result stats] (typed-fusion/fusion-fixpoint program)]
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        [_ control-stats] (typed-fusion/fusion-fixpoint
+                           (frontend/form->program (without-middle-write source)
+                                                   {:dtype :float :array-types {'a :float 'x :float}}))]
+    (is (= 1 (:horizontal control-stats)) "the maps are fusible without the intervening write")
     (is (= 3 (count (dialect/equations result))))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
     (is (= '[left right] (dialect/outputs result))
@@ -555,10 +636,10 @@
     (is (= 1 (count (dialect/equations result))))
     (is (= [{:id 'rstr_producer_local_0
              :dtype :float
-             :init '(clojure.core/float (* %element0 %element0))}
+             :init '(clojure.core/float (clojure.core/unchecked-float (* %element0 %element0)))}
             {:id 'rstr_consumer_local_0
              :dtype :float
-             :init '(clojure.core/float (+ rstr_producer_local_0 1.0))}]
+             :init '(clojure.core/float (clojure.core/unchecked-float (+ rstr_producer_local_0 1.0)))}]
            (mapv #(update % :init projection/scalar-folds->source) locals)))
     (is (= '[rstr_consumer_local_0] body-results))
     (is (= result (dialect/validate! result)))))
@@ -1024,61 +1105,86 @@
     (is (seq (:body (#'route/host-projection program [] (dialect/outputs program)))))
     (is (= projected (dialect/validate! projected)))))
 
-(deftest completed-reduction-conversion-preserves-the-accumulator-precision
-  (let [program (frontend/form->program
-                 '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
-                         ^float result (float total)] result)
-                 {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
-        [result stats] (typed-fusion/fusion-fixpoint program)
-        operation (dialect/operation-parts (first (dialect/equations result)))
-        transform (get-in operation [:attributes :result-transform])]
-    (is (= 1 (:vertical stats)))
-    (is (= 1 (count (dialect/equations result))))
-    (is (= [:double] (get-in operation [:attributes :dtypes])))
-    (is (= :float (:result-dtype transform)))
-    (is (= :float (get-in (dialect/facts result) [:values 'result :dtype])))
-    (is (= result (dialect/validate! result)))))
-
-(deftest adjacent-mixed-width-arithmetic-preserves-its-terminal-region
-  (let [program (frontend/form->program
-                 '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
-                         ^float result (float (+ total 0.25))] result)
-                 {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
-        [result stats] (typed-fusion/fusion-fixpoint program)]
-    (is (= 1 (:vertical stats)))
-    (is (= 1 (count (dialect/equations result))))
-    (let [operation (dialect/operation-parts (first (dialect/equations result)))]
-      (is (= [:double] (get-in operation [:attributes :dtypes])))
-      (is (= :float (get-in operation [:attributes :result-transform :result-dtype]))))
-    (is (= result (dialect/validate! result)))))
-
-(defn- separated-reduction-conversion [intervening terminal]
-  (frontend/form->program
+(defn- separated-reduction-source [intervening terminal result-tag]
    (list 'let*
          ['total '(raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
           (with-meta 'unchanged {:tag 'double}) '(double total)
           'middle intervening
-          (with-meta 'result {:tag 'float}) terminal]
-         'result)
+          (with-meta 'result {:tag result-tag}) terminal]
+         'result))
+
+(deftest checked-terminal-conversions-stay-at-the-source-owned-boundary
+  ;; These are source admission checks, not pure scalar algebra. A throwing
+  ;; Float conversion cannot acquire permission to move merely because its
+  ;; operand is a completed reduction. Actual precision/overflow execution is
+  ;; covered by declared-array-storage-device-test's source-owned roundtrips.
+  (let [options {:dtype :double :array-types {'x :double 'out :double}
+                 :scalar-types {'n :long}}
+        pure-map '(raster.par/pmap j n double (* (aget x j) 2.0))
+        separated #(separated-reduction-source %1 %2 'float)]
+    (doseq [[label source checked-binding terminal?]
+            [[:direct '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                               ^float result (float total)] result) 'result true]
+             [:adjacent-arithmetic
+              '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                      ^float result (float (+ total 0.25))] result) 'result true]
+             [:pure-gap (separated pure-map '(float unchanged)) 'result true]
+             [:effect-gap (separated '(raster.par/map! out j n double (* (aget x j) 2.0))
+                                     '(float unchanged)) 'result true]
+             [:nonadjacent-arithmetic (separated pure-map '(float (+ unchanged 0.25))) 'result true]
+             [:nonidentity-transform
+              '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                      ^double scaled (* total 2.0)
+                      middle (raster.par/pmap j n double (* (aget x j) 2.0))
+                      ^float result (float scaled)] result) 'result true]
+             [:intermediate-narrowing
+              '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                      ^float narrowed (float total)
+                      middle (raster.par/pmap j n double (* (aget x j) 2.0))
+                      ^double result (double narrowed)] result) 'narrowed false]
+             [:alias-shaped-gap (separated '(raster.par/pmap j n double (aget x j))
+                                           '(float unchanged)) 'result true]
+             [:shared-result (separated '(raster.par/pmap j n double (+ (aget x j) unchanged))
+                                       '(float unchanged)) 'result true]]]
+      (let [decline (frontend/coverage-decline source options)
+            checked (first (filter #(= checked-binding (:binding %)) (:bindings decline)))
+            retained (frontend/terminal-host-source source options)
+            terminal (last retained)
+            flattened (if terminal?
+                        (list (first retained) (into (second retained) (second terminal)) (last terminal))
+                        retained)]
+        (is (nil? (frontend/form->program source options)) (str label))
+        (is (= :uncertified-host-scalar (:reason checked)) (str label))
+        (is (contains? (:source-evaluation-flags checked) :checked-source-cast) (str label))
+        (is (= source flattened) (str label " retains the entire original ordered source"))
+        (if terminal?
+          (is (= 'let* (first terminal)) (str label " retains an explicit terminal region"))
+          (is (= source retained) "intermediate checks cannot hide a later numerical consumer"))))))
+
+(defn- separated-reduction-conversion [intervening terminal]
+  ;; Pure algebra controls use admitted Double-only consumers. Checked Float
+  ;; source conversions above are intentionally not fabricated as pure IR.
+  (frontend/form->program
+   (separated-reduction-source intervening terminal 'double)
    {:dtype :double :array-types {'x :double 'out :double}
     :scalar-types {'n :long}}))
 
 (deftest terminal-conversion-crosses-only-pure-ssa-equations
   (let [program (separated-reduction-conversion
                  '(raster.par/pmap j n double (* (aget x j) 2.0))
-                 '(float unchanged))
+                 '(double unchanged))
         [result stats] (typed-fusion/fusion-fixpoint program)
         operation (dialect/operation-parts (first (dialect/equations result)))]
     (is (= 2 (:vertical stats)))
     (is (= ['reduce 'map] (mapv dialect/operation-kind (dialect/equations result))))
     (is (= [:double] (get-in operation [:attributes :dtypes])))
-    (is (= :float (get-in operation [:attributes :result-transform :result-dtype])))
+    (is (= :double (get-in operation [:attributes :result-transform :result-dtype])))
     (is (= result (dialect/validate! result)))))
 
 (deftest terminal-conversion-does-not-cross-effects-or-generalize-arithmetic
   (doseq [[intervening terminal]
-          [['(raster.par/map! out j n double (* (aget x j) 2.0)) '(float unchanged)]
-           ['(raster.par/pmap j n double (* (aget x j) 2.0)) '(float (+ unchanged 0.25))]]]
+          [['(raster.par/map! out j n double (* (aget x j) 2.0)) '(double unchanged)]
+           ['(raster.par/pmap j n double (* (aget x j) 2.0)) '(double (+ unchanged 0.25))]]]
     (let [program (separated-reduction-conversion intervening terminal)
           [result stats] (typed-fusion/fusion-fixpoint program)]
       (is (= 1 (:vertical stats)) "only the adjacent identity cast fuses")
@@ -1087,32 +1193,22 @@
 (deftest terminal-conversion-retains-existing-nonidentity-transforms
   (let [program (frontend/form->program
                  '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
-                         ^double scaled (* total 2.0)
+                         ^double scaled (* ^double total 2.0)
                          middle (raster.par/pmap j n double (* (aget x j) 2.0))
-                         ^float result (float scaled)] result)
+                         ^double result (double scaled)] result)
                  {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
         [result stats] (typed-fusion/fusion-fixpoint program)]
     (is (= 1 (:vertical stats)))
     (is (= 3 (count (dialect/equations result))))
-    (is (= :double (get-in (dialect/operation-parts (first (dialect/equations result)))
-                          [:attributes :result-transform :result-dtype])))))
-
-(deftest terminal-conversion-retains-intermediate-narrowing
-  (let [program (frontend/form->program
-                 '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
-                         ^float narrowed (float total)
-                         middle (raster.par/pmap j n double (* (aget x j) 2.0))
-                         ^double result (double narrowed)] result)
-                 {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
-        [result stats] (typed-fusion/fusion-fixpoint program)]
-    (is (= 1 (:vertical stats)))
-    (is (= 3 (count (dialect/equations result))))
-    (is (= :float (get-in (dialect/operation-parts (first (dialect/equations result)))
-                         [:attributes :result-transform :result-dtype])))))
+    (let [operation (dialect/operation-parts (first (dialect/equations result)))
+          transform (get-in operation [:attributes :result-transform])]
+      (is (= :double (:result-dtype transform)))
+      (is (some #{2.0} (flatten (:body-results (dialect/lambda-parts (:lambda transform)))))
+          "the existing numerical scaling must not be overwritten by the later identity cast"))))
 
 (deftest terminal-conversion-retains-opaque-host-boundaries
   (let [program (separated-reduction-conversion
-                 '(raster.par/pmap j n double (* (aget x j) 2.0)) '(float unchanged))
+                 '(raster.par/pmap j n double (* (aget x j) 2.0)) '(double unchanged))
         facts (assoc-in (dialect/facts program) [:attributes :host-binding-ids] #{2})
         program (dialect/make facts (dialect/equations program) (dialect/outputs program))
         [result stats] (typed-fusion/fusion-fixpoint program)]
@@ -1121,7 +1217,7 @@
 
 (deftest terminal-conversion-retains-an-intervening-alias-contract
   (let [program (separated-reduction-conversion
-                 '(raster.par/pmap j n double (aget x j)) '(float unchanged))
+                 '(raster.par/pmap j n double (aget x j)) '(double unchanged))
         middle-id (second (nth (dialect/equations program) 2))
         facts (assoc-in (dialect/facts program) [:equations middle-id :aliases] {'middle 'x})
         program (dialect/make facts (dialect/equations program) (dialect/outputs program))
@@ -1132,7 +1228,7 @@
 
 (deftest terminal-conversion-retains-a-shared-reduction-result
   (let [program (separated-reduction-conversion
-                 '(raster.par/pmap j n double (+ (aget x j) unchanged)) '(float unchanged))
+                 '(raster.par/pmap j n double (+ (aget x j) unchanged)) '(double unchanged))
         [result stats] (typed-fusion/fusion-fixpoint program)]
     (is (= 1 (:vertical stats)))
     (is (= 3 (count (dialect/equations result))))))

@@ -187,6 +187,37 @@ The bounded REPL's four affected lineage/checked-owner/terminal-owner/source-ord
 namespaces pass 57 tests / 440 assertions, including both required and optional
 foreign-selection refusal and missing optional physical evidence.
 
+Fusion qualification now separates nine checked terminal source shapes from the
+pure scalar algebra. The checked shapes retain exact ordered source and explicit
+declines; Double-only controls retain nonidentity transforms, host boundaries,
+aliasing and shared-use obligations. IEEE map fixtures declare that intent in
+their body, preserving the outer storage cast. Alias and intervening-write
+negatives have matching fusible counterfactuals rather than passing vacuously
+because a conversion independently blocks motion. No source cast was globally
+reclassified as pure.
+
+This exposed an actual optional-optimization failure: a legal typed IEEE map
+feeding a reduction/scan projected its canonical conversion back to source during
+algebra recertification, where generic effect analysis could not prove the element.
+Fusion now abstains only for that exact local missing-element-effect request and
+retains the complete materialized boundary; invalid algebra, malformed conversion,
+source/history failures and unrelated exceptions still propagate. Later legal
+candidates are attempted and only successful rewrites affect the counters.
+Independent review found no blocker. Primitive operand correspondence through
+canonical conversion algebra remains a performance capability gap: valid policy
+attributes alone are not proof of the operand's physical carrier. Do not solve
+that gap by erasing Object/reference completion or relaxing source purity.
+
+A fresh single 900 MiB REPL passes six complete affected namespaces (125 tests /
+860 assertions) and four actual OpenCL/Level Zero scalar-observation regression
+cases (4 tests / 206 assertions). The complete fusion namespace's preceding
+focused run passes 58 tests / 366 assertions. These receipts supersede its earlier
+local failures, not the broader draft's red CI. The independent fusion-abstention
+repair is being qualified separately on clean main so it need not wait for the
+source-ownership draft. Remaining production failures include training scalar
+ownership, checked conversion maps and normalized AD/source lifecycle; none is
+declared complete by fixture consolidation.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification
