@@ -46,6 +46,38 @@ assertions, including both hardware-free CUDA/HIP emissions, all three Double
 pointer slots and rejection of the Float request. Vendor compilation and runtime
 qualification remain separate; the other aggregate emission refusals remain open.
 
+The next execution repair reuses the original source executor for flat eager prefixes
+that already possess an ordered source owner. It checks the entire executor set
+before materialization, executes each invocation occurrence once and supplies
+shared host equations from those completed results instead of reinterpreting
+their source. Missing selected-helper executors refuse before any earlier source
+action; there is no typed-interpreter retry. Copied owners and stale histories
+also refuse before materialization. Three affected namespaces pass 41 tests /
+451 assertions; after adding the historical negative controls, the complete
+scalar-source namespace passes 14 tests / 101 assertions. Local device and the
+existing ownerless unchecked-prefix controls are included in the former gate.
+
+A wider compatibility gate caught the aggregate/physical-entry mismatch before
+landing. Projection tags cannot manufacture the original field-read/unboxing
+context. Evaluator-family selection is now explicit before evaluation: validated
+aggregate projections keep their existing reference path, with present-owner
+historical guards; flat owned plans use their prepared source executors. No failed
+executor can switch families. Six affected flat/record/tree namespaces then pass
+54 tests / 576 assertions, including CSR on both local GPU backends. Fabricated
+projection metadata must still fail exact owner identity before evaluation.
+The final complete scalar-source namespace passes 14 tests / 102 assertions after
+adding that exact owner-identity control with a structurally valid projection.
+
+This is deliberately not a complete seal of eager preparation. The pre-existing
+ownerless reference subset remains unchanged, so removing the optional owner from
+an editable compilation cannot yet be distinguished from intentionally ownerless
+compilation. The next consolidation must introduce producer-owned eager evaluation
+authority for both modes, bound to exact semantic/emitted identities and historical
+inputs; mutable policy flags or fresh recompilation cannot authenticate an old
+artifact. Aggregate parameter projection also needs qualification at that boundary.
+Do not count this bounded reuse repair as closure of all eager ownership checks
+or of selected dimension helpers and the unchanged training workload.
+
 ### October 21 primitive math completion
 
 Eight audited primitive FP math rows (sqrt, floor, sin, cos, tan, exp, log and

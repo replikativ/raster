@@ -787,8 +787,9 @@
   "Specialize a compiled equation-first program against ordered public arguments.
 
    Returns a validated, allocation-free LinkPlan. Public buffers retain their stable host source
-   identity until instantiation; scalar prefix and host-only equations execute through the same
-   typed JVM reference backend.
+   identity until instantiation. Flat source-owned scalar prefixes use their prepared original
+   executors; shared host equations reuse those results. The ownerless and aggregate reference
+   subsets retain their existing typed JVM evaluator and grant no ordered-source capability.
    Retained-validation is an internal capability path: it must be exact-owner
    static evidence. Invocation materialization and final LinkPlan validation remain fresh."
   [compilation arguments project retained-validation caller-options]
@@ -798,7 +799,7 @@
            {:actual (type compilation)}))
   (let [started (System/nanoTime)
         source-ns (:source-ns compilation)
-        invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
+        invocation-plan (invocation/validate! (get-in compilation [:semantic :attributes :invocation-plan]))
         _ (when (get-in invocation-plan [:attributes :terminal-host-result])
             (fail! :explicit-host-result-required
                    "terminal host observation requires the ordered host-result executor" {}))
@@ -808,14 +809,28 @@
                    "host actions after numerical work require source-ordered execution, not eager materialization"
                    {:actions (mapv #(select-keys % [:position :binding :invocation-step :equation])
                                    ordered-host-actions)}))
+        _ (when (:ordered-source-owner compilation)
+          (source-owner/assert-ordered-compilation-source! compilation))
+        owned-prefix
+        (when (and (:ordered-source-owner compilation)
+                   ;; Original aggregate entry ports do not authenticate the
+                   ;; flattened leaf carriers. Keep that existing reference
+                   ;; family until the projection owns this correspondence.
+                   (nil? (get-in invocation-plan [:attributes :parameter-projection])))
+          (let [initial (invocation-link/begin-ordered-realization compilation arguments caller-options)]
+            ;; Qualify the whole executor set before any scalar source work.
+            ;; No missing executor may fall back after an earlier check ran.
+            (source-owner/assert-ordered-executor-coverage! compilation initial arguments)
+            initial))
         unsupported-host-evaluation
         (fn [& _]
           (fail! :equation-first-source-free-host-evaluation
                  "source-free compilation cannot evaluate a host invocation step or equation"
                  {:function (:function compilation)}))
-        evaluate-step (if source-ns
-                        (partial scalar/evaluate-invocation-step source-ns)
-                        unsupported-host-evaluation)
+        evaluate-step (cond
+                        owned-prefix (partial source-owner/evaluate-ordered-invocation-step compilation)
+                        source-ns (partial scalar/evaluate-invocation-step source-ns)
+                        :else unsupported-host-evaluation)
         materialized
         (materialization/materialize
          invocation-plan (vec arguments)
@@ -823,11 +838,27 @@
         materialization-ns (- (System/nanoTime) started)
         buffer-shapes (into {} (map (fn [[id buffer]] [id (:shape buffer)]))
                             (:program-buffers materialized))
-        evaluate-host (if source-ns
+        shared-host-steps (when owned-prefix
+                            (into {} (keep (fn [entry]
+                                            (when (and (:equation entry) (:invocation-step entry))
+                                              [(:equation entry) (:invocation-step entry)])))
+                                  (:source-order owned-prefix)))
+        evaluate-host (cond
+                        owned-prefix
+                        (fn [equation _]
+                          (source-owner/assert-ordered-compilation-source! compilation)
+                          (let [step (get shared-host-steps (:id equation))
+                                result (get-in materialized [:values step])]
+                            (when-not (and step (= 1 (count (:results equation))) result)
+                              (fail! :equation-first-owned-host-result
+                                     "owned host equation lacks its completed invocation result"
+                                     {:equation (:id equation)}))
+                            {(first (:results equation)) result}))
+                        source-ns
                         (fn [equation context]
                           (scalar/evaluate-host-equation
                            source-ns equation (assoc context :buffer-shapes buffer-shapes)))
-                        unsupported-host-evaluation)
+                        :else unsupported-host-evaluation)
         construction-started (System/nanoTime)
         projection-ns (volatile! 0)
         project (fn [plan]
@@ -842,6 +873,8 @@
                  (invocation-link/lower
                   materialized (:emitted compilation) (:target compilation)
                   evaluate-host project retained-validation caller-options))]
+    (when (:ordered-source-owner compilation)
+      (source-owner/assert-ordered-compilation-source! compilation))
     (when *lower-observer*
       (*lower-observer* {:materialization-ns materialization-ns
                          :link-plan-construction-ns

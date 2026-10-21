@@ -2,12 +2,14 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.source-owner :as owner]
             [raster.compiler.backend.jvm.terminal-source :as projection]
+            [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.arrays :as arrays]
+            [raster.numeric :as numeric]
             [raster.core :as core]
             [raster.gpu.core :as gpu]
             [raster.gpu.compiled :as compiled]
@@ -27,6 +29,11 @@
 
 (core/deftm typed-unchecked-narrow [n :- Long] :- Long
   (long (clojure.core/unchecked-int n)))
+
+(core/deftm selected-prefix-dimension [n :- Long] :- (Array double)
+  (let [size (numeric/* n 2)
+        out (double-array size)]
+    (par/map! out i size double 1.0)))
 
 (core/deftm typed-checked-narrow [n :- Long] :- Long
   (long (clojure.core/int n)))
@@ -137,6 +144,57 @@
            (is (= (outcome #(plain-checked-narrow n))
                   (outcome #(typed-checked-narrow n))
                   (outcome #(execute [n]))))))))))
+
+(deftest eager-owned-prefix-reuses-each-source-result-instead-of-reinterpreting-it
+  (let [compilation (equation-first/compile #'shadowed-dimension {:target :ocl:0 :dtype :double})
+        original owner/evaluate-ordered-invocation-step
+        calls (atom [])
+        forbidden (fn [& _] (throw (AssertionError. "owned source fell back to typed interpretation")))]
+    (with-redefs [scalar/evaluate-invocation-step forbidden scalar/evaluate-host-equation forbidden
+                  owner/evaluate-ordered-invocation-step
+                  (fn [c step values]
+                    (swap! calls conj (:id step))
+                    (original c step values))]
+      (is (map? (equation-first/lower compilation [1])))
+      (is (= 2 (count @calls)))
+      (is (= 2 (count (distinct @calls)))))))
+
+(deftest eager-owned-prefix-preflights-all-executors-before-materialization
+  (let [compilation (equation-first/compile #'selected-prefix-dimension {:target :ocl:0 :dtype :double})
+        started (atom 0)]
+    (is (some? (:ordered-source-owner compilation)))
+    (with-redefs [materialization/materialize
+                  (fn [& _] (swap! started inc) (throw (AssertionError. "missing executor ran source")))]
+      (is (= :unclosed-ordered-source-executor
+             (reason #(equation-first/lower compilation [1])))))
+    (is (zero? @started))))
+
+(deftest eager-owned-prefix-checks-original-history-before-materialization
+  (let [compilation (equation-first/compile #'shadowed-dimension {:target :ocl:0 :dtype :double})
+        other (equation-first/compile #'shadowed-dimension {:target :ocl:0 :dtype :double})
+        source (core/resolve-deftm-var #'shadowed-dimension {:dtype :double})
+        metadata (meta source)
+        started (atom 0)]
+    (with-redefs [materialization/materialize
+                  (fn [& _] (swap! started inc) (throw (AssertionError. "stale source was evaluated")))]
+      (is (= :ordered-source-owner-mismatch
+             (reason #(equation-first/lower
+                       (assoc compilation :ordered-source-owner (:ordered-source-owner other)) [1]))))
+      (let [parameters (mapv :symbol (get-in compilation [:semantic :attributes :invocation-plan :parameters]))
+            projection {:public-parameters parameters
+                        :physical-parameters (mapv (fn [id] {:symbol id :binding id}) parameters)}
+            changed (assoc-in compilation
+                              [:semantic :attributes :invocation-plan :attributes :parameter-projection]
+                              projection)]
+        (is (= :ordered-source-owner-mismatch
+               (reason #(equation-first/lower changed [1])))
+            "even structurally valid projection metadata cannot select another family's evaluator"))
+      (try
+        (alter-meta! source assoc ::changed-source true)
+        (is (= :stale-definition-proof-input
+               (reason #(equation-first/lower compilation [1]))))
+        (finally (reset-meta! source metadata))))
+    (is (zero? @started))))
 
 (deftest prepared-steps-follow-invocation-identities-through-shadowed-bindings
   (let [expected (mapv #(vec (shadowed-dimension %)) [0 2 5])
