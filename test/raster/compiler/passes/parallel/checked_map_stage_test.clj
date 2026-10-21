@@ -5,6 +5,7 @@
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.ir.emitted-parallel-equation :as emitted]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.stage-result :as result]
@@ -171,6 +172,23 @@
       (is (not (checked/candidate?
                 (:algorithm equation)
                 (assoc-in source path (list (first conversion) attributes (nth conversion 2)))))))))
+
+(deftest checked-stage-refusal-identifies-the-first-unmet-existing-contract
+  (let [equation (numerical-equation (compilation (first targets)))
+        source (equation-graph/make (:algorithm equation) (:body equation))
+        output (get-in source [:nodes 0 :operation :out-sym])
+        path [:nodes 0 :operation :scalar-region :result]
+        conversion (get-in source path)]
+    (doseq [[changed requirement]
+            [[(update source :temporaries conj (graph/buffer 'diagnostic-scratch :int 4 :device :temporary))
+              :no-existing-temporaries]
+             [(assoc-in source [:outputs 0 :elements] 17) :single-output-boundary]
+             [(update-in source [:nodes 0 :operation :inputs] conj output) :write-only-output]
+             [(assoc-in source path (nth conversion 2)) :checked-outer-result-conversion]]]
+      (let [error (try (checked/plan (:algorithm equation) changed {}) nil
+                       (catch clojure.lang.ExceptionInfo error error))]
+        (is (= :checked-map-stage-declined (:reason (ex-data error))))
+        (is (= requirement (:requirement (ex-data error))))))))
 
 (deftest completed-status-protocol-is-bounded-and-empty-safe
   (let [equation (numerical-equation (compilation (first targets)))

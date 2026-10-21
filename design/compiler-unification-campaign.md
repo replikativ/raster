@@ -189,6 +189,29 @@ affected namespaces pass 114 tests / 638 assertions. Independent review found no
 blocker and required the final fresh-process check, which passed. Portable
 map/fold-map and checked-map refusals remain separate open failures.
 
+CI at `244dfb6b` independently confirms the preparation repair: public emission
+job 33383 passes 146 of 172 attempts, with 26 remaining refusals; private fixture
+generation also refuses a checked conversion. These are not vendor compiler or
+device results. Nested scalar-lowering diagnostics now retain only fixed keyword
+contract fields (never expressions/bodies), and the existing checked-map gate
+identifies its first unmet requirement without changing admission. Representative
+unchanged probes distinguish RMS chunked's `:private-result-storage` from the
+cooperative Q8 quantizer's `:single-output-boundary`; neither can be fixed by
+pretending every checked conversion is one private final store.
+
+Reviewed next conversion order: first a general invariant-scalar motion refinement
+exercised by RMSNorm's checked `eps` then `gain-offset` casts. Its guard must mean
+the final map actually runs (both rows AND features), with prior reads independently
+proved bounded/otherwise-total and conversion order retained. Reuse InvocationPlan
+ScalarCompute and the existing owned scalar projector's exact RT.floatCast and
+matching-carrier conditionals; do not add a floating launch-expression evaluator.
+The derived guard/host step needs its own independently reconstructed source-motion
+authority: successful projection alone cannot authorize synthesized work. Test
+empty domains with invalid scalars, each/both failures, aliasing, unchanged output
+on failure and resident replay. Cooperative lanes must still all reach barriers.
+Data-dependent internal casts and batch normalization's multiple running-state
+stores remain subsequent general lowering obligations, not exemptions or skips.
+
 ### October 21 ordered host-integral qualification
 
 Late checked integral computations may now remain opaque ordered host actions

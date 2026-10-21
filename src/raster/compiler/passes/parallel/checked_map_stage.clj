@@ -129,26 +129,28 @@
         {:keys [attributes operand]} (conversion/canonical-parts (:result region))
         output (:out-sym operation)
         {index :name bound :bound} (first (get-in operation [:space :dims]))
-        _ (when-not (and (= 1 (count (soac/equations algorithm)))
-                         (= 'map (soac/operation-kind equation))
-                         (= 1 (count (:nodes source-graph)))
-                         (segop/seg-map? operation)
-                         (= 1 (count (get-in operation [:space :dims])))
-                         (empty? (:temporaries source-graph))
-                         (= 1 (count (:outputs source-graph)))
-                         (= output (:id (first (:outputs source-graph))))
-                         (= :output (:role (first (:outputs source-graph))))
-                         (= bound (:elements (first (:outputs source-graph))))
-                         (or (and (empty? (:effects facts)) (empty? (:aliases facts))
-                                  (empty? (get-in facts [:attributes :result-storage])))
-                             (private-result-storage? facts equation output))
-                         (= #{output} (:outputs operation))
-                         (not (contains? (:inputs operation) output))
-                         (vector? (:locals region))
-                         (not (contains? region :effects))
-                         (= source-conversion attributes))
+        unmet (cond
+                (not (and (= 1 (count (soac/equations algorithm)))
+                          (= 'map (soac/operation-kind equation)))) :single-map-equation
+                (not (and (= 1 (count (:nodes source-graph)))
+                          (segop/seg-map? operation))) :single-map-node
+                (not= 1 (count (get-in operation [:space :dims]))) :one-dimensional-domain
+                (seq (:temporaries source-graph)) :no-existing-temporaries
+                (not (and (= 1 (count (:outputs source-graph)))
+                          (= output (:id (first (:outputs source-graph))))
+                          (= :output (:role (first (:outputs source-graph))))
+                          (= bound (:elements (first (:outputs source-graph)))))) :single-output-boundary
+                (not (or (and (empty? (:effects facts)) (empty? (:aliases facts))
+                              (empty? (get-in facts [:attributes :result-storage])))
+                         (private-result-storage? facts equation output))) :private-result-storage
+                (not= #{output} (:outputs operation)) :single-output-store
+                (contains? (:inputs operation) output) :write-only-output
+                (not (and (vector? (:locals region))
+                          (not (contains? region :effects)))) :value-producing-scalar-region
+                (not= source-conversion attributes) :checked-outer-result-conversion)
+        _ (when unmet
             (decline! "checked map requires a single write-only outer Double-to-Float result"
-                      {:operation (:id operation) :conversion attributes}))
+                      {:operation (:id operation) :conversion attributes :requirement unmet}))
         projected (reads/validate-and-project-addresses operation node source-graph)
         requirements (get-in node [:read-capacity-certificate :requirements])
         _ (when-not (set/subset? (:inputs operation) (set (keys requirements)))

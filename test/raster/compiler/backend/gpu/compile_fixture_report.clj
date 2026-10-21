@@ -4,6 +4,19 @@
 
 (def ^:dynamic ^:private *report* nil)
 
+(defn- lowering-diagnostic [data]
+  ;; Preserve the actionable nested refusal without retaining arbitrary ASTs,
+  ;; bodies, values, or lazy diagnostic collections from a failed compiler.
+  (let [decline (:kernel-body-decline data)
+        summary (when (map? decline)
+                  (into {} (keep (fn [key]
+                                   (let [value (get decline key)]
+                                     (when (keyword? value) [key value]))))
+                        [:reason :missing-rule :source :target :requirement :fallback]))]
+    (cond-> (select-keys data [:reason :pass])
+      (keyword? (:requirement data)) (assoc :requirement (:requirement data))
+      (seq summary) (assoc :kernel-body-decline summary))))
+
 (defn- abort-cause? [error]
   (let [seen (java.util.IdentityHashMap.)]
     (loop [cause error]
@@ -37,7 +50,7 @@
                                  :exception (.getName (class error))}
                                 (when (and message (> (count message) 1024))
                                   {:message-truncated? true})
-                                (select-keys (ex-data error) [:reason :pass]))]
+                                (lowering-diagnostic (ex-data error)))]
           (swap! *report* (fn [report]
                            (-> report
                                (update :failures conj diagnostic)

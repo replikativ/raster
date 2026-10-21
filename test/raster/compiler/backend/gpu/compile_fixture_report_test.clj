@@ -42,6 +42,38 @@
           #(map (fn [source] (report/attempt! {} (fn [] {:source source}))) ["a" "b"]))))
   (is (= 7 (report/attempt! {} (fn [] 7)))))
 
+(deftest nested-lowering-refusals-retain-bounded-contract-identities-not-expressions
+  (let [opaque (lazy-seq (throw (AssertionError. "diagnostic realized an arbitrary value")))
+        error (try
+                (report/collect!
+                 #(vector
+                   (report/attempt!
+                    {:function 'example/kernel :target :cuda:fixture}
+                    (fn []
+                      (throw (ex-info "portable map refused"
+                                      {:reason :kernel-graph-target-lowering-missing
+                                       :kernel-body-decline
+                                       {:reason :segmap-kernel-body-declined
+                                        :missing-rule :checked-floating-conversion
+                                        :source :double :target :float :fallback :none
+                                        :requirement :write-only-output
+                                        :expression opaque :body opaque}}))))))
+                nil (catch clojure.lang.ExceptionInfo error error))
+        diagnostic (first (:failures (ex-data error)))]
+    (is (= :cuda:fixture (:target diagnostic)))
+    (is (= {:reason :segmap-kernel-body-declined
+            :missing-rule :checked-floating-conversion
+            :source :double :target :float :fallback :none
+            :requirement :write-only-output}
+           (:kernel-body-decline diagnostic)))
+    (is (= {:reason :checked-map-stage-declined :requirement :single-output-store}
+           (#'report/lowering-diagnostic
+            {:reason :checked-map-stage-declined :requirement :single-output-store
+             :expression opaque})))
+    (is (= {} (#'report/lowering-diagnostic
+               {:kernel-body-decline {:source opaque :expression opaque}
+                :requirement opaque})))))
+
 (deftest cancellation-and-vm-failures-are-not-converted-to-compile-refusals
   (doseq [failure [(InterruptedException. "interrupted")
                    (java.util.concurrent.CancellationException. "cancelled")
