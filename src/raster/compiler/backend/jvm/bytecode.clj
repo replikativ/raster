@@ -6256,6 +6256,15 @@
                  :element-type (:element-type record)}) guard)
              :input-contract contract :input-completion completed))))
 
+(defn ^:no-doc compile-input-invocation-region
+  "Outline one input of an exact frontend-origin call through its original emission.
+   This follows the existing opaque input-origin relation, not source equality.
+   The caller additionally retains frontend identity and ownership of execution order."
+  [emission input-body original input-index]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (assoc (compile-invocation-input-region emission owned input-index)
+           :source-input original :source-input-index input-index)))
+
 (defn ^:no-doc compile-terminal-result-region
   "Outline the exact observed outer lexical tail, excluding its initializers.
    Retain physical input ports, actual result context and the original method's

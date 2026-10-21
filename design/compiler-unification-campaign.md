@@ -290,6 +290,51 @@ The reused capped REPL passes 55 transport/inliner/construction tests (364
 assertions) and 136 source/ownership tests (1,579 assertions); these are focused
 gates, not fresh-process, whole-draft or performance qualification.
 
+### October 21 original frontend argument execution
+
+Explicit `prepare-frontend-invocation-input!` now follows the authenticated
+frontend/input-origin relation into the existing bytecode input outliner. It
+preserves the original positional completion, physical ports and emitted method
+dependencies. This prepares an argument slot, not a whole helper or numerical
+argument; no source interpreter, new dtype inference or execution-order grant
+is introduced.
+
+The returned executable freezes both raw frontend identity and full transitive
+module history. A module guard alone accepts an equal-but-copied raw source body;
+the additional frontend guard correctly refuses it. Guards run before execution
+and before returning, with no fresh observations. A local collector prevents
+unrelated enclosing dependencies from becoming runtime costs, while historical
+adoption still fences the enclosing compilation. The existing input invocation
+checks its own region guard; the wrapper does not redundantly repeat that guard.
+
+Independent review found no blocker. Five new tests / 37 assertions cover the
+actual unused checked helper argument, overflow, out-of-owner invocation, copied
+and foreign inputs, source replacement before/after execution, transitive changes,
+no refreshed evidence and isolation from unrelated parent history. The existing
+136-test source/ownership gate also passes 1,579 assertions in the capped REPL.
+The complete source expansion and unchanged training gates remain unqualified.
+
+The next consumer must use general lexical call frames, not enlarge a root-only
+flat-prefix matcher or dispatch on the literal-count fixture. Actual `local-loss`
+contains only `mse-loss(linear-nb(...), y, rows)`; allocation products and reduction
+counts belong to imported callees. A frame must independently validate the
+bounded builder/substitution law, selected callee import, ordered completed formal
+slots (including unused arguments), callee-local substitutions, actual return
+completion and exact final invocation/equation interval. Construction traces only
+locate candidates. Existing ScalarCompute and ordered-source execution remain
+the executor model; prepared reverse-AD import closure is a separate obligation.
+
+Numerical arguments must NOT be executed by outlining their whole original CPU
+expression. A computed resident prediction needs proven physical-producer/formal
+correspondence. MSE's count uses prediction length, not target length or the loss
+denominator. Its current original count outliner takes a JVM array: the resident
+route requires an authenticated metadata/length projection through existing
+allocation/view/stage-completion facts, with null/bounds/domain/failure order
+preserved. Downloading or inventing a replacement array is not a valid shortcut.
+Acceptance must still rerun unchanged `local-loss` and `local-gradient-sum` with
+changed inputs and independent numerical/device oracles; successful scalar frames
+alone cannot close campaign items 3 or 5.
+
 ### October 21 original reduction count execution and outline hygiene
 
 The shared owned-input outliner now supports an original reduction's WHOLE

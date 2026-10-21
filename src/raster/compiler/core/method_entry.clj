@@ -945,6 +945,50 @@
   (frontend-occurrence-observation frontend original
     'raster.compiler.backend.jvm.bytecode/retained-input-binding-context index))
 
+(defn prepare-frontend-invocation-input!
+  "Compile an ORIGINAL invocation argument with its actual positional completion.
+   Requires a collecting owner and an authenticated unchanged frontend/emission.
+   Refused occurrences retain nothing. The returned region retains its own frozen
+   frontend and transitive module guards, including outside the collecting scope.
+   Invocation checks those original inputs; it never refreshes observations.
+   This is explicit code preparation, not a read-only occurrence query, helper
+   equivalence, replay permission or authority to change source execution order."
+  [frontend original input-index]
+  (call-with-optional-definition-inputs
+   (fn []
+     (when *emission-inputs*
+       (assert-definition-inputs-current! @*emission-inputs*)
+       ;; Retain only this region's actual inputs, not unrelated observations from
+       ;; a possibly large enclosing compiler. Adoption checks the parent history
+       ;; again; a fresh child cannot refresh the enclosing owner's old evidence.
+       (let [collector (atom {:static [] :values []})
+             region
+             (binding [*emission-inputs* collector]
+               (frontend-emission-observation
+                frontend
+                (fn [emission]
+                  (when-let [region
+                             ((requiring-resolve
+                               'raster.compiler.backend.jvm.bytecode/compile-input-invocation-region)
+                              emission (:body frontend) original input-index)]
+                    (observe-frontend-source-identity! frontend)
+                    region))))]
+         (when region
+           (let [historical @collector original-guard (:guard region) invoke (:invoke region)
+                 history-guard #(assert-definition-inputs-current! historical)
+                 guard (fn [] (history-guard) (original-guard))]
+             (adopt-definition-inputs! historical)
+             (guard)
+             (assoc region :guard guard
+                           :invoke (fn [& arguments]
+                                     ;; The existing invocation already checks its original
+                                     ;; region guard before/after. Add only this wrapper's
+                                     ;; frozen history; keep the combined guard for callers.
+                                     (history-guard)
+                                     (let [value (apply invoke arguments)]
+                                       (history-guard)
+                                       value))))))))))
+
 (defn original-source-frontend
   "Optional original frontend for an exact already-resolved deftm source Var.
    Shared mangling only discovers the operation; selected correspondence proves it."
