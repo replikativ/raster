@@ -61,10 +61,23 @@
                                    (begin frontend parameters))
                       prefix/close (fn [& arguments]
                                      (let [result (apply close arguments)]
-                                       (swap! observed assoc :inputs arguments :correspondence result)
+                                       (swap! observed assoc :inputs (vec (take 5 arguments))
+                                              :construction (nth arguments 5 nil)
+                                              :correspondence result)
                                        result))]
           (equation/compile function {:target target :dtype :double} descriptor))]
     (assoc @observed :compilation compilation)))
+
+(deftest source-phase-history-is-local-and-checked-before-prefix-verification
+  (let [{:keys [inputs construction correspondence]} (capture #'selected-prefix)
+        [input normalization normalized represented program] inputs]
+    (is (some? construction))
+    (is (some? correspondence))
+    (is (some? (reclose input normalization normalized represented program construction)))
+    (is (nil? (reclose input normalization normalized represented program {})))
+    (is (nil? (reclose input normalization normalized
+                      (with-meta (apply list represented) (meta represented)) program construction)))
+    (is (nil? (reclose input {} normalized represented program construction)))))
 
 (deftest unused-helper-input-is-not-erased-before-source-ownership
   ;; Complete the original numerical JIT before retaining compilation history.

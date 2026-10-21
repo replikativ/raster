@@ -4,6 +4,7 @@
    never reconstruct their origins from later symbol names or equal expressions."
   (:require [raster.compiler.core.inference :as inference]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]))
 
 (defn effective-body
@@ -182,3 +183,117 @@
            (entry/assert-producer-current! input)
            (entry/adopt-definition-inputs! (.-observations input))
            (assoc (first matches) :frontend (.-frontend input))))))))
+
+(def ^:dynamic ^:private *source-construction-observer* nil)
+
+(defn observe-type-elaboration!
+  "Observe an actual constructor return, only inside the owner-local source phase.
+   This retains origins, not equivalence, types, completion or execution evidence."
+  [original constructed environment]
+  (when (and *source-construction-observer* (not (identical? original constructed)))
+    (*source-construction-observer*
+     :type-elaboration {:original original :constructed constructed :environment environment})))
+
+(defn observe-builder-expansion!
+  "Retain the shared builder's actual inputs/output. This is NOT the final expanded AST."
+  [caller callee arguments environment result-symbol expansion]
+  (when *source-construction-observer*
+    (*source-construction-observer*
+     :builder-expansion {:caller caller :source-import (:source-import callee)
+                         :walked-body (:walked-body callee) :arguments arguments
+                         :environment environment :result-symbol result-symbol
+                         :expansion expansion})))
+
+(deftype ^:private SourceConstruction [normalization result edges builders observations]
+  entry/RetainedProducerInput
+  (assert-producer-current! [_]
+    (entry/assert-producer-current! normalization)
+    (entry/assert-definition-inputs-current! observations)
+    true))
+
+(defn with-source-construction-history
+  "Run the actual source phase once, retaining its owner-local construction returns.
+   No witness is emitted for ownerless input. Nothing enters compiler options, AST
+   metadata or portable IR. Successful callee imports join this same local history."
+  [normalization construct]
+  (if-not (and entry/*emission-inputs* (instance? SourceNormalization normalization))
+    {:form (construct)}
+    (with-local-history
+      (fn []
+        (entry/assert-producer-current! normalization)
+        (entry/adopt-definition-inputs! (.-observations ^SourceNormalization normalization))
+        (let [edges (volatile! []) builders (volatile! [])
+              result (binding [*source-construction-observer*
+                               (fn [kind event]
+                                 (case kind
+                                   :type-elaboration (vswap! edges conj event)
+                                   :builder-expansion (vswap! builders conj event)))]
+                       (construct))]
+          {:form result
+           :source-construction
+           (SourceConstruction. normalization result @edges @builders @entry/*emission-inputs*)})))))
+
+(defn source-construction-view
+  "Read only the exact completed phase under its original history.
+   Builder observations describe construction, not final placement or execution."
+  [input normalization result]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and entry/*emission-inputs* (instance? SourceConstruction input)
+                (identical? normalization (.-normalization ^SourceConstruction input))
+                (identical? result (.-result ^SourceConstruction input)))
+       (entry/assert-producer-current! input)
+       (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
+       {:type-elaborations (.-edges ^SourceConstruction input)
+        :builder-expansions (.-builders ^SourceConstruction input)}))))
+
+(defn construction-occurrence
+  "Follow unique actual construction edges back to normalization. Never search by equality.
+   A changed tag proves origin only; copied/shared/branching/cyclic histories abstain."
+  [input constructed]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and entry/*emission-inputs* (instance? SourceConstruction input))
+       (entry/assert-producer-current! input)
+       (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
+       (let [^SourceConstruction input input edges (.-edges input)
+             visited (java.util.IdentityHashMap.)]
+         (loop [value constructed chain [] remaining (inc (count edges))]
+           (when (and (pos? remaining) (not (.containsKey visited value)))
+             (.put visited value true)
+             (let [incoming (filterv #(identical? value (:constructed %)) edges)]
+               (cond
+                 (empty? incoming)
+                 (when-let [origin (normalization-occurrence (.-normalization input) value)]
+                   (assoc origin :normalized value :constructed constructed
+                                 :construction-edges (vec (reverse chain))))
+
+                 (= 1 (count incoming))
+                 (let [edge (first incoming)
+                       outgoing (filterv #(identical? (:original edge) (:original %)) edges)]
+                   (when (= 1 (count outgoing))
+                     (recur (:original edge) (conj chain edge) (dec remaining)))))))))))))
+
+(defn builder-expansion-view
+  "Query one exact shared-builder output and its original caller/imported callee.
+   Every actual argument must still be the caller's positional occurrence, including
+   unused ones. Recursive argument rewrites without their own proof abstain. This
+   supplies no formal completion, return adaptation or final-prefix interval proof."
+  [input expansion]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and entry/*emission-inputs* (instance? SourceConstruction input))
+       (entry/assert-producer-current! input)
+       (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
+       (let [builders (.-builders ^SourceConstruction input)
+             matches (filterv #(identical? expansion (:expansion %)) builders)]
+         (when (= 1 (count matches))
+           (let [{:keys [caller source-import walked-body arguments] :as event} (first matches)
+                 original-arguments (descriptor/call-args caller)
+                 uses (filterv #(identical? caller (:caller %)) builders)]
+             (when (and (= 1 (count uses))
+                        (= (count arguments) (count original-arguments))
+                        (every? true? (map identical? arguments original-arguments)))
+               (when-let [origin (construction-occurrence input caller)]
+                 (when-let [imported (body-import-view source-import walked-body)]
+                   (assoc event :caller-origin origin :callee-import imported)))))))))))

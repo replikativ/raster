@@ -66,6 +66,7 @@
             [raster.compiler.core.hoist :as hoist]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as value-completion]
+            [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.support.mangled :as mangled]
@@ -316,7 +317,8 @@
    Tags let/let* forms (recurse into bindings), par forms (from init/buffer),
    and loop forms. Does not descend into opaque calls."
   [expr env]
-  (cond
+  (let [constructed
+   (cond
     (not (seq? expr)) (inf/mask-unknown-local expr env)
     ;; let/let*: tag binding symbols + recurse into init exprs and body
     (form/binding-form? expr)
@@ -342,6 +344,7 @@
                                 (vary-meta assoc :raster.effect/effectful true))
                    new-env (assoc env sym (if object-storage?
                                            {:tag tag :physical-carrier Object} tag))]
+               (source-transport/observe-type-elaboration! sym tagged-sym env)
                [new-env (conj acc tagged-sym tagged-init)]))
            [env []]
            pairs)
@@ -357,7 +360,9 @@
       (if (and tag (not (:tag (meta expr))))
         (try (with-meta expr (assoc (or (meta expr) {}) :tag tag))
              (catch Exception _ expr))
-        expr))))
+        expr)))]
+    (source-transport/observe-type-elaboration! expr constructed env)
+    constructed))
 
 (defn- tag-binding-types
   "Walk a form and attach :tag metadata to binding symbols and expressions.

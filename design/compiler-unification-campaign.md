@@ -163,10 +163,11 @@ helper, region-copy traversal, and the no-op/quote-safe AD hoister (main did not
 yet have the draft's earlier hoister repair). Independent review of its actual
 six-file diff found no blocker or broad-only API dependency. Its exact 67 on-disk
 test declarations pass 368 assertions in the reused development process; fresh
-exact-head CI remains the merge gate. #1556's apparent status delay was verified
+all seven exact-head CI contexts then succeeded, and it squash-merged as
+`aa816699`. #1556's apparent status delay was verified
 through CircleCI's workflow API: setup/build succeeded and downstream jobs were
-queued, not absent from configuration. Both exact-head guarded monitors are
-active at this checkpoint; neither PR is recorded as merged or fully qualified.
+queued, not absent from configuration. Both exact-head guarded monitors have
+completed their merges; these focused receipts do not qualify the broad draft.
 
 ### October 21 shared operand outlining retains original method dependencies
 
@@ -257,6 +258,37 @@ is deliberately not inferred from the existence of a scalar evaluator. That
 construction-edge integration remains next; no fallback or new interpreter was
 introduced. Review also confirmed that rebased source IDs are not globally equal
 to retained binding ordinals, so no such new coordinate assumption was added.
+
+### October 21 actual source-construction history
+
+The equation-first pre-SOA phase now scopes one owner-local SourceTransport
+collector around the actual pipeline. Type elaboration records its actual
+input/output and lexical environment, without rerunning inference. Both shared
+inliner entrypoints pass their actual caller before recursive argument rewriting;
+the observer records the builder's argument/substitution/result construction,
+not a fictitious final AST interval.
+
+An unchanged real helper probe now joins normalization to its caller's actual
+type edge and exact imported callee. Identity-only queries reject copied outputs,
+ambiguous/fan-in/fan-out/cyclic construction chains, repeated caller expansions,
+changed or missing positional arguments, and stale caller/callee source inputs.
+The actual recursive path has both an unchanged-argument positive control and a
+rewritten-argument negative control. Self identity edges are omitted, and chain
+traversal is bounded; queries currently scan retained events, not an indexed cache.
+
+The history is passed directly to the prefix verifier and is not added to compiler
+options, AST metadata, target modules or portable compilation artifacts. The
+existing bounded prefix/metadata/order verifier remains unchanged after that
+phase identity check. An observer trace is trusted producer provenance, NOT
+standalone transformation authorization: before expanded intervals can execute,
+the consumer still owes independent bounded transformation laws, exact final
+placement, formal completion, result adaptation and original source executors.
+Incompatible tag provenance deliberately grants no width/completion permission.
+The original checked-helper overflow case still refuses before device allocation.
+Independent read-only review found no blocker in this provenance-only scope.
+The reused capped REPL passes 55 transport/inliner/construction tests (364
+assertions) and 136 source/ownership tests (1,579 assertions); these are focused
+gates, not fresh-process, whole-draft or performance qualification.
 
 ### October 21 original reduction count execution and outline hygiene
 

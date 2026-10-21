@@ -742,8 +742,11 @@
          walked (or (:walked-body normalized-input)
                     (pipeline/get-walked-body resolved-var (:dtype compiler-options)))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
-         represented-source (pipeline/run-passes
-                             source pipeline/gpu-resident-pre-soa-passes compiler-options)
+         source-construction
+         (source-transport/with-source-construction-history
+          (:source-normalization normalized-input)
+          #(pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes compiler-options))
+         represented-source (:form source-construction)
          representation (parameter-representation f-var (:dtype compiler-options))
          param-specs (:params representation)
          represented (soa-lower/soa-lower represented-source param-specs (:soa-env representation))
@@ -784,7 +787,8 @@
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))
          prefix-correspondence (source-prefix/close prefix-input (:source-normalization normalized-input)
-                                                    source represented-source semantic)
+                                                    source represented-source semantic
+                                                    (:source-construction source-construction))
          _ (source-prefix/prepare-selected-calls! prefix-correspondence retained-frontend semantic
                                                   rcore/ensure-current-owned-bytecode!)
          source-ns-symbol (source-namespace-symbol f-var)

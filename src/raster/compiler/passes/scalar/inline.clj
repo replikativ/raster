@@ -428,7 +428,8 @@
    A result binder requests the binding inliner's existing flat placement;
    otherwise retain the nested body's lexical scopes for recursive expansion.
    This construction is NOT a completion, correspondence or execution proof."
-  [{:keys [params tags walked-body source-import]} args source-env subst-fn result-sym]
+  [{:keys [params tags walked-body source-import] :as callee}
+   args source-env subst-fn result-sym caller]
   (when source-import
     (let [imported (source-transport/body-import-view source-import walked-body)]
       (when-not (and imported (= params (:parameters imported)) (= tags (:tags imported)))
@@ -438,7 +439,8 @@
         callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
         arguments (atom [])
         substitutions (argument-substitution callee-params args tags source-env
-                                            #(swap! arguments conj %))]
+                                            #(swap! arguments conj %))
+        expansion
     (if-not result-sym
       {:argument-bindings @arguments :body (subst-fn substitutions body-form)}
       (let [pairs (atom @arguments)
@@ -467,7 +469,9 @@
           (emit-tail! (mapv #(subst-fn substitutions %) (rest body-form)))
 
           :else (swap! pairs conj [result-sym (subst-fn substitutions body-form)]))
-        {:argument-bindings @arguments :bindings @pairs}))))
+        {:argument-bindings @arguments :bindings @pairs}))]
+    (source-transport/observe-builder-expansion! caller callee args source-env result-sym expansion)
+    expansion))
 
 ;; ================================================================
 ;; value+grad / grad inlining
@@ -1201,7 +1205,7 @@
                  ;; reports "No AD template for <callee>".) A deftm call with the wrong
                  ;; number of args is always a bug — say so, at the call.
                                  _ (check-inline-arity! head params args init)
-                                 expansion (build-inline-expansion deftm-info args @type-env subst-fn sym)]
+                                 expansion (build-inline-expansion deftm-info args @type-env subst-fn sym init)]
                              (swap! result-pairs into (:bindings expansion))
                              (reset! any-inlined? true)
             ;; Record the inlined function's return type so subsequent
@@ -1369,7 +1373,7 @@
                (util/make-invk impl-sym new-args (meta form)))
              ;; Simple body -- safe to inline
              (let [args (mapv #(inline-invk % policy) (drop 2 form))
-                   expansion (build-inline-expansion deftm-info args *param-env* subst-syms nil)
+                   expansion (build-inline-expansion deftm-info args *param-env* subst-syms nil form)
                    inlined (:body expansion)
                    ;; mark this callee as on the inline stack while re-processing its
                    ;; body, so a recursive self-call inside stays a call (terminates)

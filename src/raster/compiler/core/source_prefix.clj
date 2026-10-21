@@ -170,7 +170,14 @@
    Aggregate projection, inserted/removed/reordered prefix work, nested scopes
    and changed source metadata prevent construction. Existing plan validation
    separately owns logical result-materialization conversions."
-  [input normalization normalized represented program]
+  ([input normalization normalized represented program construction]
+   ;; Retain the ACTUAL source-phase boundary, not a replay or an options-carried history.
+   ;; Expanded helper intervals remain unsupported by the bounded verifier below; builder
+   ;; observations alone must not bypass its complete prefix/metadata/order checks.
+   (when (or (nil? construction)
+             (transport/source-construction-view construction normalization represented))
+     (close input normalization normalized represented program)))
+  ([input normalization normalized represented program]
   (when (and (instance? PrefixInput input)
              (flat-prefix (:source program))
              (nil? (get-in program [:attributes :invocation-plan :attributes :parameter-projection])))
@@ -218,7 +225,7 @@
                       :step step :result-expression final-expression})))
                (range) original represented-pairs)]
           (when (every? some? entries)
-            (PrefixCorrespondence. input program entries)))))))
+            (PrefixCorrespondence. input program entries))))))))
 
 (defn- owned-entries [correspondence frontend program]
   (when (and (instance? PrefixCorrespondence correspondence)
