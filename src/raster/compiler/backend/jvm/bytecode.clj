@@ -620,7 +620,7 @@
     (vector? form) (with-meta (mapv desugar-invk form) (meta form))
     :else form))
 
-(deftype ^:private ReductionInputOrigins [input-body emitted-body pairs])
+(deftype ^:private InputOrigins [input-body emitted-body families])
 
 (defn ^:no-doc retain-invocation-occurrences
   "Give each executable call occurrence an emission-local identity.
@@ -628,7 +628,7 @@
    catalog is private to the owning emission, not a source/cache identity or
    authority reconstructed by comparing expressions. Quoted values stay opaque."
   [body]
-  (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) origins (atom [])]
+  (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) origins (atom {})]
     (letfn [(visit [expression]
               (if (and (seq? expression)
                        (contains? #{'quote 'clojure.core/quote} (first expression)))
@@ -644,23 +644,25 @@
                     (let [token (Object.)
                           owned (vary-meta node assoc ::reduction-occurrence token)]
                       (swap! reductions assoc token owned)
-                      (swap! origins conj [expression owned])
+                      (swap! origins update :reduction (fnil conj []) [expression owned])
                       owned)
                     (form-ir/binding-form? node)
                     (let [token (Object.)
                           owned (vary-meta node assoc ::binding-scope-occurrence token)]
                       (swap! scopes assoc token owned)
+                      (swap! origins update :binding (fnil conj []) [expression owned])
                       owned)
                     (not (form-ir/call-form? node)) node
                     :else
                     (let [token (Object.)
                           owned (vary-meta node assoc ::call-occurrence token)]
                       (swap! catalog assoc token owned)
+                      (swap! origins update :invocation (fnil conj []) [expression owned])
                       owned)))))]
       (let [owned (with-meta (mapv visit body) {::body-occurrence (Object.)})]
         {:body owned :catalog @catalog :binding-catalog @scopes :reduction-catalog @reductions
-         :reduction-input-origins (when (seq @origins)
-                                    (ReductionInputOrigins. body owned @origins))}))))
+         :input-origins (when (seq @origins)
+                          (InputOrigins. body owned @origins))}))))
 
 (defn- retain-reduction-observation! [ctx role observation]
   (when (and me/*emission-inputs* (= role (::reduction-role ctx)))
@@ -781,21 +783,27 @@
           (assoc :root-result (:root-result bound))
           result-fact (assoc :result-fact result-fact))))))
 
+(defn- input-origin
+  "Producer-local identity relation, not a syntax matcher or physical proof."
+  [emission input-body original family]
+  (when-let [origins (:input-origins emission)]
+    (when (and (instance? InputOrigins origins)
+               (identical? input-body (.-input-body ^InputOrigins origins))
+               (identical? (:body emission) (.-emitted-body ^InputOrigins origins)))
+      (let [matches (filterv #(identical? original (first %))
+                             (get (.-families ^InputOrigins origins) family))]
+        (when (= 1 (count matches))
+          (second (first matches)))))))
+
 (defn ^:no-doc retained-input-reduction-emission
   "Follow a producer-retained input occurrence to its actual emitted reduction.
    Requires the EXACT emitter input body and a unique original object occurrence.
    This does not match equal source, cross AD/SIMD rewrites, or authenticate a
    frozen frontend by itself; its caller must retain that frontend's source owner."
   [emission input-body original]
-  (when-let [origins (:reduction-input-origins emission)]
-    (when (and (instance? ReductionInputOrigins origins)
-               (identical? input-body (.-input-body ^ReductionInputOrigins origins))
-               (identical? (:body emission) (.-emitted-body ^ReductionInputOrigins origins)))
-      (let [matches (filterv #(identical? original (first %))
-                             (.-pairs ^ReductionInputOrigins origins))]
-        (when (= 1 (count matches))
-          (when-let [observed (retained-reduction-emission emission (second (first matches)))]
-            (assoc observed :source-input original)))))))
+  (when-let [owned (input-origin emission input-body original :reduction)]
+    (when-let [observed (retained-reduction-emission emission owned)]
+      (assoc observed :source-input original))))
 
 (defn- retain-binding-context! [ctx binding-count index binder initializer before after]
   (when-let [token (::binding-scope-occurrence ctx)]
@@ -826,6 +834,14 @@
                (= (:binder record) (nth (second scope) (* 2 index))))
       (me/assert-emission-inputs-current! emission)
       record)))
+
+(defn ^:no-doc retained-input-binding-context
+  "Follow an exact emitter-input scope to its observed sequential binding.
+   The ordinal and physical context remain owned by retained-binding-context."
+  [emission input-body original index]
+  (when-let [owned (input-origin emission input-body original :binding)]
+    (when-let [observed (retained-binding-context emission owned index)]
+      (assoc observed :source-input original))))
 
 (defn ^:no-doc retained-body-context
   "Original parameter locals of this emission's actual whole numerical body."
@@ -1001,6 +1017,15 @@
    Copies, missing/cloned contexts and stale dependencies cannot establish it."
   [emission expression]
   (retained-call-observation emission expression :invocation-contexts))
+
+(defn ^:no-doc retained-input-invocation-context
+  "Follow an exact emitter-input call to its actual invocation observation.
+   Unlike retained-input-call-context, this follows a frontend origin, not a
+   nested emitted operand edge. Neither observer grants semantic admission."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [observed (retained-invocation-context emission owned)]
+      (assoc observed :source-input original))))
 
 (defn ^:no-doc retained-input-call-context
   "Follow an actual emitted input edge to its nested invocation context.

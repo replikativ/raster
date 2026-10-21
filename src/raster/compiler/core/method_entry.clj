@@ -735,13 +735,32 @@
                    :source-owner owner :implementation implementation
                    :emission emission} frontend)))))))
 
-(defn frontend-reduction-emission
-  "Observe an unchanged frozen frontend reduction through its actual emitter.
-   Source ownership, input occurrence identity and emitted completion are separate
-   proofs. Cold/legacy entries and transformed emitter inputs abstain; this query
-   never materializes bytecode or infers correspondence from equal expressions."
-  [frontend original]
-  (let [{:keys [emission implementation source-owner source-entry body definition]} frontend
+(declare original-source-frontend)
+
+(defn- assert-frontend-selection!
+  [frontend source-var]
+  (assert-frontend-source! frontend source-var)
+  (let [current (original-source-frontend source-var)
+        selected (:definition current)
+        claimed (:definition frontend)]
+    (when-not (and current
+                   (every? #(identical? (get frontend %) (get current %))
+                           [:source-frontend :source-owner :implementation :source-entry])
+                   (= (select-keys claimed [:operation :implementation-op :parameters :tags])
+                      (select-keys selected [:operation :implementation-op :parameters :tags]))
+                   (every? #(identical? (get claimed %) (get selected %))
+                           [:source-var :generic-var :receiver-var :entry]))
+      (throw (ex-info "frontend physical entry differs from its original producer"
+                      {:reason :retained-frontend-entry-mismatch})))
+    selected))
+
+(defn- frontend-emission
+  "Authenticate the whole historical emission before any occurrence query."
+  [frontend]
+  (let [{:keys [emission implementation source-owner source-entry]} frontend
+        _ (assert-frontend-source! frontend (:source-var source-entry))
+        definition (when *emission-inputs*
+                     (assert-frontend-selection! frontend (:source-var source-entry)))
         ;; The opaque origin relation seals bodies, not editable observation maps.
         ;; Reuse the ALREADY observed receiver metadata, never refresh it around
         ;; a caller-supplied emission or an older materialized implementation.
@@ -749,7 +768,6 @@
                      (get-in @*emission-inputs*
                              [:definition-proofs (:receiver-var definition)
                               :metadata :raster.core/bytecode-emission]))]
-    (assert-frontend-source! frontend (:source-var source-entry))
     (when (and emission (identical? emission historical)
                (identical? implementation (:implementation emission))
                (identical? source-owner (:frontend-source-owner emission))
@@ -758,11 +776,33 @@
       ;; instruction/occurrence consumers still owe its complete input history.
       (assert-emission-inputs-current! emission)
       (assert-definition-inputs-current! @*emission-inputs*)
-      (let [observed
-            ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-reduction-emission)
-             emission body original)]
-        (assert-definition-inputs-current! @*emission-inputs*)
-        observed))))
+      emission)))
+
+(defn- frontend-occurrence-observation [frontend original observer & arguments]
+  (when-let [emission (frontend-emission frontend)]
+    (let [observed (apply (requiring-resolve observer) emission (:body frontend) original arguments)]
+      (assert-definition-inputs-current! @*emission-inputs*)
+      observed)))
+
+(defn frontend-reduction-emission
+  "Observe an unchanged frozen frontend reduction through its actual emitter.
+   Cold/legacy entries and transformed inputs abstain without emission or source
+   matching. Physical completion is not permission to differentiate the region."
+  [frontend original]
+  (frontend-occurrence-observation frontend original
+    'raster.compiler.backend.jvm.bytecode/retained-input-reduction-emission))
+
+(defn frontend-invocation-context
+  "Actual invocation context of an unchanged original frontend occurrence."
+  [frontend original]
+  (frontend-occurrence-observation frontend original
+    'raster.compiler.backend.jvm.bytecode/retained-input-invocation-context))
+
+(defn frontend-binding-context
+  "Actual sequential binding context of an unchanged original frontend scope."
+  [frontend original index]
+  (frontend-occurrence-observation frontend original
+    'raster.compiler.backend.jvm.bytecode/retained-input-binding-context index))
 
 (defn original-source-frontend
   "Optional original frontend for an exact already-resolved deftm source Var.
@@ -852,21 +892,7 @@
    emits nor invokes code and requires the enclosing definition owner. Missing
    physical evidence abstains; contradictory or changed ownership throws."
   [frontend source-var]
-  (assert-frontend-source! frontend source-var)
-  (let [current (original-source-frontend source-var)
-        selected (:definition current)
-        claimed (:definition frontend)
-        selection-matches?
-        (and current
-             (every? #(identical? (get frontend %) (get current %))
-                     [:source-frontend :source-owner :implementation :source-entry])
-             (= (select-keys claimed [:operation :implementation-op :parameters :tags])
-                (select-keys selected [:operation :implementation-op :parameters :tags]))
-             (every? #(identical? (get claimed %) (get selected %))
-                     [:source-var :generic-var :receiver-var :entry]))]
-    (when-not selection-matches?
-      (throw (ex-info "frontend physical entry differs from its original producer"
-                      {:reason :retained-frontend-entry-mismatch})))
+  (let [selected (assert-frontend-selection! frontend source-var)]
     (let [physical (original-body-entry-carriers
                     (:operation selected) (:implementation-op selected)
                     (count (:parameters selected)) source-var)

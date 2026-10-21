@@ -112,6 +112,29 @@ negative controls. Do not rewrite helper bodies universally: AD/native consumers
 must not silently become warm-only or acquire unsupported reserved terms. This
 review identifies the next implementation boundary; it does not qualify execution.
 
+### October 21 shared frontend-to-emission origins
+
+One private input-origin owner now relates original calls, lexical binding scopes
+and reductions to their actual emitted occurrences. It seals the exact input and
+output bodies, keeps separate immutable identity pairs per family and refuses
+duplicate occurrences of the same original object. Equal-but-distinct forms stay
+distinct; quotes remain opaque. The reduction-only owner/key are retired, not
+retained as a second compatibility path. All three observers delegate to existing
+physical bytecode validators. The shared frontend boundary authenticates the
+original selection and whole historical emission; editable receiver/definition
+maps cannot supply another implementation's evidence. No query emits or executes
+code, reparses source, grants an unboxing or proves numerical admission.
+
+The origin gate passes 10 tests / 95 assertions in the bounded REPL, covering
+actual Object results despite Long hints, family isolation, exact body identity,
+clones, ambiguity, quotes, foreign selections, stale histories and cold queries.
+Independent implementation review found no blocker. A wider four-namespace run
+first reports one cold selected-host fixture error (`:unclosed-jvm-source-owner`);
+the isolated test and warm rerun pass, with the latter reporting 52 tests / 538
+assertions. That warm result does not qualify the initial cold failure, which
+remains under investigation. Original selected-call execution and unchanged
+training acceptance remain open; this is correspondence infrastructure only.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long
