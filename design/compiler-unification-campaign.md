@@ -68,15 +68,34 @@ projection metadata must still fail exact owner identity before evaluation.
 The final complete scalar-source namespace passes 14 tests / 102 assertions after
 adding that exact owner-identity control with a structurally valid projection.
 
-This is deliberately not a complete seal of eager preparation. The pre-existing
-ownerless reference subset remains unchanged, so removing the optional owner from
-an editable compilation cannot yet be distinguished from intentionally ownerless
-compilation. The next consolidation must introduce producer-owned eager evaluation
-authority for both modes, bound to exact semantic/emitted identities and historical
-inputs; mutable policy flags or fresh recompilation cannot authenticate an old
-artifact. Aggregate parameter projection also needs qualification at that boundary.
-Do not count this bounded reuse repair as closure of all eager ownership checks
-or of selected dimension helpers and the unchanged training workload.
+That reuse repair alone did not seal eager evaluator selection: removal of an
+optional owner could not distinguish an intentionally ownerless reference program
+from an edited artifact. The subsequent producer-owned eager authority now seals
+both existing evaluator families. It binds exact semantic/emitted identities,
+the original ordered owner (including nil), original namespace and collected
+definition history. The lowerer uses the sealed mode and namespace, not mutable
+policy or namespace metadata. Missing frontend provenance refuses at the producer;
+no invocation-time reconstruction or interpreter retry supplies a missing seal.
+
+The requirement is independently derived from validated sourceful host-evaluation
+obligations. Removing the seal, ordered owner and namespace together cannot opt
+out. Genuine source-free programs keep their separate contract; numerical-only
+artifacts do not acquire a process-local owner. Archival explicitly refuses a
+supplied eager owner instead of serializing or silently stripping it. The existing
+aggregate/reference family remains producer-authorized; this seals selection and
+history, not the still-unproved aggregate physical-entry/coercion correspondence.
+
+A fresh bounded REPL passes six complete flat/record/tree/device namespaces (55
+tests / 587 assertions), plus three focused numerical-only archival/source-free
+controls (23 assertions). Final ownerless-reference, foreign-source-free-owner
+and archival controls pass 3 tests / 25 assertions. Tamper cases cover removed or
+copied seals, removed ordered owner, changed/nil/removed namespace and fabricated
+projection metadata, before materialization. Removing a defrecord basis field
+correctly fails the compilation-type guard first. Independent review found no
+blocker. The complete archival namespace remains red on process-owner reconstruction
+and dependent persistent-evidence expectations; it is not qualified by the focused
+controls. Selected dimension helper execution, MSE consumers, prepared AD imports
+and unchanged training acceptance remain separate open obligations.
 
 ### October 21 primitive math completion
 

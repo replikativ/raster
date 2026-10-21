@@ -631,6 +631,11 @@
     (is (equation-first/equation-first-compilation? compilation))
     (is (= :double (:dtype compilation)))
     (is (nil? (:source-ns compilation)))
+    (is (nil? (:eager-source-owner compilation)))
+    (is (nil? (source-owner/assert-eager-evaluation! compilation)))
+    (is (= :eager-source-owner-mismatch
+           (reason #(source-owner/assert-eager-evaluation!
+                     (assoc compilation :eager-source-owner (Object.))))))
     (is (= :typed-parallel (get-in compilation [:semantic :dialect])))
     (is (= :scheduled-parallel (get-in compilation [:scheduled :dialect])))
     (is (seq (:kernels compilation)))

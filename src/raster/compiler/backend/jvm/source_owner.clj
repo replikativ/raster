@@ -398,6 +398,49 @@
   (when (or ordered-source-owner (ordered-source-required? semantic emitted))
     (assert-ordered-source! ordered-source-owner semantic emitted)))
 
+(deftype ^:private EagerEvaluationOwner
+  [program emission observations source-ns ordered-owner mode])
+
+(defn eager-evaluation-required?
+  "Derive sourceful host-evaluation authority independently of editable owner/namespace fields.
+   Numerical-only artifacts retain their existing portability. Genuine source-free plans
+   keep their separately validated invocation contract, not a reconstructed source owner."
+  [program emission]
+  (and (not (invocation/source-free-program? program))
+       (ordered-source-required? program emission)))
+
+(defn compile-eager-evaluation
+  "Seal the existing eager evaluator family at its original compiler producer.
+   This is dispatch/history authority, not new source/coercion correspondence for the
+   reference subset. Missing original frontend ownership cannot be refreshed at invocation."
+  [program emission source-var frontend ordered-owner]
+  (entry/assert-frontend-source! frontend source-var)
+  (let [{:keys [collector source-ns]} (original-source-context! source-var :unowned-eager-source)
+        _ (when ordered-owner (assert-ordered-source! ordered-owner program emission))
+        mode (if (and ordered-owner
+                      (nil? (get-in program [:attributes :invocation-plan :attributes :parameter-projection])))
+               :owned-flat :typed-reference)
+        observations @collector]
+    (source-history-current! source-ns observations :stale-eager-source-namespace)
+    (EagerEvaluationOwner. program emission observations source-ns ordered-owner mode)))
+
+(defn assert-eager-evaluation!
+  "Authenticate eager evaluator selection before source work. An absent, copied or altered
+   owner is never replaced by a reference fallback. Return the sealed mode and namespace;
+   this neither executes source nor grants completion, lifetime or physical-carrier facts."
+  [{:keys [eager-source-owner ordered-source-owner semantic emitted source-ns]}]
+  (when (or eager-source-owner (eager-evaluation-required? semantic emitted))
+    (when-not (and (instance? EagerEvaluationOwner eager-source-owner)
+                   (identical? semantic (.-program ^EagerEvaluationOwner eager-source-owner))
+                   (identical? emitted (.-emission ^EagerEvaluationOwner eager-source-owner))
+                   (identical? ordered-source-owner (.-ordered-owner ^EagerEvaluationOwner eager-source-owner))
+                   (= source-ns (ns-name (.-source-ns ^EagerEvaluationOwner eager-source-owner))))
+      (throw (ex-info "eager evaluation lacks its original producer authority"
+                      {:reason :eager-source-owner-mismatch})))
+    (let [^EagerEvaluationOwner owner eager-source-owner]
+      (source-history-current! (.-source-ns owner) (.-observations owner) :stale-eager-source-namespace)
+      {:mode (.-mode owner) :source-ns (.-source-ns owner)})))
+
 (defn evaluate-ordered-invocation-step
   "Execute one prepared original source occurrence without typed-region coercions.
    No lookup, compilation, nominal redispatch or expression retry occurs at invocation."

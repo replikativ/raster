@@ -141,6 +141,7 @@
     (fail! "terminal host regions require reconstruction of their process-local source owner"
            :equation-artifact-terminal-owner {}))
   (when (or (:ordered-source-owner compilation)
+            (:eager-source-owner compilation)
             (source-owner/ordered-source-required? (:semantic compilation) (:emitted compilation)))
     (fail! "ordered source regions require reconstruction of their process-local source owner"
            :equation-artifact-ordered-owner {}))

@@ -196,6 +196,30 @@
         (finally (reset-meta! source metadata))))
     (is (zero? @started))))
 
+(deftest eager-evaluator-authority-cannot-be-removed-copied-or-redirected
+  (let [compilation (equation-first/compile #'shadowed-dimension {:target :ocl:0 :dtype :double})
+        other (equation-first/compile #'shadowed-dimension {:target :ocl:0 :dtype :double})
+        started (atom 0)
+        forbidden (fn [& _] (swap! started inc) (throw (AssertionError. "unowned eager preparation ran source")))]
+    (is (some? (:eager-source-owner compilation)))
+    (with-redefs [materialization/materialize forbidden scalar/evaluate-invocation-step forbidden
+                  scalar/evaluate-host-equation forbidden owner/evaluate-ordered-invocation-step forbidden]
+      (doseq [[changed expected]
+              [[(dissoc compilation :eager-source-owner) :eager-source-owner-mismatch]
+               [(assoc compilation :eager-source-owner (:eager-source-owner other)) :eager-source-owner-mismatch]
+               [(dissoc compilation :ordered-source-owner) :eager-source-owner-mismatch]
+               [(assoc compilation :source-ns 'clojure.core) :eager-source-owner-mismatch]
+               [(assoc compilation :source-ns nil) :eager-source-owner-mismatch]
+               [(assoc (dissoc compilation :eager-source-owner :ordered-source-owner) :source-ns nil)
+                :eager-source-owner-mismatch]
+               ;; Removing a defrecord basis field already invalidates the
+               ;; compilation type; it cannot reach evaluator selection.
+               [(dissoc compilation :source-ns) :equation-first-compilation]
+               [(dissoc compilation :source-ns :eager-source-owner :ordered-source-owner)
+                :equation-first-compilation]]]
+        (is (= expected (reason #(equation-first/lower changed [1]))))))
+    (is (zero? @started))))
+
 (deftest prepared-steps-follow-invocation-identities-through-shadowed-bindings
   (let [expected (mapv #(vec (shadowed-dimension %)) [0 2 5])
         compilation (equation-first/compile #'shadowed-dimension {:target :ocl:0 :dtype :double})

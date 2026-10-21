@@ -4,6 +4,7 @@
             [raster.par :as par]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
@@ -109,6 +110,7 @@
         compilation (equation-first/compile source {:target :ocl:0 :dtype :double})
         sessions (atom 0)]
     (is (nil? (:ordered-source-owner compilation)))
+    (is (= :typed-reference (:mode (source-owner/assert-eager-evaluation! compilation))))
     (is (seq (invocation/source-host-actions
               (get-in compilation [:semantic :attributes :invocation-plan]) (:semantic compilation))))
     (is (empty? (invocation/ordered-host-actions
@@ -116,6 +118,8 @@
     (with-redefs [gpu/make-session (fn [& _] (swap! sessions inc)
                                    (throw (AssertionError. "compile/lower touched a device")))]
       (is (some? (link-plan/validate! (equation-first/lower compilation [1]))))
+      (is (= :eager-source-owner-mismatch
+             (reason #(equation-first/lower (dissoc compilation :eager-source-owner) [1]))))
       (is (= :ordered-source-owner-mismatch
              (reason #(link/instantiate-ordered-invocation! compilation [1] {})))))
     (is (zero? @sessions))))

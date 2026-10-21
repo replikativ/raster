@@ -412,6 +412,16 @@
              (reason-of #(artifact/seal identity candidate)))
           "dropping an owner cannot erase the independently derived source requirement"))))
 
+(deftest numerical-only-artifacts-do-not-acquire-an-eager-process-owner
+  (let [pure (equation-first/compile #'artifact-state! {:target target :dtype :float})
+        eager (:eager-source-owner @compilation)]
+    (is (nil? (:eager-source-owner pure)))
+    (is (some? eager))
+    (is (map? (artifact/seal identity pure)))
+    (is (= :equation-artifact-ordered-owner
+           (reason-of #(artifact/seal identity (assoc pure :eager-source-owner eager))))
+        "a process-local eager owner is explicitly refused, never silently serialized or dropped")))
+
 (deftest artifact-store-refusal-retains-bounded-diagnostics-not-source-objects
   (let [key {:kind ::refused-store-diagnostics
              :semantic-fingerprint "refused-store-diagnostics"

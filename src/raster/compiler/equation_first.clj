@@ -482,7 +482,11 @@
                                  (source-owner/ordered-source-required? semantic (:program emission)))
                         (source-owner/compile-ordered-source
                          semantic (:program emission) source-var retained-frontend
-                         (boolean (stage-result/requires-observation? (:program emission)))))]
+                         (boolean (stage-result/requires-observation? (:program emission)))))
+        eager-owner (when (and source-var
+                              (source-owner/eager-evaluation-required? semantic (:program emission)))
+                      (source-owner/compile-eager-evaluation
+                       semantic (:program emission) source-var retained-frontend ordered-owner))]
     (when-not invocation-plan
       (fail! :equation-first-invocation
              "equation-first semantic program has no retained public invocation plan"
@@ -503,6 +507,7 @@
       :emission (:stats emission)
       :fallback :none})
       terminal-owner (assoc :terminal-source-owner terminal-owner)
+      eager-owner (assoc :eager-source-owner eager-owner)
       ordered-owner (assoc :ordered-source-owner ordered-owner))))
 
 (def ^:private typed-compilation-options
@@ -811,12 +816,10 @@
                                    ordered-host-actions)}))
         _ (when (:ordered-source-owner compilation)
           (source-owner/assert-ordered-compilation-source! compilation))
+        eager-context (source-owner/assert-eager-evaluation! compilation)
+        source-ns (or (:source-ns eager-context) source-ns)
         owned-prefix
-        (when (and (:ordered-source-owner compilation)
-                   ;; Original aggregate entry ports do not authenticate the
-                   ;; flattened leaf carriers. Keep that existing reference
-                   ;; family until the projection owns this correspondence.
-                   (nil? (get-in invocation-plan [:attributes :parameter-projection])))
+        (when (= :owned-flat (:mode eager-context))
           (let [initial (invocation-link/begin-ordered-realization compilation arguments caller-options)]
             ;; Qualify the whole executor set before any scalar source work.
             ;; No missing executor may fall back after an earlier check ran.
@@ -875,6 +878,7 @@
                   evaluate-host project retained-validation caller-options))]
     (when (:ordered-source-owner compilation)
       (source-owner/assert-ordered-compilation-source! compilation))
+    (source-owner/assert-eager-evaluation! compilation)
     (when *lower-observer*
       (*lower-observer* {:materialization-ns materialization-ns
                          :link-plan-construction-ns
