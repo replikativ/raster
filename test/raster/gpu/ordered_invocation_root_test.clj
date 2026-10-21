@@ -11,6 +11,7 @@
             [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.program-memory-order-test :as dense-fixture]
             [raster.math :as math]
+            [raster.numeric :as numeric]
             [raster.par :as par]))
 
 (deftm source-zero-observed
@@ -49,6 +50,40 @@
 (deftm unused-captured-entry
   [x :- (Array double), unused :- (Array double), out :- (Array double)] :- (Array double)
   (par/map! out i 1 double (aget x i)))
+
+(deftm selected-prefix-allocation [n :- Long] :- (Array double)
+  (let [size (numeric/* n 2)
+        out (double-array size)]
+    (par/map! out i size double 1.0)))
+
+(defn- check-selected-prefix! [target]
+  (let [inputs [0 1 3]
+        expected (mapv #(vec (selected-prefix-allocation %)) inputs)
+        compilation (equation-first/compile #'selected-prefix-allocation {:target target :dtype :double})
+        evaluate source-owner/evaluate-ordered-invocation-step]
+    (doseq [[n values] (map vector inputs expected)]
+      (let [calls (atom 0)
+            executable (link/instantiate-ordered-invocation! compilation [n] {})]
+        (try
+          (with-redefs [source-owner/evaluate-ordered-invocation-step
+                        (fn [& arguments] (swap! calls inc) (apply evaluate arguments))]
+            (is (zero? @calls) "binding does not run the original scalar call")
+            (dotimes [replay 2]
+              (let [output (first (keys (link/run! executable)))]
+                (is (= values (vec (link/download executable output))))
+                (is (= (inc replay) @calls) "the source Method runs once per replay"))))
+          (finally (link/close! executable)))
+        (is (true? (:closed? @(:session executable))))))))
+
+(deftest opencl-original-selected-prefix-executes-once-per-replay
+  (if @ocl-probe/opencl-available?
+    (check-selected-prefix! :ocl:0)
+    (ocl-probe/opencl-skip! "original selected scalar prefix and replay")))
+
+(deftest level-zero-original-selected-prefix-executes-once-per-replay
+  (if @ze-probe/gpu-available?
+    (check-selected-prefix! :ze:0)
+    (ze-probe/gpu-skip! "original selected scalar prefix and replay")))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))

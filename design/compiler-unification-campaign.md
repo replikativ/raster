@@ -361,6 +361,45 @@ original argument order and returned reference, plus truthful Object/payload fac
 and caller/callee historical guards. Unknown inputs or missing correspondence
 continue to refuse; prepared-AD import closure remains a separate obligation.
 
+### October 21 original selected-call execution and constructor order
+
+The source owner now consumes that observation for the bounded direct-global
+Long-input/boxed-Long-result subset. It validates the original caller invocation
+and binding completion against the independently selected callee and its owned
+return bridge. Execution calls the captured actual interface Method, preserving
+argument order and the returned Object reference; the conditional Long payload
+does not relabel the physical result as primitive. Missing, stale or inconsistent
+observations, nested operands and unsupported carriers still refuse before any
+source computation. No new function/type registry or `compute_static` shortcut is
+introduced. This closes a real prefix executor, not the helper-expanded MSE or
+prepared-AD import obligations.
+
+Qualification exposed a distinct eager-lowering defect: a source array constructor
+can have no invocation-plan step, so iterating steps alone skipped its constructor
+count check. Pure specialization now walks retained source order and reuses the
+ordered runtime's count/shape validation. Negative counts fail before later scalar
+work. Wrapping constructor counts that cannot match retained mathematical extents
+refuse rather than producing an incorrect native shape. This creates no storage,
+acquisition acknowledgement, initialization or completion evidence. Used host or
+realized state is rejected, and terminal materialization cannot execute unconsumed
+scalar/shape computations after bypassing their source positions.
+
+Independent review found no remaining blocker in the executor or count repair.
+The reused-REPL prefix/shared ordered-runtime/materialization/source-order gate
+passes 53 tests / 490 assertions. A freshly started capped REPL then passes all
+eleven affected prefix, preparation, source-owner, native-alias and shared ordered
+runtime/materialization/source-order namespaces: 148 tests / 1,142 assertions.
+Both real local devices are available. The new OpenCL and Level Zero tests pass
+2 tests / 36 assertions: changed input sizes 0/1/3, two replays each, independent
+JVM outputs, zero source calls while binding, exactly one per replay and closed
+sessions. No device test was skipped. These bounded receipts do not qualify the
+broad draft's unrelated CI or unchanged-training refusals.
+
+PR #1551 (bounded apt acquisition retries, without softening failed prerequisites)
+is squash-merged as `4bb40cb1` after all seven exact-head CircleCI contexts passed.
+PR #1550 now includes that prerequisite at head `0c0af56f`; its new CI run must be
+qualified independently of the old head's six successes and pre-test HTTP failure.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long

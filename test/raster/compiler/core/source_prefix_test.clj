@@ -5,8 +5,12 @@
             [raster.par :as par]
             [raster.compiler.core.source-prefix :as prefix]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.backend.jvm.source-owner :as owner]
+            [raster.compiler.backend.jvm.terminal-source :as projection]
             [raster.compiler.equation-first :as equation]
-            [raster.compiler.ir.invocation-plan :as invocation]))
+            [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.gpu.core :as gpu]))
 
 (deftm selected-prefix [n :- Long] :- (Array double)
   (let [size (numeric/* n 2)
@@ -22,6 +26,12 @@
   (let [size (numeric/* (long n) 2)
         out (double-array size)]
     (par/map! out i size double 1.0)))
+
+(deftm allocation-before-selected [n :- Long] :- (Array double)
+  (let [early (double-array n)
+        size (numeric/* n 2)
+        out (double-array size)]
+    (par/map! out i size double (aget early 0))))
 
 (defn- source-with-bindings [source bindings]
   (with-meta (list* (first source) bindings (nnext source)) (meta source)))
@@ -64,11 +74,7 @@
     (is (nil? (prefix/original-step correspondence frontend program (into {} step))))
     (is (nil? (prefix/original-step correspondence frontend (assoc program :copied true) step)))
     (is (nil? (prefix/original-step correspondence (into {} frontend) program step)))
-    (let [failure (try (equation/lower compilation [1]) nil
-                       (catch clojure.lang.ExceptionInfo error (ex-data error)))]
-      (is (= :unclosed-ordered-source-executor (:reason failure)))
-      (is (= (select-keys original [:ordinal :binding :expression]) (:original-source failure)))
-      (is (identical? (:expression original) (get-in failure [:original-source :expression]))))))
+    (is (= [[2]] (mapv #(get-in % [:view :shape]) (vals (:nodes (equation/lower compilation [1]))))))))
 
 (deftest history-and-original-frontend-identity-remain-required
   (let [{:keys [frontend inputs correspondence]} (capture #'selected-prefix)
@@ -147,9 +153,7 @@
         (is (= Object (:return-carrier (entry/frontend-invocation-context frontend (:expression original)))))
         (is (= :ref (get-in (entry/frontend-binding-context frontend (:scope original) (:ordinal original))
                            [:after :type])))))
-    (is (= :unclosed-ordered-source-executor
-           (try (equation/lower compilation [1]) nil
-                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+    (is (map? (equation/lower compilation [1])))))
 
 (deftest unsupported-and-foreign-prefixes-perform-no-preparation
   (let [prepared (atom [])
@@ -166,7 +170,155 @@
                                        [correspondence frontend program]]]
         (is (nil? (prefix/prepare-selected-calls! owner source semantic #(swap! prepared conj %)))))
       (is (empty? (:definition-proofs @entry/*emission-inputs*)))
-      (is (empty? @prepared)))))
+      (is (empty? @prepared)))
+    (let [compilation (:compilation (capture #'nested-input-prefix))
+          failure (try (equation/lower compilation [1]) nil
+                       (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+      (is (= :unclosed-ordered-source-executor (:reason failure)))
+      (is (= '.invk (first (get-in failure [:original-source :expression])))))))
+
+(defn- outcome [run]
+  (try (let [value (run)] [:value (class value) value])
+       (catch Exception failure [:error (class failure)])))
+
+(deftest original-selected-execution-preserves-overflow-and-changed-inputs
+  (let [{:keys [compilation]} (capture #'selected-prefix)
+        step (first (filter invocation/scalar-compute?
+                            (get-in compilation [:semantic :attributes :invocation-plan :steps])))
+        execute #(get (owner/evaluate-ordered-invocation-step compilation step
+                                                             {'n {:type :long :value %}}) :value)]
+    (doseq [n [0 -3 1 63 64 1000 Long/MAX_VALUE Long/MIN_VALUE]]
+      (is (= (outcome #(Math/multiplyExact (long n) (long 2)))
+             (outcome #(numeric/* n 2)) (outcome #(execute n)))))
+    (doseq [n [0 1 3]]
+      (is (= [[(* 2 n)]]
+             (mapv #(get-in % [:view :shape]) (vals (:nodes (equation/lower compilation [n])))))))
+    (doseq [value [nil 1.0 (int 1)]]
+      (is (= :ordered-scalar-source-arguments
+             (try (execute value) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+    (let [source #'numeric/_star__m_long_long metadata (meta source)]
+      (try
+        (alter-meta! source assoc ::changed-helper true)
+        (is (= :stale-definition-proof-input
+               (try (execute 1) nil
+                    (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+        (finally (reset-meta! source metadata))))))
+
+(deftest eager-source-counts-run-in-source-order-without-native-evidence
+  (let [compilation (:compilation (capture #'selected-prefix))
+        before-allocation (:compilation (capture #'allocation-before-selected))
+        execute owner/evaluate-ordered-invocation-step
+        calls (atom 0)
+        forbidden (fn [& _] (throw (AssertionError. "pure specialization acquired native evidence")))]
+    (with-redefs [gpu/make-session forbidden gpu/alloc! forbidden gpu/zero-buffer! forbidden
+                  invocation-link/prepare-source-allocation forbidden
+                  owner/evaluate-ordered-invocation-step
+                  (fn [& args] (swap! calls inc) (apply execute args))]
+      (doseq [n [-1 (long Integer/MAX_VALUE) Long/MAX_VALUE]]
+        (is (= (outcome #(alength (selected-prefix n)))
+               (outcome #(equation/lower compilation [n])))))
+      (doseq [n [2147483648 2147483649]]
+        (is (= (- (* 2 n) 4294967296) (alength (double-array (* 2 n)))))
+        (is (= :invocation-ordered-allocation-shape
+               (try (equation/lower compilation [n]) nil
+                    (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+      (reset! calls 0)
+      ;; The first constructor fails before the otherwise-overflowing multiply.
+      (is (= [:error NegativeArraySizeException]
+             (outcome #(equation/lower before-allocation [Long/MAX_VALUE]))))
+      (is (zero? @calls))
+      (is (= (outcome #(alength (allocation-before-selected Long/MAX_VALUE)))
+             (outcome #(equation/lower before-allocation [Long/MAX_VALUE]))))
+      (is (zero? @calls))
+      (is (map? (equation/lower before-allocation [1])))
+      (is (= 1 @calls) "successful prefix computes the selected source call once"))))
+
+(deftest eager-source-prefix-rejects-used-state-and-unconsumed-computations
+  (let [compilation (:compilation (capture #'selected-prefix))
+        initial (invocation-link/begin-ordered-realization compilation [1] nil)
+        calls (atom 0)
+        forbidden (fn [& _] (swap! calls inc)
+                    (throw (AssertionError. "invalid prefix executed source work")))
+        failure (fn [state]
+                  (try (invocation-link/materialize-owned-source-prefix state forbidden forbidden nil)
+                       nil
+                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (doseq [changed [(assoc initial :host-scalars {'foreign {:type :long :value 1}})
+                     (assoc initial :host-steps {:foreign {}})
+                     (assoc-in initial [:realized :buffers] {'foreign :storage})
+                     (assoc-in initial [:realized :storage] {:foreign {}})
+                     (assoc-in initial [:realized :loop-scratch] {:foreign {}})
+                     (assoc initial :pending {:kind :source-allocation})
+                     (assoc initial :acquired-storage #{:foreign})
+                     (assoc initial :source-cursor 1)
+                     (assoc-in initial [:materialization :next-step] 1)]]
+      (is (= :invocation-eager-source-start (failure changed))))
+    ;; Removing the source entries must not turn the terminal materializer into
+    ;; a second route that executes skipped source computations out of order.
+    (is (= :invocation-eager-source-unconsumed (failure (assoc initial :source-order []))))
+    (is (zero? @calls))))
+
+(deftest resolved-projector-preserves-the-returned-reference
+  ;; Isolate backend mechanics with an interface-compatible instrumented target.
+  ;; This deliberately substituted bridge is NOT a frontend authority: the
+  ;; compiler's original-owner checks reject foreign implementations below.
+  (let [{:keys [frontend]} (capture #'selected-prefix)
+        source (nth (second (first (:body frontend))) 1)
+        source-ns (get-in frontend [:source-entry :source-ns])
+        returned (Long. (long 1000)) calls (atom 0)]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [callee (entry/original-source-frontend #'numeric/_star__m_long_long)
+             bridge (entry/frontend-return-bridge callee)
+             method (:invocation-method bridge)
+             interface (.getDeclaringClass ^java.lang.reflect.Method method)
+             target (java.lang.reflect.Proxy/newProxyInstance
+                     (.getClassLoader interface) (into-array Class [interface])
+                     (reify java.lang.reflect.InvocationHandler
+                       (invoke [_ _ actual arguments]
+                         (is (= method actual))
+                         (is (= [5 2] (vec arguments)))
+                         (swap! calls inc)
+                         returned)))
+             projected (projection/project-original-invocation
+                        source [{:symbol 'n :carrier Long/TYPE}] source-ns
+                        {:unchecked-math false} (assoc bridge :implementation target))
+             execute (owner/compile-function
+                      (:params projected) (:source projected) (fn [params body] (list 'fn* params body))
+                      (merge projected {:source-policy {:unchecked-math false} :source-ns source-ns}))]
+         (is (= {:carrier Object :boxed-carrier Long :non-null? true} (:result-facts projected)))
+         (is (identical? returned (execute [5])))
+         (is (= 1 @calls))
+         (is (not-any? #(and (symbol? %) (= "compute_static" (name %)))
+                       (tree-seq coll? seq (:source projected)))))))))
+
+(deftest original-selected-executor-refuses-wrong-physical-completions
+  (let [call entry/frontend-invocation-context binding-context entry/frontend-binding-context
+        bridge entry/frontend-return-bridge
+        changes
+        [{#'entry/frontend-invocation-context #(some-> (call %1 %2) (assoc :return-carrier Long/TYPE))}
+         {#'entry/frontend-invocation-context #(some-> (call %1 %2) (assoc :invocation-mode :primitive-indy))}
+         {#'entry/frontend-invocation-context #(some-> (call %1 %2) (assoc-in [:inputs 0 :ports 'n :type] :ref))}
+         {#'entry/frontend-invocation-context #(some-> (call %1 %2) (assoc-in [:inputs 0 :context :object-result?] true))}
+         {#'entry/frontend-invocation-context #(some-> (call %1 %2) (assoc-in [:receiver-input :context :object-result?] true))}
+         {#'entry/frontend-invocation-context #(some-> (call %1 %2)
+                                                     (assoc :method (.getMethod clojure.lang.IFn "invoke"
+                                                                              (into-array Class [Object Object]))))}
+         {#'entry/frontend-binding-context #(some-> (binding-context %1 %2 %3) (assoc-in [:after :type] :long))}
+         {#'entry/frontend-binding-context #(some-> (binding-context %1 %2 %3) (assoc :initializer '(foreign n 2)))}
+         {#'entry/frontend-return-bridge #(some-> (bridge %) (assoc :implementation (Object.)))}
+         {#'entry/frontend-return-bridge #(some-> (bridge %) (assoc :payload-carrier Double/TYPE))}
+         {#'entry/frontend-return-bridge #(some-> (bridge %) (assoc :invocation-method nil))}]]
+    ;; Deliberately corrupt internal observations to test the consumer's
+    ;; completion checks. Public queries separately reject forged module maps.
+    (doseq [change changes]
+      (with-redefs-fn change
+        (fn []
+          (let [compilation (:compilation (capture #'selected-prefix))]
+            (is (= :unclosed-ordered-source-executor
+                   (try (equation/lower compilation [1]) nil
+                        (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))))))
 
 (deftest alpha-transport-checks-order-capture-literal-bits-and-declarations
   ;; Isolate the bounded transformation verifier; public tests above exercise

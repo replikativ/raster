@@ -789,10 +789,9 @@
         host-step (update :host-scalars merge (:results host-step))
         host-step (assoc-in [:host-steps (:id equation)] host-step)))))
 
-(defn ^:no-doc prepare-source-allocation
-  "Prepare the exact next source allocation, not an unspecified numerical result buffer.
-   evaluate-size is the trusted typed host evaluator returning the source value and its actual
-   constructor count. Acquisition and zero initialization must complete before cursor advance."
+(defn- source-allocation-request
+  "Validate source constructor count/shape only. No allocation, initialization,
+   acquisition acknowledgement, pending action or cursor advancement is produced."
   [state evaluate-size caller-options]
   (when-not (= caller-options (:caller-options state))
     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
@@ -854,35 +853,109 @@
           (fail! :invocation-ordered-allocation-shape
                  "retained storage differs from the evaluated source constructor count"
                  {:shape shape :constructor-count elements :destination destination}))
-        (let [step (when-let [id (:invocation-step entry)]
-                     (let [next-step (nth (get-in materialization [:plan :steps])
-                                          (:next-step materialization) nil)]
-                       (when-not (and (= id (:id next-step))
-                                      (invocation/buffer-allocation? next-step))
-                         (fail! :invocation-ordered-allocation-step
-                                "source allocation differs from the next invocation step" {:entry entry}))
-                       next-step))
-              materialization (if step (materialization/materialize-next materialization nil)
-                                  materialization)
-              [realized token]
-              (if step
-                (let [buffer (get-in materialization [:values (:id step)])
-                      token (:id buffer)]
-                  [(-> (:realized state)
-                       (assoc-in [:buffers destination] token)
-                       (add-storage token destination abstract shape nil :zero)) token])
-                (allocate-result (:realized state) (get-in materialization [:plan :id])
-                                 destination abstract scalars :result))
-              _ (when (contains? (:acquired-storage state) token)
-                  (fail! :invocation-ordered-allocation-acquired
-                         "source allocation is already acquired in this invocation" {:storage token}))
-              realized (assoc-in realized [:storage token :initialization] :zero)
-              layout (storage-link-layout realized scalars (:target state) #{token} [token])]
-          {:state (assoc state :realized realized :materialization materialization
-                               :pending {:kind :source-allocation :storage token
-                                         :source-cursor (:source-cursor state)})
-           :nodes (:nodes layout) :values (:values layout)
-           :storage token :initialization :zero :elements elements})))))
+        {:entry entry :destination destination :abstract abstract :materialization materialization
+         :scalars scalars :shape shape :elements elements}))))
+
+(defn- materialize-source-allocation [{:keys [entry materialization]}]
+  (let [step (when-let [id (:invocation-step entry)]
+               (let [next-step (nth (get-in materialization [:plan :steps])
+                                    (:next-step materialization) nil)]
+                 (when-not (and (= id (:id next-step))
+                                (invocation/buffer-allocation? next-step))
+                   (fail! :invocation-ordered-allocation-step
+                          "source allocation differs from the next invocation step" {:entry entry}))
+                 next-step))]
+    {:step step :materialization (if step (materialization/materialize-next materialization nil)
+                                    materialization)}))
+
+(defn ^:no-doc prepare-source-allocation
+  "Prepare the exact next source allocation, not an unspecified numerical result buffer.
+   evaluate-size is the trusted typed host evaluator returning the source value and its actual
+   constructor count. Acquisition and zero initialization must complete before cursor advance."
+  [state evaluate-size caller-options]
+  (let [{:keys [entry destination abstract scalars shape elements] :as request}
+        (source-allocation-request state evaluate-size caller-options)
+        {:keys [step materialization]} (materialize-source-allocation request)
+        [realized token]
+        (if step
+          (let [buffer (get-in materialization [:values (:id step)])
+                token (:id buffer)]
+            [(-> (:realized state)
+                 (assoc-in [:buffers destination] token)
+                 (add-storage token destination abstract shape nil :zero)) token])
+          (allocate-result (:realized state) (get-in materialization [:plan :id])
+                           destination abstract scalars :result))
+        _ (when (contains? (:acquired-storage state) token)
+            (fail! :invocation-ordered-allocation-acquired
+                   "source allocation is already acquired in this invocation" {:storage token}))
+        realized (assoc-in realized [:storage token :initialization] :zero)
+        layout (storage-link-layout realized scalars (:target state) #{token} [token])]
+    {:state (assoc state :realized realized :materialization materialization
+                         :pending {:kind :source-allocation :storage token
+                                   :source-cursor (:source-cursor state)})
+     :nodes (:nodes layout) :values (:values layout)
+     :storage token :initialization :zero :elements elements}))
+
+(defn ^:no-doc materialize-owned-source-prefix
+  "Pure eager counterpart of ordered source-prefix execution.
+   Walk source order, not just invocation steps: a constructor may have no step.
+   Scalar work runs once; each source count is checked before later scalar work.
+   The returned materialization grants NO acquired/initialized/native-root facts.
+   Late host actions remain ordered-runtime obligations, never hoisted here."
+  [initial evaluate-step evaluate-size caller-options]
+  (let [plan (get-in initial [:materialization :plan])]
+    (when-not (= caller-options (:caller-options initial))
+      (fail! :invocation-ordered-request "eager specialization cannot change its caller math request" {}))
+    (when (or (seq (:acquired-storage initial)) (:pending initial)
+              (seq (:host-scalars initial)) (seq (:host-steps initial))
+              (some seq (map (:realized initial) [:buffers :storage :loop-scratch]))
+              (not= 0 (:source-cursor initial))
+              (not= 0 (get-in initial [:materialization :next-step])))
+      (fail! :invocation-eager-source-start "eager source specialization requires a fresh prefix" {}))
+    (when (seq (invocation/ordered-host-actions plan (:program initial)))
+      (fail! :ordered-source-execution-required "late host work cannot be eagerly specialized" {}))
+    (loop [state initial]
+      (let [entry (nth (:source-order state) (:source-cursor state) nil)
+            equation (when (:equation entry)
+                       (some #(when (= (:equation entry) (:id %)) %) (get-in state [:program :equations])))
+            action (get (:source-realizations state) (:source-cursor state))
+            step (when (:invocation-step entry)
+                   (nth (:steps plan) (get-in state [:materialization :next-step]) nil))]
+        (cond
+          (or (nil? entry) (and equation (not (true? (get-in equation [:attributes :host-only])))))
+          (let [_ (when (some #(or (invocation/scalar-compute? %)
+                                  (invocation/shape-projection? %))
+                              (drop (get-in state [:materialization :next-step]) (:steps plan)))
+                    (fail! :invocation-eager-source-unconsumed
+                           "source computations must execute at their retained source positions" {}))
+                finished (loop [materialization (:materialization state)]
+                           (if (= (:next-step materialization) (count (:steps plan)))
+                             materialization
+                             (recur (materialization/materialize-next materialization evaluate-step))))]
+            (materialization/finish-materialization finished))
+
+          (or (:storage entry) (= :result-allocation (:kind action)))
+          (let [request (source-allocation-request state evaluate-size caller-options)
+                materialized (materialize-source-allocation request)]
+            (recur (-> state (assoc :materialization (:materialization materialized))
+                       (update :source-cursor inc))))
+
+          (or (and step (or (invocation/scalar-compute? step) (invocation/shape-projection? step))) equation)
+          (recur (advance-host-source state evaluate-step nil caller-options))
+
+          (= :storage-alias (:kind action))
+          (let [materialized (if (:invocation-step entry)
+                               (do
+                                 (when-not (and (= (:invocation-step entry) (:id step))
+                                                (invocation/value-alias? step))
+                                   (fail! :invocation-eager-source-alias "source alias differs from the next step" {}))
+                                 (materialization/materialize-next (:materialization state) nil))
+                               (:materialization state))]
+            (recur (-> state (assoc :materialization materialized) (update :source-cursor inc))))
+
+          :else
+          (fail! :invocation-eager-source-entry "source prefix has no closed specialization action"
+                 {:entry entry}))))))
 
 (defn ^:no-doc advance-source-alias
   "Bind one validated source alias to already acquired storage. This neither acquires storage

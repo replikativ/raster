@@ -844,9 +844,13 @@
                         source-ns (partial scalar/evaluate-invocation-step source-ns)
                         :else unsupported-host-evaluation)
         materialized
-        (materialization/materialize
-         invocation-plan (vec arguments)
-         evaluate-step)
+        (if owned-prefix
+          (invocation-link/materialize-owned-source-prefix
+           owned-prefix evaluate-step
+           (fn [extent scalars]
+             (scalar/evaluate-array-size source-ns (update-vals scalars :value) extent))
+           caller-options)
+          (materialization/materialize invocation-plan (vec arguments) evaluate-step))
         materialization-ns (- (System/nanoTime) started)
         buffer-shapes (into {} (map (fn [[id buffer]] [id (:shape buffer)]))
                             (:program-buffers materialized))

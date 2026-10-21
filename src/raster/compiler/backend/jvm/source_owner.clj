@@ -259,13 +259,24 @@
              (when direct? (intrinsic-source/observe-original! source-ns 'clojure.core/alength))
              {:carrier Long/TYPE :presence :present})))))))
 
-(defn- prepare-scalar-step [step facts source-ns policy collector]
+(defn- compile-scalar-projection [step expression ports projection source-ns policy collector]
+  (let [execute (compile-function
+                 (:params projection) (:source projection)
+                 (fn [params body] (list 'fn* params body))
+                 (merge projection {:source-policy policy :source-ns source-ns
+                                    :guard #(entry/assert-definition-inputs-current! @collector)}))]
+    {:step step :expression expression :ports ports :execute execute
+     :result-facts (:result-facts projection)}))
+
+(defn- scalar-ports [step facts]
+  (mapv (fn [{:keys [symbol value]}]
+          (when-let [fact (get facts value)] (assoc fact :symbol symbol))) (:operands step)))
+
+(defn- prepare-primitive-scalar-step [step facts source-ns policy collector]
   (entry/call-with-optional-definition-inputs
    (fn []
      (let [{:keys [parameters locals body-results]} (soac/lambda-parts (:region step))
-           ports (mapv (fn [{:keys [symbol value]}]
-                         (when-let [fact (get facts value)]
-                           (assoc fact :symbol symbol))) (:operands step))]
+           ports (scalar-ports step facts)]
        (when (and (empty? locals) (= 1 (count body-results))
                   (= parameters (mapv :symbol ports)) (every? some? ports))
          (let [expression (first body-results)
@@ -280,13 +291,76 @@
            ;; This is a result ABI comparison, not an inference of source facts.
            ;; Keep coercions inside the source executable; never repair a mismatch.
            (when (and projection (= expected actual) (.isPrimitive ^Class actual))
-             (let [execute (compile-function
-                            (:params projection) (:source projection)
-                            (fn [params body] (list 'fn* params body))
-                            (merge projection {:source-policy policy :source-ns source-ns
-                                               :guard #(entry/assert-definition-inputs-current! @collector)}))]
-               {:step step :expression expression :ports ports :execute execute
-                :result-facts (:result-facts projection)}))))))))
+             (compile-scalar-projection step expression ports projection source-ns policy collector))))))))
+
+(defn- prepare-original-invocation-step
+  [step facts source-ns policy collector frontend program prefix-correspondence]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [scope ordinal binding expression result-expression]}
+                (source-prefix/original-step prefix-correspondence frontend program step)]
+       (let [{:keys [parameters locals body-results]} (soac/lambda-parts (:region step))
+             ports (scalar-ports step facts)
+             public (set (get-in frontend [:source-entry :params]))
+             {:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+             (descriptor/call-description expression)]
+         (when (and (= {:unchecked-math false} policy)
+                    (empty? locals) (= 1 (count body-results))
+                    (= parameters (mapv :symbol ports)) (every? some? ports)
+                    (every? #(and (contains? public (:symbol %)) (= Long/TYPE (:carrier %))) ports)
+                    dispatch? (not lexical-callee)
+                    (every? #(or (instance? Long %)
+                                 (and (symbol? %) (contains? (set parameters) %))) arguments)
+                    (= :long (dtype/canon (get-in step [:value :dtype])))
+                    ;; Prefix correspondence and plan validation already relate
+                    ;; this independently owned ABI materialization to the exact
+                    ;; step. It is not an original binding-level unboxing.
+                    (seq? result-expression) (= 2 (count result-expression))
+                    (= 'clojure.core/long (first result-expression)))
+           (let [call (entry/frontend-invocation-context frontend expression)
+                 bound (entry/frontend-binding-context frontend scope ordinal)
+                 selected (entry/selected-parameter-carriers semantic-op implementation-op (count arguments))
+                 callee (when selected (entry/original-source-frontend (get-in selected [:definition :source-var])))
+                 bridge (when callee (entry/frontend-return-bridge callee))
+                 method (:method call)
+                 expected-context (completion/bytecode-operand-context {:preserve-source-call-results? true})]
+             (when (and (= :global-typed-indy (:invocation-mode call))
+                        (= Object (:return-carrier call))
+                        (= implementation-op (:receiver call))
+                        (= binding (:binder bound)) (= :ref (get-in bound [:after :type]))
+                        (= Object (get-in bound [:after :reference-class]))
+                        (identical? (:initializer bound) (:expression call))
+                        (= arguments (mapv :operand (:inputs call)))
+                        (= (count arguments) (count (:inputs call)))
+                        (every? true?
+                                (map (fn [argument input]
+                                       (and (= expected-context (:context input))
+                                            (if (instance? Long argument)
+                                              (empty? (:ports input))
+                                              (and (= #{argument} (set (keys (:ports input))))
+                                                   (= :long (get-in input [:ports argument :type]))
+                                                   (= (get-in bound [:before argument])
+                                                      (get-in input [:ports argument]))))))
+                                     arguments (:inputs call)))
+                        (= implementation-op (get-in call [:receiver-input :operand]))
+                        (empty? (get-in call [:receiver-input :ports]))
+                        (= expected-context (get-in call [:receiver-input :context]))
+                        (instance? Method method)
+                        (= method (:invocation-method selected) (:invocation-method bridge))
+                        (= Object (:result-carrier selected) (:result-carrier bridge))
+                        (= Long/TYPE (:payload-carrier bridge))
+                        (every? #(= Long/TYPE %) (:parameter-carriers selected))
+                        (identical? (get-in selected [:definition :entry :typed-impl])
+                                    (:implementation callee))
+                        (identical? (:implementation callee) (:implementation bridge)))
+               (let [projection (terminal-source/project-original-invocation
+                                 expression ports source-ns policy bridge)]
+                 (compile-scalar-projection step expression ports projection source-ns policy collector))))))))))
+
+(defn- prepared-result-fact [prepared]
+  (let [{:keys [carrier boxed-carrier non-null?]} (:result-facts prepared)]
+    (cond-> {:carrier carrier :presence (if non-null? :present :unknown)}
+      (and non-null? boxed-carrier) (assoc :builtin-class boxed-carrier))))
 
 (defn- prepare-scalar-steps [program frontend source-var source-ns policy collector prefix-correspondence]
   (let [plan (get-in program [:attributes :invocation-plan])
@@ -299,11 +373,12 @@
         (fn [{:keys [facts] :as state} step]
           (cond
             (invocation/scalar-compute? step)
-            (if-let [prepared (prepare-scalar-step step facts source-ns policy collector)]
+            (if-let [prepared (or (prepare-primitive-scalar-step step facts source-ns policy collector)
+                                 (prepare-original-invocation-step step facts source-ns policy collector
+                                                                   frontend program prefix-correspondence))]
               (-> state
                   (assoc-in [:steps (:id step)] prepared)
-                  (assoc-in [:facts (:id step)]
-                            {:carrier (get-in prepared [:result-facts :carrier]) :presence :present}))
+                  (assoc-in [:facts (:id step)] (prepared-result-fact prepared)))
               state)
             (invocation/value-alias? step)
             (assoc-in state [:facts (:id step)] (get facts (:source step)))

@@ -30,8 +30,8 @@
 (core/deftm typed-unchecked-narrow [n :- Long] :- Long
   (long (clojure.core/unchecked-int n)))
 
-(core/deftm selected-prefix-dimension [n :- Long] :- (Array double)
-  (let [size (numeric/* n 2)
+(core/deftm unsupported-selected-prefix-dimension [n :- Long] :- (Array double)
+  (let [size (numeric/* (long n) 2)
         out (double-array size)]
     (par/map! out i size double 1.0)))
 
@@ -160,7 +160,7 @@
       (is (= 2 (count (distinct @calls)))))))
 
 (deftest eager-owned-prefix-preflights-all-executors-before-materialization
-  (let [compilation (equation-first/compile #'selected-prefix-dimension {:target :ocl:0 :dtype :double})
+  (let [compilation (equation-first/compile #'unsupported-selected-prefix-dimension {:target :ocl:0 :dtype :double})
         started (atom 0)]
     (is (some? (:ordered-source-owner compilation)))
     (with-redefs [materialization/materialize
