@@ -8,6 +8,41 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### October 21 DeepSeek inference reference integration
+
+Read-only research verified the official [DeepInfer](https://github.com/deepseek-ai/DeepInfer)
+release and its exact dependency pins. Shallow sibling checkouts, without models,
+builds or submodule initialization, are available for reproducible source study:
+
+| Sibling directory | Inspected commit |
+|---|---|
+| `DeepInfer-raster-review` | `9bd9cf243fc53ef9afbf8f04d391d989117d6ab9` |
+| `DeepGEMM-raster-review` | `1fc9c66975ee322d628b3288534ca0e9ce12a64d` |
+| `FlashMLA-raster-review` | `2e5429fc5653bab6e081f09477126f731882a6a9` |
+| `DeepEP-raster-review` | `f6aa38fe06cd4a0489e7730365d4e0114970a2f3` |
+
+These observations are requirements evidence, not benchmark or execution results.
+The pretrained comparison used checkout `f4c2bb476884c36b5e12a8fa934eb2ddf4ca2ead`
+with existing decoder/local-server edits; neither it nor Raster's shared root was
+modified. It is not a qualification of current released pretrained behavior.
+
+| Requirement / evidence | Existing campaign integration and bounded acceptance |
+|---|---|
+| Encoded values **and auxiliary scales** have physical layouts, group axes and conversion semantics. DeepInfer `layers/tilelang_ops/cache_common.py::KVCacheFormat` and DeepGEMM `csrc/jit_kernels/heuristics/config.hpp::GemmDesc` keep these concerns explicit. | Items 2/3/4/8: generic byte-storage codecs and views, explicit decode/compute/accumulation and rounding contracts. First compare tiny encoded matvecs with decode→Float contraction, including tails and scale edge cases. Do not implement FP4 as merely a new fractional-byte scalar dtype or add model-specific emitters. |
+| Same-shaped inputs can invalidate inspected-content-dependent schedules. Pinned [FlashMLA's interface](https://github.com/deepseek-ai/FlashMLA/blob/2e5429fc5653bab6e081f09477126f731882a6a9/flash_mla/flash_mla_interface.py#L90) warns that changing valid-length values while reusing scheduler metadata silently retains stale split-KV scheduling. | Items 1/3/4/7/8, immediate correctness priority: distinguish replay inputs from specialized assumptions; retain content/version dependencies and completion-fenced metadata generations through existing owners/events. Test changed lengths with unchanged shapes, stale slots and failure/cancellation across two inflight iterations. Do not add a second attention-specific artifact cache. |
+| Sparse selection, ragged histories and expert routing compose several numerical operations. DeepInfer `attention_backend.py`, `models/v4_modules/mlp.py` and pinned grouped-GEMM paths provide concrete cases. | Items 2/3/4/5: qualify existing segmented gather/selection/weighted-reduction and histogram/scan/permute/grouped-contraction/combine composition. Start with empty and skewed groups, duplicate policies and masked invalid values against sequential oracles. Compression rollback remains a model-state contract, not automatic compiler algebra. |
+| Bulk matrix pipelines require phase/transaction and result-readiness contracts, beyond an async-copy spelling. DeepGEMM's SM100 implementation uses payload/scale streams, transaction barriers, rings and special storage. | Items 1/3/4/6/7: qualify existing `PipelinedFor`, async-copy/commit/wait, participation barriers, collectives and `MatrixMad` first; report native versus synchronous physical lowering. Later add only workload-backed bulk-copy, async-matrix, special-storage and cluster capabilities. An async-shaped IR or compiling instruction does not prove overlap or speed. |
+| Communication consumes compute and memory resources as well as link bandwidth. DeepEP routing handles/events and DeepInfer dispatch/combine SM budgets are concrete evidence. | Items 6/7: segmented exchange/all-to-all-v intent with counts, permutations, replication and combine arithmetic; shared compute/HBM/fabric capacity and completion ownership. Add hardware-free skew/contention/cleanup counterexamples now; real NVLink/RDMA and measured overlap belong to multi-device qualification. |
+| Regime-specific specialization includes scale layout, group skew, valid lengths and replay buckets, not merely dense matrix sizes. | Items 1/3/4/5: reuse existing finite schedules, numerical permissions and versioned measurement receipts. Bound search/compile/code-size/memory costs and measure cold preparation, host submission, GPU events and warm replay separately. No independent DeepSeek autotuner or keyword dispatch. |
+
+The release is useful inference implementation evidence, not a complete production
+cache/load-balancing/disaggregation stack. These requirements strengthen the same
+eight obligations; they do not add a ninth campaign or close source correspondence,
+real-weight training, durable publication or actual multi-host acceptance. The
+immediate continuation remains the local source/semantic ownership repair, then
+content-aware prepared replay and encoded/ragged composition qualification. No
+SM100, Ascend, model download or cloud dependency enters the hot development loop.
+
 ### October 21 ordered host-integral qualification
 
 Late checked integral computations may now remain opaque ordered host actions
@@ -144,6 +179,27 @@ The same gate order in a fresh 900 MiB REPL then passes the origin namespace
 (10 tests / 95 assertions) and all four physical-observation namespaces (52 tests /
 539 assertions). No production guard is weakened or extra warm-up lookup added.
 The existing ordered-source namespace separately passes 15 tests / 112 assertions.
+
+The next reviewed implementation boundary is one producer-owned flat-prefix
+correspondence transaction at `equation-first/compile`, spanning the authenticated
+frontend, source normalization, pre-SOA passes and constructed invocation steps.
+Validate the complete bounded evaluated prefix under explicit capture-avoiding
+renaming, including operand order, preceding initializers and metadata obligations;
+then bind exact original scope/ordinal/call and exact constructed `ScalarCompute`
+objects. Normalized binding IDs or matching printed expressions alone cannot
+authenticate an original bytecode context. Initially transformed/helper-expanded
+prefixes and aggregate parameter projections abstain. This is a plan, not an
+implemented admission or proof of arbitrary compiler rewrites.
+
+The actual small selected-product probe demonstrates two distinct obligations:
+the original initializer is an Object-returning `invk`; the normalized scalar
+region additionally carries `invocation-source/scalar-equation-source`'s explicit
+Long result-materialization conversion. `scalar-result` and all pre-SOA passes
+retain the original product computation in this probe; do not blame them for
+inventing a widening or collapse the result ABI conversion into original source.
+An unchanged training recheck still refuses forward `local-loss` at the missing
+ordered executor and `local-gradient-sum` at direct semantic coverage. Neither
+workload is qualified by the ownership and physical-observation gates above.
 
 ### October 21 primitive boxing-edge correspondence
 
