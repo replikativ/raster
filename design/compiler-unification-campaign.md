@@ -29,6 +29,12 @@ assertions in one bounded REPL, including Long checked overflow and unchanged FP
 invocation, binding and input-completion controls. This independent foundation
 does not qualify the separate source-ownership draft or its training workload.
 
+PR #1549's first CI head passed setup, build, unit tests and both vendor compiler
+gates. The OpenCL gate did not qualify: one shard failed installing dependencies
+because the git-core Ubuntu PPA returned HTTP 503. That is infrastructure evidence,
+not an OpenCL pass or a compiler regression. A new exact-head qualification is
+required before merge; successful contexts on the earlier head are not reused.
+
 ### October 21 primitive math completion
 
 Eight audited primitive FP math rows (sqrt, floor, sin, cos, tan, exp, log and
