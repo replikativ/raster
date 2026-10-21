@@ -843,19 +843,39 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
+(defn- method-local-callee-candidate?
+  "Conservative denial for operands whose original method-local callees are
+   not retained by the input outliner. Match the emitter's actual lookup keys;
+   this is not a function registry, dispatch proof or purity analysis."
+  [expression ctx]
+  (cond
+    (and (seq? expression) (contains? #{'quote 'clojure.core/quote} (first expression))) false
+    (completion/canonical-parts expression)
+    (method-local-callee-candidate? (:operand (completion/canonical-parts expression)) ctx)
+    :else
+    (boolean
+     (or (and (seq? expression) (symbol? (first expression))
+              (or (contains? (:typed-sibling-methods ctx) (name (first expression)))
+                  (contains? (:sibling-methods ctx) (str (first expression)))))
+         (and (coll? expression)
+              (some #(method-local-callee-candidate? % ctx) expression))))))
+
+(defn- physical-operand-input
+  "Describe an operand using its actual lexical ports and retained context."
+  [operand locals ctx]
+  (let [visible (set (keys locals))
+        free (binding [util/*shadowing-locals* visible]
+               (util/free-syms operand))]
+    {:operand operand :context (completion/bytecode-operand-context ctx)
+     :unretained-sibling-calls? (method-local-callee-candidate? operand ctx)
+     ;; A logical hint does not prove a reference nonnull or an exact payload.
+     :ports (select-keys locals (filter visible free))}))
+
 (defn- retain-invocation-context!
   [method receiver arguments mode return-carrier locals ctx]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
-      (let [visible (set (keys locals))
-            input (fn [operand]
-                    (let [free (binding [util/*shadowing-locals* visible]
-                                 (util/free-syms operand))]
-                      {:operand operand
-                       :context (completion/bytecode-operand-context ctx)
-                       ;; :type is the ACTUAL local stack category. :hint is
-                       ;; retained for compilation, never a nonnull/Class proof.
-                       :ports (select-keys locals (filter visible free))}))
+      (let [input #(physical-operand-input % locals ctx)
             guarded? (= mode :guarded-local-typed-interface)
             record (cond-> {:status (if guarded? :unsupported :known)
                     :method method :receiver receiver :expression (::call-expression ctx)
@@ -2287,13 +2307,10 @@
 (defn- retain-array-read! [ctx array index index-type result-type locals proof]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
-      (let [free (binding [util/*shadowing-locals* (set (keys locals))]
-                   (util/free-syms index))
-            record {:status :known :expression (::call-expression ctx)
+      (let [record {:status :known :expression (::call-expression ctx)
                     :array array :array-local (get locals array)
                     :result-type result-type
-                    :input {:operand index :type index-type :ports (select-keys locals free)
-                            :context (completion/bytecode-operand-context ctx)}
+                    :input (assoc (physical-operand-input index locals ctx) :type index-type)
                     :primitive-index? (and (contains? #{:int :long} index-type) (empty? (:open proof)))
                     :index-routes (:routes proof)
                     :element-type (:element-type ctx)}]
@@ -2307,18 +2324,15 @@
 
 (defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals proof]
   (when me/*emission-inputs*
-    (let [free (binding [util/*shadowing-locals* (set (keys locals))]
-                 (util/free-syms count-source))]
-      (retain-call-observation!
+    (retain-call-observation!
        ctx :array-allocation-contexts
        {:status :known :array-class array-class :fresh? true :initialization :jvm-zero
         :element-type (:element-type ctx)
         :primitive-count? (and (contains? #{:int :long} count-type) (empty? (:open proof)))
         :count-routes (:routes proof)
-        :count {:operand count-source :input-type count-type :completed-type :int
-                :completion :raw-jvm-int
-                :ports (select-keys locals free)
-                :context (completion/bytecode-operand-context ctx)}} nil))))
+        :count (assoc (physical-operand-input count-source locals ctx)
+                      :input-type count-type :completed-type :int
+                      :completion :raw-jvm-int)} nil)))
 
 (defn ^:no-doc retained-zero-array-allocation
   "Actual fresh, zero-filled newarray operation, with its original count input.
@@ -5866,6 +5880,15 @@
   "Shared physical ABI, guarded compilation and invocation for owned operands.
    The caller owns the operand occurrence and its exact completion recipe."
   [emission input carrier spec-options guard]
+    ;; Historical source guards authenticate the ORIGINAL class, not recompiling
+    ;; its operands without its same-class method environment. Never silently
+    ;; rebind an original sibling call to an unchanged same-named global.
+    (when-not (boolean? (:unretained-sibling-calls? input))
+      (throw (ex-info "Input outlining lacks original method dependency closure"
+                      {:reason :unowned-bytecode-input-dependencies})))
+    (when (:unretained-sibling-calls? input)
+      (throw (ex-info "Input outlining needs the original method-local callees"
+                      {:reason :unsupported-bytecode-input-callees})))
     (let [ports (:ports input)
           parameters (mapv key (sort-by (comp :slot val) ports))
           physical-parameters
