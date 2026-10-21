@@ -205,6 +205,25 @@ Broad CI at `2bfcda0e` reports 148/172 public fixtures passing and 24 failures
 (job 33424), versus the earlier 146/172. Vendor compilation and the other red
 unit/OpenCL gates remain unqualified; no failing fixture was skipped.
 
+### October 21 retain actual reference call-input completion
+
+The same owned input outliner now supports an actual recorded CHECKCAST. It
+restores the original operand context, verifies its emitted reference carrier,
+and uses the typed method return to perform the original reference check. The
+outlined method must resolve the identical target Class, not a matching name or
+declared dtype. Null and successful reference identity are preserved; wrong array
+and object classes fail after the original operand effects, even when the callee
+does not use that formal. Complete positional evidence and historical guards
+remain required. No floating AD contract is granted to the reference input.
+
+The six affected lineage/outlining/AD namespaces pass 73 tests / 1,055 assertions,
+including stale, copied and guarded-evidence controls. Independent review found
+no blocker. This closes another prerequisite for ordered helper arguments, not
+the helper expansion itself: callee bindings, allocation and return still need
+their own source correspondence. Broad draft CI at `e93adb6f` remains red in
+test, public source emission and OpenCL; no merge or RMS runtime qualification
+is claimed.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast

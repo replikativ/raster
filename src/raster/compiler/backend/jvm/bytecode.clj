@@ -6145,7 +6145,7 @@
                    value))}))
 
 (defn ^:no-doc compile-invocation-input-region
-  "Outline one original completed FP or Int/Long input using its bytecode emitter.
+  "Outline one original FP, Int/Long or CHECKCAST input using its bytecode emitter.
    Physical ports and historical guards are preserved; this is not portable
    source, a derivative rule or permission to flatten the region."
   [emission original input-index]
@@ -6177,7 +6177,9 @@
           carrier (nth carriers input-index)
           completed (nth completions input-index)
           integral? (contains? #{Integer/TYPE Long/TYPE} carrier)
-          contract (when-not integral?
+          checked-reference? (= :checkcast (:adaptation completed))
+          raw-completion? (or integral? checked-reference?)
+          contract (when-not raw-completion?
                      (completion/bytecode-floating-input-contract carrier (:context input)))
           guard (fn []
                   (when-not (identical? record (retained-invocation-context emission original))
@@ -6185,11 +6187,14 @@
                                     {:reason :unowned-bytecode-input-region}))))]
       (assoc (compile-owned-input-region
               emission input carrier
-              (if integral?
+              (if raw-completion?
                 ;; The original operand first produces its observed JVM carrier.
                 ;; The method return then uses the SAME emit-coerce as the call
-                ;; input. In particular this is not a checked source int/long cast.
-                {:return-tag (if (= carrier Long/TYPE) 'long 'int)
+                ;; input, or the same CHECKCAST for a typed reference return.
+                ;; The returned Method must retain the exact original Class.
+                ;; In particular this is not a checked source int/long cast.
+                {:return-tag (if checked-reference? carrier
+                                (if (= carrier Long/TYPE) 'long 'int))
                  :walked-body [(:operand input)] :element-type (:element-type record)
                  ::body-input-context (:context input)
                  ::expected-body-type (:emitted-type completed)}

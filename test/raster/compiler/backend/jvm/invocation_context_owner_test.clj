@@ -63,13 +63,20 @@
           :checked-int [#'int-input-template '[long] '(clojure.core/int value)]
           :object-long [#'long-input-template '[Object] 'value]
           :ordered-object-long [#'long-input-template '[Object Object]
-                                '(do (swap! events conj :operand) value)])
-        params (if (= 2 (count tags)) '[value events] '[value])
+                                '(do (swap! events conj :operand) value)]
+          :reference [#'unused-input-call '[double Object] 'value]
+          :ordered-reference [#'unused-input-call '[double Object Object]
+                              '(do (swap! events conj :operand) value)])
+        reference? (contains? #{:reference :ordered-reference} variant)
+        params (if reference?
+                 (if (= 3 (count tags)) '[scalar value events] '[scalar value])
+                 (if (= 2 (count tags)) '[value events] '[value]))
         source (core/resolve-deftm-var template)
         walked (core/ensure-walked-body! source)
         call (first (filter #(and (seq? %) (= '.invk (first %))) (tree-seq coll? seq walked)))
         _ (assert call "fixture needs a walker-selected typed helper call")
-        body (with-meta (list (first call) (second call) operand) (meta call))
+        body (with-meta (list* (first call) (second call)
+                              (if reference? ['scalar operand] [operand])) (meta call))
         interface (types/ensure-fn-interface! tags)
         emitted (:emission
                  (#'core/emit-owned-bytecode!
@@ -84,6 +91,35 @@
 
 (defn- input-outcome [f & arguments]
   (try [:value (apply f arguments)] (catch Throwable error [:error (class error)])))
+
+(deftest reference-outlining-retains-checkcast-class-null-and-identity
+  (let [{:keys [emission call]} (integral-input-owner :reference)
+        region (bytecode/compile-invocation-input-region emission call 1)
+        ^java.lang.reflect.Method original-method
+        (:method (bytecode/retained-invocation-context emission call))
+        expected-class (aget (.getParameterTypes original-method) 1)
+        original (:implementation emission)]
+    (is (identical? expected-class (.getReturnType ^java.lang.reflect.Method (:method region))))
+    (is (= :ref (get-in region [:input-completion :emitted-type])))
+    (is (= :checkcast (get-in region [:input-completion :adaptation])))
+    (is (nil? (:input-contract region)) "reference checking grants no floating AD contract")
+    (doseq [value [nil (double-array [1.0 2.0]) (double-array 0) (float-array 1) "wrong" (Object.)]]
+      (let [expected (input-outcome original 3.0 value)
+            actual (input-outcome (:invoke region) value)]
+        (if (= :error (first expected))
+          (is (= expected actual))
+          (do (is (= [:value 7] expected) "the unused formal is still checked")
+              (is (identical? value (second actual))))))))
+  (let [{:keys [emission call]} (integral-input-owner :ordered-reference)
+        region (bytecode/compile-invocation-input-region emission call 1)]
+    (doseq [value [nil (double-array 0) "wrong"]]
+      (let [a (atom []) b (atom [])
+            expected (input-outcome (:implementation emission) 3.0 value a)
+            actual (input-outcome (:invoke region) value b)]
+        (is (= [:operand] @a @b))
+        (if (= :error (first expected))
+          (is (= expected actual))
+          (is (identical? value (second actual))))))))
 
 (deftest integral-outlining-keeps-raw-narrowing-distinct-from-checked-source-casts
   (doseq [[source adaptation] [[:long-int :coerce] [:checked-int :identity]]]
