@@ -83,6 +83,18 @@ validation. Their exact reasons were updated without accepting alternatives or
 removing malformed cases. Review confirmed the earlier refusals; both full test
 namespaces pass 23 tests / 182 assertions. Production validation is unchanged.
 
+Fresh qualification at `fe439ca4` still fails unit, OpenCL and fixture emission;
+setup/build success does not qualify the draft. The public clone fixture exposes
+an independent generated-storage mismatch: clone normalization invented a generic
+`alloc-like` call with no selected implementation. Generated copy scaffolding now
+uses the existing dtype authority's concrete primitive constructor, retaining the
+source length evaluation, fresh allocation and identity map. The allocation
+validator is unchanged. The affected frontend, public compile/link and actual
+OpenCL/Level Zero clone gates pass 140 tests / 876 assertions, including primitive
+widths, empty/changed inputs and null failure ordering. Packed-half scalar copying
+remains refused. This closes that allocation mismatch, not the checked-exponential
+overflow-boundary proof or the remaining broad qualification failures.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification
