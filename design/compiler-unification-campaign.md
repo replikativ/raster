@@ -776,6 +776,42 @@ builder, consume them in source-prefix call intervals, and prepare only closed
 original argument outlines. Missing callee/allocation/return obligations still
 refuse. The broad draft and the original eight completion gates remain open.
 
+### October 21 checked nested helper substitution
+
+The shared builder now retains indexed formal/actual/binder slots for authenticated
+nested imports only; ordinary ownerless expansion does not allocate this evidence.
+The construction query is factored into exact recorded builder return + imported
+body, with the existing root-origin/unchanged-argument query retaining its stricter
+requirements. A separate inliner query independently validates each recorded nested
+frame's substitution law: exact positional argument identity (including repeats),
+ordered once-only lifted initializers, unique noncapturing binders, and replay of
+the shared scope-aware substitution over the exact imported body. Significant
+metadata and floating bits participate; quoted products retain identity. An arbitrary
+builder callback cannot validate itself. No function-name or model registry is added.
+
+Independent review found malformed false-valued binders could hide an unused failing
+argument, and wrong-shaped results could throw during comparison. Both now abstain
+under explicit shape checks, with regressions for unused checked overflow, repeated
+arguments, missing/reordered evaluation, capture, shadowing, quoted products, copied
+imports/outputs and faulty callbacks. Complete composed queries use optional-owner
+transactions, so a later refusal cannot publish partial imported dependencies.
+Identity assertions cover the unchanged parent history on refused root and nested
+relations. The three affected source-transport/inliner/construction namespaces pass
+60 tests / 413 assertions in the reused capped REPL.
+
+The unchanged production `local-loss` source supplies authentic nested `linear-nb`
+and MSE frames that pass this law, even though MSE's rewritten numerical argument
+does not satisfy the separate root-only caller relation. The two `oftype` frames
+still abstain: their unlifted `(float 1.0)` / `(float 0.0)` arguments use bare cast
+names, for which the shared SOURCE constant evaluator supplies no resolution proof.
+Canonical constant folding is not substituted for that missing source evidence.
+
+These are local substitution facts, not executable-call certificates. Original
+argument/formal completion, selected callee correspondence, resident prediction
+length projection, return adaptation, and exact final expanded interval remain
+separate obligations. Flat placement remains unqualified. No source execution or
+training admission is broadened; draft CI and all eight campaign gates remain open.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast

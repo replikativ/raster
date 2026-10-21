@@ -16,6 +16,7 @@
             [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.par :as par]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.core :as rcore]
@@ -178,7 +179,7 @@
 
 (defn- argument-substitution
   "Build a call-by-value substitution, emitting argument bindings in source order."
-  [params args tags source-env emit! & [force-bindings?]]
+  [params args tags source-env emit! & [force-bindings? observe-slot!]]
   (into {}
         (map-indexed
          (fn [i p]
@@ -196,8 +197,11 @@
                                        (cond-> (meta a)
                                          source-tag (assoc :raster.type/tag source-tag))))]
                  (emit! [id a])
+                 (when observe-slot! (observe-slot! {:ordinal i :formal p :argument a :binder id}))
                  [p id])
-               [p a])))
+               (do
+                 (when observe-slot! (observe-slot! {:ordinal i :formal p :argument a}))
+                 [p a]))))
          params)))
 
 (defn ^:no-doc prepare-call-arguments
@@ -423,6 +427,90 @@
   ;; the scope-aware subst-syms which handles scoping correctly.
   (subst-syms (merge devirt->dispatch smap) expr))
 
+(defn- substitution-products-preserved? [expected actual]
+  ;; Substitution cannot rebuild a quoted reference-valued product. Fingerprints
+  ;; alone compare its contents, not this source identity obligation. General map
+  ;; and set reconstruction is deliberately outside this bounded source relation.
+  (cond
+    (identical? expected actual) true
+    (and (seq? expected) (#{'quote 'clojure.core/quote} (first expected))) false
+    (or (seq? expected) (vector? expected))
+    (and (if (seq? expected) (seq? actual) (vector? actual))
+         (= (count expected) (count actual))
+         (every? true? (map substitution-products-preserved? expected actual)))
+    (coll? expected) false
+    :else true))
+
+(defn ^:no-doc nested-expansion-substitution-view
+  "Independently check a nested shared-builder substitution against its exact import.
+   Slots are positional, including repeated and unused arguments. This checks only
+   the substitution law: no call selection, conversions, final placement or execution
+   permission follows. Flat placement and unsupported comparisons abstain."
+  [{:keys [source-import walked-body params tags]} arguments expansion]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+  (when (and (vector? arguments) (map? expansion) (vector? (:argument-slots expansion))
+             (every? #(and (map? %) (or (nil? (:binder %)) (symbol? (:binder %))))
+                     (:argument-slots expansion))
+             (vector? (:argument-bindings expansion))
+             (every? #(and (vector? %) (= 2 (count %))) (:argument-bindings expansion)))
+   (when-let [imported (source-transport/body-import-view source-import walked-body)]
+    (when (and (identical? params (:parameters imported)) (identical? tags (:tags imported)))
+    (let [parameters (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
+          slots (:argument-slots expansion)
+          bindings (:argument-bindings expansion)
+          body (first (source-transport/effective-body walked-body))
+          ;; No generated argument binder may capture any name in an initializer
+          ;; or imported body, even a bound name. This is stricter than free-vars.
+          names (into (set parameters)
+                      (filter symbol?)
+                      (tree-seq coll? seq (cons body arguments)))
+          lifted (filterv #(some? (:binder %)) slots)
+          binders (mapv :binder lifted)]
+      (when (and (contains? expansion :body) (not (contains? expansion :bindings))
+                 (= (count parameters) (count arguments) (count slots))
+                 (= (count bindings) (count lifted))
+                 (= (count binders) (count (set binders)))
+                 (every? #(and (symbol? %) (nil? (namespace %)) (not (contains? names %))) binders)
+                 (every? true?
+                         (map-indexed
+                          (fn [i {:keys [ordinal formal argument binder]}]
+                            (and (= ordinal i) (= formal (nth parameters i))
+                                 (identical? argument (nth arguments i))
+                                 (or (some? binder) (not (coll? argument))
+                                     (some? (constant/source-value argument))))) slots))
+                 (every? true?
+                         (map (fn [[id init] slot]
+                                (and (identical? id (:binder slot))
+                                     (identical? init (:argument slot)))) bindings lifted)))
+        (let [substitutions (into {} (map (fn [{:keys [formal argument binder]}]
+                                            [formal (or binder argument)]) slots))
+              expected (subst-syms substitutions body)
+              equivalent? (try (and (substitution-products-preserved? expected (:body expansion))
+                                    (fingerprint/equivalent? expected (:body expansion)))
+                               (catch clojure.lang.ExceptionInfo error
+                                 (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
+                                   false
+                                   (throw error))))]
+          (when equivalent?
+            {:callee-import imported :argument-slots slots
+             :argument-bindings bindings :substitutions substitutions
+             :body (:body expansion)}))))))))))
+
+(defn ^:no-doc nested-builder-substitution-view
+  "Check a recorded nested frame's local substitution without equating its caller
+   or rewritten arguments to root source. No conversion/placement/execution grant."
+  [construction expansion]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [source-import walked-body arguments callee-import] :as event}
+                (source-transport/builder-construction-view construction expansion)]
+       (when-let [law (nested-expansion-substitution-view
+                      {:source-import source-import :walked-body walked-body
+                       :params (:parameters callee-import) :tags (:tags callee-import)}
+                      arguments expansion)]
+         {:builder event :substitution law})))))
+
 (defn- build-inline-expansion
   "Construct argument bindings and the substituted callee in one place.
    A result binder requests the binding inliner's existing flat placement;
@@ -438,11 +526,14 @@
   (let [body-form (first (source-transport/effective-body walked-body))
         callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
         arguments (atom [])
+        slots (when source-import (atom []))
         substitutions (argument-substitution callee-params args tags source-env
-                                            #(swap! arguments conj %))
+                                            #(swap! arguments conj %) false
+                                            (when slots #(swap! slots conj %)))
         expansion
     (if-not result-sym
-      {:argument-bindings @arguments :body (subst-fn substitutions body-form)}
+      (cond-> {:argument-bindings @arguments :body (subst-fn substitutions body-form)}
+        slots (assoc :argument-slots @slots))
       (let [pairs (atom @arguments)
             emit-tail! (fn [expressions]
                          (doseq [effect (butlast expressions)]

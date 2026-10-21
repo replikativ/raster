@@ -1,5 +1,6 @@
 (ns raster.compiler.core.source-construction-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.walk :as walk]
             [raster.core :refer [deftm]]
             [raster.par :as par]
             [raster.compiler.core.method-entry :as entry]
@@ -8,6 +9,7 @@
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.core.util :as util]
             [raster.compiler.equation-first :as equation]
+            [raster.compiler.fixtures.distributed-training :as training]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.pipeline :as pipeline]))
 
@@ -48,6 +50,120 @@
   (let [size (fixture/literal-count (fixture/literal-count n))
         out (double-array size)]
     (par/map! out i size double 1.0)))
+
+(deftm substitution-helper [unused :- Long x :- Long y :- Long] :- Long
+  (let [value (+ x y)] value))
+
+(deftm shadowed-substitution-helper [x :- Long] :- Long
+  (let [quoted '(x) x (+ x 1)] x))
+
+(deftest nested-substitution-law-is-positional-and-independent-of-the-builder-callback
+  (substitution-helper 0 2 3)
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [callee (#'inline/try-resolve-walked-body #'substitution-helper_m_long_long_long)
+           argument '(clojure.core/long value)
+           arguments ['(clojure.core/int 4294967296) argument argument]
+           build @#'inline/build-inline-expansion
+           expansion (build callee arguments {} inline/subst-syms nil '(helper))
+           check #(inline/nested-expansion-substitution-view callee arguments %)
+           slots (:argument-slots expansion)]
+       (is (some? (check expansion)))
+       (is (= [0 1 2] (mapv :ordinal slots)))
+       (is (= 3 (count (:argument-bindings expansion))))
+       (is (identical? argument (:argument (nth slots 1))))
+       (is (identical? argument (:argument (nth slots 2))))
+       (is (not= (:binder (nth slots 1)) (:binder (nth slots 2))))
+       (doseq [changed [(assoc expansion :argument-slots (vec (reverse slots)))
+                        (assoc expansion :argument-slots (pop slots))
+                        (assoc-in expansion [:argument-slots 2 :binder] (:binder (nth slots 1)))
+                        (assoc expansion :argument-bindings (vec (reverse (:argument-bindings expansion))))
+                        (assoc expansion :argument-bindings (pop (:argument-bindings expansion)))
+                        (assoc expansion :argument-bindings [0])
+                        (assoc expansion :argument-bindings nil)
+                        (assoc expansion :argument-slots [0])
+                        (assoc expansion :argument-slots :invalid)
+                        (assoc expansion :argument-slots
+                               (mapv #(assoc % :binder false) slots) :argument-bindings [])
+                        (assoc-in expansion [:argument-slots 0 :binder] 'value)
+                        (assoc expansion :body 0)
+                        (assoc expansion :body [])
+                        (assoc expansion :body (vary-meta (:body expansion) assoc :tag 'float))
+                        (assoc expansion :bindings [])]]
+         (is (nil? (check changed))))
+       (is (nil? (check (build callee arguments {} (fn [_ _] 0) nil '(helper))))
+           "a faulty substitution callback cannot validate itself")
+       (let [renamed (with-meta (apply list argument) (meta argument))]
+         (is (nil? (check (assoc-in expansion [:argument-slots 1 :argument] renamed)))))
+       (is (nil? (inline/nested-expansion-substitution-view
+                  (assoc callee :walked-body (mapv identity (:walked-body callee)))
+                  arguments expansion)))
+       (let [arguments [0 'value 'value]
+             expansion (build callee arguments {} inline/subst-syms nil '(helper))]
+         (is (empty? (:argument-bindings expansion)))
+         (is (some? (inline/nested-expansion-substitution-view callee arguments expansion))))))))
+
+(deftest nested-substitution-cannot-drop-an-unused-throwing-slot
+  (fixture/literal-count 0)
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [callee (#'inline/try-resolve-walked-body #'fixture/literal-count_m_long)
+           arguments ['(clojure.core/int 4294967296)]
+           expansion (#'inline/build-inline-expansion callee arguments {} inline/subst-syms nil '(helper))
+           forged (-> expansion (assoc :argument-bindings [])
+                      (assoc-in [:argument-slots 0 :binder] false))]
+       (is (= 7 (:body expansion)))
+       (is (some? (inline/nested-expansion-substitution-view callee arguments expansion)))
+       (is (nil? (inline/nested-expansion-substitution-view callee arguments forged)))
+       (is (nil? (inline/nested-expansion-substitution-view
+                  callee arguments (assoc-in forged [:argument-slots 0 :binder] nil))))))))
+
+(deftest nested-substitution-preserves-shadowing-and-quoted-products
+  (shadowed-substitution-helper 1)
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [callee (#'inline/try-resolve-walked-body #'shadowed-substitution-helper_m_long)
+           build @#'inline/build-inline-expansion
+           arguments ['x]
+           good (build callee arguments {} inline/subst-syms nil '(helper))
+           copied (build callee arguments {}
+                         (fn [substitutions body]
+                           (walk/postwalk identity (inline/subst-syms substitutions body)))
+                         nil '(helper))]
+       (is (some? (inline/nested-expansion-substitution-view callee arguments good)))
+       (is (= (:body good) (:body copied)))
+       (is (nil? (inline/nested-expansion-substitution-view callee arguments copied)))
+       (is (nil? (inline/nested-expansion-substitution-view
+                  (assoc callee :source-import {}) arguments good)))))))
+
+(deftest unchanged-training-imports-obey-the-nested-substitution-law
+  (let [captured (atom nil) construct transport/with-source-construction-history
+        target :ocl:training-substitution-test]
+    (with-redefs [transport/with-source-construction-history
+                  (fn [normalization run]
+                    (let [result (construct normalization run)]
+                      (reset! captured (assoc result :normalization normalization))
+                      result))]
+      (equation/compile #'training/local-loss {:target target :dtype :float
+                                             :schedule {:precision :f32-scalar}}
+                        {:device-id target :device-type :gpu :backend :ocl
+                         :subgroup-dialect :opencl-portable :max-workgroup-size 256}))
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [events (:builder-expansions (phase-view @captured))
+             selected (filterv #(contains? '#{raster.dl.nn/linear-nb raster.dl.loss/mse-loss}
+                                           (descriptor/semantic-op (:caller %))) events)]
+         (is (= '#{raster.dl.nn/linear-nb raster.dl.loss/mse-loss}
+                (set (map #(descriptor/semantic-op (:caller %)) selected))))
+         (doseq [event selected]
+           (let [construction (:source-construction @captured)
+                 checked (inline/nested-builder-substitution-view construction (:expansion event))]
+             (is (some? checked) (str (descriptor/semantic-op (:caller event))))
+             (is (identical? (:expansion event) (get-in checked [:builder :expansion])))
+             (is (nil? (inline/nested-builder-substitution-view construction
+                                                              (into {} (:expansion event)))))
+             (is (not-any? #(contains? checked %)
+                           [:executor :completion :return-carrier :resident-result])))))))))
 
 (deftest actual-source-phase-connects-elaboration-to-the-shared-builder
   (let [{:keys [source-construction compilation] :as captured} (capture)
@@ -99,6 +215,28 @@
              (is (some? (origin-view source-construction caller)))
              (is (some? (builder-view source-construction expansion))))))
     (is (= {:form :plain} (transport/with-source-construction-history normalization (constantly :plain))))))
+
+(deftest declined-composed-frame-queries-do-not-publish-partial-history
+  (let [{:keys [source-construction normalization] :as captured} (capture)
+        event (first (:builder-expansions (phase-view captured)))
+        imported (:callee-import (builder-view source-construction (:expansion event)))
+        callee {:params (:parameters imported) :tags (:tags imported)
+                :walked-body (:walked-body imported) :source-import (:source-import event)}
+        caller (:normalized (:caller-origin (builder-view source-construction (:expansion event))))
+        args (vec (descriptor/call-args caller))
+        copied-args [(with-meta (apply list (first args)) (meta (first args)))]
+        changed-args (history normalization
+                              #(#'inline/build-inline-expansion callee copied-args {} inline/subst-syms nil caller))
+        faulty-law (history normalization
+                            #(#'inline/build-inline-expansion callee args {} (fn [_ _] 8) nil caller))]
+    (doseq [query [#(transport/builder-expansion-view (:source-construction changed-args) (:form changed-args))
+                   #(inline/nested-builder-substitution-view (:source-construction faulty-law) (:form faulty-law))
+                   #(inline/nested-expansion-substitution-view callee args (:form faulty-law))]]
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [before @entry/*emission-inputs*]
+           (is (nil? (query)))
+           (is (identical? before @entry/*emission-inputs*))))))))
 
 (deftest construction-chains-do-not-grant-type-or-completion-permission
   (let [{:keys [source-construction normalization] :as captured} (capture)

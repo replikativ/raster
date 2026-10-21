@@ -274,11 +274,10 @@
                    (when (= 1 (count outgoing))
                      (recur (:original edge) (conj chain edge) (dec remaining)))))))))))))
 
-(defn builder-expansion-view
-  "Query one exact shared-builder output and its original caller/imported callee.
-   Every actual argument must still be the caller's positional occurrence, including
-   unused ones. Recursive argument rewrites without their own proof abstain. This
-   supplies no formal completion, return adaptation or final-prefix interval proof."
+(defn builder-construction-view
+  "Read one exact recorded builder return and its authenticated imported body.
+   This also covers import-local callers and rewritten arguments, but proves NO
+   caller correspondence or substitution law. Consumers must check those separately."
   [input expansion]
   (entry/call-with-optional-definition-inputs
    (fn []
@@ -288,12 +287,23 @@
        (let [builders (.-builders ^SourceConstruction input)
              matches (filterv #(identical? expansion (:expansion %)) builders)]
          (when (= 1 (count matches))
-           (let [{:keys [caller source-import walked-body arguments] :as event} (first matches)
-                 original-arguments (descriptor/call-args caller)
+           (let [{:keys [caller source-import walked-body] :as event} (first matches)
                  uses (filterv #(identical? caller (:caller %)) builders)]
-             (when (and (= 1 (count uses))
-                        (= (count arguments) (count original-arguments))
-                        (every? true? (map identical? arguments original-arguments)))
-               (when-let [origin (construction-occurrence input caller)]
-                 (when-let [imported (body-import-view source-import walked-body)]
-                   (assoc event :caller-origin origin :callee-import imported)))))))))))
+             (when (= 1 (count uses))
+               (when-let [imported (body-import-view source-import walked-body)]
+                 (assoc event :callee-import imported))))))))))
+
+(defn builder-expansion-view
+  "Query one exact shared-builder output and its original caller/imported callee.
+   Every actual argument must still be the caller's positional occurrence, including
+   unused ones. Recursive argument rewrites without their own proof abstain. This
+   supplies no formal completion, return adaptation or final-prefix interval proof."
+  [input expansion]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [caller arguments] :as event} (builder-construction-view input expansion)]
+       (let [original-arguments (descriptor/call-args caller)]
+         (when (and (= (count arguments) (count original-arguments))
+                    (every? true? (map identical? arguments original-arguments)))
+           (when-let [origin (construction-occurrence input caller)]
+             (assoc event :caller-origin origin))))))))
