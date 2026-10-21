@@ -42,6 +42,21 @@
     (is (Double/isNaN (double (loss/mse-loss (float-array 0) (float-array 0) 0)))
         "an empty reduction still reaches its IEEE Double zero-denominator quotient")))
 
+(deftest unchanged-training-loss-reaches-portable-source-emission
+  ;; This checks the public primal entry, not a replacement scalar formula.
+  ;; Source emission is intentionally distinct from numerical/device acceptance.
+  (let [target :ocl:training-loss-source
+        compilation (equation-first/compile
+                     #'training/local-loss
+                     {:target target :dtype :float :schedule {:precision :f32-scalar}}
+                     {:device-id target :device-type :gpu :backend :ocl
+                      :subgroup-dialect :opencl-portable :max-workgroup-size 256})]
+    (is (= target (:target compilation)))
+    (is (= :float (:dtype compilation)))
+    (is (some? (:semantic compilation)))
+    (is (some? (:emitted compilation)))
+    (is (seq (:kernels compilation)))))
+
 (deftest coverage-reports-the-actual-normalized-admission-refusal
   (let [attempt (atom nil)
         repeated-analyses (atom 0)
@@ -74,7 +89,11 @@
     (is (= :typed-soac-source-coverage (:reason actual)))
     (is (= actual (:coverage (ex-data error)))
         "report the refusal from the same pass that decided legality")
-    (is (= 4 (count (:bindings actual))))
+    ;; Original ordered integer prefixes now close. The two floating quotients
+    ;; still require source-completion/count correspondence; neither is waived.
+    (is (= 2 (count (:bindings actual))))
+    (is (= '#{clojure.core// raster.numeric//}
+           (set (map :operation (:bindings actual)))))
     (let [correspondences (:reduction-value-correspondences actual)
           proof (:value-correspondence (first correspondences))]
       (is (= 1 (count correspondences)))

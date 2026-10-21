@@ -61,6 +61,33 @@ immediate continuation remains the local source/semantic ownership repair, then
 content-aware prepared replay and encoded/ragged composition qualification. No
 SM100, Ascend, model download or cloud dependency enters the hot development loop.
 
+### October 21 fresh unchanged training-source checkpoint
+
+After `ab49dcb6`, a fresh capped REPL compiles the unchanged public `local-loss`
+fixture through equation-first to portable OpenCL source, with semantic/scheduled
+programs and emitted kernels. This supersedes the earlier first-Long-initializer
+refusal as the current next-action evidence. It is not a numerical, device or
+complete training acceptance receipt.
+
+The unchanged `local-gradient-sum` still refuses with exactly two retained host
+quotients: `clojure.core//` without normal-completion evidence and `raster.numeric//`
+with a present Object/known-Double completion. Both retain original source
+evaluation. Its Float reduction correspondence remains conditional on the checked
+Int source count at its original position, with domain correspondence unproved.
+The diagnostics test's stale count of four was observed failing before updating
+it to two plus the exact operation set; no production admission was relaxed.
+The complete diagnostic namespace, including the new primal source-emission
+control, passes four tests / 28 assertions.
+
+Review also identifies the earliest caller-identity seam: immediately after
+`retained-frontend-source`, `normalize-source-bindings` rebuilds call nodes, before
+`pass-lower`'s additional normalization and inlining. Callee BodyImport alone cannot
+authenticate these rewritten caller occurrences. Any subsequent expansion witness
+must be produced by those actual reconstruction steps and compose with retained
+argument/count/conversion obligations; matching equal forms afterward is not an
+alternative. Determine the remaining quotient's exact prerequisite before adding
+another transport layer.
+
 ### October 21 ordered host-integral qualification
 
 Late checked integral computations may now remain opaque ordered host actions
