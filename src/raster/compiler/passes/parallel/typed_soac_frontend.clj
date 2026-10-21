@@ -3271,15 +3271,13 @@
 
 (defn- requires-evaluation?
   [expression]
-  (boolean (some #{:checked-source-cast :source-reference-cast :preserve-source-evaluation
-                   :unclosed-source-obligations}
-                 (:flags (effects/descriptor expression)))))
+  (boolean (seq (:flags (effects/descriptor expression)))))
 
 (defn- requires-ordered-evaluation?
   [expression]
   (let [flags (:flags (effects/descriptor expression))]
     (boolean
-     (or (some #{:checked-source-cast :source-reference-cast :unclosed-source-obligations} flags)
+     (or (seq (disj flags :preserve-source-evaluation))
          (and (contains? flags :preserve-source-evaluation)
               ;; Retain the evaluation itself, but a proved closed, pure,
               ;; nonthrowing source constant has no ordering observation.

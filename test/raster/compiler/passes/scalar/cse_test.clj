@@ -26,6 +26,15 @@
             pairs (partition 2 bindings)]
         (is (= 'a (second (second pairs))))))))
 
+(deftest unresolved-arithmetic-does-not-become-an-alias
+  (doseq [expression ['(clojure.core/* x y) '(clojure.core// x y)
+                      (with-meta '(.invk raster.numeric/_star__m_long_long-impl x y)
+                        {:raster.op/original 'raster.numeric/*})]]
+    (let [source (list 'let* ['a expression 'b expression] '[a b])
+          result (cse/cse-let source)]
+      (is (= source (:form result)))
+      (is (zero? (get-in result [:stats :cse-aliases]))))))
+
 (deftest no-cse-for-impure-test
   (testing "side-effecting calls are not CSE'd"
     (let [form '(let* [a (reset! buf 1.0)

@@ -16,6 +16,7 @@
   (:require [beichte.core :as b]
             [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -175,12 +176,15 @@
                           (scalar-conversion/source-policy
                            source target (descriptor/semantic-op expression))))))))
 
-(defn- source-cast-flags
+(defn- source-evaluation-flags
   "Evaluation obligations for source conversions/arithmetic from shared descriptors.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   checked integral/Float casts remain conservatively non-removable. Local product
+   checked integral/Float casts remain conservatively non-removable.
+   Arithmetic purity proves neither successful operand completion nor absence
+   of overflow/division errors. Keep that obligation until a source-owned proof
+   closes it; logical dtype tags are not physical operand evidence. Local product
    lowering additionally retains its generic factory's reference conversion
    obligation explicitly. Untyped scoped binders require their own type evidence;
    this does not globally reinterpret their casts as reference conversions."
@@ -189,6 +193,12 @@
    (mapcat (fn [node]
              (let [operation (when (seq? node) (descriptor/semantic-op node))]
                     (cond-> []
+                        (and (seq? node)
+                             (or (contains? #{:+ :- :* :div :neg :quot :rem :mod}
+                                            (intrinsics/canonical operation))
+                                 (descriptor/increment-op? operation)
+                                 (descriptor/decrement-op? operation)))
+                        (conj :unclosed-source-arithmetic)
                         (and (seq? node) (not (proven-total-cast? node))
                              (descriptor/cast-op? operation)
                              (= :reject (descriptor/cast-integral-narrowing operation))
@@ -206,7 +216,10 @@
                         ;; external purity, and actual primitive/Object storage.
                         (true? (:raster.effect/preserve-evaluation (meta node)))
                         (conj :preserve-source-evaluation))))
-         (tree-seq coll? seq expr))))
+         (tree-seq #(and (coll? %)
+                         (not (and (seq? %)
+                                   (contains? '#{quote clojure.core/quote} (first %)))))
+                   seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)
 
@@ -276,7 +289,7 @@
     ;; and their evaluation/exception obligations must survive DCE and CSE too.
     (if (coll? expr)
       (analyze-descriptor expr)
-      {:effect :pure :flags (source-cast-flags expr)})
+      {:effect :pure :flags (source-evaluation-flags expr)})
     (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
                    [(descriptor-key expr) proof])
@@ -294,7 +307,7 @@
   ;; source obligations. Read those from original syntax, not its Beichte-only
   ;; call projection, and merge them even when that analysis abstains.
   (try
-   (let [obligations (source-cast-flags expr)
+   (let [obligations (source-evaluation-flags expr)
         result
         (try
           (let [semantic-expr (semantic-calls expr)

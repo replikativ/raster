@@ -61,6 +61,39 @@ immediate continuation remains the local source/semantic ownership repair, then
 content-aware prepared replay and encoded/ragged composition qualification. No
 SM100, Ascend, model download or cloud dependency enters the hot development loop.
 
+### October 21 arithmetic normal-completion conservation
+
+A real public helper reproduction exposed a silent source loss: an unused helper
+argument containing checked Long multiplication disappeared at `:dce-cleaned`.
+The original call throws on overflow, but the resulting program accepted that
+input. External purity is not a proof of successful evaluation. The shared
+effects descriptor now retains `:unclosed-source-arithmetic` for arithmetic
+identified by the existing canonical operation descriptors; DCE, CSE and the
+TypedSOAC required-evaluation boundary conserve the obligation. Logical type tags
+do not waive it, and quoted arithmetic remains data. This is conservative denial
+until a source-owned completion proof is available, not a second type registry.
+
+The repair also makes existing source-prefix correspondence distinguish a shared
+scalar ProgramEquation from an invocation-only ScalarCompute. The latter must
+retain the same source in both closed region and initializer, or the same central
+result materialization in both. Source-order validation independently rebuilds
+the entire step. Coherent source/plan mutation still cannot replace the original
+source occurrence. The executor uses the actual original Object-returning call
+and authenticated non-null Long boxing bridge; a syntactic result `long` wrapper
+is not a prerequisite or a replacement for that physical evidence. Exact owner,
+Method, implementation, operand, returned-wrapper and historical guards remain.
+
+The existing capped REPL passes six focused namespaces (77 tests / 871 assertions),
+the shared inliner namespace (31 / 192), two required-evaluation boundary tests
+(2 / 24), and source-owner/invocation-plan namespaces (18 / 83). Original selected-call overflow, changed-input and allocation-order
+oracles are retained. The unused-helper argument now survives before allocation
+and unsupported lowering refuses rather than silently dropping its exception.
+This does not yet provide that imported argument's executable source ownership.
+Implicit loop-count conversions, reads, allocations and other pure calls need
+their own completion accounting; no general totality or broad CI claim follows.
+Draft #1539 at `c41be4d4` still has failed test, OpenCL and public-source emission
+contexts, with CUDA/HIP compilation not established. It remains unqualified.
+
 ### October 21 dynamic checked-map loop qualification
 
 The checked-map schedule now proves termination/nonoverflow for an actual validated

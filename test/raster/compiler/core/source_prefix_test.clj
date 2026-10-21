@@ -5,15 +5,25 @@
             [raster.par :as par]
             [raster.compiler.core.source-prefix :as prefix]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.backend.jvm.source-owner :as owner]
             [raster.compiler.backend.jvm.terminal-source :as projection]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.gpu.core :as gpu]))
 
 (deftm selected-prefix [n :- Long] :- (Array double)
   (let [size (numeric/* n 2)
+        out (double-array size)]
+    (par/map! out i size double 1.0)))
+
+(deftm literal-count [unused :- Long] :- Long 7)
+
+(deftm unused-checked-helper-input [rows :- Long chunks :- Long] :- (Array double)
+  (let [size (literal-count (numeric/* rows chunks))
         out (double-array size)]
     (par/map! out i size double 1.0)))
 
@@ -56,6 +66,28 @@
           (equation/compile function {:target target :dtype :double} descriptor))]
     (assoc @observed :compilation compilation)))
 
+(deftest unused-helper-input-is-not-erased-before-source-ownership
+  ;; Complete the original numerical JIT before retaining compilation history.
+  (is (= (vec (repeat 7 1.0)) (vec (unused-checked-helper-input 2 3))))
+  (is (thrown? ArithmeticException (unused-checked-helper-input Long/MAX_VALUE 2)))
+  (let [{:keys [compilation]} (capture #'unused-checked-helper-input)
+        program (:semantic compilation)
+        source (:source program)
+        first-expression (second (second source))
+        order (invocation/source-order (get-in program [:attributes :invocation-plan]) program)
+        allocations (atom 0)]
+    (is (some #(= 'raster.numeric/* (descriptor/semantic-op %))
+              (filter seq? (tree-seq coll? seq first-expression))))
+    (is (contains? (:flags (effects/descriptor first-expression)) :unclosed-source-arithmetic))
+    (is (some? (:equation (first order))) "argument evaluation precedes allocation")
+    (is (some? (:storage (second order))))
+    (with-redefs [gpu/alloc! (fn [& _] (swap! allocations inc)
+                             (throw (AssertionError. "unclosed argument reached device allocation")))]
+      (is (= :ordered-source-execution-required
+             (try (equation/lower compilation [Long/MAX_VALUE 2]) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (is (zero? @allocations))))
+
 (deftest original-occurrence-is-separate-from-logical-result-conversion
   (let [{:keys [frontend inputs correspondence compilation]} (capture #'selected-prefix)
         [input normalization normalized represented program] inputs
@@ -81,6 +113,47 @@
     (is (nil? (prefix/original-step correspondence frontend (assoc program :copied true) step)))
     (is (nil? (prefix/original-step correspondence (into {} frontend) program step)))
     (is (= [[2]] (mapv #(get-in % [:view :shape]) (vals (:nodes (equation/lower compilation [1]))))))))
+
+(deftest invocation-only-scalar-correspondence-retains-exact-conversions
+  (let [{:keys [inputs]} (capture #'selected-prefix)
+        [input normalization normalized represented] inputs
+        program (last inputs)
+        step (first (filter invocation/scalar-compute?
+                            (get-in program [:attributes :invocation-plan :steps])))
+        expression (second (second (nth inputs 3)))
+        final-expression (second (second (:source program)))
+        corresponds? @(ns-resolve 'raster.compiler.core.source-prefix 'scalar-source-corresponds?)
+        {:keys [parameters]} (dialect/lambda-parts (:region step))
+        with-body #(assoc step :region (dialect/lambda-form parameters [%]))]
+    (is (nil? (:equation (first (invocation/source-order
+                                (get-in program [:attributes :invocation-plan]) program)))))
+    (is (corresponds? expression final-expression step nil {'n 'long}))
+    ;; An unchanged invocation-only source is also legal; adding a result cast
+    ;; is not required merely to construct correspondence.
+    (is (corresponds? expression expression (with-body expression) nil {'n 'long}))
+    (doseq [[changed-final changed-step]
+            [[expression step]
+             [final-expression (with-body expression)]
+             [final-expression (with-body '(clojure.core/long 7))]
+             [final-expression (assoc-in step [:value :dtype] :int)]
+             [final-expression (assoc-in step [:operands 0 :symbol] 'foreign)]
+             [(list 'clojure.core/int expression) step]]]
+      (is (not (corresponds? expression changed-final changed-step nil {'n 'long}))))
+    ;; A coherently edited plan can still be internally valid. That must not
+    ;; authorize replacing the authenticated source occurrence by new work.
+    (let [materialized-expression (second final-expression)
+          replacement (with-meta (apply list (concat (butlast materialized-expression) [3]))
+                        (meta materialized-expression))
+          result (with-meta (list (first final-expression) replacement) (meta final-expression))
+          changed-step (with-body result)
+          changed (-> program
+                      (assoc :source (source-with-bindings (:source program)
+                                                          (assoc (second (:source program)) 1 result)))
+                      (update-in [:attributes :invocation-plan :steps]
+                                 #(mapv (fn [candidate] (if (identical? candidate step)
+                                                         changed-step candidate)) %)))]
+      (is (some? (invocation/validate-against! (get-in changed [:attributes :invocation-plan]) changed)))
+      (is (nil? (reclose input normalization normalized represented changed))))))
 
 (deftest history-and-original-frontend-identity-remain-required
   (let [{:keys [frontend inputs correspondence]} (capture #'selected-prefix)

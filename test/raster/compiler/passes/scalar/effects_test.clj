@@ -32,7 +32,7 @@
 (deftest optional-obligation-abstention-retains-a-generic-denial
   (doseq [failure [(IllegalArgumentException. "unsupported obligation analysis")
                    (StackOverflowError. "bounded obligation refusal")]]
-    (with-redefs-fn {#'effects/source-cast-flags (fn [& _] (throw failure))}
+    (with-redefs-fn {#'effects/source-evaluation-flags (fn [& _] (throw failure))}
       #(let [result (#'effects/analyze-descriptor '(clojure.core/double 1.0))]
          (is (= :io (:effect result)))
          (is (contains? (:flags result) :unclosed-source-obligations))))))
@@ -106,8 +106,9 @@
           {:raster.op/original 'raster.numeric/*
            :raster.type/tag 'long :tag 'long})
         unknown-call '(.invk user/unknown-impl rows width)]
-    (is (= {:effect :pure :flags #{}} (effects/descriptor pure-call)))
-    (is (effects/removable-expr? pure-call))
+    (is (= {:effect :pure :flags #{:unclosed-source-arithmetic}} (effects/descriptor pure-call)))
+    (is (not (effects/removable-expr? pure-call))
+        "external purity and logical Long tags do not prove successful operand completion")
     (is (not (effects/removable-expr? unknown-call))
         "an invk without certified semantic metadata remains conservative")))
 
@@ -190,5 +191,24 @@
                                    :raster.type/tag 'long :tag 'long})]
     (is (= form certified))
     (is (not (effects/removable-expr? form)))
-    (is (effects/removable-expr? certified))
+    (is (= :pure (:effect (effects/descriptor certified))))
+    (is (contains? (:flags (effects/descriptor certified)) :unclosed-source-arithmetic))
+    (is (not (effects/removable-expr? certified)))
     (is (not (effects/removable-expr? form)) "a cached certified result is not reused")))
+
+(deftest unresolved-source-arithmetic-retains-normal-completion
+  (doseq [expression ['(clojure.core/+ x y) '(clojure.core/- x)
+                      '(clojure.core/* x y) '(clojure.core// x y)
+                      '(clojure.core/quot x y) '(clojure.core/rem x y)
+                      '(clojure.core/mod x y) '(clojure.core/inc x)
+                      '(clojure.core/dec x) '(clojure.core/unchecked-multiply x y)
+                      (with-meta '(.invk raster.numeric/_star__m_double_double-impl x y)
+                        {:raster.op/original 'raster.numeric/* :raster.type/tag 'double})]]
+    (is (contains? (:flags (effects/descriptor expression)) :unclosed-source-arithmetic))
+    (is (not (effects/removable-expr? expression)))
+    (is (not (effects/cse-safe-expr? expression)))))
+
+(deftest quoted-arithmetic-and-conversions-are-data-not-completion-obligations
+  (doseq [head '[quote clojure.core/quote]]
+    (is (empty? (:flags (effects/descriptor
+                        (list head '(clojure.core/+ (clojure.core/int x) y))))))))

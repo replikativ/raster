@@ -297,7 +297,7 @@
   [step facts source-ns policy collector frontend program prefix-correspondence]
   (entry/call-with-optional-definition-inputs
    (fn []
-     (when-let [{:keys [scope ordinal binding expression result-expression]}
+     (when-let [{:keys [scope ordinal binding expression]}
                 (source-prefix/original-step prefix-correspondence frontend program step)]
        (let [{:keys [parameters locals body-results]} (soac/lambda-parts (:region step))
              ports (scalar-ports step facts)
@@ -311,12 +311,11 @@
                     dispatch? (not lexical-callee)
                     (every? #(or (instance? Long %)
                                  (and (symbol? %) (contains? (set parameters) %))) arguments)
-                    (= :long (dtype/canon (get-in step [:value :dtype])))
-                    ;; Prefix correspondence and plan validation already relate
-                    ;; this independently owned ABI materialization to the exact
-                    ;; step. It is not an original binding-level unboxing.
-                    (seq? result-expression) (= 2 (count result-expression))
-                    (= 'clojure.core/long (first result-expression)))
+                    (= :long (dtype/canon (get-in step [:value :dtype]))))
+           ;; Prefix correspondence relates the exact region and initializer,
+           ;; whether unchanged or explicitly materialized. A syntactic `long`
+           ;; wrapper is not evidence about the ORIGINAL call's object result;
+           ;; the actual binding context and boxed-Long bridge below own that.
            (let [call (entry/frontend-invocation-context frontend expression)
                  bound (entry/frontend-binding-context frontend scope ordinal)
                  selected (entry/selected-parameter-carriers semantic-op implementation-op (count arguments))

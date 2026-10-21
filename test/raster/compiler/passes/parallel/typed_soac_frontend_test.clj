@@ -2039,7 +2039,9 @@
         equation (first (dialect/equations program))
         obligation (dialect/required-evaluation program (second equation))]
     (is (= '[unused] (nth equation 2)))
-    (is (= {:source-binding-id 0 :flags #{:preserve-source-evaluation} :ordering :source}
+    (is (= {:source-binding-id 0
+            :flags #{:preserve-source-evaluation :unclosed-source-arithmetic}
+            :ordering :source}
            obligation))
     (is (= obligation (get-in (dialect/facts program)
                              [:equations (second equation) :attributes :required-evaluation])))

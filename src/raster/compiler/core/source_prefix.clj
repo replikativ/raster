@@ -5,12 +5,14 @@
    it grants no physical carrier, conversion, purity or execution permission.
    In particular a scalar equation's materialization cast is not original source."
   (:require [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-source :as source]))
 
@@ -143,6 +145,24 @@
                        (assoc declarations id tag) (dissoc declarations id)))))
           renaming)))))
 
+(defn- scalar-source-corresponds?
+  "Relate source to a validated scalar producer, retaining its result conversion.
+   Invocation-only producers have no ProgramEquation. Their closed region and
+   final initializer must BOTH retain the source unchanged, or BOTH be its
+   declared materialization. This never strips an arbitrary source conversion."
+  [expression final-expression step equation declarations]
+  (if equation
+    (same-expression? expression (source/scalar-equation-expression equation) {} declarations)
+    (let [{:keys [parameters locals body-results]} (dialect/lambda-parts (:region step))
+          tag (dtype/scalar-tag-for-dtype (get-in step [:value :dtype]))
+          materialized (source/typed-store-value (symbol "clojure.core" (name tag)) expression)]
+      (and (= parameters (mapv :symbol (:operands step)))
+           (empty? locals) (= 1 (count body-results))
+           (some (fn [expected]
+                   (and (same-expression? expected (first body-results) {} declarations)
+                        (same-expression? expected final-expression {} declarations)))
+                 [expression materialized])))))
+
 (defn close
   "Verify the complete bounded transformation at the equation-first producer.
    Intermediate forms are checked in their actual phase order. The exact final
@@ -185,16 +205,14 @@
                        [final-id final-expression] (nth final-pairs ordinal nil)
                        step (get steps (:invocation-step position))
                        equation (some #(when (= (:id %) (:equation position)) %) (:equations program))
-                       computation (if (invocation/scalar-compute? step)
-                                     (source/scalar-equation-expression equation)
-                                     final-expression)]
+                       scalar? (invocation/scalar-compute? step)]
                    (when (and (= ordinal (:position position))
                               (= represented-id final-id (:binding position))
-                              (same-expression? expression computation {} (nth declarations ordinal))
-                              ;; The existing plan validator owns the explicit
-                              ;; source/result conversion, not this relation.
-                              (or (not (invocation/scalar-compute? step))
-                                  (and (= represented-id (:symbol step)) equation)))
+                              (if scalar?
+                                (and (= represented-id (:symbol step))
+                                     (scalar-source-corresponds?
+                                      expression final-expression step equation (nth declarations ordinal)))
+                                (same-expression? expression final-expression {} (nth declarations ordinal))))
                      {:ordinal ordinal :scope (.-scope input)
                       :binding original-id :expression original-expression
                       :step step :result-expression final-expression})))
