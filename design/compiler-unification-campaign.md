@@ -224,6 +224,17 @@ their own source correspondence. Broad draft CI at `e93adb6f` remains red in
 test, public source emission and OpenCL; no merge or RMS runtime qualification
 is claimed.
 
+### October 21 native replay refusal coverage alignment
+
+The replay-boundary regression now pins the earlier native refusal
+`:unclosed-c-family-value-completion`, replacing two stale expectations of the
+later unsupported string/throw refusal. It independently requires the retained
+completion, original alias-guard message and reason in the refused body, and
+checks that native compilation is never invoked. Runtime alias controls remain
+unchanged. The namespace passes 9 tests / 65 assertions; independent review found
+no blocker. This repairs CI accounting without admitting native replay guards or
+claiming a production AD fix. Remaining broad CI failures are still open.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast
