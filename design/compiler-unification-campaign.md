@@ -8,6 +8,23 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### October 21 independent fusion robustness
+
+Optional map-to-reduction/scan fusion now retains the original materialized
+program when the exact substituted element lacks a fresh effect proof. Only the
+local `*-element-impure-or-unknown` refusal with that same request identity may
+abstain; malformed conversion, invalid monoid, stale history and unrelated errors
+still propagate. A failed candidate cannot mutate IR or stop later legal fusion;
+only successful rewrites contribute to counters and placement decisions.
+
+The bounded clean-main REPL passes four complete affected namespaces (81 tests /
+507 assertions). New controls use already-supported Double programs, first prove
+normal fusion, then inject unavailable analysis only for the substituted element.
+They cover preserved source values, later candidates, scans and strict error
+propagation. This is proof-failure robustness, not new IEEE conversion admission
+or a kernel-performance result. The separate source-ownership draft's concrete
+IEEE conversion case and its wider qualification remain outside this landing.
+
 ### October 19 active continuation
 
 The original eight obligations below remain open. Execute bounded, reviewed
