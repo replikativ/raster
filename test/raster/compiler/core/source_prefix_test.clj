@@ -1,9 +1,10 @@
 (ns raster.compiler.core.source-prefix-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.numeric :as numeric]
             [raster.par :as par]
             [raster.compiler.core.source-prefix :as prefix]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.ir.invocation-plan :as invocation]))
 
@@ -16,6 +17,11 @@
   (let [n (numeric/* n 2)
         out (double-array n)]
     (par/map! out i n double 1.0)))
+
+(deftm nested-input-prefix [n :- Long] :- (Array double)
+  (let [size (numeric/* (long n) 2)
+        out (double-array size)]
+    (par/map! out i size double 1.0)))
 
 (defn- source-with-bindings [source bindings]
   (with-meta (list* (first source) bindings (nnext source)) (meta source)))
@@ -114,6 +120,53 @@
 (deftest shadowed-original-parameters-do-not-acquire-prefix-authority
   (let [{:keys [correspondence]} (capture #'shadowed-prefix)]
     (is (nil? correspondence))))
+
+(deftest producer-prepares-callee-before-caller-without-query-side-effects
+  (let [prepared (atom []) prepare! core/ensure-current-owned-bytecode!
+        {:keys [frontend inputs correspondence compilation]}
+        (with-redefs [core/ensure-current-owned-bytecode!
+                      (fn [receiver] (swap! prepared conj receiver) (prepare! receiver))]
+          (capture #'selected-prefix))
+        [_ normalized represented program] inputs
+        step (first (filter invocation/scalar-compute?
+                            (get-in program [:attributes :invocation-plan :steps])))
+        original (prefix/original-step correspondence frontend program step)
+        receiver (get-in frontend [:definition :receiver-var])]
+    ;; A cold batch invalidates the whole compilation and runs again warm.
+    ;; A warm compile validates the same ordered pair without replacing code.
+    (is (contains? #{2 4} (count @prepared)))
+    (is (every? #(= [#'numeric/_star__m_long_long-impl receiver] (vec %))
+                (partition 2 @prepared)))
+    (with-redefs [core/ensure-current-owned-bytecode!
+                  (fn [_] (throw (AssertionError. "an observation query prepared code")))]
+      (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+        (is (some? (prefix/begin frontend '[n])))
+        (is (some? (prefix/close (first inputs) normalized represented program)))
+        (is (identical? (:expression original)
+                        (:expression (prefix/original-step correspondence frontend program step))))
+        (is (= Object (:return-carrier (entry/frontend-invocation-context frontend (:expression original)))))
+        (is (= :ref (get-in (entry/frontend-binding-context frontend (:scope original) (:ordinal original))
+                           [:after :type])))))
+    (is (= :unclosed-ordered-source-executor
+           (try (equation/lower compilation [1]) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
+(deftest unsupported-and-foreign-prefixes-perform-no-preparation
+  (let [prepared (atom [])
+        {:keys [correspondence frontend inputs]}
+        (with-redefs [core/ensure-current-owned-bytecode! #(swap! prepared conj %)]
+          (capture #'nested-input-prefix))
+        program (last inputs)]
+    (is (some? correspondence) "the unsupported operand is not a missing prefix proof")
+    (is (empty? @prepared))
+    (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+      (doseq [[owner source semantic] [[nil frontend program]
+                                       [correspondence (into {} frontend) program]
+                                       [correspondence frontend (assoc program :foreign true)]
+                                       [correspondence frontend program]]]
+        (is (nil? (prefix/prepare-selected-calls! owner source semantic #(swap! prepared conj %)))))
+      (is (empty? (:definition-proofs @entry/*emission-inputs*)))
+      (is (empty? @prepared)))))
 
 (deftest alpha-transport-checks-order-capture-literal-bits-and-declarations
   ;; Isolate the bounded transformation verifier; public tests above exercise

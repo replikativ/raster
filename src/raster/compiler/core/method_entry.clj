@@ -768,7 +768,11 @@
 
 (declare original-source-frontend)
 
-(defn- assert-frontend-selection!
+(defn assert-frontend-selection!
+  "Authenticate an original frontend's actual registered source/receiver entry.
+   Producer preparation may use this before acquiring an emitted-module guard.
+   This grants neither emission freshness nor original invocation completion;
+   physical occurrence consumers must still use their owned observation queries."
   [frontend source-var]
   (assert-frontend-source! frontend source-var)
   (let [current (original-source-frontend source-var)

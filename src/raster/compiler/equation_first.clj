@@ -782,6 +782,8 @@
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))
          prefix-correspondence (source-prefix/close prefix-input source represented-source semantic)
+         _ (source-prefix/prepare-selected-calls! prefix-correspondence retained-frontend semantic
+                                                  rcore/ensure-current-owned-bytecode!)
          source-ns-symbol (source-namespace-symbol f-var)
          id (cond-> [::compilation (function-symbol f-var) target (:dtype compiler-options)]
               (:preserve-declared-array-storage? compiler-options)

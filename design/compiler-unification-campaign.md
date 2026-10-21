@@ -293,6 +293,30 @@ selective-preparation prerequisite PR's unit job 33178 failed during apt reposit
 installation (git-core PPA HTTP 503), before tests; this is an infrastructure
 failure and does not qualify the PR for merge.
 
+### October 21 source-prefix producer preparation
+
+Equation-first compilation now explicitly prepares eligible original prefix calls
+after correspondence closes and before importing physical occurrence guards.
+The existing frontend-selection validator authenticates the caller; signature-only
+queries establish primitive Long public ports and exactly registered callees.
+This first subset accepts direct original `invk` initializers with those unchanged
+public symbols or Long literals. Nested expressions, local/renamed operands,
+reference formals, recursive receiver selection and unowned prefixes abstain.
+All eligible selections close before the first callback. Preparation runs callees
+in original occurrence order, then their actual caller, through the shared owned
+renewal service. Changed snapshots escape to the whole-compilation retry.
+
+Correspondence, call and binding queries still perform no preparation. The new
+phase grants no selected-call execution, result unboxing or purity: the selected
+product fixture still refuses lowering at its missing original-source executor.
+Independent review found no blocker. The reused REPL passes 8 prefix tests / 71
+assertions and 74 ordered/source-owner/preparation tests / 456 assertions. An
+actual nested-argument control retains valid prefix correspondence but produces
+zero callbacks and no retained speculative selections. The isolated emitter
+lifecycle tests above supply the separate cold/renewal evidence; accepting a warm
+or cold preparation count alone does not prove a cold path ran. Fresh-JVM/full-CI
+qualification and unchanged real training acceptance remain outstanding.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long

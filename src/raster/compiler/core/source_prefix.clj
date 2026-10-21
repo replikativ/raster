@@ -197,18 +197,69 @@
           (when (every? some? entries)
             (PrefixCorrespondence. input program entries)))))))
 
+(defn- owned-entries [correspondence frontend program]
+  (when (and (instance? PrefixCorrespondence correspondence)
+             (identical? program (.-program ^PrefixCorrespondence correspondence)))
+    (let [^PrefixInput input (.-input ^PrefixCorrespondence correspondence)]
+      (when (identical? frontend (.-frontend input))
+        (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+        (.-entries ^PrefixCorrespondence correspondence)))))
+
 (defn original-step
   "Query an exact constructed step under its exact original frontend/program.
    This proves correspondence only. It does not authorize interpreting source,
    manufacturing bytecode contexts or adapting an Object result to a primitive.
    The enclosing owner still owes complete namespace/definition history guards."
   [correspondence frontend program step]
-  (when (and (instance? PrefixCorrespondence correspondence)
-             (invocation/scalar-compute? step)
-             (identical? program (.-program ^PrefixCorrespondence correspondence)))
-    (let [^PrefixInput input (.-input ^PrefixCorrespondence correspondence)]
-      (when (identical? frontend (.-frontend input))
-        (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
-        (let [matches (filterv #(identical? step (:step %))
-                               (.-entries ^PrefixCorrespondence correspondence))]
-          (when (= 1 (count matches)) (first matches)))))))
+  (when (invocation/scalar-compute? step)
+    (let [matches (filterv #(identical? step (:step %))
+                           (owned-entries correspondence frontend program))]
+      (when (= 1 (count matches)) (first matches)))))
+
+(defn prepare-selected-calls!
+  "Explicit equation-first producer preparation, not an occurrence query.
+   Prepare original direct registered invk initializers over primitive Long
+   public parameters/literals, then their actual caller. Signature observations
+   do not import an old emitted-module guard before renewal. Unsupported arguments
+   and transformed/foreign prefix ownership abstain without compilation.
+   Promotion/renewal invalidates the ORIGINAL owner and must escape to its whole
+   compilation retry. This grants no source executor, result unboxing or purity."
+  [correspondence frontend program prepare!]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [entries (owned-entries correspondence frontend program)]
+       (when entry/*emission-inputs*
+         (let [caller (entry/assert-frontend-selection!
+                       frontend (get-in frontend [:source-entry :source-var]))
+               signature (entry/selected-parameter-carriers
+                          (:operation caller) (:implementation-op caller)
+                          (count (:parameters caller)))
+               long-ports (into #{} (keep (fn [[id carrier]]
+                                           (when (= Long/TYPE carrier) id)))
+                                (map vector (:parameters signature) (:parameter-carriers signature)))
+               callees
+               (into []
+                     (keep
+                      (fn [{:keys [expression step]}]
+                        (entry/call-with-optional-definition-inputs
+                         (fn []
+                           (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+                                 (descriptor/call-description expression)]
+                             (when (and signature (invocation/scalar-compute? step)
+                                        dispatch? (not lexical-callee)
+                                        (every? #(or (instance? Long %)
+                                                     (and (symbol? %) (contains? long-ports %)))
+                                                arguments))
+                               (when-let [selected (entry/selected-parameter-carriers
+                                                    semantic-op implementation-op (count arguments))]
+                                 (let [receiver (get-in selected [:definition :receiver-var])]
+                                   (when (and (every? #(= Long/TYPE %) (:parameter-carriers selected))
+                                              (= Object (:result-carrier selected))
+                                              (not (identical? receiver (:receiver-var caller))))
+                                     receiver)))))))))
+                     entries)]
+           (when (and (:receiver-var caller) (seq callees))
+             ;; All selections are authenticated before the first callback.
+             ;; The service keeps this order and owns compilation separately.
+             (entry/prepare-owned-definition-inputs! prepare! (conj callees (:receiver-var caller)))
+             true)))))))
