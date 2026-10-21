@@ -6520,7 +6520,8 @@
                                         :source-binding-id (:id description)})
                                 true
                                 (update :attributes assoc
-                                        :source-prefix? (boolean (:source-prefix? description)))
+                                        :source-prefix? (boolean (:source-prefix? description))
+                                        :before-parallel? (boolean (:before-parallel? description)))
                                 (seq flags)
                                 (assoc-in [:attributes :required-evaluation]
                                           {:source-binding-id (:id description)

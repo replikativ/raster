@@ -212,7 +212,8 @@ the ordered argument/result interval transport or full training acceptance.
 The focused fix is PR #1556, reconciled head `13e4da6f` after main's #1555
 landing. The reconciliation adds only the independently qualified naming fix
 and its fixtures; the reviewed dependency-closure diff remains two files. Its
-fresh CI is pending. #1555 passed all seven exact-head contexts at `3dc8ff4e`
+all seven exact-head CI contexts succeeded and it squash-merged as `a17af351`.
+#1555 passed all seven exact-head contexts at `3dc8ff4e`
 and squash-merged as `0513d222`; the broad draft has merged that main commit
 without dropping its separate ownership work. Neither receipt qualifies the
 broad draft or closes its still-red workload gates.
@@ -231,6 +232,31 @@ retained before authenticating the inliner interval. Do not assume the inliner
 sees an unchanged normalized call, weaken identity queries or infer origins from
 equal spellings. This evidence changes the next integration action; it does not
 grant completion/execution permission to the elaborated call.
+
+### October 21 ordered unused scalar prerequisite
+
+The actual unchanged helper probe exposed a missing executor before interval
+integration: an unused checked argument retained its TypedSOAC equation and
+required-evaluation obligation, but no InvocationPlan step. Shape liveness must
+not decide whether original checked work executes.
+
+Pre-device required scalars now retain a host-only equation with empty scheduled
+operations and exactly one existing ScalarCompute executor. They are not labeled
+graph-shape proofs. Prefix dependency pruning roots their existing obligations,
+rechecking the nested catalog, transported claim, provenance, exact source
+binding and computation flags; removing both catalogs does not prove totality.
+Flags come from the retained scalar computation, not a generated result ABI cast.
+The frontend's before-parallel relation remains distinct from stageable-prefix.
+
+Focused reused-REPL validation passes the seven invocation/shape/ordering tests
+(106 assertions, including the production public-parameter ordering control) and
+135 source/ownership tests (1,573 assertions). These are not full draft CI gates.
+The helper now has its ordered step but still refuses before allocation with
+`:unclosed-ordered-source-executor`: original argument/result interval ownership
+is deliberately not inferred from the existence of a scalar evaluator. That
+construction-edge integration remains next; no fallback or new interpreter was
+introduced. Review also confirmed that rebased source IDs are not globally equal
+to retained binding ordinals, so no such new coordinate assumption was added.
 
 ### October 21 original reduction count execution and outline hygiene
 

@@ -80,12 +80,15 @@
               (filter seq? (tree-seq coll? seq first-expression))))
     (is (contains? (:flags (effects/descriptor first-expression)) :unclosed-source-arithmetic))
     (is (some? (:equation (first order))) "argument evaluation precedes allocation")
+    (is (some? (:invocation-step (first order)))
+        "the unused checked argument has one ordered scalar executor")
     (is (some? (:storage (second order))))
     (with-redefs [gpu/alloc! (fn [& _] (swap! allocations inc)
                              (throw (AssertionError. "unclosed argument reached device allocation")))]
-      (is (= :ordered-source-execution-required
+      (is (= :unclosed-ordered-source-executor
              (try (equation/lower compilation [Long/MAX_VALUE 2]) nil
-                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "an executor plan alone does not prove the original helper argument interval"))
     (is (zero? @allocations))))
 
 (deftest original-occurrence-is-separate-from-logical-result-conversion
