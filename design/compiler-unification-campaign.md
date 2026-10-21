@@ -407,6 +407,39 @@ refuses two retained source evaluations (core division and numeric division),
 while retaining its conditional Float reduction correspondence and unproved
 source-count-domain obligation. These are failures, not qualified training results.
 
+### October 21 source qualification history prerequisite
+
+The existing body qualifier now accepts an optional observer for its actual
+symbol, namespace and alias resolution decisions. Inliner body qualification and
+its adjacent nonprimitive formal-tag qualification both retain these decisions
+in the existing compiler owner. Resolved Vars reuse definition snapshots at the
+original lookup namespace/symbol. Classes, misses and namespace/alias identities
+use private immutable producer guards, including detached/replaced namespace
+targets. Optional refused queries discard these observations; no second symbol
+scan, whole-namespace snapshot or executable registry is introduced.
+
+Review exposed a real qualification defect: an alias can have the same spelling
+as an already loaded global namespace. Qualification must resolve in the original
+source namespace first. It now preserves that alias target, including a missing
+member: the latter must remain unresolved instead of becoming a successful call
+in the unrelated global namespace. Independent source-versus-consumer eval tests
+cover both cases. Observer failures propagate outside lookup exception handling.
+
+Independent review finds no blocker. Focused controls include Class/static method
+owners, structural `new`/`catch`, namespace recreation, changed aliases/imports,
+lexical/quoted opacity and actual inliner formal-tag import invalidation. The
+completed affected qualifier/inliner, preparation, prefix, retained-frontend,
+source-owner and native-alias gate passes 167 tests / 1,060 assertions in the
+capped REPL with freshly loaded production classes. This retains lookup history;
+it grants no formal argument completion, helper-expansion correspondence or source
+execution. Compile-overhead and full exact-head CI remain separate qualification.
+
+PR #1550 is squash-merged as `63a5a97c` after all seven exact-head CircleCI gates
+passed. PR #1552, the independent observation-checked explicit preparation API,
+now targets main at `1ee2fb0b` and requires its own new seven-gate run. The broad
+draft's emission job `33256` still refuses the known checked Double→Float
+running-variance update conversion; it remains unqualified and must not merge.
+
 ### Next producer-owned helper-expansion transport
 
 Independent review of the actual inliner locates the missing relation:

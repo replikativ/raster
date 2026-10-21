@@ -1835,11 +1835,29 @@ stable physical-leaf order on every backend."}
 (defn qualify-body-symbols
   "Qualify unqualified symbols in a walked body to their source namespace.
    Lexical scopes come from form/scope-info; quoted data is opaque. Structural
-   classes use class-only qualification, independently of lexical binders."
-  [body source-ns param-set]
-  (let [class-symbol (fn [value]
+   classes use class-only qualification, independently of lexical binders.
+   An optional observer receives the actual resolution decisions; it is not a
+   source correspondence or permission to execute the transformed body."
+  ([body source-ns param-set] (qualify-body-symbols body source-ns param-set nil))
+  ([body source-ns param-set observe!]
+  (let [resolve! (fn [symbol]
+                   (let [result (try (ns-resolve source-ns symbol) (catch Exception _ nil))]
+                     (when observe! (observe! {:kind :symbol-resolution :source-ns source-ns
+                                              :symbol symbol :result result}))
+                     result))
+        namespace! (fn [symbol]
+                     (let [result (find-ns symbol)]
+                       (when observe! (observe! {:kind :namespace-resolution :source-ns source-ns
+                                                :symbol symbol :result result}))
+                       result))
+        alias! (fn [symbol]
+                 (let [result (get (ns-aliases source-ns) symbol)]
+                   (when observe! (observe! {:kind :alias-resolution :source-ns source-ns
+                                            :symbol symbol :result result}))
+                   result))
+        class-symbol (fn [value]
                        (if (symbol? value)
-                         (let [resolved (try (ns-resolve source-ns value) (catch Exception _ nil))]
+                         (let [resolved (resolve! value)]
                            (if (class? resolved)
                              (with-meta (symbol (.getName ^Class resolved)) (meta value))
                              value))
@@ -1867,7 +1885,7 @@ stable physical-leaf order on every backend."}
                            (let [name-str (name expr)]
                              (and (seq name-str)
                                   (Character/isUpperCase ^char (first name-str)))))
-                      (let [resolved (try (ns-resolve source-ns expr) (catch Exception _ nil))]
+                      (let [resolved (resolve! expr)]
                         (cond
                           (var? resolved)
                           (symbol (str (.name (.ns ^clojure.lang.Var resolved)))
@@ -1878,23 +1896,11 @@ stable physical-leaf order on every backend."}
                           (class? resolved)
                           (symbol (.getName ^Class resolved))
                           :else expr))
-                      (and (namespace expr)
-                           (try (the-ns (symbol (namespace expr))) true
-                                (catch Exception _ false)))
-                      expr
-                      ;; Java static-call head `Class/method` where the namespace
-                      ;; part is a simple (imported) class name, not a loaded ns:
-                      ;; qualify Class to its FQN so the backend resolves it with no
-                      ;; ns context (e.g. MemorySegment/ofArray ->
-                      ;; java.lang.foreign.MemorySegment/ofArray when inlined out of
-                      ;; the ns that imported it).
-                      (and (namespace expr)
-                           (class? (try (ns-resolve source-ns (symbol (namespace expr)))
-                                        (catch Exception _ nil))))
-                      (symbol (.getName ^Class (ns-resolve source-ns (symbol (namespace expr))))
-                              (name expr))
                       :else
-                      (if-let [v (try (ns-resolve source-ns expr) (catch Exception _ nil))]
+                      ;; Resolve in the ORIGINAL namespace before interpreting a
+                      ;; qualifier as a globally loaded namespace. A local alias
+                      ;; of that spelling may designate a different namespace.
+                      (if-let [v (resolve! expr)]
                         (cond
                           ;; var: qualify to ns/sym
                           (var? v) (symbol (str (.name (.ns ^clojure.lang.Var v)))
@@ -1903,7 +1909,20 @@ stable physical-leaf order on every backend."}
                           ;; -> (new X a), exposing X): qualify to its FQN
                           (class? v) (symbol (.getName ^Class v))
                           :else expr)
-                        expr)) (meta expr))
+                        (if (namespace expr)
+                          (let [qualifier (symbol (namespace expr))]
+                            (if-let [alias (alias! qualifier)]
+                              ;; An unresolved member must remain unresolved in
+                              ;; its original alias target, never fall through to
+                              ;; a same-spelled global namespace or Class.
+                              (symbol (str (ns-name alias)) (name expr))
+                              (if (namespace! qualifier)
+                                expr
+                                (let [owner (resolve! qualifier)]
+                                  (if (class? owner)
+                                    (symbol (.getName ^Class owner) (name expr))
+                                    expr)))))
+                          expr))) (meta expr))
                     (and (seq? expr) (contains? #{'quote 'clojure.core/quote} (first expr))) expr
                     (seq? expr)
                     (let [expr (form/map-structural-classes class-symbol expr)]
@@ -1929,7 +1948,7 @@ stable physical-leaf order on every backend."}
                                           (meta expr))
                     (set? expr) (with-meta (into (empty expr) (map #(qualify % bound)) expr) (meta expr))
                     :else expr))]
-    (qualify body #{})))
+    (qualify body #{}))))
 
 ;; ================================================================
 ;; Late-pipeline type inference (moved from inline.clj to break cycle)

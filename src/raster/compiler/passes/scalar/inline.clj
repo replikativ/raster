@@ -291,8 +291,12 @@
                           (if (or (nil? t) (prim-tags t)
                                   (.contains (str t) "."))
                             t ;; already qualified or primitive
-                            (if-let [cls (try (ns-resolve source-ns (symbol (str t)))
-                                              (catch Exception _ nil))]
+                            (if-let [cls (let [lookup (symbol (str t))
+                                               result (try (ns-resolve source-ns lookup)
+                                                           (catch Exception _ nil))]
+                                           (method-entry/observe-source-resolution!
+                                            {:kind :symbol-resolution :source-ns source-ns
+                                             :symbol lookup :result result}))]
                               (if (class? cls)
                                 (symbol (.getName ^Class cls))
                                 t)
@@ -312,7 +316,8 @@
               {:params params
                :tags (or qualified-tags tags)
                :return-tag return-tag
-               :walked-body (mapv #(inf/qualify-body-symbols % source-ns param-set)
+               :walked-body (mapv #(inf/qualify-body-symbols % source-ns param-set
+                                                           method-entry/observe-source-resolution!)
                                   hygienic-wb)}
               {:params params :tags tags :return-tag return-tag :walked-body hygienic-wb})))))))
 

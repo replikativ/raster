@@ -24,9 +24,32 @@
             [raster.numeric]
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
+
+(deftest actual-inliner-retains-formal-class-import-history
+  (let [name (gensym "raster.formal.qualification.")
+        source (create-ns name)]
+    (try
+      (binding [*ns* source]
+        (clojure.core/refer 'clojure.core)
+        (.importClass ^clojure.lang.Namespace source java.util.Date)
+        (eval '(raster.core/deftm helper [unused :- Date] :- Long (let [one 1] one))))
+      (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+        (let [helper (ns-resolve source 'helper_m_Date)
+              info (#'inline/try-resolve-walked-body helper)
+              inputs @entry/*emission-inputs*]
+          (is (= '[java.util.Date] (:tags info)))
+          (is (seq (:walked-body info)))
+          (is (entry/assert-definition-inputs-current! inputs))
+          (ns-unmap source 'Date)
+          (.importClass ^clojure.lang.Namespace source java.sql.Date)
+          (is (= :stale-source-resolution
+                 (try (entry/assert-definition-inputs-current! inputs) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+      (finally (remove-ns name)))))
 
 (deftest anf-bindings-carry-existing-result-types-without-reinference
   (let [result (with-meta 'rhs {:raster.type/tag 'doubles})

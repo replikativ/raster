@@ -154,6 +154,53 @@
     (swap! *emission-inputs* update :source-body-inputs (fnil conj #{}) [v origin])
     true))
 
+(deftype ^:private SourceResolutionInput [kind source-ns lookup-symbol result]
+  RetainedProducerInput
+  (assert-producer-current! [_]
+    (when-not (and (identical? source-ns (find-ns (ns-name source-ns)))
+                   (or (not (instance? clojure.lang.Namespace result))
+                       (identical? result (find-ns (ns-name result))))
+                   (identical? result
+                               (case kind
+                                 :symbol-resolution (try (ns-resolve source-ns lookup-symbol)
+                                                         (catch Exception _ nil))
+                                 :alias-resolution (get (ns-aliases source-ns) lookup-symbol)
+                                 :namespace-resolution (find-ns lookup-symbol))))
+      (throw (ex-info "source qualification lookup changed"
+                      {:reason :stale-source-resolution :kind kind :symbol lookup-symbol})))
+    true))
+
+(defn observe-source-resolution!
+  "Retain one actual source-qualification decision in the current owner.
+   Vars reuse definition observations at their ORIGINAL lookup site. Classes,
+   namespace/alias identities and misses have identity-only producer guards. No scan,
+   code emission, source correspondence or normal-completion fact is supplied."
+  [{:keys [kind source-ns symbol result]}]
+  (when *emission-inputs*
+    (when-not (and (instance? clojure.lang.Namespace source-ns) (symbol? symbol)
+                   (case kind
+                     :symbol-resolution (or (nil? result) (var? result) (class? result))
+                     :alias-resolution (or (nil? result) (instance? clojure.lang.Namespace result))
+                     :namespace-resolution (or (nil? result) (instance? clojure.lang.Namespace result))
+                     false))
+      (throw (ex-info "source qualification needs an actual lookup decision"
+                      {:reason :invalid-source-resolution})))
+    (if (var? result)
+      (observe-definition-input! result source-ns symbol)
+      (let [input (SourceResolutionInput. kind source-ns symbol result)]
+        (assert-producer-current! input)
+        (swap! *emission-inputs*
+               (fn [inputs]
+                 (if (some #(and (instance? SourceResolutionInput %)
+                                 (= kind (.-kind ^SourceResolutionInput %))
+                                 (identical? source-ns (.-source-ns ^SourceResolutionInput %))
+                                 (= symbol (.-lookup-symbol ^SourceResolutionInput %))
+                                 (identical? result (.-result ^SourceResolutionInput %)))
+                           (:producer-inputs inputs))
+                   inputs
+                   (retain-producer-inputs inputs [input])))))))
+  result)
+
 (defn assert-definition-inputs-current!
   "Validate normalization's historical definition observations, not a fresh
    post-hoc source traversal. Sequential staleness fence, not an ABA guarantee."
