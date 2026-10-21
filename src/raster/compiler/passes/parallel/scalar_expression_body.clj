@@ -1643,9 +1643,11 @@
        actual))))
 
 (defn- completed-fp-argument?
-  "A logical dtype or nullable reference class cannot discharge entry unboxing."
+  "Only FP formals have this completion proof. A logical dtype or nullable reference
+   class cannot discharge entry unboxing, including for an unused integral formal."
   [{:keys [carrier presence builtin-class]} target]
-  (and (= :present presence)
+  (and (contains? #{Float/TYPE Double/TYPE} target)
+       (= :present presence)
        (or (and (contains? #{Float/TYPE Double/TYPE} carrier)
                 (or (= target Double/TYPE) (= carrier Float/TYPE)))
            (and (class? carrier) (not (.isPrimitive ^Class carrier))

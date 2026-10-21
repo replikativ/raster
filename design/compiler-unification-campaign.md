@@ -112,6 +112,27 @@ negative controls. Do not rewrite helper bodies universally: AD/native consumers
 must not silently become warm-only or acquire unsupported reserved terms. This
 review identifies the next implementation boundary; it does not qualify execution.
 
+### October 21 primitive boxing-edge correspondence
+
+The existing emitter-owned return bridge now records audited primitive Long
+boxing as well as Float/Double boxing. Its source result carrier remains Object;
+the observed static return supplies a separate conditional payload carrier. The
+query checks actual interface/static Methods, signatures, original body/context
+and historical guards. It does not invoke the helper, force the JIT, prove normal
+completion or authorize unboxing, source motion, FP recipes or kernel admission.
+Missing, duplicate, foreign, legacy and inconsistent observations abstain, as do
+hidden Object-to-primitive return adaptations.
+
+Review caught an FP consumer's implicit assumption that every bridge formal was
+FP. The shared FP argument-completion predicate now explicitly checks its target
+domain. A mixed Float/Long helper with an unused Long formal produces a legitimate
+Float boxing observation but cannot acquire an FP recipe by omitting the integral
+argument conversion. That regression had two failing assertions before the guard
+and passes afterward. Four complete affected namespaces pass 37 tests / 349
+assertions in one bounded REPL, including Long checked overflow and unchanged FP,
+invocation, binding and input-completion controls. This independent foundation
+does not qualify the separate source-ownership draft or its training workload.
+
 ### October 21 primitive math completion
 
 Eight audited primitive FP math rows (sqrt, floor, sin, cos, tan, exp, log and

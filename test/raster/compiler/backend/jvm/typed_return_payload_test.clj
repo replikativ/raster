@@ -16,13 +16,14 @@
 (def ^:private boxed-fp {:carrier Object :presence :present :builtin-class Double})
 
 (defn- fixture! [scope-name body & [type]]
-  (let [scope (create-ns (gensym scope-name))]
+  (let [scope (create-ns (gensym scope-name))
+        [left right] (if (vector? type) type [(or type 'Double) (or type 'Double)])]
     (binding [*ns* scope]
       (refer 'clojure.core)
       (ns-unmap scope '*)
       (eval (list 'raster.core/deftm '*
-                  ['x ':- (or type 'Double) 'y ':- (or type 'Double)]
-                  ':- (or type 'Double) body)))
+                  ['x ':- left 'y ':- right]
+                  ':- left body)))
     (let [source (core/resolve-deftm-var (ns-resolve scope '*))]
       {:scope scope :generic (ns-resolve scope '*) :source source
        :receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))})))
@@ -115,6 +116,73 @@
                        (assoc emission :implementation (Object.)))))
             (is (nil? (payload call [fp {:carrier Object :presence :unknown}])))
             (is (nil? (payload call [fp]))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest actual-long-boxing-is-payload-evidence-not-a-primitive-source-carrier
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.long-return-payload." '(clojure.core/* x y) 'Long)]
+    (try
+      (is (some? (:raster.core/jit-spec (meta receiver))))
+      (with-redefs [core/ensure-bytecode-implementation!
+                    (fn [& _] (throw (AssertionError. "bridge query forced the JIT")))]
+        (is (nil? (bytecode/retained-typed-return-bridge
+                   (:raster.core/bytecode-emission (meta receiver))))))
+      (core/ensure-bytecode-implementation! receiver)
+      (let [emission (:raster.core/bytecode-emission (meta receiver))
+            bridge (bytecode/retained-typed-return-bridge emission)
+            outcome (fn [f]
+                      (try (let [value (f)] [:value (class value) value])
+                           (catch Exception error [:exception (class error)])))]
+        (is (= :boxed-primitive-static-return (:kind bridge)))
+        (is (= Object (:result-carrier bridge)))
+        (is (= Long/TYPE (:payload-carrier bridge)))
+        (is (= [Long/TYPE Long/TYPE] (:parameter-carriers bridge)))
+        (is (= :long (get-in bridge [:body-context :emitted-result-type])))
+        (doseq [[x y] [[0 1] [4097 3] [Long/MIN_VALUE 1] [Long/MAX_VALUE -1] [Long/MAX_VALUE 2]]]
+          (is (= (outcome #(clojure.core/* (long x) (long y)))
+                 (outcome #(clojure.lang.Reflector/invokeInstanceMethod
+                            @receiver "invk" (object-array [x y]))))))
+        ;; This shared wrapper observation does not broaden the FP SSA recipe.
+        (with-selected-fixture fixture
+          (fn [call]
+            (is (nil? (payload call [{:carrier Long/TYPE :presence :present}
+                                    {:carrier Long/TYPE :presence :present}])))))
+        (doseq [changed [(dissoc emission :typed-return-bridges)
+                         (assoc emission :implementation (Object.))
+                         (update emission :typed-return-bridges #(into % %))
+                         (assoc-in emission [:typed-return-bridges 0 :kind] :boxed-fp-static-return)
+                         (assoc-in emission [:typed-return-bridges 0 :payload-carrier] Double/TYPE)
+                         (assoc-in emission [:typed-return-bridges 0 :parameter-carriers] [Object Object])]]
+          (is (nil? (bytecode/retained-typed-return-bridge changed)))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest an-unused-integral-formal-does-not-acquire-fp-argument-completion
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.mixed-return-payload." '(clojure.core/float x) '[Float Long])]
+    (try
+      (core/ensure-bytecode-implementation! receiver)
+      (let [bridge (bytecode/retained-typed-return-bridge
+                    (:raster.core/bytecode-emission (meta receiver)))]
+        (is (= [Float/TYPE Long/TYPE] (:parameter-carriers bridge)))
+        (is (= Float/TYPE (:payload-carrier bridge))))
+      (with-selected-fixture fixture
+        (fn [call]
+          (doseq [argument [{:carrier Float/TYPE :presence :present}
+                           {:carrier Object :presence :present :builtin-class Float}
+                           {:carrier Long/TYPE :presence :present}]]
+            (is (nil? (payload call [{:carrier Float/TYPE :presence :present} argument]))
+                "even an unused integral formal retains its original argument conversion"))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest a-hidden-long-result-unboxing-does-not-become-a-boxing-proof
+  (let [{:keys [scope receiver]} (fixture! "raster.long-return-coercion." '(clojure.core/identity x) 'Long)]
+    (try
+      (core/ensure-bytecode-implementation! receiver)
+      (let [emission (:raster.core/bytecode-emission (meta receiver))
+            context (bytecode/retained-body-context emission)]
+        (is (= :long (:return-stack-type context)))
+        (is (= :ref (:emitted-result-type context)))
+        (is (nil? (bytecode/retained-typed-return-bridge emission))))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest a-hidden-object-to-primitive-return-conversion-is-not-a-payload-recipe
