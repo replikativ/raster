@@ -1300,6 +1300,10 @@
 
       intrinsic
       (let [arity (:arity intrinsic)
+            _ (when-not (= arity (count infos))
+                (throw (ex-info "scalar intrinsic arity mismatch"
+                                {:operation canonical-op :expected arity
+                                 :actual (count infos)})))
             kind (:kind intrinsic)
             operand-type (same-types! "scalar intrinsic" infos)
             integral? (contains? #{:byte :int :long} operand-type)
@@ -1318,9 +1322,6 @@
                  (contains? arithmetic-overflow-policies overflow-policy)
                  (or (not (contains? options :proof))
                      (proof-covers-derived-range? proof derived-range result-type)))]
-        (when-not (= arity (count infos))
-          (throw (ex-info "scalar intrinsic arity mismatch"
-                          {:operation canonical-op :expected arity :actual (count infos)})))
         (when (and arithmetic-overflow? (not valid-options?))
           (throw (ex-info "integral arithmetic requires exactly one overflow contract"
                           {:reason :kernel-body-intrinsic-overflow
