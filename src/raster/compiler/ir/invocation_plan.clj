@@ -273,7 +273,7 @@
    A later owner must establish physical exports, compile under that retained
    context, guard dependencies, await completion and explicitly observe results.
 
-   The boundary is one return expression over produced Double/Long scalars,
+   The boundary is one return expression over produced Float/Double/Long scalars,
    optionally using declared public Double/Long scalars at their original
    argument positions. Public-port declarations are not physical carrier proof.
    Nested scopes and canonical completions remain intact; prefix
@@ -311,7 +311,7 @@
                           (let [[equation position] (get producers result)
                                 value (get (:values program) result)]
                             (when-not (and (scalar-value? value)
-                                           (contains? #{:double :long} (:dtype value)))
+                                           (contains? #{:float :double :long} (:dtype value)))
                               (fail! :invocation-terminal-carrier
                                      "terminal port requires a supported produced scalar"
                                      {:value result :abstract value}))

@@ -643,7 +643,8 @@
   owner)
 
 (defn- terminal-carrier? [dtype value]
-  (case dtype :double (instance? Double value) :long (instance? Long value) false))
+  (case dtype :float (instance? Float value) :double (instance? Double value)
+        :long (instance? Long value) false))
 
 (defn terminal-public-arguments
   "Select exact public source scalars before observing any resident export.

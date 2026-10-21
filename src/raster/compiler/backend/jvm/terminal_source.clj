@@ -200,21 +200,35 @@
                             (static-call java.util.Objects "isNull" [Object] [(:source (first arguments))]))
                         (and operation (= "clojure.core" (namespace operation))
                              (source-arithmetic/binary-operator? (name operation)))
-                        (do
+                        (let [floating-source? (and (not typed-context?)
+                                                    (every? #(contains? #{Float/TYPE Double/TYPE}
+                                                                        (:carrier %)) arguments))]
                           (intrinsic-current! v operation)
                           ;; This is physical carrier selection, not a result-tag
                           ;; guess. Other carriers/arity need their own exact source
                           ;; overload/completion projection before admission.
                           (when-not (and (= 2 (count arguments))
                                          (or (every? #(= Double/TYPE (:carrier %)) arguments)
+                                             floating-source?
                                              (and typed-context? (false? (:unchecked-math policy))
                                                   (not= "/" (name operation))
                                                   (every? #(= Long/TYPE (:carrier %)) arguments))))
                             (fail! "terminal arithmetic needs its exact primitive source carriers"
                                    {:head head :carriers (mapv :carrier arguments)}))
-                          (static-call clojure.lang.Numbers
-                                       (source-arithmetic/numbers-method-name (name operation))
-                                       (mapv :carrier arguments) (mapv :source arguments)))
+                          ;; Ordinary Clojure core inlines select Numbers' Double
+                          ;; overload for Float operands. Preserve the exported
+                          ;; Float checkpoint, then widen exactly at this call.
+                          ;; Typed scalar Float arithmetic is a different source
+                          ;; context and remains outside this admission rule.
+                          (let [arguments (if floating-source?
+                                            (mapv #(if (= Float/TYPE (:carrier %))
+                                                     (static-call clojure.lang.RT "doubleCast"
+                                                                  [Float/TYPE] [(:source %)]) %)
+                                                  arguments)
+                                            arguments)]
+                            (static-call clojure.lang.Numbers
+                                         (source-arithmetic/numbers-method-name (name operation))
+                                         (mapv :carrier arguments) (mapv :source arguments))))
                         (or (:macro metadata) (:inline metadata) (nil? v))
                         (fail! "terminal call has no owned non-expanding projection" {:head head})
                         typed-context?
@@ -247,6 +261,11 @@
                                   (static-call clojure.lang.RT "longCast" [Object] [(:source read)])
                                   (= Integer/TYPE carrier)
                                   (static-call clojure.lang.RT "intCast" [Object] [(:source read)])
+                                  (= Float/TYPE carrier)
+                                  ;; The owner checks an exact Float wrapper.
+                                  ;; Extract its value without adding a checked
+                                  ;; narrowing point (which could reject infinity).
+                                  (static-call clojure.lang.RT "uncheckedFloatCast" [Object] [(:source read)])
                                   (= Double/TYPE carrier)
                                   (static-call clojure.lang.RT "doubleCast" [Object] [(:source read)])
                                   :else (fail! "source port has no audited physical projection"
@@ -265,7 +284,8 @@
    Direct helper calls retain an unhinted Object ABI; private captures are not portable IR."
   [contract source-ns]
   (let [parameters (mapv (fn [{:keys [symbol dtype]}]
-                           {:symbol symbol :carrier (case dtype :double Double/TYPE :long Long/TYPE)})
+                           {:symbol symbol :carrier (case dtype :float Float/TYPE
+                                                               :double Double/TYPE :long Long/TYPE)})
                          (invocation/terminal-parameters contract))]
     (project* (assoc contract :parameters parameters) source-ns false)))
 

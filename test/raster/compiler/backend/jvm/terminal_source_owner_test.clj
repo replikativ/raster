@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core]
             [raster.compiler.backend.jvm.source-owner :as owner]
+            [raster.compiler.backend.jvm.terminal-source :as terminal]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
@@ -96,6 +97,58 @@
                      Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
         (is (= (outcome oracle value)
                (outcome #(owner/invoke-terminal-result owner p c [%]) value)))))))
+
+(deftest terminal-float-export-preserves-the-checkpoint-before-core-arithmetic
+  ;; Structural source-owner mechanics only; device tests independently owe an
+  ;; exact emitted Float ABI and initialized one-element storage.
+  (let [v (source)
+        samples [(float 0.0) (float -0.0) (float 16777216.0) Float/MAX_VALUE
+                 Float/POSITIVE_INFINITY Float/NEGATIVE_INFINITY Float/NaN
+                 (Float/intBitsToFloat 2143289361)]
+        observe (fn [evaluate]
+                  (try
+                    (let [value (evaluate)]
+                      [(class value) (if (instance? Float value)
+                                     (Float/floatToRawIntBits value)
+                                     (Double/doubleToRawLongBits value))])
+                    (catch Exception error [:error (class error)])))]
+    (doseq [body (concat ['total '(clojure.core/double total) '(clojure.core/float total)
+                         (list 'clojure.core/float (list 'clojure.core/+ 'total Double/MAX_VALUE))]
+                        (for [operation '[clojure.core/+ clojure.core/- clojure.core/* clojure.core//]
+                              [left right] [['total 0.25] [0.25 'total] ['total 'total]]]
+                          (list operation left right)))]
+      (let [p (-> (boundary body)
+                  (assoc-in [:values 'x :dtype] :float)
+                  (assoc-in [:values 'total :dtype] :float))
+            c (contract p v)
+            {:keys [owner]} (compile-owned p c v)
+            ;; Compile ordinary Clojure source over an ACTUAL primitive Float
+            ;; local, independently of Raster's terminal projection.
+            oracle (eval (list 'fn '[x]
+                               (list 'let* '[total (.floatValue ^Float x)] body)))]
+        (doseq [value samples]
+          (is (= (observe #(oracle value))
+                 (observe #(owner/invoke-terminal-result owner p c [value])))))
+        (doseq [wrong [nil 1.0 1]]
+          (is (= :terminal-source-arguments
+                 (reason #(owner/invoke-terminal-result owner p c [wrong])))))))))
+
+(deftest float-terminal-promotion-does-not-authorize-typed-float-arithmetic
+  (is (= :unclosed-terminal-source-projection
+         (entry/call-with-definition-inputs
+          #(reason (fn []
+                     (terminal/project-scalar '(clojure.core/+ value value)
+                                              [{:symbol 'value :carrier Float/TYPE}]
+                                              *ns* {:unchecked-math false})))))))
+
+(deftest produced-float-support-does-not-invent-a-public-float-entry-carrier
+  (is (= :invocation-terminal-public-carrier
+         (reason #(invocation/terminal-source-result
+                   (boundary '(clojure.core/+ total coefficient))
+                   {:source-policy {:unchecked-math false}
+                    :source-namespace 'raster.compiler.backend.jvm.terminal-source-owner-test
+                    :public-parameters [{:symbol 'coefficient
+                                         :value (av/tensor {:dtype :float :shape []})}]})))))
 
 (deftest terminal-arithmetic-never-borrows-a-dtype-tag-or-unowned-definition
   (let [v (source)]

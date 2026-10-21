@@ -1,10 +1,16 @@
 (ns raster.compiler.fixtures.mixed-storage
   (:require [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
+            [raster.numeric :as numeric]
             [raster.par :as par]
             [raster.ad.reverse :as reverse]))
 
 (def policy {:preserve-declared-array-storage? true})
+
+(deftm float-reduction-double-quotient
+  [values :- (Array float)] :- Double
+  (let [total (par/reduce acc (float 0.0) i 4 (numeric/+ acc (aget values i)))]
+    (/ total 2.0)))
 
 (deftm object-context-array-map
   [values :- (Array double)] :- (Array double)

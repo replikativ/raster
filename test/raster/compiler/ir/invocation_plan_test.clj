@@ -111,11 +111,18 @@
   (doseq [body ['(aget x 0) '(+ total private-capture) '(let* [total 1.0] total)]]
     (is (= :invocation-terminal-free-values
            (reason-of #(invocation/terminal-source-result (terminal-program body) terminal-context)))))
-  (doseq [value [(array-value :double 1) (scalar :float) (scalar :int)]]
+  (doseq [value [(array-value :double 1) (scalar :int)]]
     (is (= :invocation-terminal-carrier
            (reason-of #(invocation/terminal-source-result
                         (assoc-in (terminal-program 'total) [:values 'total] value)
                         terminal-context)))))
+  (let [p (assoc-in (terminal-program 'total) [:values 'total] (scalar :float))
+        contract (invocation/terminal-source-result p terminal-context)]
+    (is (= [:float] (mapv :dtype (:parameters contract))))
+    (is (identical? contract (invocation/validate-terminal-source-result! contract p terminal-context)))
+    (is (= :invocation-terminal-correspondence
+           (reason-of #(invocation/validate-terminal-source-result!
+                        (assoc-in contract [:parameters 0 :dtype] :double) p terminal-context)))))
   (is (= :unclosed-source-policy
          (reason-of #(invocation/terminal-source-result (terminal-program 'total)
                                                       (dissoc terminal-context :source-policy)))))

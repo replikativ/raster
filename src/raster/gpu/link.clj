@@ -1531,7 +1531,8 @@
         (throw (ex-info "terminal scalar export lost its exact realized resident view"
                         {:reason :link-terminal-export-view :node node}))))
     (let [arguments (mapv (fn [{:keys [node dtype]}]
-                            (let [destination (case dtype :double (double-array 1) :long (long-array 1))]
+                            (let [destination (case dtype :float (float-array 1)
+                                                     :double (double-array 1) :long (long-array 1))]
                               (gpu/download-range! (:session executable) (get node-views node)
                                                    destination {:elements 1})
                               (java.lang.reflect.Array/get destination 0))) exports)

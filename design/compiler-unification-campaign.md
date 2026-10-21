@@ -94,6 +94,38 @@ their own completion accounting; no general totality or broad CI claim follows.
 Draft #1539 at `c41be4d4` still has failed test, OpenCL and public-source emission
 contexts, with CUDA/HIP compilation not established. It remains unqualified.
 
+### October 21 Float numerical checkpoint at the terminal host boundary
+
+An unchanged-training recheck after `78a6a4bd` found a missing boundary, not a
+reason to drop the new arithmetic obligation: `local-loss`'s retained quotient
+needs its numerical Float reduction export, while terminal ports previously
+accepted only Double/Long. The four-test diagnostic gate initially reported one
+error (`:invocation-terminal-carrier` on that Float result). Its source-emission
+oracle is kept unchanged.
+
+Produced terminal ports now additionally support Float. Existing emitted physical
+output correspondence, exact dtype/one-element ABI, initialized storage, ordered
+completion and source-owner/history checks remain. Download uses a one-element
+Float array; exact Float wrapper validation precedes value extraction through
+the existing static `RT.uncheckedFloatCast(Object)` adapter. That extraction
+does not add a checked narrowing point or permit a Double input. Ordinary core
+binary arithmetic over actual Float/Double operands widens Float at the source
+call to the existing Numbers Double overload; it never widens the reduction.
+Typed scalar Float arithmetic and public Float entry ports remain unsupported
+by this rule. Explicit checked source narrowing remains independently checked.
+
+The reused capped REPL passes source-owner, terminal-owner, invocation-plan and
+unchanged training diagnostics (47 tests / 476 assertions). These include Float
+identity and noncanonical NaN payload, signed zero/infinities, exact wrapper
+refusal, checked narrowing overflow, mixed core arithmetic, typed-context refusal
+and public Float refusal. Actual OpenCL and Level Zero changed-input replays pass
+14 assertions, including exactly one Float-element download and Double host
+result comparison with the JVM. The device sums are deliberately association-
+exact; they do not claim arbitrary tree/serial Float equivalence. `local-loss`
+again emits source; `local-gradient-sum` retains the two existing quotient
+completion/count obligations. Resident training and helper-expansion ownership
+remain open, and no full-draft green or performance claim follows.
+
 ### October 21 dynamic checked-map loop qualification
 
 The checked-map schedule now proves termination/nonoverflow for an actual validated

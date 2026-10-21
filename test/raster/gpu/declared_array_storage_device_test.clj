@@ -252,6 +252,38 @@
     (run-completed-conversion-case :ocl:0)
     (opencl/opencl-skip! "completed reduction conversion on OpenCL")))
 
+(defn- run-float-terminal-export-case [target]
+  (let [input (float-array [16777216.0 0.0 0.0 0.0])
+        _ (storage/float-reduction-double-quotient input)
+        compilation (equation-first/compile #'storage/float-reduction-double-quotient
+                                            {:target target :dtype :float})
+        contract (get-in compilation [:semantic :attributes :invocation-plan :attributes :terminal-host-result])]
+    (is (= [:float] (mapv :dtype (:parameters contract))))
+    (with-open [artifact (link/instantiate-host-result! compilation [input])]
+      ;; Exact sums under every legal reduction tree; widening happens only
+      ;; after the Float checkpoint. Cancellation/association is tested apart.
+      (doseq [values [[16777216.0 0.0 0.0 0.0] [4.0 -2.0 8.0 -4.0]]]
+        (doseq [i (range 4)] (aset-float input i (float (nth values i))))
+        (let [download gpu/download-range!
+              downloads (atom [])
+              actual (with-redefs [gpu/download-range!
+                                  (fn [session source destination options]
+                                    (swap! downloads conj [(class destination) (:elements options)])
+                                    (download session source destination options))]
+                       (link/run-host-result! artifact))]
+          (is (= [[(class (float-array 0)) 1]] @downloads))
+          (is (= Double (class actual)))
+          (is (= (Double/doubleToRawLongBits (storage/float-reduction-double-quotient input))
+                 (Double/doubleToRawLongBits actual))))))))
+
+(deftest float-terminal-exports-remain-float-on-both-backends
+  (if @opencl/opencl-available?
+    (run-float-terminal-export-case :ocl:0)
+    (opencl/opencl-skip! "Float terminal exports on OpenCL"))
+  (if @gp/gpu-available?
+    (run-float-terminal-export-case :ze:0)
+    (gp/gpu-skip! "Float terminal exports on Level Zero")))
+
 (defn- run-terminal-roundtrip-case [target]
   (doseq [function [#'storage/double-reduction-float-roundtrip
                     #'storage/scaled-reduction-float-roundtrip]
