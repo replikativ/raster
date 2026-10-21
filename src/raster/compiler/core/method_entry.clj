@@ -211,6 +211,34 @@
                         {:reason :unstable-definition-proof-input})))
       true)))
 
+(defn- prepare-observed-definition-inputs! [prepare! receivers pending-only?]
+  (when-not *emission-inputs*
+    (throw (ex-info "definition preparation requires a compiler owner"
+                    {:reason :missing-definition-preparation-owner})))
+  (let [historical @*emission-inputs*
+        _ (assert-definition-inputs-current! historical)
+        _ (when-not (or (and pending-only? (nil? receivers))
+                        (and (vector? receivers) (every? var? receivers)))
+            (throw (ex-info "definition preparation requires an ordered Var selection"
+                            {:reason :invalid-definition-preparation-selection})))
+        _ (doseq [v receivers]
+            (when-not (contains? (:definition-proofs historical) v)
+              (throw (ex-info "requested preparation has no original definition observation"
+                              {:reason :unobserved-definition-preparation-input :source v}))))
+        pending (into [] (keep (fn [[v snapshot]]
+                                 (when (map? (get-in snapshot [:metadata :raster.core/jit-spec]))
+                                   v)))
+                      (:definition-proofs historical))
+        selected (cond
+                   (nil? receivers) pending
+                   pending-only? (into [] (filter (set pending)) (distinct receivers))
+                   :else (vec (distinct receivers)))]
+    ;; One batch may promote several entries. Do not expose the deliberately
+    ;; stale enclosing owner to each dependency's own compilation transaction.
+    (binding [*emission-inputs* nil]
+      (doseq [v selected] (prepare! v)))
+    (assert-definition-inputs-current! historical)))
+
 (defn prepare-pending-definition-inputs!
   "Prepare observed pending JIT receivers before publishing a long-lived artifact.
    `prepare!` is the existing non-evaluating compiler entry, not a numerical call.
@@ -222,30 +250,19 @@
    subset prepares nothing. No fresh metadata lookup supplies a missing input."
   ([prepare!] (prepare-pending-definition-inputs! prepare! nil))
   ([prepare! receivers]
-  (when-not *emission-inputs*
-    (throw (ex-info "definition preparation requires a compiler owner"
-                    {:reason :missing-definition-preparation-owner})))
-  (let [historical @*emission-inputs*
-        _ (assert-definition-inputs-current! historical)
-        _ (when (and (some? receivers)
-                     (not (and (vector? receivers) (every? var? receivers))))
-            (throw (ex-info "definition preparation requires an ordered Var selection"
-                            {:reason :invalid-definition-preparation-selection})))
-        _ (doseq [v receivers]
-            (when-not (contains? (:definition-proofs historical) v)
-              (throw (ex-info "requested preparation has no original definition observation"
-                              {:reason :unobserved-definition-preparation-input :source v}))))
-        pending (into [] (keep (fn [[v snapshot]]
-                                 (when (map? (get-in snapshot [:metadata :raster.core/jit-spec]))
-                                   v)))
-                      (:definition-proofs historical))
-        selected (if (nil? receivers) pending
-                     (into [] (filter (set pending)) (distinct receivers)))]
-    ;; One batch may promote several entries. Do not expose the deliberately
-    ;; stale enclosing owner to each dependency's own compilation transaction.
-    (binding [*emission-inputs* nil]
-      (doseq [v selected] (prepare! v)))
-    (assert-definition-inputs-current! historical))))
+   (prepare-observed-definition-inputs! prepare! receivers true)))
+
+(defn prepare-owned-definition-inputs!
+  "Explicitly prepare or renew an ordered selection of already observed receivers.
+   Unlike pending-only preparation, call `prepare!` for warm receivers too: the
+   existing bytecode owner can validate current emissions or emit NEW code from
+   still-current frozen source after an earlier callee was promoted. The callback
+   must not invoke numerical code or restamp old emissions. The producer remains
+   responsible for authenticating which receivers need preparation.
+   Original snapshots still fence the entire batch; promotion or renewal requires
+   a fresh whole-producer attempt. No local owner refresh or execution grant."
+  [prepare! receivers]
+  (prepare-observed-definition-inputs! prepare! receivers false))
 
 (defn call-with-definition-inputs
   "Own normalization and emission together for a static compiled artifact.

@@ -22,6 +22,26 @@
   (swap! cold-source-evaluations inc)
   (par/reduce acc 0.0 i count (+ acc (aget xs i))))
 
+(defonce renewal-source-evaluations (atom 0))
+
+(defn- fresh-renewal-fixture []
+  ;; Fresh declarations make the cold→warm lifecycle repeatable in one REPL.
+  ;; The caller removes this scope even when compilation or an assertion fails.
+  (let [scope (create-ns (gensym "raster.test.renewal."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm leaf [xs :- (Array double) count :- Long] :- Double
+                 (swap! raster.compiler.backend.jvm.frontend-reduction-correspondence-test/renewal-source-evaluations inc)
+                 (raster.par/reduce acc 0.0 i count (+ acc (aget xs i)))))
+        (eval '(raster.core/deftm caller [xs :- (Array double) count :- Long] :- Double
+                 (leaf xs count))))
+      {:scope scope :caller (core/resolve-deftm-var (ns-resolve scope 'caller))
+       :callee (core/resolve-deftm-var (ns-resolve scope 'leaf))}
+      (catch Throwable failure
+        (remove-ns (ns-name scope))
+        (throw failure)))))
+
 (use-fixtures :each
   (fn [run]
     (binding [entry/*emission-inputs* (atom {:static [] :values []})]
@@ -282,3 +302,54 @@
       (is (some? (entry/frontend-reduction-emission frontend original)))
       (is (= 1 (count (:producer-inputs @parent))))
       (is (entry/assert-definition-inputs-current! @parent)))))
+
+(deftest owned-preparation-renews-real-bytecode-in-callee-before-caller-order
+  (let [{scope :scope caller-source :caller leaf-source :callee} (fresh-renewal-fixture)
+        caller (receiver caller-source)
+        callee (receiver leaf-source)
+        metadata (meta leaf-source)
+        before @renewal-source-evaluations]
+    (try
+      (doseq [invalidate-caller? [false true]]
+        (core/ensure-current-owned-bytecode! caller)
+        (let [old-emission (:raster.core/bytecode-emission (meta caller))
+              old-guard (entry/prepare-emission-input-guard! old-emission)
+              attempts (atom 0) prepared (atom [])]
+          (is (nil? (:raster.core/jit-spec (meta caller))))
+          (is (= (not invalidate-caller?) (map? (:raster.core/jit-spec (meta callee)))))
+          ;; A callee promotion need not invalidate an inlined caller. Test that
+          ;; current code is retained, then invalidate a REAL imported source
+          ;; snapshot to exercise renewal rather than assuming it is necessary.
+          (when invalidate-caller?
+            (alter-meta! leaf-source assoc ::changed-before-preparation true))
+          (let [inputs
+                (binding [entry/*emission-inputs* nil]
+                  (entry/call-with-definition-inputs
+                   (fn []
+                     (swap! attempts inc)
+                     (doseq [v [callee caller]]
+                       (entry/observe-definition-input! v (:ns (meta v)) (:name (meta v))))
+                     (entry/prepare-owned-definition-inputs!
+                      (fn [v]
+                        (is (nil? entry/*emission-inputs*))
+                        (swap! prepared conj v)
+                        (core/ensure-current-owned-bytecode! v))
+                      [callee caller])
+                     @entry/*emission-inputs*)))
+                current (:raster.core/bytecode-emission (meta caller))]
+            (is (= 2 @attempts))
+            (is (= [callee caller callee caller] @prepared))
+            (is (= (not invalidate-caller?) (identical? old-emission current)))
+            (is (= (not invalidate-caller?)
+                   (identical? (:implementation old-emission) (:implementation current))))
+            (is (identical? current
+                            (get-in inputs [:definition-proofs caller :metadata :raster.core/bytecode-emission])))
+            (is (entry/assert-definition-inputs-current! inputs))
+            (is (entry/assert-emission-inputs-current! current))
+            (is (= (when invalidate-caller? :stale-emission-inputs)
+                   (try (old-guard) nil
+                        (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+            (is (= before @renewal-source-evaluations)))))
+      (finally
+        (reset-meta! leaf-source metadata)
+        (remove-ns (ns-name scope))))))

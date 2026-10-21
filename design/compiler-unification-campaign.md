@@ -266,6 +266,33 @@ from the parent definition snapshot index and confirms rejection after the query
 returns. Existing copied/foreign/cold occurrence controls remain passing. These
 are affected loaded-code receipts, not fresh-JVM or full-CI qualification.
 
+### October 21 explicit owned-definition renewal
+
+The existing preparation algorithm now serves two explicit entry points:
+pending-only preparation retains its default/all-pending and warm-skip behavior;
+owned-definition preparation requires an explicit ordered vector and asks the
+existing bytecode owner to validate or renew each selected receiver, including
+warm ones. Both validate the entire selection against original observations
+before callbacks, compile under separate ownership and check the original owner
+afterward. A changed batch requires a fresh whole-producer attempt. Neither API
+refreshes observations or acquires physical selection/execution authority.
+
+Actual emitter evidence refines the lifecycle: promoting a callee does not always
+invalidate an inlined caller. Current caller emissions remain identical. When a
+real retained helper-source dependency changes, the owner emits a new caller
+implementation from frozen source and the old emission guard rejects. Preparation
+must precede importing occurrence guards; an already-stale enclosing owner is
+rejected, not healed. Source-prefix execution remains a subsequent obligation.
+
+The reused capped REPL passes the complete affected 34 tests / 233 assertions,
+plus ordered/prefix/checked-source gates (30 tests / 208 assertions). The actual
+emitter lifecycle regression uses isolated fresh declarations and also passes two
+consecutive reruns without namespace reload (60 assertions), with no numerical
+body execution. These are loaded-code receipts, not full-CI qualification. The
+selective-preparation prerequisite PR's unit job 33178 failed during apt repository
+installation (git-core PPA HTTP 503), before tests; this is an infrastructure
+failure and does not qualify the PR for merge.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long
