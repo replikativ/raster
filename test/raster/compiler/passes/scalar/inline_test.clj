@@ -29,6 +29,56 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
 
+(deftest no-op-ad-hoisting-preserves-exact-source-occurrences
+  (let [leaf (with-meta '(helper x) {:source-marker :leaf})
+        tuple (with-meta [leaf 'x] {:source-marker :tuple})
+        source (with-meta (list 'outer leaf tuple) {:source-marker :root})
+        scoped '(let* [x ((raster.ad.reverse/value+grad (var f)) y)] x)
+        result (#'inline/hoist-nested-vg ['answer source 'scoped scoped] [source tuple])]
+    (is (false? (:changed? result)))
+    (is (identical? source (second (:bindings result))))
+    (is (identical? scoped (nth (:bindings result) 3)))
+    (is (identical? source (first (:body result))))
+    (is (identical? tuple (second (:body result))))
+    (is (identical? leaf (second (first (:body result)))))
+    (is (identical? (meta source) (meta (first (:body result)))))))
+
+(deftest real-ad-hoisting-replaces-only-the-changed-source-path
+  (let [application '((raster.ad.reverse/value+grad (var f)) x)
+        leaf '(untouched x)
+        source (with-meta (list 'outer leaf application) {:source-marker :root})
+        result (#'inline/hoist-nested-vg ['answer source] [])
+        [lifted call answer transformed] (:bindings result)]
+    (is (true? (:changed? result)))
+    (is (symbol? lifted))
+    (is (identical? application call))
+    (is (= 'answer answer))
+    (is (not (identical? source transformed)))
+    (is (identical? leaf (second transformed)))
+    (is (= lifted (nth transformed 2)))
+    (is (identical? (meta source) (meta transformed))))
+  (let [application '((raster.ad.reverse/value+grad (var f)) x)
+        result (#'inline/hoist-nested-vg ['answer application] [])]
+    (is (false? (:changed? result)))
+    (is (identical? application (second (:bindings result))))))
+
+(deftest ad-hoisting-never-evaluates-quoted-data
+  (let [application '((raster.ad.reverse/value+grad (var f)) x)]
+    (doseq [head '[quote clojure.core/quote]
+            data [application [application]]]
+      (let [quoted (with-meta (list head data) {:source-marker :data})
+            source (list 'outer quoted [quoted])
+            result (#'inline/hoist-nested-vg ['answer source 'data quoted] [quoted])]
+        (is (false? (:changed? result)))
+        (is (identical? source (second (:bindings result))))
+        (is (identical? quoted (nth (:bindings result) 3)))
+        (is (identical? quoted (first (:body result))))))
+    (let [quoted (list 'quote application)
+          result (#'inline/hoist-nested-vg ['answer (list 'outer quoted application)] [])]
+      (is (true? (:changed? result)))
+      (is (= 4 (count (:bindings result))))
+      (is (identical? quoted (second (nth (:bindings result) 3)))))))
+
 (deftest actual-inliner-retains-formal-class-import-history
   (let [name (gensym "raster.formal.qualification.")
         source (create-ns name)]

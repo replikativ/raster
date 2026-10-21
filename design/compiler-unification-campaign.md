@@ -138,6 +138,29 @@ available for that imported helper step. This is evidence for the already-open
 helper substitution/source-ownership transport, not permission to guess origins
 or use a fallback. Full RMS execution and vendor compilation remain unqualified.
 
+### October 21 preserve actual caller occurrences before helper import
+
+The helper-ownership review identified an earlier information loss:
+`hoist-nested-vg` reconstructed every ordinary call even when no AD application
+was hoisted. It now preserves a source node only when every child is the exact
+unchanged occurrence; changed paths retain their existing ordered construction
+and metadata. This is not an equality-based origin lookup or execution witness.
+The same review found and repaired an existing quote-boundary defect: syntactic
+AD applications inside quoted data must never be lifted or executed. Both quote
+spellings are opaque at the initializer and nested traversal boundaries.
+
+The inliner, source transport, source-prefix and actual JVM input-completion
+namespaces pass 75 tests / 639 assertions. Controls cover unchanged calls/vectors/
+scopes, genuine hoists with unchanged siblings, top-level applications and nested
+quoted data. Independent review found no blocker.
+
+Next, actual binding expansion must consume the exact caller occurrence, callee
+BodyImport and every positional input completion while constructing substitutions
+and binding-origin edges together. Existing argument substitution alone is not
+formal entry conversion. In particular Object-to-Long completion is not identity;
+unused arguments and normal-return completion remain separate obligations. This
+prerequisite does not by itself authorize the refused RMS allocation helper.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast
