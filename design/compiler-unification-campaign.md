@@ -84,8 +84,10 @@ bytecode coercions. Float/Double tests cover empty and shifted inputs, independe
 stable-reference values, primitive array classes, unchanged inputs and changed-data
 calls. The integrated broad-branch REPL passes 54 tests / 360 assertions, including
 its extra qualified-call reference-preservation regression. Independent review of
-the exact four-file patch found no blocker. Full exact-head CI is still required;
-this receipt is not a merge or backend-performance claim.
+the exact four-file patch found no blocker. All seven exact-head CI contexts then
+succeeded, and #1554 was squash-merged as `695c24ba` on October 21. The broader
+draft has reconciled that main ancestry without extra content changes. These
+source/compile gates are not backend-performance or full-draft acceptance claims.
 
 The unchanged-source GPU probe now gets past the reduction-initializer rewalk and
 still refuses `softmax/inv-sum` with `:uncertified-host-scalar` and
