@@ -533,6 +533,13 @@
               portable (contraction-schedule/plan-portable-body
                         contract-facts sm desc
                         {:array-types (or array-types {}) :scalar-types (or scalar-types {})})
+              _ (when (= :checked-floating-conversion (:reason portable))
+                  ;; A source-shaped leaf has no completion observer. Do not
+                  ;; generate it before the later epilogue/output guards refuse:
+                  ;; an internal checked conversion need not change output dtype.
+                  (throw (ex-info "checked contraction conversion requires an ordered host observation"
+                                  {:reason :contraction-checked-conversion-observation-required
+                                   :schedule-decline portable :fallback :none})))
               emitted (when (:ok portable)
                         (sco/generate-contraction-kernel-body (:body portable)))
               {:keys [kernel-name source array-params scalar-params abi]}

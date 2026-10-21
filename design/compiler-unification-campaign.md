@@ -95,6 +95,16 @@ widths, empty/changed inputs and null failure ordering. Packed-half scalar copyi
 remains refused. This closes that allocation mismatch, not the checked-exponential
 overflow-boundary proof or the remaining broad qualification failures.
 
+The repeated-dense-map device failure was a contract mismatch in its checkpoint
+fixtures. IEEE checkpoint cases now explicitly use `unchecked-float`, with finite
+rounding and overflow-to-infinity controls. Separate checked `float` epilogues,
+including Double-to-Float-to-Double, refuse before invoking the legacy SegMap
+emitter and retain the original portable decline. The existing final epilogue
+guard already refused these cases; no returned-artifact miscompile was established.
+Independent review found no blocker, and the affected contraction/body plus actual
+OpenCL/Level Zero gate passes 29 tests / 451 assertions. Other legacy fallback
+decline classes remain outside this bounded guarantee.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification
