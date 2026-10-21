@@ -160,12 +160,34 @@ independent fix is extracted onto main in reviewed PR #1555 (`1ee20648`); its
 exact 13 on-disk tests pass with 138 assertions in the reused REPL, and fresh CI
 is the required merge gate. It is not a fresh clean-main JVM measurement.
 
+The first fresh-CI run found an adjacent index-sibling fixture hard-coding the
+old generated name `input`, rather than consuming its returned method spec.
+PR #1555 head `3dc8ff4e` corrects the fixture while preserving direct primitive
+INVOKESTATIC, declaring-owner closure and no-reflection/no-boxing assertions.
+The corrected index namespace passes 3 tests / 23 assertions in the reused REPL;
+the clean-main hygiene declarations still pass 13 / 138. The replacement CI run
+is pending; this is not a green-main or merge receipt.
+
+An additional unchanged-stdlib MSE component test emits a fresh diagnostic module
+from the original body's exact retained input, rather than restamping an older
+REPL implementation. Its count outliner depends only on the actual `pred` array:
+lengths 0/1/17 and null behavior pass; neither target nor the mean denominator is
+invented as a count dependency. Cross-module source authentication still refuses.
+The ownership namespace passes 24 tests / 209 assertions. This is actual count
+execution over a public array, NOT full MSE scheduling, resident metadata
+projection, or enclosing `local-loss` source correspondence.
+
 The complete broad-branch targeted gate selects current on-disk declarations
 across eight ownership/input/AD namespaces, avoiding stale extra test Vars in the
 reused REPL: 124 tests / 1,483 assertions, zero failures/errors. Independent review
 covered the count/context joins, sibling refusal and shared naming repair.
 Memory pressure excluded an additional local JVM; no full-suite or performance
 claim follows.
+
+After the real MSE component and index fixture additions, the current on-disk
+gate spans nine namespaces: 128 tests / 1,514 assertions, zero failures/errors.
+The reused independent reviewer also checked both additions without a blocker;
+neither tests nor review establish full MSE scheduling or GPU admission.
 
 Executable count evaluation is NOT yet source-position scheduling or proof that
 the chosen launch domain agrees with the original count. The ordered invocation
@@ -174,6 +196,19 @@ initialization, association, result-checkpoint and box-use obligations. Public
 draft CI at `61b84139` still fails emission job 33524 on the unchanged softmax
 `inv-sum` arithmetic-completion gap. This advances items 3/5 without closing that
 continuation or the full eight-item campaign.
+
+The reviewed continuation is to reuse InvocationPlan `ScalarCompute`, not add a
+count-specific runtime: construct the whole checked count binding before seed
+evaluation at the actual reduction transformation; transport the original
+occurrence to its count/reduction interval; prepare that exact step through the
+owned count executor before generic scalar projection. Keep the signed Int count
+distinct from the nonnegative launch extent and qualify read capacity separately.
+Do not loosen SourcePrefix's flat-prefix authority to admit later regions.
+For unchanged `local-loss`, original helper-call argument/result completion and
+substitution intervals must first connect its MSE helper to the final steps:
+the original caller contains no reduction. A literal/public-count surrogate or
+the component test above cannot close this obligation. Arithmetic denial flags,
+Float checkpoints and prepared-AD import checks remain in force.
 
 ### October 21 arithmetic normal-completion conservation
 

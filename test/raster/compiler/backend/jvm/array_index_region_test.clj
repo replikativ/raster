@@ -57,7 +57,7 @@
         region (bytecode/compile-array-index-region emission read)
         spec (:spec region)
         params (:params spec)
-        call (list* 'input params)
+        call (list* (:name spec) params)
         artifact (bytecode/compile-specialized-class!
                   "raster.compiled.IndexSiblingControl"
                   [{:name 'run :params params :return-tag 'int :walked-body [call] :source-ns *ns*}
@@ -71,5 +71,6 @@
     (is (= Integer/TYPE (.getReturnType run)))
     (is (= 7 (.invoke run nil (object-array values))))
     (is (= 7 ((.invoke delayed nil (object-array values)))))
-    (is (re-find #"(?s)INVOKESTATIC.*input" code))
+    (is (re-find (re-pattern (str "(?s)INVOKESTATIC.*"
+                                 (java.util.regex.Pattern/quote (str (:name spec))))) code))
     (is (not (re-find #"reflect|IFn|Integer" code)))))

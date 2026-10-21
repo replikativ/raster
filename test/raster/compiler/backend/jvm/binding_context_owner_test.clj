@@ -425,6 +425,32 @@
     (is (instance? Double (weighted-reduction (double-array [1.0 2.0 3.0]) 2.0 count)))
     (is (instance? Float (float-reduced (float-array [1.0 2.0 3.0]) count)))))
 
+(deftest unchanged-mse-count-outlines-only-the-original-prediction-length
+  (let [source-var (core/resolve-deftm-var #'loss/mse-loss {:dtype :float})
+        receiver (ns-resolve (.ns source-var) (symbol (str (:name (meta source-var)) "-impl")))
+        _ (core/ensure-bytecode-implementation! receiver)
+        original (:raster.core/bytecode-emission (meta receiver))
+        interface (types/ensure-fn-interface! (:tags original))
+        ;; Emit the unchanged stdlib body, not a hand-written scalar-count
+        ;; surrogate. A fresh module also avoids lending new context fields to
+        ;; an older implementation already resident in a development REPL.
+        {:keys [emission]}
+        (#'core/emit-owned-bytecode!
+         bytecode/compile-typed-impl! "raster.compiled.MseCountComponent"
+         (:params original) (:tags original) (:return-tag original)
+         (:body original) (:source-ns original) (:iface-name interface) 'mse-count-component)
+        source (first (vals (:reduction-catalog emission)))
+        region (bytecode/compile-reduction-count-region emission source)]
+    (is (= :owned-bytecode-reduction-count-region (:kind region)))
+    (is (= '[pred] (:parameters region))
+        "neither target nor the mean denominator is a count dependency")
+    (is (= Integer/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+    (doseq [size [0 1 17]]
+      (is (= size (invoke-region region {'pred (float-array size)}))))
+    (is (thrown? NullPointerException (invoke-region region {'pred nil})))
+    (is (nil? (bytecode/retained-reduction-emission original source))
+        "the fresh module does not authenticate an older emission's source")))
+
 (deftest mse-source-completion-does-not-confuse-the-float-checkpoint-and-double-quotient
   (let [source-var (core/resolve-deftm-var #'loss/mse-loss {:dtype :float})
         receiver (ns-resolve (.ns source-var) (symbol (str (:name (meta source-var)) "-impl")))
