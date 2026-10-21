@@ -8,14 +8,16 @@
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
 
+;; Positive fusion fixtures explicitly request IEEE narrowing. The paired
+;; checked-float controls below retain the source exception/materialization fence.
 (def ^:private map-map-source
-  '(let* [y (raster.par/pmap i n float (* (aget x i) (aget x i)))
-          z (raster.par/pmap j n float (+ (aget y j) 1.0))]
+  '(let* [y (raster.par/pmap i n float (clojure.core/unchecked-float (* (aget x i) (aget x i))))
+          z (raster.par/pmap j n float (clojure.core/unchecked-float (+ (aget y j) 1.0)))]
          z))
 
 (def ^:private horizontal-map-source
-  '(let* [u (raster.par/pmap i n float (* (aget a i) 2.0))
-          v (raster.par/pmap j n float (+ (aget b j) 1.0))]
+  '(let* [u (raster.par/pmap i n float (clojure.core/unchecked-float (* (aget a i) 2.0)))
+          v (raster.par/pmap j n float (clojure.core/unchecked-float (+ (aget b j) 1.0)))]
          [u v]))
 
 (defn- source-program
@@ -69,11 +71,19 @@
     (is (= 1 (count (dialect/equations typed-result))))
     (is (= 'map (:kind operation)))
     (is (= '[(clojure.core/float
-              (+ (clojure.core/float (* %element0 %element0)) 1.0))]
+              (clojure.core/unchecked-float
+               (+ (clojure.core/float (clojure.core/unchecked-float (* %element0 %element0))) 1.0)))]
            (mapv projection/scalar-folds->source
                  (:body-results (dialect/lambda-parts (:lambda operation))))))
     (is (= '[n x] (:inputs (dialect/facts typed-result))))
-    (is (not (contains? (:values (dialect/facts typed-result)) 'y)))))
+    (is (not (contains? (:values (dialect/facts typed-result)) 'y)))
+    (let [{:keys [parameters body-results]} (dialect/lambda-parts (:lambda operation))
+          fused (eval (list 'fn parameters (projection/scalar-folds->source (first body-results))))
+          source (eval (list 'fn '[x n] map-map-source))]
+      (doseq [values [[1.25 -2.5 0.0] [Float/MAX_VALUE -0.0 (- Float/MAX_VALUE)]]]
+        (let [input (float-array values)]
+          (is (= (mapv #(Float/floatToRawIntBits %) (source input 3))
+                 (mapv #(Float/floatToRawIntBits (fused %)) input))))))))
 
 (deftest fusion-preserves-pointwise-storage-capacity-obligations
   (doseq [[source array-types expected]
@@ -368,9 +378,18 @@
     (is (= {:vertical 0 :horizontal 1 :iterations 2} typed-stats))
     (is (= '[u v] (nth equation 2)))
     (is (= '[%element0 %element1] (second lambda)))
-    (is (= '[(clojure.core/float (* %element0 2.0))
-             (clojure.core/float (+ %element1 1.0))]
-           (mapv projection/scalar-folds->source (:body-results region))))))
+    (is (= '[(clojure.core/float (clojure.core/unchecked-float (* %element0 2.0)))
+             (clojure.core/float (clojure.core/unchecked-float (+ %element1 1.0)))]
+           (mapv projection/scalar-folds->source (:body-results region))))
+    (let [expressions (mapv projection/scalar-folds->source (:body-results region))
+          fused (eval (list 'fn (:parameters region) expressions))
+          source (eval (list 'fn '[a b n] horizontal-map-source))
+          a (float-array [Float/MAX_VALUE -0.0 -2.5])
+          b (float-array [-1.0 Float/MAX_VALUE 0.25])
+          [left right] (source a b 3)
+          bits #(mapv (fn [x] (Float/floatToRawIntBits x)) %)]
+      (is (= (mapv (fn [a b] (bits [a b])) left right)
+             (mapv (fn [a b] (bits (fused a b))) a b))))))
 
 (deftest captured-map-fusion-has-the-certified-functional-result
   (let [source '(let* [y (raster.par/pmap i n float (* (aget x i) scale))
@@ -566,8 +585,8 @@
         (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
     (is (= {:vertical 0 :horizontal 1 :iterations 2} stats))
     (is (= ['rstr_left_local_0 'rstr_right_local_0] (mapv :id locals)))
-    (is (= '[(clojure.core/float (* %element0 2.0))
-             (clojure.core/float (+ %element1 1.0))]
+    (is (= '[(clojure.core/float (clojure.core/unchecked-float (* %element0 2.0)))
+             (clojure.core/float (clojure.core/unchecked-float (+ %element1 1.0)))]
            (mapv (comp projection/scalar-folds->source :init) locals)))
     (is (= '[rstr_left_local_0 rstr_right_local_0] body-results))
     (is (= result (dialect/validate! result)))))

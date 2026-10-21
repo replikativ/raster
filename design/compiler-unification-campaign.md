@@ -24,6 +24,13 @@ does not establish that every CI failure belongs to those categories. Freeze new
 admission families and repair these production boundaries before extending the
 helper-payload projection further.
 
+The fixed-head `fe439ca4` unit report across sixteen failed shards totals 7,306
+tests / 87,115 assertions, with 124 failures and 156 errors. Group by the first
+structured refusal and its producer, not the generic validator stack line or
+workload name. Some old positive fusion fixtures expect IEEE behavior from a
+checked source `float`; they require explicit numerical intent, not relaxed
+fusion validation. Other categories still require production repairs.
+
 The public ordered route (`90f13070`) now selects the existing owned executor only
 for reconstructed late host actions. Prefix-only programs remain concrete; source
 owners, executor coverage, role/layout/alias gates and unobserved checked-stage
@@ -94,6 +101,9 @@ OpenCL/Level Zero clone gates pass 140 tests / 876 assertions, including primiti
 widths, empty/changed inputs and null failure ordering. Packed-half scalar copying
 remains refused. This closes that allocation mismatch, not the checked-exponential
 overflow-boundary proof or the remaining broad qualification failures.
+The clone repair was independently extracted and fresh-main qualified (133 tests /
+819 assertions), then squash-merged as #1546 at `b0cef3df` after all seven exact-head
+CI checks passed.
 
 The repeated-dense-map device failure was a contract mismatch in its checkpoint
 fixtures. IEEE checkpoint cases now explicitly use `unchecked-float`, with finite
@@ -104,6 +114,19 @@ guard already refused these cases; no returned-artifact miscompile was establish
 Independent review found no blocker, and the affected contraction/body plus actual
 OpenCL/Level Zero gate passes 29 tests / 451 assertions. Other legacy fallback
 decline classes remain outside this bounded guarantee.
+
+Shared positive map/map and horizontal fusion fixtures now use the existing inner
+`unchecked-float` pattern, retaining the outer Float storage cast. Executed raw-bit
+source/fused comparisons include overflow; checked-cast no-fusion and failure-before-
+write controls remain unchanged. The focused gate passes five tests / 27 assertions.
+The full fusion namespace remains unqualified: its preceding run had 24 failures
+and nine errors, including separate terminal-frontend refusals. Do not replace a
+nil frontend program with an invented SOAC value or waive source completion.
+The internal `pmap` macro's bare-cast allocator and materializer cast tables also
+need later reconciliation with the shared descriptor/dtype authorities: putting
+`unchecked-float` directly in that cast slot currently disagrees with runtime
+storage. The existing inner-expression pattern avoids extending that inconsistent
+surface while qualification is red.
 
 #### Reviewed next vertical: source correspondence through resident training
 
