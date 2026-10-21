@@ -258,6 +258,16 @@
     (is (= {:value 12} (outcome invoke [(long 3) (long 4) output])))
     (is (= [12] (vec output)))))
 
+(deftest floating-to-integral-source-casts-are-checked-in-jit-and-aot-bytecode
+  (doseq [[source reference] [[#'checked-casts/double-to-int (fn [^double x] (long (int x)))]
+                             [#'checked-casts/double-to-long (fn [^double x] (long x))]]]
+    (let [aot (pipeline/compile-aot source :simd? false)]
+      (doseq [value [-1.9 -0.0 0.0 1.9 2147483648.0 Double/MAX_VALUE
+                     Double/NEGATIVE_INFINITY Double/POSITIVE_INFINITY Double/NaN]
+              [tier run] [[:jit @source] [:aot aot]]]
+        (is (= (outcome reference [value]) (outcome run [value]))
+            (pr-str [source tier value]))))))
+
 (deftest explicit-long-to-int-casts-are-checked-in-jit-and-aot-bytecode
   (let [jit checked-casts/declared-narrow-rows!
         aot (pipeline/compile-aot #'checked-casts/declared-narrow-rows! :simd? false)]

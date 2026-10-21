@@ -8,6 +8,32 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### October 21 checked integral source conversions
+
+Tracing reduction count obligations exposed a JVM source-cast miscompile: an
+explicit `int` or `long` of an out-of-range floating operand used a raw JVM
+coercion and silently saturated instead of throwing. Source emission now chooses
+the Clojure runtime overload from the actual emitted operand carrier. Integral
+identity/widening and checked Long-to-Int narrowing keep their existing behavior;
+Boolean uses the Object overload, void completes its effects then supplies nil,
+and divergent operands remain divergent. Operand evaluation occurs once, including
+when the result is discarded. Internal ABI coercions and unchecked casts are
+unchanged. No source-execution/projection or GPU admission is broadened.
+
+Independent review found no blocker. The serial affected five-namespace gate in
+the capped REPL passes 55 tests / 2,056 assertions, including actual primitive and
+Object overloads, reflection carrier/input validation, exceptional values,
+public invocation/AOT parity and the existing ownership/effect controls. The
+original `par/reduce` oracle confirms checked count conversion before initializer
+effects and array reads, with negative/NaN zero trips and out-of-range failure.
+The low-level matrix remains independent of full pipeline loading; public AOT
+checks reuse the existing checked-casts fixture/integration namespace.
+
+This repairs source behavior needed by the reduction contract; it does not prove
+count-to-extent correspondence, read bounds, quotient completion, prepared-AD
+import closure or end-to-end training. Those original obligations remain open.
+Full exact-head CI, including vendor compile gates, remains required before merge.
+
 ### October 21 selective definition preparation
 
 The existing producer preparation service accepts an optional ordered subset of

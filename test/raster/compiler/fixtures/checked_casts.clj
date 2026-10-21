@@ -4,6 +4,9 @@
             [raster.core :refer [deftm]]
             [raster.par]))
 
+(deftm double-to-int [x :- Double] :- Long (long (int x)))
+(deftm double-to-long [x :- Double] :- Long (long x))
+
 (deftm double-divide-to-float!
   "Retain Double arithmetic until the explicit Float materialization boundary."
   [input :- (Array float) output :- (Array float) n :- Long] :- (Array float)
