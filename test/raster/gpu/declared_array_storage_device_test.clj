@@ -9,11 +9,38 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.nn :as nn]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as link]
             [raster.gpu.runtime-backend :as backend]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.value :as value]))
+
+(defn- run-generated-clone [target]
+  (doseq [n [0 4]]
+    (let [input (float-array (take n [1.25 -2.5 -0.0 (Float/intBitsToFloat 0x7fc00001)]))
+          storage-bits #(mapv (fn [x] (Float/floatToRawIntBits x)) %)
+          artifact (compiled/instantiate!
+                    (compiled/lower #'nn/dense-backward-db [input]
+                                    {:compiler :equation-first :target target :dtype :float}))]
+      (try
+        (doseq [offset [0.0 2.0]]
+          (let [changed (float-array (map #(+ (double %) offset) input))
+                before (storage-bits changed)
+                actual (value/->host (:result (compiled/invoke-compiled artifact {:dy changed})))]
+            (is (= (storage-bits (nn/dense-backward-db changed)) (storage-bits actual)))
+            (is (= (class changed) (class actual)))
+            (is (not (identical? changed actual)))
+            (is (= before (storage-bits changed)))))
+        (finally (compiled/close! artifact))))))
+
+(deftest generated-clone-matches-jvm-on-both-local-backends
+  (if @opencl/opencl-available?
+    (run-generated-clone :ocl:0)
+    (opencl/opencl-skip! "generated clone storage on OpenCL"))
+  (if @gp/gpu-available?
+    (run-generated-clone :ze:0)
+    (gp/gpu-skip! "generated clone storage on Level Zero")))
 
 (defn- run-retired-segmap-invariants [target]
   (let [runtime (backend/runtime-namespace target)

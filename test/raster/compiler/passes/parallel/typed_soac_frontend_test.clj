@@ -124,13 +124,58 @@
   (let [source '(let* [result (clojure.core/aclone input)] result)
         options {:dtype :float :array-types {'input :float}}
         normalized (frontend/normalize-source source options)]
-    (is (some #{'raster.arrays/alloc-like} (flatten normalized)))
+    (is (some #{'clojure.core/float-array} (flatten normalized)))
+    (is (not-any? #{'raster.arrays/alloc-like} (flatten normalized))
+        "generated storage does not invent an unselected generic helper")
     (is (some #{'raster.par/map!} (flatten normalized)))
     (is (not-any? #{'clojure.core/aclone} (flatten normalized)))
     (is (= normalized (frontend/normalize-source normalized options))
         "copy normalization is stable across compiler fixpoints")
     (is (= source (frontend/normalize-source source {:dtype :float}))
         "an untyped/object clone does not acquire a guessed device representation")))
+
+(deftest generated-clone-storage-preserves-primitive-width-and-evaluation-order
+  (doseq [[storage constructor make-array values]
+          [[:float 'clojure.core/float-array float-array
+            [-0.0 1.25 -2.5 (Float/intBitsToFloat 0x7fc00001)]]
+           [:double 'clojure.core/double-array double-array
+            [-0.0 1.25 -2.5 (Double/longBitsToDouble 0x7ff8000000000001)]]
+           [:byte 'clojure.core/byte-array byte-array [-128 0 127]]
+           [:int 'clojure.core/int-array int-array [Integer/MIN_VALUE 0 Integer/MAX_VALUE]]
+           [:long 'clojure.core/long-array long-array [Long/MIN_VALUE 0 Long/MAX_VALUE]]]]
+    (let [normalized (frontend/normalize-source
+                      '(let* [result (clojure.core/aclone input)] result)
+                      {:dtype :double :array-types {'input storage}})
+          allocation (get (into {} (map vec) (partition 2 (second normalized))) 'result)
+          copy (eval (list 'fn '[input] normalized))
+          storage-bits (case storage
+                         :float #(mapv (fn [x] (Float/floatToRawIntBits x)) %)
+                         :double #(mapv (fn [x] (Double/doubleToRawLongBits x)) %)
+                         vec)]
+      (is (= constructor (first allocation)) "source storage wins over ambient precision")
+      (is (= :zero (descriptor/allocation-initialization constructor)))
+      (doseq [data [values (reverse values) []]]
+        (let [input (make-array data) output (copy input)]
+          (is (= (class input) (class output)))
+          (is (not (identical? input output)))
+          (is (= (storage-bits input) (storage-bits output))
+              "a clone preserves signed zero and NaN payloads, not just numerical values")))
+      (let [events (atom [])
+            ordered (frontend/normalize-source
+                     '(let* [before (swap! events conj :before)
+                             result (clojure.core/aclone input)
+                             after (swap! events conj :after)] result)
+                     {:dtype :double :array-types {'input storage}})
+            copy (eval (list 'fn '[input events] ordered))]
+        (is (thrown? NullPointerException (copy nil events)))
+        (is (= [:before] @events)))))
+  (is (= :half
+         (try
+           (frontend/normalize-source '(let* [result (clojure.core/aclone input)] result)
+                                      {:array-types {'input :half}})
+           nil
+           (catch clojure.lang.ExceptionInfo error (:dtype (ex-data error)))))
+      "a packed storage constructor is not a JVM scalar-copy implementation"))
 
 (deftest array-oftype-witness-is-a-typed-conversion-not-a-device-input
   (let [y (with-meta 'y {:tag 'floats :raster.type/tag 'floats})

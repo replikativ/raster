@@ -4687,11 +4687,15 @@
                                (some-> source-array types/sym-type-tag
                                        dtype/dtype-for-array-tag dtype/canon))
                            cast (some-> storage-dtype dtype/scalar-tag-for-dtype)
+                           constructor (some-> storage-dtype dtype/jvm-array-constructor)
                            index (fresh (str "rstr_copy_index_" ordinal "_"))
                            effect (fresh (str "rstr_copy_effect_" ordinal "_"))
                            extent (list 'clojure.core/alength source-array)]
-                       (if cast
-                         [destination (list 'raster.arrays/alloc-like source-array extent)
+                       (if (and cast constructor)
+                         ;; This is compiler-generated storage, not a selected
+                         ;; source helper call. Preserve its exact physical type
+                         ;; without inventing an unresolved generic alloc-like.
+                         [destination (list constructor extent)
                           effect (list 'raster.par/map! destination index extent cast
                                        (list 'clojure.core/aget source-array index))]
                          [destination expression]))
