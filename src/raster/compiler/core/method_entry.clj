@@ -792,11 +792,35 @@
       (assert-definition-inputs-current! @*emission-inputs*)
       emission)))
 
+(deftype ^:private FrontendEmissionInput [emission guard]
+  RetainedProducerInput
+  (assert-producer-current! [this]
+    (guard)
+    this))
+
+(defn- retain-frontend-emission! [emission]
+  ;; Only the exact authenticated emission from frontend-emission reaches here.
+  ;; An observation map alone cannot become a producer certificate. Deduplicate
+  ;; by module identity, never by equal code or equal dependency maps.
+  (when-not (some #(and (instance? FrontendEmissionInput %)
+                       (identical? emission (.-emission ^FrontendEmissionInput %)))
+                  (:producer-inputs @*emission-inputs*))
+    (adopt-definition-inputs!
+     {:producer-inputs [(FrontendEmissionInput.
+                         emission (prepare-emission-input-guard! emission))]})))
+
 (defn- frontend-occurrence-observation [frontend original observer & arguments]
-  (when-let [emission (frontend-emission frontend)]
-    (let [observed (apply (requiring-resolve observer) emission (:body frontend) original arguments)]
-      (assert-definition-inputs-current! @*emission-inputs*)
-      observed)))
+  (call-with-optional-definition-inputs
+   (fn []
+     (when-let [emission (frontend-emission frontend)]
+       (when-let [observed (apply (requiring-resolve observer) emission (:body frontend) original arguments)]
+         ;; Physical facts may outlive this query. Retain their entire historical
+         ;; module lineage, not just the currently selected caller's definition.
+         ;; This proves freshness only: source-import closure and execution
+         ;; permission still belong to their separate original producers.
+         (retain-frontend-emission! emission)
+         (assert-definition-inputs-current! @*emission-inputs*)
+         observed)))))
 
 (defn frontend-reduction-emission
   "Observe an unchanged frozen frontend reduction through its actual emitter.

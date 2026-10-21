@@ -241,6 +241,31 @@ requested order, duplicate collapse, warm reuse, no numerical execution, unchang
 unrequested pending inputs, empty selection, pre-callback refusal, nested ownership
 and whole-producer retry after promotion.
 
+### October 21 retained physical-observation dependencies
+
+Successful original-frontend call, binding and reduction observations now retain
+the exact authenticated emission's historical guard in their enclosing producer.
+The existing emission guard owns recursive static dependencies and nested producer
+guards; it is not reconstructed from the returned physical observation. The shared
+query boundary commits authentication, observation and retention atomically through
+the existing optional-proof transaction. Refused queries leave the original parent
+collector unchanged. Repeated queries deduplicate by exact emission identity inside
+that owner, without a global registry or shape/source-equality cache.
+
+This closes a freshness gap, not a semantic import-closure or execution gap.
+Emission maps do not currently publish preparation's source-body/unclosed-import
+obligations. Those still require their original preparation owner; a physical
+observation does not grant selected scalar execution, primitive unboxing, helper
+purity or prepared-AD closure. The training acceptance threshold is unchanged.
+
+Independent review found no blocker. Loaded-code checks in the reused capped REPL
+pass 30 tests / 178 assertions for frontend correspondence and definition
+preparation, plus 51 tests / 348 assertions for prefix/source owners and native
+aliasing. The transitive-history regression mutates a real emitted helper absent
+from the parent definition snapshot index and confirms rejection after the query
+returns. Existing copied/foreign/cold occurrence controls remain passing. These
+are affected loaded-code receipts, not fresh-JVM or full-CI qualification.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long

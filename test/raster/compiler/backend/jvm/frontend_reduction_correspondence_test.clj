@@ -232,3 +232,53 @@
       (finally (reset-meta! source metadata)))
     (is (some? (entry/frontend-invocation-context frontend original)))
     (is (some? (entry/frontend-binding-context frontend scope 0)))))
+
+(deftest successful-physical-observations-retain-transitive-module-history
+  (let [frontend (captured #'source-binding)
+        scope (first (:body frontend))
+        original (nth (second scope) 1)
+        dependency (some #(when (= #'numeric/_star__m_long_long (:var %)) (:var %))
+                         (get-in frontend [:emission :dependency-snapshots]))
+        parent (atom {:static [] :values []})]
+    (is (var? dependency) "use a real transitive input of the emitted caller")
+    (binding [entry/*emission-inputs* parent]
+      (is (some? (entry/frontend-invocation-context frontend original)))
+      (let [producer (first (:producer-inputs @parent))]
+        (is (satisfies? entry/RetainedProducerInput producer))
+        (is (some? (entry/frontend-binding-context frontend scope 0)))
+        (is (= 1 (count (:producer-inputs @parent))))
+        (is (identical? producer (first (:producer-inputs @parent))))))
+    ;; The query has returned and the request-local collector is no longer bound.
+    ;; A later consumer must still reject changes below the caller's selection.
+    (let [historical @parent metadata (meta dependency)]
+      (is (not (contains? (:definition-proofs historical) dependency)))
+      (is (entry/assert-definition-inputs-current! historical))
+      (try
+        (alter-meta! dependency assoc ::changed-after-query true)
+        (is (= :stale-emission-inputs
+               (try (entry/assert-definition-inputs-current! historical) nil
+                    (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+        (finally (reset-meta! dependency metadata)))
+      (is (entry/assert-definition-inputs-current! historical)))))
+
+(deftest refused-physical-observations-retain-no-speculative-inputs
+  (let [frontend (captured #'source-binding)
+        scope (first (:body frontend)) original (nth (second scope) 1)
+        parent (atom {:static [] :values []}) before @parent]
+    (binding [entry/*emission-inputs* parent]
+      (is (nil? (entry/frontend-invocation-context frontend (apply list original))))
+      (is (identical? before @parent))
+      (is (nil? (entry/frontend-binding-context frontend scope 1)))
+      (is (identical? before @parent))
+      (is (nil? (entry/frontend-invocation-context
+                 (assoc frontend :emission (into {} (:emission frontend))) original)))
+      (is (identical? before @parent)))))
+
+(deftest reduction-observation-uses-the-same-historical-producer-contract
+  (let [frontend (captured #'source-sum)
+        original (first (reduction-forms (:body frontend)))
+        parent (atom {:static [] :values []})]
+    (binding [entry/*emission-inputs* parent]
+      (is (some? (entry/frontend-reduction-emission frontend original)))
+      (is (= 1 (count (:producer-inputs @parent))))
+      (is (entry/assert-definition-inputs-current! @parent)))))
