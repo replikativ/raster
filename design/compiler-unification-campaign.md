@@ -126,6 +126,51 @@ again emits source; `local-gradient-sum` retains the two existing quotient
 completion/count obligations. Resident training and helper-expansion ownership
 remain open, and no full-draft green or performance claim follows.
 
+### October 21 generic inlining must preserve dispatch selection
+
+The next helper-origin investigation exposed another silent miscompile. A helper
+with only a Long method and a constant Long result correctly rejects a Double
+argument in the source program. Ordinary compilation nevertheless selected its
+sole body, erased the call, and accepted every tested Double input as an array
+program. Unknown arguments and a single registered overload are not evidence of
+method applicability.
+
+Ordinary generic inlining now branches on dispatch-table presence before reading
+backing metadata. Complete argument tuples use the same selection, priority and
+parametric specialization machinery as `try-resolve-call`; the new tag-tuple
+facade shares that implementation without fabricating source arguments. Misses,
+unknown/partial tuples and unpreserved promotion casts abstain, never fall back
+to whichever body exists. Actual selected mangled symbols come from the shared
+selector. The actual generic Var and lookup join the existing historical owner;
+normal overload publication and namespace-alias remapping invalidate old inputs
+even when the imported backing method has not changed. Rejected candidates do
+not publish their optional observations.
+
+The duplicated AD resolver is reduced separately. A single-method AD constructor
+uses the canonical public `value+grad` method-selection policy BEFORE the returned
+gradient receives arguments. That is not the ordinary runtime generic-call rule.
+Multi-method AD application selection uses the shared selector; general runtime
+parity of that specialization policy is not established here. Argument tags use
+the existing inference API rather than a symbol-only lookup. Runtime-versus-
+inlined constructor tests preserve actual Float/Double result classes and bits,
+argument failures and single evaluation.
+
+The reused capped REPL passes dispatch/inliner/inference tests (60 tests / 328
+assertions), canonical dispatch/parametric tests (17 / 130), and source-prefix,
+unchanged-training diagnostics and terminal-owner tests (45 / 544). The public
+incompatible caller is now explicitly rejected with its undevirtualized callee
+still identified; the compatible Long caller compiles and lowers to its expected
+seven-element output. This repairs method selection, not formal-completion
+proofs: even an applicable overload can require an implicit conversion, and the
+already-selected direct-call path still needs the planned expansion transaction.
+
+Exact-head CircleCI at `d86c72ac` remains red. The public emission job #33480
+specifically refuses `raster.nn/softmax`'s retained `inv-sum` (`raster.numeric//`,
+`:unclosed-source-arithmetic`, normal completion unavailable). That is a real
+remaining source-completion obligation exposed by conservation, not an
+infrastructure failure and not a reason to waive the flag. Unit and OpenCL gates
+also failed; neither CUDA nor HIP compilation is established by that run.
+
 ### October 21 dynamic checked-map loop qualification
 
 The checked-map schedule now proves termination/nonoverflow for an actual validated

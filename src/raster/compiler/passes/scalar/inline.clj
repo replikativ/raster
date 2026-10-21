@@ -338,64 +338,54 @@
               (inf/try-parametric-specialize! parent-sym tags)
               (try (resolve base-sym) (catch Exception _ nil)))))))))
 
+(defn- selected-inline-var
+  "Select a generic call through the shared inference authority, never its body
+   cache or the number of currently registered methods. Unknown/missing tuples
+   abstain. Promotion still needs explicit call completion before inlining."
+  [sym table arg-tags]
+  (when (and (vector? arg-tags) (every? some? arg-tags))
+    (let [v (resolve sym)]
+      (when-not (and (var? v) (identical? table (:raster.core/dispatch-table (meta v))))
+        (throw (ex-info "Inline selection differs from its actual generic definition"
+                        {:reason :unclosed-inline-dispatch :callee sym})))
+      (method-entry/observe-definition-input! v *ns* sym))
+    (when (and (= 1 (count @table)) (not (contains? @table (count arg-tags))))
+      (let [expected (first (keys @table))]
+        (throw (ex-info (str "Arity mismatch inlining `" sym "`: it takes " expected
+                             " arg(s) but the call passes " (count arg-tags) ".")
+                        {:callee sym :expected-arity expected :actual-arity (count arg-tags)
+                         :arg-tags arg-tags}))))
+    (when-let [signature (inf/specialize-call-signature sym arg-tags)]
+      (when-not (some some? (:promotion-casts signature))
+        (try (resolve (:mangled-sym signature)) (catch Exception _ nil))))))
+
 (defn- try-resolve-deftm
   "Try to resolve a symbol to a deftm var with an inlinable walked body.
-   When arg-tags are provided, selects the matching overload from multi-method
-   dispatch tables. Without arg-tags, only inlines single-method dispatch."
+   Generic calls require a complete argument tuple and shared dispatch selection.
+   A single registered method is not evidence it accepts the actual arguments.
+   Already-selected implementation Vars remain a separate resolution boundary."
   ([sym] (try-resolve-deftm sym nil))
   ([sym arg-tags]
-   (when (qualified-symbol? sym)
-     (let [name-str (name sym)
-           base-sym (if (.endsWith ^String name-str "-impl")
-                      (symbol (namespace sym) (subs name-str 0 (- (count name-str) 5)))
-                      sym)
-           ;; Single source of truth for inline opacity (direct + `_m_` parent).
-           dispatch-no-inline? (dispatch/no-inline? base-sym)]
-       (when-not dispatch-no-inline?
-         (when-let [v (or (try (resolve base-sym) (catch Exception _ nil))
-                          ;; Cold-compile gate: the mangled specialization does not
-                          ;; exist yet in this JVM — force it deterministically so the
-                          ;; FIRST compile behaves like every later one.
-                          (force-mangled-specialization! base-sym))]
-           (when-not (:no-inline (meta v))
-             (let [parametric-sym (symbol (namespace base-sym) (name base-sym))
-                   has-parametric? (contains? @dispatch/parametric-registry parametric-sym)]
-               (or
-                ;; For parametric (All [T]) functions, skip the var's parametric
-                ;; template body — its literals are still T-generic. Force the
-                ;; dispatch-table path so try-parametric-specialize! generates
-                ;; (or finds) a concrete entry whose body has the literal-cast-fn
-                ;; applied (e.g. `0.0` → `(float 0.0)` for T=float).
-                (when-not has-parametric?
-                  (try-resolve-walked-body v))
-                (when-let [dispatch-table (:raster.core/dispatch-table (meta v))]
-                  (let [all-methods (mapcat identity (vals @dispatch-table))
-                      ;; Type-safe overload selection with parametric specialization.
-                      ;; Single-method fallback only when function is NOT parametric
-                      ;; (i.e., the one method IS the only possible overload).
-                        match (or (when (seq arg-tags)
-                                    (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
-                                      ;; No match — try parametric specialization
-                                        (when (inf/try-parametric-specialize!
-                                               parametric-sym arg-tags)
-                                          (let [new-methods (mapcat identity
-                                                                    (vals @(:raster.core/dispatch-table (meta v))))]
-                                            (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
-                                ;; Single method fallback: safe when no other overloads exist
-                                ;; AND function is not parametric. Parametric functions
-                                ;; may need a different specialization that hasn't been
-                                ;; generated yet — inlining the only existing overload
-                                ;; (e.g. doubles) into a float pipeline causes VerifyErrors.
-                                  (when (and (= 1 (count all-methods))
-                                             (not has-parametric?))
-                                    (first all-methods)))]
-                    (when match
-                      (let [backing-sym (symbol (namespace base-sym)
-                                                (str (types/mangle (name base-sym)
-                                                                   (:tags match))))
-                            backing-var (try (resolve backing-sym) (catch Exception _ nil))]
-                        (when backing-var
-                          (try-resolve-walked-body backing-var)))))))))))))))
+   (method-entry/call-with-optional-definition-inputs
+    (fn []
+      (when (qualified-symbol? sym)
+        (let [name-str (name sym)
+              base-sym (if (.endsWith ^String name-str "-impl")
+                         (symbol (namespace sym) (subs name-str 0 (- (count name-str) 5)))
+                         sym)
+              ;; Single source of truth for inline opacity (direct + `_m_` parent).
+              dispatch-no-inline? (dispatch/no-inline? base-sym)]
+          (when-not dispatch-no-inline?
+            (when-let [v (or (try (resolve base-sym) (catch Exception _ nil))
+                             ;; Cold-compile gate: the mangled specialization does not
+                             ;; exist yet in this JVM — force it deterministically so the
+                             ;; FIRST compile behaves like every later one.
+                             (force-mangled-specialization! base-sym))]
+              (when-not (:no-inline (meta v))
+                (if-let [table (:raster.core/dispatch-table (meta v))]
+                  (when-let [selected (selected-inline-var base-sym table arg-tags)]
+                    (try-resolve-walked-body selected))
+                  (try-resolve-walked-body v)))))))))))
 
 (def ^:private alloc-sym->array-tag op/alloc-sym->array-tag)
 
@@ -978,34 +968,28 @@
                            (catch Exception _ nil)))
                        (all-ns))))]
      (when v
-       (let [;; Try direct metadata, deref'd value metadata, then dispatch table
+       (let [;; A generic constructor must resolve before importing backing metadata.
              val-meta (when (var? v) (try (meta @v) (catch Exception _ nil)))
              _ (source-owner/assert-portable-source! (meta v))
              _ (source-owner/assert-portable-source! val-meta)
-             resolved (cond
-                        (:raster.core/deftm (meta v)) v
-                        (:raster.core/deftm val-meta) @v
-                        :else (when-let [dt (:raster.core/dispatch-table (meta v))]
-                                (let [all-methods (mapcat val @dt)
-                                      has-parametric? (contains? @dispatch/parametric-registry
-                                                                 (symbol (namespace var-sym) (name var-sym)))
-                                ;; Type-safe overload selection + parametric specialization
-                                      method (or (when (seq arg-tags)
-                                                   (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
-                                                       (when (inf/try-parametric-specialize!
-                                                              (symbol (namespace var-sym) (name var-sym)) arg-tags)
-                                                         (let [new-methods (mapcat val @dt)]
-                                                           (first (filter #(= (vec arg-tags) (vec (:tags %)))
-                                                                          new-methods))))))
-                                           ;; Non-parametric single method: safe (no other overloads possible)
-                                                 (when (and (= 1 (count all-methods)) (not has-parametric?))
-                                                   (first all-methods)))
-                                      ns-obj (:ns (meta v))
-                                      mangled (when method
-                                                (symbol (str (types/mangle (:name (meta v))
-                                                                           (:tags method)))))]
-                                  (when mangled
-                                    (try (ns-resolve ns-obj mangled) (catch Exception _ nil))))))]
+             resolved (if-let [table (:raster.core/dispatch-table (meta v))]
+                        ;; AD construction selects a declared function BEFORE
+                        ;; its returned gradient is invoked. A single-method
+                        ;; constructor uses the public AD policy, even when its
+                        ;; eventual arguments are expressions of another type.
+                        ;; This does not authorize inlining an ordinary generic
+                        ;; call. Multi-method AD applications still need shared
+                        ;; dispatch selection, with no fallback after a miss.
+                        (if (= 1 (reduce + 0 (map count (vals @table))))
+                          (do
+                            (method-entry/observe-definition-input! v (:ns (meta v)) (:name (meta v)))
+                            (rcore/resolve-deftm-var v {:deref-value? true}))
+                          (selected-inline-var
+                           (symbol (str (ns-name (:ns (meta v)))) (str (:name (meta v))))
+                           table arg-tags))
+                        (cond
+                          (:raster.core/deftm (meta v)) v
+                          (:raster.core/deftm val-meta) @v))]
          (when resolved
            (let [m (meta resolved)
                  _ (source-owner/assert-portable-source! m)
@@ -1032,9 +1016,8 @@
   [vg-info & {:keys [param-env]}]
   (let [{:keys [var-sym args mode options]} vg-info
         ;; Infer arg types from param-env to select the right overload
-        arg-tags (when (and param-env (every? symbol? args))
-                   (let [tags (mapv #(get param-env %) args)]
-                     (when (every? some? tags) tags)))
+        arg-tags (let [tags (mapv #(inf/infer-arg-tag % param-env) args)]
+                   (when (every? some? tags) tags))
         deftm-info (resolve-deftm-for-ad var-sym arg-tags)]
     (when deftm-info
       (let [;; One typed AD preparation owns activity, constant data, seed widths and padded

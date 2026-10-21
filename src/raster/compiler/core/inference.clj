@@ -961,6 +961,29 @@ stable physical-leaf order on every backend."}
   [fn-sym arg-tags]
   (:signature (registered-call-selection fn-sym arg-tags)))
 
+(defn- resolve-call-signature
+  [fn-sym table arg-tags]
+  (let [specialize! (fn []
+                      (when (try-parametric-specialize! fn-sym arg-tags)
+                        (resolve-method-entry (get-dispatch-table fn-sym) arg-tags)))
+        direct (resolve-method-entry table arg-tags)
+        result (cond
+                 (and direct (parametric-fallback-entry? (:entry direct) arg-tags))
+                 (or (specialize!) direct)
+                 direct direct
+                 :else (specialize!))]
+    (method-signature fn-sym result)))
+
+(defn specialize-call-signature
+  "Use ordinary compiler dispatch for an already-inferred complete tag tuple.
+   Shares try-resolve-call's parametric/concrete priority without fabricating
+   argument forms. May instantiate a parametric specialization, never invokes
+   the function. Selection is not formal-completion or execution evidence."
+  [fn-sym arg-tags]
+  (when (and (vector? arg-tags) (every? some? arg-tags))
+    (when-let [table (get-dispatch-table fn-sym)]
+      (resolve-call-signature fn-sym table arg-tags))))
+
 (defn try-resolve-call
   "Try to resolve a deftm call to a direct mangled call.
   type-env: {sym → {:tag, :fn-info, :element}}
@@ -989,22 +1012,8 @@ stable physical-leaf order on every backend."}
                                 (when (and (seq? form) (contains? types/primitive-info (first form)))
                                   (first form))
                                 extra))
-                          arg-forms (or extra-tags (repeat nil)))
-           specialize! (fn []
-                         (when (try-parametric-specialize! fn-sym arg-tags)
-                           ;; Re-read table after specialization added the entry
-                           (resolve-method-entry (get-dispatch-table fn-sym) arg-tags)))
-           direct (resolve-method-entry table arg-tags)
-           result (cond
-                    ;; A generic parametric fallback matched concrete array args —
-                    ;; specialize to the concrete element type and prefer it.
-                    (and direct (parametric-fallback-entry? (:entry direct) arg-tags))
-                    (or (specialize!) direct)
-                    ;; Concrete/promoted match — use it directly.
-                    direct direct
-                    ;; No entry at all — try parametric specialization.
-                    :else (specialize!))]
-       (method-signature fn-sym result)))))
+                          arg-forms (or extra-tags (repeat nil)))]
+       (resolve-call-signature fn-sym table arg-tags)))))
 
 ;; ================================================================
 ;; aget/rewritten-tag inference
