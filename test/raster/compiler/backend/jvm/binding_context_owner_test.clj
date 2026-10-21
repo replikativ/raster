@@ -6,6 +6,7 @@
             [raster.par :as par]
             [raster.dl.loss :as loss]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
@@ -31,6 +32,19 @@
     (par/reduce acc (float 0.0) i cnt (clojure.core/+ acc (float (aget xs i))))
     (double cnt)))
 
+(deftm counted-steps [cnt :- Long] :- Float
+  (par/reduce acc (float 0.0) i cnt (n/+ acc (float 1.0))))
+
+(deftm count-before-initialization [events :- (Array long) cnt :- Long] :- Float
+  (par/reduce acc (float (do (aset events 1 (inc (aget events 1))) 0.0))
+    i (do (aset events 0 (inc (aget events 0))) cnt)
+    (do (aset events 2 (inc (aget events 2))) (n/+ acc (float 1.0)))))
+
+(defonce count-global-calls (atom 0))
+(defn count-sibling [_] (swap! count-global-calls inc) 0)
+(defn _plus__m_long_long [_ _] (swap! count-global-calls inc) 0)
+(defn input [value] (swap! count-global-calls inc) value)
+
 (use-fixtures :once (fn [run] (response 0.8 0.7 1.0) (run)))
 
 (defn- emitted [v]
@@ -38,6 +52,186 @@
         receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))]
     (core/ensure-bytecode-implementation! receiver)
     (:raster.core/bytecode-emission (meta receiver))))
+
+(defn- invoke-region [region environment]
+  (apply (:invoke region) (mapv environment (:parameters region))))
+
+(defn- thrown-result [run]
+  (try (run) :returned
+       (catch Throwable error [(class error) (.getMessage error)])))
+
+(deftest reduction-count-outline-preserves-checked-source-completion
+  (let [emission (emitted #'counted-steps)
+        original (first (vals (:reduction-catalog emission)))
+        observed (bytecode/retained-reduction-emission emission original)
+        region (bytecode/compile-reduction-count-region emission original)]
+    (is (= :owned-bytecode-reduction-count-region (:kind region)))
+    (is (identical? (:bound observed) (:bound-context region)))
+    (is (identical? (get-in observed [:bound :initializer])
+                    (get-in region [:input :operand])))
+    (is (contains? (:bound observed) :element-type))
+    (is (= (get-in observed [:bound :element-type]) (get-in region [:spec :element-type])))
+    (is (= Integer/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+    (is (= ['cnt] (:parameters region)))
+    (is (= Long/TYPE (first (.getParameterTypes ^java.lang.reflect.Method (:method region)))))
+    (doseq [cnt [0 1 3 -1 (long Integer/MIN_VALUE) (long Integer/MAX_VALUE)]]
+      (is (= cnt (invoke-region region {'cnt cnt}))))
+    (doseq [cnt [4294967297 Long/MAX_VALUE Long/MIN_VALUE]]
+      (let [expected (thrown-result #(counted-steps cnt))]
+        (is (not= :returned expected))
+        (is (= expected (thrown-result #(invoke-region region {'cnt cnt}))))))
+    (doseq [cnt [0 1 3 -1]]
+      (is (= (float (max 0 cnt)) (counted-steps cnt))))))
+
+(deftest reduction-count-outline-executes-only-count-effects-once
+  (let [emission (emitted #'count-before-initialization)
+        original (first (vals (:reduction-catalog emission)))
+        region (bytecode/compile-reduction-count-region emission original)]
+    (is (= #{'events 'cnt} (set (:parameters region))))
+    (is (not-any? #(contains? region %) [:pure? :replayable? :source-position? :domain-proved?]))
+    (doseq [cnt [-1 0 2]]
+      (let [events (long-array 3)]
+        (is (= cnt (invoke-region region {'events events 'cnt cnt})))
+        (is (= [1 0 0] (vec events)))))
+    (let [events (long-array 3)]
+      (is (= (float 2.0) (count-before-initialization events 2)))
+      (is (= [1 1 2] (vec events))))
+    (let [events (long-array 1)]
+      (is (= 2 (invoke-region region {'events events 'cnt 2})))
+      (is (= [1] (vec events)))
+      (is (thrown? ArrayIndexOutOfBoundsException (count-before-initialization events 2)))
+      (is (= [2] (vec events)) "the primal reaches its separate seed only after counting"))
+    (is (= (first (thrown-result #(count-before-initialization nil 2)))
+           (first (thrown-result #(invoke-region region {'events nil 'cnt 2})))))
+    (let [expected-events (long-array 3)
+          actual-events (long-array 3)
+          expected (thrown-result #(count-before-initialization expected-events Long/MAX_VALUE))]
+      (is (not= :returned expected))
+      (is (= expected (thrown-result #(invoke-region region {'events actual-events 'cnt Long/MAX_VALUE}))))
+      (is (= [1 0 0] (vec expected-events) (vec actual-events))))))
+
+(deftest reduction-count-outline-requires-joined-original-evidence
+  (let [emission (emitted #'counted-steps)
+        original (first (vals (:reduction-catalog emission)))
+        observed (bytecode/retained-reduction-emission emission original)
+        bound-key [(get-in observed [:expansion :witness]) :bound-scope]
+        path [:reduction-contexts bound-key]
+        binder (get-in observed [:bound :binder])
+        changed [(with-meta (apply list original) (meta original))]]
+    (is (= :unowned-bytecode-reduction-count-region
+           (try (bytecode/compile-reduction-count-region (emitted #'float-reduced) original) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (doseq [source changed]
+      (is (= :unowned-bytecode-reduction-count-region
+             (try (bytecode/compile-reduction-count-region emission source) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (doseq [mutated [(assoc-in emission (conj path :status) :ambiguous)
+                     (assoc-in emission (conj path :initializer) '(int 7))
+                     (assoc-in emission (conj path :binder) (with-meta (symbol (str binder)) (meta binder)))
+                     (assoc-in emission (into path [:before 'cnt :type]) :double)
+                     (update-in emission (conj path :context) dissoc :void-context)
+                     (assoc-in emission (into path [:context :object-result?]) nil)]]
+      (is (nil? (bytecode/retained-reduction-emission mutated original)))
+      (is (= :unowned-bytecode-reduction-count-region
+             (try (bytecode/compile-reduction-count-region mutated original) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest reduction-count-outline-refuses-incomplete-compiler-context
+  (let [emission (emitted #'counted-steps)
+        original (first (vals (:reduction-catalog emission)))
+        observed (bytecode/retained-reduction-emission emission original)
+        path [:reduction-contexts [(get-in observed [:expansion :witness]) :bound-scope]]]
+    (doseq [mutated [(update-in emission path dissoc :element-type)
+                     (update-in emission path dissoc :unretained-sibling-calls?)
+                     (assoc-in emission (conj path :unretained-sibling-calls?) nil)]]
+      (is (= :unowned-bytecode-reduction-count-region
+             (try (bytecode/compile-reduction-count-region mutated original) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest reduction-count-outline-does-not-rebind-original-siblings-to-globals
+  (doseq [[bound siblings]
+          [['(count-sibling cnt)
+            [{:name 'count-sibling :params [(with-meta 'cnt {:tag 'long})]
+              :return-tag 'long :walked-body '[3]
+              :source-ns (the-ns 'raster.compiler.backend.jvm.binding-context-owner-test)}]]
+           ;; Including the real mangled deftm seeds the typed sibling table.
+           ;; Its lookup uses name, so the other namespace is not a distinction.
+           ['(if (clojure.core/< cnt 0)
+               (raster.numeric/_plus__m_long_long 0 3)
+               (raster.compiler.backend.jvm.binding-context-owner-test/_plus__m_long_long cnt 3))
+            []]]]
+    (let [before @count-global-calls
+          body (list 'raster.par/reduce 'acc '(float 0.0) 'i bound
+                     '(clojure.core/+ acc (float 1.0)))
+          interface (types/ensure-fn-interface! '[long])
+          emitter (fn [& args] (apply bytecode/compile-typed-impl! (concat args [siblings])))
+          {:keys [emission implementation]}
+          (#'core/emit-owned-bytecode!
+           emitter "raster.compiled.ReductionCountSibling" '[cnt] '[long] 'float [body]
+           (the-ns 'raster.compiler.backend.jvm.binding-context-owner-test)
+           (:iface-name interface) 'count-sibling-original)
+          original (first (vals (:reduction-catalog emission)))
+          observed (bytecode/retained-reduction-emission emission original)]
+      (is (= (float 3.0) (implementation 0)))
+      (is (true? (get-in observed [:bound :unretained-sibling-calls?])))
+      (is (= :unsupported-bytecode-reduction-count-callees
+             (try (bytecode/compile-reduction-count-region emission original) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (= before @count-global-calls) "neither original execution nor outlining calls the colliding global"))))
+
+(deftest method-local-count-callee-denial-respects-quoted-data
+  (let [candidate? #'bytecode/method-local-callee-candidate?
+        context {:typed-sibling-methods {"helper" {}} :sibling-methods {"static-helper" {}}}]
+    (is (true? (candidate? '(other/helper 1) context)))
+    (is (true? (candidate? '(fn* [] (helper 1)) context)))
+    (is (true? (candidate? '(static-helper 1) context)))
+    (is (false? (candidate? '(quote (helper 1)) context)))
+    (is (false? (candidate? '(clojure.core/quote (helper 1)) context)))
+    (is (false? (candidate? '(other/static-helper 1) context)))))
+
+(deftest owned-count-outline-does-not-capture-a-global-input-function
+  (let [body '(raster.par/reduce acc (float 0.0) i (input cnt)
+                (clojure.core/+ acc (float 1.0)))
+        interface (types/ensure-fn-interface! '[long])
+        {:keys [emission implementation]}
+        (#'core/emit-owned-bytecode!
+         bytecode/compile-typed-impl! "raster.compiled.GlobalInputCount"
+         '[cnt] '[long] 'float [body]
+         (the-ns 'raster.compiler.backend.jvm.binding-context-owner-test)
+         (:iface-name interface) 'global-input-count)
+        original (first (vals (:reduction-catalog emission)))
+        before @count-global-calls
+        region (bytecode/compile-reduction-count-region emission original)]
+    (is (= before @count-global-calls) "outlining must not execute the input")
+    (is (not= "input" (.getName ^java.lang.reflect.Method (:method region))))
+    (is (= (str (get-in region [:spec :name])) (.getName ^java.lang.reflect.Method (:method region))))
+    ;; Guard the regression run against the old recursively self-capturing code.
+    (when (not= "input" (.getName ^java.lang.reflect.Method (:method region)))
+      (is (= 3 (invoke-region region {'cnt 3})))
+      (is (= (inc before) @count-global-calls))
+      (is (= (float 3.0) (implementation 3)))
+      (is (= (+ before 2) @count-global-calls)))))
+
+(deftest outlined-method-name-avoids-qualified-and-bound-source-names
+  (let [choices (atom ['taken 'bound 'fresh])
+        allocate (fn [& _] (let [choice (first @choices)] (swap! choices subvec 1) choice))
+        chosen (with-redefs [clojure.core/gensym allocate]
+                 (#'bytecode/fresh-input-method-name
+                  {:params '[parameter]
+                   :walked-body '[(let* [bound 1] (other/taken bound))]}))]
+    (is (= 'fresh chosen))
+    (is (empty? @choices))))
+
+(deftest reduction-count-outline-retains-the-entire-emission-history
+  (let [emission (emitted #'counted-steps)
+        original (first (vals (:reduction-catalog emission)))
+        region (bytecode/compile-reduction-count-region emission original)
+        dependency (some #(when (= #'n/_plus__m_float_float (:var %)) (:var %))
+                         (:dependency-snapshots emission))]
+    (is (var? dependency))
+    (with-redefs-fn {dependency (fn [& _] nil)}
+      #(is (thrown? clojure.lang.ExceptionInfo (invoke-region region {'cnt 1}))))
+    (is (= 2 (invoke-region region {'cnt 2})))))
 
 (deftest sequential-binding-facts-come-from-the-actual-owner
   (let [emission (emitted #'array-tail)

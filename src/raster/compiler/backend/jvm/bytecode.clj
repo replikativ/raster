@@ -753,6 +753,7 @@
         loop-entry (get contexts [witness :loop])
         backedge (get contexts [witness :recur])
         exit (get contexts [witness :exit])
+        bound-bindings (second (:expression bound))
         variables (:variables loop-entry)]
     (when (and (= :jvm-bytecode (:backend emission)) token witness
                (identical? original (get (:reduction-catalog emission) token))
@@ -766,8 +767,15 @@
                (= (second variables) (:value exit))
                (= (get-in loop-entry [:locals (second variables)]) (:local exit))
                (= 1 (:binding-count bound))
+               (= 'let* (first (:expression bound)))
+               (vector? bound-bindings) (= 2 (count bound-bindings))
+               (identical? (:binder bound) (first bound-bindings))
+               (identical? (:initializer bound) (second bound-bindings))
+               (completion/bytecode-operand-context? (:context bound))
                (= :int (get-in bound [:after :type]))
                (= (:after bound) (get-in loop-entry [:outer-locals (:binder bound)]))
+               (= (assoc (:before bound) (:binder bound) (:after bound))
+                  (:outer-locals loop-entry))
                (= [(nth original 3) (nth original 1)] variables)
                (= (mapv #(get (:locals loop-entry) %) variables) (:targets backedge))
                (some? (:label-id loop-entry))
@@ -987,19 +995,21 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
+(defn- physical-operand-input
+  "Describe an operand using its actual lexical ports and retained context."
+  [operand locals context]
+  (let [visible (set (keys locals))
+        free (binding [util/*shadowing-locals* visible]
+               (util/free-syms operand))]
+    {:operand operand :context context
+     ;; A logical hint does not prove a reference nonnull or an exact payload.
+     :ports (select-keys locals (filter visible free))}))
+
 (defn- retain-invocation-context!
   [method receiver arguments mode return-carrier completions locals ctx]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
-      (let [visible (set (keys locals))
-            input (fn [operand]
-                    (let [free (binding [util/*shadowing-locals* visible]
-                                 (util/free-syms operand))]
-                      {:operand operand
-                       :context (completion/bytecode-operand-context ctx)
-                       ;; :type is the ACTUAL local stack category. :hint is
-                       ;; retained for compilation, never a nonnull/Class proof.
-                       :ports (select-keys locals (filter visible free))}))
+      (let [input #(physical-operand-input % locals (completion/bytecode-operand-context ctx))
             guarded? (= mode :guarded-local-typed-interface)
             record (cond-> {:status (if guarded? :unsupported :known)
                     :method method :receiver receiver :expression (::call-expression ctx)
@@ -3627,6 +3637,23 @@
 ;; keeping emit-form itself under the 64KB method size limit).
 ;; ---------------------------------------------------------------------------
 
+(defn- method-local-callee-candidate?
+  "Conservative denial for operands whose original method-local callees are
+   not retained by the input outliner. Match the emitter's actual lookup keys;
+   this is not a function registry, dispatch proof or purity analysis."
+  [expression ctx]
+  (cond
+    (and (seq? expression) (contains? #{'quote 'clojure.core/quote} (first expression))) false
+    (completion/canonical-parts expression)
+    (method-local-callee-candidate? (:operand (completion/canonical-parts expression)) ctx)
+    :else
+    (boolean
+     (or (and (seq? expression) (symbol? (first expression))
+              (or (contains? (:typed-sibling-methods ctx) (name (first expression)))
+                  (contains? (:sibling-methods ctx) (str (first expression)))))
+         (and (coll? expression)
+              (some #(method-local-callee-candidate? % ctx) expression))))))
+
 (defn- emit-let*-handler
   "Emit bytecode for (let* [bindings...] body...).
   Handles type inference for let bindings including:
@@ -3827,10 +3854,14 @@
                                                           :verified (boolean (and tag (not= tag 'Object)))}
                                                          (= :ref t) (assoc :reference-class (or reference-class Object))))]
                             (retain-binding-context! ctx (count pairs) (dec @binding-idx) sym init locs (get new-locs sym))
-                            (retain-reduction-observation! ctx :bound-scope
-                                                           {:binder sym :initializer init :before locs
-                                                            :context (completion/bytecode-operand-context initializer-ctx)
-                                                            :after (get new-locs sym) :binding-count (count pairs)})
+                            (when (and me/*emission-inputs* (= :bound-scope (::reduction-role ctx)))
+                              (retain-reduction-observation!
+                               ctx :bound-scope
+                               {:binder sym :initializer init :before locs
+                                :context (completion/bytecode-operand-context initializer-ctx)
+                                :element-type (:element-type initializer-ctx)
+                                :unretained-sibling-calls? (method-local-callee-candidate? init initializer-ctx)
+                                :after (get new-locs sym) :binding-count (count pairs)}))
                             (when (and (System/getProperty "raster.debug.locals")
                                        (or (.startsWith (str sym) "K_")
                                            (.startsWith (str sym) "V_")
@@ -6092,6 +6123,22 @@
      :return-stack-type (:stack-type ret-jvm)
      :bytes (:bytes result)}))
 
+(defn- fresh-input-method-name
+  "A generated method must not capture a source callee named `input` (or a
+   predictable generated name). Include qualified names and lexical binders;
+   free-variable analysis alone omits both relevant classes of collision."
+  [spec]
+  (let [nodes (tree-seq
+               #(and (coll? %)
+                     (not (and (seq? %) (contains? #{'quote 'clojure.core/quote} (first %)))))
+               #(if-let [parts (completion/canonical-parts %)] [(:operand parts)] (seq %))
+               [(:params spec) (:walked-body spec)])
+        used (into #{} (keep #(when (symbol? %) (name %))) nodes)]
+    (loop [candidate (gensym "__raster_input_")]
+      (if (contains? used (name candidate))
+        (recur (gensym "__raster_input_"))
+        candidate))))
+
 (defn- compile-owned-input-region
   "Shared physical ABI, guarded compilation and invocation for owned operands.
    The caller owns the operand occurrence and its exact completion recipe."
@@ -6112,13 +6159,15 @@
                                               {:reason :bytecode-input-port-carrier
                                                :parameter parameter})))]
                     (with-meta parameter (assoc (meta parameter) :tag tag)))) parameters)
-          spec (merge {:name 'input :params physical-parameters
+          spec (merge {:params physical-parameters
                        :source-ns (:source-ns emission) ::input-port-layout ports} spec-options)
+          method-name (fresh-input-method-name spec)
+          spec (assoc spec :name method-name)
           _ (guard)
           result (binding [me/*compilation-classloader*
                            (.getClassLoader (class (:implementation emission)))]
                    (compile-specialized-class! "raster.compiled.InvocationInput" [spec]))
-          compiled-method (get-in result [:methods 'input])
+          compiled-method (get-in result [:methods method-name])
           actual-classes (vec (.getParameterTypes ^java.lang.reflect.Method compiled-method))
           _ (when-not (and (= (count parameters) (count actual-classes))
                            (every? true?
@@ -6277,6 +6326,36 @@
                     (throw (ex-info "Count region lost its owning array allocation"
                                     {:reason :unowned-bytecode-array-count-region}))))]
       (compile-raw-int-input-region emission input (:input-type input) (:element-type record) guard))))
+
+(defn ^:no-doc compile-reduction-count-region
+  "Outline only an original reduction's actual bound initializer and context.
+   The WHOLE initializer includes the source checked Int conversion; outlining
+   the naked count via raw JVM narrowing would change overflow behavior.
+
+   This executes neither the accumulator initializer nor iterations. Count
+   effects remain effects: no purity, replay, source-position scheduling or
+   launch-domain permission is granted by outlining them."
+  [emission original]
+  (let [bound (:bound (retained-reduction-emission emission original))]
+    (when-not (and bound (contains? bound :element-type)
+                   (boolean? (:unretained-sibling-calls? bound)))
+      (throw (ex-info "Count outlining requires an original owned reduction bound"
+                      {:reason :unowned-bytecode-reduction-count-region})))
+    (when-not (false? (:unretained-sibling-calls? bound))
+      (throw (ex-info "Count outlining needs the original method-local callees"
+                      {:reason :unsupported-bytecode-reduction-count-callees})))
+    (let [input (physical-operand-input (:initializer bound) (:before bound) (:context bound))
+          guard (fn []
+                  (when-not (identical? bound (:bound (retained-reduction-emission emission original)))
+                    (throw (ex-info "Count region lost its owning reduction bound"
+                                    {:reason :unowned-bytecode-reduction-count-region}))))]
+      (assoc (compile-owned-input-region
+              emission input Integer/TYPE
+              {:return-tag 'int :walked-body [(:initializer bound)]
+               :element-type (:element-type bound)
+               ::body-input-context (:context bound) ::expected-body-type :int}
+              guard)
+             :kind :owned-bytecode-reduction-count-region :bound-context bound))))
 
 (def ^:dynamic *compiling-deftms*
   "Set of deftm var symbols currently being compiled, for cycle detection."

@@ -130,6 +130,51 @@ initializers and changed-data Float results are covered. This advances the produ
 transport prerequisite of items 3/5; full draft CI and the end-to-end training
 acceptance remain outstanding.
 
+### October 21 original reduction count execution and outline hygiene
+
+The shared owned-input outliner now supports an original reduction's WHOLE
+observed count initializer, including its checked Int conversion. It reuses the
+existing physical-port compilation, context and historical guard machinery; it
+does not interpret source or add another numerical IR. Before the bound record
+can become executable, the common reduction query checks its sole binding's
+exact initializer/binder children and joins its before/after locals to the actual
+loop-entry environment. The count outline retains the full operand context and
+original element-type context, including an explicit nil. Legacy records missing
+those execution inputs refuse rather than acquire defaults.
+
+This count region runs neither accumulator initialization nor iterations. Negative
+counts remain negative; out-of-Int Long counts throw as the original checked
+conversion does instead of wrapping. Effects in a count run once, and a count
+failure precedes the original initializer's effects. Copied/foreign occurrences,
+detached initializers/locals, incomplete contexts and stale module history refuse.
+Original method-local helper dependencies are conservatively detected from the
+actual emitter's sibling tables (including namespace-insensitive typed lookup).
+They remain unsupported for this outline rather than silently resolve a same-named
+global. This is a denial check, not dispatch, purity or replay permission.
+
+The work also found a shared outliner naming hazard: a fixed generated method
+named `input` can capture a source global call of that name. Generated method
+names now avoid executable source symbol names, including qualified names and
+binders. The final spec and reflected Method use that exact chosen name. This
+independent fix is extracted onto main in reviewed PR #1555 (`1ee20648`); its
+exact 13 on-disk tests pass with 138 assertions in the reused REPL, and fresh CI
+is the required merge gate. It is not a fresh clean-main JVM measurement.
+
+The complete broad-branch targeted gate selects current on-disk declarations
+across eight ownership/input/AD namespaces, avoiding stale extra test Vars in the
+reused REPL: 124 tests / 1,483 assertions, zero failures/errors. Independent review
+covered the count/context joins, sibling refusal and shared naming repair.
+Memory pressure excluded an additional local JVM; no full-suite or performance
+claim follows.
+
+Executable count evaluation is NOT yet source-position scheduling or proof that
+the chosen launch domain agrees with the original count. The ordered invocation
+must execute it once at the original boundary and retain read-capacity,
+initialization, association, result-checkpoint and box-use obligations. Public
+draft CI at `61b84139` still fails emission job 33524 on the unchanged softmax
+`inv-sum` arithmetic-completion gap. This advances items 3/5 without closing that
+continuation or the full eight-item campaign.
+
 ### October 21 arithmetic normal-completion conservation
 
 A real public helper reproduction exposed a silent source loss: an unused helper
