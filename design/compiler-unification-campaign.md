@@ -175,6 +175,36 @@ artifacts remain stale. Independent review found no blocker. This repair and the
 following operand slice pass the six-namespace affected gate: 72 tests / 1,034
 assertions, not a broader draft qualification.
 
+### October 21 retain actual integral call-input completion
+
+Actual RMS allocation-call observations show why an identity-only shortcut is
+insufficient: array inputs perform CHECKCAST, direct row counts arrive as Long,
+and product count operands return Object before Number-to-Long ABI coercion.
+Those are observed emitter operations, not declarations or generated source casts.
+The existing owned invocation-input outliner now also supports Int/Long inputs.
+It restores physical ports and the complete saved operand context, verifies the
+original emitted carrier, then uses the same emitter coercion on method return.
+The adaptation classifier is shared with actual typed-call emission. All
+positional completion records are checked, including unused other formals;
+missing, copied, guarded, malformed or stale evidence remains refused.
+
+Tests distinguish raw Long-to-Int wrapping from explicit checked `int`, retain
+Object-to-Long null/wrong-object failures, BigInt and nonfinite Number behavior,
+once-only custom Number unboxing and operand-effect order. The existing FP path
+is preserved, and its AD consumer now explicitly requires a floating contract:
+integral outlining cannot reach floating AD derivation. Review caught and closed
+the need to validate the full four-Boolean context rather than inherit outlining
+defaults. The six affected lineage/outlining/AD namespaces pass 72 tests / 1,034
+assertions; final independent review found no blocker.
+
+This is a JVM-owned operand capability, not authority to move arguments, omit
+checks, substitute helper bodies or admit resident execution. The next expansion
+transaction still must connect actual caller/callee inputs to its constructed
+bindings. Source-owner RMS instantiation remains refused until that closes.
+Broad CI at `2bfcda0e` reports 148/172 public fixtures passing and 24 failures
+(job 33424), versus the earlier 146/172. Vendor compilation and the other red
+unit/OpenCL gates remain unqualified; no failing fixture was skipped.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast

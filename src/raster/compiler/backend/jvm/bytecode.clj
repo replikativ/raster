@@ -3086,6 +3086,12 @@
     (emit-object-value code expression locals ctx)
     (emit-form code expression locals ctx)))
 
+(defn- typed-input-adaptation [actual carrier]
+  (cond
+    (not= actual (class-type->stack carrier)) :coerce
+    (and (= actual :ref) (not= carrier Object)) :checkcast
+    :else :identity))
+
 (defn- emit-typed-call-arguments
   "Emit the actual typed invocation's inputs once, in order. Optional owner-local
    observations describe the conversion AFTER operand emission, not inferred
@@ -3095,9 +3101,7 @@
     (doseq [[argument ^Class carrier] (map vector arguments parameter-types)]
       (let [actual (emit-argument-value code argument carrier locals ctx)
             target (class-type->stack carrier)
-            adaptation (cond (not= actual target) :coerce
-                             (and (= actual :ref) (not= carrier Object)) :checkcast
-                             :else :identity)]
+            adaptation (typed-input-adaptation actual carrier)]
         (case adaptation
           :coerce (emit-coerce code actual target)
           :checkcast (.checkcast code (class-desc-of carrier))
@@ -6141,7 +6145,7 @@
                    value))}))
 
 (defn ^:no-doc compile-invocation-input-region
-  "Outline one original completed FP input using its owning bytecode emitter.
+  "Outline one original completed FP or Int/Long input using its bytecode emitter.
    Physical ports and historical guards are preserved; this is not portable
    source, a derivative rule or permission to flatten the region."
   [emission original input-index]
@@ -6153,18 +6157,46 @@
       (throw (ex-info "Input outlining requires an original owned invocation occurrence"
                       {:reason :unowned-bytecode-input-region :input-index input-index})))
     (let [^java.lang.reflect.Method method (:method record)
-          carrier (nth (vec (.getParameterTypes method)) input-index)
-          contract (completion/bytecode-floating-input-contract carrier (:context input))
+          carriers (when (instance? java.lang.reflect.Method method)
+                     (vec (.getParameterTypes method)))
+          completions (:input-completions record)
+          _ (when-not (and (vector? completions)
+                           (= (count carriers) (count (:inputs record)) (count completions))
+                           (every? true?
+                                   (map (fn [original completed carrier]
+                                          (let [actual (:emitted-type completed)]
+                                            (and (identical? (:operand original) (:operand completed))
+                                                 (completion/bytecode-operand-context? (:context original))
+                                                 (identical? carrier (:parameter-carrier completed))
+                                                 (contains? #{:ref :long :int :float :double :bool} actual)
+                                                 (= (typed-input-adaptation actual carrier)
+                                                    (:adaptation completed)))))
+                                        (:inputs record) completions carriers)))
+              (throw (ex-info "Input outlining requires its complete actual positional conversions"
+                              {:reason :unclosed-bytecode-input-completion :input-index input-index})))
+          carrier (nth carriers input-index)
+          completed (nth completions input-index)
+          integral? (contains? #{Integer/TYPE Long/TYPE} carrier)
+          contract (when-not integral?
+                     (completion/bytecode-floating-input-contract carrier (:context input)))
           guard (fn []
                   (when-not (identical? record (retained-invocation-context emission original))
                     (throw (ex-info "Input region lost its owning invocation"
                                     {:reason :unowned-bytecode-input-region}))))]
       (assoc (compile-owned-input-region
               emission input carrier
-              {:return-tag (if (= carrier Double/TYPE) 'double 'float)
-               :walked-body [(completion/complete-value contract (:operand input))]
-               :element-type (:element-type record)} guard)
-             :input-contract contract))))
+              (if integral?
+                ;; The original operand first produces its observed JVM carrier.
+                ;; The method return then uses the SAME emit-coerce as the call
+                ;; input. In particular this is not a checked source int/long cast.
+                {:return-tag (if (= carrier Long/TYPE) 'long 'int)
+                 :walked-body [(:operand input)] :element-type (:element-type record)
+                 ::body-input-context (:context input)
+                 ::expected-body-type (:emitted-type completed)}
+                {:return-tag (if (= carrier Double/TYPE) 'double 'float)
+                 :walked-body [(completion/complete-value contract (:operand input))]
+                 :element-type (:element-type record)}) guard)
+             :input-contract contract :input-completion completed))))
 
 (defn ^:no-doc compile-terminal-result-region
   "Outline the exact observed outer lexical tail, excluding its initializers.

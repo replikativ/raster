@@ -3,6 +3,7 @@
             [clojure.set :as set]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.types :as types]
             [raster.core :as core :refer [deftm]]
             [raster.arrays :as arrays]
             [raster.numeric :as n]))
@@ -26,6 +27,10 @@
   (unused-input-helper x xs))
 (deftm nested-input-call [x :- Double] :- Double
   (scalar-helper (scalar-helper x)))
+(deftm long-input-helper [value :- Long] :- Long value)
+(deftm int-input-helper [value :- Integer] :- Integer value)
+(deftm long-input-template [value :- Long] :- Long (long-input-helper value))
+(deftm int-input-template [value :- Integer] :- Integer (int-input-helper value))
 
 (use-fixtures :once
   (fn [run]
@@ -50,6 +55,108 @@
   (filter #(= 'raster.compiler.backend.jvm.invocation-context-owner-test/scalar-helper
               (:raster.op/original (meta %)))
           (vals (:invocation-catalog emitted))))
+
+(defn- integral-input-owner [variant]
+  (let [[template tags operand]
+        (case variant
+          :long-int [#'int-input-template '[long] 'value]
+          :checked-int [#'int-input-template '[long] '(clojure.core/int value)]
+          :object-long [#'long-input-template '[Object] 'value]
+          :ordered-object-long [#'long-input-template '[Object Object]
+                                '(do (swap! events conj :operand) value)])
+        params (if (= 2 (count tags)) '[value events] '[value])
+        source (core/resolve-deftm-var template)
+        walked (core/ensure-walked-body! source)
+        call (first (filter #(and (seq? %) (= '.invk (first %))) (tree-seq coll? seq walked)))
+        _ (assert call "fixture needs a walker-selected typed helper call")
+        body (with-meta (list (first call) (second call) operand) (meta call))
+        interface (types/ensure-fn-interface! tags)
+        emitted (:emission
+                 (#'core/emit-owned-bytecode!
+                  bytecode/compile-typed-impl! "raster.compiled.IntegralInputOriginal"
+                  params tags 'Object [body]
+                  (the-ns 'raster.compiler.backend.jvm.invocation-context-owner-test)
+                  (:iface-name interface) 'integral-input))
+        calls (filter #(bytecode/retained-invocation-context emitted %)
+                      (vals (:invocation-catalog emitted)))]
+    (is (= 1 (count calls)))
+    {:emission emitted :call (first calls)}))
+
+(defn- input-outcome [f & arguments]
+  (try [:value (apply f arguments)] (catch Throwable error [:error (class error)])))
+
+(deftest integral-outlining-keeps-raw-narrowing-distinct-from-checked-source-casts
+  (doseq [[source adaptation] [[:long-int :coerce] [:checked-int :identity]]]
+    (let [{:keys [emission call]} (integral-input-owner source)
+          region (bytecode/compile-invocation-input-region emission call 0)
+          original (:implementation emission)]
+      (is (= adaptation (get-in region [:input-completion :adaptation])))
+      (is (= Integer/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+      (is (nil? (:input-contract region)) "integral outlining grants no floating AD contract")
+      (doseq [value [0 1 -1 Integer/MIN_VALUE Integer/MAX_VALUE 2147483648 Long/MIN_VALUE Long/MAX_VALUE]]
+        (is (= (input-outcome original (long value))
+               (input-outcome (:invoke region) (long value)))))
+      (is (= (if (= source :long-int) [:value Integer/MIN_VALUE] [:error ArithmeticException])
+             (input-outcome original 2147483648))))))
+
+(deftest object-long-outlining-preserves-number-unboxing-and-operand-order
+  (let [{:keys [emission call]} (integral-input-owner :object-long)
+        region (bytecode/compile-invocation-input-region emission call 0)
+        original (:implementation emission)]
+    (is (= :ref (get-in region [:input-completion :emitted-type])))
+    (is (= :coerce (get-in region [:input-completion :adaptation])))
+    (is (= Long/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+    (doseq [value [nil "not a number" 7 3.75 3.75M 9223372036854775808N
+                   Double/NaN Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+      (is (= (input-outcome original value) (input-outcome (:invoke region) value))))
+    (doseq [run [original (:invoke region)]]
+      (let [events (atom [])
+            value (proxy [Number] []
+                    (intValue [] 0) (floatValue [] (float 0.0)) (doubleValue [] 0.0)
+                    (longValue [] (swap! events conj :unbox) (long 23)))]
+        (is (= 23 (run value)))
+        (is (= [:unbox] @events)))))
+  (let [{:keys [emission call]} (integral-input-owner :ordered-object-long)
+        region (bytecode/compile-invocation-input-region emission call 0)]
+    (doseq [run [(:implementation emission) (:invoke region)] value [7 nil]]
+      (let [events (atom [])]
+        (is (= (if value [:value 7] [:error NullPointerException])
+               (input-outcome run value events)))
+        (is (= [:operand] @events))))))
+
+(deftest integral-outlining-requires-complete-owned-positional-evidence
+  (let [{:keys [emission call]} (integral-input-owner :object-long)
+        token (::bytecode/call-occurrence (meta call))
+        path [:invocation-contexts token :input-completions]
+        region (bytecode/compile-invocation-input-region emission call 0)]
+    (doseq [changed [(update-in emission [:invocation-contexts token] dissoc :input-completions)
+                     (assoc-in emission path [])
+                     (assoc-in emission (conj path 0 :operand) 'foreign)
+                     (assoc-in emission (conj path 0 :parameter-carrier) Integer/TYPE)
+                     (assoc-in emission (conj path 0 :adaptation) :identity)
+                     (assoc-in emission [:invocation-contexts token :inputs 0 :context] nil)
+                     (assoc-in emission [:invocation-contexts token :inputs 0 :context :object-result?]
+                               :not-a-boolean)]]
+      (is (= :unclosed-bytecode-input-completion
+             (try (bytecode/compile-invocation-input-region changed call 0) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (is (= :unowned-bytecode-input-region
+           (try (bytecode/compile-invocation-input-region
+                 emission (with-meta (apply list call) (meta call)) 0) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :unowned-bytecode-input-region
+           (try (bytecode/compile-invocation-input-region
+                 (assoc-in emission [:invocation-contexts token :status] :unsupported) call 0) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :bytecode-input-result-carrier
+           (try (bytecode/compile-invocation-input-region
+                 (-> emission (assoc-in (conj path 0 :emitted-type) :long)
+                     (assoc-in (conj path 0 :adaptation) :identity)) call 0) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (let [dependency (:var (first (:dependency-snapshots emission)))]
+      (is (var? dependency))
+      (with-redefs-fn {dependency (fn [& _] :stale)}
+        #(is (thrown? clojure.lang.ExceptionInfo ((:invoke region) 1)))))))
 
 (deftest actual-emission-distinguishes-equal-call-occurrences
   (let [emitted (emission #'duplicate-calls)
@@ -114,7 +221,19 @@
     (is (= [Double/TYPE (class (double-array 0))] (mapv :parameter-carrier completions)))
     (is (= [:identity :checkcast] (mapv :adaptation completions)))
     (is (every? true? (map #(identical? (:operand %1) (:operand %2))
-                          (:inputs record) completions)))))
+                          (:inputs record) completions)))
+    (is (= :unclosed-bytecode-input-completion
+           (try (bytecode/compile-invocation-input-region
+                 (update-in emitted [:invocation-contexts (::bytecode/call-occurrence (meta call))
+                                     :input-completions] pop) call 0) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "a valid requested input cannot hide a missing unused formal")
+    (is (= :unclosed-bytecode-input-completion
+           (try (bytecode/compile-invocation-input-region
+                 (assoc-in emitted [:invocation-contexts (::bytecode/call-occurrence (meta call))
+                                    :input-completions 1 :parameter-carrier] Object) call 0) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "outlining the first formal still validates the second formal's carrier")))
 
 (deftest nested-input-completions-belong-to-their-own-invocations
   (let [emitted (emission #'nested-input-call)

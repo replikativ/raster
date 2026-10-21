@@ -65,7 +65,9 @@
   [emitter-context]
   (into {} (map (fn [key] [key (boolean (get emitter-context key))])) bytecode-operand-context-keys))
 
-(defn- bytecode-operand-context? [context]
+(defn ^:no-doc bytecode-operand-context?
+  "Validate the complete retained operand context, never outlining defaults."
+  [context]
   (and (map? context) (= (set bytecode-operand-context-keys) (set (keys context)))
        (every? boolean? (vals context))))
 

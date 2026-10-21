@@ -7048,7 +7048,11 @@
         operand (get-in region [:input :operand])
         child (nested emission original input-index)
         ports (:physical-ports region)]
-    (when-not (and child
+    ;; General operand outlining also supports integral ABI conversions. That
+    ;; physical capability is not permission to differentiate an integer input.
+    (when-not (and (contains? #{Float/TYPE Double/TYPE}
+                             (get-in region [:input-contract :target-carrier]))
+                   child
                    (map? declarations) (= (set (keys ports)) (set (keys declarations)))
                    (vector? active-ports) (= (count active-ports) (count (distinct active-ports)))
                    (every? #(contains? ports %) active-ports)
