@@ -61,6 +61,40 @@ immediate continuation remains the local source/semantic ownership repair, then
 content-aware prepared replay and encoded/ragged composition qualification. No
 SM100, Ascend, model download or cloud dependency enters the hot development loop.
 
+### October 21 typed reduction identity and rewalk qualification
+
+Focused PR #1554 (`0b839b48`, based on main `5baa8b30`) replaces the
+softmax maximum seed with the existing typed `neg-inf-val` helper. The former
+Float specialization retained checked `(float ##-Inf)`: ordinary Clojure rejects
+that conversion even if an unchecked bytecode conversion masks it. The new source
+does not read an element to select its identity, so empty inputs remain valid.
+Explicit checked Float narrowing is not weakened.
+
+Inlining this helper exposed an independent information-loss issue: the reduction
+walker inferred an accumulator type but retained it only on the form, not its
+binder. A subsequent walk after initializer lowering could no longer recover it.
+The fix uses the existing symbol metadata helper to retain that same logical type
+on the binder. It adds neither static-field inference nor a softmax special case;
+logical type retention still cannot stand in for physical-carrier evidence.
+
+Fresh capped clean-main JVM qualification: `raster.nn-test` and
+`raster.compiler.core.walker-test`, 53 tests / 356 assertions, zero failures/errors.
+The retained-source oracle uses ordinary Clojure evaluation independently of Raster
+bytecode coercions. Float/Double tests cover empty and shifted inputs, independent
+stable-reference values, primitive array classes, unchanged inputs and changed-data
+calls. The integrated broad-branch REPL passes 54 tests / 360 assertions, including
+its extra qualified-call reference-preservation regression. Independent review of
+the exact four-file patch found no blocker. Full exact-head CI is still required;
+this receipt is not a merge or backend-performance claim.
+
+The unchanged-source GPU probe now gets past the reduction-initializer rewalk and
+still refuses `softmax/inv-sum` with `:uncertified-host-scalar` and
+`:unclosed-source-arithmetic`. The next completion obligation is transporting
+actual source-owned producer/checkpoint evidence into scalar FP consumers after
+reductions, preserving their original evaluation position. Conditional reduction
+value correspondence must not silently prove loop counts, read bounds, argument
+evaluation or safe box erasure. No arithmetic flag is waived by this source fix.
+
 ### October 21 arithmetic normal-completion conservation
 
 A real public helper reproduction exposed a silent source loss: an unused helper
