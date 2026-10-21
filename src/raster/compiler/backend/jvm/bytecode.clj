@@ -5862,6 +5862,22 @@
      :return-stack-type (:stack-type ret-jvm)
      :bytes (:bytes result)}))
 
+(defn- fresh-input-method-name
+  "A generated method must not capture a source callee named `input` (or a
+   predictable generated name). Include qualified names and lexical binders;
+   free-variable analysis alone omits both relevant classes of collision."
+  [spec]
+  (let [nodes (tree-seq
+               #(and (coll? %)
+                     (not (and (seq? %) (contains? #{'quote 'clojure.core/quote} (first %)))))
+               #(if-let [parts (completion/canonical-parts %)] [(:operand parts)] (seq %))
+               [(:params spec) (:walked-body spec)])
+        used (into #{} (keep #(when (symbol? %) (name %))) nodes)]
+    (loop [candidate (gensym "__raster_input_")]
+      (if (contains? used (name candidate))
+        (recur (gensym "__raster_input_"))
+        candidate))))
+
 (defn- compile-owned-input-region
   "Shared physical ABI, guarded compilation and invocation for owned operands.
    The caller owns the operand occurrence and its exact completion recipe."
@@ -5882,13 +5898,15 @@
                                               {:reason :bytecode-input-port-carrier
                                                :parameter parameter})))]
                     (with-meta parameter (assoc (meta parameter) :tag tag)))) parameters)
-          spec (merge {:name 'input :params physical-parameters
+          spec (merge {:params physical-parameters
                        :source-ns (:source-ns emission) ::input-port-layout ports} spec-options)
+          method-name (fresh-input-method-name spec)
+          spec (assoc spec :name method-name)
           _ (guard)
           result (binding [me/*compilation-classloader*
                            (.getClassLoader (class (:implementation emission)))]
                    (compile-specialized-class! "raster.compiled.InvocationInput" [spec]))
-          compiled-method (get-in result [:methods 'input])
+          compiled-method (get-in result [:methods method-name])
           actual-classes (vec (.getParameterTypes ^java.lang.reflect.Method compiled-method))
           _ (when-not (and (= (count parameters) (count actual-classes))
                            (every? true?
