@@ -537,15 +537,7 @@
                               (or (contains? '#{quote clojure.core/quote} (first expression))
                                   (form/introduces-scope? expression)
                                   (form/binding-form? expression))))
-        rebuild (fn [original children]
-                  ;; A no-op AD search must not erase exact caller occurrences
-                  ;; before helper import/substitution can observe them. Only
-                  ;; actual child replacement constructs a new source node.
-                  (if (and (= (count original) (count children))
-                           (every? true? (map identical? original children)))
-                    original
-                    (with-meta (if (vector? original) (vec children) (apply list children))
-                      (meta original))))
+        rebuild util/remake-if-changed
         lift-in (fn lift-in [expr]
                   ;; walk expr; lift nested vg apps. `expr` is NEVER the top-level
                   ;; init here (caller passes children), so any vg-app found is nested.

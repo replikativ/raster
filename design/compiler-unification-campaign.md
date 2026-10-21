@@ -130,6 +130,34 @@ initializers and changed-data Float results are covered. This advances the produ
 transport prerequisite of items 3/5; full draft CI and the end-to-end training
 acceptance remain outstanding.
 
+### October 21 no-op source reconstruction through region-copy lowering
+
+Actual REPL phase instrumentation found that preserving only type-elaboration
+edges was insufficient: region-copy rebuilt every call even when it expanded no
+copy. A shared `util/remake-if-changed` now preserves seq/vector occurrences only
+when ordered child OBJECTS and count are unchanged. Equal symbols with different
+type metadata rebuild; original collection kind and metadata are retained. The
+AD application hoister reuses this helper instead of its duplicate implementation.
+Region-copy reuses actual control-head symbols and its original binding vector
+when unchanged, while rebuilding ancestors of real copy expansions.
+
+The traversal also now treats quote/core-quote as opaque in both value and
+statement contexts, and leaves empty `(do)` empty (nil) rather than constructing
+`(do do)`. These are source semantics corrections, not source-proof defaults.
+No permission for changed copy nodes, array aliases, bounds or metadata-only
+equivalence is added.
+
+Three affected namespaces pass 77 tests / 421 assertions; the ten ownership/AD
+namespaces separately retain 135 / 1,572, and existing copy complete-write
+coverage passes 1 / 8, all in the reused capped REPL. Independent review found
+no blocker. A diagnostic construction-edge map at actual type-tagging returns
+now reaches the real flat-binding helper builder with authenticated original
+caller, authenticated callee import and identical argument occurrences. Without
+the no-op region-copy repair the caller chain was missing. This diagnostic map
+grants no production admission. The next connected implementation must retain
+the actual type-elaboration edge and consume helper intervals in source-prefix
+validation and original source execution; it must not infer provenance by names.
+
 ### October 21 shared operand outlining retains original method dependencies
 
 A real same-class sibling/global collision reproduced wrong execution in an

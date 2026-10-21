@@ -7,6 +7,51 @@
   (with-meta (apply list '.invk 'raster.arrays/acopy!_m_floats_long_floats_long_long-impl arguments)
     {:raster.op/original 'raster.arrays/acopy! :raster.type/tag 'floats :tag 'floats}))
 
+(deftest no-copy-traversal-retains-exact-source-occurrences
+  (let [source (with-meta '(let* [size (helper input)]
+                            (do (if flag (left size) (right size))
+                                (dotimes [i size] (touch i))
+                                (raster.par/map-void! row size (touch row))
+                                size))
+                 {:line 19 :raster.type/tag 'long})
+        result (region-copy/expand-region-copies source)]
+    (is (= {:region-copies-expanded 0} (:stats result)))
+    (is (identical? source (:form result)))
+    (is (identical? (second source) (second (:form result))))))
+
+(deftest changed-copy-preserves-unrelated-call-occurrences-and-source-metadata
+  (let [kept (with-meta '(identity n) {:tag 'long})
+        source (with-meta (list 'let* ['kept kept
+                                       'effect '(java.lang.System/arraycopy src 0 dst 0 n)]
+                                'dst)
+                 {:line 29})
+        result (region-copy/expand-region-copies source)
+        lowered (:form result)
+        execute (eval (list 'fn '[src dst n] lowered))]
+    (is (= {:region-copies-expanded 1} (:stats result)))
+    (is (not (identical? source lowered)))
+    (is (identical? kept (second (second lowered))))
+    (is (identical? (meta source) (meta lowered)))
+    (doseq [n [0 1 3]]
+      (let [src (double-array [2.0 4.0 8.0])
+            expected (double-array [-1.0 -1.0 -1.0])
+            actual (aclone expected)]
+        (System/arraycopy src 0 expected 0 n)
+        (is (identical? actual (execute src actual n)))
+        (is (= (vec expected) (vec actual)))))))
+
+(deftest quoted-copies-are-data-and-empty-do-is-still-empty
+  (doseq [head ['quote 'clojure.core/quote]]
+    (let [quoted (list head '(do (java.lang.System/arraycopy src 0 dst 0 n) dst))]
+      (doseq [source [quoted (list 'do quoted nil)]]
+        (let [result (region-copy/expand-region-copies source)]
+          (is (zero? (get-in result [:stats :region-copies-expanded])))
+          (is (identical? source (:form result)))))))
+  (let [source '(do)
+        result (:form (region-copy/expand-region-copies source))]
+    (is (identical? source result))
+    (is (nil? (eval result)))))
+
 (deftest a-copy-per-row-is-a-nested-store-loop
   ;; linear's bias prefill: one acopy! per batch row, in the body of a dotimes
   (let [form (list 'let* ['_ (list 'dotimes '[i batch]
