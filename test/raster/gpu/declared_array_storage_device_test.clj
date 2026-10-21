@@ -251,6 +251,39 @@
     (run-completed-conversion-case :ocl:0)
     (opencl/opencl-skip! "completed reduction conversion on OpenCL")))
 
+(defn- run-terminal-roundtrip-case [target]
+  (doseq [function [#'storage/double-reduction-float-roundtrip
+                    #'storage/scaled-reduction-float-roundtrip]
+          n [0 1]]
+    (let [scaled? (= function #'storage/scaled-reduction-float-roundtrip)
+          input (double-array (take n [16777217.0]))
+          ;; Settle the oracle's lazy JIT before compilation freezes its source
+          ;; owner; executing the reference must not mutate that owner mid-replay.
+          _ (function input)
+          compilation (equation-first/compile function
+                                              (merge storage/policy {:target target :dtype :double}))]
+      (with-open [artifact (link/instantiate-host-result! compilation [input])]
+        (doseq [value [16777217.0 16777219.0]]
+          (when (= 1 n) (aset-double input 0 value))
+          (let [actual (link/run-host-result! artifact)
+                expected (function input)]
+            (is (= Double (class actual)))
+            (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual)))
+            (when (and (= 1 n) (= 16777217.0 value))
+              (is (= (if scaled? 25165826.0 16777216.0) actual)
+                  "the completed Float checkpoint survives widening"))))
+        (when (= 1 n)
+          (aset-double input 0 Double/MAX_VALUE)
+          (is (thrown? IllegalArgumentException (link/run-host-result! artifact))))))))
+
+(deftest checked-terminal-roundtrips-preserve-rounding-and-overflow
+  (if @opencl/opencl-available?
+    (run-terminal-roundtrip-case :ocl:0)
+    (opencl/opencl-skip! "checked terminal roundtrips on OpenCL"))
+  (if @gp/gpu-available?
+    (run-terminal-roundtrip-case :ze:0)
+    (gp/gpu-skip! "checked terminal roundtrips on Level Zero")))
+
 (defn- run-scalar-gradient-case [target]
   (doseq [n [0 3 2049]]
     (let [x (double-array (take n (cycle [1.5 -2.0 0.25])))

@@ -645,8 +645,9 @@
                                                          (first (:results consumer))))))
            :when (fusible-equation? program (:id producer))
            :when (fusible-equation? program (:id consumer))
-           ;; A direct Float/Double conversion cannot trap or observe memory. It can move
-           ;; across pure SSA equations, but never across a physical effect/alias boundary.
+           ;; Only conversions which pass the independent fusibility/completion
+           ;; gates above may move across pure SSA equations, never a physical
+           ;; effect/alias boundary. A source Double-to-Float cast can trap.
            ;; Nontrivial scalar epilogues retain the existing adjacent-only policy.
            :when (or (= consumer-index (inc producer-index))
                      (and (scalar-region/completed-floating-conversion?

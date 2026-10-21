@@ -128,6 +128,31 @@ need later reconciliation with the shared descriptor/dtype authorities: putting
 storage. The existing inner-expression pattern avoids extending that inconsistent
 surface while qualification is red.
 
+Fresh terminal-roundtrip qualification exposed a missing execution root, not a
+reason to weaken owner coverage. A removable scalar reduction extent was retained
+as a host-only graph-shape proof equation, but no buffer shape used it and prefix
+pruning omitted its evaluator. Prefix construction now roots only results whose
+equations already have literal-true `:host-only` and `:graph-shape-definition`.
+Canonical source correspondence, dependency pruning and executor checks remain
+unchanged. The fresh-process gate passes eight tests / 135 assertions, including
+actual OpenCL/Level Zero direct and scaled Double-to-Float-to-Double checkpoints,
+zero rows, changed replay, overflow/publication and existing checked-prefix controls.
+The complete affected invocation/source-order/terminal-owner namespaces also pass
+46 tests / 310 assertions; neither receipt qualifies the whole draft.
+The source oracle is JIT-settled before its owner is captured; an earlier warm REPL
+also retained an obsolete fixture signature, so only the fresh receipt qualifies.
+
+Next terminal extension, kept separate: distinguish numerical-result exports from
+public scalar argument ports. Current terminal ports are all downloaded device
+exports; merely allowing a free public symbol would be unsound. Establish the
+authenticated original public parameter order/carriers before building the
+terminal contract, rederive the two origins at validation/owner compilation, and
+bind public scalars from validated invocation arguments without device copying.
+Initially bound this to Double/Long plus at least one numerical dependency;
+refuse arrays, arbitrary captures and shadowed/private identities. Gate ordinal
+tampering, carriers, owner invalidation, changed inputs, zero rows and overflow.
+No public-scalar terminal support is claimed by the constant-scale oracle above.
+
 #### Reviewed next vertical: source correspondence through resident training
 
 This is the October 20 planning checkpoint, not a new implementation or qualification

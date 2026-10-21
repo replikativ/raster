@@ -7,6 +7,7 @@
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.mixed-storage :as mixed-storage]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.dialects :as dialects]
@@ -40,6 +41,34 @@
             [raster.numeric :as numeric]
             [raster.nn :as nn]
             [raster.ode.pde :as pde]))
+
+(deftest scalar-reduction-domain-retains-one-host-shape-executor
+  (let [compilation (equation-first/compile #'mixed-storage/double-reduction-float-result
+                                           (merge mixed-storage/policy {:target :ocl:0 :dtype :double}))
+        semantic (:semantic compilation)
+        plan (get-in semantic [:attributes :invocation-plan])
+        equation (first (:equations semantic))
+        result (first (:results equation))
+        step (first (:steps plan))
+        public (mapv :symbol (:parameters plan))
+        prefix #(#'route/invocation-prefix % public (:values %))]
+    (is (true? (get-in equation [:attributes :host-only])))
+    (is (true? (get-in equation [:attributes :graph-shape-definition])))
+    (is (empty? (:operations equation)))
+    (is (= [] (get-in semantic [:values (first (:outputs semantic)) :shape])))
+    (is (= 1 (count (:steps plan))))
+    (is (invocation/shape-projection? step))
+    (is (= result (:symbol step)))
+    (is (= :long (get-in step [:value :dtype])))
+    (is (= (:id step) (:invocation-step (first (invocation/source-order plan semantic)))))
+    (is (= plan (invocation/validate-against! plan semantic)))
+    (is (= [result] (mapv first (prefix semantic))))
+    (doseq [attributes [{:host-only false :graph-shape-definition true}
+                        {:host-only :yes :graph-shape-definition true}
+                        {:host-only true :graph-shape-definition false}
+                        {:host-only true :graph-shape-definition :yes}]]
+      (is (empty? (prefix (update-in semantic [:equations 0 :attributes] merge attributes)))
+          "only the earlier planner's exact host-only graph-shape grant adds this root"))))
 
 (deftest diagnostic-pipeline-reports-an-emitted-structured-program
   (let [diagnostic (pipeline/show-pipeline

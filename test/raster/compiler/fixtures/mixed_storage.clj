@@ -39,6 +39,18 @@
         ^float result (float total)]
     result))
 
+(deftm double-reduction-float-roundtrip
+  [values :- (Array double)] :- Double
+  (let [total (par/reduce acc 0.0 i (alength values)
+                          (+ acc (aget values i)))]
+    (double (float total))))
+
+(deftm scaled-reduction-float-roundtrip
+  [values :- (Array double)] :- Double
+  (let [total (par/reduce acc 0.0 i (alength values)
+                          (+ acc (aget values i)))]
+    (double (float (* total 1.5)))))
+
 (deftm mixed-scale-energy
   [coefficient :- Float values :- (Array double)] :- Double
   (par/dot-product (par/scale coefficient values) values))

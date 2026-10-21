@@ -362,7 +362,16 @@
                 (comp (mapcat (comp #(mapcat util/free-syms %) :shape val))
                       (filter #(scalar-value? (get prefix-values %))))
                 program-values)
-          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots)
+          host-shape-roots
+          (into #{}
+                (comp (filter #(and (true? (get-in % [:attributes :host-only]))
+                                     (true? (get-in % [:attributes :graph-shape-definition]))))
+                      (mapcat :results))
+                (:equations parallel-program))
+          ;; A reduction extent can be needed only by its launch/domain, not by
+          ;; any result-buffer shape. The retained host-only equation still needs
+          ;; its one canonical invocation executor; its proof term cannot run it.
+          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots host-shape-roots)
                                 (set public-parameters))
           required (required-prefix-symbols candidates roots)
           bindings (filterv (comp required first) candidates)
