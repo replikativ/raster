@@ -8,6 +8,33 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### October 21 primitive boxing-edge correspondence
+
+The existing emitter-owned return bridge now records audited primitive Long
+boxing as well as Float/Double boxing. Its source result carrier remains Object;
+the observed static return supplies a separate conditional payload carrier. The
+query checks actual interface/static Methods, signatures, original body/context
+and historical guards. It does not invoke the helper, force the JIT, prove normal
+completion or authorize unboxing, source motion, FP recipes or kernel admission.
+Missing, duplicate, foreign, legacy and inconsistent observations abstain, as do
+hidden Object-to-primitive return adaptations.
+
+Review caught an FP consumer's implicit assumption that every bridge formal was
+FP. The shared FP argument-completion predicate now explicitly checks its target
+domain. A mixed Float/Long helper with an unused Long formal produces a legitimate
+Float boxing observation but cannot acquire an FP recipe by omitting the integral
+argument conversion. That regression had two failing assertions before the guard
+and passes afterward. Four complete affected namespaces pass 37 tests / 349
+assertions in one bounded REPL, including Long checked overflow and unchanged FP,
+invocation, binding and input-completion controls. This independent foundation
+does not qualify the separate source-ownership draft or its training workload.
+
+PR #1549's first CI head passed setup, build, unit tests and both vendor compiler
+gates. The OpenCL gate did not qualify: one shard failed installing dependencies
+because the git-core Ubuntu PPA returned HTTP 503. That is infrastructure evidence,
+not an OpenCL pass or a compiler regression. A new exact-head qualification is
+required before merge; successful contexts on the earlier head are not reused.
+
 ### October 21 primitive math completion
 
 Eight audited primitive FP math rows (sqrt, floor, sin, cos, tan, exp, log and
