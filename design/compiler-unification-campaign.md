@@ -97,6 +97,21 @@ and dependent persistent-evidence expectations; it is not qualified by the focus
 controls. Selected dimension helper execution, MSE consumers, prepared AD imports
 and unchanged training acceptance remain separate open obligations.
 
+The next reviewed execution boundary is original call-result completion, not
+another arithmetic/type registry. A non-emitting REPL query confirms the selected
+Long product's actual interface is `Object invk(long,long)`. Exact primitive input
+ports therefore do not establish a primitive Long output. The existing invocation
+observer can authenticate Method/receiver/ordered input contexts, but the retained
+return-bridge proof is FP-only. Reuse exact original binding/input occurrence
+evidence and shared value-completion machinery for the result adaptation; do not
+insert `.longValue` from a Long annotation or turn an Object payload into its
+parent's source carrier. Keep cold queries non-emitting and abstaining when their
+original context is unavailable. Foreign receivers/methods, arity/carrier mismatch,
+nullable/Object results, checked overflow/order and stale histories are required
+negative controls. Do not rewrite helper bodies universally: AD/native consumers
+must not silently become warm-only or acquire unsupported reserved terms. This
+review identifies the next implementation boundary; it does not qualify execution.
+
 ### October 21 primitive math completion
 
 Eight audited primitive FP math rows (sqrt, floor, sin, cos, tan, exp, log and
