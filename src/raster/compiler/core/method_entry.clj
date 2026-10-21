@@ -216,22 +216,36 @@
    `prepare!` is the existing non-evaluating compiler entry, not a numerical call.
    Preparation has separate ownership. Afterwards ORIGINAL observations are checked:
    a promotion must discard/retry construction, never refresh the rejected result.
-   Refused optional queries must not contribute observations to this owner."
-  [prepare!]
+   Refused optional queries must not contribute observations to this owner.
+   Optional `receivers` selects an ordered subset of ALREADY observed Vars.
+   Duplicates collapse by Var identity, warm entries are skipped, and an empty
+   subset prepares nothing. No fresh metadata lookup supplies a missing input."
+  ([prepare!] (prepare-pending-definition-inputs! prepare! nil))
+  ([prepare! receivers]
   (when-not *emission-inputs*
     (throw (ex-info "definition preparation requires a compiler owner"
                     {:reason :missing-definition-preparation-owner})))
   (let [historical @*emission-inputs*
+        _ (assert-definition-inputs-current! historical)
+        _ (when (and (some? receivers)
+                     (not (and (vector? receivers) (every? var? receivers))))
+            (throw (ex-info "definition preparation requires an ordered Var selection"
+                            {:reason :invalid-definition-preparation-selection})))
+        _ (doseq [v receivers]
+            (when-not (contains? (:definition-proofs historical) v)
+              (throw (ex-info "requested preparation has no original definition observation"
+                              {:reason :unobserved-definition-preparation-input :source v}))))
         pending (into [] (keep (fn [[v snapshot]]
                                  (when (map? (get-in snapshot [:metadata :raster.core/jit-spec]))
                                    v)))
-                      (:definition-proofs historical))]
-    (assert-definition-inputs-current! historical)
+                      (:definition-proofs historical))
+        selected (if (nil? receivers) pending
+                     (into [] (filter (set pending)) (distinct receivers)))]
     ;; One batch may promote several entries. Do not expose the deliberately
     ;; stale enclosing owner to each dependency's own compilation transaction.
     (binding [*emission-inputs* nil]
-      (doseq [v pending] (prepare! v)))
-    (assert-definition-inputs-current! historical)))
+      (doseq [v selected] (prepare! v)))
+    (assert-definition-inputs-current! historical))))
 
 (defn call-with-definition-inputs
   "Own normalization and emission together for a static compiled artifact.
