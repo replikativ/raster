@@ -180,16 +180,35 @@ The same gate order in a fresh 900 MiB REPL then passes the origin namespace
 539 assertions). No production guard is weakened or extra warm-up lookup added.
 The existing ordered-source namespace separately passes 15 tests / 112 assertions.
 
-The next reviewed implementation boundary is one producer-owned flat-prefix
-correspondence transaction at `equation-first/compile`, spanning the authenticated
-frontend, source normalization, pre-SOA passes and constructed invocation steps.
-Validate the complete bounded evaluated prefix under explicit capture-avoiding
-renaming, including operand order, preceding initializers and metadata obligations;
-then bind exact original scope/ordinal/call and exact constructed `ScalarCompute`
-objects. Normalized binding IDs or matching printed expressions alone cannot
-authenticate an original bytecode context. Initially transformed/helper-expanded
-prefixes and aggregate parameter projections abstain. This is a plan, not an
-implemented admission or proof of arbitrary compiler rewrites.
+One producer-owned flat-prefix correspondence transaction is now implemented at
+`equation-first/compile`, spanning the authenticated frontend, source normalization,
+pre-SOA passes and constructed invocation steps. It validates the complete bounded
+evaluated prefix under explicit capture-avoiding renaming, including operand order,
+preceding initializers, literal bits and metadata obligations, then binds exact
+original scope/ordinal/call and exact constructed `ScalarCompute` objects. Normalized
+binding IDs or matching printed expressions alone cannot authenticate an original
+bytecode context. Transformed/helper-expanded prefixes, nested scopes, originally
+shadowed parameters and aggregate projections abstain. Retained declarations may
+elaborate lexical-reference tags; only the existing canonical core allocator table
+owns added allocation-result tags. Neither is primitive carrier evidence.
+
+The correspondence stays process-local inside the existing ordered source owner;
+it is not another cache, registry, interpreter or portable IR annotation. The first
+consumer enriches a missing-executor refusal with its authenticated original source.
+Execution remains refused: ownership of the original occurrence does not prove its
+Method, operand completion, Object payload, result adaptation or numerical legality.
+Existing source-free paths remain independent and no fallback gains admission.
+
+Independent review found a capture counterexample where an earlier initializer
+reads a global whose name is a later binder. The verifier now collects free names
+sequentially, not by subtracting all binders up front. Exact future-binding and
+self-initializer counterexamples, capture/shadowing controls and unchanged-name
+positives exercise that repair. Re-review found no remaining blocker. A fresh
+900 MiB REPL passes the prefix, ordered-source and original-frontend namespaces
+(31 tests / 262 assertions), plus existing checked-source-owner/native-alias gates
+(33 tests / 210 assertions) and two focused source-free controls (20 assertions).
+The broad draft remains red in CI, including checked floating conversion emission;
+these bounded receipts do not qualify it or the unchanged training workload.
 
 The actual small selected-product probe demonstrates two distinct obligations:
 the original initializer is an Object-returning `invk`; the normalized scalar

@@ -8,6 +8,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.ordered-call :as ordered-call]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.source-prefix :as source-prefix]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.value-completion :as completion]
@@ -287,7 +288,7 @@
                {:step step :expression expression :ports ports :execute execute
                 :result-facts (:result-facts projection)}))))))))
 
-(defn- prepare-scalar-steps [program frontend source-var source-ns policy collector]
+(defn- prepare-scalar-steps [program frontend source-var source-ns policy collector prefix-correspondence]
   (let [plan (get-in program [:attributes :invocation-plan])
         source-expressions (into {} (map vec) (partition 2 (second (:source program))))
         entry (entry/frontend-body-entry-carriers frontend source-var)]
@@ -317,6 +318,7 @@
                                [id (get-in entry [:parameter-facts symbol])])) (:parameters plan))
          :steps {} :shapes #{}}
         (:steps plan)) :facts)
+       :frontend frontend :prefix-correspondence prefix-correspondence
        :entry-ports (mapv (fn [{:keys [symbol]}]
                             (assoc (get-in entry [:parameter-facts symbol]) :symbol symbol))
                           (:parameters plan))))))
@@ -341,6 +343,8 @@
   ([program emission source-var frontend]
    (compile-ordered-source program emission source-var frontend true))
   ([program emission source-var frontend required?]
+   (compile-ordered-source program emission source-var frontend required? nil))
+  ([program emission source-var frontend required? prefix-correspondence]
    (entry/call-with-optional-definition-inputs
     (fn []
       (entry/assert-frontend-source! frontend source-var)
@@ -372,7 +376,8 @@
             (when required?
               (throw (ex-info "ordered source needs checked policy and original import lineage"
                               unavailable)))
-            (let [scalar-source (prepare-scalar-steps program frontend source-var source-ns policy collector)
+            (let [scalar-source (prepare-scalar-steps program frontend source-var source-ns policy collector
+                                                       prefix-correspondence)
                   observations @collector]
               (source-history-current! source-ns observations :stale-checked-result-source-namespace)
               (OrderedSourceOwner. program emission observations source-ns scalar-source)))))))))
@@ -483,10 +488,17 @@
         steps (into {} (map (juxt :id identity)) (:steps plan))
         equations (into {} (map (juxt :id identity)) (:equations semantic))
         scalar-source (when ordered-source-owner (.-scalar-source ^OrderedSourceOwner ordered-source-owner))
-        refuse! (fn [entry context]
-                  (throw (ex-info "ordered source occurrence has no closed executor"
-                                  {:reason :unclosed-ordered-source-executor
-                                   :entry entry :context context})))]
+        refuse! (fn [source-entry context]
+                  (let [step (get steps (:invocation-step source-entry))
+                        original (source-prefix/original-step
+                                  (:prefix-correspondence scalar-source) (:frontend scalar-source)
+                                  semantic step)]
+                    (throw (ex-info "ordered source occurrence has no closed executor"
+                                    (cond-> {:reason :unclosed-ordered-source-executor
+                                             :entry source-entry :context context}
+                                      original (assoc :original-source
+                                                      (select-keys original
+                                                                   [:ordinal :binding :expression])))))))]
     (when-not (and (identical? plan (get-in state [:materialization :plan]))
                    (if source-free? (empty? (:source-order state)) (= order (:source-order state)))
                    (= (count (:parameters plan)) (count arguments)))

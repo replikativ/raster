@@ -18,6 +18,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.source-prefix :as source-prefix]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -434,7 +435,8 @@
 
 (defn- compile-semantic
   "Schedule and emit one exact typed semantic program without source or ABI reconstruction."
-  [{:keys [id function-id target dtype source-ns source-var retained-frontend options compiler-options]
+  [{:keys [id function-id target dtype source-ns source-var retained-frontend prefix-correspondence
+           options compiler-options]
     :as context}
    semantic]
   (when-not (= :typed-parallel (:dialect semantic))
@@ -482,7 +484,8 @@
                                  (source-owner/ordered-source-required? semantic (:program emission)))
                         (source-owner/compile-ordered-source
                          semantic (:program emission) source-var retained-frontend
-                         (boolean (stage-result/requires-observation? (:program emission)))))
+                         (boolean (stage-result/requires-observation? (:program emission)))
+                         prefix-correspondence))
         eager-owner (when (and source-var
                               (source-owner/eager-evaluation-required? semantic (:program emission)))
                       (source-owner/compile-eager-evaluation
@@ -730,6 +733,8 @@
                                                        :target-descriptor target-descriptor)))
          retained-frontend (pipeline/retained-frontend-source
                             f-var resolved-var (:dtype compiler-options) compiler-options)
+         prefix-input (source-prefix/begin retained-frontend
+                                           (:raster.core/deftm-params (meta resolved-var)))
          walked (or (when retained-frontend
                       (pipeline/normalize-source-bindings
                        (:body retained-frontend) (:raster.core/deftm-params (meta resolved-var))))
@@ -776,6 +781,7 @@
          semantic (cond-> semantic
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))
+         prefix-correspondence (source-prefix/close prefix-input source represented-source semantic)
          source-ns-symbol (source-namespace-symbol f-var)
          id (cond-> [::compilation (function-symbol f-var) target (:dtype compiler-options)]
               (:preserve-declared-array-storage? compiler-options)
@@ -785,6 +791,7 @@
              {:id id :function-id (function-symbol f-var) :target target
               :dtype (:dtype compiler-options) :source-ns source-ns-symbol
               :source-var resolved-var :retained-frontend retained-frontend
+              :prefix-correspondence prefix-correspondence
               :options options :compiler-options compiler-options})
       semantic))))))
 
