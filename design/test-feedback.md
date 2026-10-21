@@ -9,8 +9,21 @@ and share runtime/dispatch state. Keep local JVM concurrency bounded by availabl
 Inspect the failed step before classifying a red job. A dependency-installation
 HTTP 503 is not a compiler test failure, but it is also not a passing test run.
 The unit and OpenCL jobs give apt package/index fetches three bounded transport
-retries. Repository URLs, package/runtime selection and fatal installation exit
-handling remain unchanged; exhausted retries still fail the job.
+retries. Dependency-installation failures remain fatal. A subsequent run exhausted these
+retries on two unit shards while fetching the unrelated image-provided Git PPA,
+before either shard could run its tests.
+
+Unit prerequisite installation now scopes APT to the image's main
+`/etc/apt/sources.list`, excluding source fragments such as that PPA. The source
+file must exist and be nonempty; there is no fallback to all repositories or
+permission to skip missing BLAS/LAPACK/Clang. The unit update uses
+`APT::Update::Error-Mode=any`, so partial index-fetch failures cannot silently use
+cached indexes. Package names are unchanged, but this source policy is not a
+toolchain-version pin: all source fragments are excluded, not only the Git PPA.
+This is invocation-local APT configuration: it deletes no repository files and
+does not affect preinstalled Git, CUDA/HIP compiler images or the OpenCL job's
+explicit optional Intel repository. See the documented [APT source configuration
+items](https://manpages.debian.org/unstable/apt/apt-get.8.en.html#FILES).
 
 Qualification requires the complete expected check set for the exact PR head:
 setup, build, unit tests, GPU source emission, OpenCL execution, CUDA compilation
