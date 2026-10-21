@@ -63,6 +63,20 @@ SM100, Ascend, model download or cloud dependency enters the hot development loo
 
 ### October 21 fresh unchanged training-source checkpoint
 
+Subsequent count-contract investigation found and repaired an actual source-cast
+miscompile rather than broadening admission: floating/reference `int` and `long`
+must use the Clojure source overload, not raw JVM saturation/ABI coercion. The
+independently reviewed clean-main fix is PR #1553 (`a93d6f91`), with 55 tests /
+2,056 assertions passing. Draft integration `19d59fe2` preserves the earlier
+Float-cast repair; its fresh 14-namespace source-owner, inference/inliner,
+native-alias and checked-cast gate passes 198 tests / 2,186 assertions. These
+receipts establish source behavior, not a reduction-domain or training proof.
+
+PR #1552 is squash-merged as `c389b458` after all seven contexts passed on exact
+head `050e635f`. The draft also adopts main's identical scoped unit APT setup and
+bounded OpenCL retries, keeping infrastructure failures separate from compiler
+failures. PR #1553 requires its own complete exact-head CI qualification.
+
 After `ab49dcb6`, a fresh capped REPL compiles the unchanged public `local-loss`
 fixture through equation-first to portable OpenCL source, with semantic/scheduled
 programs and emitted kernels. This supersedes the earlier first-Long-initializer
