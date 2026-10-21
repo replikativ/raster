@@ -6468,6 +6468,23 @@
      :main-body rewritten-body
      :helpers @helpers}))
 
+(defn- partitioned-binding-scope
+  "Retain a root lexical occurrence across producer-owned method extraction.
+   Extraction may replace initializers, but must not alter the ordered binder
+   objects. Observations retain their ACTUAL emitted initializer and carrier;
+   this relation grants no source-initializer or whole-body equivalence."
+  [original bindings body]
+  (let [original-bindings (second original)]
+    (when-not (and (vector? original-bindings) (vector? bindings)
+                   (even? (count original-bindings))
+                   (= (count original-bindings) (count bindings))
+                   (every? true? (map identical?
+                                      (take-nth 2 original-bindings)
+                                      (take-nth 2 bindings))))
+      (throw (ex-info "Method extraction changed the original binding layout"
+                      {:reason :partitioned-binding-layout})))
+    (with-meta (list* (first original) bindings body) (meta original))))
+
 (defn compile-typed-impl!
   "Compile a deftm walked body into a class implementing the typed interface.
   Returns an instance of the compiled class, or nil on failure.
@@ -6506,7 +6523,7 @@
                        {:keys [main-bindings main-body helpers]}
                        (split-body-into-helpers body binds params tags source-ns 2)
                        ;; Rebuild let with rewritten bindings (par forms replaced by helper calls)
-                       main-form (list* 'let main-bindings main-body)
+                       main-form (partitioned-binding-scope form main-bindings main-body)
                        ;; Tag main fn-spec params
                        tagged-params (mapv (fn [p t]
                                              (vary-meta p assoc :tag t))

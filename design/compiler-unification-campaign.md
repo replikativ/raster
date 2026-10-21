@@ -95,6 +95,39 @@ reductions, preserving their original evaluation position. Conditional reduction
 value correspondence must not silently prove loop counts, read bounds, argument
 evaluation or safe box erasure. No arithmetic flag is waived by this source fix.
 
+### October 21 lexical observations survive method extraction
+
+The next source probe localized a concrete lost producer relation: softmax's
+original root scope existed in the bytecode binding catalog, but its binding
+observations were empty. `compile-typed-impl!` partitioned the function into
+static parallel helpers and rebuilt the main `let` without the root scope's
+metadata. The shared extractor now retains that root occurrence only after
+checking equal binding-vector size and identical ordered binder objects. It
+retains the original lexical head too. This is a producer-owned transformation,
+not a syntax search or a new type inference rule.
+
+The observation continues to expose the ACTUAL initializer and physical carrier.
+An extracted reduction reports a static helper initializer and may return primitive
+Float where the unsplit reduction returned an Object with a Float payload. The
+unchanged scalar initializer still identifies its original invocation context;
+the generated helper is not an original source invocation. Whole-body vector
+identity is deliberately not transferred. Both the original whole-body query and
+the production AD entry still refuse the split body without its separate proof.
+
+The regenerated softmax source now has all four binding observations (Float max,
+Float-array map output, Float sum, Object scalar-call result), while its GPU scalar
+continuation remains honestly unqualified. No count conversion, read-capacity,
+association or box-erasure permission follows merely from these observations.
+
+Independent review found no blocker; its requested production-AD negative was
+added and passes. Reused capped-REPL qualification covers frontend/reduction,
+binding and terminal ownership (42 tests / 386 assertions), plus loop carriers,
+whole-bytecode gradients and original source-prefix ownership (58 / 600), all
+passing. Copied scopes, equal-but-distinct binders, changed layouts, actual helper
+initializers and changed-data Float results are covered. This advances the producer
+transport prerequisite of items 3/5; full draft CI and the end-to-end training
+acceptance remain outstanding.
+
 ### October 21 arithmetic normal-completion conservation
 
 A real public helper reproduction exposed a silent source loss: an unused helper

@@ -5,6 +5,7 @@
             [raster.numeric :as numeric]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.ir.par :as par-ir]
+            [raster.compiler.backend.jvm.split :as split]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
 (deftm source-sum [xs :- (Array double) count :- Long] :- Double
@@ -15,6 +16,11 @@
 
 (deftm source-binding [n :- Long] :- Long
   (let [size (numeric/* n 2)] (long size)))
+
+(deftm partitioned-reduction-scalar [xs :- (Array float)] :- Float
+  (let [sum (par/reduce acc (float 0.0) i 4 (numeric/+ acc (aget xs i)))
+        reciprocal (numeric// (float 1.0) sum)]
+    reciprocal))
 
 (defonce ^:private cold-source-evaluations (atom 0))
 
@@ -57,6 +63,61 @@
 
 (defn- reduction-forms [body]
   (filter par-ir/par-reduce-form? (tree-seq coll? seq body)))
+
+(deftest method-extraction-retains-bindings-but-not-original-initializers
+  ;; Size is a compiler decision; force it without depending on source size or
+  ;; redefining the compile-time constant TARGET-SIZE. No original body is run
+  ;; to construct these observations.
+  (with-redefs [split/estimate-form-size (constantly 1000000)]
+    (let [frontend (captured #'partitioned-reduction-scalar)
+          scope (first (:body frontend))
+          first-binding (entry/frontend-binding-context frontend scope 0)
+          second-binding (entry/frontend-binding-context frontend scope 1)
+          original-reduction (nth (second scope) 1)
+          original-scalar (nth (second scope) 3)
+          scalar-context (entry/frontend-invocation-context frontend original-scalar)]
+      (is (some? first-binding))
+      (is (some? second-binding))
+      (is (= ['sum 'reciprocal] (mapv :binder [first-binding second-binding])))
+      (is (not= original-reduction (:initializer first-binding))
+          "the actual initializer is an extracted static helper call")
+      (is (identical? original-scalar (:source-input scalar-context)))
+      (is (identical? (:initializer second-binding) (:expression scalar-context))
+          "the untouched scalar still identifies its actual initializer")
+      (is (nil? (entry/frontend-invocation-context frontend (:initializer first-binding)))
+          "a generated helper call is not an original source call")
+      (is (= 'sum (:binder first-binding)))
+      (is (= :float (get-in first-binding [:after :type]))
+          "report the actual split static return, not an unsplit Object carrier")
+      (is (= (:after first-binding) (get-in second-binding [:before 'sum])))
+      (is (nil? (entry/frontend-binding-context
+                 frontend (with-meta (apply list scope) (meta scope)) 0)))
+      (is (nil? (bytecode/retained-body-context (:emission frontend)))
+          "root binding identity does not authorize an original unsplit body")
+      (is (= :ad-unclosed-bytecode-body-region
+             (try
+               ((requiring-resolve 'raster.ad.reverse/owned-bytecode-body-program)
+                (:emission frontend) (get-in frontend [:emission :params]) [])
+               nil
+               (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "the production AD entry guard still refuses the unowned whole body")
+      (doseq [[values expected] [[[1.0 2.0 3.0 4.0] (float 0.1)]
+                                 [[2.0 3.0 4.0 5.0] (float (/ 1.0 14.0))]]]
+        (is (= (Float/floatToRawIntBits expected)
+               (Float/floatToRawIntBits (partitioned-reduction-scalar (float-array values)))))))))
+
+(deftest method-extraction-refuses-changed-binding-layout
+  (let [binder (with-meta 'value {:raster.type/tag 'float})
+        scope (list 'let* [binder '(float 1.0)] binder)
+        rebuild #'bytecode/partitioned-binding-scope]
+    (is (= scope (rebuild scope (second scope) (nnext scope))))
+    (is (identical? binder (first (second (rebuild scope (second scope) (nnext scope))))))
+    (doseq [bindings [[] [binder '(float 1.0) 'extra 2]
+                      [(with-meta 'value (meta binder)) '(float 1.0)]
+                      [binder]]]
+      (is (= :partitioned-binding-layout
+             (try (rebuild scope bindings (nnext scope)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
 
 (deftest frozen-source-occurrence-reaches-only-its-own-emitted-reduction
   (doseq [[function payload] [[#'source-sum Double] [#'source-float-sum Float]]]
