@@ -5,6 +5,7 @@
 (def numeric-calls (atom 0))
 (def input-a (fn [] (swap! numeric-calls inc)))
 (def input-b (fn [] (swap! numeric-calls inc)))
+(def input-c (fn [] (swap! numeric-calls inc)))
 
 (defn- observe! [v]
   (entry/observe-definition-input! v (:ns (meta v)) (:name (meta v))))
@@ -108,3 +109,63 @@
       (is (= 1 @attempts))
       (finally (alter-var-root #'input-a (constantly root))
                (reset-meta! #'input-a original)))))
+
+(deftest selected-preparation-preserves-order-and-does-not-promote-unrequested-inputs
+  (let [vars [#'input-a #'input-b #'input-c]
+        roots (mapv deref vars) metadata (mapv meta vars)
+        prepared (atom []) attempts (atom 0) before @numeric-calls]
+    (try
+      (doseq [v vars] (alter-meta! v assoc :raster.core/jit-spec {}))
+      (let [result
+            (entry/call-with-definition-inputs
+             (fn []
+               (swap! attempts inc)
+               (doseq [v vars] (observe! v))
+               (entry/prepare-pending-definition-inputs!
+                (fn [v]
+                  (is (nil? entry/*emission-inputs*))
+                  (swap! prepared conj v)
+                  (alter-var-root v (constantly (fn [] (swap! numeric-calls inc))))
+                  (alter-meta! v dissoc :raster.core/jit-spec))
+                [#'input-b #'input-a #'input-b])
+               @entry/*emission-inputs*))]
+        (is (= [#'input-b #'input-a] @prepared))
+        (is (= 2 @attempts) "promotion restarts the whole owning transaction")
+        (is (= before @numeric-calls))
+        (is (map? (:raster.core/jit-spec (meta #'input-c))))
+        (is (entry/assert-definition-inputs-current! result)))
+      (finally
+        (doseq [[v root metadata] (map vector vars roots metadata)]
+          (alter-var-root v (constantly root))
+          (reset-meta! v metadata))))))
+
+(deftest selected-preparation-requires-original-observations-before-any-compilation
+  (let [metadata (mapv meta [#'input-a #'input-b]) calls (atom [])]
+    (try
+      (doseq [v [#'input-a #'input-b]] (alter-meta! v assoc :raster.core/jit-spec {}))
+      (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+        (observe! #'input-a)
+        (doseq [[selection reason] [[[#'input-a #'input-b] :unobserved-definition-preparation-input]
+                                    [(list #'input-a) :invalid-definition-preparation-selection]
+                                    [[42] :invalid-definition-preparation-selection]]]
+          (is (= reason
+                 (try (entry/prepare-pending-definition-inputs! #(swap! calls conj %) selection)
+                      nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+        (is (empty? @calls))
+        (is (entry/assert-definition-inputs-current! @entry/*emission-inputs*)))
+      (finally
+        (doseq [[v metadata] (map vector [#'input-a #'input-b] metadata)]
+          (reset-meta! v metadata))))))
+
+(deftest an-explicit-empty-preparation-subset-does-not-mean-all-inputs
+  (let [metadata (meta #'input-a)]
+    (try
+      (alter-meta! #'input-a assoc :raster.core/jit-spec {})
+      (is (= :ready
+             (entry/call-with-definition-inputs
+              #(do (observe! #'input-a)
+                   (entry/prepare-pending-definition-inputs!
+                    (fn [_] (throw (AssertionError. "empty selection prepared a receiver"))) [])
+                   :ready))))
+      (is (map? (:raster.core/jit-spec (meta #'input-a))))
+      (finally (reset-meta! #'input-a metadata)))))

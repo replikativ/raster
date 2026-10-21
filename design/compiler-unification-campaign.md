@@ -8,6 +8,27 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### October 21 selective definition preparation
+
+The existing producer preparation service accepts an optional ordered subset of
+already-observed receiver Vars. Selection is checked against the original owner
+before callbacks; duplicates collapse by Var identity, warm receivers are skipped
+and an explicit empty subset prepares nothing. Default all-pending behavior is
+unchanged. A separate compilation owner prepares the selected batch; the original
+historical guard then rejects a promoted enclosing attempt so the whole producer
+retries. No query emits code, no observations are refreshed and no numerical body
+executes. This permits callee-before-caller preparation without promoting unrelated
+imports. It does not yet enable selected scalar execution or relax any carrier,
+source-policy or completion check.
+
+Independent review found no blocker. The exact new function and complete affected
+clean-main test namespace pass 9 tests / 36 assertions loaded into the existing
+capped campaign REPL. This is bounded loaded-code evidence, not a fresh clean-main
+JVM gate; the PR still requires full exact-head CircleCI qualification. Tests cover
+requested order, duplicate collapse, warm reuse, no numerical execution, unchanged
+unrequested pending inputs, empty selection, pre-callback refusal, nested ownership
+and whole-producer retry after promotion.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long
