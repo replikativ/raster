@@ -269,3 +269,60 @@
   (if @opencl/opencl-available?
     (check-fold-device :ocl:0)
     (opencl/opencl-skip! "checked ordered fold on OpenCL")))
+
+(defn- check-dynamic-fold-device [target]
+  (let [cases [[16777216.0 1.0 -16777216.0] [1.0 2.0 3.0]
+               [Float/MAX_VALUE (- Float/MAX_VALUE) 1.0]]
+        ;; Freeze every source oracle before retaining the compilation history.
+        expected (into {} (for [n [0 1 3] values cases]
+                            [[n values] (vec (storage/dynamic-double-fold-float-storage
+                                              (float-array values) n))]))
+        compiled (equation-first/compile #'storage/dynamic-double-fold-float-storage
+                                         (merge storage/policy {:target target :dtype :double}))]
+    (doseq [n [0 1 3]]
+      (let [input (float-array 3)
+            executable (link/instantiate-checked-invocation! compiled [input n])
+            session (:session executable)]
+        (try
+          (doseq [values cases]
+            (dotimes [i 3] (aset input i (float (nth values i))))
+            (let [output (first (keys (link/run! executable)))]
+              (is (= (get expected [n values]) (vec (link/download executable output))))))
+          (is (= 3 @(:completed-replays executable)))
+          (when (= n 3)
+            (aset input 0 Float/MAX_VALUE)
+            (aset input 1 Float/MAX_VALUE)
+            (aset input 2 (float 0.0))
+            (is (= (thrown-description #(float (* (double Float/MAX_VALUE) 2.0)))
+                   (thrown-description #(link/run! executable))))
+            (is (= 3 @(:completed-replays executable)))
+            (is (false? @(:output-ready? executable)))
+            (is (nil? (:resident-boundary @(:execution-state executable))))
+            (is (empty? (get-in @(:execution-state executable) [:ordered :observed])))
+            (is (= :link-execution-poisoned (reason #(link/outputs executable))))
+            (is (= :link-execution-poisoned (reason #(link/run! executable))))
+            (is (empty? (:kernel-graphs @session)))
+            (is (empty? (:events @session))))
+          (finally (link/close! executable)))
+        (is (true? (:closed? @session)))))
+    ;; Header termination does not grant read capacity. This separate source
+    ;; obligation must fail before any graph is submitted to the device.
+    (let [executable (link/instantiate-checked-invocation! compiled [(float-array 3) 4])
+          session (:session executable)]
+      (try
+        (with-redefs [gpu/run-kernel-graph!
+                      (fn [& _] (throw (AssertionError. "out-of-capacity graph submitted")))]
+          (is (= :program-link-graph-range (reason #(link/run! executable)))))
+        (is (zero? @(:completed-replays executable)))
+        (is (false? @(:output-ready? executable)))
+        (is (empty? (get-in @(:execution-state executable) [:ordered :observed])))
+        (finally (link/close! executable)))
+      (is (true? (:closed? @session))))))
+
+(deftest dynamic-ordered-fold-keeps-double-carries-and-checked-publication
+  (if @level-zero/gpu-available?
+    (check-dynamic-fold-device :ze:0)
+    (level-zero/gpu-skip! "dynamic checked ordered fold on Level Zero"))
+  (if @opencl/opencl-available?
+    (check-dynamic-fold-device :ocl:0)
+    (opencl/opencl-skip! "dynamic checked ordered fold on OpenCL")))

@@ -74,7 +74,41 @@
          (= :exact (:overflow expression))
          (= :long (:dtype expression))) (literal-loop-bound (:argument expression))))
 
-(defn- otherwise-total! [operations]
+(defn- integral-header-leaf? [expression]
+  (or (integer? expression) (symbol? expression)
+      (and (record-kind? "Literal" expression)
+           (contains? #{:int :long} (:type expression)))
+      (and (record-kind? "IndexCast" expression)
+           (= :long (:dtype expression)) (= :exact (:overflow expression))
+           (integral-header-leaf? (:argument expression)))))
+
+(defn- proved-unit-headers [kernel]
+  ;; Validation proves the actual loop's bounds and induction value have the
+  ;; same Long representation. No parameter hint or producer-supplied interval
+  ;; is accepted here. Membership remains tied to exact operation occurrences.
+  (body/validate! kernel)
+  (let [occurrences (java.util.IdentityHashMap.)]
+    (letfn [(visit [operations]
+              (doseq [operation operations]
+                (when (record-kind? "ForLoop" operation)
+                  (.put occurrences operation (inc (long (or (.get occurrences operation) 0)))))
+                (cond
+                  (or (record-kind? "Guard" operation) (record-kind? "ForLoop" operation))
+                  (visit (:operations operation))
+                  (record-kind? "IfRegion" operation)
+                  (do (visit (:then-operations operation)) (visit (:else-operations operation))))))]
+      (visit (:operations kernel)))
+    (fn [operation]
+      (and (= 1 (.get occurrences operation))
+           (= :long (get-in operation [:index :type]))
+           (= 1 (:step operation))
+           (not= :inclusive (get-in operation [:attributes :upper-bound]))
+           (integral-header-leaf? (:lower operation))
+           (integral-header-leaf? (:upper operation))))))
+
+(defn- otherwise-total!
+  ([operations] (otherwise-total! operations (constantly false)))
+  ([operations proved-header?]
   ;; This is a deliberately closed schedule grammar, not a purity claim. A
   ;; validated load also requires the independent source address proof below.
   (doseq [operation operations]
@@ -85,24 +119,27 @@
       (total-expression! (:expression operation))
       (record-kind? "IfRegion" operation)
       (do (total-expression! (:condition operation))
-          (otherwise-total! (:then-operations operation))
-          (otherwise-total! (:else-operations operation)))
+          (otherwise-total! (:then-operations operation) proved-header?)
+          (otherwise-total! (:else-operations operation) proved-header?))
       (record-kind? "ForLoop" operation)
       (let [lower (literal-loop-bound (:lower operation))
             upper (literal-loop-bound (:upper operation))]
-        ;; Unit-step, exclusive literal bounds prove termination AND the final
-        ;; increment representable. Typed KernelBody validation alone does not.
-        (when-not (and (= :long (get-in operation [:index :type]))
-                       (= 1 (:step operation))
-                       (not= :inclusive (get-in operation [:attributes :upper-bound]))
-                       (integer? lower) (integer? upper)
-                       (<= 0 lower upper Long/MAX_VALUE))
+        ;; For actual validated Long leaves, lower>=upper is zero-trip; otherwise
+        ;; each executed index is <= upper-1, so the unit increment fits Long.
+        ;; This proves finiteness, NOT a practical runtime or array-read bound.
+        ;; Unowned controls retain the earlier conservative static proof.
+        (when-not (or (proved-header? operation)
+                      (and (= :long (get-in operation [:index :type]))
+                           (= 1 (:step operation))
+                           (not= :inclusive (get-in operation [:attributes :upper-bound]))
+                           (integer? lower) (integer? upper)
+                           (<= 0 lower upper Long/MAX_VALUE)))
           (decline! "checked map fold needs a finite nonoverflowing counted domain"
                     {:operation operation}))
         (doseq [argument (:iter-args operation)] (total-expression! (:initial argument)))
-        (otherwise-total! (:operations operation)))
+        (otherwise-total! (:operations operation) proved-header?))
       :else (decline! "checked map operand is not a total scalar/load region"
-                      {:operation operation}))))
+                      {:operation operation})))))
 
 (defn- private-result-storage? [facts equation output]
   (let [results (nth equation 2)
@@ -190,7 +227,7 @@
                          (= [index] (:coordinates store))
                          (= :map-active (:predicate store)))
             (decline! "checked map requires one lane-owned final result store" {}))
-        _ (otherwise-total! (butlast operations))
+        _ (otherwise-total! (butlast operations) (proved-unit-headers original-body))
         extent ['_n_bound]
         failure [(body/->ScalarStore diagnostics [index] (:value store) :map-active)
                  (body/->ScalarStore status [index] (body/literal 1 :int) :map-active)

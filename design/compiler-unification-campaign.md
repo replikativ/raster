@@ -61,6 +61,34 @@ immediate continuation remains the local source/semantic ownership repair, then
 content-aware prepared replay and encoded/ragged composition qualification. No
 SM100, Ascend, model download or cloud dependency enters the hot development loop.
 
+### October 21 dynamic checked-map loop qualification
+
+The checked-map schedule now proves termination/nonoverflow for an actual validated
+exclusive Long loop with unit increment and integral leaf bounds. The proof is
+local to the exact KernelBody operation occurrence, not copied metadata, inferred
+parameter ranges or an arithmetic-expression rewrite. The previous literal-only
+proof remains independently available. Negative/reversed bounds are covered by
+the header theorem, not claimed as qualified source invocation/read domains; a
+finite loop is not necessarily short enough for a device watchdog.
+
+The real dynamic Float-storage/Double-accumulator fixture retains its independent
+source read-capacity certificate and conditional private-result initialization on
+OpenCL/CUDA/HIP source targets. Both local OpenCL and Level Zero execute zero/one/
+three-trip loops and changed-input replays against JVM oracles, including a
+cancellation case that distinguishes Double from Float accumulation. An
+overflowing final Float conversion prevents publication and poisons execution;
+an excessive dynamic count independently fails with `:program-link-graph-range`
+before graph submission. Session, graph and event ownership checks remain intact.
+The affected three namespaces pass 32 tests / 640 assertions; review found no
+blocker and its additional read-capacity control is included.
+
+Unchanged `rms-norm-chunked` now passes its dynamic-loop checked stage, but its
+final map remains refused at `:single-output-boundary`: the map domain retains a
+lifted scalar extent while output storage projects the checked product of rows
+and features. This requires the existing causal extent evidence, not weakened
+equality or a norm-specific exception. Internal checked conversions, complete
+training/source correspondence, and the broad draft's red CI remain open.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast

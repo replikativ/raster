@@ -28,6 +28,16 @@
            (recur (inc j) (+ acc (double (aget x j))))
            acc))))))
 
+(deftm dynamic-double-fold-float-storage
+  [x :- (Array float) n :- Long] :- (Array float)
+  (let [out (arrays/zeros-like x 1)]
+    (par/map! out i 1 nil
+      (float
+       (loop [j 0 acc (double 0.0)]
+         (if (< j n)
+           (recur (inc j) (+ acc (double (aget x j))))
+           acc))))))
+
 (deftm mixed-scale
   [coefficient :- Double values :- (Array float)] :- (Array float)
   (par/scale coefficient values))

@@ -5,7 +5,9 @@
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.ir.emitted-parallel-equation :as emitted]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.stage-result :as result]
@@ -119,6 +121,60 @@
                        (assoc loop :step 2)
                        (assoc-in loop [:attributes :upper-bound] :inclusive)]]
         (is (= :checked-map-stage-declined (reason #(#'checked/otherwise-total! [changed]))))))))
+
+(deftest dynamic-unit-loop-proof-uses-exact-validated-operation-membership
+  (let [wide #(body/index-cast % :long :exact)
+        loop-for (fn [lower upper step attributes]
+                   (body/->ForLoop (body/value 'i :long) lower upper step
+                                   [(body/->LoopArg (body/value 'carry :double) (body/literal 0.0 :double))]
+                                   [(body/->Yield ['carry])] [(body/value 'sum :double)] attributes))
+        kernel-for (fn [operation parameter-type]
+                     (body/make {:id :dynamic-unit-proof
+                                 :parameters [(body/->KernelParameter 'lo :scalar parameter-type [] nil nil :bound)
+                                              (body/->KernelParameter 'hi :scalar parameter-type [] nil nil :bound)]
+                                 :operations [operation]
+                                 :launch (launch/spec {:workgroup-size [1] :group-count [1]})}))]
+    (doseq [[lower upper parameter-type]
+            [['lo 'hi :long]
+             [(wide 'lo) (wide 'hi) :int]
+             [(wide -3) 'hi :long]
+             [Long/MIN_VALUE Long/MAX_VALUE :long]
+             [Long/MAX_VALUE Long/MIN_VALUE :long]]]
+      (let [operation (loop-for lower upper 1 {})
+            kernel (kernel-for operation parameter-type)
+            proved? (#'checked/proved-unit-headers kernel)]
+        (is (true? (proved? operation)))
+        (is (false? (proved? (with-meta operation {:copied true}))))
+        (is (nil? (#'checked/otherwise-total! [operation] proved?)))))
+    (doseq [operation [(loop-for 'lo 'hi 2 {})
+                      (loop-for 'lo 'hi 1 {:upper-bound :inclusive})
+                      (loop-for 'lo (body/expression :add 'hi (wide 0)) 1 {})]]
+      (let [proved? (#'checked/proved-unit-headers (kernel-for operation :long))]
+        (is (false? (proved? operation)))
+        (is (= :checked-map-stage-declined (reason #(#'checked/otherwise-total! [operation] proved?))))))
+    (let [operation (loop-for 'lo 'hi 1 {})]
+      (is (= :checked-map-stage-declined (reason #(#'checked/otherwise-total! [operation]))))
+      (doseq [bad [(assoc (kernel-for operation :long) :operations [(assoc operation :upper 'missing)])
+                   (assoc-in (kernel-for operation :long) [:parameters 1 :dtype] :double)]]
+        (is (thrown? clojure.lang.ExceptionInfo (#'checked/proved-unit-headers bad)))))))
+
+(deftest dynamic-source-fold-retains-its-independent-read-and-result-obligations
+  (doseq [target targets]
+    (let [compilation (equation-first/compile #'storage/dynamic-double-fold-float-storage
+                                             (merge storage/policy {:target target :dtype :double}))
+          equation (numerical-equation compilation)
+          report (emitted/validate-with-result-contracts equation)
+          kernel (get-in equation [:graph :nodes 0 :operation :attributes :kernel-body])
+          operation (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                                   (tree-seq coll? seq (:operations kernel))))]
+      (is (symbol? (:upper operation)))
+      (is (nil? (#'checked/otherwise-total! [operation] (#'checked/proved-unit-headers kernel))))
+      (is (= :checked-map-stage-declined (reason #(#'checked/otherwise-total! [operation]))))
+      (is (= :double (get-in operation [:iter-args 0 :binding :type])))
+      (is (= :invocation-private (get-in report [:stage-results 0 :output-ownership])))
+      (is (= :conditional-on-success (get-in report [:stage-results 0 :initialization])))
+      (is (seq (get-in equation [:refinement :source :nodes 0 :read-capacity-certificate :requirements])))
+      (is (empty? (:complete-write-domains report))))))
 
 (deftest physical-refinement-does-not-authorize-unobserved-consumers
   (let [compilation (compilation (first targets))
