@@ -167,6 +167,28 @@ single known running-variance refusal. No fixture was skipped or permission
 relaxed; the full failure inventory and source preparation/lowering repairs
 remain required before broad landing.
 
+The preparation failure is now reproduced and repaired at the helper-import
+producer, without raising the retry limit. In a fresh capped JVM, three public
+softmax-cross-entropy compile attempts exhausted their internal retries across
+nine helper receivers. Every captured conflict preserved the executable root and
+changed only `:raster.core/jit-spec`: publishing the frozen frontend owner was
+invalidating prior observations one helper at a time. Typed-source import now
+batches only historically observed, still-unfrozen frontend receivers through
+the existing separate-ownership preparation service. Original history is checked
+after the entire batch; stale output is discarded and the WHOLE producer retries.
+No snapshots are refreshed, numerical bodies invoked, JVM implementations
+promoted, or already-frozen frontier callbacks repeated.
+
+The final filtered implementation passes the same cold public reproduction on
+its FIRST compile, emitting eight CUDA source kernels; two warm repetitions also
+emit eight. This is source-emission evidence, not nvcc or device qualification.
+Fresh six-helper fixtures exceed the fixed retry budget and pass in both
+observation orders with one rejected producer attempt, unchanged executable
+roots, zero numerical calls and bounded warm callback scope. The complete seven
+affected namespaces pass 114 tests / 638 assertions. Independent review found no
+blocker and required the final fresh-process check, which passed. Portable
+map/fold-map and checked-map refusals remain separate open failures.
+
 ### October 21 ordered host-integral qualification
 
 Late checked integral computations may now remain opaque ordered host actions

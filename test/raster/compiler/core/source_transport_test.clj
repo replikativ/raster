@@ -1,6 +1,6 @@
 (ns raster.compiler.core.source-transport-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-transport :as transport]
@@ -13,6 +13,48 @@
       (+ x n))))
 
 (def unrelated-input 7)
+(def frontier-numerical-calls (atom 0))
+
+(deftest inliner-freezes-the-observed-cold-frontend-frontier-in-one-batch
+  (doseq [reverse? [false true]]
+    (let [scope (create-ns (gensym "raster.frontend.frontier."))]
+      (try
+        (binding [*ns* scope]
+          (refer 'clojure.core)
+          (doseq [name '[a b c d e f]]
+            (eval (list 'raster.core/deftm name '[x :- Long] ':- 'Long
+                        '(let [unused (swap! raster.compiler.core.source-transport-test/frontier-numerical-calls inc)]
+                           x)))))
+        (let [sources (mapv #(ns-resolve scope (symbol (str % "_m_long"))) '[a b c d e f])
+              receivers (mapv #(ns-resolve scope (symbol (str (:name (meta %)) "-impl"))) sources)
+              ordered (if reverse? (vec (reverse receivers)) receivers)
+              roots (mapv var-get receivers)
+              attempts (atom 0)
+              before @frontier-numerical-calls
+              info (entry/call-with-definition-inputs
+                    (fn []
+                      (swap! attempts inc)
+                      (doseq [receiver ordered]
+                        (entry/observe-definition-input! receiver scope (:name (meta receiver))))
+                      (#'inline/try-resolve-walked-body (first sources))))]
+          (is (= 2 @attempts) "one batch publication rejects exactly one whole producer attempt")
+          (is (seq (:walked-body info)))
+          (is (some? (:source-import info)))
+          (is (= before @frontier-numerical-calls) "preparation never invokes numerical bodies")
+          (doseq [[receiver root] (map vector receivers roots)]
+            (is (identical? root (var-get receiver)) "frontend preparation does not promote the JVM implementation")
+            (is (some? (get-in (meta receiver) [:raster.core/jit-spec :frontend-source-owner]))))
+          (let [prepare core/prepare-implementation-frontend! calls (atom [])]
+            (with-redefs [core/prepare-implementation-frontend!
+                          (fn [receiver] (swap! calls conj receiver) (prepare receiver))]
+              (entry/call-with-definition-inputs
+               (fn []
+                 (doseq [receiver ordered]
+                   (entry/observe-definition-input! receiver scope (:name (meta receiver))))
+                 (#'inline/try-resolve-walked-body (first sources)))))
+            (is (= [(first receivers)] @calls)
+                "warm imports prepare only their actual helper, not the already frozen frontier")))
+        (finally (remove-ns (ns-name scope)))))))
 
 (deftm loop-helper [n :- Long] :- Long
   (loop [i 0 total 0]
