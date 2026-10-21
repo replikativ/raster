@@ -10,6 +10,11 @@
 (defn- observe! [v]
   (entry/observe-definition-input! v (:ns (meta v)) (:name (meta v))))
 
+(defn- observed-inputs [v]
+  (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+    (observe! v)
+    @entry/*emission-inputs*))
+
 (deftest refused-optional-analysis-does-not-retain-speculative-dependencies
   (let [owner (atom {:static [] :values []})]
     (binding [entry/*emission-inputs* owner]
@@ -169,3 +174,70 @@
                    :ready))))
       (is (map? (:raster.core/jit-spec (meta #'input-a))))
       (finally (reset-meta! #'input-a metadata)))))
+
+(deftest owned-preparation-renews-a-warm-caller-after-its-callee-is-promoted
+  (let [callee #'input-a caller #'input-b
+        metadata (mapv meta [callee caller]) roots (mapv deref [callee caller])
+        attempts (atom 0) prepared (atom []) before @numeric-calls
+        old-emission (Object.) new-emission (Object.)]
+    (try
+      (alter-meta! callee assoc :raster.core/jit-spec {})
+      (alter-meta! caller dissoc :raster.core/jit-spec)
+      (alter-meta! caller assoc ::emission old-emission)
+      (let [result
+            (entry/call-with-definition-inputs
+             (fn []
+               (swap! attempts inc)
+               (doseq [v [callee caller]] (observe! v))
+               (entry/prepare-owned-definition-inputs!
+                (fn [v]
+                  (is (nil? entry/*emission-inputs*))
+                  (swap! prepared conj v)
+                  (cond
+                    (and (identical? v callee) (:raster.core/jit-spec (meta v)))
+                    (do (alter-var-root v (constantly (fn [] (swap! numeric-calls inc))))
+                        (alter-meta! v dissoc :raster.core/jit-spec))
+                    (and (identical? v caller) (identical? old-emission (::emission (meta v))))
+                    (alter-meta! v assoc ::emission new-emission)))
+                [callee caller callee])
+               @entry/*emission-inputs*))]
+        (is (= 2 @attempts))
+        (is (= [callee caller callee caller] @prepared))
+        (is (identical? new-emission (get-in result [:definition-proofs caller :metadata ::emission])))
+        (is (= before @numeric-calls))
+        (is (entry/assert-definition-inputs-current! result)))
+      (finally
+        (doseq [[v root metadata] (map vector [callee caller] roots metadata)]
+          (alter-var-root v (constantly root))
+          (reset-meta! v metadata))))))
+
+(deftest owned-preparation-validates-the-entire-explicit-selection-first
+  (let [parent (atom (observed-inputs #'input-a)) before @parent calls (atom [])]
+    (binding [entry/*emission-inputs* parent]
+      (doseq [[selection reason] [[nil :invalid-definition-preparation-selection]
+                                  [(list #'input-a) :invalid-definition-preparation-selection]
+                                  [[#'input-a #'input-b] :unobserved-definition-preparation-input]]]
+        (is (= reason
+               (try (entry/prepare-owned-definition-inputs! #(swap! calls conj %) selection) nil
+                    (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+      (is (empty? @calls))
+      (is (identical? before @parent))
+      (is (true? (entry/prepare-owned-definition-inputs! #(swap! calls conj %) [])))
+      (is (empty? @calls)))))
+
+(deftest owned-preparation-keeps-all-warm-current-inputs-in-one-attempt
+  (let [metadata (mapv meta [#'input-a #'input-b])
+        roots (mapv deref [#'input-a #'input-b])
+        attempts (atom 0) prepared (atom [])]
+    (is (entry/call-with-definition-inputs
+         #(do (swap! attempts inc)
+              (doseq [v [#'input-a #'input-b]] (observe! v))
+              (entry/prepare-owned-definition-inputs!
+               (fn [v] (is (nil? entry/*emission-inputs*)) (swap! prepared conj v))
+               [#'input-b #'input-a #'input-b])
+              true)))
+    (is (= 1 @attempts))
+    (is (= [#'input-b #'input-a] @prepared))
+    (doseq [[v root metadata] (map vector [#'input-a #'input-b] roots metadata)]
+      (is (identical? root @v))
+      (is (identical? metadata (meta v))))))

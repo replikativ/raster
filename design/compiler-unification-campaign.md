@@ -29,6 +29,26 @@ requested order, duplicate collapse, warm reuse, no numerical execution, unchang
 unrequested pending inputs, empty selection, pre-callback refusal, nested ownership
 and whole-producer retry after promotion.
 
+### October 21 explicit owned-definition preparation
+
+The preparation service now shares one observation-checked batch implementation
+between pending-only preparation and an explicit owned-receiver API. The latter
+accepts an ordered vector of already-observed Vars and calls the supplied
+non-evaluating compiler preparation callback for warm receivers too. This lets
+the existing bytecode owner decide whether a current emission can be reused or a
+new emission is required after a callee promotion; it does not itself renew code.
+The original enclosing observations are checked before and after the whole batch,
+so changed inputs require a whole-producer retry rather than restamping old code.
+No callback runs until the entire selection has been validated.
+
+Independent review finds no broad-draft dependency or pending-only behavior
+change. The exact clean-branch functions and tests pass 12 tests / 61 assertions
+in an isolated namespace in the existing capped REPL. Simulated callbacks qualify
+selection, ordering, empty/warm behavior, ownership and retry; they do not prove
+actual bytecode renewal, source correspondence or execution admission. Fresh
+clean-branch qualification also passes 12 tests / 61 assertions in a 256 MiB JVM.
+Exact-head CI qualification remains a separate gate.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long
