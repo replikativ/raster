@@ -406,6 +406,54 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Arity mismatch"
                              (#'inline/inline-invk call)))))))
 
+(deftest both-inline-entrypoints-share-ordered-expansion-construction
+  (let [build @#'inline/build-inline-expansion
+        modes (atom [])
+        info {:params '[unused value] :tags '[int long]
+              :walked-body '[(let* [copy value]
+                               (swap! calls conj :callee)
+                               (+ copy copy))]}]
+    (with-redefs-fn
+      {#'inline/try-resolve-deftm (fn [& _] info)
+       #'inline/build-inline-expansion
+       (fn [callee args environment substitute result]
+         (swap! modes conj (if result :binding :nested))
+         (build callee args environment substitute result))}
+      (fn []
+        (doseq [mode [:binding :nested]
+                [first-value expected-events expected-result]
+                [[3 [:first :second :callee] [:value 14]]
+                 [4294967296 [:first] [:error ArithmeticException]]]]
+          (let [arguments [(list 'int (list 'do '(swap! calls conj :first) first-value))
+                           '(do (swap! calls conj :second) 7)]
+                expression (if (= :binding mode)
+                             (:form (#'inline/inline-one-pass
+                                     (list 'let* ['result (list* 'example/helper arguments)] 'result)))
+                             (#'inline/inline-invk (list* '.invk 'example/helper arguments)))
+                actual (eval (list 'let ['calls '(atom [])]
+                                   [(list 'try [:value expression]
+                                          (list 'catch 'Throwable 'error
+                                                [:error '(class error)]))
+                                    '(deref calls)]))]
+            (is (= [expected-result expected-events] actual))))))
+    (is (= [:binding :binding :nested :nested] @modes))))
+
+(deftest both-inline-entrypoints-retain-every-body-form
+  (with-redefs-fn
+    {#'inline/try-resolve-deftm
+     (fn [& _] {:params [] :tags []
+               :walked-body '[(swap! calls conj :first) (swap! calls conj :second) 42]})}
+    (fn []
+      (doseq [expression [(:form (#'inline/inline-one-pass
+                                 '(let* [result (example/helper)] result)))
+                          (#'inline/inline-invk '(.invk example/helper))]]
+        (is (= [42 [:first :second]]
+               (eval (list 'let ['calls '(atom [])] [expression '(deref calls)])))))
+      (binding [inline/*inline-size-limit* 6]
+        (is (= '(.invk example/helper)
+               (#'inline/inline-invk '(.invk example/helper)))
+            "the size budget must cover the whole body, not just its first form")))))
+
 (deftest unused-collection-arguments-still-evaluate-their-elements
   (with-redefs-fn {#'inline/try-resolve-deftm
                   (fn [_] {:params ['x] :walked-body [42]})}

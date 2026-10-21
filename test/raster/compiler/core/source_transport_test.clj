@@ -189,6 +189,49 @@
          (is (nil? (transport/body-import-view candidate output))))
        (is (empty? (:definition-proofs @entry/*emission-inputs*)))))))
 
+(deftest actual-expansion-consumes-the-exact-imported-body
+  (let [expected (scoped-helper 3)
+        ;; A first numerical JIT legitimately changes the helper's metadata.
+        ;; Complete that before capturing, never refresh an old import's history.
+        imported (imported-helper)
+        view transport/body-import-view
+        observed (atom [])
+        expand (fn [mode]
+                 (entry/call-with-definition-inputs
+                  #(if (= :binding mode)
+                     (:form (#'inline/inline-one-pass '(let* [result (example/helper 3)] result)))
+                     (#'inline/inline-invk '(.invk example/helper 3)))))]
+    (with-redefs-fn
+      {#'inline/try-resolve-deftm (fn [& _] imported)
+       #'transport/body-import-view
+       (fn [input body]
+         (swap! observed conj [input body])
+         (view input body))}
+      (fn []
+        (doseq [mode [:binding :nested]]
+          (is (= expected (eval (expand mode)))))
+        (is (= 2 (count @observed)))
+        (is (every? (fn [[input body]]
+                      (and (identical? (:source-import imported) input)
+                           (identical? (:walked-body imported) body))) @observed))))
+    (doseq [candidate [(assoc imported :walked-body (mapv identity (:walked-body imported)))
+                       (assoc imported :params '[foreign])
+                       (assoc imported :tags '[double])]]
+      (with-redefs-fn
+        {#'inline/try-resolve-deftm (fn [& _] candidate)}
+        (fn []
+          (doseq [mode [:binding :nested]]
+            (is (= :unclosed-inline-body-import (reason #(expand mode))))))))
+    (let [metadata (meta #'scoped-helper_m_long)]
+      (try
+        (alter-meta! #'scoped-helper_m_long assoc ::changed true)
+        (with-redefs-fn
+          {#'inline/try-resolve-deftm (fn [& _] imported)}
+          (fn []
+            (doseq [mode [:binding :nested]]
+              (is (= :stale-definition-proof-input (reason #(expand mode)))))))
+        (finally (reset-meta! #'scoped-helper_m_long metadata))))))
+
 (deftest import-queries-check-history-without-transforming-source-again
   (let [imported (imported-helper)
         forbidden (fn [& _] (throw (AssertionError. "query reran source transformation")))]

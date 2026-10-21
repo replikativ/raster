@@ -433,6 +433,52 @@
   ;; the scope-aware subst-syms which handles scoping correctly.
   (subst-syms (merge devirt->dispatch smap) expr))
 
+(defn- build-inline-expansion
+  "Construct argument bindings and the substituted callee in one place.
+   A result binder requests the binding inliner's existing flat placement;
+   otherwise retain the nested body's lexical scopes for recursive expansion.
+   This construction is NOT a completion, correspondence or execution proof."
+  [{:keys [params tags walked-body source-import]} args source-env subst-fn result-sym]
+  (when source-import
+    (let [imported (source-transport/body-import-view source-import walked-body)]
+      (when-not (and imported (= params (:parameters imported)) (= tags (:tags imported)))
+        (throw (ex-info "Inline expansion differs from its exact imported body or declarations"
+                        {:reason :unclosed-inline-body-import})))))
+  (let [body-form (first (source-transport/effective-body walked-body))
+        callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
+        arguments (atom [])
+        substitutions (argument-substitution callee-params args tags source-env
+                                            #(swap! arguments conj %))]
+    (if-not result-sym
+      {:argument-bindings @arguments :body (subst-fn substitutions body-form)}
+      (let [pairs (atom @arguments)
+            emit-tail! (fn [expressions]
+                         (doseq [effect (butlast expressions)]
+                           (swap! pairs conj
+                                  [(with-meta (gensym "effect_") {:raster.effect/effectful true}) effect]))
+                         (swap! pairs conj [result-sym (last expressions)]))]
+        (cond
+          (form/binding-form? body-form)
+          (let [[_ bindings & body] body-form
+                current (atom substitutions)]
+            (doseq [[id init] (partition 2 bindings)]
+              (let [fresh (gensym (str (name id) "_"))
+                    value (subst-fn @current init)
+                    renamed (if (and (seq? value) (symbol? (first value))
+                                     (op/alloc-op? (first value)))
+                              (with-meta fresh {:raster.buffer/hoistable true
+                                                :tag (get alloc-sym->array-tag (first value))})
+                              (if (meta id) (vary-meta fresh merge (meta id)) fresh))]
+                (swap! pairs conj [renamed value])
+                (swap! current assoc id renamed)))
+            (emit-tail! (mapv #(subst-fn @current %) body)))
+
+          (and (seq? body-form) (= 'do (first body-form)))
+          (emit-tail! (mapv #(subst-fn substitutions %) (rest body-form)))
+
+          :else (swap! pairs conj [result-sym (subst-fn substitutions body-form)]))
+        {:argument-bindings @arguments :bindings @pairs}))))
+
 ;; ================================================================
 ;; value+grad / grad inlining
 ;; ================================================================
@@ -1166,7 +1212,7 @@
                              deftm-info (when (and (not ad-only?) head (not has-ad-rule?))
                                           (try-resolve-deftm head arg-tags))]
                          (if (and deftm-info (safe-to-inline? deftm-info))
-                           (let [{:keys [params walked-body tags]} deftm-info
+                           (let [{:keys [params]} deftm-info
                                  args (call-args init)
                  ;; ARITY GATE. The substitution below pairs callee params with call
                  ;; args POSITIONALLY — `(nth args i)` over the param index. A call
@@ -1180,52 +1226,8 @@
                  ;; reports "No AD template for <callee>".) A deftm call with the wrong
                  ;; number of args is always a bug — say so, at the call.
                                  _ (check-inline-arity! head params args init)
-                 ;; Handle multi-form bodies: wrap in (do ...) if more than one form
-                                 body-form (if (> (count walked-body) 1)
-                                             (list* 'do walked-body)
-                                             (first walked-body))
-                                 callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil)
-                                                     params)
-                 ;; ANF argument lifting + typed bindings for callee params.
-                 ;; Two cases require lifting an argument to a preceding let binding:
-                 ;; 1. Record/value-class params: preserves type info for bytecode backend
-                 ;; 2. Non-trivial call expressions: prevents duplication when the param
-                 ;;    appears multiple times in the callee body (e.g. inside par/pmap
-                 ;;    where CSE can't extract the duplicate afterward)
-                                 param-subst
-                                 (argument-substitution callee-params args tags @type-env
-                                                        #(swap! result-pairs conj %))]
-                             (if (form/binding-form? body-form)
-                               (let [[_ inner-bindings & inner-body] body-form
-                                     inner-pairs (partition 2 inner-bindings)
-                                     current-subst (atom param-subst)]
-                                 (doseq [[inner-sym inner-init] inner-pairs]
-                                   (let [base-renamed (gensym (str (name inner-sym) "_"))
-                                         substed (subst-fn @current-subst inner-init)
-                                         renamed (if (and (seq? substed)
-                                                          (symbol? (first substed))
-                                                          (op/alloc-op? (first substed)))
-                                                   (with-meta base-renamed
-                                                     {:raster.buffer/hoistable true
-                                                      :tag (get alloc-sym->array-tag (first substed))})
-                                                   (if (meta inner-sym)
-                                                     (vary-meta base-renamed merge (meta inner-sym))
-                                                     base-renamed))]
-                                     (swap! result-pairs conj [renamed substed])
-                                     (swap! current-subst assoc inner-sym renamed)))
-                                 (let [substed-body (mapv #(subst-fn @current-subst %) inner-body)]
-                                   (when (> (count substed-body) 1)
-                                     (doseq [effect (butlast substed-body)]
-                                       (swap! result-pairs conj [(with-meta (gensym "effect_") {:raster.effect/effectful true}) effect])))
-                                   (swap! result-pairs conj [sym (last substed-body)])))
-               ;; Handle do blocks: decompose into effect bindings + result
-                               (if (and (seq? body-form) (= 'do (first body-form)))
-                                 (let [do-exprs (rest body-form)
-                                       substed-exprs (mapv #(subst-fn param-subst %) do-exprs)]
-                                   (doseq [effect (butlast substed-exprs)]
-                                     (swap! result-pairs conj [(with-meta (gensym "effect_") {:raster.effect/effectful true}) effect]))
-                                   (swap! result-pairs conj [sym (last substed-exprs)]))
-                                 (swap! result-pairs conj [sym (subst-fn param-subst body-form)])))
+                                 expansion (build-inline-expansion deftm-info args @type-env subst-fn sym)]
+                             (swap! result-pairs into (:bindings expansion))
                              (reset! any-inlined? true)
             ;; Record the inlined function's return type so subsequent
             ;; backward calls can infer arg-tags through the binding chain
@@ -1377,7 +1379,7 @@
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info
                _ (check-inline-arity! impl-sym params (drop 2 form) form)
-               body-form (first walked-body)
+               body-form (first (source-transport/effective-body walked-body))
                safe? (safe-to-inline? deftm-info)
                ;; size policy: large straight-line callees become calls (wasm path);
                ;; fusable bodies (loop/par) always inline so fusion sees them.
@@ -1392,21 +1394,15 @@
                (util/make-invk impl-sym new-args (meta form)))
              ;; Simple body -- safe to inline
              (let [args (mapv #(inline-invk % policy) (drop 2 form))
-                   {:keys [tags]} deftm-info
-                   callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
-                   ;; ANF lifting + typed bindings — same logic as inline-one-pass
-                   lifted-bindings (atom [])
-                   param-subst
-                   (argument-substitution callee-params args tags *param-env*
-                                          #(swap! lifted-bindings into %))
-                   inlined (subst-syms param-subst body-form)
+                   expansion (build-inline-expansion deftm-info args *param-env* subst-syms nil)
+                   inlined (:body expansion)
                    ;; mark this callee as on the inline stack while re-processing its
                    ;; body, so a recursive self-call inside stays a call (terminates)
                    result (binding [*inlining* (conj *inlining* rkey)]
                             (inline-invk inlined policy))]
                ;; Wrap in let* with lifted bindings if any were emitted
-               (if (seq @lifted-bindings)
-                 (list 'let* (vec @lifted-bindings) result)
+               (if (seq (:argument-bindings expansion))
+                 (list 'let* (vec (mapcat identity (:argument-bindings expansion))) result)
                  result))))
          ;; Has template or can't resolve: keep call, recurse into arguments
          (let [args (drop 2 form)

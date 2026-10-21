@@ -272,6 +272,35 @@ allocation/local evaluation and normal return require independent closure before
 RMS or training execution is admitted. No weaker fallback or restamped history
 is an acceptable route to a green campaign.
 
+### October 21 shared production inline construction
+
+Both binding expansion and recursive `.invk` expansion now use one builder for
+ordered argument lifting and callee substitution. The builder retains their
+existing flat versus nested placement conventions; sequential local renaming,
+allocator metadata and effect/result placement are unchanged. When a BodyImport
+is supplied, construction consumes its exact body and authenticated parameters
+and tags under its original history. Copied bodies, foreign declarations and
+stale inputs fail before substitution. Legacy/generated helpers without imports
+do not acquire ownership by passing through this builder.
+
+Review caught and closed two gaps: validating only the body was insufficient
+without its declarations, and the recursive path's size/fusability policy needed
+the same whole-body convention as construction. The latter also fixes a legacy
+multi-form path that previously substituted only the first form. Tests check
+both actual entrypoints, once-only ordered arguments, unused checked failure
+before later arguments/callee effects, all body effects/results and whole-body
+size limits. The five affected inliner/import/prefix/JVM-input namespaces pass
+94 tests / 856 assertions; three affected owned-AD namespaces separately pass
+33 tests / 524 assertions. Independent final review found no blocker. Unchanged
+`rms-norm-chunked` still emits three CUDA source kernels; no vendor compiler or
+RMS device execution is established by that source probe.
+
+This intentionally introduces no standalone provenance token. The next connected
+slice must retain actual caller/argument/callee construction edges through this
+builder, consume them in source-prefix call intervals, and prepare only closed
+original argument outlines. Missing callee/allocation/return obligations still
+refuse. The broad draft and the original eight completion gates remain open.
+
 ### October 21 fresh unchanged training-source checkpoint
 
 Subsequent count-contract investigation found and repaired an actual source-cast
