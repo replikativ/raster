@@ -8,6 +8,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.source-transport :as transport]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.invocation-plan :as invocation]
@@ -149,7 +150,7 @@
    Aggregate projection, inserted/removed/reordered prefix work, nested scopes
    and changed source metadata prevent construction. Existing plan validation
    separately owns logical result-materialization conversions."
-  [input normalized represented program]
+  [input normalization normalized represented program]
   (when (and (instance? PrefixInput input)
              (flat-prefix (:source program))
              (nil? (get-in program [:attributes :invocation-plan :attributes :parameter-projection])))
@@ -160,11 +161,15 @@
           original (.-pairs input)
           normalized-pairs (flat-prefix normalized)
           represented-pairs (flat-prefix represented)
-          normalized-map (prefix-renaming original normalized-pairs parameters parameter-declarations)
+          normalized-origin (transport/normalization-occurrence normalization normalized)
           represented-map (prefix-renaming original represented-pairs parameters parameter-declarations)
           plan (get-in program [:attributes :invocation-plan])]
       (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
-      (when (and normalized-map represented-map plan
+      (when (and normalized-origin
+                 (identical? frontend (:frontend normalized-origin))
+                 (identical? (.-scope input) (:original normalized-origin))
+                 (= (count original) (count normalized-pairs))
+                 represented-map plan
                  (= parameters (mapv :symbol (:parameters plan))))
         (let [order (invocation/source-order plan program)
               steps (into {} (map (juxt :id identity)) (:steps plan))
@@ -203,6 +208,7 @@
     (let [^PrefixInput input (.-input ^PrefixCorrespondence correspondence)]
       (when (identical? frontend (.-frontend input))
         (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+        (entry/observe-frontend-source-identity! frontend)
         (.-entries ^PrefixCorrespondence correspondence)))))
 
 (defn original-step

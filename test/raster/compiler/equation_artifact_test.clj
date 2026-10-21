@@ -418,6 +418,11 @@
     (is (nil? (:eager-source-owner pure)))
     (is (some? eager))
     (is (map? (artifact/seal identity pure)))
+    (let [restored (artifact/open identity
+                                  (artifact/decode (artifact/encode (artifact/seal identity pure))))
+          arguments [(float-array [1.0 2.0]) 2]]
+      (is (= pure restored) "producer-local normalization authority must not enter portable payloads")
+      (is (= (equation-first/lower pure arguments) (equation-first/lower restored arguments))))
     (is (= :equation-artifact-ordered-owner
            (reason-of #(artifact/seal identity (assoc pure :eager-source-owner eager))))
         "a process-local eager owner is explicitly refused, never silently serialized or dropped")))

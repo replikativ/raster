@@ -576,6 +576,43 @@ on two shards after Git PPA HTTP 503 retries. Commit `050e635f` scopes unit APT
 prerequisites to the image's main source list and makes update failures fatal.
 All seven contexts must pass anew on that exact head before merging.
 
+### October 21 actual scoped normalization reconstruction
+
+The shared scope uniquifier now optionally observes its actual reconstruction:
+original node, constructed node, visible lexical renaming and bound names. The
+callback cannot replace the result; independent invocations do not inherit it,
+and both quoted-data spellings remain opaque. Existing normalization arities keep
+their output contract and allocate no observation events when tracing is disabled.
+
+Source transport reuses one guarded binder allocator and local-history transaction
+for helper import and authenticated frontend normalization. Its owner-local
+normalization witness requires unique original/constructed identities. Copied,
+ambiguous, ownerless or malformed queries supply no authority. Queries adopt the
+original lightweight source identity/history; they do not rerun normalization or
+refresh dependencies. This records a transformation, not type inference or
+permission to execute, differentiate, move or erase source work.
+
+Equation-first keeps the witness local and the prefix verifier consumes it instead
+of re-matching the normalized root structurally. Existing independent represented
+source/final-step checks remain. The internal `source-prefix/close` now requires
+this witness; there is no old matching fallback. Public `deftm` semantics are
+unchanged. Prefix queries into a fresh publication owner also retain exact source
+identity. No opaque token is added to options, IR metadata or portable artifacts.
+
+Independent review finds no blocker. The reused capped REPL's complete affected
+16-namespace gate passes 240 tests / 2,408 assertions, including unchanged training
+diagnostics. Two additional artifact controls pass 9 assertions: numerical-only
+compilation still seals/encodes/decodes/opens and lowers equivalently, while
+process-local source owners remain explicitly refused. Ambiguity controls exercise
+both duplicate output and one original paired with distinct outputs.
+
+This closes the first reconstruction seam only. Helper argument completion and
+substitution, later normalization/lifting, original count-to-extent correspondence,
+read obligations, quotient execution and prepared-AD closure still require the
+remaining chain above. Neither this receipt nor green focused tests qualifies the
+broad draft for merge. PR #1553 is now squash-merged as `5baa8b30` after all seven
+exact-head contexts passed; the checked source-cast prerequisite is on main.
+
 ### Next producer-owned helper-expansion transport
 
 Independent review of the actual inliner locates the missing relation:

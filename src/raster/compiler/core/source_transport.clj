@@ -11,6 +11,38 @@
   [body]
   (if (> (count body) 1) [(apply list 'do body)] body))
 
+(defn- with-local-history [construct]
+  (let [parent entry/*emission-inputs* historical @parent
+        local (atom {:static [] :values []})
+        _ (entry/assert-definition-inputs-current! historical)
+        result (binding [entry/*emission-inputs* local] (construct))]
+    (when-not (identical? historical @parent)
+      (throw (ex-info "source transformation's enclosing owner changed during construction"
+                      {:reason :unstable-definition-proof-input})))
+    (entry/assert-definition-inputs-current! historical)
+    (entry/assert-definition-inputs-current! @local)
+    (entry/adopt-definition-inputs! @local)
+    result))
+
+(defn- with-hygienic-renamings [body parameters transform]
+  ;; Shared by helper alpha conversion and source uniquification. A trace alone
+  ;; cannot make a capturing or metadata-changing binder allocator trustworthy.
+  (let [used (volatile! (into (set parameters) (mapcat util/free-syms) body))
+        events (volatile! []) allocate util/*fresh-binder*
+        result (binding [util/*fresh-binder*
+                         (fn [original]
+                           (let [fresh (allocate original)]
+                             (when-not (and (symbol? fresh) (nil? (namespace fresh))
+                                            (not (contains? @used fresh))
+                                            (identical? (meta original) (meta fresh)))
+                               (throw (ex-info "source transformation requires fresh metadata-preserving binders"
+                                               {:reason :nonfresh-source-import-binder})))
+                             (vswap! used conj fresh)
+                             (vswap! events conj [original fresh])
+                             fresh))]
+                 (transform))]
+    {:body result :renamings @events}))
+
 (deftype ^:private BodyImport
   [frontend parameters source-ns effective hygienic qualified tags renamings observations]
   entry/RetainedProducerInput
@@ -50,25 +82,9 @@
             (entry/observe-frontend-source-identity! frontend))
         qualified-tags (qualify-tags tags source-ns)
         effective (effective-body body)
-        ;; The free set is scope-aware. Shadowed original binders deliberately
-        ;; remain distinct ordered events, never entries in a symbol-keyed map.
-        used (when owned? (volatile! (into (set parameters) (mapcat util/free-syms) effective)))
-        events (when owned? (volatile! []))
-        allocate util/*fresh-binder*
-        hygienic (if owned?
-                   (binding [util/*fresh-binder*
-                             (fn [original]
-                               (let [fresh (allocate original)]
-                                 (when-not (and (symbol? fresh) (nil? (namespace fresh))
-                                                (not (contains? @used fresh))
-                                                (identical? (meta original) (meta fresh)))
-                                   (throw (ex-info "source import requires fresh metadata-preserving binders"
-                                                   {:reason :nonfresh-source-import-binder})))
-                                 (vswap! used conj fresh)
-                                 (vswap! events conj [original fresh])
-                                 fresh))]
-                     (mapv util/alpha-convert effective))
-                   (mapv util/alpha-convert effective))
+        renamed (when owned?
+                  (with-hygienic-renamings effective parameters #(mapv util/alpha-convert effective)))
+        hygienic (if owned? (:body renamed) (mapv util/alpha-convert effective))
         parameter-set (set (map #(if (symbol? %) % (symbol (name %))) parameters))
         qualified (if source-ns
                     (mapv #(inference/qualify-body-symbols % source-ns parameter-set
@@ -78,7 +94,7 @@
                 (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
                 (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
                 (BodyImport. frontend parameters source-ns effective hygienic qualified
-                             qualified-tags @events @entry/*emission-inputs*))]
+                             qualified-tags (:renamings renamed) @entry/*emission-inputs*))]
     {:walked-body qualified :tags qualified-tags :source-import input}))
 
 (defn prepare-inline-body
@@ -89,17 +105,7 @@
    return or permission to execute the imported body is supplied."
   [frontend body parameters tags source-ns]
   (if (and frontend entry/*emission-inputs*)
-    (let [parent entry/*emission-inputs* historical @parent
-          _ (entry/assert-definition-inputs-current! historical)
-          imported (binding [entry/*emission-inputs* (atom {:static [] :values []})]
-                     (prepare-body frontend body parameters tags source-ns true))
-          ^BodyImport input (:source-import imported)]
-      (when-not (identical? historical @parent)
-        (throw (ex-info "source import's enclosing owner changed during construction"
-                        {:reason :unstable-definition-proof-input})))
-      (entry/assert-definition-inputs-current! historical)
-      (entry/adopt-definition-inputs! (.-observations input))
-      imported)
+    (with-local-history #(prepare-body frontend body parameters tags source-ns true))
     (prepare-body frontend body parameters tags source-ns false)))
 
 (defn body-import-view
@@ -118,3 +124,61 @@
         :tags (.-tags ^BodyImport input)
         :effective-body (.-effective ^BodyImport input) :hygienic-body (.-hygienic ^BodyImport input)
         :walked-body body :renamings (.-renamings ^BodyImport input)}))))
+
+(deftype ^:private SourceNormalization [frontend body occurrences renamings observations]
+  entry/RetainedProducerInput
+  (assert-producer-current! [_]
+    (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+    (entry/assert-definition-inputs-current! observations)
+    true))
+
+(defn normalize-frontend-bindings
+  "Uniquify the exact authenticated frontend, retaining actual construction edges.
+   The witness is producer-local: do not put it in compiler options, IR metadata
+   or portable artifacts. It proves no completion, inlining or execution rights."
+  [frontend parameters]
+  (when (and frontend entry/*emission-inputs*)
+    (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+    (when-not (= parameters (get-in frontend [:source-entry :params]))
+      (throw (ex-info "source normalization differs from its original parameters"
+                      {:reason :source-normalization-input-mismatch})))
+    (with-local-history
+      (fn []
+        (entry/observe-frontend-source-identity! frontend)
+        (let [parameters (mapv #(if (symbol? %) (symbol (name %)) %) parameters)
+              occurrences (volatile! [])
+              renamed (with-hygienic-renamings
+                        (:body frontend) parameters
+                        #(mapv (fn [ordinal expression]
+                                 (util/uniquify-rebindings
+                                  parameters expression
+                                  (fn [original constructed renaming bound]
+                                    (when (and (seq? original)
+                                               (not (contains? '#{quote clojure.core/quote}
+                                                               (first original))))
+                                      (vswap! occurrences conj
+                                              {:original original :constructed constructed
+                                               :root ordinal :renaming renaming :bound bound})))))
+                               (range) (:body frontend)))
+              body (:body renamed)]
+          {:walked-body body
+           :source-normalization (SourceNormalization. frontend body @occurrences
+                                                       (:renamings renamed) @entry/*emission-inputs*)})))))
+
+(defn normalization-occurrence
+  "Query a unique exact constructed occurrence under its original history.
+   Copied, repeated-shared or ownerless nodes abstain. No transformation or source
+   search is rerun; successful adoption retains the original source identity guard."
+  [input constructed]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and entry/*emission-inputs* (instance? SourceNormalization input))
+       (let [^SourceNormalization input input
+             occurrences (.-occurrences input)
+             matches (filterv #(identical? constructed (:constructed %)) occurrences)]
+         (when (and (= 1 (count matches))
+                    (= 1 (count (filter #(identical? (:original (first matches)) (:original %))
+                                        occurrences))))
+           (entry/assert-producer-current! input)
+           (entry/adopt-definition-inputs! (.-observations input))
+           (assoc (first matches) :frontend (.-frontend input))))))))

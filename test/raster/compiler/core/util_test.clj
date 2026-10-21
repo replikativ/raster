@@ -5,6 +5,47 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.core.util :as util]))
 
+(deftest uniquification-observes-actual-reconstruction-with-lexical-scope
+  (let [events (atom [])
+        shared '(clojure.core/inc x)
+        source (list 'let* ['x 1] (list 'let* ['x shared] shared))
+        result (util/uniquify-rebindings
+                #{} source (fn [original constructed renaming bound]
+                             (swap! events conj [original constructed renaming bound])
+                             :not-a-replacement))
+        matches (filterv #(identical? shared (first %)) @events)
+        inner (nth result 2)
+        renamed (first (second inner))]
+    (is (= 2 (count matches)))
+    (is (not (identical? (second (first matches)) (second (second matches)))))
+    (is (= {} (nth (first matches) 2)) "inner initializer sees outer x")
+    (is (= {'x renamed} (nth (second matches) 2)) "inner body sees the new x")
+    (is (not= :not-a-replacement result))
+    (is (= 3 ((eval (list 'fn [] result)))))
+    (is (identical? source (ffirst (take-last 1 @events)))))
+  (let [failure (Exception. "observer")]
+    (is (identical? failure
+                   (try (util/uniquify-rebindings #{} '(inc 1)
+                                                   (fn [& _] (throw failure)))
+                        (catch Exception error error))))))
+
+(deftest independent-normalization-does-not-inherit-an-enclosing-observer
+  (let [events (atom []) outside '(clojure.core/inc foreign)]
+    (util/uniquify-rebindings
+     #{} '(clojure.core/inc x)
+     (fn [original & _]
+       (swap! events conj original)
+       (util/uniquify-rebindings #{} outside)))
+    (is (not-any? #(identical? outside %) @events))))
+
+(deftest quoted-data-is-opaque-to-uniquification-observation
+  (doseq [head '[quote clojure.core/quote]]
+    (let [data '(let* [x 2] x) source (list head data) events (atom [])
+          result (util/uniquify-rebindings #{'x} source (fn [original & _] (swap! events conj original)))]
+      (is (identical? source result))
+      (is (identical? data (second result)))
+      (is (= 1 (count @events))))))
+
 ;; ================================================================
 ;; free-syms: scoped free variable collection
 ;; ================================================================

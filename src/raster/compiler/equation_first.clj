@@ -19,6 +19,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.source-prefix :as source-prefix]
+            [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -735,9 +736,10 @@
                             f-var resolved-var (:dtype compiler-options) compiler-options)
          prefix-input (source-prefix/begin retained-frontend
                                            (:raster.core/deftm-params (meta resolved-var)))
-         walked (or (when retained-frontend
-                      (pipeline/normalize-source-bindings
-                       (:body retained-frontend) (:raster.core/deftm-params (meta resolved-var))))
+         normalized-input (when retained-frontend
+                            (source-transport/normalize-frontend-bindings
+                             retained-frontend (:raster.core/deftm-params (meta resolved-var))))
+         walked (or (:walked-body normalized-input)
                     (pipeline/get-walked-body resolved-var (:dtype compiler-options)))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
          represented-source (pipeline/run-passes
@@ -781,7 +783,8 @@
          semantic (cond-> semantic
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))
-         prefix-correspondence (source-prefix/close prefix-input source represented-source semantic)
+         prefix-correspondence (source-prefix/close prefix-input (:source-normalization normalized-input)
+                                                    source represented-source semantic)
          _ (source-prefix/prepare-selected-calls! prefix-correspondence retained-frontend semantic
                                                   rcore/ensure-current-owned-bytecode!)
          source-ns-symbol (source-namespace-symbol f-var)

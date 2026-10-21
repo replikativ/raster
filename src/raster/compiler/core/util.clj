@@ -312,6 +312,8 @@
 
 (declare uniquify*)
 
+(def ^:dynamic ^:private *uniquify-observer* nil)
+
 (defn- uniquify-scope
   "Uniquify one scope's binders, threading [env bound]: a binder that SHADOWS a
    name already in `bound` is renamed to a fresh name (and recorded in env);
@@ -341,9 +343,9 @@
 
 (defn- uniquify*
   [env bound form]
-  (cond
+  (let [result (cond
     (symbol? form) (get env form form)
-    (and (seq? form) (= 'quote (first form))) form
+    (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
     (seq? form)
     (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)]
       (rebuild (mapv #(uniquify-scope env bound % sequential? rec?) scopes)
@@ -353,7 +355,13 @@
     (record? form) (reduce-kv (fn [r k v] (assoc r k (uniquify* env bound v))) form form)
     (map? form) (into (empty form) (map (fn [[k v]] [(uniquify* env bound k) (uniquify* env bound v)]) form))
     (set? form) (into (empty form) (map #(uniquify* env bound %) form))
-    :else form))
+    :else form)]
+    ;; Observe the actual reconstruction, never a second walk or a replacement
+    ;; returned by the observer. Scope maps are the immutable lexical inputs to
+    ;; this exact recursive invocation. Disabled observation allocates no event.
+    (when *uniquify-observer*
+      (*uniquify-observer* form result env bound))
+    result))
 
 (defn scope-blind-substitution-safe?
   "Is a scope-BLIND symbol substitution of `smap` over `expr` provably equivalent to the
@@ -406,9 +414,18 @@
    buffer conflates the input and output buffers in materialize/buffer analysis —
    the output alloc is bound to `up`, so the map body's read of `up` resolves to
    the uninitialized output. Distinct SSA names remove the hazard (matches what a
-   hand-written distinct binding does)."
+   hand-written distinct binding does).
+
+   Optional observer receives [original constructed lexical-renaming bound-names]
+   after each actual recursive reconstruction; its return value is ignored.
+   Quoted data is opaque. Observation alone grants no source/execution authority."
   ([form] (uniquify-rebindings #{} form))
-  ([params form] (uniquify* {} (set params) form)))
+  ([params form] (uniquify-rebindings params form nil))
+  ([params form observe!]
+   ;; Each public invocation owns its observer. A nested independent call from
+   ;; an allocator/observer must not pollute its enclosing reconstruction trace.
+   (binding [*uniquify-observer* observe!]
+     (uniquify* {} (set params) form))))
 
 (defn remake
   "Construct a new list form preserving metadata from orig.

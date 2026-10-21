@@ -36,6 +36,9 @@
 (defn- source-with-bindings [source bindings]
   (with-meta (list* (first source) bindings (nnext source)) (meta source)))
 
+(defn- reclose [& arguments]
+  (entry/call-with-definition-inputs #(apply prefix/close arguments)))
+
 (defn- capture [function]
   (let [observed (atom {})
         begin prefix/begin close prefix/close
@@ -55,7 +58,7 @@
 
 (deftest original-occurrence-is-separate-from-logical-result-conversion
   (let [{:keys [frontend inputs correspondence compilation]} (capture #'selected-prefix)
-        [input normalized represented program] inputs
+        [input normalization normalized represented program] inputs
         step (first (filter invocation/scalar-compute?
                             (get-in program [:attributes :invocation-plan :steps])))
         original (prefix/original-step correspondence frontend program step)]
@@ -69,7 +72,10 @@
     (is (= 'clojure.core/long (first (:result-expression original))))
     (is (= (:expression original) (second (:result-expression original))))
     (is (identical? step (:step original)))
-    (is (some? (prefix/close input normalized represented program)))
+    (is (some? (reclose input normalization normalized represented program)))
+    (is (nil? (reclose input nil normalized represented program)))
+    (is (nil? (reclose input {} normalized represented program)))
+    (is (nil? (reclose input normalization (apply list normalized) represented program)))
     (is (nil? (prefix/original-step correspondence frontend program nil)))
     (is (nil? (prefix/original-step correspondence frontend program (into {} step))))
     (is (nil? (prefix/original-step correspondence frontend (assoc program :copied true) step)))
@@ -78,27 +84,46 @@
 
 (deftest history-and-original-frontend-identity-remain-required
   (let [{:keys [frontend inputs correspondence]} (capture #'selected-prefix)
-        [input normalized represented program] inputs
+        [input normalization normalized represented program] inputs
         step (first (filter invocation/scalar-compute?
                             (get-in program [:attributes :invocation-plan :steps])))
         source (get-in frontend [:source-entry :source-var])
         metadata (meta source)]
-    (is (nil? (prefix/close nil normalized represented program)))
-    (is (nil? (prefix/close {} normalized represented program)))
+    (is (nil? (reclose nil normalization normalized represented program)))
+    (is (nil? (reclose {} normalization normalized represented program)))
     (is (thrown? clojure.lang.ExceptionInfo
                  (prefix/begin (assoc frontend :body (mapv identity (:body frontend))) '[n])))
     (try
       (alter-meta! source assoc :raster.core/source-policy {:unchecked-math true})
       (is (thrown? clojure.lang.ExceptionInfo
-                   (prefix/close input normalized represented program)))
+                   (reclose input normalization normalized represented program)))
       (is (thrown? clojure.lang.ExceptionInfo
                    (prefix/original-step correspondence frontend program step)))
       (finally (reset-meta! source metadata)))
     (is (some? (prefix/original-step correspondence frontend program step)))))
 
+(deftest original-step-adopts-source-identity-into-a-fresh-publication-owner
+  (let [{:keys [frontend inputs correspondence]} (capture #'selected-prefix)
+        program (last inputs)
+        step (first (filter invocation/scalar-compute?
+                            (get-in program [:attributes :invocation-plan :steps])))
+        owner (atom {:static [] :values []})
+        source (get-in frontend [:source-entry :source-var])
+        metadata (meta source) raw (:raster.core/deftm-source-body metadata)]
+    (binding [entry/*emission-inputs* owner]
+      (is (some? (prefix/original-step correspondence frontend program step))))
+    (try
+      (alter-meta! source assoc :raster.core/deftm-source-body (with-meta (mapv identity raw) (meta raw)))
+      (is (= metadata (meta source)))
+      (is (every? entry/var-snapshot-current? (vals (:definition-proofs @owner))))
+      (is (= :stale-definition-proof-input
+             (try (entry/assert-definition-inputs-current! @owner) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+      (finally (reset-meta! source metadata)))))
+
 (deftest whole-prefix-must-survive-not-just-the-selected-call
   (let [{:keys [inputs]} (capture #'selected-prefix)
-        [input normalized represented program] inputs
+        [input normalization normalized represented program] inputs
         pairs (second normalized)
         rewrites [(source-with-bindings normalized (vec (drop 2 pairs)))
                   (source-with-bindings normalized (vec (concat (take 2 pairs) pairs)))
@@ -109,19 +134,19 @@
                   (source-with-bindings normalized (update pairs 1 vary-meta assoc :raster.effect/preserve-evaluation true))
                   (source-with-bindings normalized (assoc pairs 1 '(foreign.namespace/producer n 2)))]]
     (doseq [changed rewrites]
-      (is (nil? (prefix/close input changed represented program))))
+      (is (nil? (reclose input normalization changed represented program))))
     (doseq [changed rewrites]
-      (is (nil? (prefix/close input normalized changed program))))))
+      (is (nil? (reclose input normalization normalized changed program))))))
 
 (deftest result-materialization-remains-an-independently-validated-contract
   (let [{:keys [inputs]} (capture #'selected-prefix)
-        [input normalized represented program] inputs
+        [input normalization normalized represented program] inputs
         expression (second (second (:source program)))]
     (doseq [replacement [(second expression) (list 'clojure.core/double (second expression))]
             :let [changed (update program :source
                                   #(source-with-bindings % (assoc (second %) 1 replacement)))]]
       (is (thrown? clojure.lang.ExceptionInfo
-                   (prefix/close input normalized represented changed))))))
+                   (reclose input normalization normalized represented changed))))))
 
 (deftest shadowed-original-parameters-do-not-acquire-prefix-authority
   (let [{:keys [correspondence]} (capture #'shadowed-prefix)]
@@ -133,7 +158,7 @@
         (with-redefs [core/ensure-current-owned-bytecode!
                       (fn [receiver] (swap! prepared conj receiver) (prepare! receiver))]
           (capture #'selected-prefix))
-        [_ normalized represented program] inputs
+        [_ normalization normalized represented program] inputs
         step (first (filter invocation/scalar-compute?
                             (get-in program [:attributes :invocation-plan :steps])))
         original (prefix/original-step correspondence frontend program step)
@@ -147,7 +172,7 @@
                   (fn [_] (throw (AssertionError. "an observation query prepared code")))]
       (binding [entry/*emission-inputs* (atom {:static [] :values []})]
         (is (some? (prefix/begin frontend '[n])))
-        (is (some? (prefix/close (first inputs) normalized represented program)))
+        (is (some? (reclose (first inputs) normalization normalized represented program)))
         (is (identical? (:expression original)
                         (:expression (prefix/original-step correspondence frontend program step))))
         (is (= Object (:return-carrier (entry/frontend-invocation-context frontend (:expression original)))))
