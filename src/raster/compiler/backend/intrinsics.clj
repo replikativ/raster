@@ -142,10 +142,10 @@
    :mod  {:arity 2 :kind :special :c :floored-mod :wgsl :floored-mod}
    :quot {:arity 2 :kind :infix :wasm {:i32 :i32.div_s} :c "/" :wgsl "/"}
    ;; math — unary
-   :sqrt  (math1 :f64.sqrt :f32.sqrt "sqrt")
+   :sqrt  (assoc (math1 :f64.sqrt :f32.sqrt "sqrt") :primitive-fp-total true)
    :abs   {:arity 1 :kind :fn :wasm (vt3 :f64.abs :f32.abs nil) :c {:fn "fabs" :glsl "abs"} :wgsl {:fn "abs"}
            :native-c (native-absolute)}
-   :floor (math1 :f64.floor :f32.floor "floor")
+   :floor (assoc (math1 :f64.floor :f32.floor "floor") :primitive-fp-total true)
    :ceil  {:arity 1 :kind :fn :wasm :poly :c {:fn "ceil"} :wgsl {:fn "ceil"}}   ; -floor(-x)
    :trunc {:arity 1 :kind :fn :wasm (vt3 :f64.trunc :f32.trunc nil) :c {:fn "trunc"} :wgsl {:fn "trunc"}}
    :round {:arity 1 :kind :fn :c {:fn "round"} :wgsl {:fn "round"} :wasm :poly
@@ -161,12 +161,16 @@
    ;; transcendentals — wasm has no opcode; all lower to an inline polynomial
    ;; (:wasm :poly, see backend.wasm.transcendental): sin/cos/tan + exp via
    ;; squaring, log via sqrt-reduction, pow=exp(y·log x), fma=a·b+c. No bit ops.
-   :sin (target-math 1 "sin" "sin")
-   :cos (target-math 1 "cos" "cos")
-   :tan (target-math 1 "tan" "tan")
-   :exp (target-math 1 "exp" "exp")
-   :log (target-math 1 "log" "log")
-   :pow (target-math 2 "pow" "pow")
+   ;; Audited primitive JVM FP operations return values (including NaN/Inf)
+   ;; rather than throwing after operand completion. This is not a promise
+   ;; about source unboxing/callees or target-library numerical accuracy.
+   ;; Opt in these rows, not all present/future target-math operations.
+   :sin (assoc (target-math 1 "sin" "sin") :primitive-fp-total true)
+   :cos (assoc (target-math 1 "cos" "cos") :primitive-fp-total true)
+   :tan (assoc (target-math 1 "tan" "tan") :primitive-fp-total true)
+   :exp (assoc (target-math 1 "exp" "exp") :primitive-fp-total true)
+   :log (assoc (target-math 1 "log" "log") :primitive-fp-total true)
+   :pow (assoc (target-math 2 "pow" "pow") :primitive-fp-total true)
    :fma {:arity 3 :kind :fn :wasm :poly :c {:fn "fma"} :wgsl {:fn "fma"}}
    ;; widening int8 multiply-accumulate: int8×int8 → int32 lane accumulate. The
    ;; ONE canonical quant primitive; scalar :c is a plain int-widening mul-add,

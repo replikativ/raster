@@ -8,6 +8,23 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### October 21 primitive math completion
+
+Eight audited primitive FP math rows (sqrt, floor, sin, cos, tan, exp, log and
+pow) now declare nonthrowing execution after operand completion. This facet does
+not prove a source callee, Object unboxing, operand completion, target-library
+accuracy or a final checked storage conversion. Descriptor factories stay
+unchanged so future math operations do not inherit the grant automatically.
+KernelBody checks intrinsic arity before analyses requiring nonempty operands;
+malformed empty unary and binary operations receive a structured refusal.
+
+The clean-main 900 MiB REPL passes four complete affected namespaces (107 tests /
+1,364 assertions), covering malformed operands, actual physical return payloads,
+scalar-region lowering and KernelBody validation. These are local correctness
+receipts, not vendor runtime, performance or broader draft qualification. The
+separate draft's checked-map device cases additionally exercise final Float
+overflow and publication; that machinery is not part of this independent slice.
+
 ### October 21 independent fusion robustness
 
 Optional map-to-reduction/scan fusion now retains the original materialized
