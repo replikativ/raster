@@ -902,6 +902,8 @@
   (let [;; Physical parameter derivation precedes this shared GPU admission
         ;; boundary. Array ABI descriptors permit nullable references, not
         ;; nonnull claims; Object completion keeps that same reference.
+        ;; Late representation rewrites can introduce whole sequential wrappers;
+        ;; normalize here without lifting call/vector operands (main #1558).
         source (if (device/gpu-target? (:target-device opts))
                  (inline/flatten-nested-lets
                   (local-products/project-storage-alias-snapshots
