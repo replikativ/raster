@@ -458,6 +458,17 @@ materialization and ordered scalar folds, including tiny native OpenCL/Level Zer
 folds. Review found no checkpoint blocker. This is not full-suite or model validation;
 PR #1539 remains draft while its broader seven-gate obligations are unsatisfied.
 
+Follow-up control observation records the signed Int `<` test at the actual
+`IF_ICMPGE` emission, only for the owned reduction exit and actual Int/Int operands.
+Predicate/operand identities, original local slots and operand context are retained in
+that existing exit record. Negative/zero/singleton cases and tampered-record refusal are
+covered; no launch-domain or source-success claim follows. Future correspondence must
+join initial zero, exact backedge and source count, and prove nonnegative native domain
+`max(0,n)` plus index widening/no-overflow rather than treating signed `n` as an extent.
+Reviewed follow-up qualification: the same seven affected namespaces pass 141 tests /
+2,283 assertions, including native ordered folds; this supersedes, not adds to, the
+overlapping 140-test receipt. Public nonempty source activation is still unqualified.
+
 ### October 21 DeepSeek inference reference integration
 
 The recovered full source review is retained locally in

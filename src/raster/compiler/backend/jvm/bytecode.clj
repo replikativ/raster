@@ -3996,6 +3996,8 @@
         ;; instead of materializing boolean. Critical for C2 counted loop
         ;; recognition which requires IF_ICMPxx at the loop back-edge.
         cmp-parts (comparison-pred-parts pred)
+        reduction-control (when (and me/*emission-inputs* (= :exit (::reduction-role ctx)))
+                            (atom nil))
         branch-folded?
         (when cmp-parts
           (let [pn (nth cmp-parts 0)
@@ -4006,7 +4008,16 @@
             (cond
                   ;; Both int → IF_ICMPxx (inverted for else branch)
               (and (= t1 :int) (= t2 :int))
-              (do (case pn "<" (.if_icmpge code else-label) "<=" (.if_icmpgt code else-label)
+              (do (case pn "<" (do
+                                  (.if_icmpge code else-label)
+                                  (when reduction-control
+                                    (reset! reduction-control
+                                            {:kind :int-less-than :predicate pred
+                                             :operands [a1 a2] :input-types [t1 t2]
+                                             :locals locals
+                                             :context (completion/bytecode-operand-context val-ctx)
+                                             :false-branch :if-icmpge})))
+                        "<=" (.if_icmpgt code else-label)
                         ">" (.if_icmple code else-label) ">=" (.if_icmplt code else-label)
                         "==" (.if_icmpne code else-label) "not=" (.if_icmpeq code else-label))
                   true)
@@ -4083,9 +4094,11 @@
               ;; Record the real carry load and merge conversion. A logical
               ;; Double carry alone does not prove a primitive loop result.
               (retain-reduction-observation!
-                ctx :exit {:value else :local (get locals else) :input-type else-type
-                           :result-type (if (primitive? else-type) :ref else-type)
-                           :context (completion/bytecode-operand-context ctx)})
+                ctx :exit (cond-> {:value else :local (get locals else) :input-type else-type
+                                   :result-type (if (primitive? else-type) :ref else-type)
+                                   :context (completion/bytecode-operand-context ctx)}
+                            (some? (some-> reduction-control deref))
+                            (assoc :control @reduction-control)))
               (.labelBinding code end-label)
               (if (primitive? else-type) :ref else-type)))
         ;; Normal case: both branches produce values.

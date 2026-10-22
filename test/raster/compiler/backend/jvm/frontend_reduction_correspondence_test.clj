@@ -564,6 +564,34 @@
                                   (if float? Double/TYPE Float/TYPE))]
             (is (nil? (entry/frontend-reduction-emission changed original)))))))))
 
+(deftest original-reduction-retains-the-emitted-signed-int-control
+  (doseq [count-expression [-1 0 1]]
+    (with-fresh-reduction-binding
+      false false count-expression
+      (fn [frontend]
+        (let [original (first (reduction-forms (:body frontend)))
+              observed (entry/frontend-reduction-emission frontend original)
+              control (get-in observed [:exit :control])
+              index (first (get-in observed [:loop :variables]))
+              bound (get-in observed [:bound :binder])]
+          (is (= :int-less-than (:kind control)))
+          (is (identical? (:predicate control) (second (get-in observed [:exit :expression]))))
+          (is (= [index bound] (:operands control)))
+          (is (every? true? (map identical? (:operands control)
+                                (raster.compiler.core.op-descriptor/call-args (:predicate control)))))
+          (is (= [:int :int] (:input-types control)))
+          (is (= :if-icmpge (:false-branch control)))
+          (is (identical? (get-in observed [:loop :locals index]) (get-in control [:locals index])))
+          (is (identical? (get-in observed [:bound :after]) (get-in control [:locals bound])))
+          (is (completion/bytecode-operand-context? (:context control)))
+          ;; A signed Int test is not a nonnegative device extent. In particular
+          ;; the same control recipe must be retained for the negative-count case.
+          (let [witness (get-in observed [:expansion :witness])
+                changed (assoc-in frontend
+                                  [:emission :reduction-contexts [witness :exit]
+                                   :control :false-branch] :if-icmpgt)]
+            (is (nil? (entry/frontend-reduction-emission changed original)))))))))
+
 (deftest explicit-reduction-preparation-keeps-terminal-before-caller-order
   (doseq [float? [false true]]
     (with-fresh-reduction-binding
