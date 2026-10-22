@@ -6830,6 +6830,42 @@
                       {:reason :partitioned-binding-layout})))
     (with-meta (list* (first original) bindings body) (meta original))))
 
+(defn- emit-object-parameter
+  "Complete one boxed IFn argument using the actual compute parameter descriptor."
+  [code ^ClassDesc parameter]
+  (case (.descriptorString parameter)
+    "D" (emit-unbox-to-prim code :double)
+    "J" (emit-unbox-to-prim code :long)
+    "F" (emit-unbox-to-prim code :float)
+    "Z" (emit-unbox-to-prim code :bool)
+    "I" (emit-unbox-to-prim code :int)
+    ("B" "S") (do (.checkcast code number-cd)
+                    (.invokevirtual code number-cd
+                                    (if (= "B" (.descriptorString parameter)) "byteValue" "shortValue")
+                                    (MethodTypeDesc/of parameter no-cd)))
+    "C" (let [character (ClassDesc/of "java.lang" "Character")]
+          (.checkcast code character)
+          (.invokevirtual code character "charValue" (MethodTypeDesc/of parameter no-cd)))
+    "Ljava/lang/Object;" nil
+    (.checkcast code parameter)))
+
+(defn- emit-object-return
+  "Box the actual compute return descriptor for either IFn entry shape."
+  [code ^ClassDesc result]
+  (case (.descriptorString result)
+    "D" (emit-box-to-ref code :double)
+    "J" (emit-box-to-ref code :long)
+    "F" (emit-box-to-ref code :float)
+    "Z" (emit-box-to-ref code :bool)
+    "I" (emit-box-to-ref code :int)
+    ("B" "S" "C") (let [wrapper (ClassDesc/of "java.lang"
+                                                (case (.descriptorString result)
+                                                  "B" "Byte" "S" "Short" "C" "Character"))]
+                      (.invokestatic code wrapper "valueOf"
+                                     (MethodTypeDesc/of wrapper (into-array ClassDesc [result]))))
+    "V" (.aconst_null code)
+    nil))
+
 (defn compile-typed-impl!
   "Compile a deftm walked body into a class implementing the typed interface.
   Returns an instance of the compiled class, or nil on failure.
@@ -6846,8 +6882,8 @@
   ;; Note: clojure.lang.IFn caps positional invoke at 20 args, but the JVM
   ;; method limit is 255. For >20 typed params we still emit compute_static
   ;; and the typed `invk` method as usual; the `invoke(Object…)` overloads
-  ;; are skipped (existing guard) and the applyTo path uses a reflective
-  ;; fallback into compute_static (emitted below).
+  ;; are skipped and applyTo completes the same typed arguments before calling
+  ;; compute_static directly (emitted below).
   (let [;; Par-extraction splitting: extract par/map! and par/reduce forms into
         ;; separate static methods. Keeps scalar code in the main method.
         ;; Uses size estimate to avoid splitting small bodies unnecessarily.
@@ -6930,6 +6966,10 @@
                     ;; Implement both the typed interface AND IFn so the
                     ;; compiled impl can be used as a regular Clojure function.
                     ;; This enables deftm vars to hold the impl directly.
+                          ;; Inherit IFn's ordinary unsupported-arity methods;
+                          ;; implementing only the selected overload would leak
+                          ;; AbstractMethodError on a wrong-arity call.
+                          (.withSuperclass cb (ClassDesc/of "clojure.lang" "AFn"))
                           (.withInterfaceSymbols cb (into-array ClassDesc [iface-cd ifn-cd]))
                     ;; No-arg constructor
                           (.withMethodBody cb "<init>"
@@ -6938,7 +6978,7 @@
                                            (reify java.util.function.Consumer
                                              (accept [_ code]
                                                (.aload code 0)
-                                               (.invokespecial code obj-cd "<init>"
+                                               (.invokespecial code (ClassDesc/of "clojure.lang" "AFn") "<init>"
                                                                (MethodTypeDesc/of V-cd (into-array ClassDesc [])))
                                                (.return_ code))))
                     ;; Shared helper: load params, checkcast IFn__ types, call compute_static
@@ -7089,77 +7129,24 @@
                               ;; Unbox each Object arg to the compute_static param type
                                                    (loop [slot 1 i 0]
                                                      (when (< i (count compute-param-cds))
-                                                       (let [cpd (.descriptorString ^ClassDesc (nth compute-param-cds i))]
+                                                       (let [parameter (nth compute-param-cds i)]
                                                          (.aload code slot)
-                                                         (cond
-                                                           (= cpd "D")
-                                                           (let [num-lbl (.newLabel code)
-                                                                 end-lbl (.newLabel code)]
-                                        ;; instanceof Number guard — matches emit-coerce [:ref :double]
-                                                             (.dup code)
-                                                             (.instanceOf code number-cd)
-                                                             (.ifeq code num-lbl)
-                                                             (.checkcast code number-cd)
-                                                             (.invokevirtual code number-cd "doubleValue"
-                                                                             (MethodTypeDesc/of D-cd no-cd))
-                                                             (.goto_ code end-lbl)
-                                                             (.labelBinding code num-lbl)
-                                                             (.pop code)
-                                                             (.ldc code (double 0.0))
-                                                             (.labelBinding code end-lbl))
-                                                           (= cpd "J") (do (.checkcast code number-cd)
-                                                                           (.invokevirtual code number-cd "longValue"
-                                                                                           (MethodTypeDesc/of J-cd no-cd)))
-                                                           (= cpd "F") (do (.checkcast code number-cd)
-                                                                           (.invokevirtual code number-cd "floatValue"
-                                                                                           (MethodTypeDesc/of F-cd no-cd)))
-                                                           (= cpd "Z")
-                                                           (let [bool-cd (ClassDesc/of "java.lang" "Boolean")]
-                                                             (.checkcast code bool-cd)
-                                                             (.invokevirtual code bool-cd "booleanValue"
-                                                                             (MethodTypeDesc/of (ClassDesc/ofDescriptor "Z") no-cd)))
-                                                           (#{"I" "B" "S" "C"} cpd)
-                                                           (do (.checkcast code number-cd)
-                                                               (.invokevirtual code number-cd "intValue"
-                                                                               (MethodTypeDesc/of I-cd no-cd)))
-                                      ;; Ref types: checkcast if not Object
-                                                           :else (when (not= cpd "Ljava/lang/Object;")
-                                                                   (.checkcast code (nth compute-param-cds i))))
+                                                         (emit-object-parameter code parameter)
                                                          (recur (inc slot) (inc i)))))
                               ;; Call compute_static (invokestatic — cheapest call)
                                                    (.invokestatic code statics-cd "compute_static" compute-mt)
                               ;; Box primitive return to Object
-                                                   (let [crd (.descriptorString ^ClassDesc compute-ret-cd)]
-                                                     (cond
-                                                       (= crd "D") (.invokestatic code dbl-box-cd "valueOf"
-                                                                                  (MethodTypeDesc/of dbl-box-cd (into-array ClassDesc [D-cd])))
-                                                       (= crd "J") (.invokestatic code long-box-cd "valueOf"
-                                                                                  (MethodTypeDesc/of long-box-cd (into-array ClassDesc [J-cd])))
-                                                       (= crd "F") (.invokestatic code flt-box-cd "valueOf"
-                                                                                  (MethodTypeDesc/of flt-box-cd (into-array ClassDesc [F-cd])))
-                                                       (= crd "Z")
-                                                       (let [bool-box-cd (ClassDesc/of "java.lang" "Boolean")
-                                                             bool-cd (ClassDesc/ofDescriptor "Z")]
-                                                         (.invokestatic code bool-box-cd "valueOf"
-                                                                        (MethodTypeDesc/of bool-box-cd (into-array ClassDesc [bool-cd]))))
-                                                       (#{"I" "B" "S" "C"} crd)
-                                                       (.invokestatic code int-box-cd "valueOf"
-                                                                      (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
-                                                       (= crd "V") (.aconst_null code)
-                                                       :else nil))
+                                                   (emit-object-return code compute-ret-cd)
                                                    (.areturn code))))))
                       ;; applyTo for varargs.
                       ;; For ≤20 params: AFn.applyToHelper unpacks the seq and
                       ;; routes to one of the IFn.invoke(Object…) overloads.
                       ;; For >20 params: AFn.applyToHelper caps at 20, so we
-                      ;; emit a custom body that builds an Object[N] from the
-                      ;; seq and invokes compute_static reflectively.
+                      ;; check exact arity, then complete arguments in source
+                      ;; order and call compute_static without reflection.
                           (let [afn-cd (ClassDesc/of "clojure.lang" "AFn")
                                 iseq-cd (ClassDesc/of "clojure.lang" "ISeq")
-                                reflector-cd (ClassDesc/of "clojure.lang" "Reflector")
-                                obj-arr-cd (ClassDesc/ofDescriptor "[Ljava/lang/Object;")
                                 apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))
-                                reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [(ClassDesc/of "java.lang.Class") string-cd obj-arr-cd]))
                                 small? (<= (count param-cds) 20)
                                 load-int (fn [code n]
                                            (cond (<= -128 n 127) (.bipush code (int n))
@@ -7175,30 +7162,40 @@
                                                        (.aload code 1)
                                                        (.invokestatic code afn-cd "applyToHelper" apply-mt)
                                                        (.areturn code))
-                                                   (let [n (count param-cds)]
-                                                     (load-int code n)
-                                                     (.anewarray code obj-cd)
-                                                     (.astore code 2)
+                                                   (let [n (count param-cds)
+                                                         exact (.newLabel code)
+                                                         arity-cd (ClassDesc/of "clojure.lang" "ArityException")]
+                                                     ;; Match ordinary IFn entry behavior: reject arity
+                                                     ;; before any parameter conversion or body effect.
                                                      (.aload code 1)
-                                                     (.astore code 3)
+                                                     (load-int code (inc n))
+                                                     (.invokestatic code (ClassDesc/of "clojure.lang" "RT") "boundedLength"
+                                                                    (MethodTypeDesc/of I-cd (into-array ClassDesc [iseq-cd I-cd])))
+                                                     (.istore code 2)
+                                                     (.iload code 2)
+                                                     (load-int code n)
+                                                     (.if_icmpeq code exact)
+                                                     (.new_ code arity-cd)
+                                                     (.dup code)
+                                                     (.iload code 2)
+                                                     (.ldc code (str class-name))
+                                                     (.invokespecial code arity-cd "<init>"
+                                                                     (MethodTypeDesc/of (ClassDesc/ofDescriptor "V")
+                                                                                        (into-array ClassDesc [I-cd string-cd])))
+                                                     (.athrow code)
+                                                     (.labelBinding code exact)
                                                      (dotimes [i n]
-                                                       (.aload code 2)
-                                                       (load-int code i)
-                                                       (.aload code 3)
+                                                       (.aload code 1)
                                                        (.invokeinterface code iseq-cd "first"
                                                                          (MethodTypeDesc/of obj-cd no-cd))
-                                                       (.aastore code)
-                                                       (.aload code 3)
-                                                       (.invokeinterface code iseq-cd "next"
-                                                                         (MethodTypeDesc/of iseq-cd no-cd))
-                                                       (.astore code 3))
-                                                     ;; Use the actual emitted owner, including its unique
-                                                     ;; literal-capture suffix, in this wrapper's loader.
-                                                     ;; The requested source name is not a loadable class.
-                                                     (.ldc code statics-cd)
-                                                     (.ldc code "compute_static")
-                                                     (.aload code 2)
-                                                     (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
+                                                       (emit-object-parameter code (nth compute-param-cds i))
+                                                       (when (< i (dec n))
+                                                         (.aload code 1)
+                                                         (.invokeinterface code iseq-cd "next"
+                                                                           (MethodTypeDesc/of iseq-cd no-cd))
+                                                         (.astore code 1)))
+                                                     (.invokestatic code statics-cd "compute_static" compute-mt)
+                                                     (emit-object-return code compute-ret-cd)
                                                      (.areturn code))))))))))
         loader (compilation-loader)
         wrapper-class (.defineClass loader wrapper-name bytes nil)

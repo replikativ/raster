@@ -20,6 +20,59 @@
   (swap! input-calls inc)
   (+ (double value) 1.0))
 
+(deftest boxed-typed-entry-preserves-conversions-arity-and-body-order
+  ;; Exercise the common emitter directly, independently of AD preparation.
+  (doseq [arity [1 20 21]]
+    (let [parameters (mapv #(symbol (str "parameter" %)) (range arity))
+          tags (vec (repeat arity 'double))
+          interface (types/ensure-fn-interface! tags)
+          implementation
+          (bytecode/compile-typed-impl!
+           "raster.compiled.BoxedEntryCompletion" parameters tags 'double
+           [(list 'do '(clojure.core/swap! input-calls clojure.core/inc)
+                  (first parameters))]
+           (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+           (:iface-name interface))
+          arguments (vec (repeat arity 2.5))]
+      (is (= 2.5 (apply implementation arguments)))
+      (is (= 3.0 (apply implementation (assoc arguments 0 (bigdec 3)))))
+      (doseq [index (distinct [0 (dec arity)])
+              [value failure] [[nil NullPointerException] ["not a number" ClassCastException]]]
+        (let [before @input-calls]
+          (is (= failure (try (apply implementation (assoc arguments index value)) nil
+                              (catch Throwable error (class error)))))
+          (is (= before @input-calls) "even unused parameters complete before the body")))
+      (doseq [invalid [(pop arguments) (conj arguments 3.0)]]
+        (let [before @input-calls]
+          (is (thrown? clojure.lang.ArityException (apply implementation invalid)))
+          (is (= before @input-calls))))
+      (let [order (atom [])
+            arguments (mapv (fn [index]
+                              (proxy [Number] []
+                                (intValue [] (int index))
+                                (longValue [] (long index))
+                                (floatValue [] (float index))
+                                (doubleValue [] (swap! order conj index) (double index))))
+                            (range arity))]
+        (is (= 0.0 (apply implementation arguments)))
+        (is (= (vec (range arity)) @order)
+            "each positional conversion occurs once, left to right")))))
+
+(deftest boxed-typed-entry-preserves-small-primitive-carriers
+  (doseq [arity [1 21]
+          [tag value] [['byte (byte -7)] ['short (short 321)] ['char \u03bb]]]
+    (let [parameters (mapv #(symbol (str "parameter" %)) (range arity))
+          tags (vec (repeat arity tag))
+          interface (types/ensure-fn-interface! tags)
+          implementation (bytecode/compile-typed-impl!
+                          "raster.compiled.SmallPrimitiveEntry" parameters tags tag
+                          [(first parameters)]
+                          (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+                          (:iface-name interface))
+          actual (apply implementation (repeat arity value))]
+      (is (= value actual))
+      (is (= (class value) (class actual))))))
+
 (defn- typed-helper-call [caller argument]
   (let [source (core/resolve-deftm-var caller)
         body (core/ensure-walked-body! source)
