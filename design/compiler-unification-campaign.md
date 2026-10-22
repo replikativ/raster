@@ -213,6 +213,25 @@ function registry or permission to evaluate the numerical body on the CPU.
 
 ### October 21 selected ancestry for imported helper calls
 
+Construction direction after independent review: preserve original completed
+call slots at the shared inline builder instead of repeatedly recovering erased
+input conversions downstream. An authenticated resolved-call plan must retain
+receiver/Method, original operand contexts and policy; every argument, including
+unused arguments, completes before body entry. Return carrier, boxed payload and
+actual return adaptation remain distinct. Unsupported return/completion recipes
+must retain/refuse the call. Existing SourcePrefix/SourceOwner consumers remain
+the placement/execution authorities; this does not solve resident child results
+or helper endpoints by itself.
+
+The first implemented prerequisite is explicit Int/Long bytecode input
+completion. It reuses `emit-argument-value`/`emit-coerce`, not Clojure source casts,
+logical dtype inference or a new evaluator. Existing FP completion shares that
+emitter; source projection refuses unsupported bytecode contexts. Structural AD
+explicitly refuses integral completion (including inactive operands) rather than
+falling through an unhandled dispatch. Five related namespaces pass 67 tests /
+664 assertions in the reused campaign REPL. A focused main-based extraction is
+under fresh qualification; no inline expansion or GPU admission is widened yet.
+
 Imported call origins now feed the existing selected-call contract, rather than
 remaining disconnected tracing data. The shared Method/receiver/implementation
 checks serve both root and imported calls. An imported frame must derive its exact
