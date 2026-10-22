@@ -260,6 +260,14 @@
              (is (every? #(= :unclosed (:constructed-correspondence %)) (:argument-slots frame)))
              (is (= (count (:arguments event)) (count (:argument-slots frame))))
              (is (every? #(contains? (:input-completion %) :adaptation) (:argument-slots frame)))
+             (let [callee (get-in frame [:original-invocation :builder :callee-import :frontend])
+                   bridge (entry/frontend-reference-return-bridge callee)]
+               (if (= 'raster.dl.nn/linear-nb (descriptor/semantic-op (:caller event)))
+                 (do
+                   (is (= :reference-static-return (:kind bridge)))
+                   (is (= "[F" (.getName ^Class (:body-return-carrier bridge))))
+                   (is (identical? (:implementation callee) (:implementation bridge))))
+                 (is (nil? bridge) "MSE's boxed scalar is not a reference-body return recipe")))
              (when (= 'raster.dl.loss/mse-loss (descriptor/semantic-op (:caller event)))
                (let [slot (first (:argument-slots frame))]
                  (is (= 'raster.dl.nn/linear-nb (descriptor/semantic-op (:source-operand slot))))
@@ -299,6 +307,10 @@
                                      (get-in frame [:parent-frame :original-invocation :builder :expansion])))
                      (is (identical? caller (get-in frame [:parent-substitution :constructed])))
                      (is (= :unclosed (:return-correspondence frame) (:final-placement frame)))
+                     (let [callee (get-in frame [:original-invocation :builder :callee-import :frontend])
+                           bridge (entry/frontend-reference-return-bridge callee)]
+                       (is (= :reference-static-return (:kind bridge)))
+                       (is (= "[F" (.getName ^Class (:body-return-carrier bridge)))))
                      (is (every? #(= :unclosed (:constructed-correspondence %)) (:argument-slots frame)))
                      (is (= :unclosed (get-in frame [:original-invocation :parent-linkage])))
                      ;; Explicit preparation is separate from the frame query.
