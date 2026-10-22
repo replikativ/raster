@@ -28,6 +28,35 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 prepared-module positioning checkpoint: the early AD module cut now
+retains the inliner's actual scope, binding ordinal and already-constructed prefix.
+Compilation-local identity registration authenticates both the scope and the exact
+immutable binding-site object; a structurally plausible replacement prefix is not
+accepted. Scope/cut records are deliberately excluded from ordinary source
+substitution edges. Output ports reserve both later binders and previous module
+ports, preserving inactive slots and result aliases without capturing locals.
+
+This is constructor-position evidence, not final equation placement or permission
+to execute a module. The next step remains importing the exact generated entry
+with its completion obligations, then splicing its canonical source spine and
+ParallelProgram together before deriving one InvocationPlan. Production admission
+must retain public argument checks and resident buffer contracts, and close the
+matching prepared import only after the entire composition validates. No fallback
+or marker waiver is authorized by this checkpoint.
+
+Focused reused-REPL qualification passes 90 tests / 747 assertions across the
+module cut, source transport/construction and ordinary inliner. Independent review
+found and closed the prefix-identity gap. Wider qualification also exposes an
+existing raw-projection test that sends reserved completion syntax to Clojure
+`eval`. A diagnostic bytecode emission with an Object-typed caller instead shows
+why that structural projection is not execution authority: it omits the generated
+entry's positional argument adaptation and changes the loss carrier for Float
+inputs. The importer must start at the actual Method/parameter contracts, not
+silently execute those substituted bindings. This remains an open qualification
+obligation; the raw-projection test is not skipped or counted green.
+The separate owned generated-entry/completion gate passes 133 tests / 1,705
+assertions in the same process. Neither receipt establishes broad CI acceptance.
+
 #### Reviewed continuation: close the producer, not individual optimizer copies
 
 October 22 boundary checkpoint (draft implementation, not released acceptance):

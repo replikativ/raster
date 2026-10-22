@@ -625,7 +625,7 @@
    otherwise retain the nested body's lexical scopes for recursive expansion.
    This construction is NOT a completion, correspondence or execution proof."
   [{:keys [params tags walked-body source-import prepared-program projection-mode] :as callee}
-   args source-env subst-fn result-sym caller & [reserved-symbols]]
+   args source-env subst-fn result-sym caller & [reserved-symbols binding-site]]
   (if prepared-program
     (let [projection
           ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
@@ -633,6 +633,7 @@
           {:keys [bindings result-form]}
           (source-transport/consume-prepared-program-projection
            projection {:kind (if result-sym :binding :nested) :destination result-sym
+                       :binding-site binding-site
                        :reserved-symbols (when reserved-symbols
                                            (into reserved-symbols (keys source-env)))})]
       (if result-sym
@@ -1287,7 +1288,12 @@
                                 (assoc :raster.effect/effectful true)))]
              [[[result-sym (first body-exprs-raw)]] [result-sym]])
            [nil body-exprs-raw])
-         pairs (concat (partition 2 bindings-vec) extra-body-pairs)
+         pairs (vec (concat (partition 2 bindings-vec) extra-body-pairs))
+         prepared-scope
+         (when prepared-reservations
+           (with-meta (list* (first form) (vec (mapcat identity pairs)) body-exprs) (meta form)))
+         _ (when prepared-scope
+             (source-transport/observe-prepared-program-scope! form prepared-scope))
          result-pairs (atom [])
          any-inlined? (atom false)
          ;; Type env for dispatch resolution when inlining multi-overload calls
@@ -1310,10 +1316,14 @@
                                      (vector? f) (mapcat count-syms f)
                                      :else []))
                              all-forms)))]
-     (doseq [[sym init-raw] pairs]
+     (doseq [[source-index [sym init-raw]] (map-indexed vector pairs)]
        (let [;; D-value rewriting is deferred — D-call? and distribution run first.
              ;; Only rewrite D-as-value when D appears as an argument to non-pointwise ops.
              init init-raw
+             binding-site (when prepared-scope
+                            {:scope prepared-scope :index source-index :prefix @result-pairs})
+             _ (when binding-site
+                 (source-transport/observe-prepared-program-binding-site! binding-site))
              ;; Detect (value+grad f) or (grad f) partial application
              vg-partial (when (and (seq? init) (<= 2 (count init)))
                           (let [op (first init)]
@@ -1362,6 +1372,7 @@
                         (when-let [projection (inline-value+grad-call vg-info :param-env @type-env)]
                           (source-transport/consume-prepared-program-projection
                            projection {:kind :binding :destination sym
+                                       :binding-site binding-site
                                        :reserved-symbols (when prepared-reservations
                                                            (into prepared-reservations (keys @type-env)))}))]
                  (do
@@ -1433,7 +1444,7 @@
                  ;; number of args is always a bug — say so, at the call.
                                  _ (check-inline-arity! head params args init)
                                  expansion (build-inline-expansion deftm-info args @type-env subst-fn sym init
-                                                                   prepared-reservations)]
+                                                                   prepared-reservations binding-site)]
                              (swap! result-pairs into (:bindings expansion))
                              (reset! any-inlined? true)
             ;; Record the inlined function's return type so subsequent

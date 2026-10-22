@@ -543,9 +543,9 @@
     (with-redefs-fn
       {#'inline/try-resolve-deftm (fn [& _] info)
        #'inline/build-inline-expansion
-       (fn [callee args environment substitute result caller]
+       (fn [callee args environment substitute result caller & placement]
          (swap! modes conj (if result :binding :nested))
-         (build callee args environment substitute result caller))}
+         (apply build callee args environment substitute result caller placement))}
       (fn []
         (doseq [mode [:binding :nested]
                 [first-value expected-events expected-result]

@@ -267,6 +267,17 @@
                [(assoc seen slot ordinal) (conj result ordinal)]))
            [{} []] (map-indexed vector slots))))
 
+(defn- prepared-binding-site?
+  [placement event]
+  (let [{:keys [scope index prefix]} (:binding-site placement)
+        bindings (when (and (seq? scope) (form/binding-form? scope)) (second scope))]
+    (and (vector? bindings) (even? (count bindings))
+         (integer? index) (<= 0 index) (< index (quot (count bindings) 2))
+         (identical? (:destination placement) (nth bindings (* 2 index)))
+         (identical? (:caller event) (nth bindings (inc (* 2 index))))
+         (vector? prefix)
+         (every? #(and (vector? %) (= 2 (count %)) (symbol? (first %))) prefix))))
+
 (defn consume-prepared-program-projection
   "Cut an exact prepared projection before its raw bindings enter source passes.
    Default expansion is unchanged. An installed consumer must replace the WHOLE
@@ -277,13 +288,14 @@
     projection
     (let [event (when *source-construction-observer*
                   (*source-construction-observer*
-                   :prepared-program-consume {:projection projection}))]
+                   :prepared-program-consume {:projection projection :placement placement}))]
       (when-not (and event (contains? #{:value+grad :grad} (:mode event))
                      (vector? (:elements projection))
                      (= :binding (:kind placement))
                      (symbol? (:destination placement))
                      (nil? (namespace (:destination placement)))
-                     (set? (:reserved-symbols placement)))
+                     (set? (:reserved-symbols placement))
+                     (prepared-binding-site? placement event))
         (throw (ex-info "prepared module needs its original binding occurrence"
                         {:reason :unclosed-prepared-program-placement
                          :placement placement})))
@@ -293,7 +305,11 @@
             scalar? (:scalar-result? projection)
             reserved (into (conj (:reserved-symbols placement) (:destination placement))
                            (concat (map first (:bindings projection))
-                                   (mapcat util/free-syms (:arguments event))))]
+                                   (mapcat util/free-syms (:arguments event))
+                                   (filter symbol?
+                                           (tree-seq coll? seq (get-in placement [:binding-site :prefix])))
+                                   (filter symbol?
+                                           (tree-seq coll? seq (get-in placement [:binding-site :scope])))))]
         (when-not (and (vector? ports) (= (count elements) (count ports))
                        (= (mapv nil? elements) (mapv nil? ports))
                        (= (slot-aliases elements) (slot-aliases ports))
@@ -303,6 +319,8 @@
           (throw (ex-info "prepared module ports violate the ordered result boundary"
                           {:reason :unclosed-prepared-program-outputs
                            :mode mode :expected-slots (count elements)})))
+        (*source-construction-observer*
+         :prepared-program-cut {:event event :placement placement :ports ports})
         (assoc projection
                :bindings [] :elements ports
                :loss-sym (when (= :value+grad mode) (first ports))
@@ -316,6 +334,22 @@
   (when (and *source-construction-observer* (not (identical? original constructed)))
     (*source-construction-observer*
      :type-elaboration {:original original :constructed constructed :environment environment})))
+
+(defn observe-prepared-program-scope!
+  "Register the inliner's actual pre-loop binding snapshot, not a type rewrite.
+   This private-phase notice authenticates constructor positioning only; it is
+   neither a generic source-provenance edge nor final equation placement."
+  [input-scope scope]
+  (when *source-construction-observer*
+    (*source-construction-observer*
+     :prepared-program-scope {:input-scope input-scope :scope scope})))
+
+(defn observe-prepared-program-binding-site!
+  "Register the inliner's exact immutable site, including its constructed prefix.
+   Scope membership alone cannot authenticate the order of earlier expansions."
+  [site]
+  (when *source-construction-observer*
+    (*source-construction-observer* :prepared-program-binding-site site)))
 
 (defn observe-builder-expansion!
   "Retain the shared builder's actual inputs/output. This is NOT the final expanded AST."
@@ -348,6 +382,12 @@
     (entry/assert-definition-inputs-current! observations)
     true))
 
+(defn- ordinary-construction-edges [edges]
+  ;; Prepared scopes/cuts are ordered constructor records, never substitutions.
+  ;; In particular, their absent :constructed key cannot be an edge to nil.
+  (filterv #(and (nil? (:construction-kind %))
+                 (contains? % :original) (contains? % :constructed)) edges))
+
 (defn with-source-construction-history
   "Run the actual source phase once, retaining its owner-local construction returns.
    No witness is emitted for ownerless input. Nothing enters compiler options, AST
@@ -361,11 +401,39 @@
         (entry/adopt-definition-inputs! (.-observations ^SourceNormalization normalization))
         (let [edges (volatile! []) builders (volatile! [])
               consumed (java.util.IdentityHashMap.)
+              scopes (java.util.IdentityHashMap.)
+              sites (java.util.IdentityHashMap.)
               result (binding [*source-construction-observer*
                                (fn [kind event]
                                  (case kind
                                    :type-elaboration (vswap! edges conj event)
                                    :prepared-program-projection (vswap! edges conj event)
+                                   :prepared-program-scope
+                                   (let [scope (:scope event)]
+                                     (when-not (and (seq? scope) (form/binding-form? scope)
+                                                    (vector? (second scope))
+                                                    (not (.containsKey scopes scope)))
+                                       (throw (ex-info "prepared module scope is not a unique binding snapshot"
+                                                       {:reason :unclosed-prepared-program-placement})))
+                                     (.put scopes scope event)
+                                     (vswap! edges conj (assoc event :construction-kind :prepared-program-scope)))
+                                   :prepared-program-binding-site
+                                   (do
+                                     (when-not (and (.containsKey scopes (:scope event))
+                                                    (not (.containsKey sites event)))
+                                       (throw (ex-info "prepared module site is not a unique registered scope occurrence"
+                                                       {:reason :unclosed-prepared-program-placement})))
+                                     (.put sites event true))
+                                   :prepared-program-cut
+                                   (let [projection-event (:event event)]
+                                     (when-not (and (= :consumed (.get consumed (:occurrence projection-event)))
+                                                    (.containsKey sites (get-in event [:placement :binding-site]))
+                                                    (.containsKey scopes (get-in event [:placement :binding-site :scope]))
+                                                    (prepared-binding-site? (:placement event) projection-event))
+                                       (throw (ex-info "prepared cut lost its consumed binding occurrence"
+                                                       {:reason :unclosed-prepared-program-placement})))
+                                     (.put consumed (:occurrence projection-event) :cut)
+                                     (vswap! edges conj (assoc event :construction-kind :prepared-program-cut)))
                                    :prepared-program-consume
                                    (do
                                      (entry/assert-producer-current! normalization)
@@ -375,8 +443,11 @@
                                             @edges (:projection event)
                                             #(normalized-construction-occurrence normalization @edges %))]
                                        (when (and projection-event
+                                                  (.containsKey sites (get-in event [:placement :binding-site]))
+                                                  (.containsKey scopes (get-in event [:placement :binding-site :scope]))
+                                                  (prepared-binding-site? (:placement event) projection-event)
                                                   (not (.containsKey consumed (:occurrence projection-event))))
-                                         (.put consumed (:occurrence projection-event) true)
+                                         (.put consumed (:occurrence projection-event) :consumed)
                                          projection-event)))
                                    :builder-expansion (vswap! builders conj event)))]
                        (construct))]
@@ -395,10 +466,13 @@
                 (identical? result (.-result ^SourceConstruction input)))
        (entry/assert-producer-current! input)
        (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
-       {:type-elaborations (filterv #(not= :prepared-program-projection (:construction-kind %))
-                                   (.-edges ^SourceConstruction input))
+       {:type-elaborations (ordinary-construction-edges (.-edges ^SourceConstruction input))
         :prepared-program-projections (filterv #(= :prepared-program-projection (:construction-kind %))
                                               (.-edges ^SourceConstruction input))
+        :prepared-program-cuts (filterv #(= :prepared-program-cut (:construction-kind %))
+                                       (.-edges ^SourceConstruction input))
+        :prepared-program-scopes (filterv #(= :prepared-program-scope (:construction-kind %))
+                                         (.-edges ^SourceConstruction input))
         :builder-expansions (.-builders ^SourceConstruction input)}))))
 
 (defn- construction-leaf
@@ -418,7 +492,7 @@
 
 (defn- normalized-construction-occurrence
   [normalization edges constructed]
-  (let [ordinary (filterv #(not= :prepared-program-projection (:construction-kind %)) edges)]
+  (let [ordinary (ordinary-construction-edges edges)]
     (when-let [leaf (construction-leaf ordinary constructed)]
       (when-let [origin (normalization-occurrence normalization (:value leaf))]
         (assoc origin :normalized (:value leaf) :constructed constructed
@@ -469,7 +543,7 @@
        (entry/assert-producer-current! input)
        (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
        (let [events (.-edges ^SourceConstruction input)
-             ordinary (filterv #(not= :prepared-program-projection (:construction-kind %)) events)
+             ordinary (ordinary-construction-edges events)
              leaf (construction-leaf ordinary constructed)
              matches
              (when leaf
