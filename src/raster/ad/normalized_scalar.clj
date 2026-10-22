@@ -826,7 +826,12 @@
                       (fn [index equation-facts]
                         ;; With no intervening host activity, the first parallel equation
                         ;; ends the frontend's stageable scalar prefix for every later one.
-                        (and (= {:source-prefix? (zero? index)} (:attributes equation-facts))
+                        ;; These are distinct frontend phase facts in general. This
+                        ;; envelope admits only parallel equations without intervening
+                        ;; host activity, so both must change after the first equation.
+                        ;; Exact equality also rejects unknown or malformed obligations.
+                        (and (= {:source-prefix? (zero? index)
+                                 :before-parallel? (zero? index)} (:attributes equation-facts))
                              (= :analyzed-source (get-in equation-facts [:provenance :front-end]))
                              (= index (get-in equation-facts [:provenance :source-binding-id]))))
                       equation-facts))))))
