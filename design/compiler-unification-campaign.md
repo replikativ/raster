@@ -306,6 +306,36 @@ SM100, Ascend, model download or cloud dependency enters the hot development loo
 
 ### October 21 integral call-completion prerequisite and next construction gate
 
+October 22 continuation: the opt-in completed `linear-nb` call is now tested as
+part of the **whole CPU training loss**, comparing original and completed JVM
+Methods bit-for-bit and against an independent squared-loss oracle for changed
+weights and row counts 1/3. Numerical calls run outside retryable compiler proof
+transactions; captured definition history is checked before and after execution.
+This is not resident training qualification or default producer enablement.
+
+CI also exposed a shared frontend/AD envelope drift: analyzed-source equations
+now carry both `:source-prefix?` and `:before-parallel?`, while normalized AD
+expected only the former. The common envelope checker now checks both exact
+booleans against its admitted no-host-activity equation sequence. It still refuses
+unknown attributes, host activity, allocation/evaluation obligations and invalid
+provenance. Real frontend Float/Double map-to-sum objectives, their JVP/VJP and
+finite-difference oracles, and tampered phase/provenance controls cover this
+boundary. An independent read-only review found no blocker. The adjacent resident
+scalar allowlist accepts only optional boolean phase facts; it does not use them
+as movement authority or weaken totality to admit unfinished source arithmetic.
+Targeted AD/whole-loss qualification passes 50 tests / 806 assertions. The new
+resident phase-fact test passes 22 assertions; the other 33 resident tests retain
+exactly the same failure signatures before/after the allowlist repair (27 failures,
+18 errors), including source-decline and unresolved arithmetic obligations. These
+are explicitly recorded baseline defects, not a green resident vertical.
+
+Draft #1539 remains unqualified: at head `e8cd519d`, setup/build passed but test,
+public fixture emission and OpenCL CPU gates failed. The 16 deterministic test
+shards reported 7,535 tests / 88,656 assertions / 317 failures / 274 errors;
+these are check totals, not independent defect counts. Public softmax and the
+training gradient still show source-arithmetic/evaluation correspondence gaps.
+No broad green or merge readiness is claimed by these targeted repairs.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction

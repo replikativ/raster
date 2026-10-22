@@ -560,7 +560,12 @@
          (empty? (:effects equation-facts))
          (empty? (:aliases equation-facts))
          (empty? (get-in equation-facts [:attributes :result-storage]))
-         (set/subset? (set (keys (:attributes equation-facts))) #{:source-prefix?})
+         ;; Phase facts are historical bookkeeping, not placement authority.
+         ;; The enclosing closure checks positions, dependencies and host uses;
+         ;; totality below remains independently necessary for movement.
+         (set/subset? (set (keys (:attributes equation-facts)))
+                      #{:source-prefix? :before-parallel?})
+         (every? boolean? (vals (:attributes equation-facts)))
          (= #{:dtypes} (set (keys (:attributes info))))
          (empty? (get-in info [:attributes :attributes]))
          (= [(:dtype value)] (get-in info [:attributes :dtypes]))
