@@ -62,15 +62,36 @@ construction/import/inliner tests / 555 assertions and 136 source/bytecode/AD
 ownership tests / 1,579 assertions. The groups overlap and are not additive;
 neither group closes the unimplemented nested-prefix execution relation.
 
-CI feedback extraction: PR #1559, reviewed head `8fd40930`, changes test
+CI feedback extraction: PR #1559, reviewed head `8fd40930`, squash-merged as
+`85192b1a` after all seven CI contexts passed. It changes test
 infrastructure only. It attempts both CUDA/HIP public fixture groups, accumulates
 ordinary refusals and still fails the gate; cancellation/interruption/fatal errors
 abort. A same-REPL control against baseline `aa816699` preserved all 172 exact
 calls (86 per target), Var identities, options, optional captured descriptors and
 ordered artifacts. Eight reporting tests / 45 assertions pass; normal shard
 discovery includes the new namespace. These stubbed controls are not source
-compiler or device-performance evidence. All seven CI contexts remain the merge
-gate. This replaces first-failure-only feedback without waiving any workload.
+compiler or device-performance evidence. The draft has merged the extraction,
+preserving main's original public Float contraction fixture. This replaces
+first-failure-only feedback without waiving any workload.
+
+Independent whole-draft triage separates three shared consumer obligations:
+producer-owned source evaluation through the existing activation path; checked
+conversion scheduling at its actual semantic position; and in-process execution
+ownership versus persistent-artifact eligibility. Keep `execution-identity`'s
+portable content-identity contract strict. Local observation, if added, needs an
+explicit authenticated process scope and must never populate portable program
+fingerprints or reach AMR/resident-state exporters by comparing absent hashes.
+
+Optimization-retention failures are distinct from coverage refusals. A fresh
+canonical-liveness probe succeeds with a validated typed program but removes zero
+bindings rather than two. Well-formed TypedSOAC alone does not prove successful
+original reads or permit erasing their failure obligations. A future removable-
+evaluation proof must separately close primitive numerical totality, count/index
+completion, original access domain and private/unobserved storage, or retain the
+original ordered checks independently of removed numerical work. The raw typed
+route fixture is not a valid standalone JVM source oracle; qualify this with an
+actual prepared `deftm` and short/null/alias/earlier-effect controls. Do not weaken
+effect flags or change expectations merely to make the failed tests green.
 
 Inspecting the actual placement seam uncovered a real pre-existing miscompile in
 default `anf-lift`: concatenating work lifted from every call/vector operand moves
