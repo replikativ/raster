@@ -125,6 +125,26 @@ the same caller is rebuilt. General emission retries do not gain this renewal
 permission. These focused results do not replace the draft's still-red unit,
 fixture-generation and OpenCL CI gates.
 
+Prepared completion classification now has an emitted occurrence boundary,
+reusing the bytecode owner's existing InputOrigins rather than a new AD type
+registry. Canonical completions have their own catalog, separate from calls;
+the shared scalar/Object dispatcher records raw, completed and parent-visible
+carriers, contexts and lexical locals. The original input, catalog-owned source
+and backend-rebuilt expression remain distinct. No `:ref` carrier implies an
+exact runtime Class or permission to erase a check. Divergence records no
+unexecuted adaptation, and a divergent let initializer now stops emission of
+unreachable later bindings and body.
+
+The unchanged training module exposes all 57 completion occurrences through
+this API. The existing changed-input CPU training oracle passes one test / 118
+assertions, including complete occurrence coverage. Completion, conversion,
+invocation and binding controls pass 84 tests / 1,368 assertions; prepared AD
+and source-transport controls still pass 58 / 407 in the reused REPL. This is
+evidence for the importer, not a completed typed-module lowering. At the prior
+head `2ef58c02`, CI fixture job 34060 still passes 142 of 172 public requests and
+fails private segmented reduction generation; unit job 34063 and OpenCL job
+34059 are also red. Those production obligations remain open.
+
 The earlier checkpoints below describe prerequisite evidence, not completion.
 
 Prerequisite qualification: scalar PE and simplification now preserve existing

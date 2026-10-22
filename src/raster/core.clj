@@ -379,7 +379,8 @@
   [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym & [preparation-inputs]]
   (loop [attempt 0]
     (let [{owned-body :body invocation-catalog :catalog binding-catalog :binding-catalog
-           reduction-catalog :reduction-catalog input-origins :input-origins}
+           reduction-catalog :reduction-catalog completion-catalog :completion-catalog
+           input-origins :input-origins}
           ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retain-invocation-occurrences) body)
           dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/emission-input-snapshots)
                         body source-ns)
@@ -400,6 +401,8 @@
                     ;; observations, but intentionally no frontend InputOrigins.
                     :invocation-catalog (merge invocation-catalog (:invocation-catalog @inputs))
                     :binding-catalog binding-catalog :binding-contexts (:binding-contexts @inputs)
+                    :completion-catalog completion-catalog
+                    :completion-contexts (:completion-contexts @inputs)
                     :floating-conversion-contexts (:floating-conversion-contexts @inputs)
                     :array-read-contexts (:array-read-contexts @inputs)
                     :array-allocation-contexts (:array-allocation-contexts @inputs)

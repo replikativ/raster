@@ -629,7 +629,7 @@
    catalog is private to the owning emission, not a source/cache identity or
    authority reconstructed by comparing expressions. Quoted values stay opaque."
   [body]
-  (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) origins (atom {})]
+  (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) completions (atom {}) origins (atom {})]
     (letfn [(visit [expression]
               (if (and (seq? expression)
                        (contains? #{'quote 'clojure.core/quote} (first expression)))
@@ -638,9 +638,16 @@
                             visit identity
                             (if (instance? clojure.lang.IObj expression)
                               (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence
-                                         ::reduction-occurrence ::reduction-witness ::reduction-role)
+                                         ::reduction-occurrence ::reduction-witness ::reduction-role
+                                         ::completion-occurrence)
                               expression))]
                   (cond
+                    (completion/canonical-form? node)
+                    (let [token (Object.)
+                          owned (vary-meta node assoc ::completion-occurrence token)]
+                      (swap! completions assoc token owned)
+                      (swap! origins update :completion (fnil conj []) [expression owned])
+                      owned)
                     (par/par-reduce-form? node)
                     (let [token (Object.)
                           owned (vary-meta node assoc ::reduction-occurrence token)]
@@ -662,6 +669,7 @@
                       owned)))))]
       (let [owned (with-meta (mapv visit body) {::body-occurrence (Object.)})]
         {:body owned :catalog @catalog :binding-catalog @scopes :reduction-catalog @reductions
+         :completion-catalog @completions
          :input-origins (when (seq @origins)
                           (InputOrigins. body owned @origins))}))))
 
@@ -857,6 +865,25 @@
   (when-let [owned (input-origin emission input-body original :binding)]
     (when-let [observed (retained-binding-context emission owned index)]
       (assoc observed :source-input original))))
+
+(defn ^:no-doc retained-input-completion-context
+  "Read one exact canonical completion from its actual owned emission.
+   Raw operand, completed and parent-visible carriers are distinct. A :ref
+   carrier proves no runtime Class, presence or permission to erase a check.
+   :source is the catalog-owned node, :expression is the backend-rebuilt node;
+   their occurrence join does not prove operand syntax equivalence. Copies,
+   missing and multiply-emitted occurrences abstain; stale owners fail."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :completion)]
+    (let [token (::completion-occurrence (meta owned))
+          record (get (:completion-contexts emission) token)]
+      (when (and (= :jvm-bytecode (:backend emission)) token
+                 (identical? owned (get (:completion-catalog emission) token))
+                 (= :known (:status record))
+                 (identical? token (::completion-occurrence (meta (:expression record))))
+                 (= (:contract (completion/canonical-parts owned)) (:contract record)))
+        (me/assert-emission-inputs-current! emission)
+        (assoc record :source-input original :source owned)))))
 
 (defn ^:no-doc retained-body-context
   "Original parameter locals of this emission's actual whole numerical body."
@@ -4078,6 +4105,7 @@
   (let [[bindings & body] args
         pairs (partition 2 bindings)
         binding-idx (atom 0)
+        diverged? (volatile! false)
         new-locals (reduce
                     (fn [locs [sym init]]
                       (swap! binding-idx inc)
@@ -4142,12 +4170,16 @@
                                            (.startsWith (str sym) "Q_")))
                               (println (str "  [bind] " sym " → slot " slot " type " t)))
                             new-locs)
-                          locs)))
+                          (if (= :diverge t)
+                            (do (vreset! diverged? true) (reduced locs))
+                            locs))))
                     locals pairs)]
-    (let [result-type (emit-body code body new-locals ctx)]
-      (retain-terminal-context! ctx (count pairs) body new-locals result-type)
-      (retain-reduction-root-result! ctx body result-type)
-      result-type)))
+    (if @diverged?
+      :diverge
+      (let [result-type (emit-body code body new-locals ctx)]
+        (retain-terminal-context! ctx (count pairs) body new-locals result-type)
+        (retain-reduction-root-result! ctx body result-type)
+        result-type))))
 
 (defn- comparison-pred-parts
   "Return [op-name arg1 arg2] when `pred` is a 2-arg comparison the if-handler can
@@ -5550,15 +5582,18 @@
    preserves its identity across loaders. This returns only a :ref stack carrier,
    not verified local Class facts; a later typed binder performs its own check.
    Nil passes; the operand is consumed once at its original position."
-  [code {:keys [contract operand]} locals ctx]
-  (let [^Class carrier (:target-carrier contract)]
-    (if (nil? (.getClassLoader carrier))
-      (let [actual (emit-object-value code operand locals ctx)]
-        (if (= :diverge actual) actual
-          (do (.checkcast code (ClassDesc/ofDescriptor (.descriptorString carrier))) :ref)))
-      (let [actual (emit-object-value code operand locals ctx)]
-        (if (= :diverge actual) actual
-          (do
+  [code {:keys [contract operand]} locals ctx & [observation]]
+  (let [^Class carrier (:target-carrier contract)
+        actual (emit-object-value code operand locals ctx)]
+    (when observation
+      (vreset! observation {:input-carrier actual
+                            :adaptation (if (= :diverge actual) :diverge :checkcast)
+                            :operand-context (completion/bytecode-operand-context
+                                              (object-input-context ctx))}))
+    (if (= :diverge actual) actual
+      (if (nil? (.getClassLoader carrier))
+        (do (.checkcast code (ClassDesc/ofDescriptor (.descriptorString carrier))) :ref)
+        (do
             ;; Operand first: a recur/goto must not carry a Class receiver into
             ;; an enclosing loop target with a different stack shape.
             (emit-literal-reference code carrier ctx)
@@ -5566,14 +5601,18 @@
             (.swap code) ;; Both operand and Class are category-1 references.
             (.invokevirtual code (ClassDesc/of "java.lang.Class") "cast"
                             (MethodTypeDesc/of obj-cd (into-array ClassDesc [obj-cd])))
-            :ref))))))
+            :ref)))))
 
 (defn- emit-bytecode-result-completion
   "Replay the observed region context, without completing or coercing its value."
-  [code {:keys [contract operand]} locals ctx]
+  [code {:keys [contract operand]} locals ctx & [observation]]
   (let [original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
                                 (:operand-context contract))
         actual (emit-form code operand locals original-context)]
+    (when observation
+      (vreset! observation {:input-carrier actual
+                            :adaptation (if (= :diverge actual) :diverge :identity)
+                            :operand-context (completion/bytecode-operand-context original-context)}))
     (when-not (or (= :diverge actual) (= (:result-carrier contract) actual))
       (throw (ex-info "Bytecode result context produced a different physical carrier"
                       {:reason :bytecode-result-context-carrier-mismatch
@@ -5583,13 +5622,18 @@
 (defn- emit-bytecode-input-completion
   "Use precisely the original bytecode invocation's argument/conversion path.
    Never reinterpret a Clojure source-policy contract as this context."
-  [code {:keys [contract operand]} locals ctx]
+  [code {:keys [contract operand]} locals ctx & [observation]]
   (let [carrier (:target-carrier contract)
         target (class-type->stack carrier)
         original-context (merge (apply dissoc ctx ::expected-completion-input-type
                                       completion/bytecode-operand-context-keys)
                                 (:operand-context contract))
         actual (emit-argument-value code operand carrier locals original-context)]
+    (when observation
+      (vreset! observation {:input-carrier actual
+                            :adaptation (if (= :diverge actual) :diverge
+                                            (typed-input-adaptation actual carrier))
+                            :operand-context (completion/bytecode-operand-context original-context)}))
     (when-let [expected (:expected-input-carrier contract)]
       (when-not (or (= :diverge actual) (= expected actual))
         (throw (ex-info "Planned input changed its physical carrier before conversion"
@@ -5605,6 +5649,48 @@
                       {:reason :void-bytecode-input-completion :contract contract})))
     (if (= :diverge actual) actual
       (do (emit-typed-input-adaptation code actual carrier) target))))
+
+(defn- emit-canonical-completion
+  "One completion dispatcher for scalar and Object consumption. Observations
+   retain immutable emitter facts only, never an executable or CodeBuilder."
+  [code expression locals ctx object-parent?]
+  (let [{:keys [contract operand] :as parts} (completion/canonical-parts expression)
+        token (::completion-occurrence (meta expression))
+        observation (when (and token me/*emission-inputs*) (volatile! nil))
+        completed
+        (case (:source-context contract)
+          :jvm-object-input
+          (let [actual (emit-object-value code operand locals ctx)]
+            (when observation
+              (vreset! observation {:input-carrier actual
+                                    :adaptation (if (= :diverge actual) :diverge :identity)
+                                    :operand-context (completion/bytecode-operand-context
+                                                      (object-input-context ctx))}))
+            actual)
+          :jvm-checkcast (emit-reference-check-completion code parts locals ctx observation)
+          :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx observation)
+          (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
+          (emit-bytecode-input-completion code parts locals ctx observation)
+          (throw (ex-info "JVM completion consumer has no input-conversion authority"
+                          {:reason :unsupported-jvm-value-completion :contract contract})))
+        returned (if object-parent?
+                   (cond
+                     (= :diverge completed) :diverge
+                     (= :void completed) (do (.aconst_null code) :ref)
+                     (primitive? completed) (do (emit-box-to-ref code completed) :ref)
+                     :else completed)
+                   completed)]
+    (when observation
+      (let [record (merge @observation
+                          {:status :known :expression expression :contract contract :operand operand
+                           :site-context (completion/bytecode-operand-context ctx)
+                           :locals-before locals :object-parent? object-parent?
+                           :completion-carrier completed :returned-carrier returned})]
+        (swap! me/*emission-inputs* update :completion-contexts
+               (fn [contexts]
+                 (assoc contexts token (if (contains? contexts token)
+                                         {:status :ambiguous} record))))))
+    returned))
 
 (defn- emit-object-value
   "Consume the ORIGINAL operand in Object context. Result-position regions
@@ -5626,14 +5712,7 @@
               (emit-literal-reference code (second expression) ctx)
               (throw (ex-info "Object completion has an unsupported quoted literal"
                               {:reason :unsupported-jvm-object-literal})))
-            parts (case (get-in parts [:contract :source-context])
-                    :jvm-object-input (emit-object-value code (:operand parts) locals ctx)
-                    :jvm-checkcast (emit-reference-check-completion code parts locals ctx)
-                    :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx)
-                    (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
-                    (emit-bytecode-input-completion code parts locals ctx)
-                    (throw (ex-info "JVM completion consumer has no input-conversion authority"
-                                    {:reason :unsupported-jvm-value-completion :contract (:contract parts)})))
+            parts (emit-canonical-completion code expression locals ctx true)
             (contains? #{'let 'let* 'letfn* 'loop* 'do 'if 'try 'case*} head)
             (emit-form code expression locals (assoc ctx :object-result? true))
             (seq? expression)
@@ -5697,13 +5776,7 @@
       ;; Reserved contexts are interpreted, never called as runtime functions.
       (and (seq? form) (= completion/completion-symbol (first form)))
       (if (completion/canonical-form? form)
-        (let [parts (completion/canonical-parts form)]
-          (case (get-in parts [:contract :source-context])
-            :jvm-checkcast (emit-reference-check-completion code parts locals ctx)
-            (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
-            (emit-bytecode-input-completion code parts locals ctx)
-            :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx)
-            (emit-object-value code form locals ctx)))
+        (emit-canonical-completion code form locals ctx false)
         (throw (ex-info "Malformed reserved JVM value completion"
                         {:reason :invalid-value-completion :expression form})))
 
