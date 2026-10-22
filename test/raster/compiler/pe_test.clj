@@ -1,8 +1,95 @@
 (ns raster.compiler.pe-test
   (:require [clojure.test :refer [deftest testing is are]]
             [raster.compiler.passes.scalar.pe :as pe]
+            [raster.compiler.passes.scalar.simplify :as simplify]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]))
+
+(deftest completion-is-a-partial-evaluation-boundary
+  (let [contract (completion/reference-check-contract String)
+        marker (Object.)]
+    (doseq [[operand env expected] [[42 {} 42]
+                                  ['alias {'alias 'value} 'value]
+                                  ['(clojure.core/+ 1 2) {} 3]
+                                  ['(user/helper alias) {'alias 'value} '(user/helper value)]]]
+      (let [source (with-meta (completion/complete-value contract operand) {::marker marker})
+            result (pe/pe source env)]
+        (is (= completion/completion-symbol (first result)))
+        (is (= contract (second result)))
+        (is (= expected (nth result 2)))
+        (is (identical? marker (::marker (meta result))))
+        (is (= result (pe/pe result)))
+        (is (identical? contract (second result)))
+        (is (identical? contract (second (pe/pe-pass source env)))
+            "PE does not traverse or reconstruct the retained contract")))
+    (let [source (with-meta (completion/complete-value contract '(clojure.core/+ 1 2))
+                           {::marker marker})
+          result (second (simplify/simplify (list 'user/outer source)))]
+      (is (identical? contract (second result)))
+      (is (identical? marker (::marker (meta result))))
+      (is (= 3 (nth result 2)))
+      (is (identical? result (simplify/simplify result))))
+    (let [source (completion/complete-value contract 'value)
+          result (pe/pe source)
+          projected (completion/project-to-jvm-source result {:unchecked-math false}
+                                                       {String 'expected-class})
+          execute ((eval (list 'fn* '[expected-class] (list 'fn* '[value] projected))) String)
+          value (String. "original")]
+      (is (identical? value (execute value)))
+      (is (nil? (execute nil)))
+      (is (thrown? ClassCastException (execute 42)))
+      (is (identical? source (simplify/simplify-1 source))))))
+
+(deftest malformed-completions-remain-errors-during-scalar-optimization
+  (doseq [source [(list completion/completion-symbol {} 'value)
+                  (list completion/completion-symbol completion/object-input-contract)
+                  (list completion/completion-symbol completion/object-input-contract 'value 'extra)]
+          source [source (list 'user/outer source)]
+          optimize [pe/pe pe/pe-pass simplify/simplify]]
+    (is (= :invalid-value-completion
+           (try (if (identical? optimize pe/pe-pass) (optimize source {}) (optimize source)) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest quoted-completions-are-data-not-executable-validation
+  (doseq [head '[quote clojure.core/quote]
+          operand [(completion/complete-value completion/object-input-contract
+                                               '(clojure.core/+ 1 2))
+                   (list completion/completion-symbol {} 'value)]
+          optimize [pe/pe simplify/simplify]]
+    (let [source (list head operand)]
+      (is (identical? source (optimize source))))))
+
+(deftest simplifier-preserves-unchanged-collection-occurrences
+  (doseq [source [(with-meta {:value 'x} {::marker :map})
+                  (with-meta #{'x 'y} {::marker :set})]]
+    (is (identical? source (simplify/simplify source))))
+  (let [source (with-meta {:value '(clojure.core/+ 1 2)} {::marker :map})
+        result (simplify/simplify source)]
+    (is (= {:value 3} result))
+    (is (= (meta source) (meta result)))))
+
+(deftest optimized-unused-completions-retain-evaluation-and-failure-order
+  (let [contract (completion/reference-check-contract String)
+        checked (completion/complete-value contract
+                   '(do (swap! events conj :operand) value))
+        ;; The result is unused, but its CHECKCAST and operand effects aren't.
+        source (list 'let* ['unused checked]
+                     '(do (swap! events conj :after) :finished))]
+    (doseq [optimize [pe/pe simplify/simplify]]
+      (let [projected (completion/project-to-jvm-source (optimize source)
+                                                       {:unchecked-math false}
+                                                       {String 'expected-class})
+            execute ((eval (list 'fn* '[expected-class]
+                                 (list 'fn* '[events value] projected))) String)]
+        (doseq [value [nil "valid"]]
+          (let [events (atom [])]
+            (is (= :finished (execute events value)))
+            (is (= [:operand :after] @events))))
+        (let [events (atom [])]
+          (is (thrown? ClassCastException (execute events 42)))
+          (is (= [:operand] @events)
+              "A later effect must not run after the original conversion fails"))))))
 
 ;; ================================================================
 ;; Constant propagation

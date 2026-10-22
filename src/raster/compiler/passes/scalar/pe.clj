@@ -17,6 +17,7 @@
   beyond the transformations above — preserves metadata, qualified symbols, etc."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.simplify :as simp]
             [raster.core :as rcore]))
 
@@ -274,6 +275,15 @@
     (seq? form)
     (let [head (first form)]
       (cond
+        ;; A completion is an evaluation boundary, not a generic function or
+        ;; an algebraic identity. Its contract is data; only its operand is PE'd.
+        (= head completion/completion-symbol)
+        (if-let [{:keys [contract operand]} (completion/canonical-parts form)]
+          (util/remake-if-changed form
+                                  (list head contract (pe-pass operand const-env)))
+          (throw (ex-info "Malformed reserved value completion during partial evaluation"
+                          {:reason :invalid-value-completion :expression form})))
+
         ;; let/let*/loop
         (and (symbol? head) (contains? #{:binding :scope} (:kind (form/form-info form))))
         (pe-let form const-env pe-pass)
@@ -348,7 +358,7 @@
         form
 
         ;; quote — leave alone
-        (= head 'quote)
+        (contains? '#{quote clojure.core/quote} head)
         form
 
         ;; recur — PE the args but keep recur

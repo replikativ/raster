@@ -30,6 +30,18 @@ items 3 and 5; it does not replace the other six obligations.
 
 #### Reviewed continuation: close the producer, not individual optimizer copies
 
+Prerequisite qualification: scalar PE and simplification now preserve existing
+ValueCompletion terms as evaluation boundaries. The simplifier validates the
+reserved syntax before descent and simplifies only the operand, retaining the
+exact contract and wrapper metadata. Both quote forms are opaque; quoted invalid
+completion syntax is data, not an executable validation error. Independent review
+caught the initial rule-only barrier's premature descent and drove this repair.
+The final combined preparation/completion/PE, simplifier and typed arithmetic
+gate passes 73 tests / 885 assertions, including no-op collection identity. Unused
+checks still evaluate their operand once and fail before subsequent effects.
+This prerequisite does not enable helper expansion or grant resident admission;
+the shared pre-freeze canonicalizer and unchanged training acceptance remain open.
+
 The next production change should share target-neutral generated-program
 canonicalization before the owned AD entry is frozen. A REPL-only experiment
 using existing generic resolution, helper expansion and PE changes the training
