@@ -65,7 +65,9 @@
 (defn- reduction-forms [body]
   (filter par-ir/par-reduce-form? (tree-seq coll? seq body)))
 
-(defn- with-fresh-reduction-binding [float? split? run]
+(defn- with-fresh-reduction-binding
+  ([float? split? run] (with-fresh-reduction-binding float? split? 1 run))
+  ([float? split? count-expression run]
   ;; Fresh source owners keep forced-split/unsplit coverage independent of test
   ;; order and of the bytecode already cached by another REPL qualification.
   (let [scope (create-ns (gensym "raster.test.extracted."))]
@@ -73,7 +75,7 @@
       (binding [*ns* scope
                 entry/*emission-inputs* (atom {:static [] :values []})]
         (refer 'clojure.core)
-        (eval (if float?
+        (let [declaration (if float?
                 '(raster.core/deftm objective [xs :- (Array float)] :- Float
                    (let [sum (raster.par/reduce acc (float 0.0) i 1
                                (raster.numeric/+ acc (aget xs i)))
@@ -83,10 +85,18 @@
                    (let [sum (raster.par/reduce acc 0.0 i 1
                                (raster.numeric/+ acc (aget xs i)))
                          reciprocal (raster.numeric// 1.0 sum)]
-                     reciprocal))))
+                     reciprocal)))
+              body (last declaration)
+              bindings (second body)
+              reduction (second bindings)
+              ;; Construct each original test declaration BEFORE its compiler
+              ;; producer runs, never edit retained source/evidence afterward.
+              reduction (apply list (assoc (vec reduction) 4 count-expression))
+              body (list* (first body) (assoc bindings 1 reduction) (nnext body))]
+          (eval (apply list (concat (butlast declaration) [body]))))
         (with-redefs [split/estimate-form-size (constantly (if split? 1000000 0))]
           (run (captured (ns-resolve scope 'objective)))))
-      (finally (remove-ns (ns-name scope))))))
+      (finally (remove-ns (ns-name scope)))))))
 
 (deftest extracted-reduction-keeps-actual-helper-return-and-binding-boundaries
   (doseq [float? [false true]]
@@ -208,6 +218,82 @@
                   (get-in frontend [:source-entry :params]))
                  nil
                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))))
+
+(deftest original-closed-count-is-not-a-constructed-domain-proof
+  (doseq [split? [false true]
+          count-expression [0 1 2 -1 Long/MAX_VALUE]]
+    (with-fresh-reduction-binding
+      false split? count-expression
+      (fn [frontend]
+        (let [input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))
+              observed (prefix/observed-reduction-interval input)
+              closed (:closed-count observed)]
+          (is (some? observed) "the conditional scalar observation does not assume count success")
+          (if (contains? #{0 1} count-expression)
+            (do (is (= count-expression (:value closed)))
+                (is (instance? Integer (:value closed)))
+                (is (identical? (get-in observed [:producer :reduction :bound :initializer])
+                                (:source closed)))
+                (is (identical? (get-in observed [:producer :reduction :bound]) (:bound closed)))
+                (is (= (list 'clojure.core/int count-expression) (:proof-expression closed)))
+                (is (= :before-initializer (:evaluation closed)))
+                (is (not-any? #(contains? closed %)
+                              [:domain-proved? :read-proved? :prepared :replayable?])))
+            (is (nil? closed) "other counts keep their source completion/domain obligation")))))))
+
+(deftest closed-count-does-not-erase-unchecked-cast-effect-obligations
+  (doseq [[expression expected]
+          [['(clojure.core/unchecked-int 4294967296) 0]
+           ['(clojure.core/unchecked-int 4294967297) 1]]]
+    (with-fresh-reduction-binding
+      false false expression
+      (fn [frontend]
+        (let [input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))
+              observed (prefix/observed-reduction-interval input)
+              proof-expression (list 'clojure.core/int expression)]
+          (is (some? observed))
+          ;; Value evaluation knows unchecked narrowing, but that does not
+          ;; discharge the original expression's independent effect obligation.
+          (is (= expected (:value (raster.compiler.core.numeric-constant/source-value
+                                  proof-expression))))
+          (is (nil? (:closed-count observed))))))))
+
+(deftest closed-count-rejects-post-emission-bootstrap-replacement
+  (with-fresh-reduction-binding
+    false false
+    (fn [frontend]
+      (let [input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))
+            scope (get-in frontend [:source-entry :source-ns])]
+        (is (= 1 (get-in (prefix/observed-reduction-interval input) [:closed-count :value])))
+        ;; Change only this fresh namespace after bytecode emission. A newly
+        ;; resolved cast must not authenticate the previously emitted program.
+        (ns-unmap scope 'int)
+        (intern scope 'int identity)
+        (is (= :stale-definition-proof-input
+               (try (prefix/observed-reduction-interval input)
+                    nil
+                    (catch clojure.lang.ExceptionInfo failure
+                      (:reason (ex-data failure))))))))))
+
+(deftest closed-count-does-not-borrow-cast-or-sibling-authority
+  (with-fresh-reduction-binding
+    false false
+    (fn [frontend]
+      (let [input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))
+            producer (:producer (prefix/observed-reduction-interval input))
+            check (ns-resolve 'raster.compiler.core.source-prefix 'closed-reduction-count)
+            before @entry/*emission-inputs*]
+        (doseq [[path value]
+                [[[:reduction :bound :unretained-sibling-calls?] true]
+                 [[:reduction :bound :unretained-sibling-calls?] nil]
+                 [[:reduction :bound :before 'int] {:type :ref :slot 0}]
+                 [[:reduction :bound :initializer] '(foreign/int 1)]
+                 [[:reduction :bound :initializer] '(clojure.core/int unknown-count)]
+                 [[:reduction :bound :initializer] '(do (clojure.core/int 1))]
+                 [[:reduction :bound :initializer]
+                  (with-meta '(clojure.core/int 1) {:raster.effect/preserve-evaluation true})]]]
+          (is (nil? (check frontend (assoc-in producer path value))) (str "unclosed count: " path))
+          (is (identical? before @entry/*emission-inputs*)))))))
 
 (deftest extracted-binding-requires-the-complete-physical-chain
   (with-fresh-reduction-binding

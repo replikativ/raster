@@ -11,13 +11,16 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.numeric-constant :as numeric-constant]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.invocation-plan :as invocation]
-            [raster.compiler.ir.invocation-source :as source]))
+            [raster.compiler.ir.invocation-source :as source]
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 (deftype ^:private PrefixInput [frontend parameters scope pairs])
 (deftype ^:private PrefixCorrespondence [input program entries])
@@ -109,11 +112,50 @@
                                                       (get-in extracted [:helper :method]))
                              :presence :present}})))))
 
+(defn- closed-reduction-count [frontend producer]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (let [bound (get-in producer [:reduction :bound])
+           original (:initializer bound)
+           source-ns (get-in frontend [:source-entry :source-ns])
+           locals (set (keys (:before bound)))]
+       (when (and entry/*emission-inputs* (instance? clojure.lang.Namespace source-ns)
+                  (= :int (get-in bound [:after :type]))
+                  (false? (:unretained-sibling-calls? bound))
+                  (completion/bytecode-operand-context? (:context bound)))
+         ;; Qualify only this closed literal/cast proof, under actual bootstrap
+         ;; lookups. The original expression and its source position are retained.
+         ;; Bare or qualified casts cannot borrow a different lookup's identity.
+         (letfn [(canonical [expression remaining]
+                   (when (pos? remaining)
+                     (cond
+                       (or (integer? expression) (float? expression)) expression
+                       (and (seq? expression) (= 2 (count expression))
+                            (symbol? (first expression))
+                            (not (contains? locals (first expression)))
+                            (not (:lexical-callee (descriptor/call-description expression)))
+                            (descriptor/cast-op? (first expression))
+                            (contains? #{nil "clojure.core"} (namespace (first expression))))
+                       (let [lookup (first expression)
+                             operation (symbol "clojure.core" (name lookup))]
+                         (when-let [operand (canonical (second expression) (dec remaining))]
+                           (intrinsic-source/observe-original! source-ns lookup operation)
+                           (with-meta (list operation operand) (meta expression)))))))]
+           (when-let [expression (canonical original 128)]
+             (let [literal (numeric-constant/source-value expression)
+                   value (:value literal)
+                   obligations (effects/descriptor original)]
+               (when (and (instance? Integer value) (contains? #{0 1} value)
+                          (= :pure (:effect obligations)) (empty? (:flags obligations)))
+                 {:source original :bound bound :proof-expression expression :value value
+                  :scope :closed-source-count :evaluation :before-initializer})))))))))
+
 (defn observed-reduction-interval
   "Join actual producer storage to original scalar invocation completions.
    Conditional on those original evaluations completing. The selected Object
    payload computation stays separate from actual invocation return/storage.
-   No count/read, use closure, placement or GPU admission is established here.
+   An optional closed-count value is not a constructed-domain/read proof.
+   No use closure, placement or GPU admission is established here.
    Cold/missing/unsupported evidence abstains transactionally without preparing
    code. The result is not a standalone execution certificate."
   [input]
@@ -175,7 +217,8 @@
                             (identical? (get-in selected [:definition :entry :typed-impl])
                                         (get-in computation [:bridge :implementation])))
                    {:scope scope :parameters (.-parameters input) :ordinals [0 1]
-                    :producer producer :consumer {:binding bound :invocation call
+                    :producer producer :closed-count (closed-reduction-count frontend producer)
+                    :consumer {:binding bound :invocation call
                                                  :argument-facts facts :selected selected
                                                  :computation computation}}))))))))))
 

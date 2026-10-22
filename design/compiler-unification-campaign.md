@@ -400,14 +400,29 @@ Next connected execution obligation has existing capacity authorities:
 and the ordered source cursor in `gpu/link`. These must be reused, not replaced
 by another bounds system. They are not yet source read completion: unknown native
 capacity remains a caller obligation and capacity failures are not original
-null/bounds failures. Retain the checked original count as an ordered
-`ScalarCompute` using the existing reduction-count outliner, once and before
-initialization; keep signed source count separate from nonnegative launch extent.
+null/bounds failures. A general reduction-count outliner may capture arrays or
+effects; it cannot be represented by `ScalarCompute`, which requires pure
+rank-zero operands. The first closed literal count 0/1 family authenticates the
+original cast lookups and evaluates through the shared source constant evaluator,
+without inserting a synthetic source binding. General counts still require an
+authenticated original-position execution relation. Keep signed source count
+separate from nonnegative launch extent.
 At the reduction cursor, validate the original read domain against actual public
 array/live-view storage. Empty domains require no read or fabricated upload.
 Qualify null/empty inputs at counts 0/1, short views over larger roots, unknown
 capacity, changed replay, count-before-initializer failure and no launch/result
 publication after failed validation before consuming the numerical interval.
+
+The optional closed-count observation now retains the exact original checked
+initializer and bound context, original bootstrap cast identities, actual Integer
+0/1 value and independent pure/no-flags obligation. It is not a domain/read or
+execution certificate. Post-emission cast replacement invalidates the owning
+history. Explicit unchecked narrowing can produce 0/1 in the shared evaluator,
+but still abstains here while its independent source effect remains unclosed;
+value folding does not erase evaluation obligations. No admission rule changed.
+The affected seven-namespace gate passes 102 tests / 1,551 assertions. Current
+draft head `dbe75388` still fails test33827, fixture33828 and OpenCL33826; setup
+and build pass. CUDA/HIP gates have not established readiness. No merge is allowed.
 
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
