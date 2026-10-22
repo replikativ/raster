@@ -118,7 +118,7 @@
   '[defn deftm ftm defvalue defabstract defval
     specialize
     methods-of ambiguities print-methods
-    invoke prefer-method! remove-method!])
+    invoke prefer-method! remove-method! unregister!])
 
 (def ^:no-doc raster-array-refers
   "Symbols to refer from raster.arrays."
@@ -1784,6 +1784,21 @@
                                  (dispatch/make-dispatch-fn fn-name table-atom reducible?) table-atom))
     (dispatch/bump-compiler-definition-revision!)
     fn-var))
+
+(defn unregister!
+  "Remove every overload, parametric template and reducible folding declaration
+   of a deftm generic function.
+   Keeps its Var available for redefinition, including a changed signature:
+
+     (unregister! #'model-lp)
+     (deftm model-lp [theta :- (Array double)] :- Double ...)
+
+   Ordinary deftm redefinition already replaces an identical signature;
+   use this only when replacing the whole generic, not extending it.
+   Sequential REPL operation: does not revoke captured compiled functions,
+   unload generated JVM classes, or synchronize with concurrent compilation."
+  [fn-var]
+  (dispatch/unregister! fn-var))
 
 (defn ^:no-doc specialize-fn!
   "Specialize a deftm function for a given element type.
