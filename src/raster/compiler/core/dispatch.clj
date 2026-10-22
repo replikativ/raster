@@ -771,8 +771,9 @@
                          m methods))
                       {} @table-atom)
             type-form (build-tc-ann table-atom ret-tags qsym)]
-        (when type-form
-          (ann-fn [ns-sym qsym type-form {} nil nil]))))
+        ;; An empty generic must not retain the checker's previous callable
+        ;; signature after its methods have been unregistered.
+        (ann-fn [ns-sym qsym (or type-form 'typed.clojure/Any) {} nil nil])))
     (catch Exception e
       (binding [*out* *err*]
         (println (str "WARNING: TC annotation failed for " simple-name ": " (.getMessage e)))))))
@@ -1392,3 +1393,39 @@
   [fn-name args]
   (when-let [boxed (try-parametric-with @parametric-register fn-name args)]
     (or (::result boxed) true)))
+
+(defn unregister!
+  "Clear all overloads and parametric templates of a registered generic Var.
+   Preserve the Var/table identities so ordinary deftm registration can reuse
+   them. This is a sequential REPL operation, not a concurrent reload fence;
+   previously captured implementations are not revoked or unloaded."
+  [fn-var]
+  (let [metadata (when (var? fn-var) (meta fn-var))
+        table (:raster.core/dispatch-table metadata)
+        scope (:ns metadata)
+        simple-name (:name metadata)
+        key (when scope (gf-key (ns-name scope) simple-name))]
+    (when-not (and (:raster.core/generic-function metadata)
+                   table (identical? table (get @dispatch-tables key))
+                   (identical? fn-var (ns-resolve scope simple-name)))
+      (throw (ex-info "unregister! requires a currently registered generic function Var"
+                      {:reason :invalid-generic-function :var fn-var})))
+    ;; Remove templates as well as their concrete instances: otherwise the
+    ;; no-method path could silently recreate a supposedly removed overload.
+    (swap! parametric-registry dissoc key)
+    (reset! table {})
+    (clear-specialization-cache! key)
+    (publish-dispatch! fn-var (make-dispatch-fn simple-name table false scope) table)
+    ;; A replacement generic must not inherit the old associative folding law.
+    ;; register-method! intentionally inherits this flag during ordinary extension.
+    (alter-meta! fn-var #(-> %
+                            (dissoc :raster.core/reducible :no-inline)
+                            (assoc :arglists nil :raster.compiler/host-only false)))
+    (bump-compiler-definition-revision!)
+    ;; Retain the empty table for future checker initialization, and replace
+    ;; an already published signature now when the checker is active.
+    (swap! pending-tc-annotations assoc key [scope simple-name table])
+    (swap! pending-tc-annotation-version inc)
+    (when @tc-annotations-ready?
+      (emit-tc-ann! scope simple-name table))
+    fn-var))
