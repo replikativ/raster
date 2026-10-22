@@ -81,13 +81,30 @@
   {:source-context :jvm-bytecode-floating-input :target-carrier parameter-class
    :policy :preserve-bytecode-input :operand-context operand-context})
 
+(defn bytecode-integral-input-contract
+  "Retain an observed Int/Long parameter's bytecode invocation completion.
+   This is not a Clojure checked int/long source cast, nor permission to infer a
+   parameter Class from a logical dtype. The producer owes the original resolved
+   Method and operand context, just as for floating bytecode input completion."
+  [parameter-class operand-context]
+  (when-not (and (contains? #{Integer/TYPE Long/TYPE} parameter-class)
+                 (bytecode-operand-context? operand-context))
+    (throw (ex-info "bytecode integral completion requires an actual Int/Long parameter Class"
+                    {:reason :unsupported-value-completion :carrier parameter-class})))
+  {:source-context :jvm-bytecode-integral-input :target-carrier parameter-class
+   :policy :preserve-bytecode-input :operand-context operand-context})
+
 (defn canonical-contract? [contract]
   (and (map? contract)
        (or (= object-input-contract contract)
            (and (= #{:source-context :target-carrier :policy :operand-context} (set (keys contract)))
-                (= :jvm-bytecode-floating-input (:source-context contract))
+                (case (:source-context contract)
+                  :jvm-bytecode-floating-input
+                  (contains? #{Float/TYPE Double/TYPE} (:target-carrier contract))
+                  :jvm-bytecode-integral-input
+                  (contains? #{Integer/TYPE Long/TYPE} (:target-carrier contract))
+                  false)
                 (= :preserve-bytecode-input (:policy contract))
-                (contains? #{Float/TYPE Double/TYPE} (:target-carrier contract))
                 (bytecode-operand-context? (:operand-context contract)))
            (and (= #{:source-context :target-carrier :policy} (set (keys contract)))
                 (= :jvm-checkcast (:source-context contract))
@@ -200,7 +217,7 @@
      (if (and (seq? form) (= completion-symbol (first form)))
        (if-let [{:keys [contract operand]} (canonical-parts form)]
          (with-meta (case (:source-context contract)
-                      :jvm-bytecode-floating-input
+                      (:jvm-bytecode-floating-input :jvm-bytecode-integral-input)
                       (throw (ex-info "Bytecode-owned input completion requires its bytecode consumer"
                                       {:reason :unsupported-value-completion-source-context
                                        :contract contract}))
