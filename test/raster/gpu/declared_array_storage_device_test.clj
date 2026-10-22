@@ -39,6 +39,31 @@
     (run-generated-clone :ze:0)
     (gp/gpu-skip! "generated clone storage on Level Zero")))
 
+(defn- run-generated-weight-gradient [target]
+  (let [artifact (compiled/instantiate!
+                  (compiled/lower #'nn/dense-backward-dW
+                                  [(float-array [1.0 2.0]) (float-array [3.0 4.0 5.0])]
+                                  {:compiler :equation-first :target target :dtype :float}))]
+    (try
+      (doseq [[dy-values x-values] [[[1.0 2.0] [3.0 4.0 5.0]]
+                                   [[-2.0 0.5] [4.0 -1.0 2.0]]]]
+        (let [dy (float-array dy-values) x (float-array x-values)
+              independent (vec (for [a dy-values b x-values] (float (* a b))))
+              source (vec (nn/dense-backward-dW dy x))
+              actual (value/->host (:result (compiled/invoke-compiled artifact {:dy dy :x x})))]
+          (is (= independent source (vec actual)) (str target " changed-input outer product"))
+          (is (= (mapv float dy-values) (vec dy)))
+          (is (= (mapv float x-values) (vec x)))))
+      (finally (compiled/close! artifact)))))
+
+(deftest generated-weight-gradient-matches-jvm-and-independent-outer-product
+  (if @opencl/opencl-available?
+    (run-generated-weight-gradient :ocl:0)
+    (opencl/opencl-skip! "generated weight gradient on OpenCL"))
+  (if @gp/gpu-available?
+    (run-generated-weight-gradient :ze:0)
+    (gp/gpu-skip! "generated weight gradient on Level Zero")))
+
 (defn- run-retired-segmap-invariants [target]
   (let [runtime (backend/runtime-namespace target)
         resolve-runtime #(requiring-resolve (symbol (str runtime) %))
