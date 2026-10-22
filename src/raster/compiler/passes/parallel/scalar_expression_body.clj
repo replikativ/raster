@@ -827,7 +827,10 @@
                                       {:expression expression :expected expected
                                        :dtype fold-type :parameters parameters
                                        :locals fold-locals :results body-results}))
-                        loop-index (fresh "fold-index")
+                        ;; The generated ForLoop binding below is explicitly long. Preserve that
+                        ;; constructor fact on lexical uses passed to typed index callbacks too;
+                        ;; the owner's outer ABI cannot know this newly generated SSA name.
+                        loop-index (with-meta (fresh "fold-index") {:raster.type/tag 'long})
                         carry (fresh "fold-carry")
                         result (fresh "fold-result")
                         initial (lower (:identity attributes) fold-type env)

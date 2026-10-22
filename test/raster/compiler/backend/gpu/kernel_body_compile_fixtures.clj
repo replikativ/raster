@@ -50,6 +50,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.passes.parallel.ordered-scalar-fold-fixture :as ordered-fold]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.ode.multilevel :as multilevel]
@@ -762,6 +763,12 @@
                             swizzled-pipelined)
            (write-artifact! directory suffix "workgroup-reduction"
                             (reduction-artifact dialect))
+           ;; Explicit native-schedule fixture, not public source admission evidence.
+           (write-artifact! directory suffix "ordered-seeded-scalar-fold"
+                            (segop-emit/generate-segred-kernel-body
+                             (ordered-fold/operation :double 2.0 'n '*) nil
+                             :dtype :double :array-types {'a :double} :scalar-types {'n :long}
+                             :target-dialect dialect :kernel-name-prefix "ordered_seeded_fold"))
            (write-artifact! directory suffix "portable-contraction"
                             (contraction-artifact dialect descriptor))
            (write-artifact! directory suffix "widened-contraction-result"

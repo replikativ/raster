@@ -379,6 +379,57 @@ on the existing `raster.nn/softmax` `inv-sum` refusal (`:uncertified-host-scalar
 connected empty-fold work does not yet repair the real nonempty softmax boundary.
 Unit/OpenCL jobs 33883/33882 were still pending at inspection; draft remains held.
 
+### October 22 ordered seeded-fold scheduling substrate
+
+A distinct `:scalar-ordered-seeded-fold` schedule now lowers a scalar SegRed through
+the existing canonical typed `fold` and shared scalar-expression KernelBody lowerer.
+One workitem initializes the actual seed, executes an ordered carried `ForLoop`, applies
+any retained result transform and stores once. There is no tree, neutral padding,
+partial-result buffer, barrier or scratch allocation. A singleton still computes the
+recurrence over the seed and element; it cannot replace the result with the element.
+No monoid certification/combine-spelling gate is borrowed. Strict metadata says `:seed`
+and `:source-ordered-seeded-fold`, not algebraic identity or reassociation permission.
+
+Empty and ordered leaf schedules share parameter/storage construction and terminal
+transform lowering. Flat `ReductionRegion` bindings are translated into canonical typed
+locals using retained binder dtypes; missing facts refuse rather than being inferred.
+The shared fold lowerer preserves the constructor-owned long index dtype on generated
+lexical references, so typed index callbacks see the actual SSA binding type. Original
+JVM int-index correspondence remains a separate, outstanding source obligation.
+
+Read footprints reuse `map-read-requirements/fold-read-requirements`, including lexical
+locals and resident singleton captures. Every physical input needs a proved requirement,
+even when a large backing shape is supplied. ABI minima, logical requirements and actual
+backing shapes are distinct: complete fold extents may project to private `_n_bound`,
+while graph capacity checks use logical requirements and independently checked graph
+guards. Larger backing storage is accepted, insufficient/unguarded capacity and altered
+minima are rejected. Shifted, strided and indirect addresses without a dense-span proof
+refuse; arbitrary addresses are not justified by an `n`-element pointer contract.
+
+Independent review found and closed the flat-binding/typed-local mismatch; self-review
+found the generic lowerer's address expressiveness exceeded the original pointwise ABI
+minimum. Reusing the existing footprint analysis closed that memory-contract gap without
+a new address grammar or owner type. Review then accepted the complete logical/ABI/
+capacity split and graph reconstruction controls.
+
+Qualification: 190 affected tests / 2,933 assertions pass, including strict source-region,
+existing empty/tree schedules, source-owner/materialization controls and actual OpenCL
+and Level Zero execution. Tiny native cases cover non-neutral multiplication, zero-trip
+seed preservation, negative zero and cancellation-sensitive ordered accumulation. The
+same generated symbolic-bound fixture compiled locally with Clang OpenCL, nvcc 12.4
+(`sm_80` PTX) and hipcc 5.7 (`gfx1100` code object), all exit zero, without CUDA/AMD
+hardware. The existing CI generator now includes that explicitly native-schedule fixture;
+it is not counted as public deftm qualification or a performance result.
+
+This is a scheduling substrate, not public nonempty source activation. The compiler's
+existing default parallel reduction routes are unchanged. Before selection by the public
+source-owner path, the actual read, seed, combine argument order/conversions and backedge
+must be joined, and null/short-array exception ordering preserved before acquisition.
+The next source gate begins with the literal singleton and then expands checked counts;
+it must not waive those obligations based on this native test receipt. The full draft's
+softmax/source-completion CI failure and unchanged resident training acceptance remain
+open; no merge or whole-campaign completion is established.
+
 ### October 21 DeepSeek inference reference integration
 
 The recovered full source review is retained locally in
