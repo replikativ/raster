@@ -336,6 +336,34 @@ these are check totals, not independent defect counts. Public softmax and the
 training gradient still show source-arithmetic/evaluation correspondence gaps.
 No broad green or merge readiness is claimed by these targeted repairs.
 
+Next reviewed construction obligation: numerical producer → original binding →
+scalar consumer. `coverage-decline`'s normal-completion summaries are diagnostic
+only: its empty lexical environment can miss a preceding reduction result, and
+an Object/present/Double summary cannot establish execution correspondence.
+`source-prefix` currently stops before the first parallel form; its success
+must not be reused as a post-reduction placement certificate.
+
+Extend the existing SourceConstruction/correspondence/SourceOwner path with a
+bounded direct reduction-to-scalar interval. At the actual producer, retain the
+original scope and binding ordinals, exact equation/step identities and observed
+normalization/construction edges. Join existing reduction emission, binding and
+completed positional invocation observations with recurrence/checkpoint and FP
+consumer proofs. Keep actual stored carrier distinct from boxed payload. This
+relation needs a pre-admission producer seam; neither diagnostics nor a late
+prefix check can retroactively grant it. No new global facts, runtime or cache.
+
+First executable witness: an unchanged flat direct interval with checked literal
+count, literal initializer and independently certified reads, initially empty and
+singleton domains. This is a construction gate toward unchanged softmax/training,
+not replacement acceptance. Helper-expanded intervals and general dynamic counts
+stay held until their original-position/count/read contracts are connected.
+SourceOwner consumes the authenticated interval; resident reconstruction still
+checks the final use-closed placement. Required negative controls cover wrong or
+copied occurrences, stale history, changed carrier/coercions, intervening effects,
+extra uses, unchecked count substitution, insufficient/null storage, changed
+recurrence/association and missing read-domain evidence. The arithmetic flags
+remain until this complete join—not result typing alone—justifies their discharge.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction
