@@ -163,7 +163,16 @@
         carried (#'pipeline/carry-void-binding-contracts form)
         inner-binder (-> carried second second (nth 2) second first)]
     (is (:raster.effect/effectful (meta (first (second carried)))))
-    (is (:raster.effect/effectful (meta inner-binder)))))
+    (is (:raster.effect/effectful (meta inner-binder)))
+    (is (identical? carried (#'pipeline/carry-void-binding-contracts carried)))))
+
+(deftest void-contract-analysis-preserves-value-regions-and-quoted-data
+  (doseq [form ['(let* [x (outer (inner value))] x)
+                '(let* [x (let* [saved value] (outer saved))] x)
+                '(quote (let* [_ (dotimes [i n] (clojure.core/aset output i 0.0))] nil))
+                '(clojure.core/quote
+                   (let* [_ (dotimes [i n] (clojure.core/aset output i 0.0))] nil))]]
+    (is (identical? form (#'pipeline/carry-void-binding-contracts form)))))
 
 (deftest void-contract-carrying-marks-only-unused-effect-loop-results
   (let [effect-loop '(loop* [i 0]

@@ -21,6 +21,24 @@
   (doseq [empty-form ['() []]]
     (is (identical? empty-form (util/remake-if-changed empty-form [])))))
 
+(deftest metadata-preserving-walk-reuses-unchanged-occurrences-in-source-order
+  (doseq [quote-head '[quote clojure.core/quote]]
+   (let [leaf (symbol "value")
+        quoted (list quote-head '(unvisited payload))
+        source (with-meta [(list 'callee leaf) quoted] {:line 9})
+        seen (atom [])
+        unchanged (util/postwalk-preserving-meta #(do (swap! seen conj %) %) source)]
+    (is (identical? source unchanged))
+    (is (= ['callee leaf (first source) quoted source] @seen))
+    (let [retagged (with-meta leaf {:tag 'float})
+          changed (util/postwalk-preserving-meta
+                   #(if (identical? leaf %) retagged %) source)]
+      (is (= source changed))
+      (is (not (identical? source changed)))
+      (is (identical? retagged (second (first changed))))
+      (is (identical? quoted (second changed)))
+      (is (identical? (meta source) (meta changed)))))))
+
 (deftest retained-invocation-reconstruction-shares-the-canonical-metadata-contract
   (let [impl 'raster.numeric/_star__m_double_double-impl
         left (with-meta (symbol "left") {:tag 'double})

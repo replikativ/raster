@@ -81,6 +81,13 @@ test shard output33948 reports 3 failures / 13 errors in 568 tests / 4118
 assertions, including source-ordered PDE/copy execution and attention algorithm
 validation; this is one failed shard, not a whole-suite summary. Keep the broad
 draft held and use these shared-boundary counterexamples in subsequent closure.
+The subsequent shared-walk cleanup removes unconditional seq/vector copies from
+metadata-preserving postwalk and the final void-contract annotation pass. Both
+quote spellings stay opaque, real metadata changes survive, and repeated effect
+annotation is idempotent. Utility/pipeline controls pass 67 tests / 424 assertions;
+source construction/transport/preparation pass 55 tests / 495 assertions. The
+generated scale's final origin is still open; do not mistake no-op reconstruction
+cleanup for complete source correspondence or a performance measurement.
 
 Whole-draft CI checkpoint, exact remote head `150fd933` (not main): public source
 job 33722 attempted 172 compilations, passed 142 and reported 30 refusals. Its 15

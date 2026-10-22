@@ -504,14 +504,14 @@
   "Bottom-up tree rewrite that preserves metadata on every rebuilt collection.
 
    Quoted data is opaque. A replacement returned by `f` keeps its own metadata; metadata from the
-   replaced node is not incorrectly transferred onto a semantically different value."
+   replaced node is not incorrectly transferred onto a semantically different value.
+   Unchanged seq/vector children retain the original occurrence, not an equal copy."
   [f expression]
   (letfn [(go [form]
             (f
              (cond
-               (and (seq? form) (= 'quote (first form))) form
-               (seq? form) (remake-from form (map go form))
-               (vector? form) (with-meta (mapv go form) (meta form))
+               (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
+               (or (seq? form) (vector? form)) (remake-if-changed form (mapv go form))
                (record? form) (reduce-kv (fn [r k v] (assoc r k (go v))) form form)
                (map? form) (with-meta
                              (into (empty form) (map (fn [[k v]] [(go k) (go v)])) form)

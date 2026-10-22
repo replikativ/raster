@@ -377,12 +377,12 @@
    nested binder. This pass attaches only the authoritative void contract of the immediate RHS;
    it performs no type inference and leaves value-producing expressions untouched."
   [form]
-  (clojure.walk/postwalk
+  (util/postwalk-preserving-meta
    (fn [expression]
      (if-not (form/binding-form? expression)
        expression
-       (let [[head bindings & body] expression
-             pairs (vec (partition 2 bindings))
+       (let [[head original-bindings & body] expression
+             pairs (vec (partition 2 original-bindings))
              bindings
              (vec
               (mapcat
@@ -394,10 +394,12 @@
                        statement? (or (util/void-form? initializer)
                                       (and unused? (util/effect-loop-statement? initializer)))]
                    [(cond-> symbol
-                      statement? (vary-meta assoc :raster.effect/effectful true))
+                      (and statement? (not (true? (:raster.effect/effectful (meta symbol)))))
+                      (vary-meta assoc :raster.effect/effectful true))
                     initializer]))
                (range) pairs))]
-         (with-meta (list* head bindings body) (meta expression)))))
+         (util/remake-if-changed
+          expression (list* head (util/remake-if-changed original-bindings bindings) body)))))
    form))
 
 (defn- pass-region-copy
