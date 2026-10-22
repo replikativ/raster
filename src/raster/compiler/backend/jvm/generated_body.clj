@@ -38,9 +38,23 @@
                            (throw (ex-info "Generated import has a discontinuous lexical binding chain"
                                            {:reason :generated-body-binding-context :binder id})))
                          (vreset! previous (assoc (:before observed) (:binder observed) (:after observed)))
-                         [id (if (= :ref (get-in observed [:after :type]))
-                               (reference-check (get-in observed [:after :reference-class]) (walk value))
-                               (walk value))]))
+                         ;; The helper's initializer context is independent of
+                         ;; the enclosing return completion. Anchor it before
+                         ;; constructing a new outer program: moving the let
+                         ;; alone must not switch Object-return call selection
+                         ;; or consume a one-shot result flag differently.
+                         (let [raw (get-in observed [:after :type])
+                               context (:input-context observed)]
+                           (when-not (and (contains? #{:ref :double :float :long :int :bool} raw)
+                                          (completion/bytecode-operand-context? context))
+                             (decline! "Generated helper binding has no retained initializer context"
+                                       {:binder id}))
+                           (let [anchored (completion/complete-value
+                                           (completion/bytecode-result-context-contract context raw)
+                                           (walk value))]
+                             [id (if (= :ref raw)
+                                   (reference-check (get-in observed [:after :reference-class]) anchored)
+                                   anchored)]))))
                      (range) (partition 2 bindings))]
                 (with-meta (list* head (vec pairs) (mapv walk tail)) (meta node)))
               (and (seq? node) (= '.invk (first node)))

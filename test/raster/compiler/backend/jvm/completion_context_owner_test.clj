@@ -26,6 +26,8 @@
              [(completion/bytecode-floating-input-contract Float/TYPE context) 'x :ref :float 3.75 (float 3.75)]
              [(completion/bytecode-floating-input-contract Double/TYPE context) 'x :ref :double 3.75 3.75]
              [(completion/bytecode-result-context-contract context :double) 1.25 :double :double nil 1.25]
+             [(completion/bytecode-result-context-contract context :int) (int 7) :int :int nil (int 7)]
+             [(completion/bytecode-result-context-contract context :bool) true :bool :bool nil true]
              [(completion/bytecode-result-context-contract context :ref) 'x :ref :ref "value" "value"]]
             object-parent? [false true]]
       (let [expression (completion/complete-value contract operand)
@@ -44,7 +46,7 @@
         (is (= object-parent? (:object-parent? observed)))
         (if (= :ref completed)
           (is (nil? (:result-fact observed)) "a reference does not prove a nonnull scalar payload")
-          (let [tag (symbol (name completed))
+          (let [tag (if (= :bool completed) 'boolean (symbol (name completed)))
                 carrier (types/tag->java-class tag)]
             (is (= {:carrier (if object-parent? Object carrier)
                     :presence :present :builtin-class (get types/primitive-info tag)}

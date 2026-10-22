@@ -130,7 +130,7 @@
    correspondence; the constructor does not authenticate observations."
   [operand-context result-carrier]
   (when-not (and (bytecode-operand-context? operand-context)
-                 (contains? #{:ref :double :float :long} result-carrier))
+                 (contains? #{:ref :double :float :long :int :bool} result-carrier))
     (throw (ex-info "bytecode result context requires an observed supported carrier"
                     {:reason :unsupported-value-completion :result-carrier result-carrier})))
   {:source-context :jvm-bytecode-result-context
@@ -160,7 +160,7 @@
        (or (= object-input-contract contract)
            (and (= #{:source-context :operand-context :result-carrier} (set (keys contract)))
                 (= :jvm-bytecode-result-context (:source-context contract))
-                (contains? #{:ref :double :float :long} (:result-carrier contract))
+                (contains? #{:ref :double :float :long :int :bool} (:result-carrier contract))
                 (bytecode-operand-context? (:operand-context contract)))
            (and (or (= #{:source-context :target-carrier :policy :operand-context} (set (keys contract)))
                     (and (= #{:source-context :target-carrier :policy :operand-context :expected-input-carrier}

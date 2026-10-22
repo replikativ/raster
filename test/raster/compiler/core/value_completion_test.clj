@@ -16,16 +16,25 @@
     (is (= :unsupported-value-completion-source-context
            (try (completion/project-to-jvm-source term) :accepted
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-    (doseq [changed [(assoc contract :result-carrier :int)
+    (doseq [changed [(assoc contract :result-carrier :void)
                      (assoc contract :payload Float)
                      (assoc contract :presence :present)
                      (update contract :operand-context dissoc :void-context)
                      (assoc-in contract [:operand-context :void-context] nil)
                      (assoc-in contract [:operand-context :extra] false)]]
       (is (not (completion/canonical-contract? changed))))
-    (doseq [carrier [:int :void :diverge Object]]
+    (doseq [carrier [:void :diverge Object]]
       (is (thrown? clojure.lang.ExceptionInfo
                    (completion/bytecode-result-context-contract context carrier))))))
+
+(deftest integer-and-boolean-result-contexts-retain-distinct-raw-carriers
+  (doseq [carrier [:int :bool]]
+    (let [contract (completion/bytecode-result-context-contract
+                    (completion/bytecode-operand-context {}) carrier)]
+      (is (completion/canonical-contract? contract))
+      (is (= carrier (:result-carrier contract)))
+      (is (nil? (completion/object-value-declaration
+                 (completion/complete-value contract 'operand)))))))
 
 (deftest retained-context-barrier-is-quote-opaque-and-includes-invalid-terms
   (let [term (completed 'x)

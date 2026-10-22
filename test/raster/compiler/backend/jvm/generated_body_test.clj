@@ -89,6 +89,21 @@
                                    #(when % (with-meta % (assoc (meta %) :tag 'Object))))))]
            (is (nil? (generated/normalize-program program (interface-method (:tags program)) capture!))))
          (is (identical? before @entry/*emission-inputs*)))
+       (let [observe bytecode/retained-binding-context
+             before @entry/*emission-inputs*]
+         (with-redefs [bytecode/retained-binding-context
+                       (fn [& arguments]
+                         (when-let [context (apply observe arguments)]
+                           (update context :input-context dissoc :object-call-result?)))]
+           (is (nil? (generated/normalize-program program (interface-method (:tags program)) capture!))))
+         (is (identical? before @entry/*emission-inputs*))
+         (let [completions (filter raster.compiler.core.value-completion/canonical-form?
+                                   (tree-seq coll? seq (:walked-body normalized)))
+               anchors (filter #(= :jvm-bytecode-result-context (get (second %) :source-context))
+                               completions)]
+           (is (< 6 (count anchors)) "helper initializers, not only helper returns, retain context")
+           (is (every? #(raster.compiler.core.value-completion/bytecode-operand-context?
+                         (:operand-context (second %))) anchors))))
        (doseq [rows [1 3] change [0 1]]
          (let [theta (float-array (map #(+ (double %) (* change 0.125)) (training/initial-theta)))
                {:keys [x y]} (first (training/batches [rows]))
