@@ -9,6 +9,7 @@
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
@@ -121,6 +122,54 @@
             (is (nil? (payload call [fp {:carrier Object :presence :unknown}])))
             (is (nil? (payload call [fp]))))))
       (finally (remove-ns (ns-name scope))))))
+
+(deftest checked-payload-composition-is-sequential-and-capture-safe
+  (doseq [source-body ['(clojure.core/+ (clojure.core/* x y) -0.0)
+                      '(clojure.core/double x)
+                      '(clojure.core/double -0.0)]]
+    (let [{:keys [scope receiver] :as fixture} (fixture! "raster.payload-composition." source-body)]
+      (try
+        (with-selected-fixture
+          fixture
+          (fn [call]
+            (core/ensure-bytecode-implementation! receiver)
+            (let [proof (payload call [fp fp])
+                  ;; Actual argument identities deliberately collide with the old recipe's
+                  ;; definition names. A tree substitution would capture these references.
+                  ids '[scalar-value-1 scalar-value-2]
+                  arguments (mapv (fn [id] {:operations [] :result id :type :double}) ids)
+                  builder #(scalar/make-lowerer
+                            {:scalar-types (zipmap ids (repeat :double))
+                             :arrays #{} :array-types {} :index-scope #{}
+                             :source-region [ids (:computation proof)] :id-prefix "replayed"
+                             :lower-index (fn [& _] (throw (AssertionError. "payload used an index")))
+                             :decline! (fn [& _] (throw (AssertionError. "closed payload declined")))})
+                  instantiate (fn [p] (#'scalar/instantiate-checked-fp-payload p arguments (builder)))
+                  composed (instantiate proof)]
+              (is (some? proof))
+              (is (some? composed))
+              (doseq [[x y] [[3.0 2.0] [-0.0 2.0] [1.0 Double/POSITIVE_INFINITY]
+                             [Double/NaN 1.0]]]
+                (let [expected (execute-fp-program (:computation proof)
+                                                 (zipmap (:parameters proof) [x y]))
+                      actual (execute-fp-program composed (zipmap ids [x y]))]
+                  (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual)))))
+              (when (>= (count (get-in proof [:computation :operations])) 2)
+                (let [operations (get-in proof [:computation :operations])
+                      first-op (first operations)
+                      second-id (get-in operations [1 :result :id])]
+                  (doseq [changed [(assoc-in proof [:computation :operations 0 :expression :arguments 0] 'free)
+                                   (assoc-in proof [:computation :operations 0 :expression :arguments 0] second-id)
+                                   (assoc-in proof [:computation :operations] [first-op first-op])
+                                   (assoc-in proof [:computation :operations 0]
+                                             (body/->ScalarLoad (body/value 'loaded :double)
+                                                                'foreign [0] nil nil :cached))
+                                   (assoc-in proof [:computation :operations 0 :result :id]
+                                             (first (:parameters proof)))
+                                   (assoc-in proof [:computation :result] 'free)
+                                   (assoc-in proof [:computation :type] :float)]]
+                    (is (nil? (instantiate changed)))))))))
+        (finally (remove-ns (ns-name scope)))))))
 
 (deftest actual-long-boxing-is-payload-evidence-not-a-primitive-source-carrier
   (let [{:keys [scope receiver] :as fixture}

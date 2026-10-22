@@ -11,6 +11,7 @@
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
@@ -1776,6 +1777,163 @@
              {:scope :owned-fp-return-payload :result-carrier Object :payload-carrier actual
               :parameters parameters :parameter-carriers carriers :arguments (vec arguments)
               :computation program :bridge bridge})))))))
+
+(defn- instantiate-checked-fp-payload
+  "Replay the closed checked leaf's SSA through an owner's typed builder.
+   Formal substitution is positional and each definition is fresh: never walk/substitute
+   an operation tree or invent source syntax. This is computation composition only."
+  [payload arguments builder]
+  (let [{:keys [parameters parameter-carriers computation]} payload
+        types (mapv #(if (= Float/TYPE %) :float :double) parameter-carriers)]
+    (when (and (= :owned-fp-return-payload (:scope payload))
+               (vector? parameters) (every? symbol? parameters)
+               (= (count parameters) (count (set parameters))
+                  (count parameter-carriers) (count arguments))
+               (every? #{Float/TYPE Double/TYPE} parameter-carriers)
+               (= types (mapv :type arguments))
+               (every? #(vector? (:operations %)) arguments)
+               (vector? (:operations computation))
+               (<= (count (:operations computation)) 10000))
+      (let [resolve-value (fn [values value]
+                            (cond
+                              (instance? raster.compiler.ir.kernel_body.Literal value) value
+                              (symbol? value) (get values value)))
+            state
+            (reduce
+             (fn [{:keys [values operations types] :as state} operation]
+               (let [id (get-in operation [:result :id])
+                     type (get-in operation [:result :type])
+                     expression (:expression operation)
+                     operands (mapv #(resolve-value values %) (:arguments expression))]
+                 (if (and state
+                          (instance? raster.compiler.ir.kernel_body.ScalarCompute operation)
+                          (symbol? id) (not (contains? values id))
+                          (contains? #{:float :double :predicate} type)
+                          (= type (:result-type expression))
+                          (vector? (:arguments expression)) (every? some? operands))
+                   (let [computed ((:compute builder) (:op expression) type operands (:options expression))]
+                     {:values (assoc values id (:result computed))
+                      :types (assoc types id type)
+                      :operations (into operations (:operations computed))})
+                   (reduced nil))))
+             {:values (zipmap parameters (map :result arguments)) :types (zipmap parameters types)
+              :operations (vec (mapcat :operations arguments))}
+             (:operations computation))
+            original-result (:result computation)
+            result (when state (resolve-value (:values state) original-result))
+            result-type (if (instance? raster.compiler.ir.kernel_body.Literal original-result)
+                          (:type original-result) (get-in state [:types original-result]))]
+        (when (and state (some? result) (= result-type (:type computation)))
+          {:operations (:operations state) :result result :type (:type computation)})))))
+
+(defn check-completed-reduction-step
+  "Compare one original selected FP update/read with its constructed typed step.
+
+   Requires actual frontend-owned invocation, read, backedge and FP completion
+   observations. Only an invariant FP carry and a direct read at the loop index
+   are covered; selected arguments must already have identity FP completions.
+   The original Int read coordinate is CONDITIONALLY identified with the product
+   coordinate by exact widening. Count/control/domain and successful read evaluation
+   remain obligations for the enclosing source owner. No box, bounds or execution
+   permission follows from the returned arithmetic correspondence alone."
+  [frontend original product]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and method-entry/*emission-inputs* (seq? original)
+                (= 6 (bounded-count 7 original)) (= 'raster.par/reduce (first original)))
+       (reduction/validate! product)
+       (let [[_ accumulator _ index _ update] original
+             arguments (vec (descriptor/call-args update))
+             read-source (second arguments)
+             observed (method-entry/frontend-reduction-emission frontend original)
+             call (method-entry/frontend-completed-invocation-context frontend update)
+             read (when (descriptor/aget-call? read-source)
+                    (method-entry/frontend-array-read frontend read-source))
+             origin (when read (method-entry/frontend-invocation-input-source frontend update 1))
+             carry (second (get-in observed [:recur :values]))
+             carry-slot (get-in observed [:loop :locals accumulator])
+             type (:type carry-slot)
+             carrier (case type :float Float/TYPE :double Double/TYPE nil)
+             array (:array read)
+             component (first (:components product))
+             region (reduction/fold-region product)
+             physical-inputs (:input-completions call)
+             input-context (:context carry)]
+         (when (and carrier observed call read origin
+                    (= 2 (count arguments) (count (:inputs call)) (count physical-inputs))
+                    (= accumulator (first arguments))
+                    (= [index accumulator] (get-in observed [:loop :variables]))
+                    (= :global-typed-indy (:invocation-mode call))
+                    (= Object (:return-carrier call))
+                    (identical? (:expression call) (:operand carry))
+                    (= :ref (:input-type carry)) (= type (:type carry))
+                    (= carry-slot (get-in observed [:recur :targets 1]))
+                    (completion/bytecode-operand-context? input-context)
+                    (= (:input-completion carry)
+                       (completion/bytecode-input-contract carrier input-context))
+                    (= accumulator (get-in call [:inputs 0 :operand]))
+                    (= {accumulator carry-slot} (get-in call [:inputs 0 :ports]))
+                    (identical? (:expression read) (get-in call [:inputs 1 :operand]))
+                    (identical? read-source (:source-input origin))
+                    (identical? (:source read) (:source-original origin))
+                    (identical? (:expression read) (:operand origin))
+                    (symbol? array) (= type (:result-type read))
+                    (= index (get-in read [:input :operand]))
+                    (= :int (get-in read [:input :type]))
+                    (= (get-in observed [:loop :locals index])
+                       (get-in read [:input :ports index]))
+                    (true? (:primitive-index? read))
+                    (identical? (get types/primitive-array-info (dtype/array-tag-for-dtype type))
+                                (get-in read [:array-local :reference-class]))
+                    (= [type type] (mapv :emitted-type physical-inputs))
+                    (= [carrier carrier] (mapv :parameter-carrier physical-inputs))
+                    (every? #(= :identity (:adaptation %)) physical-inputs)
+                    (= 1 (count (:components product)) (count (:results region)))
+                    (= accumulator (:accumulator component)) (= index (:index product))
+                    (= type (:dtype component)) (empty? (:bindings region)))
+           (when-let [payload (checked-selected-fp-payload
+                               update [{:carrier carrier :presence :present}
+                                       {:carrier carrier :presence :present}])]
+             (when (and (= (:method call) (get-in payload [:bridge :invocation-method]))
+                        (= [carrier carrier] (:parameter-carriers payload))
+                        (= carrier (:payload-carrier payload)))
+               (let [decline! (fn [& _]
+                                (throw (ex-info "Outside completed reduction step correspondence"
+                                                {:reason ::completed-step-decline})))
+                     ;; The observed slot and product component independently establish
+                     ;; this binder's width. Normalize only that proved formal; the
+                     ;; product constructor elaborates its :tag, unlike the source use.
+                     carry-value (with-meta accumulator {:tag (dtype/scalar-tag-for-dtype type)
+                                                         :raster.type/tag (dtype/scalar-tag-for-dtype type)})
+                     actual-step (util/subst-syms {accumulator carry-value} (first (:results region)))
+                     ;; Compare coordinates only under the returned, still-unproved
+                     ;; Int -> Long relation. Do not erase the original index's width
+                     ;; metadata or pretend that its signed domain is a device extent.
+                     coordinate (body/->IndexCast index :long :exact)
+                     options {:array-types {array type} :arrays #{array}
+                              :scalar-types {accumulator type} :index-scope #{index}
+                              :source-region [original region (:computation payload)]
+                              :require-source-types? true :id-prefix "completed-step"
+                              :decline! decline!
+                              :lower-index (fn [expression _]
+                                             (if (= expression index) coordinate (decline!)))}]
+                 (try
+                   (let [source-builder (make-lowerer options)
+                         lowered-read ((:lower source-builder) read-source type {accumulator type})
+                         source (instantiate-checked-fp-payload
+                                 payload [{:operations [] :result carry-value :type type} lowered-read]
+                                 source-builder)
+                         actual ((:lower (make-lowerer options)) actual-step type {accumulator type})]
+                     (when (and source
+                                (fingerprint/equivalent?
+                                 source (select-keys actual [:operations :result :type])))
+                       {:scope :completed-selected-reduction-step :dtype type
+                        :checkpoints-preserved? true :array array
+                        :coordinate-obligation {:source :int :product :long :relation :exact-widening
+                                                :domain-correspondence :unproved}}))
+                   (catch clojure.lang.ExceptionInfo failure
+                     (when-not (= ::completed-step-decline (:reason (ex-data failure)))
+                       (throw failure)))))))))))))
 
 (defn canonical-selected-fp-operation
   "Callee-only correspondence for a selected primitive FP arithmetic leaf.

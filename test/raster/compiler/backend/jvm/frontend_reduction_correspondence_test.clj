@@ -6,11 +6,16 @@
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-prefix :as prefix]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.backend.jvm.terminal-source :as terminal-source]
             [raster.compiler.ir.par :as par-ir]
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
@@ -119,9 +124,12 @@
             (run (captured function)))))
       (finally (remove-ns (ns-name scope)))))))
 
-(defn- with-terminal-interval [float? split? count-expression run]
+(defn- with-terminal-interval
+  ([float? split? count-expression run]
+   (with-terminal-interval float? split? count-expression (if float? '(float 0.0) 0.0) run))
+  ([float? split? count-expression seed-expression run]
   (with-fresh-reduction-binding
-    float? split? count-expression
+    float? split? count-expression seed-expression
     (fn [original]
       (let [retained (atom {})
             begin prefix/begin
@@ -157,7 +165,7 @@
                                   :max-workgroup-size 256}))]
         ;; No numerical execution occurs inside the compiler's retryable proof
         ;; transaction. The namespace/definition owner remains live for run.
-        (run captured)))))
+        (run captured))))))
 
 (deftest extracted-reduction-keeps-actual-helper-return-and-binding-boundaries
   (doseq [float? [false true]]
@@ -639,6 +647,109 @@
             (is (thrown-with-msg? clojure.lang.ExceptionInfo #"changed selected terminal"
                                  (prefix/prepare-reduction-entry! input #(swap! callbacks conj %)))))
           (is (empty? @callbacks) "no partial preparation precedes selection authentication"))))))
+
+(deftest original-singleton-joins-actual-source-seed-step-and-control
+  (doseq [float? [false true]
+          seed [0.0 -0.0]]
+    (with-terminal-interval
+      float? false 1 (if float? (list 'float seed) seed)
+      (fn [{:keys [input frontend program normalized represented normalization construction]}]
+        (let [correspondence (prefix/close-reduction-terminal
+                             input normalization normalized represented program construction)
+              original (nth (second (first (:body frontend))) 1)
+              proof (with-redefs [core/ensure-current-owned-bytecode!
+                                 (fn [& _] (throw (AssertionError. "singleton query emitted code")))]
+                      (prefix/original-singleton-reduction correspondence frontend program))]
+          (is (some? proof))
+          (is (= (if float? :float :double) (:dtype proof)))
+          (is (semantic/equivalent? (if float? (float seed) seed) (:seed proof)))
+          (is (identical? original (get-in proof [:terminal :producer-source :original])))
+          (is (not (identical? original (get-in proof [:terminal :producer-source :represented]))))
+          (is (= :completed-selected-reduction-step (get-in proof [:step :scope])))
+          (is (= {:count 1 :source-index :int :native-index :long :coordinates [0]
+                  :widening :exact :backedge :no-overflow} (:domain proof)))
+          (is (= :unproved (:read-completion proof)))
+          (is (nil? (prefix/original-empty-reduction correspondence frontend program)))
+          (let [before @entry/*emission-inputs*]
+            (is (nil? (prefix/original-singleton-reduction correspondence frontend (into {} program))))
+            (is (identical? before @entry/*emission-inputs*))))))))
+
+(deftest nonidentity-parallel-seed-is-not-silently-admitted-by-source-correspondence
+  ;; A seeded ordered fold is not a monoid identity duplicated into every lane.
+  ;; The native strict-fold substrate supports this seed, but this public par/reduce
+  ;; frontend still requires its monoid identity. Keep that gap explicit and fail closed.
+  (doseq [float? [false true]]
+    (is (= :reduction-nonidentity-init
+           (try
+             (with-terminal-interval float? false 1 (if float? '(float 2.0) 2.0)
+               (fn [_] (throw (AssertionError. "nonidentity reduction passed the semantic gate"))))
+             nil
+             (catch clojure.lang.ExceptionInfo failure
+               (get-in (ex-data failure) [:coverage :reason])))))))
+
+(deftest singleton-control-requires-the-exact-complete-index-backedge
+  (with-terminal-interval
+    false false 1
+    (fn [{:keys [input frontend program normalized represented normalization construction]}]
+      (let [correspondence (prefix/close-reduction-terminal
+                           input normalization normalized represented program construction)
+            observe entry/frontend-reduction-emission]
+        (is (some? (prefix/original-singleton-reduction correspondence frontend program)))
+        ;; Exercise each local join independently of the whole-module tamper fence.
+        ;; A future observer must not let a partial tuple acquire a stronger theorem.
+        (doseq [change [#(update-in % [:recur :targets 0 :slot] inc)
+                        #(update-in % [:recur :values] conj (first (get-in % [:recur :values])))
+                        #(update-in % [:recur :targets] pop)]]
+          (with-redefs [entry/frontend-reduction-emission
+                        (fn [& arguments] (some-> (apply observe arguments) change))]
+            (is (nil? (prefix/original-singleton-reduction correspondence frontend program)))))))))
+
+(deftest completed-selected-step-compares-actual-projected-operations
+  (doseq [float? [false true]]
+    (with-terminal-interval
+      float? false 1
+      (fn [{:keys [frontend program]}]
+        (let [original (nth (second (first (:body frontend))) 1)
+              description (soac-lower/project-typed-reduce (:algorithm (first (:equations program))))
+              product (:reduction description)
+              actual (first (get-in product [:step :results]))
+              args (vec (raster.compiler.core.op-descriptor/call-args actual))
+              check #(scalar/check-completed-reduction-step frontend original %)]
+          (is (= :completed-selected-reduction-step (:scope (check product))))
+          (is (= :unproved (get-in (check product) [:coordinate-obligation :domain-correspondence])))
+          (doseq [replacement [(with-meta (apply list 'clojure.core/+ (reverse args)) (meta actual))
+                               (with-meta (apply list 'clojure.core/* args) (meta actual))
+                               (with-meta (list 'clojure.core/+ (first args)
+                                                (list 'clojure.core/aget 'other (nth original 3))) (meta actual))
+                               (with-meta (list 'clojure.core/+ (first args)
+                                                (list 'clojure.core/aget 'xs 1)) (meta actual))]]
+            (is (nil? (check (assoc-in product [:step :results] [replacement])))))
+          (is (nil? (scalar/check-completed-reduction-step
+                     frontend (with-meta (apply list original) (meta original)) product))))))))
+
+(deftest typed-reduction-lowering-reuses-the-context-complete-semantic-projection
+  (with-terminal-interval
+    false false 1
+    (fn [{:keys [program]}]
+      (let [algorithm (:algorithm (first (:equations program)))
+            expected (soac-lower/project-typed-reduce algorithm)
+            seen (atom nil)
+            substitutions (atom [])
+            subst util/subst-syms]
+        (with-redefs-fn
+          {#'soac-lower/lower-reduce-description
+           (fn [description _ & _] (reset! seen description) [])
+           #'util/subst-syms
+           (fn [& arguments]
+             (swap! substitutions conj util/*shadowing-locals*)
+             (apply subst arguments))}
+          #(is (= [] (soac-lower/lower-typed-reduce algorithm nil))))
+        (is (semantic/equivalent? expected @seen))
+        (is (seq @substitutions))
+        (is (every? #(and (contains? % 'xs) (contains? % 'sum)) @substitutions))
+        (is (= #{'xs} (:inputs expected)))
+        (is (= #{'sum} (:outputs expected)))
+        (is (= 1 (:bound expected)))))))
 
 (deftest empty-producer-proof-does-not-generalize-to-a-singleton-read
   (with-terminal-interval

@@ -430,6 +430,46 @@ it must not waive those obligations based on this native test receipt. The full 
 softmax/source-completion CI failure and unchanged resident training acceptance remain
 open; no merge or whole-campaign completion is established.
 
+### October 22 completed source-step correspondence checkpoint
+
+`project-typed-reduce` now exposes the existing semantic reduction description
+without schedule selection; production lowering delegates to that same projection.
+It establishes its lexical shadowing context from the validated program, including
+when called outside production lowering. No parallel compatibility representation
+or second reduction parser was added.
+
+Original selected FP steps are compared through their actual checked return-payload
+SSA. Composition replays only sequential scalar-compute operations through the
+shared typed builder, with positional formals, fresh result identities and exact
+operation/type/options. Tests cover actual-argument/old-SSA name collisions, zero-op
+formal/literal results, independent numerical bit checks, and malformed/free/forward/
+duplicate/foreign-memory recipes. Both sides use independently fresh builders and
+the same reserved region. Exact semantic fingerprints remain strict.
+
+The original invocation/read/recur completion chain is independently authenticated.
+Its Int read coordinate is compared under an explicit, still-conditional exact
+widening relation, not by erasing index metadata. Only the carry formal is normalized
+using its independently proved JVM slot/Product component dtype. The existing opaque
+prefix correspondence joins literal-one count, original seed bits, signed control,
+initial index and complete backedge to discharge that singleton coordinate relation.
+Successful read evaluation remains explicitly unproved; this does not activate a new
+public execution route, change default schedules or qualify resident training.
+
+A provenance defect was found and fixed: `:producer-source :original` had held the
+represented-phase rebuilt occurrence. It now retains the exact original frontend
+occurrence, with `:represented` and `:constructed` separate. Reusing an equal copy is
+not authority. Current `par/reduce` still correctly rejects nonidentity seeds; native
+strict seeded-fold support and the existing ordered `segmented-fold-map!` semantics
+must not be used to waive a monoid identity gate.
+
+Reviewed focused qualification passes 161 tests / 2,510 assertions in eight affected
+namespaces, plus two existing typed lowering/mixed-storage integration tests / 18
+assertions. These are bounded receipts, not broad draft acceptance. The latest
+exact-head fixture failure at `060f0bd0` (33912) still reports the known softmax
+`inv-sum` source-arithmetic completion gap; PR #1539 remains draft. Immediate work
+returns to unchanged `local-loss`/`local-gradient-sum` executable acceptance, using its
+first actual failing boundary rather than extending proof APIs without a consumer.
+
 ### October 22 original reduction carry completion checkpoint
 
 The JVM reduction observer now retains each actual floating recur consumer's existing

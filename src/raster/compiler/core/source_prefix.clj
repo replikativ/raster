@@ -423,7 +423,8 @@
                             ;; and operand annotations. This join does NOT prove
                             ;; those changes preserve source execution. Retain
                             ;; the actual endpoints as an outstanding obligation.
-                            :producer-source {:original producer :constructed final-producer
+                            :producer-source {:original (second (first (.-pairs input)))
+                                              :represented producer :constructed final-producer
                                               :status :unproved}
                             :observation observation}])))))))
 
@@ -554,13 +555,9 @@
                                  (.-input ^PrefixCorrespondence correspondence))]
            (assoc candidate :observation observation)))))))
 
-(defn original-empty-reduction
-  "Revalidate the original zero-count reduction and its completed literal seed.
-
-   The dead recurrence's annotations grant no evidence. This closes only a single scalar
-   producer and its existing terminal interval; its eventual owner must additionally validate
-   the native empty-fold schedule and argument/storage demand before deferring anything."
-  [correspondence frontend program]
+(defn- original-literal-reduction
+  "Common original count/index/seed join; it proves no recurrence or read."
+  [correspondence frontend program expected-count]
   (entry/call-with-optional-definition-inputs
    (fn []
      (let [contract (get-in program [:attributes :invocation-plan :attributes :terminal-host-result])
@@ -586,7 +583,8 @@
            constructed (get-in terminal [:producer-source :constructed])
            constructed-seed (when (and (seq? constructed) (= 6 (count constructed)))
                               (closed-source-literal frontend (nth constructed 2) (:before seed-init)))]
-       (when (and terminal dtype (= 0 (get-in observed [:closed-count :value]))
+       (when (and terminal dtype (contains? #{0 1} expected-count)
+                  (= expected-count (get-in observed [:closed-count :value]))
                   (= :known (get-in reduction [:loop :status])) (= 2 (count initializers))
                   (= (nth producer 1 nil) (:binder seed-init))
                   (= (nth producer 3 nil) (:binder index-init))
@@ -599,7 +597,7 @@
                   (semantic/equivalent? (:value seed) (:value constructed-seed))
                   (= 1 (count (:equations program)) (count inner))
                   (= 'reduce (:kind parts))
-                  (integer? (:extent attributes)) (zero? (:extent attributes))
+                  (integer? (:extent attributes)) (= expected-count (:extent attributes))
                   (= [dtype] (:dtypes attributes))
                   (= 1 (count (:identities attributes)))
                   (semantic/equivalent? (:value seed)
@@ -609,6 +607,75 @@
          {:dtype dtype :seed (:value seed) :initializer seed-init
           :count (:closed-count observed) :equation (:id equation)
           :result (first (:results equation)) :terminal terminal})))))
+
+(defn original-empty-reduction
+  "Revalidate the original zero-count reduction and its completed literal seed.
+   The dead recurrence's annotations grant no evidence. The eventual owner must
+   independently validate the native empty-fold schedule and physical demand."
+  [correspondence frontend program]
+  (original-literal-reduction correspondence frontend program 0))
+
+(defn original-singleton-reduction
+  "Join original literal-one count, initializer, read/update and signed Int control.
+   The existing opaque correspondence owns the exact frontend/program endpoints.
+   The singleton domain discharges the step proof's coordinate obligation: index
+   zero widens exactly, increments to one without overflow, then the loop exits.
+   Original nullable read completion, physical scheduling/storage and execution
+   still require the enclosing owner; this query does not read an array."
+  [correspondence frontend program]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [literal (original-literal-reduction correspondence frontend program 1)]
+       (let [terminal (:terminal literal)
+             original (get-in terminal [:producer-source :original])
+             observed (get-in terminal [:observation :producer :reduction])
+             index (nth original 3)
+             bound (get-in observed [:bound :binder])
+             control (get-in observed [:exit :control])
+             increment (first (get-in observed [:recur :values]))
+             increment-expression (:operand increment)
+             description
+             ((requiring-resolve 'raster.compiler.passes.parallel.soac-lower/project-typed-reduce)
+              (:algorithm (first (:equations program))))
+             step ((requiring-resolve
+                    'raster.compiler.passes.parallel.scalar-expression-body/check-completed-reduction-step)
+                   frontend original (:reduction description))]
+         (when (and step (= :completed-selected-reduction-step (:scope step))
+                    (= (:dtype literal) (:dtype step))
+                    (= {:source :int :product :long :relation :exact-widening
+                        :domain-correspondence :unproved} (:coordinate-obligation step))
+                    (= :int-less-than (:kind control)) (= :if-icmpge (:false-branch control))
+                    (identical? (:predicate control) (second (get-in observed [:exit :expression])))
+                    (= [index bound] (:operands control)) (= [:int :int] (:input-types control))
+                    (= 2 (count (descriptor/call-args (:predicate control))))
+                    (every? true? (map identical? (:operands control)
+                                      (descriptor/call-args (:predicate control))))
+                    (identical? (get-in observed [:loop :locals index])
+                                (get-in control [:locals index]))
+                    (identical? (get-in observed [:bound :after])
+                                (get-in control [:locals bound]))
+                    (= 2 (count (get-in observed [:recur :values]))
+                       (count (get-in observed [:recur :targets])))
+                    (identical? (get-in observed [:loop :locals index])
+                                (get-in observed [:recur :targets 0]))
+                    (= :int (get-in observed [:recur :targets 0 :type]))
+                    (= :int (:input-type increment) (:type increment))
+                    (seq? increment-expression) (= 2 (count increment-expression))
+                    (= 'clojure.core/unchecked-inc-int (first increment-expression))
+                    (= index (second increment-expression))
+                    (identical? (get-in observed [:loop :locals index])
+                                (get-in increment [:locals index]))
+                    (= 1 (:bound description)) (= index (:idx description))
+                    (= #{(:array step)} (:inputs description))
+                    (= #{(:result literal)} (:outputs description))
+                    (empty? (:scalars description))
+                    (semantic/equivalent? (:seed literal)
+                                         (:value (numeric-constant/value
+                                                  (get-in description [:reduction :components 0 :neutral])))))
+           (assoc literal :array (:array step) :description description :step step
+                  :domain {:count 1 :source-index :int :native-index :long
+                           :coordinates [0] :widening :exact :backedge :no-overflow}
+                  :read-completion :unproved)))))))
 
 (defn original-step
   "Query an exact constructed step under its exact original frontend/program.
