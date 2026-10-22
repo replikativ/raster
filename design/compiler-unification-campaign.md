@@ -26,6 +26,67 @@ items 3 and 5; it does not replace the other six obligations.
 | 7. Data parallelism and halos | Co-located update/collective and numerical halo demonstrations | Close public compiler-to-plan-to-runtime composition with device-scoped views, completion and cleanup; check nonuniform partitions and exact byte accounting. Do not claim multi-host transport or overlap from one laptop. |
 | 8. Durable and multilevel simulation | Manifests, mmap lease tests, checkpoint/restart and AMR provider slices | Fresh-owner restore/publication with producer geometry, time and lineage; numerical restart/branch and declared conservation/convergence/fidelity oracles; reject corrupt, incompatible or prematurely released state. |
 
+### October 21 operand-order repair and the next executable boundary
+
+Inspecting the actual placement seam uncovered a real pre-existing miscompile in
+default `anf-lift`: concatenating work lifted from every call/vector operand moves
+a later nested initializer before earlier operand evaluation. A two-element vector
+probe changed both its first value and the effect trace from `[:first :second]` to
+`[:second :first]`. Binding only earlier source values is insufficient: callee
+lookup and typed formal CHECKCAST/coercion can also have required earlier positions.
+
+The independently reviewed repair uses one sequential-wrapper normalizer. Calls
+and vectors remain opaque; whole `let`/`do` wrappers still flatten in source order.
+The unsafe default/safe-option split and redundant internal switches are removed.
+Restoring operand lifting requires an explicit completed-operand/callee contract,
+not purity or literal-looking source. This is a focused main-based extraction in
+PR #1558, head `d4a2a99e`; draft-side implementation is `91fef595`. No draft-only
+snapshot/ownership machinery is included in that PR.
+
+Evidence: exact extracted normalizer functions plus its on-disk tests pass 29
+tests / 189 assertions in the reused REPL (supplemental, not a fresh environment).
+Draft-side 67 construction/import/inliner tests / 555 assertions and 136 ownership
+tests / 1,579 assertions pass; groups overlap. Expanded normalized-AD controls
+report five `:ad-normalized-sum-boundary` errors in 20 tests / 121 assertions with
+BOTH the repair and exact pre-change `f1b3a2e2` functions in the same REPL. These
+remain separate debt, not green qualification. Unchanged `local-loss` still source
+compiles to two equations and two invocation steps. Full CI and device/training
+acceptance are separate obligations.
+
+The actual final training plan is scalar `rows * 1`, zero allocation, contraction,
+Float reduction and a terminal Double quotient. The original MSE count reads its
+prediction's length; its lowered use of the allocation extent is not by itself a
+source-placement or resident-result correspondence proof. Existing
+`project-scalar-metadata`, `owned-long-length-facts`, ShapeProjection and ordered
+ScalarCompute machinery can be reused, but must not fill that missing relation.
+
+Next implement a compositional frame-prefix verifier, consumed by SourceOwner:
+
+1. Start at the exact original root call and its checked selected frame. Instantiate
+   callee environments from indexed slots; retain every input evaluation/completion,
+   including unused inputs, and descend through checked selected ancestry.
+2. Derive the complete ordered host prefix up to the first numerical operation.
+   Verify sequential placement/alpha-renaming rather than matching generated names.
+3. Match that prefix to the final plan's exact source-order entries, ScalarCompute
+   objects and result-materialization conversions. The first useful consumer is
+   the real training `rows * 1` step, not another standalone trace query.
+4. Reuse the original argument outliner/existing scalar executor exactly once.
+   Missing/reordered/duplicated work must refuse before allocation. Do not let a
+   partial prefix witness grant an unproved later helper interval.
+5. Only then connect a completed numerical result to a formal's logical-view
+   length. Require the exact live view/producer, not equal shape or backing capacity;
+   initially plain contiguous rank-one, Java-array-compatible length. Execute the
+   original checked count conversion before seed initialization. Raw signed count
+   and nonnegative launch extent remain separate. No download, dummy array or
+   original numerical CPU evaluation may supply this evidence.
+
+Acceptance retains unchanged `local-loss`/`local-gradient-sum`, original-versus-
+lowered prefix overflow and first-failure/unused-input ordering; changed/zero
+lengths, sliced capacity mismatch, inconsistent/oversized views, replaced/stale
+results, producer failure and exact release/completion are negative controls.
+Native TypedSOAC operations retain their own semantic contracts: importing
+original Clojure semantics is not a blanket JVM-emission prerequisite.
+
 ### October 21 selected ancestry for imported helper calls
 
 Imported call origins now feed the existing selected-call contract, rather than
