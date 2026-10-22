@@ -4155,6 +4155,8 @@
 ;; Public API
 ;; ================================================================
 
+(declare adopt-prepared-program-inputs! captured-prepared-callable)
+
 (defn ^:no-doc resolve-deftm-var
   "Resolve a deftm dispatch var to its backing mangled var for value+grad. Thin
   wrapper over the canonical raster.core/resolve-deftm-var with the AD policy:
@@ -4163,8 +4165,20 @@
   dispatch var (:on-miss :self)."
   [f-var]
   (source-owner/assert-portable-source! (meta f-var))
+  ;; Higher-order AD may consume the logical body of a captured gradient.
+  ;; Retain its existing producer as well as the newly observed callable body.
+  (when-let [{:keys [prepared]} (captured-prepared-callable f-var (meta f-var))]
+    (adopt-prepared-program-inputs! prepared))
   (when (var? f-var)
-    (source-owner/assert-portable-source! (try (meta @f-var) (catch Exception _ nil))))
+    (when method-entry/*emission-inputs*
+      (method-entry/observe-definition-input! f-var (:ns (meta f-var)) (:name (meta f-var))))
+    (let [snapshot (when method-entry/*emission-inputs*
+                     (get-in @method-entry/*emission-inputs* [:definition-proofs f-var]))
+          value (if snapshot (:value snapshot) @f-var)
+          metadata (meta value)]
+      (source-owner/assert-portable-source! metadata)
+      (when-let [{:keys [prepared]} (captured-prepared-callable value metadata)]
+        (adopt-prepared-program-inputs! prepared))))
   (let [resolved (rcore/resolve-deftm-var
                   f-var {:deref-value? true
           :on-miss :self
@@ -5912,7 +5926,30 @@
     (when-not (= template-revision (tmpl/registry-revision))
       (throw (ex-info "generated AD rules changed after preparation"
                       {:reason :ad-prepared-program-stale-rules})))
+    (when-let [physical (::generated-entry program)]
+      ((:guard physical)))
     this))
+
+(defn- assert-generated-entry! [program frontend]
+  (let [{:keys [implementation emission input-body interface-class source-policy guard] :as physical}
+        (::generated-entry program)]
+    (when-not (and (map? physical) (instance? clojure.lang.IFn implementation)
+                   (class? interface-class) (.isInstance ^Class interface-class implementation)
+                   (identical? implementation (:implementation emission))
+                   (= :jvm-bytecode (:backend emission))
+                   (identical? (:params program) (:params emission))
+                   (identical? (:tags program) (:tags emission))
+                   (identical? input-body (:walked-body program))
+                   (identical? (:source-ns program) (:source-ns emission))
+                   (= 'Object (:return-tag emission))
+                   (= (symbol (.getName ^Class interface-class)) (:typed-interface emission))
+                   (= source-policy (get-in frontend [:source-entry :source-policy]))
+                   (ifn? guard))
+      (throw (ex-info "Generated AD entry differs from its frozen program"
+                      {:reason :ad-generated-entry-mismatch})))
+    ;; The owning producer runs the live emission guard. This query checks
+    ;; structural correspondence, not a second recursive freshness traversal.
+    physical))
 
 (defn ^:no-doc assert-prepared-program-source!
   "Guard the exact shared generated program and its original source history.
@@ -5932,7 +5969,49 @@
                           {:reason :ad-prepared-program-mismatch})))
         (method-entry/assert-producer-current! owner)
         (method-entry/assert-definition-inputs-current! (.-observations owner))
+        (assert-generated-entry! program (.-frontend owner))
         prepared))))
+
+(defn ^:no-doc prepared-bytecode-entry
+  "Read the exact generated program's physical entry, shared with its runtime.
+   This is generated-code evidence, not original caller/source correspondence,
+   permission to erase a cast, or native/device execution admission."
+  [prepared]
+  (when (assert-prepared-program-source! prepared)
+    (::generated-entry prepared)))
+
+(defn ^:no-doc captured-prepared-callable
+  "Authenticate a captured callable against its preparation's one-shot identity.
+   Metadata copied onto another function is not compiler execution authority."
+  [value metadata]
+  (when (contains? metadata ::prepared-program)
+    (let [prepared (::prepared-program metadata)
+          mode (::projection-mode metadata)]
+      (when-not (and (assert-prepared-program-source! prepared)
+                     (contains? #{:value+grad :grad} mode)
+                     (identical? metadata (meta value))
+                     (identical? (:params prepared) (:raster.core/deftm-params metadata))
+                     (identical? (:tags prepared) (:raster.core/deftm-tags metadata))
+                     (true? (get metadata (if (= mode :grad) ::grad ::value+grad)))
+                     (not (get metadata (if (= mode :grad) ::value+grad ::grad)))
+                     (let [identity (get (::callable-identities prepared) mode)]
+                       (and identity (realized? identity) (identical? value @identity))))
+        (throw (ex-info "Captured AD metadata does not belong to this callable"
+                        {:reason :ad-prepared-callable-mismatch})))
+      {:prepared prepared :mode mode})))
+
+(defn- prepared-callable [function metadata prepared mode]
+  (assert-prepared-program-source! prepared)
+  (let [identity (get (::callable-identities prepared) mode)
+        callable (with-meta function (assoc metadata ::prepared-program prepared ::projection-mode mode))]
+    ;; The seals belong to the authenticated immutable program, not copyable
+    ;; callable metadata. A delivered promise cannot be retargeted or restamped.
+    (when-not identity
+      (throw (ex-info "Preparation has no callable publication slot"
+                      {:reason :ad-prepared-callable-mismatch})))
+    (deliver identity callable)
+    (captured-prepared-callable callable (meta callable))
+    callable))
 
 (defn ^:no-doc adopt-prepared-program-inputs!
   "Retain authenticated preparation history in the enclosing compiler owner.
@@ -5987,6 +6066,8 @@
           projection {:bindings (into argument-bindings (mapv vec (partition 2 bindings)))
                       :result-sym nil :loss-sym (first results) :grad-syms gradients
                       :scalar-result? (and (= :grad mode) (= 1 (count gradients)))
+                      :result-form (if (= mode :value+grad) results
+                                       (if (= 1 (count gradients)) (first gradients) gradients))
                       :elements (if (= mode :value+grad) results gradients)}]
       ;; Commit input history only after successful shape/arity/projection work.
       ;; Hygiene is not an entry/return conversion or device realization proof.
@@ -6007,6 +6088,35 @@
                  (fnil conj #{}) marker)))
       projection))))
 
+(defn- emit-generated-program-entry! [program frontend]
+  (let [{:keys [params tags walked-body source-ns]} program
+        policy (get-in frontend [:source-entry :source-policy])
+        interface (types/ensure-fn-interface! tags)
+        {:keys [implementation emission]}
+        (source-policy/call-with-policy
+         policy
+         #(rcore/emit-owned-bytecode!
+           (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-impl!)
+           "raster.compiled.PreparedGradient" params tags 'Object walked-body source-ns
+           (:iface-name interface) 'generated-gradient @method-entry/*emission-inputs*))
+        _ (when-not implementation
+            (throw (ex-info "Generated AD bytecode entry could not be emitted"
+                            {:reason :ad-generated-entry-unavailable})))
+        pending (filterv #(map? (get-in % [:metadata :raster.core/jit-spec]))
+                         (:dependency-snapshots emission))]
+    ;; Only prepare receivers actually consumed by this completed emitter.
+    ;; Adopt their ORIGINAL observations, not new snapshots after promotion.
+    ;; A changed receiver invalidates this whole preparation transaction;
+    ;; neither the generated program nor its module is restamped in place.
+    (when (seq pending)
+      (method-entry/adopt-definition-inputs!
+       {:definition-proofs (into {} (map (juxt :var identity)) pending)})
+      (method-entry/prepare-pending-definition-inputs!
+       rcore/ensure-current-owned-bytecode! (mapv :var pending)))
+    {:implementation implementation :emission emission :input-body walked-body
+     :interface-class (:iface-class interface) :source-policy policy
+     :guard (method-entry/prepare-emission-input-guard! emission)}))
+
 (defn- freeze-generated-preparation [program frontend template-revision parameter-plan]
   (if-not frontend
     program
@@ -6015,7 +6125,15 @@
         ;; Retry the whole producer, never attach the final epoch to mixed rules.
         (throw (ex-info "AD rules changed during preparation"
                         {:reason :stale-definition-proof-input :phase :reverse-ad-rules})))
-      (let [observations (select-keys @method-entry/*emission-inputs*
+      (let [physical (emit-generated-program-entry! program frontend)
+            program (assoc program ::generated-entry physical
+                           ::callable-identities {:value+grad (promise) :grad (promise)})
+            ;; Emission can realize dependencies. Never stamp a new rule epoch
+            ;; onto an already transformed body after doing so.
+            _ (when-not (= template-revision (tmpl/registry-revision))
+                (throw (ex-info "AD rules changed during generated emission"
+                                {:reason :stale-definition-proof-input :phase :reverse-ad-rules})))
+            observations (select-keys @method-entry/*emission-inputs*
                                      [:definition-proofs :source-body-inputs :unclosed-source-imports :producer-inputs])
             prepared (assoc program ::generated-program-owner
                             (GeneratedPreparationOwner. program frontend observations
@@ -7230,22 +7348,30 @@
 (defn- compile-prepared-value+grad
   "Consume a whole preparation without dropping its private source owner."
   [{:keys [walked-body params source-owner paired-result-tag absent-seed?] :as prepared}]
-  (if-not (contains? prepared :source-owner)
+  (cond
+    (::generated-program-owner prepared)
+    (let [{:keys [implementation]} (prepared-bytecode-entry prepared)
+          owner (::generated-program-owner prepared)]
+      (adopt-prepared-program-inputs! prepared)
+      ;; Runtime and compiler inspect the same typed generated entry. Keep
+      ;; declared entry conversions and binding casts in that physical program,
+      ;; rather than evaluating an untyped copy of its source through eval.
+      (fn [& arguments]
+        (method-entry/assert-producer-current! owner)
+        (let [result (apply implementation arguments)]
+          (method-entry/assert-producer-current! owner)
+          result)))
+
+    (not (contains? prepared :source-owner))
     ;; Legacy public source projection only. Never rewrite an owned program:
     ;; its original operations and completion order belong to its producer.
     (let [_ (adopt-prepared-program-inputs! prepared)
           body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
                                      (first walked-body))
-          compile! #(eval (value-completion/project-to-jvm-source (runtime-function-form params body)))
-          owner (::generated-program-owner prepared)
-          execute (if owner
-                    (binding [*ns* (:source-ns prepared)]
-                      (source-policy/call-with-policy
-                       (get-in (.-frontend ^GeneratedPreparationOwner owner) [:source-entry :source-policy])
-                       compile!))
-                    (compile!))]
+          execute (eval (value-completion/project-to-jvm-source (runtime-function-form params body)))]
       (assert-prepared-program-source! prepared)
       execute)
+    :else
     (let [execute (if (= :jvm-bytecode (:backend source-owner))
                     (compile-bytecode-preparation prepared)
                     (source-owner/compile-function
@@ -7773,8 +7899,9 @@
        :elements (if (= :value+grad mode) (into [loss] gradients) gradients)})))
 
 (defn ^:no-doc prepare-value+grad
-  "Prepare the existing typed reverse-gradient program without compiling a runtime wrapper.
-   Both runtime construction and compiler inlining consume this retained program/slot boundary."
+  "Prepare the typed reverse-gradient program and its owned JVM entry without
+   evaluating a numerical body. Runtime construction and compiler inlining
+   consume this same generated program, physical entry and padded slot boundary."
   [f-var wrt]
   (method-entry/call-with-definition-inputs
    #(or (try (build-grad-walked-body f-var wrt)
@@ -7819,12 +7946,12 @@
              observation array at index 1 constant)
     :compile? - reverse mode: build the runtime function with the full
              compile-aot pipeline (inlined, devirtualized backward pass — orders
-             of magnitude faster on scalar-heavy loops) instead of evaluating
-             the AD-transformed body. Pipeline semantics apply: dead checked
+             of magnitude faster on scalar-heavy loops) instead of using
+             the shared generated bytecode entry. Pipeline semantics apply: dead checked
              reads may be eliminated and float arithmetic follows the compiled
              dtype. Like any compile-aot fn it may be called concurrently and
              with any shapes.
-             Falls back to the evaluated body when the pipeline cannot
+             Falls back to the prepared runtime entry when the pipeline cannot
              compile `f`; `(:raster.ad.reverse/compiled? (meta vg))` says which and
              `(:raster.ad.reverse/compile-failure (meta vg))` why.
 
@@ -7856,18 +7983,30 @@
            qualified-wb (if (contains? bgw :source-owner) walked-body
                            (mapv #(inline-ns % source-ns param-set) walked-body))]
        ;; Return an IFn that also carries deftm metadata for the compiler
-       (let [result-fn (fn [& args] (apply runtime-fn args))]
-         (with-meta result-fn
-           (cond-> {::value+grad true
+       (let [result-fn (fn [& args] (apply runtime-fn args))
+             metadata (cond-> {::value+grad true
                     ::compiled? (some? compiled-fn)
                     :raster.core/deftm true
                     :raster.core/deftm-walked-body qualified-wb
                     :raster.core/deftm-params params
                     :raster.core/deftm-tags tags}
-             ;; why :compile? fell back to the evaluated body
+             ;; why :compile? fell back to the prepared runtime entry
              (contains? bgw :source-owner)
              (assoc :raster.compiler/source-owner (:source-owner bgw))
-             compile-failure (assoc ::compile-failure compile-failure)))))
+             compile-failure (assoc ::compile-failure compile-failure))
+             ;; An independently optimized pipeline callable is not the bgw
+             ;; physical entry. Keep it executable but do not export bgw as
+             ;; authority for reconstructing that different implementation.
+             opaque-compiled? (and compiled-fn (::generated-program-owner bgw))
+             metadata (if opaque-compiled?
+                        (-> metadata
+                            (dissoc :raster.core/deftm :raster.core/deftm-walked-body
+                                    :raster.core/deftm-params :raster.core/deftm-tags)
+                            (assoc :no-inline true))
+                        metadata)]
+         (if (and (::generated-program-owner bgw) (not opaque-compiled?))
+           (prepared-callable result-fn metadata bgw :value+grad)
+           (with-meta result-fn metadata))))
 
      :forward
      (do
@@ -8050,14 +8189,20 @@
                                    form))
                                form))
                            wb)
-             runtime-fn (make-runtime-value+grad-fn grad-wb params)]
-         (with-meta
-           (fn [& args] (apply runtime-fn args))
-           {::grad true
+             ;; Execute the guarded physical value+grad entry, not a second
+             ;; untyped evaluation of the derived metadata body.
+             runtime-fn (fn [& args]
+                          (let [gradients (rest (apply vg-fn args))]
+                            (if (= 1 (count params)) (first gradients) (vec gradients))))]
+         (let [function (fn [& args] (apply runtime-fn args))
+               metadata {::grad true
             :raster.core/deftm true
             :raster.core/deftm-walked-body grad-wb
             :raster.core/deftm-params params
-            :raster.core/deftm-tags tags}))
+            :raster.core/deftm-tags tags}]
+           (if-let [prepared (::prepared-program vg-meta)]
+             (prepared-callable function metadata prepared :grad)
+             (with-meta function metadata))))
        ;; Fallback: no walked body (forward mode)
        (fn [& args]
          (vec (rest (apply vg-fn args))))))))

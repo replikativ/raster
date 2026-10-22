@@ -261,8 +261,8 @@
         ;; made before it. A later policy/body mutation cannot bless old code.
         metadata (if snapshot (:metadata snapshot) (meta v))
         ;; Also check the fn object's metadata (for value+grad results)
-        val-metadata (when (instance? clojure.lang.Var v)
-                       (try (meta (if snapshot (:value snapshot) @v)) (catch Exception _ nil)))
+        observed-value (when (var? v) (if snapshot (:value snapshot) @v))
+        val-metadata (meta observed-value)
         _ (source-owner/assert-portable-source! metadata)
         _ (source-owner/assert-portable-source! val-metadata)
         var-body (or (:body retained-frontend)
@@ -276,8 +276,20 @@
         tags (or (:raster.core/deftm-tags metadata)
                  (:raster.core/deftm-tags val-metadata))
         return-tag (or (:raster.core/return-tag metadata)
-                       (:raster.core/return-tag val-metadata))]
-    (when (and walked-body params (not (:no-inline metadata)))
+                       (:raster.core/return-tag val-metadata))
+        captured (when (contains? val-metadata :raster.ad.reverse/prepared-program)
+                   ((requiring-resolve 'raster.ad.reverse/captured-prepared-callable)
+                    observed-value val-metadata))
+        prepared (:prepared captured)
+        projection-mode (:mode captured)]
+    (if prepared
+      (when-not (or (:no-inline metadata) (:no-inline val-metadata))
+        ;; Never import its ordinary walked-body metadata as a helper frontend.
+        ;; Both generic expansion sites consume this through the shared projector.
+        {:params (:params prepared) :tags (:tags prepared)
+         :walked-body (:walked-body prepared)
+         :prepared-program prepared :projection-mode projection-mode})
+      (when (and walked-body params (not (:no-inline metadata)))
       (let [effective-wb (source-transport/effective-body walked-body)]
         ;; Scalar-result helpers may read array inputs without owning array storage. Preserve
         ;; the declared return fact when distinguishing them from array-returning helpers.
@@ -309,7 +321,7 @@
             ;; name prefix + tags, so name-based heuristics and dtype tags survive.
                 imported (source-transport/prepare-inline-body retained-frontend walked-body params tags source-ns)]
             (merge {:params params :return-tag return-tag}
-                   imported)))))))
+                   imported))))))))
 
 (defn- try-resolve-walked-body [v]
   ;; Rejected inlining candidates do not become executable dependencies.
@@ -612,8 +624,16 @@
    A result binder requests the binding inliner's existing flat placement;
    otherwise retain the nested body's lexical scopes for recursive expansion.
    This construction is NOT a completion, correspondence or execution proof."
-  [{:keys [params tags walked-body source-import] :as callee}
+  [{:keys [params tags walked-body source-import prepared-program projection-mode] :as callee}
    args source-env subst-fn result-sym caller]
+  (if prepared-program
+    (let [{:keys [bindings result-form]}
+          ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
+           prepared-program args projection-mode source-env caller)]
+      (if result-sym
+        {:argument-bindings [] :bindings (conj bindings [result-sym result-form])}
+        {:argument-bindings [] :body (list 'let* (vec (mapcat identity bindings)) result-form)}))
+    (do
   (when source-import
     (let [imported (source-transport/body-import-view source-import walked-body)]
       (when-not (and imported (= params (:parameters imported)) (= tags (:tags imported)))
@@ -658,7 +678,7 @@
           :else (swap! pairs conj [result-sym (subst-fn substitutions body-form)]))
         {:argument-bindings @arguments :bindings @pairs}))]
     (source-transport/observe-builder-expansion! caller callee args source-env result-sym expansion)
-    expansion))
+    expansion))))
 
 ;; ================================================================
 ;; value+grad / grad inlining

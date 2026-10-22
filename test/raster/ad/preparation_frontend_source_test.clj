@@ -7,13 +7,16 @@
             [raster.ad.templates :as templates]
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.core.method-entry :as entry]))
 
 (deftm squared-loss [x :- Double] :- Double (numeric/* x x))
-(deftm cold-squared-loss [x :- Double] :- Double (numeric/* x x))
+(def preparation-body-calls (atom 0))
 (deftm checked-policy-loss [x :- Double y :- Double] :- Double
   (let [rounded (float y)] (numeric/+ (numeric/* x x) (double rounded))))
+(deftm typed-entry-loss [unused :- Double data :- (Array double) x :- Double] :- Double
+  (numeric/* x (aget data 0)))
 (deftm two-squared-loss [x :- Double y :- Double] :- Double
   (numeric/+ (numeric/* x x) (numeric/* y y)))
 
@@ -79,18 +82,51 @@
 (deftest generation-and-compilation-use-the-definition-policy-not-the-caller-policy
   (let [seen (atom [])
         prepare reverse/ad-prepare
-        builder (ns-resolve 'raster.ad.reverse 'runtime-function-form)
-        function-form @builder]
+        emit core/emit-owned-bytecode!]
     (binding [*unchecked-math* true]
       (with-redefs [reverse/ad-prepare (fn [& arguments]
                                        (swap! seen conj [:prepare *unchecked-math*])
-                                       (apply prepare arguments))]
+                                       (apply prepare arguments))
+                    core/emit-owned-bytecode!
+                    (fn [emitter class-name & arguments]
+                      (when (.startsWith ^String class-name "raster.compiled.PreparedGradient")
+                        (swap! seen conj [:compile *unchecked-math*]))
+                      (apply emit emitter class-name arguments))]
         (let [prepared (reverse/prepare-value+grad #'squared-loss [0])]
-          (with-redefs-fn {builder (fn [& arguments]
-                                    (swap! seen conj [:compile *unchecked-math*])
-                                    (apply function-form arguments))}
-            #(is (= [9.0 6.0] (result prepared 3.0)))))))
+          (is (= [9.0 6.0] (result prepared 3.0))))))
     (is (= [[:prepare false] [:compile false]] @seen))))
+
+(deftest prepared-runtime-reuses-its-exact-owned-physical-entry
+  (let [prepared (reverse/prepare-value+grad #'squared-loss [0])
+        physical (reverse/prepared-bytecode-entry prepared)
+        emission (:emission physical)
+        compile-runtime (deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad))
+        execute (with-redefs [core/emit-owned-bytecode!
+                             (fn [& _] (throw (AssertionError. "prepared runtime recompiled its entry")))]
+                  (compile-runtime prepared))]
+    (is (identical? physical (reverse/prepared-bytecode-entry prepared)))
+    (is (identical? (:implementation physical) (:implementation emission)))
+    (is (identical? (:walked-body prepared) (:input-body physical)))
+    (is (some? (bytecode/retained-input-binding-context
+                emission (:walked-body prepared) (first (:walked-body prepared)) 0)))
+    (doseq [x [3.0 -2.5 -0.0]]
+      (is (= [(* x x) (* 2.0 x)] (execute x))))
+    (let [revision (templates/registry-revision)]
+      (with-redefs [templates/registry-revision (constantly (inc revision))]
+        (is (= :ad-prepared-program-stale-rules
+               (try (execute 3.0) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
+
+(deftest owned-generated-entry-converts-all-parameters-before-body-evaluation
+  (let [prepared (reverse/prepare-value+grad #'typed-entry-loss [2])
+        execute ((deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad)) prepared)]
+    (is (= [6.0 nil nil 2.0] (execute 1.0 (double-array [2.0]) 3.0)))
+    ;; Even an unused declared parameter is converted at the typed entry.
+    ;; Its null failure precedes the bounds failure in the body.
+    (is (thrown? NullPointerException (execute nil (double-array 0) 3.0)))
+    (is (thrown? ClassCastException (execute 1.0 (float-array [2.0]) 3.0)))
+    (is (thrown? NullPointerException (execute 1.0 (double-array 0) nil)))
+    (is (thrown? ArrayIndexOutOfBoundsException (execute 1.0 (double-array 0) 3.0)))))
 
 (deftest legacy-input-does-not-acquire-generated-program-authority
   (binding [entry/*emission-inputs* (atom {:static [] :values []})]
@@ -379,14 +415,42 @@
       (finally (remove-ns (ns-name scope))))))
 
 (deftest cold-preparation-observes-the-producer-without-running-its-numeric-body
-  (let [source (core/resolve-deftm-var #'cold-squared-loss)
+  ;; Repeated REPL runs must exercise a genuinely cold source receiver too.
+  (binding [*ns* (the-ns 'raster.ad.preparation-frontend-source-test)]
+    (eval '(deftm cold-squared-loss [x :- Double] :- Double
+             (do (swap! preparation-body-calls inc) (numeric/* x x)))))
+  (let [function (ns-resolve 'raster.ad.preparation-frontend-source-test 'cold-squared-loss)
+        source (core/resolve-deftm-var function)
         receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))
+        before @preparation-body-calls
         implementation (var-get receiver)
-        prepared (reverse/prepare-value+grad #'cold-squared-loss [0])]
-    (is (identical? implementation (var-get receiver)))
-    (is (some? (:raster.core/jit-spec (meta receiver))))
-    (is (nil? (:raster.core/bytecode-emission (meta receiver))))
-    (is (= [16.0 8.0] (result prepared 4.0)))))
+        _ (is (some? (:raster.core/jit-spec (meta receiver))))
+        emit core/emit-owned-bytecode!
+        attempts (atom [])
+        prepared (with-redefs [core/emit-owned-bytecode!
+                              (fn [emitter class-name & arguments]
+                                (let [result (apply emit emitter class-name arguments)]
+                                  (when (.startsWith ^String class-name "raster.compiled.PreparedGradient")
+                                    (swap! attempts conj result))
+                                  result))]
+                   (reverse/prepare-value+grad function [0]))
+        emission (:raster.core/bytecode-emission (meta receiver))]
+    (is (= before @preparation-body-calls)
+        "materializing an observed dependency must not evaluate the model")
+    (is (not (identical? implementation (var-get receiver))))
+    (is (nil? (:raster.core/jit-spec (meta receiver))))
+    (is (identical? (:implementation emission) (var-get receiver)))
+    (is (identical? emission ((entry/prepare-emission-input-guard! emission))))
+    (is (<= 2 (count @attempts)) "promotion retries the whole generated owner")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (entry/prepare-emission-input-guard! (:emission (first @attempts))))
+        "the rejected module's old observations remain stale")
+    (is (identical? (:emission (last @attempts))
+                    (:emission (reverse/prepared-bytecode-entry prepared)))
+        "only the newly emitted module belongs to the completed preparation")
+    (is (= [16.0 8.0] (result prepared 4.0)))
+    (is (= (inc before) @preparation-body-calls)
+        "the prepared call executes the original effect exactly once")))
 
 (deftest enclosing-owner-detects-a-source-change-during-ad-preparation
   (let [source (core/resolve-deftm-var #'squared-loss)

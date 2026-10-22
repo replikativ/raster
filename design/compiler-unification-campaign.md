@@ -28,6 +28,35 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 shared-entry checkpoint (items 3/5): the generated AD runtime and
+compiler queries use one owned JVM bytecode entry, not independently evaluated
+source. Pending helpers are compiled without numerical execution; promotion
+rejects the old module and retries the entire producer. Generic IFn wrappers now
+share actual descriptor conversions across the 20/21-argument boundary, reject
+wrong arity, and invoke wide static methods directly rather than via reflection.
+Null Double arguments no longer silently become zero. Byte/Short/Character
+boxing follows the actual primitive descriptor.
+
+Captured value+grad/grad calls must retain and project that same preparation.
+Their callable identity is one-shot-bound inside the authenticated program;
+copying metadata cannot import an unrelated function as the prepared gradient.
+Higher-order AD retains the original producer, and grad runtime projects the
+guarded value+grad entry. Independently optimized :compile? runtimes do not lend
+the generated entry as their own source.
+
+This is not resident training acceptance. The unchanged GPU gradient still
+declines two scalar source operations and an unproved original reduction-count
+correspondence. Generated-source import closure, original argument/cast order,
+read/bounds placement and resident lifetime remain separate obligations. PR #1539
+stays draft; focused JVM/oracle qualification does not replace its seven CI gates.
+Qualification for this checkpoint: affected AD preparation, captured-call,
+source-construction, transport and inlining tests pass 98 tests / 851 assertions;
+the common bytecode completion namespace passes 26 tests / 565 assertions; the
+unchanged CPU training-gradient oracles pass 2 tests / 70 assertions. Independent
+review found and drove fixes for wide arity, captured-owner loss and independently
+optimized-runtime/source mismatch. These counts are separate scopes, not an
+aggregate full-suite or resident-device training result.
+
 October 22 generated-AD consolidation (items 3/5): canonicalize local products
 and sequential lexical wrappers once, before freezing GeneratedPreparationOwner.
 Prepared runtime execution and compiler projection now consume that same form.

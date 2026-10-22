@@ -370,11 +370,12 @@
                    (catch Throwable _ form)))
             walked-body))))
 
-(clojure.core/defn ^:private emit-owned-bytecode!
+(clojure.core/defn ^:no-doc emit-owned-bytecode!
   "Emit against historical inputs and validate BEFORE publishing an impl.
    Lazy materialization can change dependency metadata on the first attempt;
    retry the emission, not its certificate, using the same bounded policy as
-   static bytecode production. No numeric body executes here."
+   static bytecode production. No numeric body executes here. Named and generated
+   producers share this service; it publishes no Var, dispatch entry or cache."
   [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym & [preparation-inputs]]
   (loop [attempt 0]
     (let [{owned-body :body invocation-catalog :catalog binding-catalog :binding-catalog
