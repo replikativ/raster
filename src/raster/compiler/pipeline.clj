@@ -915,8 +915,7 @@
                                             [parameter {:presence :present :scalar-type t
                                                         :producer-scalar-type t}])))
                                (:scalar-types opts)))
-                   nil)
-                  {:sequential-only? true})
+                   nil))
                  source)
         ;; A public array's backing capacity is independent of each traversal.
         ;; Semantic owners must prove their logical access footprint separately.
