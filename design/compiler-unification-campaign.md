@@ -28,6 +28,29 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+Landing update: PR #1558 squash-merged as `94017072` after all seven required
+contexts succeeded on reviewed head `e3f56e30`. The focused main-based checks were
+57 pipeline/inliner tests / 389 assertions, plus one permanent generated weight
+gradient device/JVM/independent-reference test / 12 assertions on OpenCL and Level
+Zero with changed inputs. These qualify that repair, not the whole training draft.
+The draft has merged this main checkpoint while retaining its additional snapshot
+evaluation-denial checks. Its broad CI and unchanged resident training acceptance
+remain open.
+Fresh post-merge qualification in the single restarted 900 MiB REPL passes 67
+construction/import/inliner tests / 555 assertions and 136 source/bytecode/AD
+ownership tests / 1,579 assertions. The groups overlap and are not additive;
+neither group closes the unimplemented nested-prefix execution relation.
+
+CI feedback extraction: PR #1559, reviewed head `8fd40930`, changes test
+infrastructure only. It attempts both CUDA/HIP public fixture groups, accumulates
+ordinary refusals and still fails the gate; cancellation/interruption/fatal errors
+abort. A same-REPL control against baseline `aa816699` preserved all 172 exact
+calls (86 per target), Var identities, options, optional captured descriptors and
+ordered artifacts. Eight reporting tests / 45 assertions pass; normal shard
+discovery includes the new namespace. These stubbed controls are not source
+compiler or device-performance evidence. All seven CI contexts remain the merge
+gate. This replaces first-failure-only feedback without waiving any workload.
+
 Inspecting the actual placement seam uncovered a real pre-existing miscompile in
 default `anf-lift`: concatenating work lifted from every call/vector operand moves
 a later nested initializer before earlier operand evaluation. A two-element vector
