@@ -1,7 +1,33 @@
 (ns raster.compiler.core.inference-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.value-completion :as completion]
             [raster.par]))
+
+(deftest source-qualification-transports-only-a-completions-operand
+  (let [scope (create-ns (gensym "raster.qualified-completion."))
+        contract (completion/bytecode-result-context-contract
+                  (completion/bytecode-operand-context {}) :double)
+        expression (completion/complete-value contract '(inc value))
+        observed (atom [])]
+    (try
+      (binding [*ns* scope] (clojure.core/refer 'clojure.core))
+      (let [result (inf/qualify-body-symbols expression scope '#{value} #(swap! observed conj %))]
+        (is (identical? contract (second result)))
+        (is (= '(clojure.core/inc value) (nth result 2)))
+        (is (= (meta expression) (meta result)))
+        (is (= ['inc] (mapv :symbol @observed))))
+      (let [expression (completion/complete-value contract 'value)]
+        (is (identical? expression (inf/qualify-body-symbols expression scope '#{value}))))
+      (reset! observed [])
+      (is (= :invalid-value-completion
+             (try (inf/qualify-body-symbols
+                   (list completion/completion-symbol (assoc contract :unexpected true) '(inc value))
+                   scope '#{value} #(swap! observed conj %))
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (empty? @observed))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest source-qualification-keeps-literals-and-parallel-binders-lexical
   (let [scope (create-ns (gensym "raster.qualified-scopes."))

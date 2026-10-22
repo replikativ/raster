@@ -1939,6 +1939,14 @@ stable physical-leaf order on every backend."}
                                     expr)))))
                           expr))) (meta expr))
                     (and (seq? expr) (contains? #{'quote 'clojure.core/quote} (first expr))) expr
+                    (and (seq? expr) (= completion/completion-symbol (first expr)))
+                    (if-let [{:keys [contract operand]} (completion/canonical-parts expr)]
+                      ;; Completion contracts are compiler data, not executable
+                      ;; source. Resolve only the operand in its lexical scope;
+                      ;; never qualify the marker or symbols inside a recipe.
+                      (util/remake-if-changed expr [(first expr) contract (qualify operand bound)])
+                      (throw (ex-info "Malformed reserved value completion during source qualification"
+                                      {:reason :invalid-value-completion :expression expr})))
                     (seq? expr)
                     (let [expr (form/map-structural-classes class-symbol expr)]
                       (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expr)]
