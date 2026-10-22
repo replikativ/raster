@@ -4,7 +4,8 @@
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.types :as types]
-            [raster.compiler.core.value-completion :as completion]))
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]))
 
 (defn- emit [body]
   (let [interface (types/ensure-fn-interface! ['Object])]
@@ -41,6 +42,13 @@
         (is (= completed (:completion-carrier observed)))
         (is (= (if object-parent? :ref completed) (:returned-carrier observed)))
         (is (= object-parent? (:object-parent? observed)))
+        (if (= :ref completed)
+          (is (nil? (:result-fact observed)) "a reference does not prove a nonnull scalar payload")
+          (let [tag (symbol (name completed))
+                carrier (types/tag->java-class tag)]
+            (is (= {:carrier (if object-parent? Object carrier)
+                    :presence :present :builtin-class (get types/primitive-info tag)}
+                   (:result-fact observed)))))
         (is (identical? expression (:source-input observed)))
         (is (some #(identical? % (:source observed)) (vals (:completion-catalog emission))))
         (is (nil? (:reference-class observed)) "a ref stack carrier is not an exact runtime Class")
@@ -129,4 +137,49 @@
             observed (observe emission body expression)]
         (is (= [:diverge :diverge :diverge :diverge]
                (mapv observed [:input-carrier :completion-carrier :returned-carrier :adaptation])))
+        (is (nil? (:result-fact observed)))
         (is (thrown? IllegalStateException (implementation (IllegalStateException. "operand"))))))))
+
+(deftest emitted-completion-facts-compose-through-the-shared-normal-return-analysis
+  (let [expression (completion/complete-value
+                    (completion/bytecode-floating-input-contract
+                     Double/TYPE (completion/bytecode-operand-context {})) 'x)
+        boxed (completion/complete-value completion/object-input-contract expression)
+        body [(list 'let* ['converted boxed 'alias 'converted] 'alias)]
+        {:keys [implementation emission]} (emit body)
+        resolve-result (fn [node] (:result-fact (observe emission body node)))
+        expected {:carrier Object :presence :present :builtin-class Double}]
+    (is (nil? (normal-return/completed-scalar-fact boxed)))
+    (let [direct-body [(list 'let* ['converted expression] 'converted)]
+          direct-emission (:emission (emit direct-body))]
+      (is (= {:carrier Double/TYPE :presence :present :builtin-class Double}
+             (normal-return/completed-scalar-fact
+              expression {} *ns*
+              (fn [node] (:result-fact (observe direct-emission direct-body node)))))))
+    (is (= expected (normal-return/completed-scalar-fact boxed {} *ns* resolve-result)))
+    (is (= expected (normal-return/completed-scalar-fact (first body) {} *ns* resolve-result)))
+    (is (= expected
+           (get (normal-return/completed-scalar-bindings
+                 (mapv vec (partition 2 (second (first body)))) {} *ns* resolve-result) 'alias)))
+    (is (nil? (normal-return/completed-scalar-fact
+               (apply list expression) {} *ns* resolve-result))
+        "a copied completion cannot borrow the original emitted result")
+    (is (= 2.5 (implementation 2.5)))
+    (is (thrown? NullPointerException (implementation nil))
+        "nonnull-on-normal-return is not proof that the conversion succeeds")
+    (with-redefs [entry/assert-emission-inputs-current!
+                  (fn [_] (throw (ex-info "stale test owner" {:reason :stale-definition-proof-input})))]
+      (is (= :stale-definition-proof-input
+             (try (normal-return/completed-scalar-fact boxed {} *ns* resolve-result) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest malformed-owned-completion-facts-fail-instead-of-becoming-types
+  (let [expression (completion/complete-value completion/object-input-contract 'x)]
+    (doseq [fact [false "not a fact"
+                  {:carrier String :presence :present :builtin-class String}
+                  {:carrier Object :presence :present}
+                  {:carrier Double/TYPE :presence :present :builtin-class Float}
+                  {:carrier Double/TYPE :presence :unknown :builtin-class Double}]]
+      (is (= :invalid-completion-result-fact
+             (try (normal-return/completed-scalar-fact expression {} *ns* (constantly fact)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))

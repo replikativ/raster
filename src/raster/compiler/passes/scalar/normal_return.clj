@@ -214,7 +214,19 @@
     {:carrier carrier :presence :present
      :builtin-class (get types/primitive-info (symbol (.getName carrier)))}))
 
-(defn- completed-scalar-fact* [expression lexical-facts source-ns]
+(defn- checked-completion-result [fact]
+  (when (some? fact)
+    (let [{:keys [carrier builtin-class]} (when (map? fact) fact)
+          expected (or (primitive-completion-fact carrier)
+                       (when (and (= Object carrier)
+                                  (some #(identical? builtin-class %) (vals types/primitive-info)))
+                         {:carrier Object :presence :present :builtin-class builtin-class}))]
+      (when-not (and expected (= expected (select-keys fact [:carrier :presence :builtin-class])))
+        (throw (ex-info "Owned completion resolver returned a noncanonical scalar fact"
+                        {:reason :invalid-completion-result-fact})))
+      expected)))
+
+(defn- completed-scalar-fact* [expression lexical-facts source-ns completion-result]
   (cond
     (symbol? expression)
     ;; Only independently supplied producer facts, never a symbol's dtype tag.
@@ -230,15 +242,16 @@
         (primitive-completion-fact (types/tag->java-class tag))))
 
     (completion/canonical-parts expression)
-    (let [{:keys [contract operand]} (completion/canonical-parts expression)
-          fact (completed-scalar-fact* operand lexical-facts source-ns)]
-      (case (:source-context contract)
-        :jvm-object-input (when fact (assoc fact :carrier Object))
-        ;; An input conversion target is not the term's result carrier:
-        ;; source primitive-input projects through RT.box, whereas the
-        ;; bytecode-floating form requires its own emitter context.
-        ;; Neither supplies a consumer-independent producer fact here.
-        nil))
+    (or (when completion-result
+          (checked-completion-result (completion-result expression)))
+        (let [{:keys [contract operand]} (completion/canonical-parts expression)
+              fact (completed-scalar-fact* operand lexical-facts source-ns completion-result)]
+          (case (:source-context contract)
+            :jvm-object-input (when fact (assoc fact :carrier Object))
+            ;; Without the owned resolver, a target is not a result carrier:
+            ;; source primitive-input projects through RT.box, whereas the
+            ;; bytecode-floating form needs its actual emitter context.
+            nil)))
 
     ;; Only the expanded special form, not an unauthenticated source macro.
     (= 'let* (first expression))
@@ -246,12 +259,12 @@
           {:keys [binders inits body]} (first scopes)]
       (when (and sequential? (= 1 (count scopes)) (every? symbol? binders))
         (let [scope (reduce (fn [scope [id init]]
-                              (assoc scope id (completed-scalar-fact* init scope source-ns)))
+                              (assoc scope id (completed-scalar-fact* init scope source-ns completion-result)))
                             lexical-facts (map vector binders inits))]
-          (completed-scalar-fact* (last body) scope source-ns))))
+          (completed-scalar-fact* (last body) scope source-ns completion-result))))
 
     (= 'do (first expression))
-    (completed-scalar-fact* (last (rest expression)) lexical-facts source-ns)
+    (completed-scalar-fact* (last (rest expression)) lexical-facts source-ns completion-result)
 
     :else
     (let [{:keys [semantic-op arguments lexical-callee implementation-op]}
@@ -274,7 +287,7 @@
             (some-> semantic-op descriptor/cast-result-tag types/tag->java-class
                     primitive-completion-fact))
           (when method-entry/*emission-inputs*
-            (when-let [proof (let [facts (mapv #(completed-scalar-fact* % lexical-facts source-ns) arguments)]
+            (when-let [proof (let [facts (mapv #(completed-scalar-fact* % lexical-facts source-ns completion-result) arguments)]
                               (or (scalar-body/checked-core-fp-evaluation expression facts source-ns)
                                   (scalar-body/checked-selected-primitive-evaluation expression facts)))]
               {:carrier (:result-carrier proof) :presence (:presence proof)
@@ -291,12 +304,22 @@
    evaluation flags, or supplies a kernel/payload lowering recipe. Core casts
    and qualified core arithmetic require the explicit producer namespace,
    bootstrap definition and source owner. Bare casts retain their original
-   namespace lookup and require an unshadowed lexical scope."
+   namespace lookup and require an unshadowed lexical scope.
+
+   Optional completion-result resolves an EXACT canonical occurrence through
+   an independently guarded producer. The caller must retain that producer's
+   owner through final validation and account for each used completion at its
+   source position through an exact executor or a typed lowering rule. This
+   imports actual normal-return facts,
+   not logical tags, totality or permission to remove/move the completion.
+   Copies and unknown observations must return nil; stale owners must throw."
   ([expression] (completed-scalar-fact expression {}))
   ([expression lexical-facts] (completed-scalar-fact expression lexical-facts nil))
   ([expression lexical-facts source-ns]
+   (completed-scalar-fact expression lexical-facts source-ns nil))
+  ([expression lexical-facts source-ns completion-result]
    (method-entry/call-with-optional-definition-inputs
-    #(completed-scalar-fact* expression lexical-facts source-ns))))
+    #(completed-scalar-fact* expression lexical-facts source-ns completion-result))))
 
 (defn completed-scalar-bindings
   "Normal-completion facts for sequential lexical producers. Unknown producers
@@ -305,6 +328,8 @@
   ([pairs] (completed-scalar-bindings pairs {}))
   ([pairs lexical-facts] (completed-scalar-bindings pairs lexical-facts nil))
   ([pairs lexical-facts source-ns]
+   (completed-scalar-bindings pairs lexical-facts source-ns nil))
+  ([pairs lexical-facts source-ns completion-result]
    (reduce (fn [facts [id expression]]
-             (assoc facts id (completed-scalar-fact expression facts source-ns)))
+             (assoc facts id (completed-scalar-fact expression facts source-ns completion-result)))
            lexical-facts pairs)))

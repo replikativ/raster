@@ -145,6 +145,55 @@ head `2ef58c02`, CI fixture job 34060 still passes 142 of 172 public requests an
 fails private segmented reduction generation; unit job 34063 and OpenCL job
 34059 are also red. Those production obligations remain open.
 
+The next importer seam is an **owned generated module**, neither an original
+frontend prefix nor a source-free algorithm. Review confirmed this landing order:
+
+1. Authenticate the exact prepared physical entry and its generated Method.
+   Derive entry carriers from that Method and the emitted entry records, not
+   desired tags. Inventory completions under their original top-level physical
+   binding ordinals before producing any provisional numerical view.
+2. Feed actual completion-result facts to the existing normal-return analysis.
+   This is opt-in and conditional on normal return. Primitive results retain
+   their actual carrier; Object-parent boxing retains the exact builtin payload
+   class. References and divergence acquire no scalar-payload fact. Every use
+   stays an obligation to execute the exact binding or discharge a typed rule.
+3. Construct the existing TypedSOAC/ParallelProgram and InvocationPlan. Their
+   `:source-binding-id` facts index the NORMALIZED source, not the physical
+   prepared binding spine: retain and validate the normalization constructor
+   correspondence before joining equations, allocations and host steps back to
+   physical ordinals. A diagnostic-only wrapper-free view still has
+   four unclosed scalar bindings after existing normalization; it is never an
+   executable or evidence that their completion obligations may be removed.
+4. Where a host ScalarCompute corresponds to a complete physical initializer,
+   prepare it through `bytecode/compile-input-binding-region`, checking exact
+   ports and physical result against the invocation value. An extracted
+   reduction followed by a scalar continuation is NOT that case: outlining the
+   original initializer would execute the reduction again. It requires an
+   explicit retained continuation or typed scalar rule; refuse until proved.
+   Reuse the existing prepared-step runtime
+   and owner checks through a generated-entry adapter. Do not fabricate a source
+   Var or outline reductions/allocations as opaque host kernels.
+5. Remap and compose the imported module and caller through the existing typed
+   value/program APIs. Preserve argument call-by-value order, result nil/alias
+   slots, source order, and logical buffer-view checks before acquisition.
+   Initially decline nonidentity argument plans until their ordered bindings
+   are represented; do not lose them when cutting raw projection bindings.
+6. Close the exact prepared-import marker only when every completion, host
+   executor, typed producer/storage boundary and final owner guard validates.
+   An output tuple must not escape this projection boundary. Resident buffers
+   must never be passed through primitive-array JVM CHECKCASTs.
+
+The emitted result-fact resolver now composes through the shared normal-return
+analysis in an opt-in path; defaults remain unchanged. The unchanged training
+oracle passes 119 assertions, including the actual Object/Double loss result
+derived from the generated Method and owned completion records. The resolver
+does not itself admit native arithmetic or discharge source evaluation.
+Malformed non-nil resolver facts fail closed, and copied conversion occurrences
+cannot borrow another occurrence's result. The combined completion/normal-return/
+JVM conversion/binding gate passes 91 tests / 1,334 assertions in the capped
+REPL. At `c1c303ac`, test job 34066, fixture job 34067 and OpenCL job 34070 are
+red; the exact-head watcher has terminated red rather than claiming acceptance.
+
 The earlier checkpoints below describe prerequisite evidence, not completion.
 
 Prerequisite qualification: scalar PE and simplification now preserve existing

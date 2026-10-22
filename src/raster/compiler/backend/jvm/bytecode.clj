@@ -98,6 +98,20 @@
   "True if this stack type is a JVM primitive (not :ref, :void, or :diverge)."
   [t] (case t (:double :float :int :long :bool) true false))
 
+(defn- primitive-carrier-class [stack-type]
+  (when (primitive? stack-type)
+    (types/tag->java-class (if (= :bool stack-type) 'boolean (symbol (name stack-type))))))
+
+(defn- completed-primitive-result-fact
+  "Actual primitive completion, optionally boxed by its parent consumption.
+   Conditional on normal return only: no totality or evaluation permission."
+  [completed returned]
+  (when-let [carrier (primitive-carrier-class completed)]
+    (when (or (= completed returned) (= :ref returned))
+      {:carrier (if (= :ref returned) Object carrier)
+       :presence :present
+       :builtin-class (get types/primitive-info (symbol (.getName ^Class carrier)))})))
+
 (defn- diverge?
   "True if this form never completes normally (throw, recur).
   Distinguished from :void which means 'no value but execution continues'."
@@ -5685,7 +5699,8 @@
                           {:status :known :expression expression :contract contract :operand operand
                            :site-context (completion/bytecode-operand-context ctx)
                            :locals-before locals :object-parent? object-parent?
-                           :completion-carrier completed :returned-carrier returned})]
+                           :completion-carrier completed :returned-carrier returned
+                           :result-fact (completed-primitive-result-fact completed returned)})]
         (swap! me/*emission-inputs* update :completion-contexts
                (fn [contexts]
                  (assoc contexts token (if (contains? contexts token)
@@ -6788,11 +6803,8 @@
                   (physical-operand-input (:initializer record) (:before record)
                                           (assoc context :local-callee-names (:local-callee-names record))))
           result (:after record)
-          carrier (case (:type result)
-                    :double Double/TYPE :float Float/TYPE :long Long/TYPE
-                    :int Integer/TYPE :bool Boolean/TYPE
-                    :ref (:reference-class result)
-                    nil)]
+          carrier (if (= :ref (:type result)) (:reference-class result)
+                      (primitive-carrier-class (:type result)))]
       (when (and carrier input (contains? record :element-type)
                  (map? (:local-callee-names record))
                  (every? set? (map (:local-callee-names record) [:typed :untyped]))
