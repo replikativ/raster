@@ -437,6 +437,35 @@ A fresh REPL first passed the constructor/transport gate (27 tests / 241
 assertions); the subsequent affected 17-namespace gate passed 265 tests / 2,774
 assertions. No whole-draft, numerical-GPU or performance acceptance follows.
 
+The opt-in phase now uses one same-position identity splice in both root
+normalization and helper import, rather than a root-only special case. Exactly one
+executable original occurrence is replaced; quotes stay opaque, equal-looking
+sibling calls are not rewritten, and ancestors retain source origins without
+inheriting completed-call authority. Import runs the splice before alpha-renaming
+and qualification; the constructor itself deliberately uses raw import.
+
+An actual failing argument-origin differential exposed an important emitter
+boundary: `(identity count)` need not emit an invocation observation, and its
+emitted operand is a reconstructed object. The constructor now joins the two
+existing producer records: exact frontend parent/argument through `InputOrigins`,
+then the owned positional argument through `retained-input-source-context` to the
+actual operand. Both identity checks are required; no equality/name matching or
+new semantic rule for identity is used. The capsule retains optional origin pairs
+under the original frontend/module history. Missing edges remain absent and this
+join grants no argument equivalence, placement or numerical admission.
+
+Independent review also caught a mixed-AD traversal: when another VG tuple was
+tracked, `resolve-vg-nth` could still enter a sealed completion region. It now uses
+the same barrier; a regression exercises folding outside while preserving the
+original region inside. Lexical-call expansion respects the barrier too. The
+latest affected 17-namespace gate passes 270 tests / 2,835 assertions. It covers
+source/normalized/imported differentials over branches, sequential rebinding,
+earlier failures and duplicate-looking calls; preserved argument origins;
+positional/copy/refusal query controls; and copied/foreign/stale import capsules.
+Default production normalization/import and numerical admission remain unchanged.
+Next is complete interval consumption in the actual training vertical, not a
+claim that constructor or origin coverage alone establishes resident execution.
+
 The campaign consumer uses the existing authenticated frontend/module-history
 observation boundary, not an editable return map. Cold queries do not compile;
 promotion requires a fresh owner, and the old cold history becomes stale. Missing,

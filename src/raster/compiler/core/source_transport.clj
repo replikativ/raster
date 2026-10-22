@@ -72,7 +72,9 @@
                  {:kind :symbol-resolution :source-ns source-ns :symbol lookup :result result})
                 (if (class? result) (symbol (.getName ^Class result)) tag)))) tags))))
 
-(defn- prepare-body [frontend body parameters tags source-ns owned?]
+(declare completed-reference-body-input)
+
+(defn- prepare-body [frontend body parameters tags source-ns owned? & [completed-call]]
   (let [_ (when frontend
             (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
             (when-not (and (identical? body (:body frontend))
@@ -84,25 +86,36 @@
         _ (when owned?
             (entry/observe-source-body-input! (get-in frontend [:source-entry :source-var]) :var)
             (entry/observe-frontend-source-identity! frontend))
+        completed (when (and owned? completed-call)
+                    (completed-reference-body-input frontend completed-call))
+        _ (when (and completed-call (nil? completed))
+            (throw (ex-info "helper import requires its exact unique completed call"
+                            {:reason :source-import-completed-call-mismatch})))
         qualified-tags (qualify-tags tags source-ns)
-        effective (effective-body body)
+        effective (effective-body (if completed (:body completed) body))
         alpha-occurrences (when owned? (volatile! []))
         qualification-occurrences (when owned? (volatile! []))
-        observe-call (fn [events]
+        observe-call (fn [events origins]
                        (when events
                          (fn [original constructed _]
-                           (when (form/call-form? original)
-                             (vswap! events conj {:original original :constructed constructed})))))
+                           (let [origin (if origins (.get ^java.util.IdentityHashMap origins original)
+                                            {:original original})]
+                             (when (and origin
+                                        (or (form/call-form? original)
+                                            (and completed (seq? original)
+                                                 (not (contains? '#{quote clojure.core/quote} (first original))))))
+                               (vswap! events conj (assoc origin :constructed constructed)))))))
         renamed (when owned?
                   (with-hygienic-renamings effective parameters
                     #(mapv (fn [expression]
-                             (util/alpha-convert {} expression (observe-call alpha-occurrences))) effective)))
+                             (util/alpha-convert {} expression
+                                                 (observe-call alpha-occurrences (:origins completed)))) effective)))
         hygienic (if owned? (:body renamed) (mapv util/alpha-convert effective))
         parameter-set (set (map #(if (symbol? %) % (symbol (name %))) parameters))
         qualified (if source-ns
                     (mapv #(inference/qualify-body-symbols % source-ns parameter-set
                                                          entry/observe-source-resolution!
-                                                         (observe-call qualification-occurrences)) hygienic)
+                                                         (observe-call qualification-occurrences nil)) hygienic)
                     hygienic)
         input (when owned?
                 (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
@@ -117,11 +130,13 @@
    An authentic frontend and active owner additionally retain an immutable input
    witness with IMPORT-LOCAL history. Legacy bodies acquire no owner. No formal
    argument completion, call substitution, final-step correspondence, normal
-   return or permission to execute the imported body is supplied."
-  [frontend body parameters tags source-ns]
+   return or permission to execute the imported body is inferred. An optional
+   owned completed call is spliced at its original occurrence before hygiene;
+   its authority comes from that constructor, not from import."
+  [frontend body parameters tags source-ns & [completed-call]]
   (if (and frontend entry/*emission-inputs*)
-    (with-local-history #(prepare-body frontend body parameters tags source-ns true))
-    (prepare-body frontend body parameters tags source-ns false)))
+    (with-local-history #(prepare-body frontend body parameters tags source-ns true completed-call))
+    (prepare-body frontend body parameters tags source-ns false completed-call)))
 
 (defn body-import-view
   "Read an exact constructed body under its original history in a collecting owner.
@@ -160,9 +175,10 @@
        (let [^BodyImport input input]
          (when-let [qualified (unique-construction-edge (.-qualification-occurrences input) constructed)]
            (when-let [renamed (unique-construction-edge (.-alpha-occurrences input) (:original qualified))]
-             {:frontend (:frontend imported) :original (:original renamed)
-              :hygienic (:constructed renamed) :constructed constructed
-              :alpha-construction renamed :qualification-construction qualified})))))))
+             (cond-> {:frontend (:frontend imported) :original (:original renamed)
+                      :hygienic (:constructed renamed) :constructed constructed
+                      :alpha-construction renamed :qualification-construction qualified}
+               (:completed-call renamed) (assoc :completed-call (:completed-call renamed))))))))))
 
 (deftype ^:private SourceNormalization [frontend body occurrences renamings observations]
   entry/RetainedProducerInput
@@ -171,12 +187,10 @@
     (entry/assert-definition-inputs-current! observations)
     true))
 
-(declare completed-reference-root-input)
-
 (defn normalize-frontend-bindings
   "Uniquify the exact authenticated frontend, retaining actual construction edges.
    The witness is producer-local: do not put it in compiler options, IR metadata
-   or portable artifacts. An optional opaque completed root carries its own
+   or portable artifacts. An optional opaque completed call carries its own
    constructor authority; normalization alone proves no completion or execution."
   ([frontend parameters] (normalize-frontend-bindings frontend parameters nil))
   ([frontend parameters completed-call]
@@ -188,14 +202,11 @@
     (with-local-history
       (fn []
         (entry/observe-frontend-source-identity! frontend)
-        (let [completed (when completed-call (completed-reference-root-input frontend completed-call))
+        (let [completed (when completed-call (completed-reference-body-input frontend completed-call))
               _ (when (and completed-call (nil? completed))
-                  (throw (ex-info "source normalization requires its exact completed root call"
+                  (throw (ex-info "source normalization requires its exact unique completed call"
                                   {:reason :source-normalization-completed-call-mismatch})))
-              input-body (if completed [(:expression completed)] (:body frontend))
-              original-nodes (when completed
-                               (doto (java.util.Collections/newSetFromMap (java.util.IdentityHashMap.))
-                                 (.addAll (filter seq? (tree-seq coll? seq (:body frontend))))))
+              input-body (if completed (:body completed) (:body frontend))
               parameters (mapv #(if (symbol? %) (symbol (name %)) %) parameters)
               occurrences (volatile! [])
               renamed (with-hygienic-renamings
@@ -204,19 +215,15 @@
                                  (util/uniquify-rebindings
                                   parameters expression
                                   (fn [original constructed renaming bound]
-                                    (when (and (seq? original)
-                                               (or (nil? completed)
-                                                   (identical? original (:expression completed))
-                                                   (.contains ^java.util.Set original-nodes original))
-                                               (not (contains? '#{quote clojure.core/quote}
-                                                               (first original))))
-                                      (vswap! occurrences conj
-                                              (cond-> {:original (if (identical? original (:expression completed))
-                                                                   (:original completed) original)
-                                                       :constructed constructed
-                                                       :root ordinal :renaming renaming :bound bound}
-                                                (identical? original (:expression completed))
-                                                (assoc :completed-call completed-call)))))))
+                                    (let [origin (if completed
+                                                   (.get ^java.util.IdentityHashMap (:origins completed) original)
+                                                   {:original original})]
+                                      (when (and origin (seq? original)
+                                                 (not (contains? '#{quote clojure.core/quote}
+                                                                 (first original))))
+                                        (vswap! occurrences conj
+                                                (assoc origin :constructed constructed
+                                                       :root ordinal :renaming renaming :bound bound)))))))
                                (range) input-body))
               body (:body renamed)]
           {:walked-body body
@@ -403,7 +410,7 @@
                       (:frontend origin) (:original origin) (get-in event [:callee-import :frontend]))]
     (assoc selected :builder event :caller-origin origin)))
 
-(deftype ^:private CompletedReferenceCall [caller callee original expression observations]
+(deftype ^:private CompletedReferenceCall [caller callee original expression operand-origins observations]
   entry/RetainedProducerInput
   (assert-producer-current! [_]
     (entry/assert-frontend-source! caller (get-in caller [:source-entry :source-var]))
@@ -455,6 +462,14 @@
                      ;; through itself or lose the original callee boundary.
                      imported (with-local-history
                                 #(prepare-body callee (:body callee) params tags source-ns true))
+                     operand-origins
+                     (keep-indexed
+                      (fn [index input]
+                        (when-let [origin (entry/frontend-invocation-input-source frontend original index)]
+                          (when (identical? (:operand input) (:operand origin))
+                            [(:operand origin) (:source-input origin)])))
+                      (:inputs call))
+                     operand-origins (vec operand-origins)
                      body (first (effective-body (:walked-body imported)))
                      all-symbols (filter symbol? (tree-seq coll? seq [original body params]))
                      built
@@ -489,7 +504,8 @@
                                        (mapcat identity slots))
                                  checked))))]
                  (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
-                 (CompletedReferenceCall. frontend callee original (:body built) @entry/*emission-inputs*))))))))))
+                 (CompletedReferenceCall. frontend callee original (:body built) operand-origins
+                                          @entry/*emission-inputs*))))))))))
 
 (defn completed-reference-call-view
   "Read the exact constructed call under its historical owner.
@@ -500,14 +516,43 @@
     (let [^CompletedReferenceCall constructed constructed]
       (entry/adopt-definition-inputs! (.-observations constructed))
       (entry/adopt-definition-inputs! {:producer-inputs [constructed]})
-      {:original (.-original constructed) :expression (.-expression constructed)})))
+      {:original (.-original constructed) :expression (.-expression constructed)
+       :operand-origins (.-operand-origins constructed)})))
 
-(defn- completed-reference-root-input [frontend constructed]
+(defn- completed-reference-body-input [frontend constructed]
   (when (and (instance? CompletedReferenceCall constructed)
-             (identical? frontend (.-caller ^CompletedReferenceCall constructed))
-             (= 1 (count (:body frontend)))
-             (identical? (first (:body frontend)) (.-original ^CompletedReferenceCall constructed)))
-    (completed-reference-call-view constructed)))
+             (identical? frontend (.-caller ^CompletedReferenceCall constructed)))
+    (when-let [{:keys [original expression operand-origins]} (completed-reference-call-view constructed)]
+      (let [origins (java.util.IdentityHashMap.) hits (volatile! 0)]
+        (letfn [(quoted? [node]
+                  (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))))
+                (seed [node]
+                  (when (and (not (quoted? node)) (or (seq? node) (vector? node)))
+                    (.put origins node {:original node})
+                    (doseq [child node] (seed child))))
+                (go [node]
+                  (cond
+                    (quoted? node) node
+
+                    (identical? original node)
+                    (do (vswap! hits inc)
+                        (.put origins expression {:original original :completed-call constructed})
+                        expression)
+
+                    (or (seq? node) (vector? node))
+                    (let [result (util/remake-if-changed node (mapv go node))]
+                      (.put origins result {:original node})
+                      result)
+
+                    :else node))]
+          (doseq [node (:body frontend)] (seed node))
+          (doseq [[actual source] operand-origins]
+            (.put origins actual {:original source}))
+          (let [body (mapv go (:body frontend))]
+            ;; No search by shape/name, no insertion under quoted data and no
+            ;; duplication of a shared occurrence. Imported nodes acquire no
+            ;; caller-source origins. Parent edges come from actual rebuilding.
+            (when (= 1 @hits) {:body body :origins origins})))))))
 
 (defn original-builder-invocation-view
   "Relate one recorded builder's imported callee to an actual original selected call.

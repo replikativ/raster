@@ -956,6 +956,14 @@
   (frontend-occurrence-observation frontend original
     'raster.compiler.backend.jvm.bytecode/retained-input-completed-invocation-context))
 
+(defn frontend-invocation-input-source
+  "Origin-only join from an original frontend argument to its actual emitted input.
+   Missing edges stay absent. No argument equivalence, completion or execution
+   authority is inferred; full original module history remains retained."
+  [frontend original input-index]
+  (frontend-occurrence-observation frontend original
+    'raster.compiler.backend.jvm.bytecode/retained-input-invocation-input-source input-index))
+
 (defn frontend-binding-context
   "Actual sequential binding context of an unchanged original frontend scope."
   [frontend original index]

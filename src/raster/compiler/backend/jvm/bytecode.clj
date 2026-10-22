@@ -1109,6 +1109,23 @@
                     (and reduction (identical? actual (get-in reduction [:bound :expression]))))
             (assoc input :source-original source)))))))
 
+(defn ^:no-doc retained-input-invocation-input-source
+  "Join a frontend argument to the actual whole invocation's emitted input.
+   Both edges come from this producer: InputOrigins and the positional retained
+   input/source context. Missing or transformed wrappers abstain; equal syntax
+   is not correspondence. This is origin only, not equivalence or admission."
+  [emission input-body original input-index]
+  (when-let [owned-parent (input-origin emission input-body original :invocation)]
+    (let [arguments (vec (util/call-args original))]
+      (when (and (integer? input-index) (<= 0 input-index) (< input-index (count arguments)))
+        (let [source (nth arguments input-index)
+              owned-source (or (input-origin emission input-body source :invocation)
+                               (input-origin emission input-body source :binding)
+                               (input-origin emission input-body source :reduction))
+              input (retained-input-source-context emission owned-parent input-index)]
+          (when (and owned-source input (identical? owned-source (:source-original input)))
+            (assoc input :source-input source)))))))
+
 (defn- retain-floating-conversion! [ctx operand input-type target-carrier locals & [source-operation]]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*

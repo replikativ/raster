@@ -53,6 +53,22 @@
         "source Object completion is not silently relabelled as bytecode authority")
     (is (false? (completion/bytecode-context-form? '(ordinary-call x))))))
 
+(deftest tracked-gradient-tuples-cannot-rewrite-a-sealed-bytecode-region
+  (let [region (completion/complete-value
+                (completion/bytecode-reference-input-contract
+                 Object (completion/bytecode-operand-context {}))
+                '(clojure.core/nth vg 1))
+        source (list 'let* ['vg '((raster.ad.reverse/value+grad (var example/loss)) x)
+                           'ordinary '(clojure.core/nth vg 1) 'sealed region]
+                     ['ordinary region])
+        expanded (with-redefs [inline/inline-value+grad-call
+                              (fn [& _] {:bindings [] :elements [17.0 23.0]})]
+                   (:form (#'inline/inline-one-pass source)))
+        bindings (into {} (map vec (partition 2 (second expanded))))]
+    (is (= 23.0 (get bindings 'ordinary)) "tracked VG projection is exercised outside the region")
+    (is (identical? region (get bindings 'sealed)))
+    (is (identical? region (second (last expanded))))))
+
 (deftest no-op-ad-hoisting-preserves-exact-source-occurrences
   (let [leaf (with-meta '(helper x) {:source-marker :leaf})
         tuple (with-meta [leaf 'x] {:source-marker :tuple})

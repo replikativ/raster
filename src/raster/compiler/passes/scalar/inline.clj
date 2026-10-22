@@ -858,6 +858,7 @@
                            :body (if (= 1 (count body)) (first body) (cons 'do body))})))))))
             (go [expression lexical known]
               (cond
+                (completion/bytecode-context-form? expression) expression
                 (and (seq? expression) (= 'quote (first expression))) expression
                 (seq? expression)
                 (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expression)]
@@ -1421,6 +1422,8 @@
      ;; Resolve (nth <vg-sym> N) in body expressions for >20 param cases
      (let [resolve-vg-nth (fn resolve-vg-nth [expr]
                             (cond
+                              (completion/bytecode-context-form? expr) expr
+
                               (and ad-only? (seq? expr)
                                    (or (= 'quote (first expr))
                                        (form/scope-info expr))) expr

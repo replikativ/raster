@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -20,7 +21,9 @@
   (core/prepare-deftm-frontend! source)
   (core/ensure-current-owned-bytecode! (receiver source)))
 
-(defn- with-call [helper-body argument run]
+(defn- with-call
+  ([helper-body argument run] (with-call helper-body argument identity run))
+  ([helper-body argument wrap run]
   ;; Fresh modules avoid renewing an old collector after the real JIT promotion.
   (let [scope (create-ns (gensym "raster.completed-call."))]
     (try
@@ -30,16 +33,20 @@
                     '[xs :- (Array float) unused :- Long] ':- '(Array float) helper-body))
         (eval (list 'raster.core/deftm 'caller
                     '[xs :- (Array float) count :- Long] ':- '(Array float)
-                    (list 'leaf 'xs argument))))
+                    (wrap (list 'leaf 'xs argument)))))
       (let [leaf (core/resolve-deftm-var (ns-resolve scope 'leaf) {:dtype :float})
             caller (core/resolve-deftm-var (ns-resolve scope 'caller) {:dtype :float})]
         (prepare! leaf)
         (prepare! caller)
         (entry/call-with-definition-inputs
          #(let [frontend (entry/original-source-frontend caller)
-                original (first (:body frontend))]
+                target (symbol (str (ns-name scope)) (str (:name (meta leaf)) "-impl"))
+                original (first (filter (fn [node]
+                                          (and (seq? node)
+                                               (= target (:implementation-op (descriptor/call-description node)))))
+                                        (tree-seq coll? seq (:body frontend))))]
             (run {:scope scope :leaf leaf :caller caller :frontend frontend :original original}))))
-      (finally (remove-ns (ns-name scope))))))
+      (finally (remove-ns (ns-name scope)))))))
 
 (defn- compiled [frontend expression]
   (let [source (:source-entry frontend)
@@ -157,10 +164,100 @@
           (let [value (float-array [3.0])]
             (is (identical? (when-not (neg? count) value) (f value count))))
           (is (= [:delegate] @events)))
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact completed root"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact unique completed call"
                              (transport/normalize-frontend-bindings
                               frontend (get-in frontend [:source-entry :params])
                               (transport/completed-reference-call-view constructed))))))))
+
+(deftest completed-call-splicing-preserves-branches-rebinding-and-earlier-failure
+  (doseq [wrap [(fn [call]
+                 (list 'let* '[count (clojure.core/inc count)]
+                       (list 'if '(clojure.core/< count 0) 'xs call)))
+               (fn [call] (list 'do '(clojure.core/quot 1 count) call))
+               ;; Equal source calls remain separate actual occurrences: one
+               ;; completed call must not rewrite its sibling by syntax equality.
+               (fn [call] (list 'do call call))]]
+    (with-call
+      '(do (clojure.core/swap! raster.compiler.core.completed-reference-call-test/events
+                               clojure.core/conj :body) xs)
+      '(do (clojure.core/swap! raster.compiler.core.completed-reference-call-test/events
+                               clojure.core/conj :argument)
+           (clojure.core/quot 1 count))
+      wrap
+      (fn [{:keys [frontend original]}]
+        (let [constructed (transport/construct-original-reference-call frontend original)
+              normalized (transport/normalize-frontend-bindings
+                          frontend (get-in frontend [:source-entry :params]) constructed)
+              imported (transport/prepare-inline-body
+                        frontend (:body frontend) (get-in frontend [:source-entry :params])
+                        (get-in frontend [:source-entry :tags]) (get-in frontend [:source-entry :source-ns])
+                        constructed)
+              root (first (:walked-body normalized))
+              root-origin (transport/normalization-occurrence (:source-normalization normalized) root)
+              source-fn (compiled frontend (first (:body frontend)))
+              constructed-fn (compiled frontend root)
+              imported-fn (compiled frontend (first (:walked-body imported)))
+              value (float-array [2.0])
+              run (fn [f count]
+                    (reset! events [])
+                    (try [:value (identical? value (f value count)) @events]
+                         (catch Exception error [:exception (class error) @events])))]
+          (is (some? constructed))
+          (is (identical? (first (:body frontend)) (:original root-origin)))
+          (is (nil? (:completed-call root-origin)) "rebuilt ancestors carry origin, not call authority")
+          (let [import-root (first (:walked-body imported))
+                origin (transport/body-import-occurrence
+                        (:source-import imported) (:walked-body imported) import-root)
+                origins (keep #(transport/body-import-occurrence
+                                (:source-import imported) (:walked-body imported) %)
+                              (filter seq? (tree-seq coll? seq import-root)))]
+            (is (identical? (first (:body frontend)) (:original origin)))
+            (is (nil? (:completed-call origin)))
+            (is (= 1 (count (filter :completed-call origins)))))
+          (doseq [count [-2 -1 0 3]]
+            (is (= (run source-fn count) (run constructed-fn count) (run imported-fn count))))
+          (is (= 1 (count (filter :completed-call
+                                 (keep #(transport/normalization-occurrence
+                                         (:source-normalization normalized) %)
+                                       (filter seq? (tree-seq coll? seq root))))))))))))
+
+(deftest completed-argument-descendants-keep-only-their-original-caller-origin
+  (with-call 'xs '(clojure.core/identity count)
+    (fn [{:keys [frontend original]}]
+      (let [argument (second (:arguments (descriptor/call-description original)))
+            constructed (transport/construct-original-reference-call frontend original)
+            normalized (transport/normalize-frontend-bindings
+                        frontend (get-in frontend [:source-entry :params]) constructed)
+            imported (transport/prepare-inline-body
+                      frontend (:body frontend) (get-in frontend [:source-entry :params])
+                      (get-in frontend [:source-entry :tags]) (get-in frontend [:source-entry :source-ns])
+                      constructed)
+            origins (keep #(transport/normalization-occurrence (:source-normalization normalized) %)
+                          (filter seq? (tree-seq coll? seq (:walked-body normalized))))
+            imported-origins (keep #(transport/body-import-occurrence
+                                    (:source-import imported) (:walked-body imported) %)
+                                  (filter seq? (tree-seq coll? seq (:walked-body imported))))]
+        (is (some? constructed))
+        (is (= 1 (count (filter #(identical? argument (:original %)) origins))))
+        (is (= 1 (count (filter #(identical? argument (:original %)) imported-origins))))))))
+
+(deftest invocation-input-origin-query-is-positional-and-transactional
+  (with-call 'xs '(clojure.core/identity count)
+    (fn [{:keys [frontend original]}]
+      (let [before @entry/*emission-inputs*
+            copied (with-meta (apply list original) (meta original))]
+        (doseq [[parent index] [[original -1] [original 2] [original 1.5]
+                               [original nil] [original 0] [copied 1]]]
+          (is (nil? (entry/frontend-invocation-input-source frontend parent index)))
+          (is (identical? before @entry/*emission-inputs*)))
+        (let [argument (second (:arguments (descriptor/call-description original)))
+              parent (entry/frontend-completed-invocation-context frontend original)
+              origin (entry/frontend-invocation-input-source frontend original 1)]
+          (is (some? origin))
+          (is (identical? argument (:source-input origin)))
+          (is (identical? (get-in parent [:inputs 1 :operand]) (:operand origin)))
+          (is (not (identical? argument (:operand origin)))
+              "the tested join crosses the real producer reconstruction boundary"))))))
 
 (deftest constructor-rejects-copied-occurrences-and-retains-stale-history
   (with-call 'xs 'count
@@ -176,6 +273,28 @@
           (is (thrown? clojure.lang.ExceptionInfo
                        (transport/completed-reference-call-view constructed)))
           (finally (reset-meta! leaf metadata)))))))
+
+(deftest helper-import-rejects-copied-foreign-and-stale-completed-calls
+  (with-call 'xs 'count
+    (fn [{:keys [frontend original leaf]}]
+      (let [constructed (transport/construct-original-reference-call frontend original)
+            import! (fn [source cap]
+                      (transport/prepare-inline-body
+                       source (:body source) (get-in source [:source-entry :params])
+                       (get-in source [:source-entry :tags]) (get-in source [:source-entry :source-ns]) cap))
+            foreign (entry/original-source-frontend leaf)
+            copied (transport/completed-reference-call-view constructed)]
+        (doseq [[source cap] [[frontend copied] [foreign constructed]]]
+          (let [before @entry/*emission-inputs*]
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact unique completed call"
+                                 (import! source cap)))
+            (is (identical? before @entry/*emission-inputs*))))
+        (let [metadata (meta leaf) before @entry/*emission-inputs*]
+          (try
+            (alter-meta! leaf assoc ::changed-import true)
+            (is (thrown? clojure.lang.ExceptionInfo (import! frontend constructed)))
+            (is (identical? before @entry/*emission-inputs*))
+            (finally (reset-meta! leaf metadata))))))))
 
 (deftest constructor-needs-an-explicit-whole-body-dependency-witness
   (with-call 'xs 'count
