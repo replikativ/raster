@@ -110,6 +110,42 @@ results, producer failure and exact release/completion are negative controls.
 Native TypedSOAC operations retain their own semantic contracts: importing
 original Clojure semantics is not a blanket JVM-emission prerequisite.
 
+Independent consumer review refined the first executable subset. Extend the
+existing `source-prefix/begin`/`close` authority for original call roots, retaining
+the flat-let case. `original-step` may then identify an authenticated original
+argument slot; `source-owner/prepare-scalar-steps` uses the existing
+`prepare-frontend-invocation-input!` and stores its executor in the existing
+`:steps` table. `evaluate-ordered-invocation-step` remains the sole executor.
+Do not add a frame interpreter, a second tracing authority or a model-specific
+extent evaluator.
+
+For unchanged `local-loss`, source order is: MSE receiver; prediction's linear
+receiver and all five arguments (`x`, `theta`, `rows`, `width`, literal `1`);
+linear body entry; allocator receiver; allocator argument zero's reference
+CHECKCAST; argument one's checked multiplication and Long completion; only then
+the allocator body and allocation. MSE target/denominator arguments occur after
+the linear call returns and cannot be hoisted before it. Neither equal carrier
+classes nor selected ancestry alone closes constructed-slot correspondence.
+
+First support only unchanged public references whose observed CHECKCAST target
+matches the exact array class required by runtime preflight, and primitive Long
+public ports/the actual Long literals. Reference completion does not prove
+non-nullness; null arrays remain outside the existing exact-array preflight
+domain. Computed arrays and Object/Double-to-Long adaptations refuse until their
+own completion and placement are integrated. Reject wrong array classes before
+the product, changed receiver/callee history, intervening effects, and
+missing/reordered/duplicated final prefix entries. Whole-plan preflight must still
+refuse later unclosed MSE count/quotient work before any prefix effects run.
+
+The actual selected allocator argument can already be outlined with original
+physical ports `[batch out-f]`: zero/changed dimensions agree and checked
+`Long/MAX_VALUE * 2` throws. This is execution evidence for the existing owned
+argument region, not completed frame-environment or final-placement authority.
+The permanent regression extends the existing unchanged-training substitution
+case rather than adding a parallel fixture. Its focused case passes 1 test / 73
+assertions; the construction/import/inliner group now passes 67 / 561. Independent
+review confirmed that outlining remains explicit and grants no prefix replay.
+
 ### October 21 selected ancestry for imported helper calls
 
 Imported call origins now feed the existing selected-call contract, rather than

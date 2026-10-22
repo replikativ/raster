@@ -301,6 +301,25 @@
                      (is (= :unclosed (:return-correspondence frame) (:final-placement frame)))
                      (is (every? #(= :unclosed (:constructed-correspondence %)) (:argument-slots frame)))
                      (is (= :unclosed (get-in frame [:original-invocation :parent-linkage])))
+                     ;; Explicit preparation is separate from the frame query.
+                     ;; Reuse the original allocator argument's bytecode region,
+                     ;; including the selected Long completion, not an algebraic
+                     ;; replacement of batch*out-f with the eventual rows value.
+                     (let [original (:original-invocation frame)
+                           region (entry/prepare-frontend-invocation-input!
+                                   (get-in original [:caller-origin :frontend])
+                                   (:original-call original) 1)
+                           execute (:invoke region)]
+                       (is (= '[batch out-f] (:parameters region)))
+                       (is (identical? Long/TYPE
+                                       (get-in region [:input-completion :parameter-carrier])))
+                       (is (= [0 1 7 6]
+                              (mapv (fn [[rows columns]] (execute rows columns))
+                                    [[0 1] [1 1] [7 1] [3 2]])))
+                       (is (thrown? ArithmeticException (execute Long/MAX_VALUE 2)))
+                       (is (= :unclosed (:final-placement frame)))
+                       (is (nil? (:executor frame))
+                           "an executable argument is not permission to replay its enclosing prefix"))
                      (let [before @entry/*emission-inputs*
                            wrong (first (filter #(= 'raster.numeric/oftype (descriptor/semantic-op %)) calls))]
                        (is (nil? (transport/imported-builder-invocation-candidate
