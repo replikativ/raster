@@ -6910,6 +6910,16 @@
         child (nested emission original input-index)
         ports (:physical-ports region)]
     (when-not (and child
+                   ;; Execution outlining also supports integral call inputs.
+                   ;; This producer linearizes only floating completions; do
+                   ;; not recurse into a floating child across an integral
+                   ;; parent conversion merely because its ports are active.
+                   (= :jvm-bytecode-floating-input (get-in region [:input-contract :source-context]))
+                   (contains? #{Float/TYPE Double/TYPE}
+                              (get-in region [:input-contract :target-carrier]))
+                   (instance? java.lang.reflect.Method (:method region))
+                   (identical? (get-in region [:input-contract :target-carrier])
+                               (.getReturnType ^java.lang.reflect.Method (:method region)))
                    (map? declarations) (= (set (keys ports)) (set (keys declarations)))
                    (vector? active-ports) (= (count active-ports) (count (distinct active-ports)))
                    (every? #(contains? ports %) active-ports)

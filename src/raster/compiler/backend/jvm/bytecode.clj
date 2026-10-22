@@ -5958,7 +5958,7 @@
                    value))}))
 
 (defn ^:no-doc compile-invocation-input-region
-  "Outline one original completed FP input using its owning bytecode emitter.
+  "Outline one original completed FP or Int/Long input through its bytecode emitter.
    Physical ports and historical guards are preserved; this is not portable
    source, a derivative rule or permission to flatten the region."
   [emission original input-index]
@@ -5971,14 +5971,16 @@
                       {:reason :unowned-bytecode-input-region :input-index input-index})))
     (let [^java.lang.reflect.Method method (:method record)
           carrier (nth (vec (.getParameterTypes method)) input-index)
-          contract (completion/bytecode-floating-input-contract carrier (:context input))
+          contract (if (contains? #{Integer/TYPE Long/TYPE} carrier)
+                     (completion/bytecode-integral-input-contract carrier (:context input))
+                     (completion/bytecode-floating-input-contract carrier (:context input)))
           guard (fn []
                   (when-not (identical? record (retained-invocation-context emission original))
                     (throw (ex-info "Input region lost its owning invocation"
                                     {:reason :unowned-bytecode-input-region}))))]
       (assoc (compile-owned-input-region
               emission input carrier
-              {:return-tag (if (= carrier Double/TYPE) 'double 'float)
+              {:return-tag (symbol (.getName ^Class carrier))
                :walked-body [(completion/complete-value contract (:operand input))]
                :element-type (:element-type record)} guard)
              :input-contract contract))))
