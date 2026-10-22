@@ -2513,6 +2513,15 @@
   [emission original]
   (retained-call-observation emission original :array-read-contexts))
 
+(defn ^:no-doc retained-input-array-read
+  "Follow an exact emitter-input read to its actual array/index completion context.
+   Uses the existing producer-local call origin; equal source, copied annotations and
+   extracted/reconstructed reads without that edge abstain. No successful read is proved."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [observed (retained-array-read emission owned)]
+      (assoc observed :source-input original :source owned))))
+
 (defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals proof]
   (when me/*emission-inputs*
     (retain-call-observation!

@@ -491,6 +491,47 @@
                               [:materialization :values]))))))
       (finally (remove-ns (ns-name scope)))))))
 
+(deftest original-reduction-read-retains-its-actual-index-and-array-carriers
+  (doseq [float? [false true]]
+    (with-fresh-reduction-binding
+      float? false 1
+      (fn [frontend]
+        (let [scope (first (:body frontend))
+              reduction (nth (second scope) 1)
+              read (first (filter raster.compiler.core.op-descriptor/aget-call?
+                                  (tree-seq coll? seq (nth reduction 5))))
+              before @entry/*emission-inputs*
+              copied (with-meta (apply list read) (meta read))]
+          (is (some? read))
+          (is (= read copied))
+          (is (not (identical? read copied)))
+          (is (nil? (entry/frontend-array-read frontend copied)))
+          (is (= before @entry/*emission-inputs*) "refused copies retain no speculative history")
+          (with-redefs [core/ensure-current-owned-bytecode!
+                        (fn [& _] (throw (ex-info "observation tried to compile" {})))]
+            (let [observed (entry/frontend-array-read frontend read)
+                  index (nth reduction 3)]
+              (is (identical? read (:source-input observed)))
+              ;; The emitter may expand/retag the instruction expression. Its original owned
+              ;; catalog occurrence and its actual instruction observation are separate edges.
+              (is (identical? (:source observed)
+                              (get-in frontend [:emission :invocation-catalog
+                                                (::bytecode/call-occurrence
+                                                 (meta (:source observed)))])))
+              (is (identical? (:expression observed)
+                              (get-in frontend [:emission :array-read-contexts
+                                                (::bytecode/call-occurrence
+                                                 (meta (:source observed))) :expression])))
+              (is (= :known (:status observed)))
+              (is (= 'xs (:array observed)))
+              (is (identical? (if float? (class (float-array 0)) (class (double-array 0)))
+                              (get-in observed [:array-local :reference-class])))
+              (is (= (if float? :float :double) (:result-type observed)))
+              (is (= index (get-in observed [:input :operand])))
+              (is (= :int (get-in observed [:input :type])
+                          (get-in observed [:input :ports index :type])))
+              (is (true? (:primitive-index? observed))))))))))
+
 (deftest explicit-reduction-preparation-keeps-terminal-before-caller-order
   (doseq [float? [false true]]
     (with-fresh-reduction-binding

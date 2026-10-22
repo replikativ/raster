@@ -956,6 +956,14 @@
   (frontend-occurrence-observation frontend original
     'raster.compiler.backend.jvm.bytecode/retained-input-completed-invocation-context))
 
+(defn frontend-array-read
+  "Observe an unchanged original array read through its actual emitted occurrence.
+   Retains the whole original module history and index/array carrier context. This is
+   non-emitting observation, not non-nullness, bounds, purity or read-completion authority."
+  [frontend original]
+  (frontend-occurrence-observation frontend original
+    'raster.compiler.backend.jvm.bytecode/retained-input-array-read))
+
 (defn frontend-invocation-input-source
   "Origin-only join from an original frontend argument to its actual emitted input.
    Missing edges stay absent. No argument equivalence, completion or execution

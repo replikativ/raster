@@ -343,6 +343,42 @@ guards. Only an independently justified algebraic permission may select a reasso
 tree. Positive/dynamic counts, null/short reads and earlier exceptions cannot borrow the
 empty-domain proof.
 
+The next read edge now reuses the existing emitter-local `InputOrigins` relation
+and guarded array-read observation, exposed through the same authenticated frontend
+observation service as calls and bindings. It retains actual primitive-array and index
+carriers, not inferred tags or equivalent source spelling. Equal copied forms abstain
+transactionally and queries cannot compile code. This closes an observation edge only:
+it proves neither a successful read nor bounds, and grants no nonempty fold execution.
+The affected source/ownership/device group passes 105 tests / 1,758 assertions; its
+new original-read check is one test / 30 assertions. Original catalog occurrence and
+actual emitter-expanded instruction are separate retained identity edges, not equal
+source substituted for either. Nonempty scheduling, original
+combine/backedge correspondence and source-ordered failure guards remain outstanding.
+
+Independent next-step review confirms a distinct ordered seeded-fold schedule is
+needed for the stronger source-exact law; adding an "exact" flag to the existing
+workgroup tree would be unsound. Reuse the canonical scalar `fold` term and its shared
+KernelBody lowerer, which already initializes the actual carry and emits an ordered
+`ForLoop`. Factor the reduce lambda/array-read projection and ABI construction rather
+than adding another interpreter. The strict route must bypass monoid-only `scalar-plan`
+and combine-spelling gates, retain terminal-only one-workitem/no-scratch execution, and
+independently reconstruct its body, seed, bound, storage and numerical contract.
+
+Before public nonempty activation, join the original read and combine occurrences to
+the actual carry/index backedge, argument order and completion conversions, and preserve
+null/short-array failure order before acquisition. Authenticate all combine/terminal
+receiver selections before a leaves-before-caller preparation batch. The review accepted
+the existing terminal-before-caller preparation and the new original-read observation
+wrappers. Certified parallel `par/reduce` schedules remain a separate, explicitly permitted
+realization; a source-exact schedule must not redefine their algebra or hide a performance
+regression behind stronger numerical claims.
+
+Exact-head CI at `bef35eaf`: setup/build passed; source-fixture job 33884 failed
+on the existing `raster.nn/softmax` `inv-sum` refusal (`:uncertified-host-scalar`,
+`:unclosed-source-arithmetic`, no normal-completion evidence). This confirms the
+connected empty-fold work does not yet repair the real nonempty softmax boundary.
+Unit/OpenCL jobs 33883/33882 were still pending at inspection; draft remains held.
+
 ### October 21 DeepSeek inference reference integration
 
 The recovered full source review is retained locally in
