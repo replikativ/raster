@@ -5,6 +5,34 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.core.util :as util]))
 
+(deftest postwalk-observes-final-reconstruction-without-changing-results
+  (let [inner (with-meta '(inc 1) {:line 12})
+        quoted (list 'quote '(hidden child))
+        source [inner quoted]
+        events (atom [])
+        output (util/postwalk-preserving-meta
+                (fn [node] (if (identical? node inner) (with-meta '(dec 1) {:line 19}) node))
+                source
+                (fn [original constructed]
+                  (swap! events conj [original constructed])
+                  :ignored))]
+    (is (= '[(dec 1) (quote (hidden child))] output))
+    (is (= {:line 19} (meta (first output))))
+    (is (identical? source (first (last @events))))
+    (is (identical? output (second (last @events))))
+    (is (some #(and (identical? inner (first %))
+                    (identical? (first output) (second %))) @events))
+    (is (not-any? #(identical? (second quoted) (first %)) @events))
+    (let [seen (atom [])
+          unchanged (util/postwalk-preserving-meta
+                     identity source
+                     (fn [original _]
+                       (swap! seen conj original)
+                       ;; An independently invoked walk has no inherited observer.
+                       (util/postwalk-preserving-meta identity [:independent])))]
+      (is (identical? source unchanged))
+      (is (not-any? #{:independent} @seen)))))
+
 (deftest no-op-reconstruction-preserves-occurrences-not-just-equality
   (doseq [original [(with-meta '(callee value) {:line 7 :tag 'double})
                     (with-meta '[callee value] {:line 7})]]

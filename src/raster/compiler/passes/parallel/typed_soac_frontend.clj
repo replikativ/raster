@@ -3942,6 +3942,14 @@
 (declare contains-parallel-form?)
 
 (def ^:dynamic ^:private *normalization-source-ns* nil)
+(def ^:dynamic ^:private *normalization-observer* nil)
+
+(defn- observe-normalization!
+  [stage original constructed & [details]]
+  (when *normalization-observer*
+    (*normalization-observer*
+     (merge details {:stage stage :original original :constructed constructed})))
+  constructed)
 
 (defn- original-inline-core-call?
   [expression]
@@ -3999,9 +4007,9 @@
     source
     (let [[head bindings & body] source
           pairs (partition 2 bindings)
-          lifted
-          (mapcat
-           (fn [[symbol expression]]
+          {:keys [lifted splits]}
+          (reduce
+           (fn [{:keys [lifted] :as state} [ordinal [symbol expression]]]
              (let [{:keys [reduction replace]} (first-strict-scalar-reduction expression)]
                (if (and reduction (not (par/par-reduce-form? expression)))
                  (let [reduction-tag (types/sym-type-tag reduction)
@@ -4014,11 +4022,27 @@
                             (= :pure (effects/analyze-effect outer))
                             (empty? (par/collect-aget-arrays outer))
                             (not (contains-parallel-form? outer)))
-                     [[value-id reduction] [symbol outer]]
-                     [[symbol expression]]))
-                 [[symbol expression]])))
-           pairs)]
-      (with-meta (list* head (vec (mapcat identity lifted)) body) (meta source)))))
+                     (let [bindings [[value-id reduction] [symbol outer]]]
+                       (cond-> (update state :lifted into bindings)
+                         *normalization-observer*
+                         (update :splits conj
+                                 {:scope source :binding-index ordinal :destination symbol
+                                  :original expression :constructed outer
+                                  :reduction reduction :result value-id :bindings bindings
+                                  :output-binding-index (count lifted)
+                                  :context :strict-first-operand :reduction-tag reduction-tag
+                                  :continuation-effect :pure
+                                  :continuation-flags (:flags (effects/descriptor outer))
+                                  :array-reads #{} :nested-parallel? false})))
+                     (update state :lifted conj [symbol expression])))
+                 (update state :lifted conj [symbol expression]))))
+           {:lifted [] :splits []}
+           (map-indexed vector pairs))
+          constructed (with-meta (list* head (vec (mapcat identity lifted)) body) (meta source))]
+      (doseq [event splits]
+        (observe-normalization! :reduction-split (:original event) (:constructed event)
+                                (assoc event :output-scope constructed)))
+      (observe-normalization! :lift-scalar-reductions source constructed))))
 
 (defn- erase-array-type-witnesses
   "Replace a pure array `oftype` witness with its declared element conversion.
@@ -4045,14 +4069,22 @@
                         :long 'clojure.core/long
                         :int 'clojure.core/int} element)]
          (if (and cast (= result element))
-           (with-meta (list cast value)
-             (-> (meta expression)
-                 (dissoc :raster.op/original)
-                 (assoc :tag (symbol (name element))
-                        :raster.type/tag (symbol (name element)))))
+           (observe-normalization!
+            :array-type-witness-rewrite expression
+            (with-meta (list cast value)
+              (-> (meta expression)
+                  (dissoc :raster.op/original)
+                  (assoc :tag (symbol (name element))
+                         :raster.type/tag (symbol (name element)))))
+            {:witness witness :value value :element-dtype element :result-dtype result
+             :cast cast :declared-array? true
+             :dtype-source (if (get array-types witness) :array-types :retained-tag)})
            expression))
        expression))
-   source))
+   source
+   (when *normalization-observer*
+     (fn [original constructed]
+       (observe-normalization! :array-type-witness original constructed)))))
 
 (defn- normalize-source*
   [source array-types scalar-types]
@@ -4061,13 +4093,20 @@
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
-  (let [source (util/uniquify-rebindings (util/free-syms source) source)
+  (let [source (observe-normalization!
+                :uniquify-root source
+                (util/uniquify-rebindings
+                 (util/free-syms source) source
+                 (when *normalization-observer*
+                   (fn [original constructed renaming bound]
+                     (observe-normalization! :uniquify original constructed
+                                             {:renaming renaming :bound bound})))))
         ;; A locally bound scalar can reuse a public array's name. Only free array
         ;; parameters may borrow the entry type; local arrays need their own tag.
         public-array-types (select-keys array-types (util/free-syms source))
-        source (-> source
-                   (erase-array-type-witnesses public-array-types)
-                   lift-nested-scalar-reductions)]
+        source (observe-normalization! :array-type-witness-root source
+                                        (erase-array-type-witnesses source public-array-types))
+        source (lift-nested-scalar-reductions source)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
@@ -4744,16 +4783,23 @@
 
    TypedSOAC operations name extents; executable host expressions never leak into schedule fields.
    This normalization inserts an ordinary typed scalar binding immediately before its operation,
-   so the same expression remains visible to JVM materialization and runtime specialization."
+   so the same expression remains visible to JVM materialization and runtime specialization.
+   The optional third argument observes compiler-local constructors only. Notices
+   grant no ownership, semantic equivalence or admission. Seq/vector events are
+   ordered; map/set child traversal is not a source evaluation-order contract.
+   A caller must seal and validate complete correspondence under its own module
+   owner; changed untraced stages remain unclosed. Nested calls own their observer."
   ([source] (normalize-source source {}))
-  ([source {:keys [array-types scalar-types source-ns]}]
+  ([source options] (normalize-source source options nil))
+  ([source {:keys [array-types scalar-types source-ns]} observe!]
    ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
    ;; binder an array, exactly as the walker stamps them.
    (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
                    (filter symbol? (take-nth 2 (second source))))
          tagged (fn [kind?]
                   (set (filter #(kind? (types/sym-type-tag %)) binders)))]
-     (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
+     (binding [*normalization-observer* observe!
+               util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
                *normalization-source-ns* (cond
                                           (instance? clojure.lang.Namespace source-ns) source-ns
                                           (symbol? source-ns) (find-ns source-ns))
@@ -4766,8 +4812,11 @@
                                (tagged #(contains? #{:long :int}
                                                    (some-> % dtype/dtype-for-scalar-tag
                                                            dtype/canon))))}]
-       (normalize-source* (copy-allocations->maps source array-types)
-                          array-types scalar-types)))))
+       (observe-normalization!
+        :normalize-source source
+        (normalize-source*
+         (observe-normalization! :copy-allocations source (copy-allocations->maps source array-types))
+         array-types scalar-types))))))
 
 (declare coverage-decline*)
 

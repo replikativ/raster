@@ -235,7 +235,16 @@
                      y)
         options {:dtype :float :array-types {'codes :byte}
                  :scalar-types {'n :long}}
-        normalized (frontend/normalize-source source options)]
+        events (atom [])
+        normalized (frontend/normalize-source source options #(swap! events conj %))
+        rewrite (first (filter #(= :array-type-witness-rewrite (:stage %)) @events))]
+    (is (= {:element-dtype :float :result-dtype :float :cast 'clojure.core/float
+            :declared-array? true :dtype-source :retained-tag}
+           (select-keys rewrite [:element-dtype :result-dtype :cast :declared-array? :dtype-source])))
+    (is (identical? (:witness rewrite) (first (descriptor/call-args (:original rewrite)))))
+    (is (identical? (:value rewrite) (second (:constructed rewrite))))
+    (is (some #(and (= :array-type-witness (:stage %))
+                    (identical? (:constructed rewrite) (:constructed %))) @events))
     (is (some #{'(clojure.core/float (clojure.core/aget codes i))}
               (tree-seq coll? seq normalized)))
     (is (not-any? #(= 'raster.numeric/oftype (descriptor/semantic-op %))
@@ -1937,6 +1946,80 @@
                                            [:attributes :result-transform])))
     (is (every? true? (map = algorithms (map dialect/validate! algorithms))))))
 
+(deftest normalization-observes-exact-reduction-splits-before-later-reconstruction
+  (let [left (with-meta '(raster.par/reduce sum 0.0 i n (+ sum (clojure.core/aget xs i)))
+               {:tag 'double :raster.type/tag 'double})
+        right (with-meta '(raster.par/reduce acc 0.0 j n (+ acc (clojure.core/aget ys j)))
+                {:tag 'double :raster.type/tag 'double})
+        source (list 'let* ['a (list 'clojure.core/+ left 1.0)
+                           'b (list 'clojure.core/+ right 2.0)] 'b)
+        events (atom [])
+        output (frontend/normalize-source
+                source {:source-ns *ns* :array-types {'xs :double 'ys :double}
+                        :scalar-types {'n :long}}
+                (fn [event] (swap! events conj event) :ignored))
+        splits (filterv #(= :reduction-split (:stage %)) @events)
+        roots (into {} (map (juxt :stage identity))
+                    (filter #(contains? #{:copy-allocations :uniquify-root :array-type-witness-root
+                                          :lift-scalar-reductions :normalize-source} (:stage %)) @events))]
+    (is (= 2 (count splits)))
+    (is (= [:copy-allocations :uniquify-root :array-type-witness-root
+            :lift-scalar-reductions :normalize-source]
+           (mapv :stage (filter #(contains? roots (:stage %)) @events))))
+    (is (= [0 1] (mapv :binding-index splits)))
+    (is (= [0 2] (mapv :output-binding-index splits))
+        "normalized ordinals are not physical input ordinals")
+    (doseq [{:keys [scope binding-index destination original reduction result bindings
+                   constructed output-scope output-binding-index context]} splits]
+      (is (identical? original (nth (second scope) (inc (* 2 binding-index)))))
+      (is (identical? destination (nth (second scope) (* 2 binding-index))))
+      (is (= :strict-first-operand context))
+      (is (identical? result (ffirst bindings)))
+      (is (identical? reduction (second (first bindings))))
+      (is (identical? constructed (second (second bindings))))
+      (is (identical? output-scope (get-in roots [:lift-scalar-reductions :constructed])))
+      (is (identical? reduction (nth (second output-scope) (inc (* 2 output-binding-index)))))
+      (is (identical? constructed (nth (second output-scope) (+ 3 (* 2 output-binding-index))))))
+    (is (identical? source (get-in roots [:copy-allocations :original])))
+    (is (identical? (get-in roots [:copy-allocations :constructed])
+                    (get-in roots [:uniquify-root :original])))
+    (is (identical? (get-in roots [:uniquify-root :constructed])
+                    (get-in roots [:array-type-witness-root :original])))
+    (is (identical? (get-in roots [:array-type-witness-root :constructed])
+                    (get-in roots [:lift-scalar-reductions :original])))
+    (is (identical? output (get-in roots [:normalize-source :constructed])))
+    (let [count-before (count @events)]
+      (doall output)
+      (is (= count-before (count @events)) "no lazy notices escape the capture interval"))))
+
+(deftest normalization-observers-are-scoped-and-exceptions-abort
+  (let [source '(let* [a 1] a)
+        events (atom [])]
+    (is (= source
+           (frontend/normalize-source
+            source {} (fn [event]
+                        (swap! events conj event)
+                        (frontend/normalize-source '(let* [nested 2] nested))
+                        :ignored))))
+    (is (= 1 (count (filter #(= :normalize-source (:stage %)) @events))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"observer abort"
+                         (frontend/normalize-source source {}
+                                                    (fn [_] (throw (ex-info "observer abort" {}))))))))
+
+(deftest reduction-split-notices-do-not-invent-an-evaluation-context
+  (let [reduction (with-meta '(raster.par/reduce sum 0.0 i n (+ sum (clojure.core/aget xs i)))
+                    {:tag 'double :raster.type/tag 'double})]
+    (doseq [expression [(list 'if 'choose? reduction 0.0)
+                        (list 'quote reduction)
+                        (list 'clojure.core/+ 1.0 reduction)
+                        (list 'clojure.core/+ reduction '(do (println "effect") 1.0))]]
+      (let [events (atom [])]
+        (frontend/normalize-source
+         (list 'let* ['result expression] 'result)
+         {:source-ns *ns* :array-types {'xs :double} :scalar-types {'n :long 'choose? :boolean}}
+         #(swap! events conj %))
+        (is (empty? (filter #(= :reduction-split (:stage %)) @events)))))))
+
 (deftest nested-reductions-do-not-cross-source-evaluation-contexts
   (let [reduction (with-meta
                     '(raster.par/reduce sum 0.0 i n
@@ -2799,7 +2882,7 @@
   (let [analyze (fn [allocation values equalities]
                   (#'frontend/source-storage-analysis
                    [['a allocation]] :float {'input :float 'a :float} {'n :long}
-                   false values equalities))
+                   false values equalities nil))
         allocation '(clojure.core/float-array n)]
     (doseq [value [(av/tensor {:dtype :float :shape [2 3]})
                    (assoc (av/tensor {:dtype :float :shape ['n]})
@@ -2839,7 +2922,7 @@
 (deftest allocation-capacities-retain-source-identities
   (let [analyze (fn [pairs scalar-types]
                   (#'frontend/source-storage-analysis
-                   pairs :float {'a :float} scalar-types false {} {}))
+                   pairs :float {'a :float} scalar-types false {} {} nil))
         allocation '(clojure.core/float-array capacity)
         product '(clojure.core/* rows width)
         pairs [[(with-meta 'capacity {:raster.type/tag 'long}) product]

@@ -505,20 +505,25 @@
 
    Quoted data is opaque. A replacement returned by `f` keeps its own metadata; metadata from the
    replaced node is not incorrectly transferred onto a semantically different value.
-   Unchanged seq/vector children retain the original occurrence, not an equal copy."
-  [f expression]
-  (letfn [(go [form]
-            (f
-             (cond
-               (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
-               (or (seq? form) (vector? form)) (remake-if-changed form (mapv go form))
-               (record? form) (reduce-kv (fn [r k v] (assoc r k (go v))) form form)
-               (map? form) (with-meta
-                             (into (empty form) (map (fn [[k v]] [(go k) (go v)])) form)
-                             (meta form))
-               (set? form) (with-meta (into (empty form) (map go) form) (meta form))
-               :else form)))]
-    (go expression)))
+   Unchanged seq/vector children retain the original occurrence, not an equal copy.
+   Optional observer receives [original constructed] at each actual recursive
+   reconstruction; its return value is ignored and grants no semantic authority."
+  ([f expression] (postwalk-preserving-meta f expression nil))
+  ([f expression observe!]
+   (letfn [(go [form]
+             (let [constructed
+                   (f (cond
+                        (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
+                        (or (seq? form) (vector? form)) (remake-if-changed form (mapv go form))
+                        (record? form) (reduce-kv (fn [r k v] (assoc r k (go v))) form form)
+                        (map? form) (with-meta
+                                      (into (empty form) (map (fn [[k v]] [(go k) (go v)])) form)
+                                      (meta form))
+                        (set? form) (with-meta (into (empty form) (map go) form) (meta form))
+                        :else form))]
+               (when observe! (observe! form constructed))
+               constructed))]
+     (go expression))))
 
 (defn call-head
   "Extract the head symbol from a call expression.

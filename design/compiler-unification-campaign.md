@@ -194,6 +194,29 @@ JVM conversion/binding gate passes 91 tests / 1,334 assertions in the capped
 REPL. At `c1c303ac`, test job 34066, fixture job 34067 and OpenCL job 34070 are
 red; the exact-head watcher has terminated red rather than claiming acceptance.
 
+The required constructor trace is now available as the optional third argument
+to `typed-soac-frontend/normalize-source`, separate from portable options. It
+records pre-lift SSA and array-witness reconstruction, exact witness rewrite
+details, and eager reduction-split notices containing both scopes, actual input
+and output ordinals, the reduction, fresh result binder and constructed pair
+identities. Root-stage notices connect exact stage inputs and outputs. Observer
+results never drive normalization, nested calls do not inherit the observer,
+and exceptions abort the candidate. Generic postwalk edges are lexical and
+quote-opaque; map/set traversal is not an evaluation-order proof.
+
+These are observations, not sealed module authority. Consumers must distinguish
+specific witness rewrites from generic reconstruction by stage before checking
+identity uniqueness, reject missing or ambiguous correspondence, retain the
+generated entry owner, and close the still-untraced post-lift transformations.
+The real diagnostic training view emits one strict-first-operand split and six
+array-witness rewrites; it remains unadmitted. New focused trace controls pass
+5 tests / 50 assertions. A same-REPL comparison of 175 existing tests found the
+same 18 failures and 14 errors under pre-change and changed implementations,
+with identical failing tests, assertions and error categories. Correcting two
+stale private-API test calls subsequently restores their 24 allocation
+assertions; the wider 179-test run now has 18 failures and one error, still open.
+No production gate is waived or declared green from that comparison.
+
 The earlier checkpoints below describe prerequisite evidence, not completion.
 
 Prerequisite qualification: scalar PE and simplification now preserve existing
