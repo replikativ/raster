@@ -346,6 +346,49 @@
         (is (= #{'base 'n 'x} (util/free-syms result)))
         (is (not-any? atoms '[acc i off value]))))))
 
+(deftest substitution-construction-observer-preserves-scopes-and-the-empty-fast-path
+  (let [source '(ftm [x] :raster.walker/source-body [(g x)] (.invk impl (g x)))
+        events (atom []) leaf (fn [env value] (get env value value))
+        actual (util/subst-syms '{g h} source leaf #(swap! events conj [%1 %2 %3]))
+        calls (filter #(= '(g x) (first %)) @events)]
+    (is (= (util/subst-syms '{g h} source) actual))
+    (is (= 2 (count calls)))
+    (is (every? #(= '(h x) (second %)) calls)))
+  (let [source '(letfn* [f (fn* [x] (f x))] (g n))
+        events (atom [])]
+    (is (identical? source
+                    (util/subst-syms {} source (fn [env value] (get env value value))
+                                     #(swap! events conj [%1 %2 %3]))))
+    (is (= 1 (count @events)))
+    (is (identical? source (ffirst @events)))))
+
+(deftest alpha-construction-observer-follows-the-shared-lexical-traversal
+  (let [quoted '(quote [(opaque x)])
+        init '(seed n)
+        step '(step i acc)
+        source (list 'let* ['x init]
+                     (list 'loop* ['i 0 'acc 'x]
+                           (list 'if '(done i) quoted (list 'recur '(inc i) step))))
+        events (atom [])
+        result (util/alpha-convert {} source #(swap! events conj [%1 %2 %3]))
+        observed (fn [original] (first (filter #(identical? original (first %)) @events)))
+        [_ constructed env] (observed step)]
+    (is (identical? result (second (observed source))))
+    (is (empty? (nth (observed init) 2)))
+    (is (= #{'x 'i 'acc} (set (keys env))))
+    (is (= (list 'step (get env 'i) (get env 'acc)) constructed))
+    (is (identical? quoted (second (observed quoted))))
+    (is (nil? (observed (first (second quoted)))))
+    (is (= #{'n 'seed 'done 'step} (disj (util/free-syms result) 'inc))))
+  (doseq [[source expected]
+          [['(letfn* [f (fn* [x] (f x))] (f n)) #{'f}]
+           ['(ftm [x] :raster.walker/source-body [(aux x)] (body x)) #{'x}]]]
+    (let [events (atom [])
+          _ (util/alpha-convert {} source #(swap! events conj [%1 %2 %3]))
+          calls (filter #(and (seq? (first %)) (contains? '#{f aux body} (ffirst %))) @events)]
+      (is (seq calls))
+      (is (every? #(every? (set (keys (nth % 2))) expected) calls)))))
+
 (deftest ftm-source-body-stays-in-sync
   (testing "subst/alpha rename the ftm :raster.walker/source-body CONSISTENTLY with the walked body"
     ;; Regression: the source-body is opaque to free-syms (raw unqualified payload)

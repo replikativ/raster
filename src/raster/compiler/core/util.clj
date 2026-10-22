@@ -143,19 +143,19 @@
    a binder free in some smap value → alpha-rename it so substituted values keep
    referring to the OUTER binding. `leaf-fn` is the symbol-substitution policy
    (see subst-syms)."
-  [smap {:keys [binders inits body aux]} sequential? rec? leaf-fn]
+  [smap {:keys [binders inits body aux]} sequential? rec? leaf-fn observe!]
   (if sequential?
     ;; let*/loop*: thread — init_k sees bound + prior binders
     (let [[sm binders' inits']
           (reduce (fn [[sm bs is] [b i]]
-                    (let [i'   (subst-syms sm i leaf-fn)
+                    (let [i'   (subst-syms sm i leaf-fn observe!)
                           cap? (and (symbol? b) (contains? (smap-value-frees sm) b))
                           [b' sm'] (if cap?
                                      (let [f (fresh-like b)] [f (assoc (dissoc sm b) b f)])
                                      [b (if (symbol? b) (dissoc sm b) sm)])]
                       [sm' (conj bs b') (conj is i')]))
                   [smap [] []] (map vector binders inits))]
-      {:binders binders' :inits inits' :body (mapv #(subst-syms sm % leaf-fn) body)})
+      {:binders binders' :inits inits' :body (mapv #(subst-syms sm % leaf-fn observe!) body)})
     ;; fn*/letfn*/par/catch/dotimes: all binders enter scope at once
     (let [vfrees (smap-value-frees smap)
           [binders' rename]
@@ -168,18 +168,18 @@
       {:binders binders'
        ;; only :rec? forms (letfn*) let inits see the binders; others' inits
        ;; (none, in the closed core) would see the outer smap
-       :inits (mapv #(subst-syms (if rec? inner smap) % leaf-fn) inits)
-       :body  (mapv #(subst-syms inner % leaf-fn) body)
+       :inits (mapv #(subst-syms (if rec? inner smap) % leaf-fn observe!) inits)
+       :body  (mapv #(subst-syms inner % leaf-fn observe!) body)
        ;; :aux (ftm source-body) shares the arity scope — rename it CONSISTENTLY
        ;; with the body so the raw AD payload never desyncs from the walked code.
-       :aux  (some->> aux (mapv #(subst-syms inner % leaf-fn)))})))
+       :aux  (some->> aux (mapv #(subst-syms inner % leaf-fn observe!)))})))
 
 (defn subst-scoped
   "Capture-avoiding substitution for an IR owner's separately stored binders and ordered body.
    Returns the common scope-info shape; uses the same scope engine as subst-syms."
   [smap binders body]
   (subst-scope smap {:binders binders :inits [] :body body}
-               false false (fn [sm expression] (get sm expression expression))))
+               false false (fn [sm expression] (get sm expression expression)) nil))
 
 (defn subst-syms
   "Capture-avoiding substitution of free symbol occurrences per
@@ -192,10 +192,14 @@
 
    `leaf-fn` (optional) is the symbol-substitution policy `(fn [smap sym] -> expr)`;
    default is plain `(get smap sym sym)`. Pass a custom leaf to preserve use-site
-   metadata onto the replacement (the inliner does this for type-tag propagation)."
+   metadata onto the replacement (the inliner does this for type-tag propagation).
+   Optional observe! receives [original constructed substitution-env] at actual
+   returns. The existing empty-map fast path remains opaque to nested traversal."
   ([smap expr] (subst-syms smap expr (fn [sm e] (get sm e e))))
-  ([smap expr leaf-fn]
-   (if (empty? smap)
+  ([smap expr leaf-fn] (subst-syms smap expr leaf-fn nil))
+  ([smap expr leaf-fn observe!]
+   (let [constructed
+    (if (empty? smap)
      expr
      (cond
        (symbol? expr) (leaf-fn smap expr)
@@ -204,17 +208,19 @@
 
        (seq? expr)
        (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expr)]
-         (rebuild (mapv #(subst-scope smap % sequential? rec? leaf-fn) scopes)
-                  (mapv #(subst-syms smap % leaf-fn) outer))
-         (remake-from expr (map #(subst-syms smap % leaf-fn) expr)))
+         (rebuild (mapv #(subst-scope smap % sequential? rec? leaf-fn observe!) scopes)
+                  (mapv #(subst-syms smap % leaf-fn observe!) outer))
+         (remake-from expr (map #(subst-syms smap % leaf-fn observe!) expr)))
 
-       (vector? expr) (with-meta (mapv #(subst-syms smap % leaf-fn) expr) (meta expr))
+       (vector? expr) (with-meta (mapv #(subst-syms smap % leaf-fn observe!) expr) (meta expr))
        ;; IR records (KernelBody IndexExpr, SegOps, ...) are maps whose type must survive:
        ;; substitute inside their fields, never `empty` them.
-       (record? expr) (reduce-kv (fn [r k v] (assoc r k (subst-syms smap v leaf-fn))) expr expr)
-       (map? expr) (into (empty expr) (map (fn [[k v]] [(subst-syms smap k leaf-fn) (subst-syms smap v leaf-fn)]) expr))
-       (set? expr) (into (empty expr) (map #(subst-syms smap % leaf-fn) expr))
-       :else expr))))
+       (record? expr) (reduce-kv (fn [r k v] (assoc r k (subst-syms smap v leaf-fn observe!))) expr expr)
+       (map? expr) (into (empty expr) (map (fn [[k v]] [(subst-syms smap k leaf-fn observe!) (subst-syms smap v leaf-fn observe!)]) expr))
+       (set? expr) (into (empty expr) (map #(subst-syms smap % leaf-fn observe!) expr))
+       :else expr))]
+     (when observe! (observe! expr constructed smap))
+     constructed)))
 
 (declare alpha-convert)
 
@@ -222,34 +228,38 @@
   "Alpha-rename one scope's binders to fresh names, threading env correctly:
    sequential inits see prior binders; :rec? inits see all binders; otherwise
    inits see only the enclosing env."
-  [env {:keys [binders inits body aux]} sequential? rec?]
+  [env {:keys [binders inits body aux]} sequential? rec? observe!]
   (if sequential?
     (let [[env' binders' inits']
           (reduce (fn [[env bs is] [b i]]
-                    (let [i' (alpha-convert env i)            ;; init sees prior binders
+                    (let [i' (alpha-convert env i observe!)   ;; init sees prior binders
                           [b' env'] (if (symbol? b)
                                       (let [f (fresh-like b)] [f (assoc env b f)])
                                       [b env])]
                       [env' (conj bs b') (conj is i')]))
                   [env [] []] (map vector binders inits))]
-      {:binders binders' :inits inits' :body (mapv #(alpha-convert env' %) body)})
+      {:binders binders' :inits inits' :body (mapv #(alpha-convert env' % observe!) body)})
     (let [pairs (mapv (fn [b] [b (if (symbol? b) (fresh-like b) b)]) binders)
           env'  (into env (filter (comp symbol? first) pairs))
           binders' (mapv second pairs)]
       {:binders binders'
-       :inits (mapv #(alpha-convert (if rec? env' env) %) inits)
-       :body  (mapv #(alpha-convert env' %) body)
+       :inits (mapv #(alpha-convert (if rec? env' env) % observe!) inits)
+       :body  (mapv #(alpha-convert env' % observe!) body)
        ;; ftm source-body (:aux) shares the arity scope — rename consistently
-       :aux  (some->> aux (mapv #(alpha-convert env' %)))})))
+       :aux  (some->> aux (mapv #(alpha-convert env' % observe!)))})))
 
 (defn alpha-convert
   "Alpha-rename EVERY bound variable in a closed-core form to a fresh gensym,
    consistently rewriting references through env. Generic over form/scope-info.
    Use to make hygienic copies of a body (e.g. unrolled fold iterations) so two
-   copies don't conflate their loop indices / accumulators. `quote` is opaque."
+   copies don't conflate their loop indices / accumulators. `quote` is opaque.
+   Optional observe! receives each actual [original constructed lexical-env]
+   return; it supplies occurrence provenance, not an equivalence proof."
   ([form] (alpha-convert {} form))
-  ([env form]
-   (cond
+  ([env form] (alpha-convert env form nil))
+  ([env form observe!]
+   (let [constructed
+    (cond
      ;; Preserve the reference's metadata (esp. :raster.type/tag) onto the fresh
      ;; name — else a re-walk after inlining can't re-devirtualize arithmetic whose
      ;; operand type lived only on the renamed symbol (e.g. an inlined SDPA's
@@ -266,14 +276,16 @@
      (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) form
      (seq? form)
      (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)]
-       (rebuild (mapv #(alpha-scope env % sequential? rec?) scopes)
-                (mapv #(alpha-convert env %) outer))
-       (remake-from form (map #(alpha-convert env %) form)))
-     (vector? form) (with-meta (mapv #(alpha-convert env %) form) (meta form))
-     (record? form) (reduce-kv (fn [r k v] (assoc r k (alpha-convert env v))) form form)
-     (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k) (alpha-convert env v)]) form))
-     (set? form) (into (empty form) (map #(alpha-convert env %) form))
-     :else form)))
+       (rebuild (mapv #(alpha-scope env % sequential? rec? observe!) scopes)
+                (mapv #(alpha-convert env % observe!) outer))
+       (remake-from form (map #(alpha-convert env % observe!) form)))
+     (vector? form) (with-meta (mapv #(alpha-convert env % observe!) form) (meta form))
+     (record? form) (reduce-kv (fn [r k v] (assoc r k (alpha-convert env v observe!))) form form)
+     (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k observe!) (alpha-convert env v observe!)]) form))
+     (set? form) (into (empty form) (map #(alpha-convert env % observe!) form))
+     :else form)]
+     (when observe! (observe! form constructed env))
+     constructed)))
 
 (defn alpha-normalize
   "Canonicalize compiler freshness suffixes on lexical binders in a closed-core form.

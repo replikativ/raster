@@ -5,7 +5,8 @@
   (:require [raster.compiler.core.inference :as inference]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.core.util :as util]))
+            [raster.compiler.core.util :as util]
+            [raster.compiler.ir.form :as form]))
 
 (defn effective-body
   "Existing multi-form helper convention: a single ordered do expression."
@@ -45,7 +46,8 @@
     {:body result :renamings @events}))
 
 (deftype ^:private BodyImport
-  [frontend parameters source-ns effective hygienic qualified tags renamings observations]
+  [frontend parameters source-ns effective hygienic qualified tags renamings
+   alpha-occurrences qualification-occurrences observations]
   entry/RetainedProducerInput
   (assert-producer-current! [_]
     (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
@@ -83,19 +85,30 @@
             (entry/observe-frontend-source-identity! frontend))
         qualified-tags (qualify-tags tags source-ns)
         effective (effective-body body)
+        alpha-occurrences (when owned? (volatile! []))
+        qualification-occurrences (when owned? (volatile! []))
+        observe-call (fn [events]
+                       (when events
+                         (fn [original constructed _]
+                           (when (form/call-form? original)
+                             (vswap! events conj {:original original :constructed constructed})))))
         renamed (when owned?
-                  (with-hygienic-renamings effective parameters #(mapv util/alpha-convert effective)))
+                  (with-hygienic-renamings effective parameters
+                    #(mapv (fn [expression]
+                             (util/alpha-convert {} expression (observe-call alpha-occurrences))) effective)))
         hygienic (if owned? (:body renamed) (mapv util/alpha-convert effective))
         parameter-set (set (map #(if (symbol? %) % (symbol (name %))) parameters))
         qualified (if source-ns
                     (mapv #(inference/qualify-body-symbols % source-ns parameter-set
-                                                         entry/observe-source-resolution!) hygienic)
+                                                         entry/observe-source-resolution!
+                                                         (observe-call qualification-occurrences)) hygienic)
                     hygienic)
         input (when owned?
                 (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
                 (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
                 (BodyImport. frontend parameters source-ns effective hygienic qualified
-                             qualified-tags (:renamings renamed) @entry/*emission-inputs*))]
+                             qualified-tags (:renamings renamed)
+                             @alpha-occurrences @qualification-occurrences @entry/*emission-inputs*))]
     {:walked-body qualified :tags qualified-tags :source-import input}))
 
 (defn prepare-inline-body
@@ -125,6 +138,30 @@
         :tags (.-tags ^BodyImport input)
         :effective-body (.-effective ^BodyImport input) :hygienic-body (.-hygienic ^BodyImport input)
         :walked-body body :renamings (.-renamings ^BodyImport input)}))))
+
+(defn ^:no-doc unique-construction-edge
+  "Identity-only uniqueness check. Caller-supplied edges are not authority."
+  [occurrences constructed]
+  (let [matches (filterv #(identical? constructed (:constructed %)) occurrences)]
+    (when (and (= 1 (count matches))
+               (= 1 (count (filter #(identical? (:original (first matches)) (:original %)) occurrences))))
+      (first matches))))
+
+(defn body-import-occurrence
+  "Follow the exact import's phase-indexed call constructors to ORIGINAL source.
+   Unchanged occurrences are recorded too; no form or name matching/reconstruction
+   is performed here. Copies, shared/repeated occurrences and ownerless input
+   abstain transactionally. This proves origin only, not transformation equivalence."
+  [input body constructed]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [imported (body-import-view input body)]
+       (let [^BodyImport input input]
+         (when-let [qualified (unique-construction-edge (.-qualification-occurrences input) constructed)]
+           (when-let [renamed (unique-construction-edge (.-alpha-occurrences input) (:original qualified))]
+             {:frontend (:frontend imported) :original (:original renamed)
+              :hygienic (:constructed renamed) :constructed constructed
+              :alpha-construction renamed :qualification-construction qualified})))))))
 
 (deftype ^:private SourceNormalization [frontend body occurrences renamings observations]
   entry/RetainedProducerInput
@@ -174,15 +211,11 @@
   (entry/call-with-optional-definition-inputs
    (fn []
      (when (and entry/*emission-inputs* (instance? SourceNormalization input))
-       (let [^SourceNormalization input input
-             occurrences (.-occurrences input)
-             matches (filterv #(identical? constructed (:constructed %)) occurrences)]
-         (when (and (= 1 (count matches))
-                    (= 1 (count (filter #(identical? (:original (first matches)) (:original %))
-                                        occurrences))))
+       (let [^SourceNormalization input input]
+         (when-let [occurrence (unique-construction-edge (.-occurrences input) constructed)]
            (entry/assert-producer-current! input)
            (entry/adopt-definition-inputs! (.-observations input))
-           (assoc (first matches) :frontend (.-frontend input))))))))
+           (assoc occurrence :frontend (.-frontend input))))))))
 
 (def ^:dynamic ^:private *source-construction-observer* nil)
 

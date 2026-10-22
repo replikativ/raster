@@ -137,9 +137,41 @@
        (is (nil? (inline/nested-expansion-substitution-view
                   (assoc callee :source-import {}) arguments good)))))))
 
+(deftest substitution-origins-do-not-promote-inserted-or-shared-calls
+  (substitution-helper 0 1 2)
+  (let [{:keys [source-construction normalization] :as captured} (capture)
+        event (first (:builder-expansions (phase-view captured)))
+        caller (:normalized (:caller-origin (builder-view source-construction (:expansion event))))
+        callee (entry/call-with-definition-inputs
+                #(#'inline/try-resolve-walked-body #'substitution-helper_m_long_long_long))
+        inserted '(clojure.core/long 2)
+        candidate (history normalization
+                           #(#'inline/build-inline-expansion callee [0 inserted 'n] {} inline/subst-syms nil caller))]
+    (entry/call-with-definition-inputs
+     (fn []
+       (is (some? (inline/nested-builder-substitution-view (:source-construction candidate) (:form candidate))))
+       (is (some #(identical? inserted %) (tree-seq coll? seq (:body (:form candidate)))))
+       (let [before @entry/*emission-inputs*]
+         (is (nil? (inline/nested-substitution-call-origin (:source-construction candidate) (:form candidate) inserted)))
+         (is (identical? before @entry/*emission-inputs*)))
+       ;; This fixture constructs a local substitution candidate only. It must
+       ;; not establish that the different original root selected this callee.
+       (is (nil? (inline/nested-original-call-frame (:source-construction candidate) (:form candidate))))))
+    (let [candidate (history normalization
+                             #(#'inline/build-inline-expansion callee [0 inserted inserted] {}
+                                                              inline/subst-syms nil caller))]
+      (entry/call-with-definition-inputs
+       (fn []
+         (is (some? (inline/nested-builder-substitution-view (:source-construction candidate) (:form candidate))))
+         (is (= 2 (count (filter #(identical? inserted %) (tree-seq coll? seq (:body (:form candidate)))))))
+         (let [before @entry/*emission-inputs*]
+           (is (nil? (inline/nested-substitution-call-origin (:source-construction candidate) (:form candidate) inserted)))
+           (is (identical? before @entry/*emission-inputs*))))))))
+
 (deftest unchanged-training-imports-obey-the-nested-substitution-law
   ;; Preparation compiles the ORIGINAL caller only; it executes no model code.
   ;; A promoted definition discards the complete owner and is recaptured below.
+  (core/prepare-deftm-frontend! (core/resolve-deftm-var #'training/local-loss))
   (entry/call-with-definition-inputs
    (fn []
      (let [frontend (entry/original-source-frontend (core/resolve-deftm-var #'training/local-loss))]
@@ -183,7 +215,35 @@
                  (is (= 'raster.dl.nn/linear-nb (descriptor/semantic-op (:source-operand slot))))
                  (is (= :checkcast (get-in slot [:input-completion :adaptation])))
                  (is (.isArray ^Class (get-in slot [:input-completion :parameter-carrier])))
-                 (is (nil? (:executor slot))))))))))))
+                 (is (nil? (:executor slot)))))))
+         (let [parent (first (filter #(= 'raster.dl.nn/linear-nb (descriptor/semantic-op (:caller %))) selected))
+               body (:walked-body parent)
+               imported (transport/body-import-view (:source-import parent) body)
+               originals (tree-seq coll? seq (:body (:frontend imported)))
+               calls (filter #(contains? '#{raster.arrays/alloc-like raster.numeric/oftype}
+                                        (descriptor/semantic-op %)) (tree-seq coll? seq body))]
+           (is (= '#{raster.arrays/alloc-like raster.numeric/oftype}
+                  (set (map descriptor/semantic-op calls))))
+           (doseq [call calls]
+             (let [origin (transport/body-import-occurrence (:source-import parent) body call)]
+               (is (some? origin))
+               (is (identical? (:frontend imported) (:frontend origin)))
+               (is (some #(identical? (:original origin) %) originals))
+               (is (identical? call (:constructed origin)))))
+           (let [children (filter #(contains? '#{raster.arrays/alloc-like raster.numeric/oftype}
+                                              (descriptor/semantic-op (:caller %))) events)]
+             (is (= 3 (count children)))
+             (doseq [child children]
+               (let [caller (:caller child)
+                     construction (:source-construction @captured)
+                     derived (inline/nested-substitution-call-origin construction (:expansion parent) caller)]
+                 (is (some? derived))
+                 (is (identical? (:frontend imported) (get-in derived [:origin :frontend])))
+                 (is (some #(identical? (get-in derived [:origin :original]) %) originals))
+                 (is (identical? (:expansion parent) (get-in derived [:parent :builder :expansion])))
+                 (is (nil? (inline/nested-substitution-call-origin construction (into {} (:expansion parent)) caller)))
+                 (is (nil? (inline/nested-substitution-call-origin construction (:expansion parent)
+                                                                  (with-meta (apply list caller) (meta caller))))))))))))))
 
 (deftest selected-call-frames-do-not-outline-or-execute-original-arguments
   (let [{:keys [source-construction normalization] :as captured} (capture)

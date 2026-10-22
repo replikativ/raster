@@ -416,8 +416,8 @@
    all of which this pass's former hand-rolled version mis-handled or dropped
    into a capturing `:else`). `subst-sym-leaf` is passed as the leaf policy so
    use-site metadata is preserved onto the replacement (type-tag propagation)."
-  [smap expr]
-  (util/subst-syms smap expr subst-sym-leaf))
+  ([smap expr] (util/subst-syms smap expr subst-sym-leaf))
+  ([smap expr observe!] (util/subst-syms smap expr subst-sym-leaf observe!)))
 
 (defn- subst-syms-safe
   "Like subst-syms but also rewrites devirtualized core array ops to
@@ -485,7 +485,11 @@
                                      (identical? init (:argument slot)))) bindings lifted)))
         (let [substitutions (into {} (map (fn [{:keys [formal argument binder]}]
                                             [formal (or binder argument)]) slots))
-              expected (subst-syms substitutions body)
+              calls (volatile! [])
+              expected (subst-syms substitutions body
+                                   (fn [original constructed _]
+                                     (when (form/call-form? original)
+                                       (vswap! calls conj {:original original :constructed constructed}))))
               equivalent? (try (and (substitution-products-preserved? expected (:body expansion))
                                     (fingerprint/equivalent? expected (:body expansion)))
                                (catch clojure.lang.ExceptionInfo error
@@ -495,7 +499,7 @@
           (when equivalent?
             {:callee-import imported :argument-slots slots
              :argument-bindings bindings :substitutions substitutions
-             :body (:body expansion)}))))))))))
+             :body (:body expansion) :replayed-body expected :replayed-calls @calls}))))))))))
 
 (defn ^:no-doc nested-builder-substitution-view
   "Check a recorded nested frame's local substitution without equating its caller
@@ -510,6 +514,44 @@
                        :params (:parameters callee-import) :tags (:tags callee-import)}
                       arguments expansion)]
          {:builder event :substitution law})))))
+
+(defn- aligned-call-occurrences [expected actual]
+  ;; Only used AFTER the complete substitution law and product checks pass.
+  ;; Locations, not names or equal-form searches, relate the replay to the
+  ;; exact recorded output. Opaque data is never traversed as code.
+  (let [calls (volatile! [])]
+    (letfn [(visit [left right]
+              (when (form/call-form? left)
+                (vswap! calls conj {:expected left :actual right}))
+              (when (and (or (seq? left) (vector? left))
+                         (not (and (seq? left) (#{'quote 'clojure.core/quote} (first left)))))
+                (doseq [[a b] (map vector left right)] (visit a b))))]
+      (visit expected actual)
+      @calls)))
+
+(defn ^:no-doc nested-substitution-call-origin
+  "Derive a child call's import-local origin from one checked recorded parent.
+   Replay edges are produced internally only; copies/repeated occurrences and
+   calls introduced by argument substitution acquire no imported-body origin.
+   The retained parent law remains a prerequisite, not execution permission."
+  [construction parent-expansion child]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [builder substitution] :as checked}
+                (nested-builder-substitution-view construction parent-expansion)]
+       (let [aligned (aligned-call-occurrences (:replayed-body substitution) (:body substitution))
+             matches (filterv #(identical? child (:actual %)) aligned)]
+         (when (= 1 (count matches))
+           (let [expected (:expected (first matches))
+                 edges (:replayed-calls substitution)
+                 replay (source-transport/unique-construction-edge edges expected)
+                 ;; Empty substitution preserves the original subtree by identity.
+                 qualified (or (:original replay)
+                               (when (and (empty? (:substitutions substitution))
+                                          (identical? expected child)) child))]
+             (when-let [origin (source-transport/body-import-occurrence
+                               (:source-import builder) (:walked-body builder) qualified)]
+               {:parent checked :origin origin :constructed child}))))))))
 
 (defn ^:no-doc nested-original-call-frame
   "Join a checked nested substitution to original selected input completions.

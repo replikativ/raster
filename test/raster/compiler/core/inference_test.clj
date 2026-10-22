@@ -14,6 +14,29 @@
       (is (= 1.0 (eval (inf/qualify-body-symbols source scope #{}))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest source-qualification-construction-and-resolution-observers-are-independent
+  (let [scope (create-ns (gensym "raster.qualified-construction."))
+        call '(inc n) local '(f x) quoted '(quote [(inc n)])
+        source (list 'let* ['x call] (list 'fn* ['f] local) quoted)
+        constructors (atom []) resolutions (atom [])]
+    (try
+      (binding [*ns* scope] (clojure.core/refer 'clojure.core))
+      (let [projected (inf/qualify-body-symbols source scope '#{n} #(swap! resolutions conj %)
+                                               #(swap! constructors conj [%1 %2 %3]))
+            observed (fn [original] (first (filter #(identical? original (first %)) @constructors)))]
+        (is (= projected (inf/qualify-body-symbols source scope '#{n})))
+        (is (identical? projected (second (observed source))))
+        (is (= '(clojure.core/inc n) (second (observed call))))
+        (is (= local (second (observed local))))
+        (is (= '#{x f} (nth (observed local) 2)))
+        (is (identical? quoted (second (observed quoted))))
+        (is (nil? (observed (first (second quoted)))))
+        (is (some #(= #'clojure.core/inc (:result %)) @resolutions)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"construction observer failed"
+                           (inf/qualify-body-symbols call scope '#{n} nil
+                             (fn [& _] (throw (ex-info "construction observer failed" {}))))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest source-qualification-threads-sequential-and-recursive-scopes
   (let [scope (create-ns (gensym "raster.qualified-sequential."))]
     (try

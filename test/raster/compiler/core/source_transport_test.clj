@@ -5,12 +5,17 @@
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.inline :as inline]))
 
 (deftm scoped-helper [n :- Long] :- Long
   (let [x n]
     (let [x (inc x)]
       (+ x n))))
+
+(deftm multiform-import-helper [n :- Long] :- Long
+  (clojure.core/identity n)
+  (clojure.core/inc n))
 
 (def unrelated-input 7)
 (def frontier-numerical-calls (atom 0))
@@ -243,6 +248,57 @@
         (is (= :stale-definition-proof-input (reason #(view imported))))
         (finally (reset-meta! #'scoped-helper_m_long metadata))))))
 
+(deftest imported-call-occurrences-follow-actual-hygiene-and-qualification
+  (doseq [source [#'scoped-helper_m_long #'multiform-import-helper_m_long]]
+    (let [imported (entry/call-with-definition-inputs #(#'inline/try-resolve-walked-body source))
+          {:keys [frontend walked-body]} (view imported)
+          input (:source-import imported)
+          originals (filter form/call-form? (tree-seq coll? seq (:body frontend)))
+          calls (filter form/call-form? (tree-seq coll? seq walked-body))
+          forbidden (fn [& _] (throw (AssertionError. "occurrence query reconstructed an import")))]
+      (is (seq calls))
+      (with-redefs [util/alpha-convert forbidden inference/qualify-body-symbols forbidden]
+        (entry/call-with-definition-inputs
+         (fn []
+           (doseq [call calls]
+             (let [origin (transport/body-import-occurrence input walked-body call)]
+               (is (some? origin))
+               (is (identical? frontend (:frontend origin)))
+               (is (some #(identical? (:original origin) %) originals))
+               (is (identical? call (:constructed origin)))
+               (is (identical? (:hygienic origin) (get-in origin [:qualification-construction :original]))))))))
+      (let [owner (atom {:static [] :values []}) before @owner call (first calls)]
+        (is (nil? (transport/body-import-occurrence input walked-body call)))
+        (binding [entry/*emission-inputs* owner]
+          (doseq [[body call] [[(mapv identity walked-body) call]
+                               [walked-body (with-meta (apply list call) (meta call))]
+                               [walked-body '(quote (foreign n))]]]
+            (is (nil? (transport/body-import-occurrence input body call)))
+            (is (identical? before @owner))))))))
+
+(deftest ambiguous-import-construction-events-abstain-without-dependencies
+  (let [original '(call n)
+        left (apply list original) right (apply list original)
+        events [{:original original :constructed left} {:original original :constructed right}]]
+    (is (not (identical? left right)))
+    (is (nil? (#'transport/unique-construction-edge events left)))
+    (is (nil? (#'transport/unique-construction-edge events right))))
+  (let [qualify inference/qualify-body-symbols
+        imported (with-redefs [inference/qualify-body-symbols
+                               (fn [body scope params resolution construction]
+                                 (qualify body scope params resolution
+                                          (fn [original constructed bound]
+                                            (construction original constructed bound)
+                                            (construction original constructed bound))))]
+                   (imported-helper))
+        {:keys [walked-body]} (view imported)
+        call (first (filter form/call-form? (tree-seq coll? seq walked-body)))
+        owner (atom {:static [] :values []}) before @owner]
+    (is (some? call))
+    (binding [entry/*emission-inputs* owner]
+      (is (nil? (transport/body-import-occurrence (:source-import imported) walked-body call)))
+      (is (identical? before @owner)))))
+
 (deftest body-import-history-excludes-unrelated-parent-dependencies
   (let [parent (atom {:static [] :values []})
         imported (binding [entry/*emission-inputs* parent]
@@ -336,7 +392,11 @@
         source (get-in description [:frontend :source-entry :source-var])
         metadata (meta source)
         raw (:raster.core/deftm-source-body metadata)
-        copied (with-meta (mapv identity raw) (meta raw))]
+        copied (with-meta (mapv identity raw) (meta raw))
+        call (first (filter form/call-form? (tree-seq coll? seq (:walked-body imported))))
+        occurrence-owner (atom {:static [] :values []})]
+    (binding [entry/*emission-inputs* occurrence-owner]
+      (is (some? (transport/body-import-occurrence (:source-import imported) (:walked-body imported) call))))
     (try
       (is (not (identical? raw copied)))
       (alter-meta! source assoc :raster.core/deftm-source-body copied)
@@ -346,4 +406,11 @@
       ;; must retain the original source identity after successful adoption.
       (is (= :stale-definition-proof-input
              (reason #(entry/assert-definition-inputs-current! @owner))))
+      (is (= :stale-definition-proof-input
+             (reason #(entry/assert-definition-inputs-current! @occurrence-owner))))
+      (let [parent (atom {:static [] :values []}) before @parent]
+        (binding [entry/*emission-inputs* parent]
+          (is (= :stale-definition-proof-input
+                 (reason #(transport/body-import-occurrence (:source-import imported) (:walked-body imported) call))))
+          (is (identical? before @parent))))
       (finally (reset-meta! source metadata)))))

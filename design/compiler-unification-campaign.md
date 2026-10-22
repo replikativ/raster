@@ -776,6 +776,54 @@ builder, consume them in source-prefix call intervals, and prepare only closed
 original argument outlines. Missing callee/allocation/return obligations still
 refuse. The broad draft and the original eight completion gates remain open.
 
+### October 21 import-local and checked substitution occurrences
+
+Shared alpha conversion and source qualification now expose optional constructor
+observers, separate from resolution-history observation. BodyImport retains only
+actual call-node edges in two explicit phase-indexed vectors, using the same
+`form/call-form?` classification as bytecode InputOrigins. No lexical environments
+are retained. Identity edges remain meaningful within a phase. The guarded query
+joins exact qualified → hygienic → original occurrences; copies, repeated originals,
+ambiguous outputs and stale source/import history refuse without publishing partial
+parent dependencies. Quote opacity, sequential/recursive scope and auxiliary source
+bodies remain governed by the existing shared lexical walkers. Normalization uses
+the same identity-uniqueness check rather than retaining a duplicate implementation.
+
+The parent-expansion relation is derived, not another passive trace. During the
+independent full substitution-law check, the shared substituter internally records
+imported-call → replay-call edges. Only after the complete metadata/raw-bit/product
+check succeeds does structural-position alignment relate those calls to the exact
+recorded builder body. Unique child and replay origins then compose with BodyImport.
+Generated names/equal-form searches and caller-supplied edges supply no authority.
+Calls introduced solely through argument substitution, including one object used
+twice, cannot acquire imported-body origins. The checked parent law/history stays
+attached. Locally exhausted substitution environments may still conservatively
+abstain; the existing empty-map fast path is not expanded into a second traversal.
+
+The unchanged production `local-loss` now recovers original `alloc-like` and both
+`oftype` caller occurrences from the actual `linear-nb` expansion. This closes their
+previous missing import-local occurrence relation, not their selected/completed
+execution frame. Existing original selected Method/implementation checks, formal
+completion, resident prediction/length correspondence and final interval placement
+remain required. No host numerical recomputation, download or execution fallback
+is introduced.
+
+Independent review found no blocker after ambiguity/staleness controls. Replacing
+only the owned capped REPL for the changed private record layout exposed a former
+warm-test assumption: the training frontend needed explicit non-evaluating
+preparation before its original caller could be compiled. The regression now does
+that through the shared service. Reused-process gates after that fresh load pass:
+80 lexical/inference/import tests / 463 assertions; 64 transport/inliner/construction
+tests / 523 assertions; 136 source/bytecode/AD ownership tests / 1,579 assertions.
+The first two gates overlap; these are not additive unique-suite totals.
+
+JVM observations remain an import bridge for faithful existing Clojure semantics,
+not a permanent requirement for native TypedSOAC operations with direct semantic
+contracts. The next consumer must close and consume actual frames in execution,
+then retain compact checked obligations rather than proliferating whole histories.
+Preparation, validation and emitted-module costs require separate measurements.
+The broad draft CI and all eight campaign completion gates remain open.
+
 ### October 21 original selected invocation frames
 
 The checked nested builder now joins an actual original selected call without

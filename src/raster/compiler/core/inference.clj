@@ -1846,9 +1846,13 @@ stable physical-leaf order on every backend."}
    Lexical scopes come from form/scope-info; quoted data is opaque. Structural
    classes use class-only qualification, independently of lexical binders.
    An optional observer receives the actual resolution decisions; it is not a
-   source correspondence or permission to execute the transformed body."
+   source correspondence or permission to execute the transformed body. A separate
+   optional construction observer receives actual [original constructed bound]
+   returns, without conflating those origins with resolution or equivalence."
   ([body source-ns param-set] (qualify-body-symbols body source-ns param-set nil))
   ([body source-ns param-set observe!]
+   (qualify-body-symbols body source-ns param-set observe! nil))
+  ([body source-ns param-set observe! construct!]
   (let [resolve! (fn [symbol]
                    (let [result (try (ns-resolve source-ns symbol) (catch Exception _ nil))]
                      (when observe! (observe! {:kind :symbol-resolution :source-ns source-ns
@@ -1883,7 +1887,9 @@ stable physical-leaf order on every backend."}
               (descriptor/aset-op? sym)
               (= 'alength sym)))
         qualify (fn qualify [expr bound]
-                  (cond
+                  (let [original expr
+                        constructed
+                   (cond
                     (symbol? expr)
                     (with-meta (cond
                       (or (contains? param-set expr)
@@ -1956,7 +1962,9 @@ stable physical-leaf order on every backend."}
                                                                    [(qualify key bound) (qualify value bound)])) expr)
                                           (meta expr))
                     (set? expr) (with-meta (into (empty expr) (map #(qualify % bound)) expr) (meta expr))
-                    :else expr))]
+                    :else expr)]
+                    (when construct! (construct! original constructed bound))
+                    constructed))]
     (qualify body #{}))))
 
 ;; ================================================================
