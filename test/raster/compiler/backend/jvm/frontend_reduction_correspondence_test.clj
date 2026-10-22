@@ -64,6 +64,122 @@
 (defn- reduction-forms [body]
   (filter par-ir/par-reduce-form? (tree-seq coll? seq body)))
 
+(defn- with-fresh-reduction-binding [float? split? run]
+  ;; Fresh source owners keep forced-split/unsplit coverage independent of test
+  ;; order and of the bytecode already cached by another REPL qualification.
+  (let [scope (create-ns (gensym "raster.test.extracted."))]
+    (try
+      (binding [*ns* scope
+                entry/*emission-inputs* (atom {:static [] :values []})]
+        (refer 'clojure.core)
+        (eval (if float?
+                '(raster.core/deftm objective [xs :- (Array float)] :- Float
+                   (let [sum (raster.par/reduce acc (float 0.0) i 1
+                               (raster.numeric/+ acc (aget xs i)))
+                         reciprocal (raster.numeric// (float 1.0) sum)]
+                     reciprocal))
+                '(raster.core/deftm objective [xs :- (Array double)] :- Double
+                   (let [sum (raster.par/reduce acc 0.0 i 1
+                               (raster.numeric/+ acc (aget xs i)))
+                         reciprocal (raster.numeric// 1.0 sum)]
+                     reciprocal))))
+        (with-redefs [split/estimate-form-size (constantly (if split? 1000000 0))]
+          (run (captured (ns-resolve scope 'objective)))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest extracted-reduction-keeps-actual-helper-return-and-binding-boundaries
+  (doseq [float? [false true]]
+    (with-fresh-reduction-binding
+      float? true
+      (fn [frontend]
+        (let [scope (first (:body frontend))
+              original (nth (second scope) 1)
+              observed (entry/frontend-extracted-reduction-binding frontend scope 0)
+              method (get-in observed [:helper :method])
+              actual (if float? Float/TYPE Double/TYPE)]
+          (is (some? observed))
+          (is (identical? original (:source-input observed)))
+          (is (identical? scope (:scope-input observed)))
+          (is (= :ref (get-in observed [:helper :emitted-result-type])))
+          (is (= actual (.getReturnType ^java.lang.reflect.Method method)))
+          (is (= (if float? :float :double)
+                 (get-in observed [:helper :return-stack-type])
+                 (get-in observed [:binding :after :type])))
+          (is (= :module-static (get-in observed [:invocation :invocation-mode])))
+          (is (= method (get-in observed [:invocation :method])))
+          (is (identical? (get-in observed [:binding :initializer])
+                          (get-in observed [:invocation :expression])))
+          (is (= Object (get-in observed [:reduction :result-fact :carrier]))
+              "the reduction Object payload is not relabelled as its helper return")
+          (is (nil? (entry/frontend-extracted-reduction-binding
+                     frontend (with-meta (apply list scope) (meta scope)) 0)))
+          (doseq [index [-1 1 2 Long/MAX_VALUE nil 0.5]]
+            (is (nil? (entry/frontend-extracted-reduction-binding frontend scope index)))))))))
+
+(deftest unsplit-reduction-does-not-invent-an-extracted-helper
+  (with-fresh-reduction-binding
+    false false
+    (fn [frontend]
+      (let [scope (first (:body frontend))]
+        (is (some? (entry/frontend-reduction-emission frontend (nth (second scope) 1))))
+        (is (nil? (entry/frontend-extracted-reduction-binding frontend scope 0)))))))
+
+(deftest extracted-binding-requires-the-complete-physical-chain
+  (with-fresh-reduction-binding
+    true true
+    (fn [frontend]
+      (let [scope (first (:body frontend))
+            emission (:emission frontend)
+            observed (entry/frontend-extracted-reduction-binding frontend scope 0)
+            helper (:helper observed)
+            body-token (get-in observed [:invocation :target-body])
+            call-token (:raster.compiler.backend.jvm.bytecode/call-occurrence
+                        (meta (get-in helper [:extraction :replacement])))
+            body-path [:body-contexts body-token]
+            call-path [:invocation-contexts call-token]
+            root-path [:reduction-contexts [(get-in observed [:reduction :expansion :witness])
+                                           :bound-scope] :root-result]
+            query #(bytecode/retained-input-extracted-reduction-binding % (:body frontend) scope 0)
+            foreign (.getMethod Double "valueOf" (into-array Class [Double/TYPE]))]
+        (is (some? (query emission)))
+        (doseq [[path value]
+                [[body-path nil]
+                 [(conj body-path :method) foreign]
+                 [(conj body-path :method-owner) Double]
+                 [(conj body-path :return-stack-type) :double]
+                 [(conj body-path :return-descriptor) "D"]
+                 [(conj body-path :emitted-result-type) :long]
+                 [(conj body-path :emitted-result-type) :float]
+                 [(conj body-path :emitted-result-type) :double]
+                 [(conj body-path :body) 42]
+                 [root-path nil]
+                 [(conj root-path :context) {}]
+                 [(into body-path [:extraction :source]) (apply list (get-in helper [:extraction :source]))]
+                 [(conj body-path :body) [(apply list (first (:body helper)))]]
+                 [(conj call-path :status) :ambiguous]
+                 [(conj call-path :invocation-mode) :global-typed-indy]
+                 [(conj call-path :target-body) (Object.)]
+                 [(conj call-path :target-owner) nil]
+                 [(conj call-path :target-descriptor) "([F)D"]
+                 [(conj call-path :input-completions) []]
+                 [(conj call-path :inputs) 42]
+                 [(conj call-path :input-completions) 42]
+                 [(into call-path [:input-completions 0]) 42]
+                 [(into call-path [:inputs 0 :ports]) 42]
+                 [(into call-path [:input-completions 0 :parameter-descriptor]) "[D"]
+                 [(into call-path [:input-completions 0 :target-stack-type]) :double]
+                 [(into call-path [:input-completions 0 :emitted-type]) :double]
+                 [(conj call-path :expression) (apply list (get-in observed [:binding :initializer]))]
+                 [[:invocation-catalog call-token]
+                  (with-meta (apply list (get-in helper [:extraction :replacement]))
+                    (meta (get-in helper [:extraction :replacement])))]]]
+          (is (nil? (query (assoc-in emission path value))) (str "incomplete extraction edge: " path)))
+        (is (nil? (query (assoc-in emission [:body-contexts (Object.)] helper)))
+            "multiple helper owners of the same occurrence are ambiguous")
+        (is (nil? (entry/frontend-extracted-reduction-binding
+                   (assoc frontend :emission (assoc-in emission (conj body-path :method) foreign)) scope 0))
+            "a copied/edited emission cannot acquire frontend authority")))))
+
 (deftest method-extraction-retains-bindings-but-not-original-initializers
   ;; Size is a compiler decision; force it without depending on source size or
   ;; redefining the compile-time constant TARGET-SIZE. No original body is run

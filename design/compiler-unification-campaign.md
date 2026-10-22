@@ -364,6 +364,23 @@ extra uses, unchecked count substitution, insufficient/null storage, changed
 recurrence/association and missing read-domain evidence. The arithmetic flags
 remain until this complete join—not result typing alone—justifies their discharge.
 
+The next physical prerequisite is now observed across method extraction: the
+producer retains original reduction → exact helper body → resolved static
+Method/return boundary → actual static argument conversions → exact bound local.
+It reuses existing body/invocation catalogs and historical module guards;
+generated calls receive no frontend origins and use a distinct `:module-static`
+mode. Reduction root and helper body result carriers/contexts must agree. The
+body-carrier/Method-return pair describes an actual conversion, not its identity,
+nonthrowingness or numerical equivalence. Missing, ambiguous, edited, foreign or
+malformed links abstain. No scheduling/admission rule or numerical code changed.
+
+Independent review caught and verified fixes to root/result joining, malformed
+record guards and oversized indices. Affected qualification passes 96 tests /
+1,393 assertions across seven ownership/input/return/source-construction
+namespaces; the new forced-split/unsplit Float/Double boundary and negative controls
+account for 3 tests / 67 assertions within that total. Full interval/count/read
+correspondence and use-closed consumer placement still remain to be connected.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction

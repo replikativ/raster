@@ -3508,7 +3508,12 @@
 
     ;; ---- Sibling method call ----
         (and (symbol? head) (get (:sibling-methods ctx) (str head)))
-        (let [{:keys [method-name method-type param-descs owner]} (get (:sibling-methods ctx) (str head))]
+        (let [{:keys [method-name method-type param-descs owner body-token]}
+              (get (:sibling-methods ctx) (str head))
+              completions (when (and me/*emission-inputs* body-token
+                                     (= owner (:class-desc ctx))
+                                     (= (count args) (count param-descs)))
+                            (atom []))]
           (doseq [[a pd] (map vector args (concat param-descs (repeat obj-cd)))]
             (let [t (if (.equals ^ClassDesc pd obj-cd)
                       (emit-object-value code a locals ctx)
@@ -3522,8 +3527,23 @@
               (if (and (= t :ref) (= target-st :ref) (not (.equals ^ClassDesc pd obj-cd)))
                 (.checkcast code pd)
                 (when (not= t target-st)
-                  (emit-coerce code t target-st)))))
+                  (emit-coerce code t target-st)))
+              (when completions
+                (swap! completions conj {:emitted-type t :target-stack-type target-st
+                                         :parameter-descriptor (.descriptorString ^ClassDesc pd)}))))
           (.invokestatic code (or owner (:class-desc ctx)) method-name method-type)
+          ;; An extraction-local static call is not a selected typed-indy call.
+          ;; Record what was actually emitted; resolve its Method only against
+          ;; the exact helper body's late attachment in the owning module.
+          (when completions
+            (retain-call-observation!
+             ctx :invocation-contexts
+             {:status :known :invocation-mode :module-static
+              :target-body body-token :target-owner owner :target-name method-name
+              :target-descriptor (.descriptorString ^MethodTypeDesc method-type)
+              :inputs (mapv #(physical-operand-input % locals ctx) args)
+              :input-completions @completions}
+             :repeated-emitted-invocation-context))
           ;; Return type from method descriptor
           (let [ret-cd (.returnType method-type)]
             (cond (.equals ^ClassDesc ret-cd D-cd) :double
@@ -5764,7 +5784,7 @@
         ;; Build method type descriptors for fn-specs
         ;; Handle both symbol params and destructuring vectors
         ;; Detect ^double/^long hints to generate primitive param types
-        method-specs (mapv (fn [{:keys [name params return-tag]}]
+        method-specs (mapv (fn [{:keys [name params return-tag walked-body]}]
                              (let [method-name (clojure.lang.Compiler/munge (str name))
                                    ;; Each param is either a symbol or a vector (destructuring)
                                    ;; Both become a single method param
@@ -5783,6 +5803,7 @@
                                    mt (MethodTypeDesc/of ret-cd
                                                          (into-array ClassDesc param-descs))]
                                {:name name
+                                :body-token (::body-occurrence (meta walked-body))
                                 :method-name method-name
                                 :method-type mt
                                 :params method-params
@@ -5847,7 +5868,8 @@
                                    {:keys [walked-body element-type source-ns]
                                     input-port-layout ::input-port-layout
                                     body-input-context ::body-input-context
-                                    expected-body-type ::expected-body-type}]
+                                    expected-body-type ::expected-body-type
+                                    extracted-region ::extracted-region}]
                                   (map vector method-specs fn-specs)]
                             (.withMethodBody cb method-name method-type
                                              (int 0x0009)  ;; PUBLIC + STATIC
@@ -5966,6 +5988,7 @@
                                                                       (if (contains? contexts token)
                                                                         (assoc contexts token {:status :ambiguous})
                                                                         (assoc contexts token {:status :known :body walked-body
+                                                                                              :extraction extracted-region
                                                                                               :locals locals
                                                                                               :unretained-sibling-calls?
                                                                                               (method-local-callee-candidate? expanded-body ctx)
@@ -6127,7 +6150,7 @@
                      (fn [record]
                        (if (and (= :known (:status record))
                                 (identical? body (:body record)))
-                         (assoc record :method method
+                         (assoc record :method method :method-owner cls
                                 :return-descriptor (.descriptorString
                                                     (.getReturnType ^java.lang.reflect.Method method)))
                          record)))))]
@@ -6276,6 +6299,87 @@
   [emission input-body original]
   (when-let [record (retained-input-invocation-context emission input-body original)]
     (when (completed-invocation-inputs? record) record)))
+
+(defn ^:no-doc retained-input-extracted-reduction-binding
+  "Observe an extraction-owned reduction/helper/invocation/binding chain.
+   This conditional physical boundary grants no count/read, successful execution,
+   value correspondence, movement or GPU admission. Missing links abstain; no
+   helper is discovered by its spelling or a boxed payload's logical dtype.
+   The observed body carrier/Method return pair describes the actual return
+   adaptation; it proves neither that adaptation's identity nor nonthrowingness."
+  [emission input-body original-scope index]
+  (when (and (integer? index) (<= 0 index)
+             (seq? original-scope) (form-ir/binding-form? original-scope)
+             (vector? (second original-scope))
+             (even? (count (second original-scope)))
+             (< index (quot (count (second original-scope)) 2)))
+    (let [original (nth (second original-scope) (inc (* 2 index)) nil)
+          owned (input-origin emission input-body original :reduction)
+          observed (when owned (retained-reduction-emission emission owned))
+          bound (when observed
+                  (retained-input-binding-context emission input-body original-scope index))
+          candidates (when (and owned (map? (:body-contexts emission)))
+                       (filterv #(identical? owned (get-in (val %) [:extraction :source]))
+                                (:body-contexts emission)))]
+      (when (and bound (= 1 (count candidates)))
+        (let [[token body] (first candidates)
+              replacement (get-in body [:extraction :replacement])
+              invocation (retained-invocation-context emission replacement)
+              ^java.lang.reflect.Method method (:method body)
+              parameters (when (instance? java.lang.reflect.Method method)
+                           (vec (.getParameterTypes method)))
+              method-descriptor (when parameters
+                                  (.descriptorString
+                                   (java.lang.invoke.MethodType/methodType
+                                    (.getReturnType method) (.getParameterTypes method))))]
+          (when (and (= :known (:status body))
+                     (vector? (:body body))
+                     (identical? token (::body-occurrence (meta (:body body))))
+                     (= 1 (count (:body body))) (identical? owned (first (:body body)))
+                     (map? (:root-result observed))
+                     (= (:emitted-result-type body) (get-in observed [:root-result :result-type]))
+                     (= (:result-context body) (get-in observed [:root-result :context]))
+                     (instance? java.lang.reflect.Method method)
+                     (identical? (:method-owner body) (.getDeclaringClass method))
+                     (java.lang.reflect.Modifier/isStatic (.getModifiers method))
+                     (= :module-static (:invocation-mode invocation))
+                     (identical? token (:target-body invocation))
+                     (= (.getName method) (:target-name invocation))
+                     (= method-descriptor (:target-descriptor invocation))
+                     (instance? ClassDesc (:target-owner invocation))
+                     (= (.descriptorString ^ClassDesc (:target-owner invocation))
+                        (.descriptorString (.getDeclaringClass method)))
+                     (= (:return-descriptor body) (.descriptorString (.getReturnType method)))
+                     (= (:return-stack-type body) (class-type->stack (.getReturnType method))
+                        (get-in bound [:after :type]))
+                     (contains? #{:ref :float :double} (:emitted-result-type body))
+                     (contains? #{:float :double} (:return-stack-type body))
+                     (identical? (:initializer bound) (:expression invocation))
+                     (map? (:before bound))
+                     (vector? (:inputs invocation)) (every? map? (:inputs invocation))
+                     (vector? (:input-completions invocation))
+                     (every? map? (:input-completions invocation))
+                     (= (count parameters) (count (:inputs invocation))
+                        (count (:input-completions invocation)))
+                     (every? true?
+                             (map (fn [input completed ^Class carrier]
+                                    (and (completion/bytecode-operand-context? (:context input))
+                                         (symbol? (:operand input))
+                                         (map? (:ports input))
+                                         (= #{(:operand input)} (set (keys (:ports input))))
+                                         (= (:ports input)
+                                            (select-keys (:before bound) (keys (:ports input))))
+                                         (= (:emitted-type completed)
+                                            (get-in input [:ports (:operand input) :type]))
+                                         (= (:parameter-descriptor completed) (.descriptorString carrier))
+                                         (= (:target-stack-type completed) (class-type->stack carrier))
+                                         (contains? #{:ref :int :long :float :double :bool}
+                                                    (:emitted-type completed))))
+                                  (:inputs invocation) (:input-completions invocation) parameters)))
+            (me/assert-emission-inputs-current! emission)
+            {:source-input original :scope-input original-scope :ordinal index
+             :reduction observed :helper body :binding bound
+             :invocation (assoc invocation :method method)}))))))
 
 (defn ^:no-doc compile-invocation-input-region
   "Outline one original FP, Int/Long or CHECKCAST input using its bytecode emitter.
@@ -6570,6 +6674,9 @@
                                 helper-params (mapv (fn [p]
                                                       (vary-meta p assoc :tag (tag-for-sym p)))
                                                     ordered-free)
+                                helper-body (with-meta [form] {::body-occurrence (Object.)})
+                                replacement (with-meta (apply list helper-name ordered-free)
+                                              {::call-occurrence (Object.)})
                                 ;; Infer array tag from :cast field (float → floats, double → doubles)
                                 cast->arr-tag (fn [cast-sym]
                                                 (case cast-sym
@@ -6593,13 +6700,20 @@
                                                   (when (not= t 'Object) t)))
                                               (cast->arr-tag (:cast info))
                                               'doubles))]
+                            ;; Extraction owns this edge. The replacement is not an
+                            ;; original frontend call and gets no InputOrigins edge.
+                            (when me/*emission-inputs*
+                              (swap! me/*emission-inputs* assoc-in
+                                     [:invocation-catalog (::call-occurrence (meta replacement))]
+                                     replacement))
                             (swap! helpers conj
                                    {:name helper-name
                                     :params helper-params
                                     :return-tag ret-tag
-                                    :walked-body [form]
+                                    :walked-body helper-body
+                                    ::extracted-region {:source form :replacement replacement}
                                     :source-ns source-ns})
-                            (apply list helper-name ordered-free))
+                            replacement)
                           ;; Not a par form — keep as-is
                           form)))
         ;; Rewrite let-binding init expressions

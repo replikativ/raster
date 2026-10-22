@@ -395,7 +395,9 @@
                      owned-body source-ns typed-interface (str (ns-name source-ns)) (str mangled-sym)))
           emission {:backend :jvm-bytecode :implementation implementation
                     :params params :tags tags :return-tag return-tag :body owned-body :source-ns source-ns
-                    :invocation-catalog invocation-catalog
+                    ;; Extraction-local generated calls have actual emission
+                    ;; observations, but intentionally no frontend InputOrigins.
+                    :invocation-catalog (merge invocation-catalog (:invocation-catalog @inputs))
                     :binding-catalog binding-catalog :binding-contexts (:binding-contexts @inputs)
                     :floating-conversion-contexts (:floating-conversion-contexts @inputs)
                     :array-read-contexts (:array-read-contexts @inputs)

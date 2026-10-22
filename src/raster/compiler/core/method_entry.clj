@@ -970,6 +970,14 @@
   (frontend-occurrence-observation frontend original
     'raster.compiler.backend.jvm.bytecode/retained-input-binding-context index))
 
+(defn frontend-extracted-reduction-binding
+  "Conditional physical join across an actual extracted reduction helper.
+   Retains the original whole module history. No numerical/count/read equivalence,
+   evaluation success, scheduling or resident execution permission is granted."
+  [frontend original-scope index]
+  (frontend-occurrence-observation frontend original-scope
+    'raster.compiler.backend.jvm.bytecode/retained-input-extracted-reduction-binding index))
+
 (defn prepare-frontend-invocation-input!
   "Compile an ORIGINAL invocation argument with its actual positional completion.
    Requires a collecting owner and an authenticated unchanged frontend/emission.
