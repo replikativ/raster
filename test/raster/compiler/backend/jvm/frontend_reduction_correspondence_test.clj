@@ -88,7 +88,7 @@
   (let [scope (create-ns (gensym "raster.test.extracted."))]
     (try
       (binding [*ns* scope
-                entry/*emission-inputs* (atom {:static [] :values []})]
+                entry/*emission-inputs* nil]
         (refer 'clojure.core)
         (let [declaration (if float?
                 '(raster.core/deftm objective [xs :- (Array float)] :- Float
@@ -121,7 +121,12 @@
                        frontend (entry/original-source-frontend source)
                        input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))]
                    (prefix/prepare-reduction-entry! input core/ensure-current-owned-bytecode!)))))
-            (run (captured function)))))
+            ;; Compilation owns its whole retryable attempt. Assertions below
+            ;; are read-only observations, not an enclosing producer that can
+            ;; retain history across a cold helper's promotion.
+            (let [frontend (entry/call-with-definition-inputs #(captured function))]
+              (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+                (run frontend))))))
       (finally (remove-ns (ns-name scope)))))))
 
 (defn- with-terminal-interval
@@ -157,12 +162,13 @@
                (fn [context program]
                  (assoc @retained :frontend (:retained-frontend context) :program program
                         :source-var (:source-var context)))}
-              #(equation/compile (get-in original [:source-entry :source-var])
+              #(binding [entry/*emission-inputs* nil]
+                 (equation/compile (get-in original [:source-entry :source-var])
                                  {:target :ocl:reduction-terminal-test
                                   :dtype (if float? :float :double)}
                                  {:device-id :ocl:reduction-terminal-test :device-type :gpu
                                   :backend :ocl :subgroup-dialect :opencl-portable
-                                  :max-workgroup-size 256}))]
+                                  :max-workgroup-size 256})))]
         ;; No numerical execution occurs inside the compiler's retryable proof
         ;; transaction. The namespace/definition owner remains live for run.
         (run captured))))))
