@@ -819,7 +819,13 @@
     (when-let [inputs me/*emission-inputs*]
       (let [key [token index]
             record {:status :known :binding-count binding-count :binder binder :initializer initializer
-                    :before before :after after}]
+                    :before before :after after
+                    ;; Do not walk every initializer to compute its free ports.
+                    ;; Most retained bindings are never outlined. Save only the
+                    ;; immutable emission facets needed by a requested region.
+                    :input-context (completion/bytecode-operand-context ctx)
+                    :local-callee-names (:local-callee-names ctx)
+                    :element-type (:element-type ctx)}]
         (swap! inputs update :binding-contexts
                (fn [contexts]
                  (if (contains? contexts key)
@@ -1502,7 +1508,8 @@
                                                                     ;; stack-map frame → VerifyError in SIMD closures).
                                                                     :element-type          (:element-type ctx)
                                                                     :sibling-methods       (:sibling-methods ctx)
-                                                                    :typed-sibling-methods (:typed-sibling-methods ctx)}
+                                                                    :typed-sibling-methods (:typed-sibling-methods ctx)
+                                                                    :local-callee-names (:local-callee-names ctx)}
                                                          expanded-body (map macroexpand-all-preserving body)
                                                          ret-type (emit-body code expanded-body param-locals inner-ctx)]
                                                ;; Box and return
@@ -3713,17 +3720,21 @@
    not retained by the input outliner. Match the emitter's actual lookup keys;
    this is not a function registry, dispatch proof or purity analysis."
   [expression ctx]
-  (cond
+  (let [names (or (:local-callee-names ctx)
+                  {:typed (set (keys (:typed-sibling-methods ctx)))
+                   :untyped (set (keys (:sibling-methods ctx)))})
+        ctx (assoc ctx :local-callee-names names)]
+   (cond
     (and (seq? expression) (contains? #{'quote 'clojure.core/quote} (first expression))) false
     (completion/canonical-parts expression)
     (method-local-callee-candidate? (:operand (completion/canonical-parts expression)) ctx)
     :else
     (boolean
      (or (and (seq? expression) (symbol? (first expression))
-              (or (contains? (:typed-sibling-methods ctx) (name (first expression)))
-                  (contains? (:sibling-methods ctx) (str (first expression)))))
+              (or (contains? (:typed names) (name (first expression)))
+                  (contains? (:untyped names) (str (first expression)))))
          (and (coll? expression)
-              (some #(method-local-callee-candidate? % ctx) expression))))))
+              (some #(method-local-callee-candidate? % ctx) expression)))))))
 
 (defn- emit-let*-handler
   "Emit bytecode for (let* [bindings...] body...).
@@ -3924,7 +3935,7 @@
                           (let [new-locs (assoc locs sym (cond-> {:slot slot :type t :hint tag
                                                           :verified (boolean (and tag (not= tag 'Object)))}
                                                          (= :ref t) (assoc :reference-class (or reference-class Object))))]
-                            (retain-binding-context! ctx (count pairs) (dec @binding-idx) sym init locs (get new-locs sym))
+                            (retain-binding-context! initializer-ctx (count pairs) (dec @binding-idx) sym init locs (get new-locs sym))
                             (when (and me/*emission-inputs* (= :bound-scope (::reduction-role ctx)))
                               (retain-reduction-observation!
                                ctx :bound-scope
@@ -5878,6 +5889,8 @@
                             deftm-refs)
         typed-sibling-methods (into {} (map (fn [ms] [(:method-name ms) ms])
                                             deftm-method-specs))
+        local-callee-names {:typed (set (keys typed-sibling-methods))
+                            :untyped (set (keys sibling-methods))}
         source-file (or (:source-file (first fn-specs))
                         (when-let [ns-obj (:source-ns (first fn-specs))]
                           (some-> ns-obj str
@@ -6002,6 +6015,7 @@
                                                             :element-type     element-type
                                                             :sibling-methods  sibling-methods
                                                             :typed-sibling-methods typed-sibling-methods
+                                                            :local-callee-names local-callee-names
                                                             :next-slot        next-slot
                                                             :source-ns        source-ns}
                                                        ctx (merge ctx body-input-context)
@@ -6454,6 +6468,45 @@
   (when-let [owned (input-origin emission input-body original :invocation)]
     (assoc (compile-invocation-input-region emission owned input-index)
            :source-input original :source-input-index input-index)))
+
+(defn ^:no-doc compile-input-binding-region
+  "Outline an exact original binding initializer, including its emitted result carrier.
+   Uses the same physical-port compiler as invocation inputs. This is execution
+   preparation only: the enclosing owner must establish occurrence correspondence,
+   dependency completion and placement. No enclosing initializers are evaluated."
+  [emission input-body original index]
+  (when-let [owned (input-origin emission input-body original :binding)]
+   (when-let [record (retained-binding-context emission owned index)]
+    (let [context (:input-context record)
+          input (when (completion/bytecode-operand-context? context)
+                  (physical-operand-input (:initializer record) (:before record)
+                                          (assoc context :local-callee-names (:local-callee-names record))))
+          result (:after record)
+          carrier (case (:type result)
+                    :double Double/TYPE :float Float/TYPE :long Long/TYPE
+                    :int Integer/TYPE :bool Boolean/TYPE
+                    :ref (:reference-class result)
+                    nil)]
+      (when (and carrier input (contains? record :element-type)
+                 (map? (:local-callee-names record))
+                 (every? set? (map (:local-callee-names record) [:typed :untyped]))
+                 (identical? (:initializer record) (:operand input))
+                 (completion/bytecode-operand-context? (:context input))
+                 (= (:ports input) (select-keys (:before record) (keys (:ports input)))))
+        (let [guard (fn []
+                      (let [current (input-origin emission input-body original :binding)]
+                        (when-not (and (identical? owned current)
+                                       (identical? record (retained-binding-context emission owned index)))
+                          (throw (ex-info "Binding region lost its original emitted owner"
+                                          {:reason :unowned-bytecode-binding-region :binding-index index})))))]
+          (assoc (compile-owned-input-region
+                  emission input carrier
+                  {:return-tag carrier :walked-body [(:operand input)]
+                   :element-type (:element-type record)
+                   ::body-input-context (:context input)
+                   ::expected-body-type (:type result)} guard)
+                 :source-input original :source-binding-index index
+                 :binding-context record)))))))
 
 (defn ^:no-doc compile-terminal-result-region
   "Outline the exact observed outer lexical tail, excluding its initializers.

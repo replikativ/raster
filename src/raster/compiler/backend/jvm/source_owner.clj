@@ -404,7 +404,7 @@
                     (last inputs))))})))))))
 
 (defn- prepare-original-invocation-step
-  [step facts source-ns policy collector frontend program prefix-correspondence]
+  [step facts policy frontend program prefix-correspondence]
   (entry/call-with-optional-definition-inputs
    (fn []
      (when-let [{:keys [scope ordinal binding expression]}
@@ -462,9 +462,22 @@
                         (identical? (get-in selected [:definition :entry :typed-impl])
                                     (:implementation callee))
                         (identical? (:implementation callee) (:implementation bridge)))
-               (let [projection (terminal-source/project-original-invocation
-                                 expression ports source-ns policy bridge)]
-                 (compile-scalar-projection step expression ports projection source-ns policy collector))))))))))
+               (let [region (entry/prepare-frontend-binding-input! frontend scope ordinal)
+                     indices (zipmap (mapv :symbol ports) (range))
+                     positions (mapv indices (:parameters region))]
+                 (when (and region (every? some? positions)
+                            (instance? Method (:method region))
+                            (= Object (.getReturnType ^Method (:method region)))
+                            (= (mapv #(get-in ports [% :carrier]) positions)
+                               (vec (.getParameterTypes ^Method (:method region)))))
+                   ;; Execute the original binding, not a reconstructed call to
+                   ;; a captured Method. The existing prefix/bridge checks above
+                   ;; still own correspondence and the completed Long payload;
+                   ;; outlining adds no placement or numerical authority.
+                   {:step step :expression expression :ports ports
+                    :result-facts {:carrier Object :boxed-carrier Long :non-null? true}
+                    :execute (fn [arguments]
+                               (apply (:invoke region) (mapv arguments positions)))}))))))))))
 
 (defn- prepared-result-fact [prepared]
   (let [{:keys [carrier boxed-carrier non-null?]} (:result-facts prepared)]
@@ -485,8 +498,8 @@
             (if-let [prepared (or (prepare-primitive-scalar-step step facts source-ns policy collector)
                                  (prepare-nested-invocation-input-step step facts frontend program
                                                                        prefix-correspondence entry)
-                                 (prepare-original-invocation-step step facts source-ns policy collector
-                                                                   frontend program prefix-correspondence))]
+                                 (prepare-original-invocation-step step facts policy frontend program
+                                                                   prefix-correspondence))]
               (-> state
                   (assoc-in [:steps (:id step)] prepared)
                   (assoc-in [:facts (:id step)] (prepared-result-fact prepared)))

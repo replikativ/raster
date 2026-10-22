@@ -85,16 +85,16 @@
                      (identical? expression (get contract :invocation-expression (:body contract))))
                 (let [bridge (:invocation contract)
                       arguments (mapv #(go % env) (descriptor/call-args expression))]
-                  (when-not (= (or (:invocation-carriers contract)
-                                  (vec (repeat (count arguments) Long/TYPE)))
-                               (mapv :carrier arguments))
+                  (when-not (and (vector? (:invocation-carriers contract))
+                                 (class? (:invocation-payload-class contract))
+                                 (= (:invocation-carriers contract) (mapv :carrier arguments)))
                     (fail! "original invocation requires its completed primitive operands" {}))
                   (assoc (resolved (:invocation-method bridge)
                                    (capture! (:implementation bridge)) (mapv :source arguments))
                          ;; This is the actual Object invocation, not its static
                          ;; compute method. The original owner separately proves
                          ;; the conditional normal-return boxing correspondence.
-                         :boxed-carrier (or (:invocation-payload-class contract) Long) :non-null? true))
+                         :boxed-carrier (:invocation-payload-class contract) :non-null? true))
                 (symbol? expression)
                 (or (when-let [value (get env expression)]
                       (update value :source with-meta (meta expression)))
@@ -378,27 +378,3 @@
    projection, not proof that the surrounding typed region's coercions agree."
   [expression parameters source-ns source-policy]
   (project* (scalar-contract expression parameters source-policy) source-ns true))
-
-(defn project-original-invocation
-  "Backend projection of an already owned original direct invocation.
-   The producer must authenticate the exact original call/binding, actual Method,
-   receiver, return bridge, completed inputs and retained history BEFORE calling.
-   This map is not a certificate or a lookup registry. Only direct primitive Long
-   inputs and the observed Object/boxed-Long return subset are representable here;
-   source hints retain the same validation as ordinary scalar projection."
-  [expression parameters source-ns source-policy bridge]
-  (let [contract (scalar-contract expression parameters source-policy)
-        method (:invocation-method bridge)
-        {:keys [dispatch? arguments lexical-callee]} (descriptor/call-description expression)]
-    (when-not (and dispatch? (not lexical-callee)
-                   (= :boxed-primitive-static-return (:kind bridge))
-                   (= Object (:result-carrier bridge)) (= Long/TYPE (:payload-carrier bridge))
-                   (instance? Method method) (= Object (.getReturnType ^Method method))
-                   (.isInstance (.getDeclaringClass ^Method method) (:implementation bridge))
-                   (= (count arguments) (.getParameterCount ^Method method))
-                   (every? #(= Long/TYPE %) (vec (.getParameterTypes ^Method method)))
-                   (every? #(= Long/TYPE (:carrier %)) parameters)
-                   (every? #(or (instance? Long %)
-                                (and (symbol? %) (contains? (set (map :symbol parameters)) %))) arguments))
-      (fail! "original invocation lacks its owned primitive-input/Object-result bridge" {}))
-    (project* (assoc contract :invocation bridge) source-ns true)))

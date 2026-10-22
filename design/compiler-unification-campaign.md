@@ -480,6 +480,31 @@ obligation; do not call warmed compilation a fix. Continue through these actual
 scalar completion boundaries with retained physical evidence, not exemptions by
 operation name. Gradient/update/replay and all eight completion gates remain open.
 
+### October 22 original binding executor consolidation
+
+Sequential source-owned binding initializers now use the same physical-port
+bytecode outliner and transactional frozen-history wrapper as original invocation
+arguments. The existing selected Long dimension consumer executes that exact
+initializer instead of compiling a reconstructed captured-Method call. Its
+prefix, physical-input and boxed-return correspondence checks remain unchanged.
+The now-unreachable `project-original-invocation` and its synthetic foreign-proxy
+test are removed; terminal reduction invocation projection remains separate and
+requires explicit carriers and payload class, without the retired Long defaults.
+
+Original initializer context, result carrier and reference CHECKCAST are retained.
+Free-port/callee traversal happens only for a requested region, not every binding.
+Binding records share compact immutable sibling-name sets, not transitive method
+specifications or mutable emitter state. Independent review checked dispatch
+ordering, physical ABI, frozen source/module history and the production consumer.
+
+Six affected namespaces pass 78 tests / 675 assertions in the reused capped REPL.
+The unchanged forward-loss device/JVM/independent-reference and changed-input
+replay check also passes again: one test / 22 assertions on OpenCL and Level Zero.
+The new binding controls cover exact effects, null/bounds exceptions, signed zero,
+exceptional FP values, reference identity/CHECKCAST, copied scopes and stale source.
+This consolidation is preparation for late gradient scalar execution; it does not
+admit the still-refused floating reduction epilogues or close training acceptance.
+
 ### October 22 unchanged-training boundary preparation
 
 The unchanged public `local-loss` source compiles to portable numerical intent,

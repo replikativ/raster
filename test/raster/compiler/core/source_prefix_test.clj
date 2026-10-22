@@ -8,7 +8,6 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.backend.jvm.source-owner :as owner]
-            [raster.compiler.backend.jvm.terminal-source :as projection]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -404,40 +403,6 @@
     ;; a second route that executes skipped source computations out of order.
     (is (= :invocation-eager-source-unconsumed (failure (assoc initial :source-order []))))
     (is (zero? @calls))))
-
-(deftest resolved-projector-preserves-the-returned-reference
-  ;; Isolate backend mechanics with an interface-compatible instrumented target.
-  ;; This deliberately substituted bridge is NOT a frontend authority: the
-  ;; compiler's original-owner checks reject foreign implementations below.
-  (let [{:keys [frontend]} (capture #'selected-prefix)
-        source (nth (second (first (:body frontend))) 1)
-        source-ns (get-in frontend [:source-entry :source-ns])
-        returned (Long. (long 1000)) calls (atom 0)]
-    (entry/call-with-definition-inputs
-     (fn []
-       (let [callee (entry/original-source-frontend #'numeric/_star__m_long_long)
-             bridge (entry/frontend-return-bridge callee)
-             method (:invocation-method bridge)
-             interface (.getDeclaringClass ^java.lang.reflect.Method method)
-             target (java.lang.reflect.Proxy/newProxyInstance
-                     (.getClassLoader interface) (into-array Class [interface])
-                     (reify java.lang.reflect.InvocationHandler
-                       (invoke [_ _ actual arguments]
-                         (is (= method actual))
-                         (is (= [5 2] (vec arguments)))
-                         (swap! calls inc)
-                         returned)))
-             projected (projection/project-original-invocation
-                        source [{:symbol 'n :carrier Long/TYPE}] source-ns
-                        {:unchecked-math false} (assoc bridge :implementation target))
-             execute (owner/compile-function
-                      (:params projected) (:source projected) (fn [params body] (list 'fn* params body))
-                      (merge projected {:source-policy {:unchecked-math false} :source-ns source-ns}))]
-         (is (= {:carrier Object :boxed-carrier Long :non-null? true} (:result-facts projected)))
-         (is (identical? returned (execute [5])))
-         (is (= 1 @calls))
-         (is (not-any? #(and (symbol? %) (= "compute_static" (name %)))
-                       (tree-seq coll? seq (:source projected)))))))))
 
 (deftest original-selected-executor-refuses-wrong-physical-completions
   (let [call entry/frontend-invocation-context binding-context entry/frontend-binding-context

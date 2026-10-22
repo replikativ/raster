@@ -986,15 +986,9 @@
   (frontend-occurrence-observation frontend original-scope
     'raster.compiler.backend.jvm.bytecode/retained-input-extracted-reduction-binding index))
 
-(defn prepare-frontend-invocation-input!
-  "Compile an ORIGINAL invocation argument with its actual positional completion.
-   Requires a collecting owner and an authenticated unchanged frontend/emission.
-   Refused occurrences retain nothing. The returned region retains its own frozen
-   frontend and transitive module guards, including outside the collecting scope.
-   Invocation checks those original inputs; it never refreshes observations.
-   This is explicit code preparation, not a read-only occurrence query, helper
-   equivalence, replay permission or authority to change source execution order."
-  [frontend original input-index]
+(defn- prepare-frontend-input-region!
+  "Shared transactional preparation and frozen history for original input regions."
+  [frontend original index compiler]
   (call-with-optional-definition-inputs
    (fn []
      (when *emission-inputs*
@@ -1009,9 +1003,8 @@
                 frontend
                 (fn [emission]
                   (when-let [region
-                             ((requiring-resolve
-                               'raster.compiler.backend.jvm.bytecode/compile-input-invocation-region)
-                              emission (:body frontend) original input-index)]
+                             ((requiring-resolve compiler)
+                              emission (:body frontend) original index)]
                     (observe-frontend-source-identity! frontend)
                     region))))]
          (when region
@@ -1029,6 +1022,29 @@
                                      (let [value (apply invoke arguments)]
                                        (history-guard)
                                        value))))))))))
+
+(defn prepare-frontend-invocation-input!
+  "Compile an ORIGINAL invocation argument with its actual positional completion.
+   Requires a collecting owner and an authenticated unchanged frontend/emission.
+   Refused occurrences retain nothing. The returned region retains its own frozen
+   frontend and transitive module guards, including outside the collecting scope.
+   Invocation checks those original inputs; it never refreshes observations.
+   This is explicit code preparation, not a read-only occurrence query, helper
+   equivalence, replay permission or authority to change source execution order."
+  [frontend original input-index]
+  (prepare-frontend-input-region!
+   frontend original input-index
+   'raster.compiler.backend.jvm.bytecode/compile-input-invocation-region))
+
+(defn prepare-frontend-binding-input!
+  "Compile one original sequential binding initializer, not its enclosing scope.
+   Shares invocation-input ownership, physical ports and frozen-history guards.
+   The caller still owes the binding's source position and completed dependencies;
+   a prepared region grants neither movement nor resident-buffer substitution."
+  [frontend original binding-index]
+  (prepare-frontend-input-region!
+   frontend original binding-index
+   'raster.compiler.backend.jvm.bytecode/compile-input-binding-region))
 
 (defn original-source-frontend
   "Optional original frontend for an exact already-resolved deftm source Var.
