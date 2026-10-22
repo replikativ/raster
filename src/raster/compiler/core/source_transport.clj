@@ -5,6 +5,7 @@
   (:require [raster.compiler.core.inference :as inference]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
 
@@ -352,13 +353,11 @@
        (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
        (mapv :expansion (.-builders ^SourceConstruction input))))))
 
-(defn- selected-original-builder-invocation [event origin]
-  (let [original (:original origin)
-        {:keys [dispatch? lexical-callee semantic-op implementation-op arguments]}
-        (descriptor/call-description original)
-        imported (get-in event [:callee-import :frontend])]
+(defn- selected-original-invocation [frontend original imported]
+  (let [{:keys [dispatch? lexical-callee semantic-op implementation-op arguments]}
+        (descriptor/call-description original)]
     (when (and dispatch? (not lexical-callee))
-      (when-let [call (entry/frontend-completed-invocation-context (:frontend origin) original)]
+      (when-let [call (entry/frontend-completed-invocation-context frontend original)]
         (let [selected (entry/selected-parameter-carriers semantic-op implementation-op (count arguments))
               definition (:definition selected)
               imported-selection (entry/assert-frontend-selection!
@@ -368,15 +367,117 @@
                      (empty? (get-in call [:receiver-input :ports]))
                      (= (:method call) (:invocation-method selected))
                      (= (count arguments) (count (:inputs call)))
+                     (= (count arguments) (count (:parameter-carriers selected))
+                        (count (:input-completions call)))
                      (every? true? (map identical? (:parameter-carriers selected)
                                         (map :parameter-carrier (:input-completions call))))
                      (every? #(identical? (get definition %) (get imported-selection %))
                              [:source-var :receiver-var :entry])
                      (identical? (get-in definition [:entry :typed-impl]) (:implementation imported)))
-            (entry/observe-frontend-source-identity! (:frontend origin))
+            (entry/observe-frontend-source-identity! frontend)
             (entry/observe-frontend-source-identity! imported)
-            {:builder event :caller-origin origin :original-call original
+            {:original-call original
              :source-arguments (vec arguments) :call-context call :selected-callee selected}))))))
+
+(defn- selected-original-builder-invocation [event origin]
+  (when-let [selected (selected-original-invocation
+                      (:frontend origin) (:original origin) (get-in event [:callee-import :frontend]))]
+    (assoc selected :builder event :caller-origin origin)))
+
+(deftype ^:private CompletedReferenceCall [caller callee original expression observations]
+  entry/RetainedProducerInput
+  (assert-producer-current! [_]
+    (entry/assert-frontend-source! caller (get-in caller [:source-entry :source-var]))
+    (entry/assert-frontend-source! callee (get-in callee [:source-entry :source-var]))
+    (entry/assert-definition-inputs-current! observations)
+    true))
+
+(defn construct-original-reference-call
+  "Construct one whole original selected call, before source rewriting.
+   Receiver and every positional argument complete once before the imported body.
+   The saved whole-body result context and actual Method-return check remain.
+   Unsupported/cold calls abstain without compiling or executing anything.
+   This construction grants no final prefix placement, resident result or AD rule."
+  [frontend original]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and frontend entry/*emission-inputs*)
+       (with-local-history
+         (fn []
+           (let [{:keys [dispatch? lexical-callee semantic-op implementation-op arguments]}
+                 (descriptor/call-description original)
+                 selected (when (and dispatch? (not lexical-callee))
+                            (entry/selected-parameter-carriers semantic-op implementation-op (count arguments)))
+                 callee (when selected (entry/original-source-frontend (get-in selected [:definition :source-var])))
+                 original-call (when callee (selected-original-invocation frontend original callee))
+                 call (:call-context original-call)
+                 bridge (when original-call (entry/frontend-reference-return-bridge callee))
+                 receiver (get-in selected [:definition :receiver-var])]
+             (when (and bridge (var? receiver) (not (.isDynamic ^clojure.lang.Var receiver))
+                        (false? (get-in bridge [:body-context :unretained-sibling-calls?]))
+                        (every? #(false? (:unretained-sibling-calls? %))
+                                (cons (:receiver-input call) (:inputs call)))
+                        (nil? (.getThreadBinding ^clojure.lang.Var receiver))
+                        (= (:method call) (:invocation-method bridge))
+                        (= (count arguments)
+                           (count (get-in callee [:source-entry :params]))
+                           (count (get-in callee [:source-entry :tags])))
+                        (every? symbol? (get-in callee [:source-entry :params]))
+                        (every? #(and (class? %)
+                                      (or (not (.isPrimitive ^Class %))
+                                          (contains? #{Integer/TYPE Long/TYPE Float/TYPE Double/TYPE} %)))
+                                (:parameter-carriers selected))
+                        (identical? (:implementation callee) (:implementation bridge)))
+               (let [params (get-in callee [:source-entry :params])
+                     tags (get-in callee [:source-entry :tags])
+                     source-ns (get-in callee [:source-entry :source-ns])
+                     imported (prepare-inline-body callee (:body callee) params tags source-ns)
+                     body (first (effective-body (:walked-body imported)))
+                     all-symbols (filter symbol? (tree-seq coll? seq [original body params]))
+                     built
+                     (with-hygienic-renamings [original body] all-symbols
+                       (fn []
+                         (let [receiver-id (util/*fresh-binder*
+                                            (with-meta 'completed_receiver {:raster.effect/effectful true}))
+                               slots (mapv (fn [formal tag carrier input]
+                                             (let [id (util/*fresh-binder*
+                                                       (with-meta (symbol (str "completed_" (name formal)))
+                                                         {:raster.effect/effectful true
+                                                          :tag (symbol (.getName ^Class carrier))
+                                                          :raster.type/tag tag}))]
+                                               [id (completion/complete-value
+                                                    (completion/bytecode-input-contract carrier (:context input))
+                                                    (:operand input))]))
+                                           params tags (:parameter-carriers selected) (:inputs call))
+                               substituted (util/subst-syms (zipmap params (mapv first slots)) body
+                                                           util/subst-symbol-preserving-meta)
+                               context (get-in bridge [:body-context :result-context])
+                               result (completion/complete-value
+                                       (completion/bytecode-result-context-contract context :ref) substituted)
+                               checked (completion/complete-value
+                                        (completion/bytecode-reference-input-contract (:body-return-carrier bridge) context)
+                                        result)]
+                           (list 'let*
+                                 (into [receiver-id
+                                        (completion/complete-value
+                                         (completion/bytecode-reference-input-contract
+                                          Object (get-in call [:receiver-input :context]))
+                                         (get-in call [:receiver-input :operand]))]
+                                       (mapcat identity slots))
+                                 checked))))]
+                 (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
+                 (CompletedReferenceCall. frontend callee original (:body built) @entry/*emission-inputs*))))))))))
+
+(defn completed-reference-call-view
+  "Read the exact constructed call under its historical owner.
+   The expression is not portable source or independent execution permission."
+  [constructed]
+  (when (and entry/*emission-inputs* (instance? CompletedReferenceCall constructed))
+    (entry/assert-producer-current! constructed)
+    (let [^CompletedReferenceCall constructed constructed]
+      (entry/adopt-definition-inputs! (.-observations constructed))
+      (entry/adopt-definition-inputs! {:producer-inputs [constructed]})
+      {:original (.-original constructed) :expression (.-expression constructed)})))
 
 (defn original-builder-invocation-view
   "Relate one recorded builder's imported callee to an actual original selected call.

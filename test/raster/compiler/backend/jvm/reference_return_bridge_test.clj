@@ -8,6 +8,10 @@
 
 (defonce body-events (atom []))
 
+(defn reference-sibling [value]
+  (swap! body-events conj :unrelated-global)
+  value)
+
 (defn- fixture
   ([return-tag] (fixture ['Object] return-tag '[value]))
   ([tags return-tag body]
@@ -56,6 +60,26 @@
            (failure #(.invoke ^java.lang.reflect.Method (:compute-method bridge)
                               nil (object-array ["not a float array"])))))
     (is (nil? (invoke implementation nil)) "CHECKCAST does not imply non-nullness")))
+
+(deftest whole-body-context-retains-original-method-local-callee-denial
+  (let [source-ns (the-ns 'raster.compiler.backend.jvm.reference-return-bridge-test)
+        interface (types/ensure-fn-interface! '[Object])
+        sibling {:name 'reference-sibling :params [(with-meta 'value {:tag 'Object})]
+                 :return-tag 'Object :walked-body '[nil] :source-ns source-ns}
+        emitter (fn [& args] (apply bytecode/compile-typed-impl! (concat args [[sibling]])))
+        {:keys [implementation emission]}
+        (#'core/emit-owned-bytecode!
+         emitter "raster.compiled.ReferenceSiblingBody" '[value] '[Object] 'Object
+         '[(reference-sibling value)] source-ns (:iface-name interface) 'reference-sibling-body)
+        bridge (bytecode/retained-reference-return-bridge emission)
+        value (Object.)
+        before @body-events]
+    (is (some? bridge) "the reference wrapper edge itself remains valid")
+    (is (true? (get-in bridge [:body-context :unretained-sibling-calls?])))
+    (is (nil? (invoke implementation value)) "original call selects its same-class sibling")
+    (is (= before @body-events) "neither query nor original invokes the colliding global"))
+  (is (false? (get-in (bytecode/retained-reference-return-bridge (:emission (fixture 'Object)))
+                     [:body-context :unretained-sibling-calls?]))))
 
 (deftest missing-foreign-and-mutated-return-observations-abstain
   (let [{:keys [emission]} (fixture 'Object)

@@ -276,7 +276,8 @@
             (get-in (completion/canonical-parts form) [:contract :source-context])))
     :ref
     (and (seq? form)
-         (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input}
+         (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                      :jvm-bytecode-reference-input}
                     (get-in (completion/canonical-parts form) [:contract :source-context])))
     ;; The completed carrier is an explicit physical result of this validated
     ;; emitter contract, not a logical metadata hint or operand-type guess.
@@ -3122,6 +3123,14 @@
     (and (= actual :ref) (not= carrier Object)) :checkcast
     :else :identity))
 
+(defn- emit-typed-input-adaptation
+  "The actual typed invocation's post-operand conversion, shared with completion."
+  [code actual carrier]
+  (case (typed-input-adaptation actual carrier)
+    :coerce (emit-coerce code actual (class-type->stack carrier))
+    :checkcast (.checkcast code (class-desc-of carrier))
+    :identity nil))
+
 (defn- emit-typed-call-arguments
   "Emit the actual typed invocation's inputs once, in order. Optional owner-local
    observations describe the conversion AFTER operand emission, not inferred
@@ -3130,12 +3139,8 @@
   (let [observations (when observe? (volatile! []))]
     (doseq [[argument ^Class carrier] (map vector arguments parameter-types)]
       (let [actual (emit-argument-value code argument carrier locals ctx)
-            target (class-type->stack carrier)
             adaptation (typed-input-adaptation actual carrier)]
-        (case adaptation
-          :coerce (emit-coerce code actual target)
-          :checkcast (.checkcast code (class-desc-of carrier))
-          :identity nil)
+        (emit-typed-input-adaptation code actual carrier)
         (when observations
           (vswap! observations conj {:operand argument :emitted-type actual
                                      :parameter-carrier carrier :adaptation adaptation}))))
@@ -5279,7 +5284,7 @@
                        :expected (:result-carrier contract) :actual actual})))
     actual))
 
-(defn- emit-bytecode-primitive-completion
+(defn- emit-bytecode-input-completion
   "Use precisely the original bytecode invocation's argument/conversion path.
    Never reinterpret a Clojure source-policy contract as this context."
   [code {:keys [contract operand]} locals ctx]
@@ -5289,10 +5294,10 @@
                                 (:operand-context contract))
         actual (emit-argument-value code operand carrier locals original-context)]
     (when (= :void actual)
-      (throw (ex-info "A void operand cannot complete a bytecode primitive input"
+      (throw (ex-info "A void operand cannot complete a bytecode invocation input"
                       {:reason :void-bytecode-input-completion :contract contract})))
     (if (= :diverge actual) actual
-      (do (when-not (= actual target) (emit-coerce code actual target)) target))))
+      (do (emit-typed-input-adaptation code actual carrier) target))))
 
 (defn- emit-object-value
   "Consume the ORIGINAL operand in Object context. Result-position regions
@@ -5318,8 +5323,8 @@
             parts (case (get-in parts [:contract :source-context])
                     :jvm-object-input (emit-object-value code (:operand parts) locals ctx)
                     :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx)
-                    (:jvm-bytecode-floating-input :jvm-bytecode-integral-input)
-                    (emit-bytecode-primitive-completion code parts locals ctx)
+                    (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
+                    (emit-bytecode-input-completion code parts locals ctx)
                     (throw (ex-info "JVM completion consumer has no input-conversion authority"
                                     {:reason :unsupported-jvm-value-completion :contract (:contract parts)})))
             (contains? #{'let 'let* 'letfn* 'loop* 'do 'if 'try 'case*} head)
@@ -5387,8 +5392,8 @@
       (if (completion/canonical-form? form)
         (let [parts (completion/canonical-parts form)]
           (case (get-in parts [:contract :source-context])
-            (:jvm-bytecode-floating-input :jvm-bytecode-integral-input)
-            (emit-bytecode-primitive-completion code parts locals ctx)
+            (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
+            (emit-bytecode-input-completion code parts locals ctx)
             :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx)
             (emit-object-value code form locals ctx)))
         (throw (ex-info "Malformed reserved JVM value completion"
@@ -5945,6 +5950,8 @@
                                                                         (assoc contexts token {:status :ambiguous})
                                                                         (assoc contexts token {:status :known :body walked-body
                                                                                               :locals locals
+                                                                                              :unretained-sibling-calls?
+                                                                                              (method-local-callee-candidate? expanded-body ctx)
                                                                                               :return-stack-type return-stack-type
                                                                                               :return-descriptor (.descriptorString
                                                                                                                   (.returnType ^MethodTypeDesc method-type))
@@ -6274,28 +6281,16 @@
                               {:reason :unclosed-bytecode-input-completion :input-index input-index})))
           carrier (nth carriers input-index)
           completed (nth completions input-index)
-          checked-reference? (= :checkcast (:adaptation completed))
-          contract (when-not checked-reference?
-                     (if (contains? #{Integer/TYPE Long/TYPE} carrier)
-                       (completion/bytecode-integral-input-contract carrier (:context input))
-                       (completion/bytecode-floating-input-contract carrier (:context input))))
+          contract (completion/bytecode-input-contract carrier (:context input))
           guard (fn []
                   (when-not (identical? record (retained-invocation-context emission original))
                     (throw (ex-info "Input region lost its owning invocation"
                                     {:reason :unowned-bytecode-input-region}))))]
       (assoc (compile-owned-input-region
               emission input carrier
-              (if checked-reference?
-                ;; The original operand first produces its observed JVM carrier.
-                ;; The method return uses the same CHECKCAST as the call input.
-                ;; The returned Method must retain the exact original Class.
-                {:return-tag carrier
-                 :walked-body [(:operand input)] :element-type (:element-type record)
-                 ::body-input-context (:context input)
-                 ::expected-body-type (:emitted-type completed)}
-                {:return-tag (symbol (.getName ^Class carrier))
-                 :walked-body [(completion/complete-value contract (:operand input))]
-                 :element-type (:element-type record)}) guard)
+              {:return-tag (if (.isPrimitive ^Class carrier) (symbol (.getName ^Class carrier)) carrier)
+               :walked-body [(completion/complete-value contract (:operand input))]
+               :element-type (:element-type record)} guard)
              :input-contract contract :input-completion completed))))
 
 (defn ^:no-doc compile-input-invocation-region

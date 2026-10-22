@@ -401,12 +401,7 @@
 (defn- subst-sym-leaf
   "Substitute a single symbol according to smap, preserving metadata."
   [smap expr]
-  (let [replacement (get smap expr expr)]
-    (if (and (not (identical? replacement expr))
-             (symbol? replacement)
-             (meta expr))
-      (vary-meta replacement merge (meta expr))
-      replacement)))
+  (util/subst-symbol-preserving-meta smap expr))
 
 (defn ^:no-doc subst-syms
   "Capture-avoiding symbol substitution — delegates to the unified

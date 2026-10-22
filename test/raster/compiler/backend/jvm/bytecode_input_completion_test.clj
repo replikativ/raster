@@ -291,6 +291,62 @@
             (is (Double/isNaN outlined))
             (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits outlined)))))))))
 
+(deftest reference-input-completion-preserves-object-consumption-and-reference-checks
+  (doseq [[carrier head values]
+          [[Object (with-meta 'java.util.Objects/isNull {:param-tags [Object]})
+            [nil (Object.) "text" (float-array [1.0])]]
+           [(class (float-array 0))
+            (with-meta 'java.util.Arrays/hashCode {:param-tags [(class (float-array 0))]})
+            [nil (float-array [1.0 2.0]) (double-array [1.0]) "wrong Class"]]]]
+    (let [term (completion/complete-value
+                (completion/bytecode-reference-input-contract carrier (completion/bytecode-operand-context {}))
+                'input)
+          original (compiled ['input] (list head 'input))
+          retained (compiled ['input] (list head term))]
+      (is (= :ref (#'bytecode/infer-arg-stack-type
+                   (with-meta term {:tag 'double :raster.type/tag 'double}) {})))
+      (doseq [value values]
+        (is (= (outcome original value) (outcome retained value))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (completion/project-to-jvm-source term {:unchecked-math false})))))
+  (let [head (with-meta 'java.util.Objects/requireNonNull {:param-tags [Object]})
+        term (completion/complete-value
+              (completion/bytecode-reference-input-contract Object (completion/bytecode-operand-context {})) 'input)
+        retained (compiled ['input] (list head term))]
+    (doseq [value [(Object.) (Double/valueOf 4097.0) (float-array [1.0])]]
+      (is (identical? value (retained value)) "Object consumption does not rebox a reference")))
+  (doseq [carrier [Double/TYPE Long/TYPE Void/TYPE]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (completion/bytecode-reference-input-contract carrier (completion/bytecode-operand-context {}))))))
+
+(deftest reference-input-completion-keeps-intermediate-object-call-results
+  (let [operand (list 'clojure.core// (typed-helper-call #'nullable-caller 'numerator)
+                      (typed-helper-call #'nullable-caller 'denominator))
+        term (completion/complete-value
+              (completion/bytecode-reference-input-contract Object (completion/bytecode-operand-context {})) operand)
+        head (with-meta 'java.util.Objects/requireNonNull {:param-tags [Object]})
+        original (compiled ['numerator 'denominator] (list head operand))
+        retained (compiled ['numerator 'denominator] (list head term))]
+    (doseq [[numerator denominator] [[1.0 2.0] [0.0 0.0] [1.0 0.0] [-1.0 2.0]]]
+      (is (= (outcome original numerator denominator) (outcome retained numerator denominator))))))
+
+(deftest reference-input-completion-remains-at-its-original-effect-position
+  (let [carrier (class (float-array 0))
+        operand '(do (clojure.core/swap! events clojure.core/conj :operand) input)
+        term (completion/complete-value
+              (completion/bytecode-reference-input-contract carrier (completion/bytecode-operand-context {})) operand)
+        run (compiled ['input 'events] (list 'do term '(clojure.core/swap! events clojure.core/conj :later)))
+        branch (compiled ['input 'events] (list 'if false term nil))]
+    (let [events (atom [])]
+      (is (= [:operand :later] (run nil events)))
+      (is (= [:operand :later] @events)))
+    (let [events (atom [])]
+      (is (= ClassCastException (:error (outcome run "wrong Class" events))))
+      (is (= [:operand] @events)))
+    (let [events (atom [])]
+      (is (nil? (branch "wrong Class" events)))
+      (is (empty? @events)))))
+
 (deftest integral-outlining-composes-an-original-call-with-its-input-completion
   (doseq [[caller carrier] [[#'integral-long-caller Long/TYPE]
                              [#'integral-int-caller Integer/TYPE]]

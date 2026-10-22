@@ -376,7 +376,8 @@
 (declare ^:private generated-bytecode-helper-record)
 
 (defn- assert-completion-transpose-domain! [contract]
-  (when (contains? #{:jvm-bytecode-result-context :jvm-bytecode-integral-input}
+  (when (contains? #{:jvm-bytecode-result-context :jvm-bytecode-integral-input
+                    :jvm-bytecode-reference-input}
                    (:source-context contract))
     (throw (ex-info "Bytecode completion has no owned structural transpose"
                     {:reason :ad-unclosed-completion-transpose

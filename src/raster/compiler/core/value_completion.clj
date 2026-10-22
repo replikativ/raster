@@ -98,6 +98,30 @@
   {:source-context :jvm-bytecode-integral-input :target-carrier parameter-class
    :policy :preserve-bytecode-input :operand-context operand-context})
 
+(defn bytecode-reference-input-contract
+  "Retain an actual reference consumer's original bytecode input context.
+   Object consumption and concrete reference checks are distinct from a source
+   CHECKCAST. The original Method (parameter or return) and operand context remain producer obligations;
+   this contract proves neither non-nullness nor runtime assignability."
+  [parameter-class operand-context]
+  (when-not (and (class? parameter-class) (not (.isPrimitive ^Class parameter-class))
+                 (bytecode-operand-context? operand-context))
+    (throw (ex-info "bytecode reference completion requires an actual reference parameter Class"
+                    {:reason :unsupported-value-completion :carrier parameter-class})))
+  {:source-context :jvm-bytecode-reference-input :target-carrier parameter-class
+   :policy :preserve-bytecode-input :operand-context operand-context})
+
+(defn bytecode-input-contract
+  "Select an existing input recipe from an actual resolved consumer Class.
+   This is not overload inference; original Method/context authority is external."
+  [carrier operand-context]
+  (cond
+    (and (class? carrier) (not (.isPrimitive ^Class carrier)))
+    (bytecode-reference-input-contract carrier operand-context)
+    (contains? #{Integer/TYPE Long/TYPE} carrier)
+    (bytecode-integral-input-contract carrier operand-context)
+    :else (bytecode-floating-input-contract carrier operand-context)))
+
 (defn bytecode-result-context-contract
   "Retain the actual bytecode region-entry context and reference result carrier.
    This is not Object-input conversion: the consumer must return the original
@@ -124,6 +148,9 @@
                   (contains? #{Float/TYPE Double/TYPE} (:target-carrier contract))
                   :jvm-bytecode-integral-input
                   (contains? #{Integer/TYPE Long/TYPE} (:target-carrier contract))
+                  :jvm-bytecode-reference-input
+                  (and (class? (:target-carrier contract))
+                       (not (.isPrimitive ^Class (:target-carrier contract))))
                   false)
                 (= :preserve-bytecode-input (:policy contract))
                 (bytecode-operand-context? (:operand-context contract)))
@@ -253,7 +280,8 @@
      (if (and (seq? form) (= completion-symbol (first form)))
        (if-let [{:keys [contract operand]} (canonical-parts form)]
          (with-meta (case (:source-context contract)
-                      (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-result-context)
+                      (:jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                       :jvm-bytecode-reference-input :jvm-bytecode-result-context)
                       (throw (ex-info "Bytecode-owned completion requires its bytecode consumer"
                                       {:reason :unsupported-value-completion-source-context
                                        :contract contract}))

@@ -390,6 +390,35 @@ body to its actual generated Method and return descriptor; a same-ABI foreign
 Method cannot supply a return CHECKCAST Class. The primitive observer retains its
 previous restrictions. Main-based qualification passed 110 tests / 1,396 assertions.
 
+The next campaign implementation constructs an owned whole original reference
+call, still **before enabling normalization or GPU admission**. It binds the stable
+receiver first, then every actual argument (including unused arguments), using the
+original typed-invocation emitter's shared conversion path. A canonical reference
+input context joins the existing integral/floating contexts; Object consumption
+retains its saved boxing/call-result behavior, while concrete reference consumers
+retain their actual CHECKCAST. These are not source casts, AD rules, non-nullness
+facts or portable native projection. The imported whole body runs under its saved
+result context and actual Method-return check. Historical source ownership and
+producer adoption remain shared, not an additional runtime interpreter/cache.
+
+Review identified two further obligations now represented here: substitution
+shares the inliner's use-site-metadata policy; actual bytecode body emission
+records the existing conservative method-local-callee denial. The constructor
+requires explicit closed dependency observations for the body and original
+receiver/argument operands. An authentic registered-source regression injects an
+owned same-class sibling through the existing producer path, verifies original
+execution does not call its colliding global, then checks construction refuses
+without publishing speculative dependencies. Other differentials cover null/
+array identity, unused argument effects and failure before the body, copied
+occurrences and stale ownership. Six whole-call tests pass with 58 assertions,
+including unchanged nested delegation, its effects and nullable results. The
+preceding affected 17-namespace gate passed 262 tests / 2,702 assertions before
+that final delegation test; independent review found no blocker in this unwired
+checkpoint. These reused-REPL results are not fresh-process or broad-CI receipts.
+The next step is construction-edge integration at both owned normalization
+producers, followed by complete helper-interval/result correspondence. No
+production normalization fallback is removed by the unwired constructor alone.
+
 The campaign consumer uses the existing authenticated frontend/module-history
 observation boundary, not an editable return map. Cold queries do not compile;
 promotion requires a fresh owner, and the old cold history becomes stale. Missing,

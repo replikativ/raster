@@ -181,6 +181,15 @@
   (subst-scope smap {:binders binders :inits [] :body body}
                false false (fn [sm expression] (get sm expression expression)) nil))
 
+(defn subst-symbol-preserving-meta
+  "Shared symbol substitution leaf retaining use-site type/call metadata."
+  [smap expr]
+  (let [replacement (get smap expr expr)]
+    (if (and (not (identical? replacement expr))
+             (symbol? replacement) (meta expr))
+      (vary-meta replacement merge (meta expr))
+      replacement)))
+
 (defn subst-syms
   "Capture-avoiding substitution of free symbol occurrences per
    smap {old-sym → replacement-expr}, over a closed-core S-expression.
