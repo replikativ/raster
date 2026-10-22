@@ -136,6 +136,25 @@
   {:source-context :jvm-bytecode-result-context
    :operand-context operand-context :result-carrier result-carrier})
 
+(defn- planned-input-carriers? [carrier raw]
+  (and (class? carrier) (contains? #{:ref :int :long :float :double :bool} raw)
+       ;; Object consumption boxes BEFORE the recorded carrier; concrete
+       ;; reference consumers require a reference before their CHECKCAST.
+       (or (.isPrimitive ^Class carrier) (= :ref raw))))
+
+(defn planned-bytecode-input-contract
+  "Construct a new owned physical program's input recipe from a resolved Class
+   and established raw carrier. This does not claim an earlier emitted source
+   occurrence. The owner must retain Method/selection/placement correspondence;
+   actual emission rechecks the raw operand before applying the conversion.
+   Unlike source-policy conversions this uses Raster's bytecode adaptation."
+  [parameter-class operand-context raw-carrier]
+  (when-not (planned-input-carriers? parameter-class raw-carrier)
+    (throw (ex-info "planned bytecode input requires an established raw carrier"
+                    {:reason :unsupported-value-completion :raw-carrier raw-carrier})))
+  (assoc (bytecode-input-contract parameter-class operand-context)
+         :expected-input-carrier raw-carrier))
+
 (defn canonical-contract? [contract]
   (and (map? contract)
        (or (= object-input-contract contract)
@@ -143,7 +162,10 @@
                 (= :jvm-bytecode-result-context (:source-context contract))
                 (contains? #{:ref :double :float :long} (:result-carrier contract))
                 (bytecode-operand-context? (:operand-context contract)))
-           (and (= #{:source-context :target-carrier :policy :operand-context} (set (keys contract)))
+           (and (or (= #{:source-context :target-carrier :policy :operand-context} (set (keys contract)))
+                    (and (= #{:source-context :target-carrier :policy :operand-context :expected-input-carrier}
+                            (set (keys contract)))
+                         (planned-input-carriers? (:target-carrier contract) (:expected-input-carrier contract))))
                 (case (:source-context contract)
                   :jvm-bytecode-floating-input
                   (contains? #{Float/TYPE Double/TYPE} (:target-carrier contract))

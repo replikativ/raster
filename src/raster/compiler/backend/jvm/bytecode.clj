@@ -3930,6 +3930,35 @@
       (when (plan-form-carrier expression locals (object-input-context ctx)) :ref)
       (plan-form-carrier expression locals ctx))))
 
+(defn ^:no-doc plan-resolved-invocation-inputs
+  "Construct inputs for a new physical program using an already resolved Method.
+   No overload/source dispatch or receiver expression is synthesized. The owner
+   must retain selection and source-import correspondence separately. Unsupported
+   operands/parameter conversions abstain; logical hints never supply raw facts.
+   Child argument context consumes the invocation's one-shot Object-result flag,
+   exactly as the real typed invocation emitter does."
+  [resolved-method arguments locals ctx]
+  (when (and (instance? java.lang.reflect.Method resolved-method)
+             (vector? arguments)
+             (= (count arguments) (.getParameterCount ^java.lang.reflect.Method resolved-method))
+             (not (.isVarArgs ^java.lang.reflect.Method resolved-method)))
+    (let [classes (vec (.getParameterTypes ^java.lang.reflect.Method resolved-method))
+          supported? (fn [^Class carrier]
+                       (or (not (.isPrimitive carrier))
+                           (contains? #{Float/TYPE Double/TYPE Integer/TYPE Long/TYPE} carrier)))
+          context (dissoc ctx :object-call-result?)]
+      (when (every? supported? classes)
+        (let [inputs (mapv (fn [operand carrier]
+                             (when-let [raw (plan-argument-carrier operand carrier locals context)]
+                               (when (and (contains? #{:ref :int :long :float :double :bool} raw)
+                                          (or (.isPrimitive ^Class carrier) (= :ref raw)))
+                                 {:operand operand :raw-carrier raw :parameter-class carrier
+                                  :adaptation (typed-input-adaptation raw carrier)
+                                  :contract (completion/planned-bytecode-input-contract
+                                             carrier (completion/bytecode-operand-context context) raw)})))
+                           arguments classes)]
+          (when (every? some? inputs) inputs))))))
+
 (defn ^:no-doc plan-flat-bindings
   "Plan a closed lexical SSA binding spine without emitting or executing it.
    Returns nil on unsupported/ambiguous facts. Local :type facts must originate
@@ -3989,6 +4018,12 @@
                                         (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
                                                (:operand-context contract)))]
               (when (= raw (:result-carrier contract)) raw))
+            (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
+            (when-let [expected (:expected-input-carrier contract)]
+              (let [original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
+                                            (:operand-context contract))
+                    raw (plan-argument-carrier operand (:target-carrier contract) locals original-context)]
+                (when (= expected raw) (class-type->stack (:target-carrier contract)))))
             ;; Input completions need retained expected-raw facts, not just
             ;; target annotations.
             nil))
@@ -5538,6 +5573,11 @@
                                       completion/bytecode-operand-context-keys)
                                 (:operand-context contract))
         actual (emit-argument-value code operand carrier locals original-context)]
+    (when-let [expected (:expected-input-carrier contract)]
+      (when-not (or (= :diverge actual) (= expected actual))
+        (throw (ex-info "Planned input changed its physical carrier before conversion"
+                        {:reason :bytecode-input-result-carrier
+                         :expected expected :actual actual}))))
     (when-let [expected (::expected-completion-input-type ctx)]
       (when-not (= expected actual)
         (throw (ex-info "Outlined operand changed its emitted carrier before conversion"

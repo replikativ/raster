@@ -359,6 +359,68 @@
       (is (= (Double/doubleToRawLongBits (original input))
              (Double/doubleToRawLongBits (first (completed input))))))))
 
+(declare outcome)
+
+(deftest new-physical-input-plan-retains-method-order-without-receiver-evaluation
+  (let [interface (types/ensure-fn-interface! '[float long floats Object])
+        method (.getMethod ^Class (:iface-class interface) "invk"
+                           (into-array Class [Float/TYPE Long/TYPE (class (float-array 0)) Object]))
+        arguments '[value count storage 1.25]
+        locals {'value {:type :double} 'count {:type :long} 'storage {:type :ref}}
+        context {:object-call-result? true :preserve-source-call-results? true}
+        inputs (bytecode/plan-resolved-invocation-inputs method arguments locals context)]
+    (is (= arguments (mapv :operand inputs)))
+    (is (= [:double :long :ref :ref] (mapv :raw-carrier inputs)))
+    (is (= [:coerce :identity :checkcast :identity] (mapv :adaptation inputs)))
+    (is (every? #(false? (get-in % [:contract :operand-context :object-call-result?])) inputs))
+    (is (every? #(true? (get-in % [:contract :operand-context :preserve-source-call-results?])) inputs))
+    (is (every? #(not (contains? % :receiver)) inputs))
+    (doseq [[resolved values known] [[nil arguments locals]
+                                     [method (pop arguments) locals]
+                                     [method arguments (assoc locals 'value {:hint 'double})]
+                                     [method arguments (assoc locals 'storage {:type :double})]]]
+      (is (nil? (bytecode/plan-resolved-invocation-inputs resolved values known context))))
+    (doseq [raw [:void :diverge]]
+      (with-redefs [bytecode/plan-argument-carrier (fn [& _] raw)]
+        (is (nil? (bytecode/plan-resolved-invocation-inputs method arguments locals context)))))))
+
+(deftest new-physical-input-recipes-recheck-raw-carriers-and-use-bytecode-conversions
+  (let [context (completion/bytecode-operand-context {})
+        contract (completion/planned-bytecode-input-contract Float/TYPE context :ref)
+        term (completion/complete-value contract 'input)
+        original (compiled ['input] '(java.lang.Float/floatToRawIntBits input))
+        retained (compiled ['input] (list 'java.lang.Float/floatToRawIntBits term))]
+    (is (= :float (bytecode/plan-form-carrier term {'input {:type :ref}} {})))
+    (is (nil? (bytecode/plan-form-carrier term {'input {:type :double}} {})))
+    (doseq [value [nil false (Object.) 1.25 Double/MAX_VALUE (- Double/MAX_VALUE) Double/NaN -0.0]]
+      (is (= (outcome original value) (outcome retained value))))
+    (is (= (Float/floatToRawIntBits Float/POSITIVE_INFINITY) (retained Double/MAX_VALUE))
+        "Bytecode Number.floatValue does not become a checked Clojure float cast")
+    (is (= :bytecode-input-result-carrier
+           (try (compiled [(with-meta 'input {:tag 'double})] term) :accepted
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :bytecode-input-result-carrier
+           (try (compiled [] (completion/complete-value contract 1.25)) :accepted
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (doseq [bad [:void :diverge nil Double/TYPE]]
+      (is (not (completion/canonical-contract? (assoc contract :expected-input-carrier bad)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (completion/planned-bytecode-input-contract (class (float-array 0)) context :double))))
+  (let [contract (completion/planned-bytecode-input-contract Float/TYPE (completion/bytecode-operand-context {}) :double)
+        term (completion/complete-value contract 'input)
+        retained (compiled [(with-meta 'input {:tag 'double})] (list 'java.lang.Float/floatToRawIntBits term))]
+    (is (= (Float/floatToRawIntBits Float/POSITIVE_INFINITY) (retained Double/MAX_VALUE))))
+  (let [context (completion/bytecode-operand-context {})
+        contract (completion/planned-bytecode-input-contract (class (float-array 0)) context :ref)
+        term (completion/complete-value contract 'input)
+        retained (compiled ['input] term)
+        value (float-array [1.25])]
+    (is (identical? value (retained value)))
+    (is (nil? (retained nil)))
+    (is (= ClassCastException (:error (outcome retained (double-array [1.25])))))
+    (is (completion/canonical-contract? (completion/planned-bytecode-input-contract Object context :ref)))
+    (is (thrown? clojure.lang.ExceptionInfo (completion/planned-bytecode-input-contract Object context :double)))))
+
 (deftest checked-float-preserves-core-source-overloads
   (doseq [[tag values] [['double [0.0 -0.0 Math/PI Double/MAX_VALUE
                                  Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]

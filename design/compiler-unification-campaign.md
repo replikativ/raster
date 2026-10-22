@@ -40,19 +40,24 @@ failure/recur order. The real training MSE body agrees with its original owned
 invocation for changed inputs and failing reads. No whole-body import or resident
 gradient admission is enabled by these mechanisms.
 
-Qualification remains incomplete: the focused boundary gate passes 96 tests /
-1,331 assertions, but a wider first run found 18 failures and one error in the
-existing reduction-correspondence namespace. Its isolated and warm reruns pass
-(43 tests / 871 assertions); this cold/order discrepancy remains open, rather
-than being dismissed as a baseline or hidden by warming. A clean REPL reproduces
-18 failures and two errors in that wider gate, including a stale original
-numeric-helper observation during owned preparation. The new real-MSE tests
-explicitly request public dtype specialization without numerical execution;
-they do not require a previously materialized mangled helper. Exact-head CI at
-5dde4f1c is red in unit, OpenCL and GPU fixtures. The fixture failure remains the
-public softmax scalar quotient's unclosed source arithmetic. The draft is not
-merge-ready. The next acceptance milestone is still the unchanged resident
-forward/gradient/update/replay path, followed by broad green CI and measurement.
+New generated ABI inputs use the resolved Method's positional Classes and the
+shared bytecode argument/adaptation mechanisms, not Clojure source-policy casts.
+Each recipe retains its established raw carrier, rechecked before conversion by
+final emission. Object consumption records the carrier after boxing. No receiver
+term, source-occurrence proof, or placement authority is synthesized. This matters
+at Float overflow: JVM d2f/Number.floatValue is not a checked core/float cast.
+
+Qualification remains incomplete: the affected boundary gate passes 98 tests /
+1,371 assertions. A wider clean run initially found 18 failures and two errors.
+Separating retryable compiler production from read-only test collectors removes
+the stale-owner errors, without changing production guards. That same clean gate
+still has 18 failures (75 tests / 1,200 assertions), localized to Float reduction
+consumer observations; warm reruns pass. This remaining discrepancy is not a
+baseline waiver or broad green CI. The real-MSE tests explicitly request public
+dtype specialization rather than borrowing a warmed mangled helper. The draft
+remains unmergeable until the unchanged resident forward/gradient/update/replay
+path, all broad gates, and subsequent measurements are qualified. The public
+softmax scalar quotient's unclosed source arithmetic is also still open.
 
 The earlier checkpoints below describe prerequisite evidence, not completion.
 
