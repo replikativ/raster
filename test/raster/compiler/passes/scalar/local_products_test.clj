@@ -6,6 +6,7 @@
             [raster.ad.accumulation :as accumulation]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.passes.scalar.local-products :as products]))
 
 (deftest absent-cotangent-identity-retains-object-context-and-helper-ownership
@@ -226,6 +227,44 @@
   (let [cast (with-meta '(clojure.core/double x) {:raster.op/lexical-callee true})
         source (list 'let* ['value cast] '(clojure.core/nil? value))]
     (is (= source (products/lower-local-products source)))))
+
+(deftest prepared-nested-presence-retains-evaluation-order-and-null-failure
+  (let [source '(let* [before (swap! calls conj :before)
+                       value (let* [saved (do (swap! calls conj :value) x)]
+                               (clojure.core/double saved))]
+                 (if (clojure.core/nil? value)
+                   :absent
+                   (do (swap! calls conj :after) :present)))
+        normalize #(entry/call-with-definition-inputs
+                    (fn [] (products/lower-local-products
+                            % {:source-ns (the-ns 'raster.compiler.passes.scalar.local-products-test)
+                               :completed-presence? true})))
+        lowered (normalize source)]
+    (is (some #{'clojure.core/nil?}
+              (tree-seq coll? seq (products/lower-local-products source))))
+    (is (not-any? #{'clojure.core/nil?} (tree-seq coll? seq lowered)))
+    (is (= lowered (normalize lowered)))
+    (doseq [expression [source lowered]]
+      (let [calls (atom [])]
+        (is (= :present (run expression 2.0 calls)))
+        (is (= [:before :value :after] @calls)))
+      (let [calls (atom [])]
+        (is (thrown? NullPointerException (run expression nil calls)))
+        (is (= [:before :value] @calls)))))
+  (let [source '(let* [value (let* [saved x]
+                               (if (clojure.core/nil? saved) nil
+                                   (clojure.core/double saved)))]
+                 (if (clojure.core/nil? value) :absent :present))
+        lowered (products/lower-local-products
+                 source {:source-ns *ns* :completed-presence? true})]
+    ;; A cast in only one arm does not prove that the join is present.
+    (doseq [x [nil 2.0]]
+      (is (= (run source x nil) (run lowered x nil)))))
+  (is (= :local-product-source-context
+         (try (products/lower-local-products
+               '(let* [x 1.0] x) {:completed-presence? true})
+              nil
+              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
 
 (deftest conditional-products-preserve-selected-effects-and-lexical-scope
   (let [source '(let* [outside (do (swap! calls conj :prefix) 7.0)

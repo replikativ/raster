@@ -30,6 +30,11 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
 
+(defn- eval-compiler-source [expression]
+  ;; Generated preparation is compiler IR, including explicit Object completion.
+  ;; Use the same projection as prepared runtime execution before JVM eval.
+  (eval (completion/project-to-jvm-source expression)))
+
 (deftest legacy-source-reconstruction-cannot-enter-bytecode-owned-completions
   (let [context (completion/bytecode-operand-context {})
         operand '(outer ((raster.ad.reverse/value+grad (var unsupported-helper)) x))]
@@ -318,7 +323,7 @@
     (let [expanded (inline/inline-value+grad-call
                     {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
                      :args '[(draw :first) (draw :unused)] :mode mode})
-          f (eval (list 'fn '[draw]
+          f (eval-compiler-source (list 'fn '[draw]
                         (list 'let* (vec (mapcat identity (:bindings expanded)))
                               (:elements expanded))))
           trace (atom [])
@@ -368,7 +373,7 @@
           result (inline/inline-value+grad-call
                   {:var-sym callee :args '[x n] :mode :value+grad}
                   :param-env {'x tag 'n 'long})
-          f (eval (list 'fn '[x n]
+          f (eval-compiler-source (list 'fn '[x n]
                         (list 'let* (vec (mapcat identity (:bindings result)))
                               (:elements result))))
           actual (f argument (long 3))]
@@ -400,14 +405,14 @@
                              :mode :reverse :wrt [0])
                    vg (gradient x y)] vg)]]
     (let [expanded (inline/inline-deftm-calls source)
-          f (eval (list 'fn '[x y] expanded))]
+          f (eval-compiler-source (list 'fn '[x y] expanded))]
       (is (= [10.0 7.0 nil] (f 2.0 3.0)))
       (is (= ((rev/value+grad #'option-loss :wrt [0]) 2.0 3.0) (f 2.0 3.0)))))
   (let [source '(let* [gradient ((raster.ad.reverse/grad
                                   (var raster.compiler.passes.scalar.inline-test/option-loss)
                                   :wrt [0]) x y)] gradient)
         expanded (inline/inline-deftm-calls source)
-        f (eval (list 'fn '[x y] expanded))]
+        f (eval-compiler-source (list 'fn '[x y] expanded))]
     (is (= [7.0 nil] (f 2.0 3.0))))
   (doseq [source ['(let* [g ((raster.ad.reverse/grad
                              (var raster.compiler.passes.scalar.inline-test/option-one-loss)
@@ -417,14 +422,14 @@
                                     :wrt [0])
                           g (gradient x)] g)]]
     (let [expanded (inline/inline-deftm-calls source)
-          f (eval (list 'fn '[x] expanded))]
+          f (eval-compiler-source (list 'fn '[x] expanded))]
       (is (= ((rev/grad #'option-one-loss :wrt [0]) 2.0) (f 2.0)))
       (is (= 4.0 (f 2.0)))))
   (let [source '(let* [vg ((raster.ad.reverse/value+grad
                             (var raster.compiler.passes.scalar.inline-test/option-loss)
                             :wrt []) x y)] vg)
         expanded (inline/inline-deftm-calls source)
-        f (eval (list 'fn '[x y] expanded))]
+        f (eval-compiler-source (list 'fn '[x y] expanded))]
     (is (= [10.0 nil nil] (f 2.0 3.0))))
   (doseq [wrt [[-1] [2] [0 0]]]
     (is (thrown? clojure.lang.ExceptionInfo

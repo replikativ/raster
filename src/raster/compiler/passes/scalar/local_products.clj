@@ -22,6 +22,8 @@
 (defn- literal? [x]
   (or (nil? x) (boolean? x) (number? x) (string? x) (keyword? x) (char? x)))
 
+(def ^:dynamic ^:private *completed-presence-source-ns* nil)
+
 (defn- relist [original children]
   (with-meta (apply list children) (meta original)))
 
@@ -140,7 +142,17 @@
                     {:present? true :scalar-type (:type proof)})
                   (let [result (normal-return/result-fact init scope)]
                     (when (= :present (:presence result))
-                      (assoc result :present? true))))
+                      (assoc result :present? true)))
+                  ;; Prepared AD may contain a nested lexical projection whose
+                  ;; primitive tail cannot return nil. Reuse the authenticated
+                  ;; completion analysis, but ONLY its conditional presence.
+                  ;; The initializer and its evaluation obligation remain intact;
+                  ;; no carrier, scalar type or nonthrowing claim is transported.
+                  (when (and *completed-presence-source-ns* (form/binding-form? init)
+                             (= :present (:presence
+                                          (normal-return/completed-scalar-fact
+                                           init {} *completed-presence-source-ns*))))
+                    {:present? true :presence :present}))
         retained (some-> (:raster.type/tag (meta id)) dtype/dtype-for-scalar-tag)
         ;; Retained consumer declarations are not physical producer evidence.
         ;; Keep that distinction through aliases for checked sum projection.
@@ -393,11 +405,19 @@
    vectors. Unknown calls/parameters never prove presence. If any product escapes,
    retain all product allocations and perform only literal presence refinement.
    Conditional product joins distribute only a bounded lexical continuation;
-   an escape or expansion limit rolls the entire product rewrite back."
-  [expression]
+   an escape or expansion limit rolls the entire product rewrite back.
+   Prepared producers may opt into completed lexical-result presence with
+   :completed-presence? and their :source-ns. The enclosing definition-input
+   owner retains the observations; no dtype, purity or totality is inferred."
+  ([expression] (lower-local-products expression {}))
+  ([expression {:keys [source-ns completed-presence?]}]
+  (when (and completed-presence? (not (instance? clojure.lang.Namespace source-ns)))
+    (throw (ex-info "Completed presence needs its producer's source namespace"
+                    {:reason :local-product-source-context})))
   (binding [*conditional-expansion-budget* (atom conditional-expansion-limit)
             *consumed-evaluation-obligations* (atom #{})
-            *evaluation-dependencies* (atom {})]
+            *evaluation-dependencies* (atom {})
+            *completed-presence-source-ns* (when completed-presence? source-ns)]
     (try (lower {} expression true)
        (catch clojure.lang.ExceptionInfo e
          (case (:reason (ex-data e))
@@ -405,7 +425,7 @@
                                       (catch clojure.lang.ExceptionInfo e
                                         (if (= :local-product-decline (:reason (ex-data e))) expression (throw e))))
            :local-product-decline expression
-           (throw e))))))
+           (throw e)))))))
 
 (defn- fp-payload [known]
   (when (and (= :present (:presence known))

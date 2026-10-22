@@ -6,6 +6,8 @@
             [raster.ad.reverse :as reverse]
             [raster.ad.templates :as templates]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.source-transport :as transport]
             [raster.compiler.core.method-entry :as entry]))
 
 (deftm squared-loss [x :- Double] :- Double (numeric/* x x))
@@ -102,10 +104,15 @@
   (let [source (core/resolve-deftm-var #'gradient-calling-root)
         receiver (ns-resolve (:ns (meta source))
                              (symbol (str (:name (meta source)) "-impl")))
+        old (reverse/prepare-value+grad #'squared-loss [0])
+        ;; Earlier qualification can legitimately promote a selected helper.
+        ;; Start from a current emission so this test isolates rule invalidation,
+        ;; rather than observing an already stale helper dependency first.
+        _ (core/ensure-current-owned-bytecode! receiver)
         implementation (var-get receiver)
         emission (:raster.core/bytecode-emission (meta receiver))
-        old (reverse/prepare-value+grad #'squared-loss [0])
         revision (templates/registry-revision)]
+    (is (identical? emission (entry/assert-emission-inputs-current! emission)))
     (is (= :jvm-bytecode (:backend emission)))
     (is (seq (:producer-inputs emission)) "the real emitted root retains its generated AD owner")
     (with-redefs [templates/registry-revision (constantly (inc revision))]
@@ -161,6 +168,24 @@
           compiled ((deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad)) prepared)]
       (is (identical? prepared (reverse/assert-prepared-program-source! prepared)))
       (is (= expected (compiled 3.0 4.0))))))
+
+(deftest generated-normalization-keeps-active-values-and-inactive-slot-padding
+  (let [normalize (deref (ns-resolve 'raster.ad.reverse 'normalize-generated-preparation))
+        program {:params '[x observations] :source-ns *ns*
+                 :walked-body '[(let* [primal x derivative 1.0]
+                                  [primal derivative nil])]}
+        plan {:candidate-params '[x]}
+        normalized (normalize program plan)]
+    (is (= '[primal derivative nil] (last (first (:walked-body normalized)))))
+    (is (= '[derivative] (:param-adj-syms normalized)))
+    ;; A direct public-parameter alias remains valid; it is not an absent slot.
+    (is (= '[x] (:param-adj-syms
+                 (normalize (assoc program :walked-body
+                                   '[(let* [primal x] [primal x nil])]) plan))))
+    (doseq [body '[(let* [primal x] [primal nil nil])
+                  (let* [primal x derivative 1.0] [primal derivative observations])
+                  (let* [primal x] [primal missing nil])]]
+      (is (nil? (normalize (assoc program :walked-body [body]) plan))))))
 
 (deftest prepared-compilation-retains-history-in-an-enclosing-owner
   (let [prepared (reverse/prepare-value+grad #'squared-loss [0])
@@ -227,10 +252,14 @@
   (doseq [[wrt expected] [[[] [25.0 nil nil]] [[0] [25.0 6.0 nil]] [[1] [25.0 nil 8.0]]]]
     (let [prepared (reverse/prepare-value+grad #'two-squared-loss wrt)
           projection (reverse/project-prepared-value+grad-call prepared '[a b] :value+grad {})
-          execute (eval (list 'fn* '[a b]
-                              (list 'let* (vec (mapcat identity (:bindings projection)))
-                                    (:elements projection))))]
+          execute (eval (completion/project-to-jvm-source
+                         (list 'fn* '[a b]
+                               (list 'let* (vec (mapcat identity (:bindings projection)))
+                                     (:elements projection)))))]
       (is (= expected (execute 3.0 4.0)))
+      (is (= expected
+             (((deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad)) prepared)
+              3.0 4.0)))
       (is (= 3 (count (:elements projection))))))
   (let [prepared (reverse/prepare-value+grad #'squared-loss [0])
         revision (templates/registry-revision)]
@@ -267,6 +296,63 @@
       (reverse/project-prepared-value+grad-call prepared '[x] :value+grad {})
       (is (seq (:producer-inputs @parent)))
       (is (some #(= :prepared-reverse-ad (first %)) (:unclosed-source-imports @parent))))))
+
+(defn- captured-call-projection []
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [source (core/resolve-deftm-var #'gradient-calling-root)
+           _ (core/prepare-deftm-frontend! source)
+           frontend (entry/original-source-frontend source)
+           {:keys [walked-body source-normalization]}
+           (transport/normalize-frontend-bindings frontend (get-in frontend [:source-entry :params]))
+           caller (second (second (first walked-body)))
+           prepared (reverse/prepare-value+grad #'squared-loss [0])
+           captured (transport/with-source-construction-history
+                     source-normalization
+                     #(reverse/project-prepared-value+grad-call prepared '[x] :value+grad {} caller))]
+       (assoc captured :normalization source-normalization :prepared prepared
+                       :caller caller :observations @entry/*emission-inputs*)))))
+
+(deftest prepared-call-projection-retains-the-generated-program-not-fake-source
+  (let [{:keys [form source-construction normalization prepared caller observations]}
+        (captured-call-projection)]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [view (transport/source-construction-view source-construction normalization form)
+             event (first (:prepared-program-projections view))
+             owned (transport/prepared-program-projection-view source-construction form)]
+         (is (= 1 (count (:prepared-program-projections view))))
+         (is (identical? form (:projection event)))
+         (is (identical? prepared (:prepared event)))
+         (is (identical? caller (:caller owned)))
+         (is (= :value+grad (:mode owned)))
+         (is (some? (:caller-origin owned)))
+         (is (= (count (get-in event [:argument-plan :bindings]))
+                (- (count (:bindings form))
+                   (quot (count (second (:projected event))) 2))))
+         (is (some #(and (= :prepared-reverse-ad (first %))
+                         (identical? (:occurrence event) (nth % 2 nil)))
+                   (:unclosed-source-imports observations)))
+         (is (empty? (:type-elaborations view))
+             "a prepared AD projection is not a type elaboration or an original body import")
+         (doseq [[_ initializer] (:bindings form)]
+           (is (nil? (transport/construction-occurrence source-construction initializer))
+               "generated bindings acquire no fabricated original source occurrence"))
+         (let [offset (count (get-in event [:argument-plan :bindings]))
+               pairs (subvec (:bindings form) offset)
+               [ordinal [_ initializer]] (first (filter (fn [[_ [_ expression]]] (seq? expression))
+                                                       (map-indexed vector pairs)))
+               origin (transport/prepared-program-binding-occurrence source-construction initializer)]
+           (is (some? origin))
+           (is (= ordinal (:ordinal origin)))
+           (is (identical? (nth pairs ordinal) (:projected-binding origin)))
+           (is (identical? (nth (second (first (:walked-body prepared))) (inc (* 2 ordinal)))
+                           (second (:prepared-binding origin))))
+           (is (nil? (transport/prepared-program-binding-occurrence
+                      source-construction (with-meta (apply list initializer) (meta initializer))))))
+         (is (nil? (transport/prepared-program-projection-view source-construction (into {} form)))))))
+    (is (nil? (transport/prepared-program-projection-view source-construction form))
+        "an ownerless query must not acquire the source history")))
 
 (deftest lazy-jit-gradient-root-retains-its-actual-ad-producer
   (let [scope (create-ns (gensym "raster.ad-preparation-jit."))]

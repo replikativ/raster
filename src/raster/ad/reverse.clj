@@ -36,6 +36,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.core.call-boundary :as call-boundary]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.scalar-conversion :as conversion]
@@ -5947,7 +5948,9 @@
    Validate the producer's padded result boundary before whole-form hygiene and
    the ordinary call-by-value substitution. No operation is rewritten here.
    This structural projection does not close JVM conversions or device semantics."
-  [{:keys [walked-body params source-ns] :as prepared} arguments mode param-env]
+  ([prepared arguments mode param-env]
+   (project-prepared-value+grad-call prepared arguments mode param-env nil))
+  ([{:keys [walked-body params source-ns] :as prepared} arguments mode param-env caller]
   (source-owner/assert-portable-source! prepared)
   (assert-prepared-program-source! prepared)
   (let [source (first walked-body)
@@ -5971,13 +5974,14 @@
                        (= results (into [(:result-sym prepared)] (map slots params))))
           (throw (ex-info "prepared AD results differ from their normalized parameter plan"
                           {:reason :ad-prepared-call-results})))))
-    (let [{argument-bindings :bindings :keys [substitutions]}
-          (inline/prepare-call-arguments
+    (let [argument-plan (inline/prepare-call-arguments
            (if owner (get-in (.-frontend ^GeneratedPreparationOwner owner) [:source-entry :source-var])
                :prepared-reverse-ad)
            params arguments param-env)
+          {argument-bindings :bindings :keys [substitutions]} argument-plan
           qualified (inf/qualify-body-symbols source source-ns (set params))
-          projected (inline/subst-syms substitutions (util/alpha-convert qualified))
+          hygienic (util/alpha-convert qualified)
+          projected (inline/subst-syms substitutions hygienic)
           [_ bindings results] projected
           gradients (vec (rest results))
           projection {:bindings (into argument-bindings (mapv vec (partition 2 bindings)))
@@ -5987,13 +5991,21 @@
       ;; Commit input history only after successful shape/arity/projection work.
       ;; Hygiene is not an entry/return conversion or device realization proof.
       (adopt-prepared-program-inputs! prepared)
-      (when method-entry/*emission-inputs*
-        (swap! method-entry/*emission-inputs* update :unclosed-source-imports
-               (fnil conj #{}) [:prepared-reverse-ad
-                               (if owner (get-in (.-frontend ^GeneratedPreparationOwner owner)
-                                                 [:source-entry :source-var])
-                                   :unowned-preparation)]))
-      projection)))
+      (let [occurrence
+            (when owner
+              (source-transport/observe-prepared-program-projection!
+               {:caller caller :prepared prepared :arguments arguments :mode mode
+                :argument-plan argument-plan :qualified qualified :hygienic hygienic
+                :projected projected :projection projection}))
+            marker (cond-> [:prepared-reverse-ad
+                            (if owner (get-in (.-frontend ^GeneratedPreparationOwner owner)
+                                              [:source-entry :source-var])
+                                :unowned-preparation)]
+                     occurrence (conj occurrence))]
+        (when method-entry/*emission-inputs*
+          (swap! method-entry/*emission-inputs* update :unclosed-source-imports
+                 (fnil conj #{}) marker)))
+      projection))))
 
 (defn- freeze-generated-preparation [program frontend template-revision parameter-plan]
   (if-not frontend
@@ -6009,6 +6021,42 @@
                             (GeneratedPreparationOwner. program frontend observations
                                                         template-revision parameter-plan))]
         (assert-prepared-program-source! prepared)))))
+
+(defn- normalize-generated-preparation
+  "Canonicalize generated local products inside their existing preparation owner.
+   Runtime and compiler consume the same result. Unsupported output/control
+   shapes abstain; presence never authorizes removing an initializer."
+  [program parameter-plan]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (let [{:keys [walked-body params source-ns]} program
+           source (first walked-body)
+           normalized (-> source
+                          (local-products/lower-local-products
+                           {:source-ns source-ns :completed-presence? true})
+                          inline/flatten-nested-lets)
+           [_ bindings outputs] (when (seq? normalized) normalized)
+           ids (when (vector? bindings) (vec (take-nth 2 bindings)))
+           visible (into (set params) ids)
+           positions (zipmap params (range))
+           active (set (:candidate-params parameter-plan))]
+       (when (and (seq? normalized) (= 'let* (first normalized)) (= 3 (count normalized))
+                  (vector? bindings) (even? (count bindings)) (every? symbol? ids)
+                  (= (count ids) (count (set ids)))
+                  (empty? (set/intersection (set ids) (set params)))
+                  (vector? outputs) (= (inc (count params)) (count outputs))
+                  (every? #(or (nil? %) (and (symbol? %) (contains? visible %))) outputs)
+                  (symbol? (first outputs))
+                  ;; Active slots retain real values (including generated
+                  ;; zeros); only positional constant-data slots may be nil.
+                  (every? (fn [p]
+                            (let [slot (nth outputs (inc (get positions p)))]
+                              (if (contains? active p)
+                                (and (symbol? slot) (contains? visible slot))
+                                (nil? slot)))) params))
+         (assoc program :walked-body [normalized] :result-sym (first outputs)
+                        :param-adj-syms (mapv #(nth outputs (inc (get positions %)))
+                                             (:candidate-params parameter-plan))))))))
 
 (defn- build-grad-walked-body
   "Build the AD-transformed walked body for a deftm var.
@@ -6117,14 +6165,12 @@
               (assert-unique-ad-minted-binds! bindings f-var)
               (list op bindings output-vec)))]
       (when flat
-        (freeze-generated-preparation
-         {:walked-body [padded-form]
-         :params all-params
-         :tags tags
-         :source-ns source-ns
-         :result-sym (:result-sym flat)
-          :param-adj-syms (:param-adj-syms flat)}
-         frontend template-revision parameter-plan)))))))
+        (let [program {:walked-body [padded-form]
+                       :params all-params :tags tags :source-ns source-ns
+                       :result-sym (:result-sym flat) :param-adj-syms (:param-adj-syms flat)}
+              canonical (when frontend (normalize-generated-preparation program parameter-plan))]
+          (freeze-generated-preparation (or canonical program)
+                                        frontend template-revision parameter-plan))))))))
 
 (defn- runtime-function-form
   [params body]

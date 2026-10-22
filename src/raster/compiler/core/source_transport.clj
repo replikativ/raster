@@ -264,6 +264,20 @@
                          :environment environment :result-symbol result-symbol
                          :expansion expansion})))
 
+(defn observe-prepared-program-projection!
+  "Retain an actual prepared-program projection in this source phase.
+   Returns an occurrence token, NOT an execution or numerical certificate. The
+   producer authenticates its prepared program; later consumers still owe the
+   complete projected interval, physical completions and final placement."
+  [event]
+  (when (and *source-construction-observer* entry/*emission-inputs*
+             (:prepared event) (seq? (:caller event)))
+    (let [occurrence (Object.)]
+      (*source-construction-observer*
+       :prepared-program-projection
+       (assoc event :construction-kind :prepared-program-projection :occurrence occurrence))
+      occurrence)))
+
 (deftype ^:private SourceConstruction [normalization result edges builders observations]
   entry/RetainedProducerInput
   (assert-producer-current! [_]
@@ -287,6 +301,7 @@
                                (fn [kind event]
                                  (case kind
                                    :type-elaboration (vswap! edges conj event)
+                                   :prepared-program-projection (vswap! edges conj event)
                                    :builder-expansion (vswap! builders conj event)))]
                        (construct))]
           {:form result
@@ -304,8 +319,26 @@
                 (identical? result (.-result ^SourceConstruction input)))
        (entry/assert-producer-current! input)
        (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
-       {:type-elaborations (.-edges ^SourceConstruction input)
+       {:type-elaborations (filterv #(not= :prepared-program-projection (:construction-kind %))
+                                   (.-edges ^SourceConstruction input))
+        :prepared-program-projections (filterv #(= :prepared-program-projection (:construction-kind %))
+                                              (.-edges ^SourceConstruction input))
         :builder-expansions (.-builders ^SourceConstruction input)}))))
+
+(defn- construction-leaf
+  [edges constructed]
+  (let [visited (java.util.IdentityHashMap.)]
+    (loop [value constructed chain [] remaining (inc (count edges))]
+      (when (and (pos? remaining) (not (.containsKey visited value)))
+        (.put visited value true)
+        (let [incoming (filterv #(identical? value (:constructed %)) edges)]
+          (cond
+            (empty? incoming) {:value value :edges (vec (reverse chain))}
+            (= 1 (count incoming))
+            (let [edge (first incoming)
+                  outgoing (filterv #(identical? (:original edge) (:original %)) edges)]
+              (when (= 1 (count outgoing))
+                (recur (:original edge) (conj chain edge) (dec remaining))))))))))
 
 (defn construction-occurrence
   "Follow unique actual construction edges back to normalization. Never search by equality.
@@ -316,23 +349,64 @@
      (when (and entry/*emission-inputs* (instance? SourceConstruction input))
        (entry/assert-producer-current! input)
        (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
-       (let [^SourceConstruction input input edges (.-edges input)
-             visited (java.util.IdentityHashMap.)]
-         (loop [value constructed chain [] remaining (inc (count edges))]
-           (when (and (pos? remaining) (not (.containsKey visited value)))
-             (.put visited value true)
-             (let [incoming (filterv #(identical? value (:constructed %)) edges)]
-               (cond
-                 (empty? incoming)
-                 (when-let [origin (normalization-occurrence (.-normalization input) value)]
-                   (assoc origin :normalized value :constructed constructed
-                                 :construction-edges (vec (reverse chain))))
+       (let [^SourceConstruction input input
+             edges (filterv #(not= :prepared-program-projection (:construction-kind %)) (.-edges input))]
+         (when-let [leaf (construction-leaf edges constructed)]
+           (when-let [origin (normalization-occurrence (.-normalization input) (:value leaf))]
+             (assoc origin :normalized (:value leaf) :constructed constructed
+                           :construction-edges (:edges leaf)))))))))
 
-                 (= 1 (count incoming))
-                 (let [edge (first incoming)
-                       outgoing (filterv #(identical? (:original edge) (:original %)) edges)]
-                   (when (= 1 (count outgoing))
-                     (recur (:original edge) (conj chain edge) (dec remaining)))))))))))))
+(defn prepared-program-projection-view
+  "Read an exact recorded prepared projection rooted in the original caller.
+   Program freshness, caller origin and unique occurrence are retained; this
+   does NOT discharge its unclosed import, conversions or final interval."
+  [input projection]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and entry/*emission-inputs* (instance? SourceConstruction input))
+       (let [events (filterv #(= :prepared-program-projection (:construction-kind %))
+                             (.-edges ^SourceConstruction input))
+             matches (filterv #(identical? projection (:projection %)) events)]
+         (when (= 1 (count matches))
+           (let [event (first matches)
+                 callers (filterv #(identical? (:caller event) (:caller %)) events)]
+             (when (= 1 (count callers))
+               (when-let [origin (construction-occurrence input (:caller event))]
+                 (assoc event :caller-origin origin))))))))))
+
+(defn prepared-program-binding-occurrence
+  "Relate a constructed initializer to its prepared-program binding ordinal.
+   This is GENERATED-program provenance, never an original frontend binding or
+   permission to execute/fuse it. Argument preparation is a separate interval."
+  [input constructed]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and entry/*emission-inputs* (instance? SourceConstruction input))
+       (entry/assert-producer-current! input)
+       (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
+       (let [events (.-edges ^SourceConstruction input)
+             ordinary (filterv #(not= :prepared-program-projection (:construction-kind %)) events)
+             leaf (construction-leaf ordinary constructed)
+             matches
+             (when leaf
+               (vec
+                (for [event events
+                      :when (= :prepared-program-projection (:construction-kind event))
+                      :let [projection (:projection event)
+                            offset (count (get-in event [:argument-plan :bindings]))
+                            projected (:bindings projection)
+                            prepared (mapv vec (partition 2 (second (first (get-in event [:prepared :walked-body])))))]
+                      :when (and (vector? projected) (= (count projected) (+ offset (count prepared))))
+                      ordinal (range (count prepared))
+                      :let [pair (nth projected (+ offset ordinal))]
+                      :when (identical? (:value leaf) (second pair))]
+                  {:event event :ordinal ordinal :prepared-binding (nth prepared ordinal)
+                   :projected-binding pair})))]
+         (when (= 1 (count matches))
+           (let [{:keys [event] :as match} (first matches)]
+             (when-let [view (prepared-program-projection-view input (:projection event))]
+               (assoc match :projection-view view :constructed constructed
+                            :construction-edges (:edges leaf))))))))))
 
 (defn builder-construction-view
   "Read one exact recorded builder return and its authenticated imported body.

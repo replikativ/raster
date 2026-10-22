@@ -4,12 +4,13 @@
   {:raster.test/opencl-gate true}
   (:require [clojure.test :refer [deftest is]]
             [clojure.set :as set]
+            [raster.ad.reverse :as reverse]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.distributed-plan :as distributed]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.compiler.fixtures.distributed-training
-             :refer [batches initial-theta local-gradient-sum multi-step-training-plan
+             :refer [batches initial-theta local-loss local-gradient-sum multi-step-training-plan
                      value-node rounded-gradient-sum max-error expected-updates
                      training-plan analytic-gradient-sum]]))
 
@@ -31,11 +32,21 @@
                 (catch clojure.lang.ExceptionInfo error (ex-data error)))))))
 
 (deftest repeated-local-ad-matches-rounded-independent-oracle
-  (doseq [row-counts [[1 3] [1 2 4]]
-          theta (cons (initial-theta) (expected-updates row-counts 2))
-          {:keys [rows x y] :as batch} (batches row-counts)]
-    (is (< (max-error (rounded-gradient-sum theta batch)
-                     (local-gradient-sum theta x y rows 17)) 1.0e-7))))
+  (let [prepared (reverse/prepare-value+grad #'local-loss [0])
+        execute ((deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad)) prepared)]
+    (doseq [row-counts [[1 3] [1 2 4]]
+            theta (cons (initial-theta) (expected-updates row-counts 2))
+            {:keys [rows x y] :as batch} (batches row-counts)]
+      (let [expected (rounded-gradient-sum theta batch)
+            [primal gradient & inactive] (execute theta x y rows 17)]
+        (is (< (max-error expected (local-gradient-sum theta x y rows 17)) 1.0e-7))
+        ;; Reuse the same prepared runtime across different rows, data and
+        ;; parameters. This qualifies preparation, not resident GPU execution.
+        (is (= primal (local-loss theta x y rows 17)))
+        (is (= [nil nil nil nil] (vec inactive)))
+        (is (< (max-error expected
+                          (mapv #(float (* (double rows) (double %))) gradient))
+               1.0e-7))))))
 
 (deftest finite-training-composition-retains-parameters-and-orders-updates
   (let [device :ocl:analytic

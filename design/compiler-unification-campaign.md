@@ -28,6 +28,43 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 generated-AD consolidation (items 3/5): canonicalize local products
+and sequential lexical wrappers once, before freezing GeneratedPreparationOwner.
+Prepared runtime execution and compiler projection now consume that same form.
+Reuse existing completed-result analysis only for opt-in presence refinement;
+retain initializer evaluation, exceptions, source policy and historical definition
+observations. No new AD rule, carrier inference or arithmetic reassociation is
+introduced. Active gradient slots require visible values; inactive slots remain
+nil. Unsupported canonical output shapes retain the original prepared program.
+
+The actual prepared training loss now has 25 top-level bindings instead of 14;
+its generated scale is no longer hidden in a presence-product branch. Existing
+SourceConstruction records the exact prepared projection and original caller,
+without treating generated bindings as original source or discharging its
+unclosed import marker. This is construction provenance, not execution permission.
+
+Focused preparation/local-product qualification: 54 tests / 339 assertions pass.
+The existing training-oracle tests, extended to reuse one prepared runtime across
+changed data, parameters and row counts, pass 2 tests / 70 assertions. Review
+identified the active-nil validation gap; it is corrected with a negative test.
+A stale-rule test now first obtains and verifies a current emission, separating
+its intended rule invalidation from an earlier legitimate helper promotion.
+Source construction, transport and inlining pass 70 tests / 618 assertions;
+direct-evaluation inliner tests now use the existing JVM projection for reserved
+completion terms, as the actual prepared runtime already does.
+
+This does NOT close resident training: the unchanged GPU gradient still refuses
+the forward reduction quotient and the generated scale as uncertified scalars.
+The prepared scale's recorded phase occurrence is authenticated, but later helper
+expansion reconstructs its expression without retaining that occurrence link.
+Observed equal syntax is diagnostic only, never a replacement for that relation.
+The next common boundary is prepared-binding/source-order correspondence and
+existing scalar execution, plus the separate original reduction/count/read join.
+Do not remove evaluation flags, infer physical carriers from storage dtype, or
+clear a whole prepared-import marker after checking only one scalar.
+PR #1539 remains draft; exact pushed head c5618c07 has setup/build green and
+fixture/OpenCL/test gates red. These focused checks do not supersede those gates.
+
 Whole-draft CI checkpoint, exact remote head `150fd933` (not main): public source
 job 33722 attempted 172 compilations, passed 142 and reported 30 refusals. Its 15
 refused workloads occur on both CUDA and HIP:

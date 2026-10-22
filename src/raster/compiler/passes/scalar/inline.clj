@@ -697,6 +697,7 @@
                      (= 'var (first var-form)))
             (let [var-sym (second var-form)]
               {:var-sym var-sym
+               :caller init
                :args args
                :options (ad-constructor-options (vec (drop 2 callee)))
                :mode (if (= op 'raster.ad.reverse/value+grad)
@@ -1222,7 +1223,7 @@
               (source-owner/assert-portable-source! prepared-body))
             ((requiring-resolve 'raster.ad.reverse/project-owned-value+grad-call) prepared-body args mode))
           ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
-           prepared-body args mode param-env))))))
+           prepared-body args mode param-env (:caller vg-info)))))))
 
 (defn- inline-one-pass
   "Single pass of deftm inlining over a let* form's bindings."
@@ -1306,6 +1307,7 @@
                                               (list 'var var-or-form)
                                               var-or-form)]
                                {:var-sym (second var-form)
+                                :caller init
                                 :args args
                                 :options options
                                 :mode mode})))
