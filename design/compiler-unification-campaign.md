@@ -368,6 +368,16 @@ production expansion, and cannot justify dropping the return-boundary gate.
 The local reproduction is `.internal/probe-unused-formal-completion.clj`; it is
 diagnostic evidence, not a permanent passing regression or a shipped inliner fix.
 
+The return-path review also rejects `body :ref` plus invocation Object as a
+sufficient recipe. The original static body Method may insert a return CHECKCAST,
+and its wrapper is a separate edge. The first reference recipe therefore needs
+an actual emitted, unguarded reference pass-through bridge tied to that whole
+callee emission. It must replay the body under its saved result context, preserve
+the actual Method-return CHECKCAST when non-Object, and preserve wrapper reference
+identity. Extend the existing emitted return-bridge producer for that edge;
+do not reinterpret its primitive payload proof or add a caller-editable authority.
+Primitive boxed helpers retain their calls until their distinct recipe closes.
+
 ### October 21 typed reduction identity and rewalk qualification
 
 Focused PR #1554 (`0b839b48`, based on main `5baa8b30`) replaces the
