@@ -314,12 +314,13 @@ is observable: the original JVM Double-to-Int path saturates, whereas source
 context and its stricter AD refusal; merging this prerequisite changes no campaign
 execution admission by itself.
 
-PR #1561 is the separately reviewed consumer: original input outlining selects
+PR #1561 landed as `a02ee86b` after all seven exact-head CI gates succeeded.
+It is the separately reviewed consumer: original input outlining selects
 the contract from the actual Method Class, while the AD producer explicitly
 requires a floating completion and matching floating Method return. Targeted
 qualification passed 97 tests / 1,221 assertions in the bounded existing REPL;
-this is not a fresh-process or whole-draft result. Until its exact-head CI and
-merge are verified, it remains pending, not landed evidence.
+this is not a fresh-process or whole-draft result. Campaign synchronization of
+the squash preserves the independently qualified integration source unchanged.
 
 The next construction change must replace retrospective argument matching with
 completed slots at the shared inline builder. Its acceptance boundary is the
