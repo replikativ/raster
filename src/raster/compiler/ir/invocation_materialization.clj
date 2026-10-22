@@ -381,6 +381,23 @@
                           (runtime-buffer-shape parameter value argument lexical scalar-values)
                           argument :copy)))
 
+(defn- checked-deferred-parameters [plan pending]
+  (when-not (and (map? pending)
+                 (or (empty? pending) (nil? (get-in plan [:attributes :parameter-projection]))))
+    (fail! :invocation-materialization-deferred-parameters
+           "deferred parameters require a flat parameter map" {}))
+  (doseq [[id entry] pending]
+    (let [position (:parameter-position entry)
+          parameter (when (and (integer? position) (<= 0 position)
+                                (< position (count (:parameters plan))))
+                      (nth (:parameters plan) position))]
+      (when-not (and (map? entry) (= #{:parameter-position :source} (set (keys entry)))
+                     (= id (:id parameter)) (buffer-value? (:value parameter)))
+        (fail! :invocation-materialization-deferred-parameters
+               "deferred input differs from its declared buffer parameter and ordinal"
+               {:parameter id :position position}))))
+  pending)
+
 (defn begin-materialization
   "Validate public arguments without evaluating any invocation step.
 
@@ -388,11 +405,23 @@
    MaterializedInvocation or permission to bind its unevaluated suffix. Advancing a state chain
    evaluates one step at a time; callers may place existing device completion boundaries between
    advances. Reusing an older state explicitly repeats computation, not a successful-check proof.
-   Host arrays remain borrowed sources, not snapshots or newly acquired lifetime leases."
-  [plan arguments]
+   Host arrays remain borrowed sources, not snapshots or newly acquired lifetime leases.
+
+   The explicit third arity may defer declared flat buffer parameter IDs. It retains
+   raw references at their original ordinals, not MaterializedBuffers. This is only
+   construction state, NOT source ownership or permission to execute. An enclosing
+   source owner must authorize the selection and original-position read checks."
+  ([plan arguments] (begin-materialization plan arguments #{}))
+  ([plan arguments deferred]
   (let [plan (invocation/validate! plan)
         _ (refuse-external-dimensions! plan)
         _ (refuse-external-storage! plan)
+        buffer-ids (into #{} (keep #(when (buffer-value? (:value %)) (:id %))) (:parameters plan))
+        _ (when-not (and (set? deferred) (set/subset? deferred buffer-ids)
+                         (or (empty? deferred)
+                             (nil? (get-in plan [:attributes :parameter-projection]))))
+            (fail! :invocation-materialization-deferred-parameters
+                   "only declared flat buffer parameter IDs may be deferred" {:parameters deferred}))
         arguments (project-parameter-arguments plan arguments)]
     (let [parameter-pairs (mapv vector (:parameters plan) arguments)
           scalar-values
@@ -407,12 +436,18 @@
           (reduce
            (fn [values [parameter argument]]
              (let [{:keys [id value]} parameter]
-               (if (buffer-value? value)
+               (if (and (buffer-value? value) (not (contains? deferred id)))
                  (assoc values id (materialize-buffer-parameter
                                    parameter argument initial-lexical scalar-values))
                  values)))
-           scalar-values parameter-pairs)]
-      (->InvocationMaterializationState plan parameter-values initial-lexical 0))))
+           scalar-values parameter-pairs)
+          pending (into {} (keep-indexed
+                            (fn [position [parameter argument]]
+                              (when (contains? deferred (:id parameter))
+                                [(:id parameter) {:parameter-position position :source argument}])))
+                        parameter-pairs)]
+      (cond-> (->InvocationMaterializationState plan parameter-values initial-lexical 0)
+        (seq pending) (assoc ::deferred-parameters pending))))))
 
 (defn- advance-materialization
   [{:keys [plan values lexical next-step] :as state} evaluate-scalar]
@@ -475,14 +510,15 @@
     (fail! :invocation-materialization-state-type "expected an InvocationMaterializationState"
            {:actual (type state)}))
   (let [{:keys [plan values lexical next-step]} state
-        plan (invocation/validate! plan)]
+        plan (invocation/validate! plan)
+        pending (checked-deferred-parameters plan (get state ::deferred-parameters {}))]
     (refuse-external-dimensions! plan)
     (refuse-external-storage! plan)
     (when-not (and (integer? next-step) (<= 0 next-step (count (:steps plan))))
       (fail! :invocation-materialization-position "materialization position is outside the plan"
              {:next-step next-step :steps (count (:steps plan))}))
     (let [prefix (concat (:parameters plan) (take next-step (:steps plan)))
-          expected-ids (set (map :id prefix))
+          expected-ids (set/difference (set (map :id prefix)) (set (keys pending)))
           expected-lexical (into {} (map (juxt :symbol :id)) prefix)]
       (when-not (and (map? values) (= expected-ids (set (keys values)))
                      (= expected-lexical lexical))
@@ -499,7 +535,8 @@
                                      "retained scalar state requires a typed value"
                                      {:value-id id :actual actual}))
                             (checked-scalar id value actual))]
-        (doseq [{:keys [id value] :as parameter} parameters]
+        (doseq [{:keys [id value] :as parameter} parameters
+                :when (not (contains? pending id))]
           (let [actual (get values id)]
             (if (scalar-value? value)
               (check-scalar! id value actual)
@@ -535,6 +572,36 @@
          (take next-step (:steps plan))))
       state)))
 
+(defn materialize-demanded-parameters
+  "Materialize explicit buffer demands in declaration order, without driver allocation.
+   Raw pending references become ordinary buffers through the shared constructor.
+   The enclosing owner owes source checks BEFORE calling; this is not a read proof.
+   Older immutable states keep their pending references unchanged."
+  [state demanded]
+  (let [state (validate-state! state)
+        {:keys [plan values]} state
+        buffer-ids (into #{} (keep #(when (buffer-value? (:value %)) (:id %))) (:parameters plan))]
+    (when-not (and (set? demanded) (set/subset? demanded buffer-ids))
+      (fail! :invocation-materialization-parameter-demand
+             "parameter demand must name declared buffers" {:parameters demanded}))
+    (let [lexical (into {} (map (juxt :symbol :id)) (:parameters plan))
+          scalars (into {} (filter (comp typed-scalar? val)) values)
+          realized
+          (reduce (fn [current {:keys [id] :as parameter}]
+                    (if (and (contains? demanded id)
+                             (contains? (get current ::deferred-parameters {}) id))
+                      (-> current
+                          (assoc-in [:values id]
+                                    (materialize-buffer-parameter
+                                     parameter (get-in current [::deferred-parameters id :source])
+                                     lexical scalars))
+                          (update ::deferred-parameters dissoc id))
+                      current))
+                  state (:parameters plan))
+          realized (if (empty? (get realized ::deferred-parameters))
+                     (dissoc realized ::deferred-parameters) realized)]
+      (validate-state! realized))))
+
 (defn materialize-next
   "Evaluate exactly the next invocation step after validating the current prefix.
    A failure returns no advanced state and does not evaluate or materialize any later step."
@@ -565,6 +632,10 @@
 
 (defn- complete-materialization
   [{:keys [plan values next-step] :as state}]
+    (when (seq (get state ::deferred-parameters))
+      (fail! :invocation-materialization-pending-parameters
+             "cannot publish an invocation with deferred public inputs"
+             {:parameters (set (keys (get state ::deferred-parameters)))}))
     (when-not (= next-step (count (:steps plan)))
       (fail! :invocation-materialization-incomplete "cannot publish an unevaluated invocation suffix"
              {:next-step next-step :steps (count (:steps plan))}))

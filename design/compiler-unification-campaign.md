@@ -502,6 +502,26 @@ admission yet. The existing materialization namespace passes 13 tests / 123
 assertions after function-only reload; the capped REPL's record identities remain
 unchanged. Demand-time realization must reuse this same constructor.
 
+Explicit deferred construction now exists as a third materialization arity over
+a set of existing flat buffer parameter IDs. It retains raw references and exact
+original argument ordinals in the existing immutable state's extension data;
+pending IDs are absent from values/bindings, not nil or dummy buffers. State
+validation checks exact prefix membership and pending schemas. Demand-time
+realization follows declaration order, shares the ordinary constructor, and
+revalidates. Shape, clone and alias consumers refuse unavailable inputs; final
+publication refuses any pending input rather than silently dropping it.
+
+This is mechanical construction state, not a source authority: a structurally
+valid redirected raw reference can validate. The SourceOwner must independently
+check both its authorized ID set and each reference's identity against original
+arguments at its retained ordinal before execution. No ordered-runtime wiring or
+default admission is added yet. Aggregate/projected deferral remains refused;
+ordinary two-argument behavior stays eager. Independent review found no blocker.
+The materialization namespace passes 17 tests / 189 assertions; the final combined
+ten-namespace gate passes 158 tests / 2,376 assertions. Original source read guards,
+zero-domain pointer elimination and full numerical producer correspondence remain
+required before enabling the connected route.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction
