@@ -230,7 +230,12 @@ emitter; source projection refuses unsupported bytecode contexts. Structural AD
 explicitly refuses integral completion (including inactive operands) rather than
 falling through an unhandled dispatch. Five related namespaces pass 67 tests /
 664 assertions in the reused campaign REPL. A focused main-based extraction is
-under fresh qualification; no inline expansion or GPU admission is widened yet.
+PR #1560, head `d52d2906`: fresh main-based qualification passes 67 tests /
+658 assertions across six existing completion/bytecode/AD namespaces. The
+semantic discriminator is permanent: original bytecode D2I saturates a primitive
+Double overflow, whereas a checked Clojure source cast throws. The exact original
+path must be retained. All seven CI gates remain required; no inline expansion or
+GPU admission is widened yet.
 
 Imported call origins now feed the existing selected-call contract, rather than
 remaining disconnected tracing data. The shared Method/receiver/implementation

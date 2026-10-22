@@ -220,6 +220,20 @@
           (doseq [input values]
             (is (= (outcome original input) (outcome retained input))
                 (str tag " to " target)))))))
+  ;; This is the semantic discriminator, not just two equivalent spellings:
+  ;; bytecode D2I saturates, whereas Clojure's checked source int conversion
+  ;; throws. Replacing this node with a source cast would be observably wrong.
+  (let [parameter (with-meta 'input {:tag 'double})
+        head (with-meta 'java.lang.Integer/toString {:param-tags [Integer/TYPE]})
+        contract (completion/bytecode-integral-input-contract
+                  Integer/TYPE (completion/bytecode-operand-context {}))
+        original (compiled [parameter] (list head 'input))
+        retained (compiled [parameter] (list head (completion/complete-value contract 'input)))
+        source-cast (binding [*unchecked-math* false]
+                      (eval '(fn [^double input] (str (int input)))))]
+    (is (= {:value "2147483647"} (outcome original Double/MAX_VALUE)))
+    (is (= (outcome original Double/MAX_VALUE) (outcome retained Double/MAX_VALUE)))
+    (is (= {:error IllegalArgumentException} (outcome source-cast Double/MAX_VALUE))))
   (doseq [carrier [Float/TYPE Double/TYPE Boolean/TYPE Byte/TYPE Object Long]]
     (is (thrown? clojure.lang.ExceptionInfo
                  (completion/bytecode-integral-input-contract
