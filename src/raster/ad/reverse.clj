@@ -373,11 +373,18 @@
 (declare ^:private generated-helper-record)
 (declare ^:private generated-bytecode-helper-record)
 
+(defn- assert-completion-transpose-domain! [contract]
+  (when (= :jvm-bytecode-integral-input (:source-context contract))
+    (throw (ex-info "Bytecode completion has no owned structural transpose"
+                    {:reason :ad-unclosed-completion-transpose
+                     :source-context (:source-context contract)}))))
+
 (defn- structural-completion?
   "Object input completion needs no generated compilation policy. Primitive
    inputs and checked references still belong to their explicit source owner."
   [expression]
   (when-let [{:keys [contract]} (value-completion/canonical-parts expression)]
+    (assert-completion-transpose-domain! contract)
     (or (= value-completion/object-input-contract contract)
         (some? *generated-product-context*))))
 
@@ -610,6 +617,7 @@
 
 (defmethod ad-record :completion [_ sym init activity]
   (let [{:keys [contract operand]} (value-completion/canonical-parts init)]
+   (assert-completion-transpose-domain! contract)
    (if (and (= value-completion/object-input-contract contract)
             (not (trivial-expr? operand)))
     (do

@@ -113,6 +113,77 @@
   (completion/bytecode-floating-input-contract
    carrier (completion/bytecode-operand-context {:preserve-source-call-results? true})))
 
+(deftest integral-completion-reuses-the-original-bytecode-argument-path
+  (doseq [[carrier operation target] [[Integer/TYPE 'java.lang.Integer/toString :int]
+                                     [Long/TYPE 'java.lang.Long/toString :long]]]
+    (let [context (completion/bytecode-operand-context {:preserve-source-call-results? true})
+          contract (completion/bytecode-integral-input-contract carrier context)
+          term (completion/complete-value contract 'input)
+          head (with-meta operation {:param-tags [carrier]})
+          original (compiled ['input] (list head 'input))
+          retained (compiled ['input] (list head term))
+          tagged (compiled ['input] (list head (with-meta term {:tag 'double :raster.type/tag 'float})))]
+      (is (completion/canonical-form? term))
+      (is (= target (#'bytecode/infer-arg-stack-type
+                     (with-meta term {:tag 'double :raster.type/tag 'float}) {})))
+      (doseq [input [nil true false "not a number" (Object.)
+                     Integer/MIN_VALUE Integer/MAX_VALUE Long/MIN_VALUE Long/MAX_VALUE
+                     -1 0 1 0.1M 2N 1/2 -0.0 2.75 Double/MAX_VALUE
+                     Double/NaN Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+        (is (= (outcome original input) (outcome retained input)) (str target " Object input"))
+        (is (= (outcome original input) (outcome tagged input)) (str target " ignores logical hints")))
+      (doseq [[tag values] [['double [-0.0 2.75 Double/MAX_VALUE Double/NaN]]
+                            ['float [(float -0.0) (float 2.75) Float/POSITIVE_INFINITY]]
+                            ['long [Long/MIN_VALUE Long/MAX_VALUE 16777217]]
+                            ['int [Integer/MIN_VALUE Integer/MAX_VALUE (int 17)]]]]
+        (let [parameter (with-meta 'input {:tag tag})
+              original (compiled [parameter] (list head 'input))
+              retained (compiled [parameter] (list head term))]
+          (doseq [input values]
+            (is (= (outcome original input) (outcome retained input))
+                (str tag " to " target)))))))
+  ;; This is the semantic discriminator, not just two equivalent spellings:
+  ;; bytecode D2I saturates, whereas Clojure's checked source int conversion
+  ;; throws. Replacing this node with a source cast would be observably wrong.
+  (let [parameter (with-meta 'input {:tag 'double})
+        head (with-meta 'java.lang.Integer/toString {:param-tags [Integer/TYPE]})
+        contract (completion/bytecode-integral-input-contract
+                  Integer/TYPE (completion/bytecode-operand-context {}))
+        original (compiled [parameter] (list head 'input))
+        retained (compiled [parameter] (list head (completion/complete-value contract 'input)))
+        source-cast (binding [*unchecked-math* false]
+                      (eval '(fn [^double input] (str (int input)))))]
+    (is (= {:value "2147483647"} (outcome original Double/MAX_VALUE)))
+    (is (= (outcome original Double/MAX_VALUE) (outcome retained Double/MAX_VALUE)))
+    (is (= {:error IllegalArgumentException} (outcome source-cast Double/MAX_VALUE))))
+  (doseq [carrier [Float/TYPE Double/TYPE Boolean/TYPE Byte/TYPE Object Long]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (completion/bytecode-integral-input-contract
+                  carrier (completion/bytecode-operand-context {})))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (completion/bytecode-integral-input-contract Long/TYPE {}))))
+
+(deftest integral-completion-stays-in-its-evaluation-position
+  (let [contract (completion/bytecode-integral-input-contract
+                  Long/TYPE (completion/bytecode-operand-context {}))
+        operand '(do (clojure.core/swap! events clojure.core/conj :operand) input)
+        term (completion/complete-value contract operand)
+        run (compiled ['input 'events] (list 'do term
+                                            '(clojure.core/swap! events clojure.core/conj :later)))
+        branch (compiled ['input 'events] (list 'if false term 7))]
+    (let [events (atom [])]
+      (is (= [:operand :later] (run 7 events)))
+      (is (= [:operand :later] @events)))
+    (let [events (atom [])]
+      (is (:error (outcome run nil events)))
+      (is (= [:operand] @events) "failing completion prevents the later effect"))
+    (let [events (atom [])]
+      (is (= 7 (branch nil events)))
+      (is (empty? @events) "an untaken completion is not hoisted"))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (completion/project-to-jvm-source term {:unchecked-math false}))
+        "a bytecode completion cannot be replaced with a Clojure source cast")))
+
 (deftest outlined-compound-input-is-an-actual-bytecode-region-not-object-source
   (doseq [tags [['double 'double] ['Object 'Object]]]
     (let [operand (list 'clojure.core// (typed-helper-call #'retained-caller 'numerator)

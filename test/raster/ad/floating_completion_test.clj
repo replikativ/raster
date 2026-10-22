@@ -101,3 +101,18 @@
     (is (= :ad-unclosed-completion-transpose
            (try (compile-program [x] [result term] result [x])
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest integral-bytecode-completion-does-not-acquire-structural-ad
+  (doseq [carrier [Integer/TYPE Long/TYPE]
+          owner [nil {:backend :jvm-bytecode} {:source-policy policy}]
+          active? [false true]]
+    (let [x (typed 'x 'double) result (typed 'result 'long)
+          term (completion/complete-value
+                (completion/bytecode-integral-input-contract
+                 carrier (completion/bytecode-operand-context {})) x)]
+      (binding [reverse/*generated-product-context* owner]
+        (doseq [run [#(#'reverse/ad-form-kind term active? result)
+                     #(#'reverse/ad-record :completion result term {x active?})]]
+          (is (= :ad-unclosed-completion-transpose
+                 (try (run) :accepted
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))))

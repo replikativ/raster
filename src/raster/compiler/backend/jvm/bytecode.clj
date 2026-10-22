@@ -272,8 +272,8 @@
     (false? form) :bool
     (number? form) (numeric-literal-stack-type form)
     (and (seq? form)
-         (= :jvm-bytecode-floating-input
-            (get-in (completion/canonical-parts form) [:contract :source-context])))
+         (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input}
+                    (get-in (completion/canonical-parts form) [:contract :source-context])))
     ;; The completed carrier is an explicit physical result of this validated
     ;; emitter contract, not a logical metadata hint or operand-type guess.
     (class-type->stack (get-in (completion/canonical-parts form) [:contract :target-carrier]))
@@ -5034,17 +5034,17 @@
                         {:reason :jvm-literal-owner-initialized})))
       (.set field nil (object-array values)))))
 
-(defn- emit-bytecode-floating-completion
+(defn- emit-bytecode-primitive-completion
   "Use precisely the original bytecode invocation's argument/conversion path.
    Never reinterpret a Clojure source-policy contract as this context."
   [code {:keys [contract operand]} locals ctx]
   (let [carrier (:target-carrier contract)
-        target (if (= Double/TYPE carrier) :double :float)
+        target (class-type->stack carrier)
         original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
                                 (:operand-context contract))
         actual (emit-argument-value code operand carrier locals original-context)]
     (when (= :void actual)
-      (throw (ex-info "A void operand cannot complete a bytecode floating input"
+      (throw (ex-info "A void operand cannot complete a bytecode primitive input"
                       {:reason :void-bytecode-input-completion :contract contract})))
     (if (= :diverge actual) actual
       (do (when-not (= actual target) (emit-coerce code actual target)) target))))
@@ -5072,7 +5072,8 @@
                               {:reason :unsupported-jvm-object-literal})))
             parts (case (get-in parts [:contract :source-context])
                     :jvm-object-input (emit-object-value code (:operand parts) locals ctx)
-                    :jvm-bytecode-floating-input (emit-bytecode-floating-completion code parts locals ctx)
+                    (:jvm-bytecode-floating-input :jvm-bytecode-integral-input)
+                    (emit-bytecode-primitive-completion code parts locals ctx)
                     (throw (ex-info "JVM completion consumer has no input-conversion authority"
                                     {:reason :unsupported-jvm-value-completion :contract (:contract parts)})))
             (contains? #{'let 'let* 'letfn* 'loop* 'do 'if 'try 'case*} head)
@@ -5139,8 +5140,9 @@
       (and (seq? form) (= completion/completion-symbol (first form)))
       (if (completion/canonical-form? form)
         (let [parts (completion/canonical-parts form)]
-          (if (= :jvm-bytecode-floating-input (get-in parts [:contract :source-context]))
-            (emit-bytecode-floating-completion code parts locals ctx)
+          (if (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input}
+                         (get-in parts [:contract :source-context]))
+            (emit-bytecode-primitive-completion code parts locals ctx)
             (emit-object-value code form locals ctx)))
         (throw (ex-info "Malformed reserved JVM value completion"
                         {:reason :invalid-value-completion :expression form})))
