@@ -10,6 +10,9 @@
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.backend.jvm.terminal-source :as terminal-source]
             [raster.compiler.ir.par :as par-ir]
+            [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]
             [raster.compiler.backend.jvm.split :as split]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
@@ -72,6 +75,8 @@
 (defn- with-fresh-reduction-binding
   ([float? split? run] (with-fresh-reduction-binding float? split? 1 run))
   ([float? split? count-expression run]
+   (with-fresh-reduction-binding float? split? count-expression (if float? '(float 0.0) 0.0) run))
+  ([float? split? count-expression seed-expression run]
   ;; Fresh source owners keep forced-split/unsplit coverage independent of test
   ;; order and of the bytecode already cached by another REPL qualification.
   (let [scope (create-ns (gensym "raster.test.extracted."))]
@@ -95,11 +100,22 @@
               reduction (second bindings)
               ;; Construct each original test declaration BEFORE its compiler
               ;; producer runs, never edit retained source/evidence afterward.
-              reduction (apply list (assoc (vec reduction) 4 count-expression))
+              reduction (apply list (assoc (vec reduction) 2 seed-expression 4 count-expression))
               body (list* (first body) (assoc bindings 1 reduction) (nnext body))]
           (eval (apply list (concat (butlast declaration) [body]))))
         (with-redefs [split/estimate-form-size (constantly (if split? 1000000 0))]
-          (run (captured (ns-resolve scope 'objective)))))
+          ;; Observation tests require actual emitted caller AND terminal leaf. Preparing only
+          ;; the caller accidentally borrowed a warm numeric callee from earlier REPL tests.
+          ;; Use the explicit producer service; the observation query itself must not emit.
+          (let [function (ns-resolve scope 'objective)]
+            (binding [entry/*emission-inputs* nil]
+              (entry/call-with-definition-inputs
+               (fn []
+                 (let [source (core/resolve-deftm-var function)
+                       frontend (entry/original-source-frontend source)
+                       input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))]
+                   (prefix/prepare-reduction-entry! input core/ensure-current-owned-bytecode!)))))
+            (run (captured function)))))
       (finally (remove-ns (ns-name scope)))))))
 
 (defn- with-terminal-interval [float? split? count-expression run]
@@ -385,6 +401,121 @@
           (is (= expected (:value (raster.compiler.core.numeric-constant/source-value
                                   proof-expression))))
           (is (nil? (:closed-count observed))))))))
+
+(deftest owned-empty-fold-keeps-unread-arguments-out-of-materialization
+  (doseq [float? [false true] split? [false true]]
+    (with-fresh-reduction-binding
+      float? split? 0
+      (fn [frontend]
+        (let [source-var (get-in frontend [:source-entry :source-var])
+              compilation (equation/compile
+                           source-var {:target :ocl:empty-source-test :dtype (if float? :float :double)}
+                           {:device-id :ocl:empty-source-test :device-type :gpu :backend :ocl
+                            :subgroup-dialect :opencl-portable :max-workgroup-size 256})
+              array-of (if float? float-array double-array)
+              reason (fn [run] (try (run) nil
+                                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+              argument (array-of [2.0])
+              arguments [argument]
+              initial (source-owner/begin-ordered-realization compilation arguments nil)
+              state (:materialization initial)
+              pending-key :raster.compiler.ir.invocation-materialization/deferred-parameters
+              pending (get state pending-key)
+              id (first (keys pending))
+              foreign-plan-state (assoc state :plan (with-meta (:plan state) {::foreign-plan true}))]
+          (is (some? (:ordered-source-owner compilation)))
+          (is (some? (:terminal-source-owner compilation)))
+          (is (= 1 (count pending)))
+          (is (identical? argument (get-in pending [id :source])))
+          (is (= {} (:values state)))
+          (is (= {} (:program-buffers (materialization/prefix-bindings state))))
+          (is (identical? foreign-plan-state (materialization/validate-state! foreign-plan-state))
+              "structural validity is not ownership of the original invocation plan")
+          (doseq [arg [nil (array-of 0)]]
+            (let [deferred (:materialization (source-owner/begin-ordered-realization compilation [arg] nil))]
+              (is (= {} (:values deferred)))
+              (is (identical? arg (get-in deferred [pending-key id :source])))))
+          (is (= :invocation-materialization-pending-parameters
+                 (reason #(materialization/finish-materialization state))))
+          (with-redefs [gpu/make-session (fn [& _]
+                                          (throw (ex-info "preflight acquired a device" {:reason :unexpected-device})))]
+            (is (thrown? ClassCastException (gpu-link/instantiate-host-result! compilation [(int-array 1)]))))
+          (doseq [forged [(assoc initial :materialization foreign-plan-state)
+                          (assoc initial :source-order [])
+                          (assoc-in initial [:materialization pending-key id :parameter-position] 1)
+                          (assoc-in initial [:materialization pending-key id :source] (array-of [2.0]))]]
+            (is (= :ordered-unread-completion
+                   (reason #(source-owner/finish-ordered-storage-boundary compilation forged arguments nil)))))
+          (is (= :ordered-source-owner-mismatch
+                 (reason #(source-owner/begin-ordered-realization
+                           (assoc compilation :ordered-source-owner {}) arguments nil))))
+          (is (= :invocation-materialization-buffer
+                 (reason #(source-owner/begin-ordered-realization
+                           (dissoc compilation :ordered-source-owner) [nil] nil))))
+          (let [metadata (meta source-var)]
+            (try
+              (alter-meta! source-var assoc ::changed-after-empty-compile true)
+              (is (some? (reason #(source-owner/begin-ordered-realization compilation arguments nil))))
+              (finally (reset-meta! source-var metadata)))))))))
+
+(deftest cold-public-empty-fold-prepares-the-original-entry-without-a-source-call
+  (doseq [float? [true false]]
+   (let [scope (create-ns (gensym "raster.test.cold-empty."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval (if float?
+                '(raster.core/deftm objective [xs :- (Array float)] :- Float
+                   (let [sum (raster.par/reduce acc (float 0.0) i 0
+                                               (raster.numeric/+ acc (aget xs i)))
+                         reciprocal (raster.numeric// (float 1.0) sum)] reciprocal))
+                '(raster.core/deftm objective [xs :- (Array double)] :- Double
+                 (let [sum (raster.par/reduce acc 0.0 i 0
+                                             (raster.numeric/+ acc (aget xs i)))
+                       reciprocal (raster.numeric// 1.0 sum)] reciprocal))))
+        (let [function (ns-resolve scope 'objective)
+              source (core/resolve-deftm-var function)
+              implementation (receiver source)]
+          (is (some? (:raster.core/jit-spec (meta implementation))))
+          ;; Public compilation owns its retry transaction. No captured/ensure-bytecode fixture
+          ;; is used, and no original function call warms the newly declared source entry.
+          (let [compilation (binding [entry/*emission-inputs* nil]
+                              (equation/compile
+                               function {:target :ocl:cold-empty-test :dtype (if float? :float :double)}
+                               {:device-id :ocl:cold-empty-test :device-type :gpu :backend :ocl
+                                :subgroup-dialect :opencl-portable :max-workgroup-size 256}))]
+            (is (nil? (:raster.core/jit-spec (meta implementation))))
+            (is (some? (:ordered-source-owner compilation)))
+            (is (some? (:terminal-source-owner compilation)))
+            (is (= {} (get-in (source-owner/begin-ordered-realization compilation [nil] nil)
+                              [:materialization :values]))))))
+      (finally (remove-ns (ns-name scope)))))))
+
+(deftest explicit-reduction-preparation-keeps-terminal-before-caller-order
+  (doseq [float? [false true]]
+    (with-fresh-reduction-binding
+      float? false 0
+      (fn [frontend]
+        (let [input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))
+              observed (prefix/observed-reduction-interval input)
+              callee (get-in observed [:consumer :selected :definition :receiver-var])
+              caller (receiver (get-in frontend [:source-entry :source-var]))
+              prepared (atom [])]
+          (is (var? callee))
+          (is (true? (prefix/prepare-reduction-entry! input #(swap! prepared conj %))))
+          (is (= [callee caller] @prepared))
+          (is (nil? (prefix/prepare-reduction-entry! nil #(swap! prepared conj %))))
+          (is (= [callee caller] @prepared)))))))
+
+(deftest empty-producer-proof-does-not-generalize-to-a-singleton-read
+  (with-terminal-interval
+    false false 1
+    (fn [{:keys [input frontend program normalized represented normalization construction]}]
+      (let [correspondence (prefix/close-reduction-terminal input normalization normalized represented program construction)
+            before @entry/*emission-inputs*]
+        (is (some? correspondence))
+        (is (nil? (prefix/original-empty-reduction correspondence frontend program)))
+        (is (identical? before @entry/*emission-inputs*))))))
 
 (deftest original-empty-and-singleton-read-completion-oracle
   (doseq [float? [false true] split? [false true] count [0 1]]

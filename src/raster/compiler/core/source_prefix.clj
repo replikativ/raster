@@ -18,6 +18,7 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.passes.scalar.effects :as effects]))
@@ -90,6 +91,35 @@
                    (= (count binders) (count (set binders))))
           (PrefixInput. frontend parameters scope pairs))))))
 
+(defn prepare-reduction-entry!
+  "Explicit producer preparation for a direct reduction/terminal interval.
+   Queries never emit. Public compilation may request the original caller's owned bytecode
+   and its selected floating terminal leaf, without executing either. Prepare the callee
+   before renewing the caller. Changed observations escape to the whole compiler retry."
+  [input prepare!]
+  (when (instance? PrefixInput input)
+    (let [frontend (.-frontend ^PrefixInput input)
+          scope (.-scope ^PrefixInput input)]
+      (when (and (direct-reduction-pairs scope)
+                 (identical? scope (first (:body frontend)))
+                 (every? true? (map identical? (mapcat identity (.-pairs ^PrefixInput input))
+                                    (second scope))))
+        (let [caller (entry/assert-frontend-selection! frontend (get-in frontend [:source-entry :source-var]))
+              expression (second (second (.-pairs ^PrefixInput input)))
+              {:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+              (descriptor/call-description expression)
+              selected (when (and dispatch? (not lexical-callee))
+                         (entry/selected-parameter-carriers semantic-op implementation-op (count arguments)))
+              callee (when (and selected (= Object (:result-carrier selected))
+                                (every? #{Float/TYPE Double/TYPE} (:parameter-carriers selected)))
+                       (get-in selected [:definition :receiver-var]))]
+          (when-let [receiver (:receiver-var caller)]
+            ;; Signature observation selects preparation only, never numerical admission.
+            ;; Even a warm caller can refer to a still-cold selected terminal implementation.
+            (entry/prepare-owned-definition-inputs!
+             prepare! (vec (distinct (cond-> [] callee (conj callee) true (conj receiver)))))
+            true))))))
+
 (defn- reduction-binding-observation [frontend scope original]
   (let [reduction (entry/frontend-reduction-emission frontend original)
         binding (entry/frontend-binding-context frontend scope 0)
@@ -112,43 +142,46 @@
                                                       (get-in extracted [:helper :method]))
                              :presence :present}})))))
 
+(defn- closed-source-literal [frontend original before]
+  (let [source-ns (get-in frontend [:source-entry :source-ns])
+        locals (set (keys before))]
+    (when (and entry/*emission-inputs* (instance? clojure.lang.Namespace source-ns))
+      (letfn [(canonical [expression remaining]
+                (when (pos? remaining)
+                  (cond
+                    (or (integer? expression) (float? expression)) expression
+                    (and (seq? expression) (= 2 (count expression))
+                         (symbol? (first expression))
+                         (not (contains? locals (first expression)))
+                         (not (:lexical-callee (descriptor/call-description expression)))
+                         (descriptor/cast-op? (first expression))
+                         (contains? #{nil "clojure.core"} (namespace (first expression))))
+                    (let [lookup (first expression)
+                          operation (symbol "clojure.core" (name lookup))]
+                      (when-let [operand (canonical (second expression) (dec remaining))]
+                        (intrinsic-source/observe-original! source-ns lookup operation)
+                        (with-meta (list operation operand) (meta expression)))))))]
+        (when-let [expression (canonical original 128)]
+          (let [literal (numeric-constant/source-value expression)
+                obligations (effects/descriptor original)]
+            (when (and literal (= :pure (:effect obligations)) (empty? (:flags obligations)))
+              {:source original :proof-expression expression :value (:value literal)})))))))
+
 (defn- closed-reduction-count [frontend producer]
   (entry/call-with-optional-definition-inputs
    (fn []
      (let [bound (get-in producer [:reduction :bound])
            original (:initializer bound)
-           source-ns (get-in frontend [:source-entry :source-ns])
-           locals (set (keys (:before bound)))]
-       (when (and entry/*emission-inputs* (instance? clojure.lang.Namespace source-ns)
+           literal (closed-source-literal frontend original (:before bound))]
+       (when (and literal
                   (= :int (get-in bound [:after :type]))
                   (false? (:unretained-sibling-calls? bound))
                   (completion/bytecode-operand-context? (:context bound)))
          ;; Qualify only this closed literal/cast proof, under actual bootstrap
          ;; lookups. The original expression and its source position are retained.
          ;; Bare or qualified casts cannot borrow a different lookup's identity.
-         (letfn [(canonical [expression remaining]
-                   (when (pos? remaining)
-                     (cond
-                       (or (integer? expression) (float? expression)) expression
-                       (and (seq? expression) (= 2 (count expression))
-                            (symbol? (first expression))
-                            (not (contains? locals (first expression)))
-                            (not (:lexical-callee (descriptor/call-description expression)))
-                            (descriptor/cast-op? (first expression))
-                            (contains? #{nil "clojure.core"} (namespace (first expression))))
-                       (let [lookup (first expression)
-                             operation (symbol "clojure.core" (name lookup))]
-                         (when-let [operand (canonical (second expression) (dec remaining))]
-                           (intrinsic-source/observe-original! source-ns lookup operation)
-                           (with-meta (list operation operand) (meta expression)))))))]
-           (when-let [expression (canonical original 128)]
-             (let [literal (numeric-constant/source-value expression)
-                   value (:value literal)
-                   obligations (effects/descriptor original)]
-               (when (and (instance? Integer value) (contains? #{0 1} value)
-                          (= :pure (:effect obligations)) (empty? (:flags obligations)))
-                 {:source original :bound bound :proof-expression expression :value value
-                  :scope :closed-source-count :evaluation :before-initializer})))))))))
+         (when (and (instance? Integer (:value literal)) (contains? #{0 1} (:value literal)))
+           (assoc literal :bound bound :scope :closed-source-count :evaluation :before-initializer)))))))
 
 (defn observed-reduction-interval
   "Join actual producer storage to original scalar invocation completions.
@@ -510,6 +543,62 @@
          (when-let [observation (observed-reduction-interval
                                  (.-input ^PrefixCorrespondence correspondence))]
            (assoc candidate :observation observation)))))))
+
+(defn original-empty-reduction
+  "Revalidate the original zero-count reduction and its completed literal seed.
+
+   The dead recurrence's annotations grant no evidence. This closes only a single scalar
+   producer and its existing terminal interval; its eventual owner must additionally validate
+   the native empty-fold schedule and argument/storage demand before deferring anything."
+  [correspondence frontend program]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (let [contract (get-in program [:attributes :invocation-plan :attributes :terminal-host-result])
+           terminal (original-terminal-invocation correspondence frontend program contract)
+           observed (:observation terminal)
+           producer (get-in terminal [:producer-source :original])
+           reduction (get-in observed [:producer :reduction])
+           initializers (get-in reduction [:loop :initializers])
+           [index-init seed-init] initializers
+           seed (when terminal (closed-source-literal frontend (:initializer seed-init) (:before seed-init)))
+           index (when terminal (closed-source-literal frontend (:initializer index-init) (:before index-init)))
+           completed (get-in observed [:producer :completed-value])
+           carrier (or (:builtin-class completed) (:carrier completed))
+           dtype (cond (contains? #{Float Float/TYPE} carrier) :float
+                       (contains? #{Double Double/TYPE} carrier) :double)
+           seed-class (case dtype :float Float :double Double nil)
+           equation (first (:equations program))
+           algorithm (:algorithm equation)
+           inner (when (dialect/program-form? algorithm) (dialect/equations algorithm))
+           semantic-equation (first inner)
+           parts (when semantic-equation (dialect/operation-parts semantic-equation))
+           attributes (:attributes parts)
+           constructed (get-in terminal [:producer-source :constructed])
+           constructed-seed (when (and (seq? constructed) (= 6 (count constructed)))
+                              (closed-source-literal frontend (nth constructed 2) (:before seed-init)))]
+       (when (and terminal dtype (= 0 (get-in observed [:closed-count :value]))
+                  (= :known (get-in reduction [:loop :status])) (= 2 (count initializers))
+                  (= (nth producer 1 nil) (:binder seed-init))
+                  (= (nth producer 3 nil) (:binder index-init))
+                  (= :int (:input-type index-init) (:completed-type index-init))
+                  (instance? Integer (:value index)) (zero? (:value index))
+                  (completion/bytecode-operand-context? (:context index-init))
+                  (= dtype (:input-type seed-init) (:completed-type seed-init))
+                  (completion/bytecode-operand-context? (:context seed-init))
+                  (identical? seed-class (class (:value seed)))
+                  (semantic/equivalent? (:value seed) (:value constructed-seed))
+                  (= 1 (count (:equations program)) (count inner))
+                  (= 'reduce (:kind parts))
+                  (integer? (:extent attributes)) (zero? (:extent attributes))
+                  (= [dtype] (:dtypes attributes))
+                  (= 1 (count (:identities attributes)))
+                  (semantic/equivalent? (:value seed)
+                                        (:value (numeric-constant/value (first (:identities attributes)))))
+                  (nil? (:result-transform attributes))
+                  (empty? (get-in program [:attributes :invocation-plan :steps])))
+         {:dtype dtype :seed (:value seed) :initializer seed-init
+          :count (:closed-count observed) :equation (:id equation)
+          :result (first (:results equation)) :terminal terminal})))))
 
 (defn original-step
   "Query an exact constructed step under its exact original frontend/program.

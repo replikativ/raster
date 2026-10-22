@@ -437,6 +437,7 @@
 (defn- compile-semantic
   "Schedule and emit one exact typed semantic program without source or ABI reconstruction."
   [{:keys [id function-id target dtype source-ns source-var retained-frontend prefix-correspondence
+           reduction-correspondence
            options compiler-options]
     :as context}
    semantic]
@@ -446,7 +447,8 @@
            {:function function-id :dialect (:dialect semantic) :fallback :none}))
   (let [terminal (get-in semantic [:attributes :invocation-plan :attributes :terminal-host-result])
         terminal-owner (when terminal (source-owner/compile-terminal-result semantic terminal source-var
-                                                                           retained-frontend))
+                                                                           retained-frontend
+                                                                           reduction-correspondence))
         {:keys [target-descriptor resolved-schedule
                 dispatch-reassociated? dispatch-contractions?]} context
         scheduled (structured-route/schedule-program semantic compiler-options)
@@ -482,11 +484,13 @@
           emission)
         invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
         ordered-owner (when (and source-var retained-frontend
-                                 (source-owner/ordered-source-required? semantic (:program emission)))
+                                 (or reduction-correspondence
+                                     (source-owner/ordered-source-required? semantic (:program emission))))
                         (source-owner/compile-ordered-source
                          semantic (:program emission) source-var retained-frontend
-                         (boolean (stage-result/requires-observation? (:program emission)))
-                         prefix-correspondence))
+                         (boolean (or reduction-correspondence
+                                      (stage-result/requires-observation? (:program emission))))
+                         prefix-correspondence reduction-correspondence))
         eager-owner (when (and source-var
                               (source-owner/eager-evaluation-required? semantic (:program emission)))
                       (source-owner/compile-eager-evaluation
@@ -736,6 +740,9 @@
                             f-var resolved-var (:dtype compiler-options) compiler-options)
          prefix-input (source-prefix/begin retained-frontend
                                            (:raster.core/deftm-params (meta resolved-var)))
+         reduction-input (source-prefix/begin-reduction-interval
+                          retained-frontend (:raster.core/deftm-params (meta resolved-var)))
+         _ (source-prefix/prepare-reduction-entry! reduction-input rcore/ensure-current-owned-bytecode!)
          normalized-input (when retained-frontend
                             (source-transport/normalize-frontend-bindings
                              retained-frontend (:raster.core/deftm-params (meta resolved-var))))
@@ -789,6 +796,15 @@
          prefix-correspondence (source-prefix/close prefix-input (:source-normalization normalized-input)
                                                     source represented-source semantic
                                                     (:source-construction source-construction))
+         reduction-correspondence
+         (source-prefix/close-reduction-terminal
+          reduction-input (:source-normalization normalized-input) source represented-source semantic
+          (:source-construction source-construction))
+         ;; The conditional terminal join is not producer correspondence by itself. Only the
+         ;; closed empty producer can currently enter the connected source-owner vertical.
+         reduction-correspondence
+         (when (source-prefix/original-empty-reduction reduction-correspondence retained-frontend semantic)
+           reduction-correspondence)
          _ (source-prefix/prepare-selected-calls! prefix-correspondence retained-frontend semantic
                                                   rcore/ensure-current-owned-bytecode!)
          source-ns-symbol (source-namespace-symbol f-var)
@@ -801,6 +817,7 @@
               :dtype (:dtype compiler-options) :source-ns source-ns-symbol
               :source-var resolved-var :retained-frontend retained-frontend
               :prefix-correspondence prefix-correspondence
+              :reduction-correspondence reduction-correspondence
               :options options :compiler-options compiler-options})
       semantic))))))
 
@@ -836,7 +853,7 @@
         source-ns (or (:source-ns eager-context) source-ns)
         owned-prefix
         (when (= :owned-flat (:mode eager-context))
-          (let [initial (invocation-link/begin-ordered-realization compilation arguments caller-options)]
+          (let [initial (source-owner/begin-ordered-realization compilation arguments caller-options)]
             ;; Qualify the whole executor set before any scalar source work.
             ;; No missing executor may fall back after an earlier check ran.
             (source-owner/assert-ordered-executor-coverage! compilation initial arguments)

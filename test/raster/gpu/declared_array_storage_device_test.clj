@@ -3,6 +3,7 @@
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
+            [raster.compiler.backend.jvm.frontend-reduction-correspondence-test :as reduction-fixture]
             [raster.compiler.compatibility-map-packet-test :as map-packet]
             [raster.compiler.backend.gpu.segmap-retirement-fixture :as retirement]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
@@ -62,6 +63,52 @@
   (if @gp/gpu-available?
     (run-empty-fold-seed :ze:0)
     (gp/gpu-skip! "exact empty scalar reduction seed on Level Zero")))
+
+(defn- run-owned-empty-source [target]
+  (doseq [float? [false true] negative? [false true]]
+    ((ns-resolve 'raster.compiler.backend.jvm.frontend-reduction-correspondence-test
+                 'with-fresh-reduction-binding)
+     float? false 0 (if float? (list 'float (if negative? -0.0 0.0)) (if negative? -0.0 0.0))
+     (fn [frontend]
+       (let [compilation (equation-first/compile (get-in frontend [:source-entry :source-var])
+                                                {:target target :dtype (if float? :float :double)})
+             array-of (if float? float-array double-array)
+             original (:implementation frontend)]
+         (doseq [input [nil (array-of 0) (array-of [2.0])]]
+           (let [artifact (link/instantiate-host-result! compilation [input])]
+             (try
+               (dotimes [replay 2]
+                 (when (and input (pos? (alength input)))
+                   (java.lang.reflect.Array/set input 0 (if float? (float (+ replay 3.0)) (+ replay 3.0))))
+                 (let [expected (original input)
+                       actual (link/run-host-result! artifact)
+                       ordered (:ordered @(:execution-state artifact))]
+                   (is (= (class expected) (class actual)))
+                   (is (= expected actual (if negative? Double/NEGATIVE_INFINITY Double/POSITIVE_INFINITY)))
+                   (is (empty? (:entry-refresh ordered)) "no unread argument is captured or uploaded")
+                   (is (= 1 (count (:roots ordered))) "only the scalar result owns native storage")))
+               (is (= 2 @(:completed-replays artifact)))
+               (finally (link/close! artifact)))
+             (is @(:closed? artifact))))
+         (when (and (not float?) (not negative?))
+           (let [artifact (link/instantiate-host-result! compilation [nil])
+                 failure (ex-info "injected terminal completion failure" {:reason :empty-terminal-failure})]
+             (try
+               (with-redefs [source-owner/invoke-terminal-result (fn [& _] (throw failure))]
+                 (is (identical? failure (try (link/run-host-result! artifact) nil
+                                             (catch clojure.lang.ExceptionInfo error error)))))
+               (is (zero? @(:completed-replays artifact)))
+               (is (false? @(:output-ready? artifact)))
+               (finally (link/close! artifact)))
+             (is @(:closed? artifact)))))))))
+
+(deftest source-owned-empty-fold-completes-null-entry-and-replay-without-an-input-buffer
+  (if @opencl/opencl-available?
+    (run-owned-empty-source :ocl:0)
+    (opencl/opencl-skip! "source-owned empty reduction on OpenCL"))
+  (if @gp/gpu-available?
+    (run-owned-empty-source :ze:0)
+    (gp/gpu-skip! "source-owned empty reduction on Level Zero")))
 
 (defn- run-generated-clone [target]
   (doseq [n [0 4]]

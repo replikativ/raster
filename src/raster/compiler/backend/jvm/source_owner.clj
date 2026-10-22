@@ -17,6 +17,11 @@
             [raster.compiler.backend.jvm.terminal-source :as terminal-source]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-source :as invocation-source]
+            [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.core.dtype :as dtype]
@@ -418,6 +423,55 @@
                  (get-in program [:attributes :invocation-plan]) program)]
     (boolean (or (seq actions) (stage-result/requires-observation? emission)))))
 
+(defn- prepare-unread-inputs
+  [program emission frontend correspondence entry-ports]
+  (when correspondence
+    (let [original (source-prefix/original-empty-reduction correspondence frontend program)
+          _ (when-not original
+              (throw (ex-info "unread inputs require their original completed empty reduction"
+                              {:reason :unclosed-empty-reduction-source})))
+          checked (emitted-program/validate-with-physical-results! emission)
+          equation (first (:equations (:program checked)))
+          emitted (first (:operations equation))
+          projection (emitted-program/operation-projection (:projections checked) emitted)
+          graph (get-in projection [:boundary :graph])
+          artifact (get-in graph [:nodes 0 :operation])
+          certificate (get-in artifact [:provenance :scheduled-operation])
+          source (:source certificate)
+          plan (get-in program [:attributes :invocation-plan])
+          parameters (:parameters plan)
+          entries
+          (mapv (fn [position parameter port]
+                  (let [array-class (get types/primitive-array-info
+                                         (dtype/array-tag-for-dtype (get-in parameter [:value :dtype])))]
+                    (when (and (= (:symbol parameter) (:symbol port))
+                               (= 1 (count (get-in parameter [:value :shape])))
+                               (identical? array-class (:carrier port)))
+                      {:id (:id parameter) :symbol (:symbol parameter)
+                       :position position :class array-class})))
+                (range) parameters entry-ports)]
+      ;; Validation above reconstructs the actual schedule/body/ABI. The additional checks tie
+      ;; that native completion to the original source initializer, not merely a zero-size flag.
+      (when-not (and (= 1 (count (:equations emission)))
+                     (= (:equation original) (:id equation))
+                     (= 1 (count (:operations equation)) (count (:nodes graph)) (count (:outputs graph)))
+                     (empty? (:inputs graph)) (empty? (:scalars graph)) (empty? (:temporaries graph))
+                     (segop/empty-scalar-reduction? source)
+                     (nil? (get-in source [:reduction :attributes :result-region]))
+                     (= (:result original) (get-in projection [:physical-results (:result original)]))
+                     (= (:result original) (get-in graph [:outputs 0 :id]))
+                     (= 1 (get-in graph [:outputs 0 :elements]))
+                     (= (:dtype original) (get-in graph [:outputs 0 :dtype]))
+                     (semantic/equivalent? (:seed original) (get-in certificate [:legality :identity]))
+                     (empty? (:steps plan)) (empty? (:storage-bindings plan))
+                     (nil? (get-in plan [:attributes :parameter-projection]))
+                     (seq parameters) (= (count parameters) (count entries)) (every? some? entries)
+                     (= [(:result original)] (:outputs program))
+                     (empty? (get-in program [:attributes :allocations])))
+        (throw (ex-info "unread input authorization lacks an exact source/native empty-fold boundary"
+                        {:reason :unclosed-empty-reduction-boundary})))
+      {:source original :parameters entries :ids (set (map :id entries))})))
+
 (defn compile-ordered-source
   "Freeze source ownership after emission under the original producer.
    This grants no physical binding, completion or initialization. The compiler
@@ -431,6 +485,8 @@
   ([program emission source-var frontend required?]
    (compile-ordered-source program emission source-var frontend required? nil))
   ([program emission source-var frontend required? prefix-correspondence]
+   (compile-ordered-source program emission source-var frontend required? prefix-correspondence nil))
+  ([program emission source-var frontend required? prefix-correspondence reduction-correspondence]
    (entry/call-with-optional-definition-inputs
     (fn []
       (entry/assert-frontend-source! frontend source-var)
@@ -464,6 +520,9 @@
                               unavailable)))
             (let [scalar-source (prepare-scalar-steps program frontend source-var source-ns policy collector
                                                        prefix-correspondence)
+                  unread (prepare-unread-inputs program emission frontend reduction-correspondence
+                                                (:entry-ports scalar-source))
+                  scalar-source (cond-> scalar-source unread (assoc :unread-inputs unread))
                   observations @collector]
               (source-history-current! source-ns observations :stale-checked-result-source-namespace)
               (OrderedSourceOwner. program emission observations source-ns scalar-source)))))))))
@@ -488,6 +547,54 @@
   [{:keys [ordered-source-owner semantic emitted]}]
   (when (or ordered-source-owner (ordered-source-required? semantic emitted))
     (assert-ordered-source! ordered-source-owner semantic emitted)))
+
+(defn- unread-inputs [compilation]
+  (assert-ordered-compilation-source! compilation)
+  (when-let [owner (:ordered-source-owner compilation)]
+    (get (.-scalar-source ^OrderedSourceOwner owner) :unread-inputs)))
+
+(defn begin-ordered-realization
+  "Begin through the existing source owner, preserving unread raw argument references.
+   Only privately prepared source/native correspondence selects deferred IDs. Original nullable
+   array entry casts run before any storage work; they grant no non-null or capacity fact."
+  [compilation arguments caller-options]
+  (let [unread (unread-inputs compilation)]
+    (when unread
+      (when-not (= (count arguments) (count (:parameters unread)))
+        (throw (ex-info "public argument arity differs from its original source entry"
+                        {:reason :ordered-unread-arguments})))
+      (doseq [{:keys [position class]} (:parameters unread)]
+        (.cast ^Class class (nth arguments position))))
+    (invocation-link/begin-ordered-realization compilation arguments caller-options
+                                              (or (:ids unread) #{}))))
+
+(defn finish-ordered-storage-boundary
+  "Finish source-owned unread arguments without fabricating a MaterializedInvocation.
+   The runtime still owes completion, initialized output bytes, root liveness and publication."
+  [compilation state arguments caller-options]
+  (let [unread (unread-inputs compilation)
+        plan (get-in compilation [:semantic :attributes :invocation-plan])
+        pending (get-in state [:materialization ::materialization/deferred-parameters])]
+    (if-not unread
+      (invocation-link/finish-ordered-storage-boundary state caller-options)
+      (do
+        (when-not (and (identical? (:program state) (:emitted compilation))
+                       (identical? plan (get-in state [:materialization :plan]))
+                       (= (invocation/source-order plan (:semantic compilation)) (:source-order state))
+                       (= (:ids unread) (set (keys pending)))
+                       (= (count arguments) (count (:parameters unread)))
+                       ;; A completed empty fold has its result storage, but never a borrowed
+                       ;; source initializer. Check logical IDs below instead of requiring an
+                       ;; empty realized storage table.
+                       (every? (fn [{:keys [id position symbol]}]
+                                 (let [entry (get pending id)]
+                                   (and (= position (:parameter-position entry))
+                                        (identical? (nth arguments position) (:source entry))
+                                        (not (contains? (get-in state [:realized :buffers]) symbol)))))
+                               (:parameters unread)))
+          (throw (ex-info "completed unread inputs differ from their source-owned argument identity"
+                          {:reason :ordered-unread-completion})))
+        (invocation-link/finish-ordered-prefix-storage-boundary state caller-options)))))
 
 (deftype ^:private EagerEvaluationOwner
   [program emission observations source-ns ordered-owner mode])

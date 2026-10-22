@@ -290,13 +290,58 @@ exact committed function definitions and rerunning in the same REPL reproduced
 the same counts, names and messages: checked-conversion, scalar-prefix and typed
 projection debt, not a green broad gate. PR1539 remains draft/unqualified.
 
-This closes native physical demand, **not original source execution**. Source
+At that checkpoint this closed native physical demand, **not original source execution**. Source
 count conversion/initializer evaluation, nullable entry conversions, read-failure
 order and acquisition/publication guards remain obligations of the ordered
 invocation owner. Deferred materialization is still unwired. The next connected
 step must authorize exact deferred IDs and original argument-reference identities,
 prove the producer construction, and reconcile truly unread parameters at source
 completion without inventing empty buffers or weakening generic finish validation.
+
+### October 22 source-owned empty-fold execution
+
+The connected public compiler now prepares the original cold reduction entry through
+the existing owned-bytecode service, without calling the numerical function. Queries
+remain non-emitting; preparation is restricted to the actual direct reduction/terminal
+scope and changed observations trigger the existing whole-compilation retry. The
+selected floating terminal leaf is prepared before the caller, including when the
+caller is already warm but its callee remains pending. Signature observation selects
+preparation only; it does not grant numerical admission or primitive return storage.
+
+The existing `OrderedSourceOwner` authorizes unread arguments only after joining the
+original checked zero count, index/accumulator initialization and exact seed bits to
+the independently reconstructed native empty-fold body, ABI and output. It retains
+original primitive-array entry classes and performs their nullable casts before any
+storage acquisition. No new owner type, model-specific rule or dummy buffer is added.
+
+Ordered realization preserves authorized raw references and original argument ordinals
+without materializing them. Completion rechecks the exact emitted program, invocation
+plan identity, source order, pending IDs, ordinals and raw-reference identity, plus
+absence of realized input storage. The shared completed-storage projection uses only
+available bindings. Generic `finish-materialization` still refuses pending parameters;
+native completion, initialized output ranges, live roots and publication remain runtime
+obligations. Missing ownership defaults to eager validation, not permission to defer.
+
+Focused evidence after explicit preparation-order coverage: 104 tests / 1,728 assertions pass,
+including actual OpenCL and Level Zero null/empty/populated input cases, FP32/FP64
+positive/negative-zero seeds, changed-data replay and terminal-failure cleanup. The
+first fresh-JVM run exposed 19 order-dependent assertions that had borrowed a warm
+FP32 terminal callee. The explicit producer service and observation fixtures now prepare
+both actual entries without numerical warmup. A second fresh JVM confirms the FP32
+terminal is pending before the public cold test, which passes for FP32 and FP64
+(one test / ten assertions); the complete affected gate also passes in that fresh JVM
+(104 tests / 1,728 assertions, zero failures/errors). A broader
+ordered-realization group has three failures in two tests; restoring the exact committed
+functions in the same REPL reproduced all three. Those baseline failures and the broad
+CI failures remain outstanding; this is not merge qualification for draft PR1539.
+
+The producer law is deliberately zero-only. A singleton must evaluate its actual read
+and combine with the source seed, not substitute the element or a reconstructed neutral
+value. The next connected step is a strict seeded fold schedule using existing KernelBody
+operations, then original read/combine/backedge correspondence and source-ordered entry
+guards. Only an independently justified algebraic permission may select a reassociated
+tree. Positive/dynamic counts, null/short reads and earlier exceptions cannot borrow the
+empty-domain proof.
 
 ### October 21 DeepSeek inference reference integration
 

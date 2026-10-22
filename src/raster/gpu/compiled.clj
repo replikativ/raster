@@ -1065,7 +1065,7 @@
         caller-options (when (contains? opts :scalar-math)
                          {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math opts))})
         initial (invocation-link/validate-ordered-source-actions!
-                 (invocation-link/begin-ordered-realization compilation args caller-options))
+                 (source-owner/begin-ordered-realization compilation args caller-options))
         _ (source-owner/assert-ordered-executor-coverage! compilation initial args)
         available (materialization/prefix-bindings (:materialization initial))
         buffers (:program-buffers available)

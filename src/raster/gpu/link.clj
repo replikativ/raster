@@ -1196,7 +1196,7 @@
                                                         (:semantic compilation) terminal))
         caller-options (caller-math-options opts)
         initial (invocation-link/validate-ordered-source-actions!
-                 (invocation-link/begin-ordered-realization compilation arguments caller-options))
+                 (source-owner/begin-ordered-realization compilation arguments caller-options))
         _ (source-owner/assert-ordered-executor-coverage! compilation initial arguments)
         entry-roles (invocation-link/ordered-entry-roles initial (:entry-roles opts))
         entry-layout (invocation-link/ordered-entry-layout initial entry-roles)
@@ -1475,7 +1475,7 @@
 (defn- finish-ordered-invocation! [executable state]
   (let [execution-state (:execution-state executable)
         epoch (:value-epoch @execution-state)
-        {:keys [compilation observe-checked? observed caller-options roots execution-id ledger timings initialized]}
+        {:keys [compilation arguments observe-checked? observed caller-options roots execution-id ledger timings initialized]}
         (:ordered @execution-state)
         _ (assert-ordered-source! compilation)
         _ (when observe-checked?
@@ -1484,8 +1484,11 @@
               (when-not (= expected observed)
                 (throw (ex-info "completed invocation lacks this replay's exact source observations"
                                 {:reason :link-checked-observations-incomplete})))))
-        final (if observe-checked?
-                {:plan (invocation-link/finish-ordered-storage-boundary state caller-options)}
+        final (if (or observe-checked?
+                      (seq (get-in state
+                                   [:materialization
+                                    :raster.compiler.ir.invocation-materialization/deferred-parameters])))
+                {:plan (source-owner/finish-ordered-storage-boundary compilation state arguments caller-options)}
                 (invocation-link/finish-ordered-realization state caller-options))
         plan (:plan final)
         groups (allocation-groups plan)]
@@ -1558,7 +1561,7 @@
       (throw (ex-info "ordered invocation still owns an unfinished prepared stage"
                       {:reason :link-ordered-prepared-stage})))
     (let [initial (assoc (invocation-link/validate-ordered-source-actions!
-                         (invocation-link/begin-ordered-realization compilation arguments caller-options))
+                         (source-owner/begin-ordered-realization compilation arguments caller-options))
                          :entry-roles entry-roles :entry-refresh entry-refresh)
           _ (source-owner/assert-ordered-executor-coverage! compilation initial arguments)
           _ (when observe-checked? (retire-checked-private-generation! executable))
@@ -1621,7 +1624,7 @@
                          {:reason :link-ordered-input-callback})))
        (assert-ordered-source! compilation)
        (let [epoch (:value-epoch @execution-state)
-             initial (invocation-link/begin-ordered-realization compilation arguments caller-options)
+             initial (source-owner/begin-ordered-realization compilation arguments caller-options)
              checked (invocation-link/ordered-input-arguments initial arguments entry-roles replacements)]
          (source-owner/assert-ordered-executor-coverage! compilation initial checked)
          (when before-mutation! (before-mutation!))

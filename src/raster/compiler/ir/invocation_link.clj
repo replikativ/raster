@@ -581,7 +581,9 @@
 (defn ^:no-doc begin-ordered-realization
   "Begin owner-local realization without evaluating invocation steps or acquiring resources.
    The returned map is runtime construction state, not a portable completion certificate."
-  [compilation arguments caller-options]
+  ([compilation arguments caller-options]
+   (begin-ordered-realization compilation arguments caller-options #{}))
+  ([compilation arguments caller-options deferred-parameters]
   (let [semantic-program (:semantic compilation)
         invocation (get-in semantic-program [:attributes :invocation-plan])
         invocation (invocation/validate-against! invocation semantic-program)
@@ -604,7 +606,7 @@
      :source-realizations (into {} (keep (fn [entry]
                                           (when-let [action (invocation-source/realization-action semantic-program entry)]
                                             [(:position entry) action]))) order)
-     :materialization (materialization/begin-materialization invocation arguments)
+     :materialization (materialization/begin-materialization invocation arguments deferred-parameters)
      :realized {:buffers {} :storage {} :loop-scratch {}}
      :acquired-storage #{}
      :source-allocations (into {} (map (juxt :destination :source-expression))
@@ -612,7 +614,7 @@
      :source-allocation-projections (into {} (map (juxt :destination :source-projection))
                                         (get-in semantic-program [:attributes :allocations]))
      :projections (:projections checked) :target (:target compilation)
-     :caller-options caller-options}))
+     :caller-options caller-options})))
 
 (defn- validate-source-result-allocation! [state entry action]
   (let [destination (:binding action)
@@ -1547,15 +1549,11 @@
                    [position {:equation (:id equation) :observations observations}])))))
           (:source-order state))))
 
-(defn ^:no-doc finish-ordered-storage-boundary
-  "Project completed source storage, not an executable program or completion proof.
-   The runtime must still check its own observation ledger, initialized ranges and
-   live acquired roots. No whole-program call is rebound or stripped of checks."
-  [state caller-options]
+(defn- completed-storage-boundary
+  [state caller-options bindings]
   (require-completed-source! state caller-options)
-  (let [materialized (materialization/finish-materialization (:materialization state))
-        scalars (merge (invocation-shape-scalars materialized)
-                       (:program-scalars materialized) (:host-scalars state))
+  (let [scalars (merge (invocation-shape-scalars (:materialization state))
+                       (:program-scalars bindings) (:host-scalars state))
         realized (:realized state)
         output-bindings (program-call/project-output-bindings
                          (:program state) (:buffers realized) scalars)
@@ -1569,11 +1567,28 @@
         ;; Initializers have already run. This boundary must not replay them.
         nodes (mapv #(assoc % :source nil) (:nodes layout))]
     (link/make-storage-boundary
-     {:id [(get-in materialized [:plan :id]) :completed-storage]
+     {:id [(get-in state [:materialization :plan :id]) :completed-storage]
       :target (:target state) :nodes nodes :values (:values layout) :outputs (vec (distinct tokens))
       :aliases (into #{} (map set) (bview/overlapping-id-pairs (map (juxt :id :view) nodes)))
       :attributes {:source :typed-invocation :semantic-outputs outputs
                    :compiler-buffer-bindings (:buffers realized)}})))
+
+(defn ^:no-doc finish-ordered-storage-boundary
+  "Project completed source storage after strict whole-invocation materialization.
+   The runtime must still check observations, initialized ranges and live acquired roots."
+  [state caller-options]
+  (completed-storage-boundary state caller-options
+                              (materialization/finish-materialization (:materialization state))))
+
+(defn ^:no-doc finish-ordered-prefix-storage-boundary
+  "Project available storage without claiming a completed MaterializedInvocation.
+   The SourceOwner caller owes original-source completion and exact unread-parameter identity
+   and demand checks. This pure projection grants no execution or lifetime authority."
+  [state caller-options]
+  (let [materialized (materialization/validate-state! (:materialization state))]
+    (when-not (= (:next-step materialized) (count (get-in materialized [:plan :steps])))
+      (fail! :invocation-ordered-incomplete "invocation suffix is still unevaluated" {}))
+    (completed-storage-boundary state caller-options (materialization/prefix-bindings materialized))))
 
 (defn ^:no-doc finish-ordered-realization
   "Construct and independently validate the ordinary whole-program boundary after source work.
