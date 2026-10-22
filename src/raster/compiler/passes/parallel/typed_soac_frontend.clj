@@ -4086,8 +4086,8 @@
      (fn [original constructed]
        (observe-normalization! :array-type-witness original constructed)))))
 
-(defn- normalize-source*
-  [source array-types scalar-types]
+(defn- normalize-value-source*
+  [source array-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
@@ -4107,6 +4107,11 @@
         source (observe-normalization! :array-type-witness-root source
                                         (erase-array-type-witnesses source public-array-types))
         source (lift-nested-scalar-reductions source)]
+    source))
+
+(defn- normalize-source*
+  [source array-types scalar-types]
+  (let [source (normalize-value-source* source array-types)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
@@ -4778,6 +4783,47 @@
         (meta source)))
     source))
 
+(defn- call-with-normalization-context
+  [source {:keys [array-types scalar-types source-ns]} observe! normalize]
+  ;; Keep runtime-safe and device projections under the same lexical/type
+  ;; environment. In particular, a local scalar may shadow a public array.
+  (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
+                  (filter symbol? (take-nth 2 (second source))))
+        tagged (fn [kind?]
+                 (set (filter #(kind? (types/sym-type-tag %)) binders)))]
+    (binding [*normalization-observer* observe!
+              util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
+              *normalization-source-ns* (cond
+                                         (instance? clojure.lang.Namespace source-ns) source-ns
+                                         (symbol? source-ns) (find-ns source-ns))
+              *region-local-counter* (atom -1)
+              *region-local-source-symbols* (source-symbols source)
+              *declared-kinds*
+              {:arrays (into (set (keys array-types))
+                             (tagged #(some? (dtype/dtype-for-array-tag %))))
+               :scalars (into (set (keys scalar-types))
+                              (tagged #(contains? #{:long :int}
+                                                  (some-> % dtype/dtype-for-scalar-tag
+                                                          dtype/canon))))}]
+      (normalize))))
+
+(defn normalize-value-source
+  "Canonical value-binding prefix shared by runtime program construction and TypedSOAC.
+
+   Performs lexical uniquification, proven array-type witness conversion and
+   strict scalar-reduction lifting only. Does not expose copies as device maps,
+   rewrite allocations, alias buffers or insert device extent bindings. This
+   constructs a NEW program before emission; it does not establish equivalence
+   to a previously emitted body or grant device admission. Completion wrappers
+   remain explicit. Options and constructor observations match normalize-source."
+  ([source] (normalize-value-source source {}))
+  ([source options] (normalize-value-source source options nil))
+  ([source options observe!]
+   (call-with-normalization-context
+    source options observe!
+    #(observe-normalization! :normalize-value-source source
+                             (normalize-value-source* source (:array-types options))))))
+
 (defn normalize-source
   "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
 
@@ -4791,32 +4837,14 @@
    owner; changed untraced stages remain unclosed. Nested calls own their observer."
   ([source] (normalize-source source {}))
   ([source options] (normalize-source source options nil))
-  ([source {:keys [array-types scalar-types source-ns]} observe!]
-   ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
-   ;; binder an array, exactly as the walker stamps them.
-   (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
-                   (filter symbol? (take-nth 2 (second source))))
-         tagged (fn [kind?]
-                  (set (filter #(kind? (types/sym-type-tag %)) binders)))]
-     (binding [*normalization-observer* observe!
-               util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
-               *normalization-source-ns* (cond
-                                          (instance? clojure.lang.Namespace source-ns) source-ns
-                                          (symbol? source-ns) (find-ns source-ns))
-               *region-local-counter* (atom -1)
-               *region-local-source-symbols* (source-symbols source)
-               *declared-kinds*
-               {:arrays (into (set (keys array-types))
-                              (tagged #(some? (dtype/dtype-for-array-tag %))))
-                :scalars (into (set (keys scalar-types))
-                               (tagged #(contains? #{:long :int}
-                                                   (some-> % dtype/dtype-for-scalar-tag
-                                                           dtype/canon))))}]
-       (observe-normalization!
-        :normalize-source source
-        (normalize-source*
-         (observe-normalization! :copy-allocations source (copy-allocations->maps source array-types))
-         array-types scalar-types))))))
+  ([source {:keys [array-types scalar-types] :as options} observe!]
+   (call-with-normalization-context
+    source options observe!
+    #(observe-normalization!
+      :normalize-source source
+      (normalize-source*
+       (observe-normalization! :copy-allocations source (copy-allocations->maps source array-types))
+       array-types scalar-types)))))
 
 (declare coverage-decline*)
 

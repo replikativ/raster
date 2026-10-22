@@ -75,7 +75,34 @@ remaining. Final-tree `prepared-program-binding-occurrence` cannot certify this
 interval. Merely moving a query to `pass-lower` is also insufficient: direct
 equation-first compilation does not necessarily inline AD in that pass.
 
-The reviewed continuation is:
+The reviewed architecture now favors constructing one canonical generated body
+**before** freezing/emitting its first outer entry, rather than maintaining an
+additional correspondence owner between physical and normalized binding spines.
+Authenticated helper expansion already constructs a new program under the
+existing GeneratedPreparationOwner. Its runtime body, emitted entry and typed
+candidate should therefore share that program. This does not allow normalizing
+an already emitted body without its original completion evidence.
+
+The first factoring step introduces `normalize-value-source`: lexical
+uniquification, proven array-type witness conversion and strict scalar-reduction
+lifting share the existing frontend implementation and lexical environment.
+Device copy exposure, allocation/buffer alias rewrites and device extent
+insertion stay in `normalize-source`. The new prefix is not yet installed in
+generated preparation, and canonical completion wrappers remain extraction
+barriers. Traversing their operand requires preserving its original emitted
+context, not merely rebuilding a syntactically identical outer contract.
+
+Qualification of this factoring: 11 focused tests / 152 assertions pass in the
+existing capped REPL. Comparing 176 unchanged tests against the previous
+implementation in that same JVM gives identical outcomes (1,040 passing
+assertions, 18 failures, one error); those existing failures remain obligations,
+not accepted skips. No resident gradient admission is claimed by this step.
+
+Next, validate post-helper flattening and the safe prefix before first emission;
+preserve result ports/aliases, parameter completions and source order, check
+idempotence and the flat binding planner, and discharge completion facts only
+from the final actual entry. Do not move the full device normalizer into runtime
+preparation. The existing-IR module import still has these obligations:
 
 1. Consume the exact prepared projection at its inliner construction boundary,
    before raw bindings are appended. One compilation-local mechanism must cover

@@ -1992,6 +1992,40 @@
       (doall output)
       (is (= count-before (count @events)) "no lazy notices escape the capture interval"))))
 
+(deftest value-normalization-excludes-device-copy-and-extent-projections
+  (let [source '(let* [copy (clojure.core/aclone input)
+                      effect (raster.par/map! output i (clojure.core/* rows width)
+                                             double (clojure.core/aget copy i))]
+                 [copy output])
+        options {:array-types {'input :double 'output :double}
+                 :scalar-types {'rows :long 'width :long} :source-ns *ns*}
+        events (atom [])
+        canonical (frontend/normalize-value-source source options #(swap! events conj %))]
+    (is (= source canonical))
+    (is (= canonical (frontend/normalize-value-source canonical options)))
+    (is (= [:uniquify-root :array-type-witness-root :lift-scalar-reductions
+            :normalize-value-source]
+           (mapv :stage (filter #(contains? #{:uniquify-root :array-type-witness-root
+                                              :lift-scalar-reductions :normalize-value-source}
+                                            (:stage %)) @events))))
+    (is (not-any? #(= :copy-allocations (:stage %)) @events))
+    (is (not= canonical (frontend/normalize-source source options)))
+    (is (= '[copy output] (last canonical)))))
+
+(deftest value-normalization-shares-the-strict-reduction-prefix
+  (let [reduction (with-meta '(raster.par/reduce sum 0.0 i n (+ sum (clojure.core/aget xs i)))
+                    {:tag 'double :raster.type/tag 'double})
+        source (list 'let* ['value (list 'clojure.core/+ reduction 1.0)] ['value 'value nil])
+        options {:array-types {'xs :double} :scalar-types {'n :long} :source-ns *ns*}
+        canonical (frontend/normalize-value-source source options)
+        bindings (second canonical)]
+    (is (= 4 (count bindings)))
+    (is (= reduction (second bindings)))
+    (is (= (list 'clojure.core/+ (first bindings) 1.0) (nth bindings 3)))
+    (is (= '[value value nil] (last canonical)))
+    (is (= canonical (frontend/normalize-value-source canonical options)))
+    (is (= canonical (frontend/normalize-source canonical options)))))
+
 (deftest normalization-observers-are-scoped-and-exceptions-abort
   (let [source '(let* [a 1] a)
         events (atom [])]
