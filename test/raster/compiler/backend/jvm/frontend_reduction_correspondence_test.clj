@@ -4,6 +4,7 @@
             [raster.par :as par]
             [raster.numeric :as numeric]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.source-prefix :as prefix]
             [raster.compiler.ir.par :as par-ir]
             [raster.compiler.backend.jvm.split :as split]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
@@ -123,6 +124,90 @@
       (let [scope (first (:body frontend))]
         (is (some? (entry/frontend-reduction-emission frontend (nth (second scope) 1))))
         (is (nil? (entry/frontend-extracted-reduction-binding frontend scope 0)))))))
+
+(deftest direct-reduction-consumer-preserves-actual-carriers-and-completions
+  (doseq [float? [false true] split? [false true]]
+    (with-fresh-reduction-binding
+      float? split?
+      (fn [frontend]
+        (let [parameters (get-in frontend [:source-entry :params])
+              input (prefix/begin-reduction-interval frontend parameters)
+              observed (prefix/observed-reduction-interval input)
+              producer-type (if float? :float :double)
+              producer-class (if float? Float/TYPE Double/TYPE)
+              producer (get-in observed [:producer :binding])
+              consumer (get-in observed [:consumer :binding])
+              call (get-in observed [:consumer :invocation])]
+          (is (some? input))
+          (is (some? observed))
+          (is (identical? (first (:body frontend)) (:scope observed)))
+          (is (= [0 1] (:ordinals observed)))
+          (is (= (if split? :extracted-reduction :direct-reduction)
+                 (get-in observed [:producer :kind])))
+          (is (= (if split? producer-class Object)
+                 (get-in observed [:producer :completed-value :carrier])))
+          (is (= (if split? producer-type :ref) (get-in producer [:after :type])
+                 (get-in call [:input-completions 1 :emitted-type])))
+          (is (= (if split? :identity :coerce) (get-in call [:input-completions 1 :adaptation])))
+          (is (= (:after producer) (get-in consumer [:before 'sum])))
+          (is (= Object (:return-carrier call)
+                 (get-in observed [:consumer :computation :result-carrier])))
+          (is (= :ref (get-in consumer [:after :type])))
+          (is (nil? (prefix/begin frontend parameters))
+              "the old prefix family stops before the first parallel operation")
+          (is (nil? (prefix/close input nil nil nil {:source (:scope observed)})))
+          (is (nil? (prefix/observed-reduction-interval nil)))
+          (is (nil? (prefix/begin-reduction-interval frontend (conj parameters 'extra)))))))))
+
+(deftest direct-reduction-consumer-refusals-do-not-retain-speculative-inputs
+  (with-fresh-reduction-binding
+    false false
+    (fn [frontend]
+      (let [input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))
+            observe entry/frontend-completed-invocation-context
+            reduction entry/frontend-reduction-emission
+            selected entry/selected-parameter-carriers
+            foreign (.getMethod Double "valueOf" (into-array Class [Double/TYPE]))]
+        (doseq [[path change]
+                [[[:method] (constantly foreign)]
+                 [[:return-carrier] (constantly Double/TYPE)]
+                 [[:receiver] (constantly 'foreign/receiver)]
+                 [[:receiver-input :ports] (constantly {'receiver {:type :ref}})]
+                 [[:receiver-input :context] (constantly nil)]
+                 [[:receiver-input :context :preserve-source-call-results?] (constantly :unknown)]
+                 [[:inputs 1 :ports 'sum :slot] inc]
+                 [[:input-completions 1 :emitted-type] (constantly :double)]
+                 [[:input-completions 1 :parameter-carrier] (constantly Float/TYPE)]
+                 [[:inputs] #(conj % (last %))]
+                 [[:input-completions] #(conj % (last %))]
+                 [[:input-completions 0] (constantly nil)]
+                 [[:input-completions] pop]]]
+          (let [before @entry/*emission-inputs*]
+            (with-redefs [entry/frontend-completed-invocation-context
+                          (fn [& arguments] (update-in (apply observe arguments) path change))]
+              (is (nil? (prefix/observed-reduction-interval input)) (str "changed call boundary: " path)))
+            (is (identical? before @entry/*emission-inputs*)
+                "a refused whole interval cannot retain individually successful subqueries")))
+        (doseq [[key value] [[:presence :unknown] [:carrier Double/TYPE]]]
+          (let [before @entry/*emission-inputs*]
+            (with-redefs [entry/frontend-reduction-emission
+                          (fn [& arguments] (assoc-in (apply reduction arguments) [:result-fact key] value))]
+              (is (nil? (prefix/observed-reduction-interval input))))
+            (is (identical? before @entry/*emission-inputs*))))
+        (with-redefs [entry/selected-parameter-carriers
+                      (fn [& arguments]
+                        (assoc-in (apply selected arguments) [:definition :entry :typed-impl] (Object.)))]
+          (is (= :retained-frontend-owner-mismatch
+                 (try (prefix/observed-reduction-interval input) nil
+                      (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+        (is (= :unowned-checked-result-frontend
+               (try
+                 (prefix/begin-reduction-interval
+                  (assoc frontend :body (with-meta (mapv identity (:body frontend))
+                                         (meta (:body frontend))))
+                  (get-in frontend [:source-entry :params]))
+                 nil
+                 (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))))
 
 (deftest extracted-binding-requires-the-complete-physical-chain
   (with-fresh-reduction-binding

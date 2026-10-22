@@ -381,6 +381,34 @@ namespaces; the new forced-split/unsplit Float/Double boundary and negative cont
 account for 3 tests / 67 assertions within that total. Full interval/count/read
 correspondence and use-closed consumer placement still remain to be connected.
 
+The source-local observation now joins that producer to an immediately following
+selected FP consumer in an unchanged two-binding scope, reusing the existing
+private input representation under a distinct entry/query family. Unsplit Object
+storage and extracted primitive storage remain different; consumer argument
+coercions, receiver, actual return/storage and selected payload computation are
+retained separately. Primitive caller shortcuts abstain rather than inheriting
+an Object-interface proof. Whole-query history adoption is transactional; a
+refusal retains none of its individually successful subqueries. The old prefix
+family cannot consume the new capture. Independent review found no blocker for
+this conditional scope. Affected qualification: 98 tests / 1,485 assertions,
+zero failures/errors; new interval controls account for 2 tests / 92 assertions.
+This still supplies no count/read, equation placement or execution certificate.
+
+Next connected execution obligation has existing capacity authorities:
+`segred_body`'s input `:minimum-elements`, reconstructed fold-read requirements,
+`kernel_call/validate-retained-input-capacities!`, linked-view range validation
+and the ordered source cursor in `gpu/link`. These must be reused, not replaced
+by another bounds system. They are not yet source read completion: unknown native
+capacity remains a caller obligation and capacity failures are not original
+null/bounds failures. Retain the checked original count as an ordered
+`ScalarCompute` using the existing reduction-count outliner, once and before
+initialization; keep signed source count separate from nonnegative launch extent.
+At the reduction cursor, validate the original read domain against actual public
+array/live-view storage. Empty domains require no read or fabricated upload.
+Qualify null/empty inputs at counts 0/1, short views over larger roots, unknown
+capacity, changed replay, count-before-initializer failure and no launch/result
+publication after failed validation before consuming the numerical interval.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction

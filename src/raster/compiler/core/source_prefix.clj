@@ -1,14 +1,17 @@
 (ns raster.compiler.core.source-prefix
-  "Producer-local verification of an unchanged evaluated frontend prefix.
+  "Producer-local verification of unchanged frontend source intervals.
 
-   This relates original lexical occurrences to constructed invocation steps;
-   it grants no physical carrier, conversion, purity or execution permission.
-   In particular a scalar equation's materialization cast is not original source."
+   Prefix correspondence relates original lexical occurrences to invocation
+   steps without granting physical carrier or execution permission. The direct
+   reduction/consumer family separately joins observed physical completions,
+   conditional on their original evaluation. Neither grants count/read, purity,
+   placement or GPU admission. A materialization cast is not original source."
   (:require [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -55,6 +58,126 @@
           ;; Shadowed declarations need a richer occurrence relation, not a
           ;; symbol-map guess that conflates two binders of the same spelling.
           (PrefixInput. frontend parameters scope pairs))))))
+
+(defn- direct-reduction-pairs [scope]
+  (when (and (seq? scope) (contains? form/let-heads (first scope))
+             (vector? (second scope)) (= 4 (count (second scope)))
+             (= 3 (count scope)))
+    (let [pairs (mapv vec (partition 2 (second scope)))]
+      (when (and (every? symbol? (map first pairs))
+                 (par/par-reduce-form? (second (first pairs)))
+                 (seq? (second (second pairs)))
+                 (not (parallel-source? (second (second pairs))))
+                 (= (first (second pairs)) (nth scope 2)))
+        pairs))))
+
+(defn begin-reduction-interval
+  "Capture an original direct reduction/consumer scope before normalization.
+   This is distinct from the pre-device prefix family. It grants no bound/read,
+   value, placement or execution correspondence, and prepares no source code."
+  [frontend parameters]
+  (when frontend
+    (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+    (when (and (vector? parameters) (= parameters (get-in frontend [:source-entry :params]))
+               (= 1 (count (:body frontend))))
+      (let [scope (first (:body frontend))
+            pairs (direct-reduction-pairs scope)
+            binders (concat parameters (map first pairs))]
+        (when (and pairs (every? symbol? parameters)
+                   (= (count binders) (count (set binders))))
+          (PrefixInput. frontend parameters scope pairs))))))
+
+(defn- reduction-binding-observation [frontend scope original]
+  (let [reduction (entry/frontend-reduction-emission frontend original)
+        binding (entry/frontend-binding-context frontend scope 0)
+        slot (:after binding)
+        root (:root-result reduction)]
+    (when (and reduction binding)
+      (if (and (identical? (:initializer binding) (get-in reduction [:bound :expression]))
+               (= :ref (:type slot) (:result-type root))
+               (identical? (:reference-class slot) (get-in reduction [:result-fact :carrier]))
+               (= :present (get-in reduction [:result-fact :presence]))
+               (contains? #{Float Double} (get-in reduction [:result-fact :builtin-class])))
+        {:kind :direct-reduction :reduction reduction :binding binding
+         :completed-value (:result-fact reduction)}
+        (when-let [extracted (entry/frontend-extracted-reduction-binding frontend scope 0)]
+          {:kind :extracted-reduction :reduction (:reduction extracted)
+           :binding (:binding extracted) :extraction extracted
+           ;; This is the actual primitive local AFTER its helper invocation
+           ;; and return adaptation complete, not a relabelled boxed payload.
+           :completed-value {:carrier (.getReturnType ^java.lang.reflect.Method
+                                                      (get-in extracted [:helper :method]))
+                             :presence :present}})))))
+
+(defn observed-reduction-interval
+  "Join actual producer storage to original scalar invocation completions.
+   Conditional on those original evaluations completing. The selected Object
+   payload computation stays separate from actual invocation return/storage.
+   No count/read, use closure, placement or GPU admission is established here.
+   Cold/missing/unsupported evidence abstains transactionally without preparing
+   code. The result is not a standalone execution certificate."
+  [input]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and entry/*emission-inputs* (instance? PrefixInput input))
+       (let [^PrefixInput input input
+             frontend (.-frontend input) scope (.-scope input) pairs (.-pairs input)
+             [[producer-id original] [consumer-id expression]] pairs]
+         (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+         (when (and (identical? scope (first (:body frontend)))
+                    (= (.-parameters input) (get-in frontend [:source-entry :params]))
+                    (= 2 (count pairs))
+                    (every? true? (map identical? (mapcat identity pairs) (second scope)))
+                    (some? (direct-reduction-pairs scope)))
+           (let [producer (reduction-binding-observation frontend scope original)
+                 bound (entry/frontend-binding-context frontend scope 1)
+                 call (entry/frontend-completed-invocation-context frontend expression)
+                 {:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+                 (descriptor/call-description expression)
+                 selected (when (and dispatch? (not lexical-callee))
+                            (entry/selected-parameter-carriers semantic-op implementation-op (count arguments)))
+                 producer-slot (get-in producer [:binding :after])
+                 producer-inputs (keep-indexed (fn [i argument] (when (= producer-id argument) i)) arguments)
+                 facts (mapv (fn [argument input completed]
+                               (if (= producer-id argument)
+                                 (when (and (= argument (:operand input))
+                                            (= {producer-id producer-slot} (:ports input))
+                                            (= (:type producer-slot) (:emitted-type completed)))
+                                   (:completed-value producer))
+                                 (when (and (empty? (:ports input))
+                                            (contains? #{:float :double} (:emitted-type completed)))
+                                   {:carrier (types/tag->java-class (symbol (name (:emitted-type completed))))
+                                    :presence :present})))
+                             arguments (:inputs call) (:input-completions call))]
+             (when (and producer bound call selected
+                        (= producer-id (get-in producer [:binding :binder]))
+                        (= consumer-id (:binder bound))
+                        (= producer-slot (get-in bound [:before producer-id]))
+                        (identical? (:initializer bound) (:expression call))
+                        (= :global-typed-indy (:invocation-mode call))
+                        (= (:invocation-method selected) (:method call))
+                        (identical? Object (:return-carrier call))
+                        (= :ref (get-in bound [:after :type]))
+                        (identical? Object (get-in bound [:after :reference-class]))
+                        (= implementation-op (:receiver call) (get-in call [:receiver-input :operand]))
+                        (empty? (get-in call [:receiver-input :ports]))
+                        (completion/bytecode-operand-context? (get-in call [:receiver-input :context]))
+                        (= 1 (count producer-inputs))
+                        (= (count arguments) (count facts) (count (:inputs call))
+                           (count (:input-completions call)))
+                        (= (:parameter-carriers selected)
+                           (mapv :parameter-carrier (:input-completions call)))
+                        (every? some? facts))
+               (when-let [computation
+                          ((requiring-resolve 'raster.compiler.passes.parallel.scalar-expression-body/checked-selected-fp-payload)
+                           expression facts)]
+                 (when (and (= (:method call) (get-in computation [:bridge :invocation-method]))
+                            (identical? (get-in selected [:definition :entry :typed-impl])
+                                        (get-in computation [:bridge :implementation])))
+                   {:scope scope :parameters (.-parameters input) :ordinals [0 1]
+                    :producer producer :consumer {:binding bound :invocation call
+                                                 :argument-facts facts :selected selected
+                                                 :computation computation}}))))))))))
 
 (defn- significant-metadata [value]
   (let [metadata (apply dissoc (or (meta value) {})
