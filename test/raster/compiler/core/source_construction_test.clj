@@ -218,7 +218,7 @@
                     (fn [& _] (throw (ex-info "stale ancestor" {:reason :stale-definition-proof-input})))]
         (is (= :stale-definition-proof-input (reason run)))))))
 
-(deftest unchanged-training-imports-obey-the-nested-substitution-law
+(defn- prepare-original-training-loss! []
   ;; Preparation compiles the ORIGINAL caller only; it executes no model code.
   ;; A promoted definition discards the complete owner and is recaptured below.
   (core/prepare-deftm-frontend! (core/resolve-deftm-var #'training/local-loss))
@@ -226,7 +226,58 @@
    (fn []
      (let [frontend (entry/original-source-frontend (core/resolve-deftm-var #'training/local-loss))]
        (entry/prepare-owned-definition-inputs! core/ensure-current-owned-bytecode!
-                                              [(get-in frontend [:definition :receiver-var])]))))
+                                              [(get-in frontend [:definition :receiver-var])])))))
+
+(deftest completed-training-helper-retains-the-whole-cpu-loss
+  (prepare-original-training-loss!)
+  (let [{:keys [original completed inputs]}
+        (entry/call-with-definition-inputs
+         (fn []
+           (let [frontend (entry/original-source-frontend (core/resolve-deftm-var #'training/local-loss))
+                 source (:source-entry frontend)
+                 call (first (filter #(= 'raster.dl.nn/linear-nb (descriptor/semantic-op %))
+                                     (tree-seq coll? seq (:body frontend))))
+                 constructed (transport/construct-original-reference-call frontend call)
+                 _ (is (some? constructed))
+                 normalized (transport/normalize-frontend-bindings frontend (:params source) constructed)
+                 context (bytecode/retained-body-context (:emission frontend))
+                 ^java.lang.reflect.Method method (:method context)
+                 name (gensym "completed_training_")
+                 compiled (bytecode/compile-specialized-class!
+                           "raster.compiled.CompletedTrainingLoss"
+                           [{:name name :params (mapv #(with-meta %1 {:tag %2}) (:params source) (:tags source))
+                             :return-tag (.getReturnType method)
+                             :walked-body (:walked-body normalized) :source-ns (:source-ns source)
+                             :raster.compiler.backend.jvm.bytecode/body-input-context (:result-context context)}])
+                 ^java.lang.reflect.Method completed (get-in compiled [:methods name])]
+             (is (some? context))
+             (is (= (vec (.getParameterTypes method)) (vec (.getParameterTypes completed))))
+             {:original method :completed completed :inputs @entry/*emission-inputs*})))]
+    ;; Numerical execution is OUTSIDE the compiler's retryable proof transaction.
+    ;; No numerical array is executed to establish shape or residency facts.
+    (doseq [iteration [0 1]
+            {:keys [rows x y]} (training/batches [1 3])]
+      (let [theta (training/initial-theta)
+            _ (when (= iteration 1) (aset-float theta 0 (+ 0.5 (aget theta 0))))
+            arguments (object-array [theta x y (long rows) (long 17)])
+            expected (/ (reduce +
+                                (for [row (range rows)]
+                                  (let [prediction (reduce +
+                                                           (for [column (range 17)]
+                                                             (* (double (aget x (+ (* row 17) column)))
+                                                                (double (aget theta column)))))
+                                        delta (- prediction (double (aget y row)))]
+                                    (* delta delta))))
+                        rows)]
+        (entry/assert-definition-inputs-current! inputs)
+        (let [before (.invoke ^java.lang.reflect.Method original nil arguments)
+              after (.invoke ^java.lang.reflect.Method completed nil arguments)]
+          (is (= (Double/doubleToRawLongBits before) (Double/doubleToRawLongBits after)))
+          (is (< (Math/abs (- expected (double after))) 1.0e-12))
+          (entry/assert-definition-inputs-current! inputs))))))
+
+(deftest unchanged-training-imports-obey-the-nested-substitution-law
+  (prepare-original-training-loss!)
   (let [captured (atom nil) construct transport/with-source-construction-history
         target :ocl:training-substitution-test]
     (with-redefs [transport/with-source-construction-history
