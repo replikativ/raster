@@ -26,6 +26,33 @@ items 3 and 5; it does not replace the other six obligations.
 | 7. Data parallelism and halos | Co-located update/collective and numerical halo demonstrations | Close public compiler-to-plan-to-runtime composition with device-scoped views, completion and cleanup; check nonuniform partitions and exact byte accounting. Do not claim multi-host transport or overlap from one laptop. |
 | 8. Durable and multilevel simulation | Manifests, mmap lease tests, checkpoint/restart and AMR provider slices | Fresh-owner restore/publication with producer geometry, time and lineage; numerical restart/branch and declared conservation/convergence/fidelity oracles; reject corrupt, incompatible or prematurely released state. |
 
+### October 21 selected ancestry for imported helper calls
+
+Imported call origins now feed the existing selected-call contract, rather than
+remaining disconnected tracing data. The shared Method/receiver/implementation
+checks serve both root and imported calls. An imported frame must derive its exact
+caller through one unique recorded parent's independently checked substitution,
+then retain that parent's selected ancestry. Identity-cycle detection and a total
+search budget derived from the finite recorded builder list bound the search.
+Root selection failure cannot fall back to an imported interpretation; stale
+ancestors propagate failure, and refused attempts publish no observations.
+
+The unchanged training `local-loss` now connects its actual `alloc-like` call to
+the selected `linear-nb` parent. The two imported `oftype` calls still refuse a
+frame because their bare cast constants lack an independent source-substitution
+proof. Original input conversions are retained; constructed-argument equivalence,
+resident result/count metadata, return completion and final execution placement
+remain explicitly unclosed. The transport-level imported selection candidate's
+`:parent-linkage :unclosed` is candidate-local, not a permission to execute.
+
+Targeted same-REPL evidence: 65 construction/import/inliner tests, 543 assertions;
+136 source/bytecode/AD ownership tests, 1,579 assertions; zero failures/errors.
+These groups overlap and are not additive. Controls cover competing parents,
+cycles, wrong root/ancestor selection, stale ancestor propagation, a wrong imported
+call, and transactional refusal. Source-fixture CI on preceding head `65e3250a`
+still fails, including softmax's uncertified `inv-sum`; these local checks do not
+qualify the broad draft for merge or establish resident training execution.
+
 ### October 21 DeepSeek inference reference integration
 
 Read-only research verified the official [DeepInfer](https://github.com/deepseek-ai/DeepInfer)

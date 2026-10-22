@@ -553,27 +553,63 @@
                                (:source-import builder) (:walked-body builder) qualified)]
                {:parent checked :origin origin :constructed child}))))))))
 
+(defn- completed-source-call-frame [checked original]
+  (let [call (:call-context original)
+        slots (mapv (fn [slot source input completed]
+                      (assoc slot :source-operand source :observed-input input
+                                  :input-completion completed
+                                  :constructed-correspondence :unclosed))
+                    (get-in checked [:substitution :argument-slots])
+                    (:source-arguments original) (:inputs call) (:input-completions call))]
+    (when (= (count slots) (count (get-in checked [:substitution :argument-slots])))
+      {:substitution (:substitution checked) :original-invocation original
+       :argument-slots slots :return-correspondence :unclosed :final-placement :unclosed})))
+
 (defn ^:no-doc nested-original-call-frame
   "Join a checked nested substitution to original selected input completions.
    Every slot exposes both source and constructed operands; their correspondence
    is deliberately unresolved. No operand executes here, and no return conversion,
-   non-null array, resident producer or final interval is inferred from its ABI."
+   non-null array, resident producer or final interval is inferred from its ABI.
+   Imported calls require one unique checked parent and that parent's complete
+   selected ancestry. Search is identity-cycle checked and bounded by the actual
+   finite construction history; rejected attempts publish no observations."
   [construction expansion]
   (method-entry/call-with-optional-definition-inputs
    (fn []
-     (when-let [checked (nested-builder-substitution-view construction expansion)]
-       (when-let [original (source-transport/original-builder-invocation-view construction expansion)]
-         (let [call (:call-context original)
-               slots (mapv (fn [slot source input completed]
-                             (assoc slot :source-operand source :observed-input input
-                                         :input-completion completed
-                                         :constructed-correspondence :unclosed))
-                           (get-in checked [:substitution :argument-slots])
-                           (:source-arguments original) (:inputs call) (:input-completions call))]
-           (when (= (count slots) (count (get-in checked [:substitution :argument-slots])))
-             {:substitution (:substitution checked) :original-invocation original
-              :argument-slots slots :return-correspondence :unclosed
-              :final-placement :unclosed})))))))
+     (when-let [candidates (source-transport/recorded-builder-expansions construction)]
+       ;; At most one parent is followed per level, and each level examines the
+       ;; finite candidate list once. Count total attempts as well as path depth.
+       (let [remaining (volatile! (* (count candidates) (inc (count candidates))))]
+         (letfn [(frame [current ancestors]
+                   (method-entry/call-with-optional-definition-inputs
+                    (fn []
+                      (when (and (pos? @remaining)
+                                 (not-any? #(identical? current %) ancestors))
+                        (vswap! remaining dec)
+                        (when-let [checked (nested-builder-substitution-view construction current)]
+                          (let [caller (get-in checked [:builder :caller])]
+                            (if (source-transport/construction-occurrence construction caller)
+                              ;; A root call with a wrong selected target must not
+                              ;; acquire a different interpretation through imports.
+                              (when-let [original (source-transport/original-builder-invocation-view construction current)]
+                                (completed-source-call-frame checked original))
+                              (let [parents
+                                    (into []
+                                          (keep (fn [candidate]
+                                                  (when (pos? @remaining)
+                                                    (vswap! remaining dec)
+                                                    (nested-substitution-call-origin construction candidate caller))))
+                                          candidates)]
+                                (when (and (pos? @remaining) (= 1 (count parents)))
+                                  (let [derived (first parents)
+                                        parent (get-in derived [:parent :builder :expansion])]
+                                    (when-let [ancestry (frame parent (conj ancestors current))]
+                                      (when-let [original
+                                                 (source-transport/imported-builder-invocation-candidate
+                                                  construction current parent (get-in derived [:origin :constructed]))]
+                                        (when-let [result (completed-source-call-frame checked original)]
+                                          (assoc result :parent-frame ancestry :parent-substitution derived))))))))))))))]
+           (frame expansion [])))))))
 
 (defn- build-inline-expansion
   "Construct argument bindings and the substituted callee in one place.

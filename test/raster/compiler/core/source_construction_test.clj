@@ -168,6 +168,56 @@
            (is (nil? (inline/nested-substitution-call-origin (:source-construction candidate) (:form candidate) inserted)))
            (is (identical? before @entry/*emission-inputs*))))))))
 
+(deftest selected-ancestry-search-refuses-ambiguity-cycles-and-broken-ancestors
+  ;; Algorithm controls only: producer authenticity and actual selected Methods
+  ;; are exercised separately by real source imports below.
+  (let [child (Object.) parent (Object.) other (Object.)
+        callers {child (Object.) parent (Object.) other (Object.)}
+        candidates [child parent other]
+        roots (atom #{parent other})
+        links (atom #{[parent child]})
+        selected? (atom true)
+        calls (atom 0)
+        selected {:source-arguments [] :call-context {:inputs [] :input-completions []}}
+        run #(entry/call-with-definition-inputs
+              (fn [] (inline/nested-original-call-frame ::algorithm child)))]
+    (with-redefs [transport/recorded-builder-expansions (fn [_] candidates)
+                  inline/nested-builder-substitution-view
+                  (fn [_ current]
+                    {:builder {:caller (get callers current)} :substitution {:argument-slots []}})
+                  transport/construction-occurrence
+                  (fn [_ caller] (some #(when (identical? caller (get callers %)) {:original caller}) @roots))
+                  transport/original-builder-invocation-view (fn [& _] (when @selected? selected))
+                  inline/nested-substitution-call-origin
+                  (fn [_ candidate caller]
+                    (swap! calls inc)
+                    (some (fn [[p c]]
+                            (when (and (identical? p candidate) (identical? caller (get callers c)))
+                              {:parent {:builder {:expansion p}} :origin {:constructed caller}})) @links))
+                  transport/imported-builder-invocation-candidate (fn [& _] selected)]
+      (is (some? (:parent-frame (run))))
+      (reset! links #{[parent child] [other child]})
+      (is (nil? (run)) "two parents cannot be resolved by first-match selection")
+      (reset! links #{[parent child]})
+      (reset! selected? false)
+      (is (nil? (run)) "a correctly linked child cannot repair wrong ancestor selection")
+      (reset! selected? true)
+      (reset! roots #{})
+      (reset! links #{[parent child] [child parent]})
+      (reset! calls 0)
+      (is (nil? (run)))
+      (is (<= @calls 12) "cyclic ancestry terminates within its finite search budget")
+      (reset! roots #{child})
+      (reset! selected? false)
+      (reset! calls 0)
+      (is (nil? (run)))
+      (is (zero? @calls) "a wrongly selected root cannot be reinterpreted as an import")
+      (reset! roots #{parent})
+      (reset! links #{[parent child]})
+      (with-redefs [transport/original-builder-invocation-view
+                    (fn [& _] (throw (ex-info "stale ancestor" {:reason :stale-definition-proof-input})))]
+        (is (= :stale-definition-proof-input (reason run)))))))
+
 (deftest unchanged-training-imports-obey-the-nested-substitution-law
   ;; Preparation compiles the ORIGINAL caller only; it executes no model code.
   ;; A promoted definition discards the complete owner and is recaptured below.
@@ -236,11 +286,33 @@
              (doseq [child children]
                (let [caller (:caller child)
                      construction (:source-construction @captured)
-                     derived (inline/nested-substitution-call-origin construction (:expansion parent) caller)]
+                     derived (inline/nested-substitution-call-origin construction (:expansion parent) caller)
+                     frame (inline/nested-original-call-frame construction (:expansion child))]
                  (is (some? derived))
                  (is (identical? (:frontend imported) (get-in derived [:origin :frontend])))
                  (is (some #(identical? (get-in derived [:origin :original]) %) originals))
                  (is (identical? (:expansion parent) (get-in derived [:parent :builder :expansion])))
+                 (if (= 'raster.arrays/alloc-like (descriptor/semantic-op caller))
+                   (do
+                     (is (some? frame))
+                     (is (identical? (:expansion parent)
+                                     (get-in frame [:parent-frame :original-invocation :builder :expansion])))
+                     (is (identical? caller (get-in frame [:parent-substitution :constructed])))
+                     (is (= :unclosed (:return-correspondence frame) (:final-placement frame)))
+                     (is (every? #(= :unclosed (:constructed-correspondence %)) (:argument-slots frame)))
+                     (is (= :unclosed (get-in frame [:original-invocation :parent-linkage])))
+                     (let [before @entry/*emission-inputs*
+                           wrong (first (filter #(= 'raster.numeric/oftype (descriptor/semantic-op %)) calls))]
+                       (is (nil? (transport/imported-builder-invocation-candidate
+                                  construction (:expansion child) (:expansion parent) wrong)))
+                       (is (identical? before @entry/*emission-inputs*)))
+                     (with-redefs [transport/original-builder-invocation-view (fn [& _] nil)]
+                       (let [before @entry/*emission-inputs*]
+                         (is (nil? (inline/nested-original-call-frame construction (:expansion child))))
+                         (is (identical? before @entry/*emission-inputs*)))))
+                   ;; Bare cast constants still lack their independent source
+                   ;; substitution proof. A valid parent cannot conceal that.
+                   (is (nil? frame)))
                  (is (nil? (inline/nested-substitution-call-origin construction (into {} (:expansion parent)) caller)))
                  (is (nil? (inline/nested-substitution-call-origin construction (:expansion parent)
                                                                   (with-meta (apply list caller) (meta caller))))))))))))))
