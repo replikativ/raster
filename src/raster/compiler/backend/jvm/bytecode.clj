@@ -5370,9 +5370,15 @@
   [code {:keys [contract operand]} locals ctx]
   (let [carrier (:target-carrier contract)
         target (class-type->stack carrier)
-        original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
+        original-context (merge (apply dissoc ctx ::expected-completion-input-type
+                                      completion/bytecode-operand-context-keys)
                                 (:operand-context contract))
         actual (emit-argument-value code operand carrier locals original-context)]
+    (when-let [expected (::expected-completion-input-type ctx)]
+      (when-not (= expected actual)
+        (throw (ex-info "Outlined operand changed its emitted carrier before conversion"
+                        {:reason :bytecode-input-result-carrier
+                         :expected expected :actual actual}))))
     (when (= :void actual)
       (throw (ex-info "A void operand cannot complete a bytecode invocation input"
                       {:reason :void-bytecode-input-completion :contract contract})))
@@ -5914,6 +5920,7 @@
                                     input-port-layout ::input-port-layout
                                     body-input-context ::body-input-context
                                     expected-body-type ::expected-body-type
+                                    expected-completion-input-type ::expected-completion-input-type
                                     extracted-region ::extracted-region}]
                                   (map vector method-specs fn-specs)]
                             (.withMethodBody cb method-name method-type
@@ -6019,6 +6026,9 @@
                                                             :next-slot        next-slot
                                                             :source-ns        source-ns}
                                                        ctx (merge ctx body-input-context)
+                                                       ctx (cond-> ctx expected-completion-input-type
+                                                             (assoc ::expected-completion-input-type
+                                                                    expected-completion-input-type))
                                                        ctx (assoc ctx
                                                                   ::body-occurrence (::body-occurrence (meta walked-body))
                                                                   ::body-scope-occurrence
@@ -6457,6 +6467,7 @@
               emission input carrier
               {:return-tag (if (.isPrimitive ^Class carrier) (symbol (.getName ^Class carrier)) carrier)
                :walked-body [(completion/complete-value contract (:operand input))]
+               ::expected-completion-input-type (:emitted-type completed)
                :element-type (:element-type record)} guard)
              :input-contract contract :input-completion completed))))
 

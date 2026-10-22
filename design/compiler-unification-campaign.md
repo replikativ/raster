@@ -28,6 +28,58 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+#### Reviewed continuation: close the producer, not individual optimizer copies
+
+The next production change should share target-neutral generated-program
+canonicalization before the owned AD entry is frozen. A REPL-only experiment
+using existing generic resolution, helper expansion and PE changes the training
+preparation from 25 to 34 to 22 bindings; rows 1/3 retain exact primal results
+and weighted-gradient errors 0 / 1.86e-9 against the independent oracle. This
+is numerical evidence only: bare expansion/PE is **not enabled** by this receipt.
+
+The current source pipeline expands helpers, propagates aliases/literals and
+later lifts reductions after preparation ownership has frozen. Reconstructing
+every such transformation afterwards would need optimizer-specific adapters.
+There is also an admission-order cycle: equation-first rejects uncertified
+scalars before its current final source-prefix correspondence is constructed.
+Do not solve either problem by clearing evaluation flags or permitting an
+isolated scalar query to discharge the whole generated import.
+
+The reviewed producer boundary must:
+
+- Preserve the original namespace, source policy, declared parameters, helper
+  selection/history, ordered argument conversions and return checks.
+- Express actual helper/binding completions with the existing ValueCompletion
+  algebra before PE; a logical annotation is not a CHECKCAST witness.
+- Share only neutral resolution/expansion/product/lexical/PE stages. Do not run
+  the GPU pre-SOA pipeline wholesale: its rewalk can remap dtype, and fusion,
+  placement and scheduling belong later.
+- Make canonicalization stable under the subsequent common scalar stages.
+  If a later stage still changes helper/alias/literal structure, factor that
+  neutral rewrite into the common producer rather than add a special verifier.
+- Qualify the actual unchanged gradient, including wrong/null helper results,
+  argument/exception order, stale helpers, negative/overflow row counts and
+  changed-input replay. Original reduction count/read and resident allocation
+  views still need their own validated correspondence; canonicalization is not
+  permission to replace JVM arrays with DeviceBuffers without that join.
+
+CI receipt for pushed 83c49343: setup/build pass; fixture job 33975 fails on
+softmax's uncertified inv-sum; unit job 33973 reports failed actions on all 16
+shards. Their executions stop at failing subshards, so neither one shard's count
+nor a sum is a complete-suite coverage claim. Failure families include source
+execution coverage, stale cold helper inputs, typed algorithm validation,
+dtype/ownership mismatches, and outdated expectations. Do not label all of them
+baseline or solved by the training work without reproducing each family.
+Origin/main 4e15484d has all seven required gates green; the draft stays held.
+
+The unit run also exposed a real operand-outlining regression: wrapping an
+original operand in its completion hid a forged pre-conversion carrier. The
+outliner now checks the actual emitted operand type before consumer conversion,
+scoped only to the outer completion. Nested-completion and existing mutation
+controls pass with the affected two namespaces: 43 tests / 767 assertions.
+Reference/integral recipe tests now assert their exact contracts rather than
+the obsolete expectation that no non-floating contract exists.
+
 October 22 shared-entry checkpoint (items 3/5): the generated AD runtime and
 compiler queries use one owned JVM bytecode entry, not independently evaluated
 source. Pending helpers are compiled without numerical execution; promotion

@@ -4,6 +4,7 @@
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as completion]
             [raster.core :as core :refer [deftm]]
             [raster.arrays :as arrays]
             [raster.numeric :as n]))
@@ -62,6 +63,11 @@
           :long-int [#'int-input-template '[long] 'value]
           :checked-int [#'int-input-template '[long] '(clojure.core/int value)]
           :object-long [#'long-input-template '[Object] 'value]
+          :nested-object-long
+          [#'long-input-template '[Object]
+           (completion/complete-value
+            (completion/bytecode-floating-input-contract
+             Double/TYPE (completion/bytecode-operand-context {})) 'value)]
           :ordered-object-long [#'long-input-template '[Object Object]
                                 '(do (swap! events conj :operand) value)]
           :reference [#'unused-input-call '[double Object] 'value]
@@ -92,6 +98,15 @@
 (defn- input-outcome [f & arguments]
   (try [:value (apply f arguments)] (catch Throwable error [:error (class error)])))
 
+(deftest outlined-input-checks-the-outer-pre-adaptation-carrier-only
+  (let [{:keys [emission call]} (integral-input-owner :nested-object-long)
+        region (bytecode/compile-invocation-input-region emission call 0)]
+    (is (= :double (get-in region [:input-completion :emitted-type])))
+    (doseq [value [3.75 nil "wrong"]]
+      (is (= (input-outcome (:implementation emission) value)
+             (input-outcome (:invoke region) value))
+          "the inner Object-to-Double completion does not inherit the outer Double expectation"))))
+
 (deftest reference-outlining-retains-checkcast-class-null-and-identity
   (let [{:keys [emission call]} (integral-input-owner :reference)
         region (bytecode/compile-invocation-input-region emission call 1)
@@ -102,7 +117,12 @@
     (is (identical? expected-class (.getReturnType ^java.lang.reflect.Method (:method region))))
     (is (= :ref (get-in region [:input-completion :emitted-type])))
     (is (= :checkcast (get-in region [:input-completion :adaptation])))
-    (is (nil? (:input-contract region)) "reference checking grants no floating AD contract")
+    (is (= {:source-context :jvm-bytecode-reference-input
+            :target-carrier expected-class :policy :preserve-bytecode-input
+            :operand-context (get-in (bytecode/retained-invocation-context emission call)
+                                     [:inputs 1 :context])}
+           (:input-contract region))
+        "the exact reference recipe grants no floating AD contract")
     (doseq [value [nil (double-array [1.0 2.0]) (double-array 0) (float-array 1) "wrong" (Object.)]]
       (let [expected (input-outcome original 3.0 value)
             actual (input-outcome (:invoke region) value)]
@@ -128,7 +148,12 @@
           original (:implementation emission)]
       (is (= adaptation (get-in region [:input-completion :adaptation])))
       (is (= Integer/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
-      (is (nil? (:input-contract region)) "integral outlining grants no floating AD contract")
+      (is (= {:source-context :jvm-bytecode-integral-input
+              :target-carrier Integer/TYPE :policy :preserve-bytecode-input
+              :operand-context (get-in (bytecode/retained-invocation-context emission call)
+                                       [:inputs 0 :context])}
+             (:input-contract region))
+          "the exact integral recipe grants no floating AD contract")
       (doseq [value [0 1 -1 Integer/MIN_VALUE Integer/MAX_VALUE 2147483648 Long/MIN_VALUE Long/MAX_VALUE]]
         (is (= (input-outcome original (long value))
                (input-outcome (:invoke region) (long value)))))
