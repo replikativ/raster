@@ -424,6 +424,23 @@ The affected seven-namespace gate passes 102 tests / 1,551 assertions. Current
 draft head `dbe75388` still fails test33827, fixture33828 and OpenCL33826; setup
 and build pass. CUDA/HIP gates have not established readiness. No merge is allowed.
 
+The original empty/singleton execution oracle adds 48 passing checks across
+Float/Double and forced split/unsplit emission: count0 does not read null/empty
+storage; count1 preserves NullPointerException/ArrayIndexOutOfBoundsException;
+changed values 2/4/-2 retain the expected consumer result. These execute original
+Methods outside proof transactions, not a device substitute.
+
+Further path review corrects the proposed integration seam: the exact two-binding
+fixture returns the scalar consumer, so existing terminal-host suffix construction
+already retains it without relaxing scalar admission. A real public equation-first
+compile reaches terminal ownership and currently refuses `.invk` with
+`:unclosed-terminal-source-projection` ("terminal symbol has no owned Var").
+Connect the authenticated original interval to the exact promoted reduction and
+existing terminal region; do not add a generic pre-admission bypass for this case.
+The generated terminal contract reads the reduction export and evaluates its
+nested scalar binding. This still requires original/constructed correspondence,
+actual operand/return completion and original read-domain execution contracts.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction

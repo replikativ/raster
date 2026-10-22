@@ -258,6 +258,32 @@
                                   proof-expression))))
           (is (nil? (:closed-count observed))))))))
 
+(deftest original-empty-and-singleton-read-completion-oracle
+  (doseq [float? [false true] split? [false true] count [0 1]]
+    (with-fresh-reduction-binding
+      float? split? count
+      (fn [frontend]
+        (let [input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))
+              observed (prefix/observed-reduction-interval input)
+              implementation (:implementation frontend)
+              array-of (if float? float-array double-array)
+              outcome (fn [xs]
+                        ;; Execute the original, already emitted implementation,
+                        ;; outside any retryable proof transaction. These are the
+                        ;; source oracles a future device admission must preserve.
+                        (try {:value (implementation xs)}
+                             (catch NullPointerException _ {:failure :null-read})
+                             (catch ArrayIndexOutOfBoundsException _ {:failure :bounds-read})))]
+          (is (= count (get-in observed [:closed-count :value])))
+          (doseq [xs [nil (array-of 0)]]
+            (is (= (if (zero? count)
+                     {:value Double/POSITIVE_INFINITY}
+                     {:failure (if (nil? xs) :null-read :bounds-read)})
+                   (outcome xs))))
+          (doseq [value [2.0 4.0 -2.0]]
+            (is (= (if (zero? count) Double/POSITIVE_INFINITY (/ 1.0 value))
+                   (:value (outcome (array-of [value])))))))))))
+
 (deftest closed-count-rejects-post-emission-bootstrap-replacement
   (with-fresh-reduction-binding
     false false
