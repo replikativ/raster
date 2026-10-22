@@ -733,7 +733,7 @@
                                             [:body (- idx original-binding-count)])])
                                    (partition 2 (second normalized))))
             form (->> (inline/flatten-nested-lets
-                       normalized {:sequential-only? true :binding-origins binding-origins
+                       normalized {:binding-origins binding-origins
                                    :body-origin [:body (max 0 (dec original-body-count))]})
                       util/normalize-let-body
                       util/uniquify-rebindings)
@@ -742,8 +742,7 @@
                                   (keys (:values opts))))
             form (util/uniquify-rebindings
                   (inline/flatten-nested-lets
-                   exposed {:sequential-only? true
-                            :binding-origins (into {} (map (fn [[id _]]
+                   exposed {:binding-origins (into {} (map (fn [[id _]]
                                                            [id (:raster.compiler/lexical-origin (meta id))]))
                                                    (partition 2 (second form)))
                             :body-origin [:body (max 0 (dec original-body-count))]}))

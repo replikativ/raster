@@ -7,6 +7,8 @@
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.scalar.local-products :as local-products]
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ad.flatten :as flat]
             [raster.compiler.ir.dialects :as dialects]
@@ -196,6 +198,45 @@
       (is (not (contains? specs :simplify)))
       (is (not (contains? specs :peephole)))
       (is (not (contains? specs :par-fuse))))))
+
+(deftest semantic-admission-shares-ordered-late-wrapper-normalization
+  ;; Buffer/representation passes can introduce this whole-let initializer
+  ;; after earlier expansion. Both admission attempts must see the SAME safe
+  ;; canonicalization, not regain the unsafe operand-hoisting implementation.
+  (let [source '(let* [size (let* [rows (record! :size)] (* rows 2))
+                      output (allocate! size)] output)
+        seen (atom [])
+        capture (fn [kind]
+                  (fn [candidate & _]
+                    (swap! seen conj [kind candidate])
+                    {:declined {:reason ::unsupported-fixture}}))
+        run (fn [expression rows]
+              (let [trace (atom [])
+                    execute (binding [*unchecked-math* false]
+                              (eval (list 'fn '[record! allocate!] expression)))
+                    record! (fn [event] (swap! trace conj event) rows)
+                    allocate! (fn [size] (swap! trace conj :allocation) [:buffer size])]
+                (try {:value (execute record! allocate!) :trace @trace}
+                     (catch ArithmeticException _ {:failure :overflow :trace @trace}))))]
+    (with-redefs [structured-route/attempt (capture :structured)
+                  typed-route/attempt (capture :typed)]
+      (#'pipeline/semantic-program-attempt source {:target-device :ocl:late-wrapper :dtype :float} nil)
+      (is (= [:structured :typed] (mapv first @seen)))
+      (let [normalized (second (first @seen))]
+        (is (identical? normalized (second (second @seen))))
+        (is (= 3 (quot (count (second normalized)) 2)))
+        (is (= {:value [:buffer 4] :trace [:size :allocation]} (run normalized 2)))
+        (doseq [rows [2 Long/MAX_VALUE]]
+          (is (= (run source rows) (run normalized rows))))
+        (is (= {:failure :overflow :trace [:size]} (run normalized Long/MAX_VALUE))))
+      (reset! seen [])
+      (#'pipeline/semantic-program-attempt source {:target-device :cpu:late-wrapper :dtype :float} nil)
+      (is (= [:typed] (mapv first @seen)))
+      (is (identical? source (second (first @seen))))
+      (with-redefs-fn {#'pipeline/abstract-machine-for-target (fn [& _] nil)}
+        #(let [refused (#'pipeline/pass-soac-fuse source {:target-device :ocl:late-wrapper :dtype :float})]
+           (is (= source (:form refused)) "refusal keeps the original nested source")
+           (is (= :disabled (get-in refused [:stats :compatibility-fusion]))))))))
 
 (deftest certified-butterfly-enters-the-typed-effect-vertical
   (let [source '(let* [step (raster.par/butterfly! re im i half wr wi base)] step)

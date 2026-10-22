@@ -1477,13 +1477,12 @@
      :else form)))
 
 (defn- anf-lift
-  "Lift nested let/let* forms out of expression position into sibling bindings.
+  "Expose whole sequential let/do wrappers at their original evaluation position.
    Returns [lifted-bindings result-expr] where lifted-bindings is a vector
    of [sym expr] pairs and result-expr is the expression with lets replaced
-   by their body symbols. Renames symbols to avoid collisions when multiple
-   nested lets are lifted into the same scope."
-  ([expr] (anf-lift expr false))
-  ([expr sequential-only?]
+   by their body symbols. Calls, vectors and execution scopes remain opaque:
+   sibling effects, callee lookup and formal conversions cannot be reordered."
+  [expr]
   (cond
     ;; Binding form in expression position → lift bindings out with renaming
     (form/binding-form? expr)
@@ -1507,7 +1506,7 @@
                               inner-pairs)
           ;; Recursively ANF-lift each renamed binding value
           lifted-inner (mapcat (fn [[sym init]]
-                                 (let [[lifted cleaned] (anf-lift init sequential-only?)]
+                                 (let [[lifted cleaned] (anf-lift init)]
                                    (concat lifted [[sym cleaned]])))
                                renamed-pairs)
           ;; CRITICAL: a binding-form with MULTIPLE body-exprs has earlier
@@ -1519,63 +1518,30 @@
           inner-body-vec (vec inner-body)
           effect-exprs (mapv #(subst-syms @rename-map %) (butlast inner-body-vec))
           effect-lifted (mapcat (fn [eff]
-                                 (let [[lifted cleaned] (if sequential-only?
-                                                          (anf-lift eff true)
-                                                          [[] eff])]
+                                 (let [[lifted cleaned] (anf-lift eff)]
                                    (concat lifted
                                            [[(with-meta (gensym "_eff_")
                                                {:raster.effect/effectful true}) cleaned]])))
                                effect-exprs)
           ;; ANF-lift the final body expression (with renaming applied)
           body-expr (subst-syms @rename-map (last inner-body-vec))
-          [body-lifted body-cleaned] (anf-lift body-expr sequential-only?)]
+          [body-lifted body-cleaned] (anf-lift body-expr)]
       [(vec (concat lifted-inner effect-lifted body-lifted)) body-cleaned])
 
     ;; A do is an ordered sequence, not a call whose operands may all be hoisted.
-    (and sequential-only? (seq? expr) (= 'do (first expr)) (seq (rest expr)))
-    (anf-lift (util/normalize-let-body expr) sequential-only?)
-
-    ;; Non-liftable forms — do NOT recurse (would lift bindings
-    ;; past scope boundaries or conditional branches)
-    (and (seq? expr) (not (:liftable? (form/form-info expr))))
-    [[] expr]
-
-    ;; This mode exposes only whole sequential wrappers at their original evaluation
-    ;; position. Calls and vectors retain their operand order and lexical subscopes.
-    (and sequential-only? (or (seq? expr) (vector? expr)))
-    [[] expr]
-
-    ;; seq (function call) → recurse into arguments
-    (seq? expr)
-    (let [results (map anf-lift expr)
-          all-lifted (vec (mapcat first results))
-          cleaned (let [r (apply list (map second results))]
-                    (if-let [m (meta expr)] (with-meta r m) r))]
-      (if (empty? all-lifted)
-        [[] expr]
-        [all-lifted cleaned]))
-
-    ;; vector → recurse
-    (vector? expr)
-    (let [results (map anf-lift expr)
-          all-lifted (vec (mapcat first results))
-          cleaned (mapv second results)]
-      (if (empty? all-lifted)
-        [[] expr]
-        [all-lifted cleaned]))
+    (and (seq? expr) (= 'do (first expr)) (seq (rest expr)))
+    (anf-lift (util/normalize-let-body expr))
 
     ;; leaf
-    :else [[] expr])))
+    :else [[] expr]))
 
 (defn flatten-nested-lets
-  "Flatten all nested let/let* forms into a single top-level let*.
-   By default, handles lets in binding values, body expressions, and argument positions.
-   With :sequential-only? true, expose only whole let/do initializers and final bodies;
+  "Flatten whole sequential let/do initializers and final bodies into a top-level let*;
    calls, vectors, conditional and nested execution scopes remain opaque.
    Optional :binding-origins and :body-origin label lifted binders with their enclosing
    lexical origin; normalization must not turn an inner initializer into a body site."
   ([form] (flatten-nested-lets form {}))
-  ([form {:keys [sequential-only? binding-origins body-origin]}]
+  ([form {:keys [binding-origins body-origin]}]
   (if-not (form/binding-form? form)
     form
     (let [[_ bindings-vec & body-exprs] form
@@ -1587,14 +1553,14 @@
                                    pairs)))
           ;; ANF-lift each binding value
           new-pairs (vec (mapcat (fn [[sym init]]
-                                   (let [[lifted cleaned] (anf-lift init sequential-only?)]
+                                   (let [[lifted cleaned] (anf-lift init)]
                                      (retain-origin (concat lifted [[sym cleaned]])
                                                     (get binding-origins sym))))
                                  pairs))
           ;; ANF-lift body expressions (only lift from the last one)
           [body-lifted final-body-expr]
           (if (= 1 (count body-exprs))
-            (let [[lifted cleaned] (anf-lift (first body-exprs) sequential-only?)]
+            (let [[lifted cleaned] (anf-lift (first body-exprs))]
               [(retain-origin lifted body-origin) [cleaned]])
             [[] body-exprs])
           all-pairs (vec (concat new-pairs body-lifted))
