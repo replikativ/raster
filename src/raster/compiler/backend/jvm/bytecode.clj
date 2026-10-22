@@ -4864,13 +4864,23 @@
         (.goto_ code loop-label)
         :diverge)
       (let [vals (mapv (fn [arg loop-var]
-                         (let [t (emit-form code arg locals (dissoc ctx :object-result?))
-                               target (:type loop-var)]
+                         (let [operand-ctx (dissoc ctx :object-result?)
+                               t (emit-form code arg locals operand-ctx)
+                               target (:type loop-var)
+                               context (completion/bytecode-operand-context operand-ctx)]
                            (when (not= t target)
                              (emit-coerce code t target))
-                           {:type target :input-type t :operand arg
-                            :context (completion/bytecode-operand-context (dissoc ctx :object-result?))
-                            :locals locals}))
+                           (cond-> {:type target :input-type t :operand arg
+                                    :context context :locals locals}
+                             ;; Retain the recipe at the actual consumer, after the
+                             ;; operand and any required conversion were emitted. The slot
+                             ;; is not evidence that an Object update was a primitive call.
+                             ;; Reuse ValueCompletion's existing Number.xxxValue/JVM
+                             ;; conversion contract; no source-cast or new type inference.
+                             (contains? #{:float :double} target)
+                             (assoc :input-completion
+                                    (completion/bytecode-input-contract
+                                     (if (= :float target) Float/TYPE Double/TYPE) context)))))
                        args loop-vars)]
         (when (= :recur (::reduction-role ctx))
           (retain-reduction-observation! ctx :recur

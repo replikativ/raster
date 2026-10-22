@@ -5,6 +5,7 @@
             [raster.numeric :as numeric]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-prefix :as prefix]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
@@ -532,6 +533,37 @@
                           (get-in observed [:input :ports index :type])))
               (is (true? (:primitive-index? observed))))))))))
 
+(deftest original-reduction-carry-retains-its-actual-floating-completion
+  (doseq [float? [false true]]
+    (with-fresh-reduction-binding
+      float? false 1
+      (fn [frontend]
+        (let [original (first (reduction-forms (:body frontend)))
+              observed (entry/frontend-reduction-emission frontend original)
+              update (nth original 5)
+              invocation (entry/frontend-invocation-context frontend update)
+              carry (second (get-in observed [:recur :values]))
+              contract (:input-completion carry)
+              dtype (if float? :float :double)
+              carrier (if float? Float/TYPE Double/TYPE)]
+          (is (some? invocation))
+          (is (identical? (:expression invocation) (:operand carry)))
+          (is (= :ref (:input-type carry))
+              "the selected update still physically returns Object")
+          (is (= dtype (:type carry) (get-in observed [:recur :targets 1 :type])))
+          (is (= (completion/bytecode-floating-input-contract carrier (:context carry)) contract))
+          (is (= :jvm-bytecode-floating-input (:source-context contract)))
+          (is (= :preserve-bytecode-input (:policy contract)))
+          (is (true? (get-in contract [:operand-context :preserve-source-call-results?])))
+          ;; Changing a recorded conversion cannot inherit the enclosing emitted
+          ;; module's authority, even if all original expression objects survive.
+          (let [witness (get-in observed [:expansion :witness])
+                changed (assoc-in frontend
+                                  [:emission :reduction-contexts [witness :recur]
+                                   :values 1 :input-completion :target-carrier]
+                                  (if float? Double/TYPE Float/TYPE))]
+            (is (nil? (entry/frontend-reduction-emission changed original)))))))))
+
 (deftest explicit-reduction-preparation-keeps-terminal-before-caller-order
   (doseq [float? [false true]]
     (with-fresh-reduction-binding
@@ -544,9 +576,41 @@
               prepared (atom [])]
           (is (var? callee))
           (is (true? (prefix/prepare-reduction-entry! input #(swap! prepared conj %))))
-          (is (= [callee caller] @prepared))
+          (is (= 3 (count @prepared)))
+          (is (= [callee caller] (subvec @prepared 1)))
+          (is (var? (first @prepared)))
+          (is (not= callee (first @prepared)))
           (is (nil? (prefix/prepare-reduction-entry! nil #(swap! prepared conj %))))
-          (is (= [callee caller] @prepared)))))))
+          (is (= [callee caller] (subvec @prepared 1))))))))
+
+(deftest reduction-preparation-authenticates-all-selections-before-any-callback
+  (with-fresh-reduction-binding
+    false false 1
+    (fn [frontend]
+      (let [input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))
+            select entry/selected-parameter-carriers
+            events (atom [])]
+        (with-redefs [entry/selected-parameter-carriers
+                      (fn [& arguments]
+                        (let [selected (apply select arguments)]
+                          (swap! events conj [:selected (get-in selected [:definition :receiver-var])])
+                          selected))]
+          (is (true? (prefix/prepare-reduction-entry!
+                      input #(swap! events conj [:prepared %])))))
+        (is (= [:selected :selected :selected :prepared :prepared :prepared]
+               (mapv first @events)))
+        (let [[caller update terminal] (mapv second (take 3 @events))]
+          (is (= [update terminal caller] (mapv second (drop 3 @events)))))
+        (let [attempts (atom 0)
+              callbacks (atom [])]
+          (with-redefs [entry/selected-parameter-carriers
+                        (fn [& arguments]
+                          (if (= 3 (swap! attempts inc))
+                            (throw (ex-info "changed selected terminal" {:reason ::selection-changed}))
+                            (apply select arguments)))]
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"changed selected terminal"
+                                 (prefix/prepare-reduction-entry! input #(swap! callbacks conj %)))))
+          (is (empty? @callbacks) "no partial preparation precedes selection authentication"))))))
 
 (deftest empty-producer-proof-does-not-generalize-to-a-singleton-read
   (with-terminal-interval

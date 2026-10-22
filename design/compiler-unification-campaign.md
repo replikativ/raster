@@ -430,6 +430,34 @@ it must not waive those obligations based on this native test receipt. The full 
 softmax/source-completion CI failure and unchanged resident training acceptance remain
 open; no merge or whole-campaign completion is established.
 
+### October 22 original reduction carry completion checkpoint
+
+The JVM reduction observer now retains each actual floating recur consumer's existing
+`ValueCompletion` input contract after the operand and any required conversion are
+emitted. Its original operand identity, physical input carrier, actual target slot and
+operand context remain separate facts. In particular a selected arithmetic update still
+physically returns `Object`; its primitive payload does not retroactively change that
+call's carrier. This is physical observation, not a successful conversion, purity,
+read/bounds proof or source-to-device numerical admission. Consumers must join the
+whole authenticated observation with the selected return bridge and arithmetic proof.
+No conversion registry or ad hoc type inference was added.
+
+Explicit producer preparation selects the direct floating update and terminal leaves
+before any callback, then prepares update → terminal → caller through the existing
+definition-input service. A failed second selection cannot partially prepare the first.
+Queries remain nonemitting and original code is not numerically invoked to warm it.
+The update is also prepared for zero-count intervals: this is a compile-time dependency
+on that selected definition, not evidence that the dead recurrence executes.
+Source-owned singleton activation, index/control correspondence and the resident
+logical-view boundary remain open; this checkpoint must not be counted as training
+qualification or resolution of the held softmax source-ownership gate.
+
+Focused REPL qualification: 140 tests / 2,253 assertions pass across source/recur
+observations, bytecode input completion, prefix/terminal/checked ownership,
+materialization and ordered scalar folds, including tiny native OpenCL/Level Zero
+folds. Review found no checkpoint blocker. This is not full-suite or model validation;
+PR #1539 remains draft while its broader seven-gate obligations are unsatisfied.
+
 ### October 21 DeepSeek inference reference integration
 
 The recovered full source review is retained locally in
@@ -471,6 +499,28 @@ real-weight training, durable publication or actual multi-host acceptance. The
 immediate continuation remains the local source/semantic ownership repair, then
 content-aware prepared replay and encoded/ragged composition qualification. No
 SM100, Ascend, model download or cloud dependency enters the hot development loop.
+
+October 22 refresh independently rechecked official remotes and reused the same sibling
+checkouts; the full delta report is locally retained as
+`.internal/deepseek-inference-refresh-20261022.md`. DeepInfer remains at the pin above.
+New companion objects were fetched without replacing the pinned source. In particular,
+[DeepGEMM 5081f851](https://github.com/deepseek-ai/DeepGEMM/commit/5081f8513af57e61696de4f4f04b0e707ffb503e)
+fixes split-barrier state surviving CUDA graph replay: a stable graph/grid identity was
+not a fresh execution generation. This is an upstream counterexample, **not an
+established Raster defect**. Items 1/3/4/6/7 must distinguish artifact identity, host
+value epochs and device-visible scratch/barrier generations. Before admitting persistent
+cross-workgroup scratch protocols, qualify at least three changed-input replays on the
+same graph/allocation, a modeled delayed producer that cannot consume prior-generation
+completion, distinct inflight slots or a proved retirement protocol, and failure/cancel
+reuse including finite-tag wrap/reinitialization rules. Include this source example in
+the CUDA-owner handoff; successful compilation alone cannot discharge it.
+
+The consumer review also confirms pretrained currently refuses descriptor mutation or
+a second submission while a paged-attention runner is pending and retains page leases.
+Keep that single-flight safety boundary until separately owned inflight metadata slots
+are qualified. Batch invariance is an explicit numerical capability, not deterministic
+sampling; bounded SWA replay is model-specific approximate reconstruction, not a generic
+equivalence-preserving compiler rewrite. These refinements do not change campaign order.
 
 Follow-up consumer review identified a small representation-identity regression target:
 `pretrained/openai/local.clj` independently defaults `:weights` and `:execution-variant`.

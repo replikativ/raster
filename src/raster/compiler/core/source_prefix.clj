@@ -94,8 +94,9 @@
 (defn prepare-reduction-entry!
   "Explicit producer preparation for a direct reduction/terminal interval.
    Queries never emit. Public compilation may request the original caller's owned bytecode
-   and its selected floating terminal leaf, without executing either. Prepare the callee
-   before renewing the caller. Changed observations escape to the whole compiler retry."
+   and its direct selected floating update/terminal leaves, without executing them.
+   Select every leaf before preparation, then prepare callees before renewing the caller.
+   Changed observations escape to the whole compiler retry."
   [input prepare!]
   (when (instance? PrefixInput input)
     (let [frontend (.-frontend ^PrefixInput input)
@@ -105,19 +106,28 @@
                  (every? true? (map identical? (mapcat identity (.-pairs ^PrefixInput input))
                                     (second scope))))
         (let [caller (entry/assert-frontend-selection! frontend (get-in frontend [:source-entry :source-var]))
-              expression (second (second (.-pairs ^PrefixInput input)))
-              {:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
-              (descriptor/call-description expression)
-              selected (when (and dispatch? (not lexical-callee))
-                         (entry/selected-parameter-carriers semantic-op implementation-op (count arguments)))
-              callee (when (and selected (= Object (:result-carrier selected))
-                                (every? #{Float/TYPE Double/TYPE} (:parameter-carriers selected)))
-                       (get-in selected [:definition :receiver-var]))]
+              pairs (.-pairs ^PrefixInput input)
+              selected-receiver
+              (fn [expression]
+                (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+                      (descriptor/call-description expression)
+                      selected (when (and dispatch? (not lexical-callee))
+                                 (entry/selected-parameter-carriers
+                                  semantic-op implementation-op (count arguments)))]
+                  (when (and selected (= Object (:result-carrier selected))
+                             (seq (:parameter-carriers selected))
+                             (every? #{Float/TYPE Double/TYPE} (:parameter-carriers selected)))
+                    (get-in selected [:definition :receiver-var]))))
+              reduction (second (first pairs))
+              update (when (= 6 (bounded-count 7 reduction))
+                       (selected-receiver (nth reduction 5)))
+              terminal (selected-receiver (second (second pairs)))]
           (when-let [receiver (:receiver-var caller)]
             ;; Signature observation selects preparation only, never numerical admission.
-            ;; Even a warm caller can refer to a still-cold selected terminal implementation.
+            ;; Even a warm caller can refer to a still-cold selected implementation.
             (entry/prepare-owned-definition-inputs!
-             prepare! (vec (distinct (cond-> [] callee (conj callee) true (conj receiver)))))
+             prepare! (vec (distinct (cond-> [] update (conj update)
+                                            terminal (conj terminal) true (conj receiver)))))
             true))))))
 
 (defn- reduction-binding-observation [frontend scope original]
