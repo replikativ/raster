@@ -441,6 +441,23 @@ The generated terminal contract reads the reduction export and evaluates its
 nested scalar binding. This still requires original/constructed correspondence,
 actual operand/return completion and original read-domain execution contracts.
 
+Independent path review confirms two distinct remaining changes. First, the
+terminal projection must consume an authenticated exact interval/contract join
+and invoke the captured interface Method/receiver with the original ordered
+argument completions. Reuse the existing Long-only original-invocation projector
+machinery, but do not resolve `.invk` as a generic Var or rewrite typed Float
+division as core `/` (which changes arithmetic width). Second,
+`invocation_materialization/begin-materialization` currently validates every
+buffer eagerly through `runtime-buffer-shape`; it rejects nil even for count0,
+before any reduction cursor. Source-owned deferred array-reference materialization
+or verified dead-input projection must preserve public argument positions and
+original read ordering/failures. Existing raw arguments/ordered realization are
+the reuse point; no independent input cache or fabricated nil-as-empty buffer.
+Terminal projection may separately qualify valid-array execution, but must not
+be reported as completing zero/null/read semantics. Source-free compile entries
+and generic frontend admission remain unchanged. Final affected source gate now
+passes 103 tests / 1,599 assertions; this does not resolve the broad draft CI.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction
