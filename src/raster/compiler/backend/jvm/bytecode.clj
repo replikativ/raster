@@ -1314,16 +1314,22 @@
   (let [stmts (butlast forms)
         last-form (last forms)
         void-ctx (assoc (dissoc ctx :object-result?) :void-context true)]
-    (doseq [s stmts]
-      (let [t (emit-form code s locals void-ctx)]
-        (when-not (#{:void :diverge} t)
-          (if (two-slot? t) (.pop2 code) (.pop code)))))
-    (if (seq forms)
-      ;; Preserve void-context if the enclosing form is already in void context.
-      ;; Otherwise dissoc so the last form's value is kept on the stack.
-      (emit-result-form code last-form locals
-                 (if (:void-context ctx) ctx (dissoc ctx :void-context)))
-      :void)))
+    (loop [remaining (seq stmts)]
+      (if (seq remaining)
+        (let [s (first remaining)
+              t (emit-form code s locals void-ctx)]
+          (if (= :diverge t)
+            :diverge
+            (do
+              (when-not (= :void t)
+                (if (two-slot? t) (.pop2 code) (.pop code)))
+              (recur (next remaining)))))
+        (if (seq forms)
+          ;; Preserve void-context if the enclosing form is already in void context.
+          ;; Otherwise dissoc so the last form's value is kept on the stack.
+          (emit-result-form code last-form locals
+                            (if (:void-context ctx) ctx (dissoc ctx :void-context)))
+          :void)))))
 
 ;; Counter for unique anonymous class names
 (def ^:private anon-counter (atom 0))
@@ -5822,17 +5828,7 @@
 
           ;; do
               do
-              (let [stmts (butlast args)
-                    last-form (last args)
-                    void-ctx (assoc (dissoc ctx :object-result?) :void-context true)]
-                (doseq [s stmts]
-                  (let [t (emit-form code s locals void-ctx)]
-                    (when-not (#{:void :diverge} t)
-                      (if (two-slot? t) (.pop2 code) (.pop code)))))
-                (if (seq args)
-                  (emit-result-form code last-form locals
-                             (if (:void-context ctx) ctx (dissoc ctx :void-context)))
-                  :void))
+              (emit-body code args locals ctx)
 
           ;; if — both branches must produce same stack type for verifier
               if

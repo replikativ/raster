@@ -175,6 +175,27 @@
              (try (normal-return/completed-scalar-fact boxed {} *ns* resolve-result) nil
                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
 
+(deftest discarded-body-divergence-does-not-emit-later-forms
+  (doseq [source ['(do (throw x) missing-later)
+                  '(let* [] (throw x) missing-later)]
+          completed? [false true]]
+    (let [expression (if completed?
+                       (completion/complete-value
+                        (completion/bytecode-result-context-contract
+                         (completion/bytecode-operand-context {}) :ref)
+                        source)
+                       source)
+          body [expression]
+          {:keys [implementation emission]} (emit body)]
+      (is (thrown? IllegalStateException (implementation (IllegalStateException. "stop"))))
+      (when completed?
+        (is (= :diverge (:completion-carrier (observe emission body expression))))))))
+
+(deftest discarded-false-nil-and-category-two-values-do-not-stop-the-body
+  (let [{:keys [implementation]} (emit ['(do nil false 1.25 (long 7) (int 3) true x)])
+        value (Object.)]
+    (is (identical? value (implementation value)))))
+
 (deftest malformed-owned-completion-facts-fail-instead-of-becoming-types
   (let [expression (completion/complete-value completion/object-input-contract 'x)]
     (doseq [fact [false "not a fact"
