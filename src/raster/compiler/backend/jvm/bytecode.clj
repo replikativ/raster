@@ -6248,29 +6248,26 @@
                               {:reason :unclosed-bytecode-input-completion :input-index input-index})))
           carrier (nth carriers input-index)
           completed (nth completions input-index)
-          integral? (contains? #{Integer/TYPE Long/TYPE} carrier)
           checked-reference? (= :checkcast (:adaptation completed))
-          raw-completion? (or integral? checked-reference?)
-          contract (when-not raw-completion?
-                     (completion/bytecode-floating-input-contract carrier (:context input)))
+          contract (when-not checked-reference?
+                     (if (contains? #{Integer/TYPE Long/TYPE} carrier)
+                       (completion/bytecode-integral-input-contract carrier (:context input))
+                       (completion/bytecode-floating-input-contract carrier (:context input))))
           guard (fn []
                   (when-not (identical? record (retained-invocation-context emission original))
                     (throw (ex-info "Input region lost its owning invocation"
                                     {:reason :unowned-bytecode-input-region}))))]
       (assoc (compile-owned-input-region
               emission input carrier
-              (if raw-completion?
+              (if checked-reference?
                 ;; The original operand first produces its observed JVM carrier.
-                ;; The method return then uses the SAME emit-coerce as the call
-                ;; input, or the same CHECKCAST for a typed reference return.
+                ;; The method return uses the same CHECKCAST as the call input.
                 ;; The returned Method must retain the exact original Class.
-                ;; In particular this is not a checked source int/long cast.
-                {:return-tag (if checked-reference? carrier
-                                (if (= carrier Long/TYPE) 'long 'int))
+                {:return-tag carrier
                  :walked-body [(:operand input)] :element-type (:element-type record)
                  ::body-input-context (:context input)
                  ::expected-body-type (:emitted-type completed)}
-                {:return-tag (if (= carrier Double/TYPE) 'double 'float)
+                {:return-tag (symbol (.getName ^Class carrier))
                  :walked-body [(completion/complete-value contract (:operand input))]
                  :element-type (:element-type record)}) guard)
              :input-contract contract :input-completion completed))))

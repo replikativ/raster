@@ -10,6 +10,11 @@
 (deftm retained-caller [x :- Double] :- Double (retained-helper x))
 (deftm nullable-caller [x :- Double] :- Double (nullable-helper x))
 
+(deftm integral-long-helper [x :- Long] :- Long x)
+(deftm integral-int-helper [x :- Integer] :- Integer x)
+(deftm integral-long-caller [x :- Long] :- Long (integral-long-helper x))
+(deftm integral-int-caller [x :- Integer] :- Integer (integral-int-helper x))
+
 (defonce input-calls (atom 0))
 (defn input [value]
   (swap! input-calls inc)
@@ -285,6 +290,75 @@
           (if (Double/isNaN expected)
             (is (Double/isNaN outlined))
             (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits outlined)))))))))
+
+(deftest integral-outlining-composes-an-original-call-with-its-input-completion
+  (doseq [[caller carrier] [[#'integral-long-caller Long/TYPE]
+                             [#'integral-int-caller Integer/TYPE]]
+          tag ['Object 'double 'long 'int]]
+    (let [tags [tag 'Object]
+          operand '(do (clojure.core/swap! events clojure.core/conj :operand) input)
+          body (typed-helper-call caller operand)
+          interface (types/ensure-fn-interface! tags)
+          {:keys [implementation emission]}
+          (#'core/emit-owned-bytecode!
+           bytecode/compile-typed-impl! "raster.compiled.IntegralRegionOriginal"
+           '[input events] tags 'Object [body]
+           (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+           (:iface-name interface) 'integral-input)
+          original (first (:body emission))
+          region (bytecode/compile-invocation-input-region emission original 0)]
+      (is (= '[input events] (:parameters region)))
+      (is (identical? carrier (.getReturnType ^java.lang.reflect.Method (:method region))))
+      (is (= :jvm-bytecode-integral-input (get-in region [:input-contract :source-context])))
+      (is (completion/canonical-form? (first (get-in region [:spec :walked-body]))))
+      (doseq [input (case tag
+                     Object [nil false "not a number" Long/MAX_VALUE 2.75 Double/MAX_VALUE Double/NaN]
+                     double [-0.0 2.75 Double/MAX_VALUE Double/NaN]
+                     long [Long/MIN_VALUE Long/MAX_VALUE 16777217]
+                     int [Integer/MIN_VALUE Integer/MAX_VALUE (int 17)])]
+        (let [source-events (atom []) outline-events (atom [])]
+          (is (= (outcome implementation input source-events)
+                 (outcome (:invoke region) input outline-events)))
+          (is (= [:operand] @source-events @outline-events))))
+      (is (= :unowned-bytecode-input-region
+           (try (bytecode/compile-invocation-input-region
+                 emission (with-meta (apply list original) (meta original)) 0)
+                :accepted
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest integral-parent-with-floating-child-refuses-before-ad-derivation
+  (require 'raster.ad.reverse)
+  (let [prepare (ns-resolve 'raster.ad.reverse 'prepare-bytecode-input-pullback)
+        derive (ns-resolve 'raster.ad.reverse 'ordered-bytecode-input-program)]
+    (doseq [[caller carrier] [[#'integral-long-caller Long/TYPE]
+                              [#'integral-int-caller Integer/TYPE]]]
+      (let [body (typed-helper-call caller (typed-helper-call #'retained-caller 'input))
+            interface (types/ensure-fn-interface! '[double])
+            {:keys [emission]}
+            (#'core/emit-owned-bytecode!
+             bytecode/compile-typed-impl! "raster.compiled.IntegralParentFloatingChild"
+             '[input] '[double] 'Object [body]
+             (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+             (:iface-name interface) 'integral-parent-floating-child)
+            original (first (:body emission))
+            region (bytecode/compile-invocation-input-region emission original 0)
+            derivations (atom 0)]
+        ;; Establish that every old preflight condition is satisfied: a real
+        ;; owned floating child, with one correctly declared active FP port.
+        ;; An absent child would make the refusal test vacuous.
+        (is (some? (bytecode/retained-input-call-context emission original 0)))
+        (is (= #{'input} (set (keys (:physical-ports region)))))
+        (is (= :double (get-in region [:physical-ports 'input :type])))
+        (is (identical? carrier (.getReturnType ^java.lang.reflect.Method (:method region))))
+        (is (= :ad-unclosed-bytecode-input-region
+               (with-redefs-fn
+                 {derive (fn [& _]
+                           (swap! derivations inc)
+                           (throw (AssertionError. "Integral parent reached AD derivation")))}
+                 #(try (prepare emission original 0 {'input 'double} ['input])
+                       :accepted
+                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+        (is (zero? @derivations))))))
 
 (deftest contexts-are-captured-from-the-original-input-producer
   (doseq [[return-tag expected] [['Object {:object-result? false :object-call-result? false
