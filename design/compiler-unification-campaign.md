@@ -495,6 +495,13 @@ The zero case also needs validated empty-domain emission that removes unused
 pointer demand: current SegRed still carries its masked input pointer. A nullable
 entry CHECKCAST is not a nonnull read proof; deferral alone does not solve count0.
 
+The first materialization prerequisite factors buffer parameter construction into
+one private helper shared by eager initialization and retained-state validation.
+It preserves existing shape/dtype/storage checks and performs no deferral or new
+admission yet. The existing materialization namespace passes 13 tests / 123
+assertions after function-only reload; the capped REPL's record identities remain
+unchanged. Demand-time realization must reuse this same constructor.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction

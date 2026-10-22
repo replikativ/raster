@@ -374,6 +374,13 @@
   [plan arguments]
   (project-parameter-arguments (invocation/validate-parameter-projection! plan) arguments))
 
+(defn- materialize-buffer-parameter
+  [parameter argument lexical scalar-values]
+  (let [{:keys [id value]} parameter]
+    (->MaterializedBuffer id value
+                          (runtime-buffer-shape parameter value argument lexical scalar-values)
+                          argument :copy)))
+
 (defn begin-materialization
   "Validate public arguments without evaluating any invocation step.
 
@@ -401,11 +408,8 @@
            (fn [values [parameter argument]]
              (let [{:keys [id value]} parameter]
                (if (buffer-value? value)
-                 (assoc values id
-                        (->MaterializedBuffer id value
-                                              (runtime-buffer-shape parameter value argument
-                                                                    initial-lexical scalar-values)
-                                              argument :copy))
+                 (assoc values id (materialize-buffer-parameter
+                                   parameter argument initial-lexical scalar-values))
                  values)))
            scalar-values parameter-pairs)]
       (->InvocationMaterializationState plan parameter-values initial-lexical 0))))
@@ -501,11 +505,8 @@
               (check-scalar! id value actual)
               (do
                 (validate-buffer! id actual value)
-                (let [expected (->MaterializedBuffer
-                                id value
-                                (runtime-buffer-shape parameter value (:source actual)
-                                                      parameter-lexical scalar-values)
-                                (:source actual) :copy)]
+                (let [expected (materialize-buffer-parameter
+                                parameter (:source actual) parameter-lexical scalar-values)]
                   (when-not (= expected actual)
                     (fail! :invocation-materialization-state-parameter
                            "retained buffer parameter differs from its original projection"
