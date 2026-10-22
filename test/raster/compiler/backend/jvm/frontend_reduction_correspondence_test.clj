@@ -118,9 +118,16 @@
               (entry/call-with-definition-inputs
                (fn []
                  (let [source (core/resolve-deftm-var function)
+                       _ (core/prepare-deftm-frontend! source)
                        frontend (entry/original-source-frontend source)
                        input (prefix/begin-reduction-interval frontend (get-in frontend [:source-entry :params]))]
-                   (prefix/prepare-reduction-entry! input core/ensure-current-owned-bytecode!)))))
+                   (when-not (and frontend input)
+                     (throw (ex-info "Fresh reduction fixture requires a prepared source frontend"
+                                     {:source source :frontend? (some? frontend)
+                                      :interval? (some? input)})))
+                   (when-not (prefix/prepare-reduction-entry! input core/ensure-current-owned-bytecode!)
+                     (throw (ex-info "Fresh reduction fixture did not prepare its entry"
+                                     {:source source})))))))
             ;; Compilation owns its whole retryable attempt. Assertions below
             ;; are read-only observations, not an enclosing producer that can
             ;; retain history across a cold helper's promotion.
