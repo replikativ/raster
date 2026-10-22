@@ -28,6 +28,27 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+Whole-draft CI checkpoint, exact remote head `150fd933` (not main): public source
+job 33722 attempted 172 compilations, passed 142 and reported 30 refusals. Its 15
+refused workloads occur on both CUDA and HIP:
+
+| Shared missing boundary | Public workload set | Next acceptance obligation |
+|---|---|---|
+| Source-owned scalar completion | `softmax`, `softmax-cross-entropy`, `loss-fn`, `gqa-decode-attention-buf!` | Preserve original scalar and reduction/count semantics through the common frontend, not workload-specific waivers. |
+| Checked floating conversion | `batch-norm`, `rms-norm-reassociated!`, `rms-norm-chunked-backward-dx`, three row activation quantizers, `layer-norm-reassociated!`, `rope-prefill-strided!` | Complete generic checked conversion/stage composition or prove totality from independent evidence; do not replace checked conversion with unchecked conversion for a green fixture. |
+| Structural read provenance | `rms-norm-chunked` | Transport the actual read certificate through the common transformation, without minting one from equal syntax. |
+| Allocation extent initialization | `gqa-causal-mha`, `gqa-causal-mha-jvp` | Retain canonical integral extent and source-position/count completion. |
+
+The failed deterministic unit-job logs (33720) report 305 assertion failures and
+273 errors across their failed shard output; these are **not** 578 independent
+defects or a complete suite summary. They include canonical liveness/fusion,
+normalized AD captures, source ordering, artifact persistence, distributed training
+and AMR composition. OpenCL job 33721 also fails. Narrow ownership tests below do
+not supersede these results. This checkpoint must remain draft. Fix shared
+mechanisms, retain negative-admission tests, and requalify real unchanged workloads
+before claiming coverage regained. The independently landed #1558/#1559 each had
+all seven green gates; this debt must not be attributed to those main extractions.
+
 Landing update: PR #1558 squash-merged as `94017072` after all seven required
 contexts succeeded on reviewed head `e3f56e30`. The focused main-based checks were
 57 pipeline/inliner tests / 389 assertions, plus one permanent generated weight
