@@ -1229,6 +1229,166 @@
       (is (= ['a physical-output '_n_bound] (mapv :name (:abi k))))
       (is (= ['a physical-output 'n] (:arguments k))))))
 
+(deftest exact-empty-scalar-fold-retains-seed-bits-without-demanding-element-storage
+  (doseq [dtype [:float :double]
+          negative? [false true]]
+    (let [seed (if (= :float dtype) (float (if negative? -0.0 0.0))
+                   (if negative? -0.0 0.0))
+          source (list 'let* ['result (list 'raster.par/reduce 'acc seed 'i 0
+                                           '(+ acc (clojure.core/aget a i)))] 'result)
+          options {:dtype dtype :array-types {'a dtype}}
+          typed (:program (typed-route/attempt source dtype {'a dtype} options))
+          program (:form (segop-lower/segop-lower-pass typed options))
+          algorithm (equation-graph/algorithm-for-equations program (:equations program))
+          graph (equation-graph/make algorithm program)
+          node (first (:nodes graph))
+          operation (:operation node)
+          certificate (segred-body/schedule operation nil options)
+          literal (get-in certificate [:body :operations 0 :expression :arguments 0])
+          bits (if (= :float dtype)
+                 #(Float/floatToRawIntBits (float %))
+                 #(Double/doubleToRawLongBits (double %)))]
+      (is (segop/empty-scalar-reduction? operation))
+      (is (= #{'a} (:inputs operation)) "semantic element inputs remain retained for audit")
+      (is (= #{} (segop/operation-inputs operation)))
+      (is (= {} (map-reads/fold-read-requirements operation options)))
+      (is (= [] (:inputs graph)))
+      (is (= dtype (:type literal)))
+      (is (= (class seed) (class (:value literal))))
+      (is (= (bits seed) (bits (:value literal))))
+      (is (= [] (get-in certificate [:body :allocations])))
+      (is (= :exact-empty-fold (get-in certificate [:numerics :policy])))
+      (is (= :exact (get-in certificate [:numerics :mode])))
+      (is (= [1] (get-in certificate [:body :launch :workgroup-size])))
+      (is (= certificate (segred-body/validate-against-node!
+                         certificate node graph algorithm program)))
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (let [emitted (sg/generate-kernel-graph
+                       graph :target-dialect target
+                       :scheduled-equation-algorithm algorithm :scheduled-equation-body program)
+              artifact (get-in emitted [:nodes 0 :operation])]
+          (is (emitted-equation/emitted-equation?
+               (emitted-equation/make algorithm program emitted)))
+          (is (= '[result 0] (:arguments artifact)))
+          (is (not (str/includes? (:source artifact) "__local")))
+          (is (not (str/includes? (:source artifact) "barrier(")))
+          (is (str/includes? (:source artifact) (if negative? "-0.0" "0.0")))))
+      (doseq [forged [(assoc-in certificate [:body :operations 0 :expression :arguments 0 :value]
+                                (if (= :float dtype) (float (if negative? 0.0 -0.0))
+                                    (if negative? 0.0 -0.0)))
+                      (assoc-in certificate [:source :reduction :components 0 :neutral]
+                                (if (= :float dtype) (float (if negative? 0.0 -0.0))
+                                    (if negative? 0.0 -0.0)))
+                      (assoc-in certificate [:body :launch :workgroup-size] [2])
+                      (assoc-in certificate [:body :attributes :identity] 1.0)]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (segred-body/validate-against-node! forged node graph algorithm program))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (segred-body/validate-against-node!
+                    certificate node (assoc-in graph [:outputs 0 :elements] 2) algorithm program)))
+      (doseq [forged [(assoc-in operation [:space :dims 0 :bound] 1)
+                      (assoc operation :phase :cross-block)
+                      (assoc-in operation [:grid :block-size] 2)
+                      (assoc-in operation [:schedule :attributes :group-count] 2)]]
+        (is (thrown? clojure.lang.ExceptionInfo (segred-body/schedule forged nil options)))))))
+
+(deftest empty-scalar-fold-keeps-terminal-captures-but-not-element-captures
+  (let [base (first (lower/lower-reduce
+                    (soac/par-form->soac
+                     'result '(raster.par/reduce acc 0.0 i 0
+                                                (+ acc (* fold-scale (clojure.core/aget a i))))
+                     94 :dtype :double) nil :dtype :double))
+        transform (kernel-body/->ScalarRegion
+                   '[completed resident scale]
+                   '(clojure.core/* scale
+                                    (clojure.core/+ completed
+                                                    (clojure.core/double
+                                                     (clojure.core/aget resident 0))))
+                   [{:sym 'resident :dtype :float :map (axis-map/singleton-broadcast)}] :double)
+        operation (-> base
+                      (update :inputs conj 'resident)
+                      (assoc :scalars #{'fold-scale 'scale})
+                      (assoc-in [:reduction :attributes :resident-scalar-captures] #{'resident})
+                      (assoc-in [:reduction :attributes :result-region] transform))
+        options {:array-types {'a :double 'resident :float 'result :double}
+                 :scalar-types {'fold-scale :double 'scale :double}}
+        certificate (segred-body/schedule operation nil options)
+        graph (kgraph/from-segops
+               [operation] {:inputs #{'resident} :outputs #{'result} :dtype :double
+                            :scalars [(kgraph/scalar 'scale :double)]
+                            :buffer-specs {'resident {:dtype :float :elements 1}
+                                           'result {:dtype :double :elements 1}}})]
+    (is (= #{'a 'resident} (:inputs operation)))
+    (is (= #{'resident} (segop/operation-inputs operation)))
+    (is (= #{'scale} (segop/operation-scalars operation)))
+    (is (= {'resident 1} (map-reads/fold-read-requirements operation options)))
+    (is (= '[resident result scale 0] (:arguments certificate)))
+    (is (= 1 (count (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                           (get-in certificate [:body :operations])))))
+    (is (= certificate (segred-body/validate-against-node! certificate (first (:nodes graph)) graph)))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (let [artifact (get-in (sg/generate-kernel-graph graph :target-dialect target)
+                             [:nodes 0 :operation])]
+        (is (= '[resident result scale 0] (:arguments artifact)))
+        (is (str/includes? (:source artifact) "resident["))))))
+
+(deftest empty-fold-terminal-conversion-and-scalar-capture-retain-their-own-contracts
+  (doseq [[accumulator-dtype result-dtype] [[:double :float] [:float :double]]]
+    (let [form (with-meta
+                 '(raster.par/reduce acc 0.0 i 0
+                                     (+ acc (* fold-scale (clojure.core/aget a i))))
+                 {:raster.type/elem-type accumulator-dtype})
+          base (first (lower/lower-reduce
+                       (soac/par-form->soac 'result form 96 :dtype accumulator-dtype)
+                       nil :dtype accumulator-dtype))
+          cast (if (= [:double :float] [accumulator-dtype result-dtype])
+                 'clojure.core/unchecked-float 'clojure.core/double)
+          transform (kernel-body/->ScalarRegion
+                     '[completed scale] (list cast '(clojure.core/* completed scale))
+                     [] result-dtype)
+          operation (-> base (assoc :scalars #{'fold-scale 'scale})
+                        (assoc-in [:reduction :attributes :result-region] transform))
+          options {:array-types {'a accumulator-dtype 'result result-dtype}
+                   :scalar-types {'fold-scale accumulator-dtype 'scale accumulator-dtype}}
+          certificate (segred-body/schedule operation nil options)
+          graph (kgraph/from-segops
+                 [operation] {:inputs #{} :outputs #{'result} :dtype result-dtype
+                              :scalars [(kgraph/scalar 'scale accumulator-dtype)]
+                              :buffer-specs {'result {:dtype result-dtype :elements 1}}})]
+      (is (= #{'scale} (segop/operation-scalars operation)))
+      (is (= '[result scale 0] (:arguments certificate)))
+      (is (= accumulator-dtype (get-in certificate [:numerics :accumulator-dtype])))
+      (is (= result-dtype (get-in certificate [:numerics :result-transform :result-dtype])))
+      (is (= result-dtype (get-in certificate [:body :parameters 0 :dtype])))
+      (is (= certificate (segred-body/validate-against-node! certificate (first (:nodes graph)) graph)))
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (is (= '[result scale 0]
+               (get-in (sg/generate-kernel-graph graph :target-dialect target)
+                       [:nodes 0 :operation :arguments]))))
+      (when (= :float result-dtype)
+        (let [checked (assoc-in operation [:reduction :attributes :result-region :expression]
+                                '(clojure.core/float (clojure.core/* completed scale)))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (segred-body/schedule checked nil options)))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (sg/generate-kernel-graph
+                        (assoc-in graph [:nodes 0 :operation] checked)
+                        :target-dialect :opencl-portable))))))))
+
+(deftest nonempty-scalar-fold-does-not-elide-element-inputs
+  (doseq [bound [1 'n]]
+    (let [source (list 'raster.par/reduce 'acc 0.0 'i bound
+                       '(+ acc (clojure.core/aget a i)))
+          operation (first (lower/lower-reduce
+                            (soac/par-form->soac 'result source 95 :dtype :double)
+                            nil :dtype :double))
+          certificate (segred-body/schedule operation nil {:scalar-types {'n :int}})]
+      (is (not (segop/empty-scalar-reduction? operation)))
+      (is (= :scalar-workgroup-tree (get-in operation [:schedule :strategy])))
+      (is (= #{'a} (segop/operation-inputs operation)))
+      (is (= 'a (first (:arguments certificate))))
+      (is (seq (get-in certificate [:body :allocations]))))))
+
 (deftest one-scalar-segred-schedule-emits-through-every-c-family-fixture
   (let [operation (first (lower/lower-reduce
                           (soac/par-form->soac

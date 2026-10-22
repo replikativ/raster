@@ -262,6 +262,42 @@ call, and transactional refusal. Source-fixture CI on preceding head `65e3250a`
 still fails, including softmax's uncertified `inv-sum`; these local checks do not
 qualify the broad draft for merge or establish resident training execution.
 
+### October 22 native empty-fold demand closure
+
+An exact integer-zero, unsegmented scalar SegRed now selects an explicit
+`:scalar-empty-fold` schedule: one workitem stores the actual component seed and
+executes any retained terminal transform. No fold element, shared tree, barrier,
+fold-only pointer or fold-only scalar is required. The seed is materialized with an
+exact same-dtype cast, not arithmetic or a reconstructed monoid zero; FP32/FP64
+positive and negative zero retain their raw bits. Ordinary positive/dynamic counts
+and product/segmented schedules keep their existing routes.
+
+The original operator and semantic `:inputs` remain retained. A shared narrow
+`segop/empty-scalar-reduction?` projection determines effective physical inputs;
+graph storage, read minima and emitter capacity checks use those physical inputs.
+Terminal singleton reads and scalar captures survive, including mixed operand and
+output storage. Checked narrowing still refuses without its original completion
+contract. SegRed/node and reconstructed schedule comparison use the existing
+semantic fingerprint equivalence so Clojure's signed-zero equality cannot admit
+forged seed bits or metadata.
+
+Qualification: 48 focused/adjacent tests, 593 assertions, zero failures/errors,
+including actual OpenCL and Level Zero seed stores without any element buffer.
+OpenCL/CUDA/HIP source emission and exact emitted-equation reconstruction pass;
+CUDA/HIP device execution is not claimed. Four broader affected namespaces have
+129 preexisting tests / 951 passing assertions / seven errors. Restoring their
+exact committed function definitions and rerunning in the same REPL reproduced
+the same counts, names and messages: checked-conversion, scalar-prefix and typed
+projection debt, not a green broad gate. PR1539 remains draft/unqualified.
+
+This closes native physical demand, **not original source execution**. Source
+count conversion/initializer evaluation, nullable entry conversions, read-failure
+order and acquisition/publication guards remain obligations of the ordered
+invocation owner. Deferred materialization is still unwired. The next connected
+step must authorize exact deferred IDs and original argument-reference identities,
+prove the producer construction, and reconcile truly unread parameters at source
+completion without inventing empty buffers or weakening generic finish validation.
+
 ### October 21 DeepSeek inference reference integration
 
 The recovered full source review is retained locally in
@@ -303,6 +339,14 @@ real-weight training, durable publication or actual multi-host acceptance. The
 immediate continuation remains the local source/semantic ownership repair, then
 content-aware prepared replay and encoded/ragged composition qualification. No
 SM100, Ascend, model download or cloud dependency enters the hot development loop.
+
+Follow-up consumer review identified a small representation-identity regression target:
+`pretrained/openai/local.clj` independently defaults `:weights` and `:execution-variant`.
+The fingerprint receives the latter while quantization separately consumes the former;
+selecting Q8 weights without changing the default Q4 variant can retain a Q4 identity.
+Items 3/8 should require identity derived from, or validated against, the selected recipe,
+with a tiny changed-recipe collision test. This is a dirty-checkout source observation,
+not released-artifact qualification. No pretrained implementation was modified here.
 
 ### October 21 integral call-completion prerequisite and next construction gate
 

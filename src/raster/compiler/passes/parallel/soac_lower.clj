@@ -1078,7 +1078,9 @@
                        grid-1 :product product-schedule dtype)]
       (case (:strategy execution)
         :single
-        (let [grid (single-block-grid grid-1)
+        (let [empty-scalar? (and (empty? (:segment-axes description))
+                                 (integer? bound) (zero? bound))
+              grid (if empty-scalar? (segop/->KernelGrid 1 1 0) (single-block-grid grid-1))
               reduction (assoc-in reduction [:attributes :physical-phase] :single)]
           [(segop/->SegRed (:id description)
                            space
@@ -1090,8 +1092,9 @@
                            (:scalars description)
                            grid
                            :single
-                           (segred-body/scalar-workgroup-tree-schedule
-                            reduction grid :single)
+                           (if empty-scalar?
+                             (segred-body/scalar-empty-fold-schedule reduction)
+                             (segred-body/scalar-workgroup-tree-schedule reduction grid :single))
                            dtype)])
 
         :two-phase

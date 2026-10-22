@@ -296,12 +296,32 @@
   (or (segop? x)
       (seg-contract? x)))
 
+(defn empty-scalar-reduction?
+  "Whether a scalar SegRed explicitly schedules an exact empty native fold.
+
+   This projects physical demand, not source argument evaluation. Original `:inputs` and the
+   reduction region remain retained for correspondence; the schedule/body validators must still
+   reconstruct the complete schedule, seed and terminal transform."
+  [operation]
+  (let [dims (get-in operation [:space :dims])
+        bound (:bound (first dims))]
+    (and (seg-red? operation)
+         (= :scalar-empty-fold (get-in operation [:schedule :strategy]))
+         (= :single (:phase operation))
+         (= 1 (count dims))
+         (integer? bound) (zero? bound)
+         (reduction/scalar? (:reduction operation)))))
+
 (defn operation-inputs
   "Physical tensor inputs of a scheduled operation, including a SegContract schedule view."
   [operation]
-  (if (seg-contract? operation)
+  (cond
+    (seg-contract? operation)
     (into #{} (map #(get (:bindings operation) % %))
           (:reads (contraction-facts/dependencies (:facts operation))))
+    (empty-scalar-reduction? operation)
+    (into #{} (map :sym) (get-in operation [:reduction :attributes :result-region :operands]))
+    :else
     (or (:inputs operation) #{})))
 
 (defn operation-outputs
@@ -337,8 +357,12 @@
           extent-expressions (cond-> (mapv :bound (:dims space))
                                (:extent operation) (conj (:extent operation)))
           extent-scalars (reduce set/union #{} (map scalar-entry-references extent-expressions))
-          explicit-scalars (reduce set/union #{}
-                                   (map scalar-entry-references (or (:scalars operation) #{})))]
+          explicit-scalars (if (empty-scalar-reduction? operation)
+                             (set/difference
+                              (set (rest (get-in operation [:reduction :attributes :result-region :parameters])))
+                              arrays)
+                             (reduce set/union #{}
+                                     (map scalar-entry-references (or (:scalars operation) #{}))))]
       (set/union explicit-scalars
                  (set/difference extent-scalars arrays axes)))))
 

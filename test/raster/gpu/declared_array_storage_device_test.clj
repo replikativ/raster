@@ -8,6 +8,10 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.kernel-call :as kernel-call]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.nn :as nn]
             [raster.gpu.compiled :as compiled]
@@ -16,6 +20,48 @@
             [raster.gpu.runtime-backend :as backend]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.value :as value]))
+
+(defn- run-empty-fold-seed [target]
+  (let [runtime (backend/runtime-namespace target)
+        api #(requiring-resolve (symbol (str runtime) %))
+        arena ((api "make-kernel-arena!"))]
+    (try
+      (with-bindings {(api "*current-arena*") arena}
+        (doseq [dtype [:float :double] negative? [false true]]
+          (let [seed (if (= :float dtype) (float (if negative? -0.0 0.0))
+                         (if negative? -0.0 0.0))
+                form (with-meta
+                       (list 'raster.par/reduce 'acc seed 'i 0
+                             '(+ acc (clojure.core/aget a i)))
+                       {:raster.type/elem-type dtype})
+                operation (first (soac-lower/lower-reduce
+                                  (soac/par-form->soac 'result form 97 :dtype dtype)
+                                  nil :dtype dtype))
+                artifact (segop-opencl/generate-segred-kernel
+                          operation nil :dtype dtype :target-dialect :opencl-portable)
+                output ((api "buffer-of-array")
+                        (if (= :float dtype) (float-array [42.0]) (double-array [42.0])) dtype)
+                bits (if (= :float dtype) #(Float/floatToRawIntBits (float %))
+                         #(Double/doubleToRawLongBits (double %)))]
+            (try
+              (is (= '[result 0] (:arguments artifact)) "there is no element-input pointer to bind")
+              ((api "register-kernel!") (:kernel-name artifact) artifact)
+              ((api "launch-registered-bound!")
+               ((api "bind-kernel-call")
+                (kernel-call/make artifact [output {:type :int :value 0}])))
+              (is (= (bits seed) (bits (first ((api "buffer->array") output)))))
+              (finally ((api "free-buffer!") output))))))
+      (finally ((api "close-kernel-arena!") arena)))))
+
+(deftest native-empty-fold-stores-exact-seed-without-an-element-buffer
+  ;; This qualifies the native schedule only. Original source entry/count/initializer guards
+  ;; belong to the invocation owner and are deliberately not inferred from this device test.
+  (if @opencl/opencl-available?
+    (run-empty-fold-seed :ocl:0)
+    (opencl/opencl-skip! "exact empty scalar reduction seed on OpenCL"))
+  (if @gp/gpu-available?
+    (run-empty-fold-seed :ze:0)
+    (gp/gpu-skip! "exact empty scalar reduction seed on Level Zero")))
 
 (defn- run-generated-clone [target]
   (doseq [n [0 4]]

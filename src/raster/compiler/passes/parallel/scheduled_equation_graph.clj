@@ -425,7 +425,7 @@
                                 (nil? (:logical-layout value))
                                 (not (unresolved-capacity? input value elements)))
                        [input [(if (= 0 elements) (launch/product 0) elements)]]))))
-           (:inputs operation))}))
+           (segop/operation-inputs operation))}))
 
 (defn- product-read-requirements
   "Optional minimum capacities from typed product loads, never guessed from loop size alone."
@@ -438,7 +438,7 @@
                         (let [value (get values id)]
                           (and (= {:kind :plain} (:representation value))
                                (nil? (:logical-layout value)))))
-                      (:inputs operation)))
+                      (segop/operation-inputs operation)))
        (let [derived
              (try
                (product-regions/dense-read-requirements
@@ -657,7 +657,7 @@
                                    id (launch/rebind-expression extent derived-scalars)))
                   marked-inputs
                   (set/intersection
-                   (set (:inputs operation))
+                   (segop/operation-inputs operation)
                    (set (mapcat #(get-in (soac/operation-parts %)
                                         [:attributes :attributes :pointwise-storage-inputs])
                                 (filter #(= (second %) (:algorithm-equation operation))
@@ -667,14 +667,14 @@
                          (some (fn [id]
                              (unresolved-capacity? id (get values id)
                                                    (get-in buffer-specs [id :elements])))
-                           (:inputs operation)))
+                           (segop/operation-inputs operation)))
                      (every? (fn [id]
                           (let [value (get values id)]
                             (or (not (unresolved-capacity?
                                       id value (get-in buffer-specs [id :elements])))
                                 (and (= {:kind :plain} (:representation value))
                                      (nil? (:logical-layout value))))))
-                        (:inputs operation)))
+                        (segop/operation-inputs operation)))
               (let [pure-map? (and (segop/seg-map? operation)
                                    (:out-sym operation)
                                    (not (seq (get-in operation [:scalar-region :effects]))))
@@ -690,7 +690,7 @@
                                     (get transform-read-requirements (:algorithm-equation operation)))
                     static-reads (when (and pure-map?
                                             (some #(not (contains? optional-reads %))
-                                                  (:inputs operation)))
+                                                  (segop/operation-inputs operation)))
                                    (map-body/static-read-requirements operation map-read-options))
                     source-requirements (merge-with (fn [left right]
                                           (if (= left right) left (launch/maximum left right)))

@@ -25,6 +25,7 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index-expression]
@@ -71,6 +72,20 @@
                    :group-count (:num-blocks grid)
                    :shared-memory-bytes shared-memory-bytes}})))
 
+(defn scalar-empty-fold-schedule
+  "Canonical single-workitem schedule for an exact native empty scalar domain.
+   Source count conversion and initialization completion remain separate obligations."
+  [operator]
+  (let [operator (reduction/validate! operator)]
+    (reduction/schedule
+     {:strategy :scalar-empty-fold :workgroup-size 1
+      :stages [:identity :terminal-store] :tuning-space {}
+      :numerical-mode (select-keys (if (scan/associative-scan? (:algebra operator))
+                                    (:algebra operator)
+                                    (first (:components (:algebra operator))))
+                                  [:order :reassociation :overflow :nan-policy :signed-zero-policy])
+      :attributes {:phase :single :group-count 1 :shared-memory-bytes 0}})))
+
 (defn- validate-scalar-segred!
   "Validate the complete semantic/schedule subset implemented by the portable workgroup tree."
   [segred out-sym array-types]
@@ -100,6 +115,7 @@
                                "portable scalar SegRed requires an explicit reduction schedule"
                                {:operation (:id segred) :schedule (:schedule segred)
                                 :schedule-error (ex-data exception)})))
+        empty-fold? (= :scalar-empty-fold (:strategy schedule))
         result-region (get-in operator [:attributes :result-region])
         result-operands (vec (:operands result-region))
         result-operand-ids (set (map :sym result-operands))
@@ -180,11 +196,17 @@
       (decline! :workgroup-size
                 "portable scalar SegRed requires a positive power-of-two workgroup"
                 {:operation (:id segred) :workgroup-size workgroup-size}))
+    (when (and empty-fold?
+               (not (and (segop/empty-scalar-reduction? segred) (= 1 workgroup-size))))
+      (decline! :empty-scalar-domain
+                "empty scalar schedule requires an exact zero domain and one terminal workitem"
+                {:operation (:id segred) :space (:space segred) :phase phase :grid grid}))
     (let [expected-level (if (= :block-local phase)
                            (segop/->SegLevel :block :virtual)
                            (segop/->SegLevel :block :none))
-          expected-shared-memory (* workgroup-size (dtype/bytes-of accumulator-dtype))
-          expected-schedule (scalar-workgroup-tree-schedule operator grid phase)]
+          expected-shared-memory (if empty-fold? 0 (* workgroup-size (dtype/bytes-of accumulator-dtype)))
+          expected-schedule (if empty-fold? (scalar-empty-fold-schedule operator)
+                                (scalar-workgroup-tree-schedule operator grid phase))]
       (when-not (= expected-level (:level segred))
         (decline! :phase-level
                   "scalar SegRed phase and execution level disagree"
@@ -499,19 +521,19 @@
                 {:expression expression :element-dtype (:type lowered)
                  :accumulator-dtype dtype}))
     {:operations (:operations lowered) :result (:result lowered)}))
-(defn lower
+(defn- lower-workgroup-tree
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
 
   `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
    accumulator remain uniform (int32/int64/FP32/FP64). A certified resident singleton used only
    by the terminal result region retains its own operand dtype. Integral combines retain their
    certified wrapping policy; integral scalar parameters may also participate in index expressions."
-  [segred out-sym & {:keys [dtype array-types array-shapes scalar-types coordinate-proof scalar-math]
+  [segred out-sym validated {:keys [dtype array-types array-shapes scalar-types coordinate-proof scalar-math]
                      :or {dtype :double array-types {} array-shapes {} scalar-types {}}}]
   (let [{validated-dtype :dtype output :output result-region :result-region
          result-operands :result-operands
          output-dtype :output-dtype}
-        (validate-scalar-segred! segred out-sym array-types)
+        validated
         dtype (or validated-dtype (:dtype segred) dtype)
         index (:name (segop/seg-space-reduced-dim (:space segred)))
         bound (:bound (segop/seg-space-reduced-dim (:space segred)))
@@ -770,6 +792,72 @@
      :group-count group-count
      :result-region result-region}))
 
+(defn- lower-empty-fold
+  [segred {:keys [dtype output output-dtype result-region result-operands]}
+   {:keys [array-shapes scalar-types scalar-math]}]
+  (let [{:keys [operator identity numerical-policy]} (scalar-plan segred)
+        arrays (vec (sort-by name (map :sym result-operands)))
+        array-ids (set arrays)
+        result-scalars (set (remove array-ids (drop 1 (:parameters result-region))))
+        pointer-parameters
+        (vec (concat
+              (map (fn [{:keys [sym dtype]}]
+                     (let [shape (or (get array-shapes sym) [1])]
+                       (assoc (body/->KernelParameter sym :input dtype shape :global
+                                                      (layout/row-major shape dtype) :operand)
+                              :minimum-elements 1))) result-operands)
+              [(body/->KernelParameter output :output output-dtype [1] :global
+                                       (layout/row-major [1] output-dtype) :result)]))
+        storage-types (scheduled-body/storage-scalar-closure pointer-parameters scalar-types #{'_n_bound})
+        scalars (vec (sort-by name (into result-scalars (keys storage-types))))
+        parameters
+        (vec (concat pointer-parameters
+                     (map #(body/->KernelParameter % :scalar (or (get storage-types %) (get scalar-types %) dtype)
+                                                  [] nil nil :parameter) scalars)
+                     [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
+        final-value 'empty-fold-result
+        transformed (when result-region
+                      (scalar-region-lower/lower
+                       result-region
+                       {:accumulator final-value :accumulator-dtype dtype :store-dtype output-dtype
+                        :scalar-math scalar-math
+                        :parameters (into {} (map (juxt :id clojure.core/identity)) parameters)
+                        :coordinate-lower (fn [operand-map]
+                                            (if (axis-map/singleton-broadcast? operand-map)
+                                              (axis-map/coordinate-exprs operand-map)
+                                              (decline! :full-reduction-result-operands
+                                                        "empty-fold transform needs singleton operands"
+                                                        {:map operand-map})))
+                        :id-prefix "completed-empty-fold"}))
+        kernel-body
+        (body/make
+         {:id [:segred (:id segred) :empty-fold]
+          :parameters parameters :stable-reads (mapv body/stable-read arrays)
+          :allocations [] :indices [] :predicates []
+          :operations (vec (concat [(body/->ScalarCompute (body/value final-value dtype)
+                                                         (body/cast-expression
+                                                          (body/literal identity dtype)
+                                                          dtype :exact :exact))]
+                                   (:operations transformed)
+                                   [(body/->ScalarStore output [0]
+                                                       (or (:result transformed) final-value) nil)]))
+          :schedule {:strategy :empty-fold :workgroup-size 1 :reduction-operator operator}
+          :launch (launch/spec {:workgroup-size [1] :group-count [1] :shared-memory-bytes 0})
+          :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)
+                       :algorithm-dialect (:algorithm-dialect segred)}
+          :attributes {:kind :scalar-reduction :identity identity
+                       :operator operator :numerical-policy numerical-policy}})]
+    {:kernel-body kernel-body :operator operator :identity identity :numerical-policy numerical-policy
+     :arrays arrays :scalars scalars :output output :bound 0 :group-count 1 :result-region result-region}))
+
+(defn lower
+  "Lower a validated scalar reduction through its explicit tree or empty-fold schedule."
+  [segred out-sym & {:as options}]
+  (let [validated (validate-scalar-segred! segred out-sym (:array-types options))]
+    (if (= :scalar-empty-fold (get-in validated [:schedule :strategy]))
+      (lower-empty-fold segred validated options)
+      (lower-workgroup-tree segred out-sym validated options))))
+
 (defn- logical-bound-dtype
   [bound scalar-types]
   (let [scalar-dtype (fn [id]
@@ -816,6 +904,7 @@
               (filterv (fn [[parameter _]] (= :scalar (:kind parameter)))
                        (map vector (:parameters kernel-body) arguments)))
         phase (:phase segred)
+        empty-fold? (segop/empty-scalar-reduction? segred)
         output-elements (launch/rebind-expression group-count {'_n_bound bound})
         integral? (dtype/integral? (:dtype segred))
         c-op ({:+ "+" :* "*" :min (if integral? "min" "fmin")
@@ -833,7 +922,8 @@
       :effects {:kind :scalar-reduction-phase
                 :phase phase
                 :uses (scheduled-body/derive-uses kernel-body arguments)}
-      :legality {:kind :scalar-segred-workgroup-tree
+      :legality {:kind (if (= :scalar-empty-fold (get-in segred [:schedule :strategy]))
+                        :scalar-segred-empty-fold :scalar-segred-workgroup-tree)
                  :product-components 1
                  :segment-dimensions 0
                  :phase phase
@@ -843,9 +933,9 @@
                  :certified-monoid (get-in segred [:reduction :algebra])
                  :identity identity
                  :uniform-dtype (dtype/canon (:dtype segred))}
-      :numerics (cond-> {:mode (if integral? :exact :reassociated)
-                         :policy :certified-workgroup-tree
-                         :rounding (if integral? :exact :implementation-defined)
+      :numerics (cond-> {:mode (if (or integral? empty-fold?) :exact :reassociated)
+                         :policy (if empty-fold? :exact-empty-fold :certified-workgroup-tree)
+                         :rounding (if (or integral? empty-fold?) :exact :implementation-defined)
                          :accumulator-dtype (dtype/canon (:dtype segred))}
                   (:overflow numerical-policy)
                   (assoc :overflow (:overflow numerical-policy))
@@ -864,7 +954,7 @@
                    :segop-id (:id segred) :phase phase}
       :attributes {:array-params arrays
                    :scalar-params scalars
-                   :strategy :scalar-workgroup-tree
+                   :strategy (get-in segred [:schedule :strategy])
                    :dtype (dtype/canon (:dtype segred))
                    :phase phase
                    :group-count output-elements
@@ -893,6 +983,10 @@
                          identity)
         scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
         source (:source scheduled)
+        _ (when-not (semantic-fingerprint/equivalent? source (:operation node))
+            (decline! :schedule-source
+                      "scalar reduction source differs in retained types or numerical bits"
+                      {:source source :node-operation (:operation node)}))
         _ (when-not (segop/seg-red? source)
             (decline! :schedule-source
                       "scalar reduction storage closure requires an exact SegRed source"
@@ -995,7 +1089,7 @@
                                      :array-shapes (into {} (map (juxt :id :shape))
                                                          (filter #(= :input (:kind %)) parameters))
                                      :scalar-types scalar-types}))]
-      (when-not (= expected scheduled)
+      (when-not (semantic-fingerprint/equivalent? expected scheduled)
         (decline! :schedule-source
                   "scalar SegRed scheduled body is not the exact refinement of its source"
                   {:node (:id node) :source (:id source)
