@@ -21,6 +21,27 @@
   (doseq [empty-form ['() []]]
     (is (identical? empty-form (util/remake-if-changed empty-form [])))))
 
+(deftest retained-invocation-reconstruction-shares-the-canonical-metadata-contract
+  (let [impl 'raster.numeric/_star__m_double_double-impl
+        left (with-meta (symbol "left") {:tag 'double})
+        right (symbol "right")
+        source (util/make-invk impl [left right] {:line 17})]
+    (is (identical? source (util/remake-invk-if-changed source impl [left right])))
+    (let [retagged (with-meta left {:tag 'float})
+          changed (util/remake-invk-if-changed source impl [retagged right])]
+      (is (= source changed))
+      (is (not (identical? source changed)))
+      (is (identical? retagged (nth changed 2)))
+      (is (identical? right (nth changed 3)))
+      (is (= (meta source) (meta changed))))
+    (let [untagged (with-meta (list '.invk impl left right) {:line 17})
+          repaired (util/remake-invk-if-changed untagged impl [left right])]
+      (is (not (identical? untagged repaired)))
+      (is (= (meta source) (meta repaired))))
+    (let [explicit (vary-meta source assoc :raster.op/original 'example/original)]
+      (is (identical? explicit (util/remake-invk-if-changed explicit impl [left right])))
+      (is (= (meta (util/make-invk impl [left right] (meta explicit))) (meta explicit))))))
+
 (deftest uniquification-observes-actual-reconstruction-with-lexical-scope
   (let [events (atom [])
         shared '(clojure.core/inc x)

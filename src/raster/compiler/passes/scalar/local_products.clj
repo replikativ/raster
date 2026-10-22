@@ -25,7 +25,7 @@
 (def ^:dynamic ^:private *completed-presence-source-ns* nil)
 
 (defn- relist [original children]
-  (with-meta (apply list children) (meta original)))
+  (util/remake-if-changed original children))
 
 (defn- fact [env expression]
   (cond (literal? expression) (cond-> {:literal expression
@@ -395,7 +395,7 @@
         (:expression identity)
         (or (project-scalar-accumulation env lowered)
             (project-array-accumulation env lowered) lowered)))
-    (vector? expression) (with-meta (mapv #(lower env % products?) expression) (meta expression))
+    (vector? expression) (util/remake-if-changed expression (mapv #(lower env % products?) expression))
     (map? expression) (into (empty expression) (map (fn [[k v]] [(lower env k products?) (lower env v products?)])) expression)
     (set? expression) (into (empty expression) (map #(lower env % products?)) expression)
     :else expression))

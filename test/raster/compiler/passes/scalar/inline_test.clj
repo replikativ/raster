@@ -26,6 +26,7 @@
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.util :as util]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
@@ -34,6 +35,21 @@
   ;; Generated preparation is compiler IR, including explicit Object completion.
   ;; Use the same projection as prepared runtime execution before JVM eval.
   (eval (completion/project-to-jvm-source expression)))
+
+(deftest helper-expansion-keeps-opaque-occurrences-and-quoted-data
+  (let [call (util/make-invk 'example/opaque_m_double-impl ['x])]
+    (with-redefs-fn {#'inline/try-resolve-deftm (constantly nil)}
+      #(doseq [source [call
+                      (with-meta (list 'outer call 'y) {:line 27})
+                      (with-meta [call 'y] {:line 28})
+                      (list 'let* ['saved call] 'saved)
+                      (list 'do call 'x)]]
+         (is (identical? source (#'inline/inline-invk source))))))
+  (with-redefs-fn {#'inline/try-resolve-deftm
+                  (fn [& _] (throw (Exception. "quoted helper was resolved")))}
+    #(doseq [head '[quote clojure.core/quote]]
+       (let [source (list head '(.invk example/helper x))]
+         (is (identical? source (#'inline/inline-invk source)))))))
 
 (deftest legacy-source-reconstruction-cannot-enter-bytecode-owned-completions
   (let [context (completion/bytecode-operand-context {})
@@ -317,6 +333,28 @@
 
 (deftm argument-effect-loss [x :- Double unused :- Double] :- Double
   (* x x))
+
+(deftest gradient-result-selection-does-not-copy-unchanged-prepared-initializers
+  (let [captured (atom nil)
+        project inline/inline-value+grad-call
+        source '(let* [vg ((raster.ad.reverse/value+grad
+                            (var raster.compiler.passes.scalar.inline-test/option-loss)
+                            :wrt [0]) x y)]
+                  (clojure.core/nth vg 1))
+        expanded (with-redefs [inline/inline-value+grad-call
+                              (fn [& arguments]
+                                (let [result (apply project arguments)]
+                                  (reset! captured result)
+                                  result))]
+                   (:form (#'inline/inline-one-pass source)))
+        final-bindings (into {} (map vec) (partition 2 (second expanded)))
+        initializers (filter (comp seq? second) (:bindings @captured))]
+    (is (seq initializers))
+    (doseq [[id initializer] initializers]
+      (is (identical? initializer (get final-bindings id)))
+      (is (= (meta initializer) (meta (get final-bindings id)))))
+    (is (= (second (:elements @captured)) (get final-bindings (last expanded))))
+    (is (= 7.0 ((eval-compiler-source (list 'fn '[x y] expanded)) 2.0 3.0)))))
 
 (deftest ad-arguments-evaluate-once-in-source-order-even-when-unused
   (doseq [mode [:value+grad :grad]]

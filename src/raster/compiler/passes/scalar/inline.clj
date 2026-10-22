@@ -1431,9 +1431,8 @@
                                        (form/scope-info expr))) expr
                               (and (seq? expr) (= 'clojure.core/nth (first expr)) (= 3 (count expr)))
                               (or (known-vg-element @vg-elements (second expr) (nth expr 2)) expr)
-                              (seq? expr) (let [r (apply list (map resolve-vg-nth expr))]
-                                            (if-let [m (meta expr)] (with-meta r m) r))
-                              (vector? expr) (mapv resolve-vg-nth expr)
+                              (or (seq? expr) (vector? expr))
+                              (util/remake-if-changed expr (mapv resolve-vg-nth expr))
                               :else expr))
            ;; Resolve nth in BOTH binding values and body expressions
            resolved-pairs (if (seq @vg-elements)
@@ -1538,6 +1537,9 @@
      ;; Ordinary helper expansion cannot erase saved argument/return semantics.
      (completion/bytecode-context-form? form) form
 
+     ;; Quoted calls are data, not helper expansion opportunities.
+     (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
+
      (and (seq? form) (= '.invk (first form)) (>= (count form) 2))
      (let [impl-sym (second form)
            rkey (recursion-key impl-sym)
@@ -1570,7 +1572,7 @@
              ;; recurse into arguments only.
              (let [args (drop 2 form)
                    new-args (map #(inline-invk % policy) args)]
-               (util/make-invk impl-sym new-args (meta form)))
+               (util/remake-invk-if-changed form impl-sym new-args))
              ;; Simple body -- safe to inline
              (let [args (mapv #(inline-invk % policy) (drop 2 form))
                    expansion (build-inline-expansion deftm-info args *param-env* subst-syms nil form)
@@ -1586,16 +1588,16 @@
          ;; Has template or can't resolve: keep call, recurse into arguments
          (let [args (drop 2 form)
                new-args (map #(inline-invk % policy) args)]
-           (util/make-invk impl-sym new-args (meta form)))))
+           (util/remake-invk-if-changed form impl-sym new-args))))
 
      ;; Binding forms -- recurse into bindings and body
      (and (seq? form) (form/binding-form? form))
      (let [[head bindings & body] form
            new-bindings (vec (mapcat (fn [[sym value]] [sym (inline-invk value policy)])
                                      (partition 2 bindings)))
-           new-body (map #(inline-invk % policy) body)
-           r (apply list head new-bindings new-body)]
-       (if-let [m (meta form)] (with-meta r m) r))
+           new-body (map #(inline-invk % policy) body)]
+       (util/remake-if-changed
+        form (list* head (util/remake-if-changed bindings new-bindings) new-body)))
 
      ;; Scope initializers and outer operands are values, but binder names and par
      ;; layout are structural. Reuse the shared decomposition without hoisting anything.
@@ -1608,15 +1610,13 @@
 
      ;; do block -- recurse into all expressions
      (and (seq? form) (= 'do (first form)))
-     (let [r (apply list 'do (map #(inline-invk % policy) (rest form)))]
-       (if-let [m (meta form)] (with-meta r m) r))
+     (util/remake-if-changed form (cons (first form) (map #(inline-invk % policy) (rest form))))
 
      ;; Any other seq -- recurse into all elements
      (seq? form)
-     (let [r (apply list (map #(inline-invk % policy) form))]
-       (if-let [m (meta form)] (with-meta r m) r))
+     (util/remake-if-changed form (mapv #(inline-invk % policy) form))
 
-     (vector? form) (mapv #(inline-invk % policy) form)
+     (vector? form) (util/remake-if-changed form (mapv #(inline-invk % policy) form))
      :else form)))
 
 (defn- anf-lift

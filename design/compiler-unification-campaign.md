@@ -65,6 +65,23 @@ clear a whole prepared-import marker after checking only one scalar.
 PR #1539 remains draft; exact pushed head c5618c07 has setup/build green and
 fixture/OpenCL/test gates red. These focused checks do not supersede those gates.
 
+Following normalization commit fe7cf8e3, review located needless copying in
+gradient-result selection, retained helper calls and local-product traversal.
+These now reuse the existing identity-based reconstruction utility. Invocation
+reconstruction shares make-invk's single metadata constructor: missing operation
+metadata and retagged children still produce new nodes; an explicitly retained
+original operation is not reinterpreted from a mangled name. Quoted helper calls
+are opaque data. No equivalence certificate or source-order permission is added.
+Utility/inliner/product tests pass 109 tests / 714 assertions; source construction,
+transport and prepared AD pass 55 tests / 495 assertions. Actual gradient still
+has the same two scalar refusals; occurrence transport is not fully closed.
+Exact fe7cf8e3 CI has setup/build green, fixture/test red, OpenCL pending at the
+latest observation. Fixture33945 again refuses softmax's inv-sum scalar. Failed
+test shard output33948 reports 3 failures / 13 errors in 568 tests / 4118
+assertions, including source-ordered PDE/copy execution and attention algorithm
+validation; this is one failed shard, not a whole-suite summary. Keep the broad
+draft held and use these shared-boundary counterexamples in subsequent closure.
+
 Whole-draft CI checkpoint, exact remote head `150fd933` (not main): public source
 job 33722 attempted 172 compilations, passed 142 and reported 30 refusals. Its 15
 refused workloads occur on both CUDA and HIP:

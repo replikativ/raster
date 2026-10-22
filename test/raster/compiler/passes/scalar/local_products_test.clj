@@ -68,6 +68,17 @@
 (defn- run [expression & arguments]
   (apply (eval (list 'fn* '[x calls] (completion/project-to-jvm-source expression))) arguments))
 
+(deftest local-product-analysis-keeps-unchanged-scalar-occurrences
+  (doseq [expression [(with-meta '(opaque (clojure.core/double x) calls) {:line 37})
+                      (with-meta '[(opaque x) calls] {:line 38})]]
+    (is (identical? expression (products/lower-local-products expression))))
+  (let [source '(let* [value (clojure.core/double x)]
+                 (if (clojure.core/nil? value) :absent :present))
+        lowered (products/lower-local-products source)]
+    (is (not (identical? source lowered)))
+    (is (= :present (run lowered 2.0 nil)))
+    (is (thrown? NullPointerException (run lowered nil nil)))))
+
 (deftm observed-product-field [x :- Double] :- Double
   (let [product [(clojure.core/* x x)]]
     (if (identical? (nth product 0) (nth product 0)) 1.0 0.0)))

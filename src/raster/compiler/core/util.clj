@@ -551,6 +551,10 @@
   [impl-sym]
   (mangled/impl->op impl-sym))
 
+(defn- invk-metadata [impl-sym original-meta]
+  (let [op (or (:raster.op/original original-meta) (impl->op impl-sym))]
+    (cond-> (or original-meta {}) op (assoc :raster.op/original op))))
+
 (defn make-invk
   "Construct a (.invk impl args...) form with :raster.op/original metadata.
    Always attaches {:raster.op/original original-op} so downstream passes can identify the operation.
@@ -558,10 +562,16 @@
   ([impl-sym args]
    (make-invk impl-sym args nil))
   ([impl-sym args original-meta]
-   (let [op (or (:raster.op/original original-meta) (impl->op impl-sym))
-         m (cond-> (or original-meta {})
-             op (assoc :raster.op/original op))]
-     (with-meta (list* '.invk impl-sym args) m))))
+   (with-meta (list* '.invk impl-sym args) (invk-metadata impl-sym original-meta))))
+
+(defn remake-invk-if-changed
+  "Reconstruct a retained invocation with make-invk's metadata contract.
+   Unchanged ordered children AND metadata retain the original occurrence.
+   An explicit original operation remains authoritative over mangled spelling."
+  [original impl-sym args]
+  (let [rebuilt (remake-if-changed original (list* (first original) impl-sym args))
+        desired (invk-metadata impl-sym (meta original))]
+    (if (= desired (meta rebuilt)) rebuilt (with-meta rebuilt desired))))
 
 (defn void-form?
   "Does this form have NO return value — i.e. is it a statement rather than an expression?
