@@ -16,6 +16,43 @@
 (deftm integral-int-caller [x :- Integer] :- Integer (integral-int-helper x))
 
 (defonce input-calls (atom 0))
+(def binding-events (atom []))
+
+(deftest lexical-binding-completion-plan-is-the-emitted-boundary
+  (let [source-ns (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+        interface (types/ensure-fn-interface! ['Object])]
+    (doseq [[tag valid expected-class] [['floats (float-array [1.0]) (class (float-array 0))]
+                                      ['doubles (double-array [1.0]) (class (double-array 0))]
+                                      ['String "valid" String]]]
+      (let [id (with-meta 'checked {:tag tag})
+            scope (list 'let* [id 'input]
+                        '(do (clojure.core/swap! binding-events clojure.core/conj :after) checked))
+            body [scope]
+            {:keys [implementation emission]}
+            (core/emit-owned-bytecode! bytecode/compile-typed-impl!
+                                      "raster.compiled.BindingCompletionPlan" '[input] ['Object]
+                                      'Object body source-ns (:iface-name interface) 'binding-plan)
+            observed (bytecode/retained-input-binding-context emission body scope 0)
+            plan (bytecode/binding-completion-plan tag :ref {:source-ns source-ns})]
+        (is (identical? expected-class (:checkcast-class plan)))
+        (is (= (:local-facts plan) (dissoc (:after observed) :slot)))
+        (doseq [value [valid nil]]
+          (reset! binding-events [])
+          (is (identical? value (implementation value)))
+          (is (= [:after] @binding-events)))
+        (reset! binding-events [])
+        (is (thrown? ClassCastException (implementation 42)))
+        (is (empty? @binding-events)))))
+  (let [ctx {:source-ns *ns* :void-context true :object-result? true :other :retained}
+        initializer (bytecode/binding-initializer-context ctx)]
+    (is (= {:source-ns *ns* :other :retained :preserve-source-call-results? true} initializer)))
+  (doseq [actual [:float :double :int :long]]
+    (is (nil? (:checkcast-class (bytecode/binding-completion-plan 'floats actual {})))
+        "A reference hint does not turn a primitive value into a CHECKCAST"))
+  (is (= {:type :ref :hint nil :verified false :reference-class Object}
+         (:local-facts (bytecode/binding-completion-plan (symbol "") :ref {}))))
+  (is (nil? (:checkcast-class (bytecode/binding-completion-plan 'Object :ref {})))))
+
 (defn input [value]
   (swap! input-calls inc)
   (+ (double value) 1.0))

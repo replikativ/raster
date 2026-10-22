@@ -42,6 +42,28 @@ checks still evaluate their operand once and fail before subsequent effects.
 This prerequisite does not enable helper expansion or grant resident admission;
 the shared pre-freeze canonicalizer and unchanged training acceptance remain open.
 
+The next shared physical-planning seam is factored from the existing JVM emitter,
+not reconstructed from logical tags: let and loop initializers use one context
+function; lexical hint selection and reference-check/local-fact planning each
+have one implementation consumed by actual let emission. The hint selector is
+the existing policy (including its conservative interop fallback), not authority
+for an initializer's raw carrier. The completion planner is likewise mechanism,
+not an authenticated witness: a future canonicalizer must establish raw facts
+from the actual parameter/operation boundary and reject unsupported carriers or
+unresolved reference hints before using its output. Final emission must recheck
+the resulting plan. No helper expansion or canonicalizer is enabled here.
+
+Qualification compares planner output with actual retained emitted binding facts,
+checks float[]/double[]/String casts, null passage and failure before later effects,
+and retains the empty-hint verifier guard. Entry/preparation checks pass 53 tests /
+787 assertions; existing binding ownership, loops, reference bridges and Object
+checks pass 74 tests / 1,243 assertions. These are separate affected scopes, not
+the broad CI or unchanged resident training gate.
+The combined seven-namespace gate also passes after a clean capped REPL restart:
+127 tests / 2,030 assertions. Bytecode's private InputOrigins class must not be
+reloaded while retaining old captures; those old diagnostic captures were
+discarded rather than interpreted as production evidence.
+
 The next production change should share target-neutral generated-program
 canonicalization before the owned AD entry is frozen. A REPL-only experiment
 using existing generic resolution, helper expansion and PE changes the training

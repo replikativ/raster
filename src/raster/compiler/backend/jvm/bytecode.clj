@@ -3736,6 +3736,158 @@
          (and (coll? expression)
               (some #(method-local-callee-candidate? % ctx) expression)))))))
 
+(defn ^:no-doc binding-initializer-context
+  "The actual lexical initializer context, shared with pre-emission planning.
+   This chooses evaluation context, not a value's physical carrier."
+  [ctx]
+  (assoc (dissoc ctx :void-context :object-result?) :preserve-source-call-results? true))
+
+(defn ^:no-doc binding-hint
+  "The existing emitter's lexical hint selection, not raw carrier inference.
+   Consumers must independently establish the initializer stack type before
+   planning its completion. Kept shared so pre-emission work cannot invent a
+   second alias/return/interop hint policy."
+  [sym init locs ctx]
+  (or (:tag (meta sym))
+        (:raster.type/tag (meta sym))
+        ;; Alias: inherit from source
+        (when (symbol? init)
+          (:hint (get locs init)))
+        ;; Call to deftm: use return-tag from var metadata
+        (when (and (seq? init) (symbol? (first init)))
+          (try (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) (first init))]
+                 (when (var? v)
+                   (:raster.core/return-tag (meta v))))
+               (catch Exception _ nil)))
+        ;; .invk call: read return-tag from walker metadata on impl symbol
+        (when (and (seq? init) (= '.invk (first init))
+                   (symbol? (second init)))
+          (:raster.type/ret-tag (meta (second init))))
+        ;; Java static field/method return type (ClassName/name)
+        ;; Only for actual Java classes (not Clojure vars)
+        (when (and (seq? init) (symbol? (first init))
+                   (let [s (str (first init))]
+                     (and (.contains s "/") (not (.startsWith s "."))))
+                   ;; Skip if it resolves to a Clojure var
+                   (not (try (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) (first init))]
+                               (var? v))
+                             (catch Exception _ false))))
+          (try
+            (let [s (str (first init))
+                  slash (.indexOf ^String s "/")]
+              (when (pos? slash)
+                (let [cls-name (subs s 0 slash)
+                      meth-name (subs s (inc slash))
+                      src-ns (or (:source-ns ctx) *ns*)
+                      cls (or (try (Class/forName cls-name) (catch Exception _ nil))
+                              (when-let [r (ns-resolve src-ns (symbol cls-name))]
+                                (when (class? r) r)))
+                      n-args (dec (count init))]
+                  (when cls
+                    (or ;; Static field (0 args)
+                     (when (zero? n-args)
+                       (try (symbol (.getName (.getType (.getField cls meth-name))))
+                            (catch Exception _ nil)))
+                        ;; Static method
+                     (when-let [m (first (filter #(and (= (.getName ^java.lang.reflect.Method %) meth-name)
+                                                       (= n-args (.getParameterCount ^java.lang.reflect.Method %)))
+                                                 (.getMethods cls)))]
+                       (let [ret (.getReturnType ^java.lang.reflect.Method m)]
+                         (when-not (.isPrimitive ret)
+                           (symbol (.getName ret))))))))))
+            (catch Exception _ nil)))
+        ;; Instance method: (. obj method args...) or (.method obj args...)
+        ;; Infer return type from the method's declaring class
+        (when (and (seq? init) (symbol? (first init)))
+          (let [h (first init)]
+            (cond
+              ;; (.method obj args...)
+              (and (.startsWith (str h) ".") (not= "." (str h)))
+              (let [meth-str (subs (str h) 1)
+                    obj-form (second init)
+                    obj-tag (when (symbol? obj-form) (:hint (get locs obj-form)))
+                    src-ns (or (:source-ns ctx) *ns*)
+                    cls (when obj-tag
+                          (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
+                              (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
+                                (when (class? r) r))))]
+                (when cls
+                  ;; Find most specific return type among matching methods
+                  ;; Java bridge methods return the erased type; prefer
+                  ;; the non-bridge overload with the most specific return
+                  (let [matches (seq (filter #(= (.getName ^java.lang.reflect.Method %) meth-str)
+                                             (.getMethods cls)))
+                        best (or (first (remove #(.isBridge ^java.lang.reflect.Method %) matches))
+                                 (first matches))]
+                    (when best
+                      (let [ret (.getReturnType ^java.lang.reflect.Method best)]
+                        (when-not (.isPrimitive ret)
+                          (symbol (.getName ret))))))))
+              ;; (. obj method args...)
+              (= '. h)
+              (let [obj-form (second init)
+                    meth-sym (nth init 2 nil)
+                    obj-tag (when (symbol? obj-form) (:hint (get locs obj-form)))
+                    src-ns (or (:source-ns ctx) *ns*)
+                    cls (when obj-tag
+                          (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
+                              (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
+                                (when (class? r) r))))]
+                (when (and cls meth-sym)
+                  (let [matches (seq (filter #(= (.getName ^java.lang.reflect.Method %) (str meth-sym))
+                                             (.getMethods cls)))
+                        best (or (first (remove #(.isBridge ^java.lang.reflect.Method %) matches))
+                                 (first matches))]
+                    (when best
+                      (let [ret (.getReturnType ^java.lang.reflect.Method best)]
+                        (when-not (.isPrimitive ret)
+                          (symbol (.getName ret))))))))
+              :else nil)))
+        ;; (new ClassName ...) → ClassName
+        (when (and (seq? init) (= 'new (first init)))
+          (let [cls-sym (second init)]
+            (when cls-sym (symbol (str cls-sym)))))
+        ;; Fallback: use infer-arg-tag for if/do/loop/etc.
+        ;; This covers forms the bytecode handler's
+        ;; pattern matching doesn't handle.
+        (try
+          (let [local-env (into {} (keep (fn [[k v]]
+                                           (when-let [h (:hint v)]
+                                             [k h]))
+                                         locs))]
+            (inf/infer-arg-tag init local-env))
+          (catch Throwable _ nil))))
+
+(defn ^:no-doc binding-completion-plan
+  "Plan the emitter's existing lexical CHECKCAST and resulting local facts.
+   `actual` must be an established raw stack carrier, not a logical annotation.
+   Resolving a hint here does not establish the initializer's carrier or totality.
+   Slot allocation and execution remain the emitter's responsibility."
+  [tag actual ctx]
+  (let [tag (if (and (symbol? tag) (zero? (count (name tag)))) nil tag)
+        reference-class
+        (when (and tag (= actual :ref) (not (typed-interface? tag)))
+          (let [src-ns (or (:source-ns ctx) *ns*)
+                cls (cond
+                      (= tag 'objects) (Class/forName "[Ljava.lang.Object;")
+                      (= tag 'doubles) (Class/forName "[D")
+                      (= tag 'floats) (Class/forName "[F")
+                      (= tag 'ints) (Class/forName "[I")
+                      (= tag 'longs) (Class/forName "[J")
+                      (= tag 'bytes) (Class/forName "[B")
+                      (= tag 'shorts) (Class/forName "[S")
+                      :else
+                      (let [tag-str (str tag)]
+                        (when (pos? (count tag-str))
+                          (or (try (Class/forName tag-str) (catch Exception _ nil))
+                              (when-let [r (ns-resolve src-ns (symbol tag-str))]
+                                (when (class? r) r))))))]
+            (when (and cls (not= cls Object)) cls)))]
+    {:checkcast-class reference-class
+     :local-facts (cond-> {:type actual :hint tag
+                          :verified (boolean (and tag (not= tag 'Object)))}
+                    (= :ref actual) (assoc :reference-class (or reference-class Object)))}))
+
 (defn- emit-let*-handler
   "Emit bytecode for (let* [bindings...] body...).
   Handles type inference for let bindings including:
@@ -3759,169 +3911,27 @@
                              (catch Exception _)))
                       ;; Binding inits must always produce a value (for the local
                       ;; variable slot), so strip :void-context from ctx.
-                      (let [initializer-ctx (assoc (dissoc ctx :void-context :object-result?)
-                                                   :preserve-source-call-results? true)
+                      (let [initializer-ctx (binding-initializer-context ctx)
                             t (emit-form code init locs initializer-ctx)
                              ;; Handle type hints on let bindings
                              ;; ^objects → checkcast [Ljava/lang/Object;
                              ;; ^doubles → checkcast [D
                              ;; ^ClassName → checkcast to that class
-                            ;; Infer tag: explicit hint, CARRIED :raster.type/tag stamp
-                            ;; (AD emission / walker — emitters read stamps, never
-                            ;; re-infer), alias source, deftm return-tag, .invk
-                            ;; return-tag, or Java static field/method return type
-                            tag (or (:tag (meta sym))
-                                    (:raster.type/tag (meta sym))
-                                    ;; Alias: inherit from source
-                                    (when (symbol? init)
-                                      (:hint (get locs init)))
-                                    ;; Call to deftm: use return-tag from var metadata
-                                    (when (and (seq? init) (symbol? (first init)))
-                                      (try (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) (first init))]
-                                             (when (var? v)
-                                               (:raster.core/return-tag (meta v))))
-                                           (catch Exception _ nil)))
-                                    ;; .invk call: read return-tag from walker metadata on impl symbol
-                                    (when (and (seq? init) (= '.invk (first init))
-                                               (symbol? (second init)))
-                                      (:raster.type/ret-tag (meta (second init))))
-                                    ;; Java static field/method return type (ClassName/name)
-                                    ;; Only for actual Java classes (not Clojure vars)
-                                    (when (and (seq? init) (symbol? (first init))
-                                               (let [s (str (first init))]
-                                                 (and (.contains s "/") (not (.startsWith s "."))))
-                                               ;; Skip if it resolves to a Clojure var
-                                               (not (try (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) (first init))]
-                                                           (var? v))
-                                                         (catch Exception _ false))))
-                                      (try
-                                        (let [s (str (first init))
-                                              slash (.indexOf ^String s "/")]
-                                          (when (pos? slash)
-                                            (let [cls-name (subs s 0 slash)
-                                                  meth-name (subs s (inc slash))
-                                                  src-ns (or (:source-ns ctx) *ns*)
-                                                  cls (or (try (Class/forName cls-name) (catch Exception _ nil))
-                                                          (when-let [r (ns-resolve src-ns (symbol cls-name))]
-                                                            (when (class? r) r)))
-                                                  n-args (dec (count init))]
-                                              (when cls
-                                                (or ;; Static field (0 args)
-                                                 (when (zero? n-args)
-                                                   (try (symbol (.getName (.getType (.getField cls meth-name))))
-                                                        (catch Exception _ nil)))
-                                                    ;; Static method
-                                                 (when-let [m (first (filter #(and (= (.getName ^java.lang.reflect.Method %) meth-name)
-                                                                                   (= n-args (.getParameterCount ^java.lang.reflect.Method %)))
-                                                                             (.getMethods cls)))]
-                                                   (let [ret (.getReturnType ^java.lang.reflect.Method m)]
-                                                     (when-not (.isPrimitive ret)
-                                                       (symbol (.getName ret))))))))))
-                                        (catch Exception _ nil)))
-                                    ;; Instance method: (. obj method args...) or (.method obj args...)
-                                    ;; Infer return type from the method's declaring class
-                                    (when (and (seq? init) (symbol? (first init)))
-                                      (let [h (first init)]
-                                        (cond
-                                          ;; (.method obj args...)
-                                          (and (.startsWith (str h) ".") (not= "." (str h)))
-                                          (let [meth-str (subs (str h) 1)
-                                                obj-form (second init)
-                                                obj-tag (when (symbol? obj-form) (:hint (get locs obj-form)))
-                                                src-ns (or (:source-ns ctx) *ns*)
-                                                cls (when obj-tag
-                                                      (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
-                                                          (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
-                                                            (when (class? r) r))))]
-                                            (when cls
-                                              ;; Find most specific return type among matching methods
-                                              ;; Java bridge methods return the erased type; prefer
-                                              ;; the non-bridge overload with the most specific return
-                                              (let [matches (seq (filter #(= (.getName ^java.lang.reflect.Method %) meth-str)
-                                                                         (.getMethods cls)))
-                                                    best (or (first (remove #(.isBridge ^java.lang.reflect.Method %) matches))
-                                                             (first matches))]
-                                                (when best
-                                                  (let [ret (.getReturnType ^java.lang.reflect.Method best)]
-                                                    (when-not (.isPrimitive ret)
-                                                      (symbol (.getName ret))))))))
-                                          ;; (. obj method args...)
-                                          (= '. h)
-                                          (let [obj-form (second init)
-                                                meth-sym (nth init 2 nil)
-                                                obj-tag (when (symbol? obj-form) (:hint (get locs obj-form)))
-                                                src-ns (or (:source-ns ctx) *ns*)
-                                                cls (when obj-tag
-                                                      (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
-                                                          (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
-                                                            (when (class? r) r))))]
-                                            (when (and cls meth-sym)
-                                              (let [matches (seq (filter #(= (.getName ^java.lang.reflect.Method %) (str meth-sym))
-                                                                         (.getMethods cls)))
-                                                    best (or (first (remove #(.isBridge ^java.lang.reflect.Method %) matches))
-                                                             (first matches))]
-                                                (when best
-                                                  (let [ret (.getReturnType ^java.lang.reflect.Method best)]
-                                                    (when-not (.isPrimitive ret)
-                                                      (symbol (.getName ret))))))))
-                                          :else nil)))
-                                    ;; (new ClassName ...) → ClassName
-                                    (when (and (seq? init) (= 'new (first init)))
-                                      (let [cls-sym (second init)]
-                                        (when cls-sym (symbol (str cls-sym)))))
-                                    ;; Fallback: use infer-arg-tag for if/do/loop/etc.
-                                    ;; This covers forms the bytecode handler's
-                                    ;; pattern matching doesn't handle.
-                                    (try
-                                      (let [local-env (into {} (keep (fn [[k v]]
-                                                                       (when-let [h (:hint v)]
-                                                                         [k h]))
-                                                                     locs))]
-                                        (inf/infer-arg-tag init local-env))
-                                      (catch Throwable _ nil)))
+                            tag (binding-hint sym init locs ctx)
                             ;; A degenerate empty-symbol tag (infer-arg-tag's ctor arm
                             ;; misfires on host `(. obj meth …)` dot forms: (name '.)
                             ;; ends with ".") is POISON: it would mark the local
                             ;; :verified (≠ 'Object) while emitting no checkcast, so a
                             ;; downstream aget skips its checkcast too → VerifyError
                             ;; (aaload on Object). Treat it as absent.
-                            tag (if (and (symbol? tag) (zero? (count (name tag)))) nil tag)
                             ;; Checkcast for typed let bindings (arrays, records, etc.)
                             ;; These CHECKCASTs are redundant when getfield already returns
                             ;; the typed value, but C2 uses them as type proofs for downstream
                             ;; optimizations. Removing them causes 2x regression.
                             ;; Skip IFn__ types — handled by wrapper guard.
-                            reference-class (when (and tag (= t :ref)
-                                         (not (typed-interface? tag)))
-                                (let [src-ns (or (:source-ns ctx) *ns*)
-                                      cls (cond
-                                            (= tag 'objects)
-                                            (Class/forName "[Ljava.lang.Object;")
-                                            (= tag 'doubles)
-                                            (Class/forName "[D")
-                                            (= tag 'floats)
-                                            (Class/forName "[F")
-                                            (= tag 'ints)
-                                            (Class/forName "[I")
-                                            (= tag 'longs)
-                                            (Class/forName "[J")
-                                            (= tag 'bytes)
-                                            (Class/forName "[B")
-                                            (= tag 'shorts)
-                                            (Class/forName "[S")
-                                            :else
-                                            (let [tag-str (str tag)]
-                                              (when (pos? (count tag-str))
-                                                (or (try (Class/forName tag-str)
-                                                         (catch Exception _ nil))
-                                                    (when-let [r (ns-resolve src-ns (symbol tag-str))]
-                                                      (when (class? r) r))))))]
-                                  ;; Object is the existing verifier carrier, not a
-                                  ;; narrower type proof. Keep all real array/record
-                                  ;; casts, but do not emit this no-op instruction.
-                                  (when (and cls (not= cls Object))
-                                    (.checkcast code (class-desc-of cls))
-                                    cls)))
+                            completion-plan (binding-completion-plan tag t ctx)
+                            _ (when-let [cls (:checkcast-class completion-plan)]
+                                (.checkcast code (class-desc-of cls)))
                             ;; Skip store for void results (effectful calls like Arrays.fill)
                             slot (when-not (#{:void :diverge} t) (alloc-slot! ctx t))]
                         (when slot
@@ -3932,9 +3942,7 @@
                             :float  (.fstore code slot)
                             (.astore code slot)))
                         (if slot
-                          (let [new-locs (assoc locs sym (cond-> {:slot slot :type t :hint tag
-                                                          :verified (boolean (and tag (not= tag 'Object)))}
-                                                         (= :ref t) (assoc :reference-class (or reference-class Object))))]
+                          (let [new-locs (assoc locs sym (assoc (:local-facts completion-plan) :slot slot))]
                             (retain-binding-context! initializer-ctx (count pairs) (dec @binding-idx) sym init locs (get new-locs sym))
                             (when (and me/*emission-inputs* (= :bound-scope (::reduction-role ctx)))
                               (retain-reduction-observation!
@@ -4791,8 +4799,7 @@
         initializers (when (= :loop (::reduction-role ctx)) (atom []))
         loop-locals (reduce
                      (fn [locs [[sym init] rt]]
-                       (let [initializer-ctx (assoc (dissoc ctx :void-context :object-result?)
-                                                    :preserve-source-call-results? true)
+                       (let [initializer-ctx (binding-initializer-context ctx)
                              t (emit-form code init locs initializer-ctx)
                              emitted-type t
                              plan (source-arithmetic/loop-initializer-plan sym init t rt)
