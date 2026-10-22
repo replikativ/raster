@@ -123,14 +123,15 @@
     :else (bytecode-floating-input-contract carrier operand-context)))
 
 (defn bytecode-result-context-contract
-  "Retain the actual bytecode region-entry context and reference result carrier.
+  "Retain the actual bytecode region-entry context and normal result carrier.
    This is not Object-input conversion: the consumer must return the original
-   reference, without adding boxing, unboxing or a cast. It carries no payload,
+   value, without adding boxing, unboxing or a cast. It carries no payload,
    presence, totality or transpose fact. The producer owns occurrence/context
    correspondence; the constructor does not authenticate observations."
   [operand-context result-carrier]
-  (when-not (and (bytecode-operand-context? operand-context) (= :ref result-carrier))
-    (throw (ex-info "bytecode result context requires an observed reference carrier"
+  (when-not (and (bytecode-operand-context? operand-context)
+                 (contains? #{:ref :double :float :long} result-carrier))
+    (throw (ex-info "bytecode result context requires an observed supported carrier"
                     {:reason :unsupported-value-completion :result-carrier result-carrier})))
   {:source-context :jvm-bytecode-result-context
    :operand-context operand-context :result-carrier result-carrier})
@@ -140,7 +141,7 @@
        (or (= object-input-contract contract)
            (and (= #{:source-context :operand-context :result-carrier} (set (keys contract)))
                 (= :jvm-bytecode-result-context (:source-context contract))
-                (= :ref (:result-carrier contract))
+                (contains? #{:ref :double :float :long} (:result-carrier contract))
                 (bytecode-operand-context? (:operand-context contract)))
            (and (= #{:source-context :target-carrier :policy :operand-context} (set (keys contract)))
                 (case (:source-context contract)

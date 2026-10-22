@@ -274,7 +274,7 @@
     (and (seq? form)
          (= :jvm-bytecode-result-context
             (get-in (completion/canonical-parts form) [:contract :source-context])))
-    :ref
+    (get-in (completion/canonical-parts form) [:contract :result-carrier])
     (and (seq? form)
          (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input
                       :jvm-bytecode-reference-input}
@@ -966,6 +966,27 @@
           (me/assert-emission-inputs-current! emission)
           (assoc bridge :body-context context))))))
 
+(defn ^:no-doc retained-primitive-body-return-bridge
+  "Observe the actual primitive compute return and its Object wrapper boxing.
+   Unlike the scalar-leaf query, the body may take primitive arrays; this does
+   not assert purity, non-nullness, read bounds, or placement. Exact interface
+   and compute parameter equality is checked by the shared bridge observer."
+  [emission]
+  (when-let [{:keys [kind payload-carrier compute-method parameter-carriers body-context] :as bridge}
+             (retained-return-bridge emission)]
+    (when (and (= :boxed-primitive-static-return kind)
+               (contains? #{Double/TYPE Float/TYPE Long/TYPE} payload-carrier)
+               (identical? payload-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
+               (every? (fn [^Class carrier]
+                         (or (contains? #{Double/TYPE Float/TYPE Long/TYPE} carrier)
+                             (and (.isArray carrier)
+                                  (.isPrimitive (.getComponentType carrier)))))
+                       parameter-carriers)
+               (= (class-type->stack payload-carrier)
+                  (:return-stack-type body-context) (:emitted-result-type body-context))
+               (= (completion/bytecode-operand-context {}) (:result-context body-context)))
+      bridge)))
+
 (defn ^:no-doc retained-typed-return-bridge
   "Observe an actual unguarded primitive-static-return → Object invk boxing edge.
    This is payload correspondence, not permission to erase an Object use or
@@ -974,15 +995,9 @@
    reference conversion. Consumers additionally own the selected receiver and
    all original argument completions and definition guards."
   [emission]
-  (when-let [{:keys [kind payload-carrier compute-method parameter-carriers body-context] :as bridge}
-             (retained-return-bridge emission)]
-    (when (and (= :boxed-primitive-static-return kind)
-               (contains? #{Double/TYPE Float/TYPE Long/TYPE} payload-carrier)
-               (identical? payload-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
-               (every? #{Double/TYPE Float/TYPE Long/TYPE} parameter-carriers)
-               (= (class-type->stack payload-carrier)
-                  (:return-stack-type body-context) (:emitted-result-type body-context))
-               (= (completion/bytecode-operand-context {}) (:result-context body-context)))
+  (when-let [{:keys [parameter-carriers] :as bridge}
+             (retained-primitive-body-return-bridge emission)]
+    (when (every? #{Double/TYPE Float/TYPE Long/TYPE} parameter-carriers)
       bridge)))
 
 (defn ^:no-doc retained-reference-return-bridge
@@ -3967,14 +3982,15 @@
           (case (:source-context contract)
             :jvm-object-input
             (when (plan-form-carrier operand locals (object-input-context ctx)) :ref)
+            :jvm-checkcast
+            (when (plan-form-carrier operand locals (object-input-context ctx)) :ref)
             :jvm-bytecode-result-context
             (let [raw (plan-form-carrier operand locals
                                         (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
                                                (:operand-context contract)))]
               (when (= raw (:result-carrier contract)) raw))
-            ;; Other contracts are unsupported by this planner: source CHECKCAST
-            ;; has no direct bytecode implementation, and input completions need
-            ;; retained expected-raw facts, not just target annotations.
+            ;; Input completions need retained expected-raw facts, not just
+            ;; target annotations.
             nil))
         (= 'let* head)
         (when (and (= 3 (count expression)) (vector? (second expression)))
@@ -5475,13 +5491,38 @@
                         {:reason :jvm-literal-owner-initialized})))
       (.set field nil (object-array values)))))
 
+(defn- emit-reference-check-completion
+  "Check the exact retained Class, not a descriptor resolved in another loader.
+   Bootstrap Classes have canonical VM identity and use CHECKCAST directly.
+   Otherwise the existing literal owner holds the exact Class, and Class.cast
+   preserves its identity across loaders. This returns only a :ref stack carrier,
+   not verified local Class facts; a later typed binder performs its own check.
+   Nil passes; the operand is consumed once at its original position."
+  [code {:keys [contract operand]} locals ctx]
+  (let [^Class carrier (:target-carrier contract)]
+    (if (nil? (.getClassLoader carrier))
+      (let [actual (emit-object-value code operand locals ctx)]
+        (if (= :diverge actual) actual
+          (do (.checkcast code (ClassDesc/ofDescriptor (.descriptorString carrier))) :ref)))
+      (let [actual (emit-object-value code operand locals ctx)]
+        (if (= :diverge actual) actual
+          (do
+            ;; Operand first: a recur/goto must not carry a Class receiver into
+            ;; an enclosing loop target with a different stack shape.
+            (emit-literal-reference code carrier ctx)
+            (.checkcast code (ClassDesc/of "java.lang.Class"))
+            (.swap code) ;; Both operand and Class are category-1 references.
+            (.invokevirtual code (ClassDesc/of "java.lang.Class") "cast"
+                            (MethodTypeDesc/of obj-cd (into-array ClassDesc [obj-cd])))
+            :ref))))))
+
 (defn- emit-bytecode-result-completion
   "Replay the observed region context, without completing or coercing its value."
   [code {:keys [contract operand]} locals ctx]
   (let [original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
                                 (:operand-context contract))
         actual (emit-form code operand locals original-context)]
-    (when-not (= (:result-carrier contract) actual)
+    (when-not (or (= :diverge actual) (= (:result-carrier contract) actual))
       (throw (ex-info "Bytecode result context produced a different physical carrier"
                       {:reason :bytecode-result-context-carrier-mismatch
                        :expected (:result-carrier contract) :actual actual})))
@@ -5530,6 +5571,7 @@
                               {:reason :unsupported-jvm-object-literal})))
             parts (case (get-in parts [:contract :source-context])
                     :jvm-object-input (emit-object-value code (:operand parts) locals ctx)
+                    :jvm-checkcast (emit-reference-check-completion code parts locals ctx)
                     :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx)
                     (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
                     (emit-bytecode-input-completion code parts locals ctx)
@@ -5600,6 +5642,7 @@
       (if (completion/canonical-form? form)
         (let [parts (completion/canonical-parts form)]
           (case (get-in parts [:contract :source-context])
+            :jvm-checkcast (emit-reference-check-completion code parts locals ctx)
             (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
             (emit-bytecode-input-completion code parts locals ctx)
             :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx)

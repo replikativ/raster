@@ -16,14 +16,14 @@
     (is (= :unsupported-value-completion-source-context
            (try (completion/project-to-jvm-source term) :accepted
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-    (doseq [changed [(assoc contract :result-carrier :float)
+    (doseq [changed [(assoc contract :result-carrier :int)
                      (assoc contract :payload Float)
                      (assoc contract :presence :present)
                      (update contract :operand-context dissoc :void-context)
                      (assoc-in contract [:operand-context :void-context] nil)
                      (assoc-in contract [:operand-context :extra] false)]]
       (is (not (completion/canonical-contract? changed))))
-    (doseq [carrier [:float :void :diverge Object]]
+    (doseq [carrier [:int :void :diverge Object]]
       (is (thrown? clojure.lang.ExceptionInfo
                    (completion/bytecode-result-context-contract context carrier))))))
 

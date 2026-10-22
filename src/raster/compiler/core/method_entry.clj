@@ -925,6 +925,14 @@
   (frontend-emission-observation
    frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge) %)))
 
+(defn frontend-primitive-body-return-bridge
+  "Observe the owned primitive body return, allowing primitive-array parameters.
+   Scalar-leaf consumers keep frontend-return-bridge's stricter interface.
+   This retains the original module history, not source-import/placement proof."
+  [frontend]
+  (frontend-emission-observation
+   frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-primitive-body-return-bridge) %)))
+
 (defn frontend-reference-return-bridge
   "Observe the exact owned implementation's reference→Object pass-through.
    Preserve its whole body context and actual Method-return CHECKCAST. This grants

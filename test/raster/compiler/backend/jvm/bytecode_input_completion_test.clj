@@ -39,9 +39,8 @@
     (is (nil? (bytecode/plan-argument-carrier 1.0 nil {} ctx)))
     (is (= {:locals {} :bindings []} (bytecode/plan-flat-bindings [] {} ctx)))
     (is (nil? (bytecode/plan-flat-bindings '[x 1.0] {'x {:type :double}} ctx)))
-    (is (nil? (bytecode/plan-form-carrier
-               (completion/complete-value (completion/reference-check-contract String) "valid") {} ctx))
-        "Source CHECKCAST recipes have no direct bytecode completion implementation yet")
+    (is (= :ref (bytecode/plan-form-carrier
+                 (completion/complete-value (completion/reference-check-contract String) "valid") {} ctx)))
     (let [id (with-meta 'boxed-number {:raster.type/tag 'double})
           plan (bytecode/plan-flat-bindings
                 [id (completion/complete-value completion/object-input-contract 1.0)] {} ctx)]
@@ -318,6 +317,48 @@
            (try (compiled [] (completion/complete-value contract 1.25)) :accepted
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
+(deftest primitive-body-result-context-replays-before-outer-boxing
+  (doseq [[carrier tag values] [[:double 'double [0.0 -0.0 Math/PI Double/NaN]]
+                                [:float 'float [(float 0.0) (float -0.0) (float 1.25) Float/NaN]]
+                                [:long 'long [Long/MIN_VALUE -1 0 Long/MAX_VALUE]]]]
+    (let [contract (completion/bytecode-result-context-contract (completion/bytecode-operand-context {}) carrier)
+          term (completion/complete-value contract 'input)
+          parameter (with-meta 'input {:tag tag})
+          f (compiled [parameter] (list 'let* ['completed term] 'completed))
+          original (compiled [parameter] 'input)]
+      (is (= carrier (bytecode/plan-form-carrier term {'input {:type carrier}} {})))
+      (is (= carrier (#'bytecode/infer-arg-stack-type term {'input {:type carrier}})))
+      (doseq [value values]
+        (let [actual (f value) expected (original value)]
+          (is (= (class expected) (class actual)))
+          (case carrier
+            :double (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual)))
+            :float (is (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits actual)))
+            :long (is (= expected actual)))))
+      (let [run (compiled ['failure]
+                          (completion/complete-value contract '(throw failure)))
+            failure (Exception. "original body failure")]
+        (is (identical? failure (try (run failure) (catch Throwable error error)))))
+      (is (= :bytecode-result-context-carrier-mismatch
+             (try (compiled [] (completion/complete-value contract nil)) :accepted
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest numeric-body-context-does-not-inherit-the-outer-object-call-flags
+  (let [call (typed-helper-call #'retained-caller 'input)
+        parameter (with-meta 'input {:tag 'double})
+        locals {'input {:type :double}}
+        context {:source-ns (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)}
+        contract (completion/bytecode-result-context-contract (completion/bytecode-operand-context {}) :double)
+        term (completion/complete-value contract call)
+        original (compiled [parameter] call 'double)
+        completed (compiled [parameter] (list 'let* ['value term] ['value]))]
+    (is (= :double (bytecode/plan-form-carrier call locals context)))
+    (is (= :ref (bytecode/plan-form-carrier call locals (assoc context :preserve-source-call-results? true))))
+    (is (= :double (bytecode/plan-form-carrier term locals (assoc context :preserve-source-call-results? true))))
+    (doseq [input [-0.0 1.25 Double/MAX_VALUE Double/NaN]]
+      (is (= (Double/doubleToRawLongBits (original input))
+             (Double/doubleToRawLongBits (first (completed input))))))))
+
 (deftest checked-float-preserves-core-source-overloads
   (doseq [[tag values] [['double [0.0 -0.0 Math/PI Double/MAX_VALUE
                                  Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
@@ -561,6 +602,63 @@
     (let [events (atom [])]
       (is (nil? (branch "wrong Class" events)))
       (is (empty? @events)))))
+
+(deftest lexical-reference-checks-preserve-identity-nil-and-effect-order
+  (doseq [carrier [String (class (float-array 0)) Object]]
+    (let [contract (completion/reference-check-contract carrier)
+          term (completion/complete-value contract 'input)
+          run (compiled ['input] term)
+          value (cond (= String carrier) (String. "unchanged")
+                      (= Object carrier) (Object.)
+                      :else (float-array [1.0]))]
+      (is (identical? value (run value)))
+      (is (nil? (run nil)))
+      (when-not (= Object carrier)
+        (is (= ClassCastException (:error (outcome run (Object.))))))))
+  (let [term (completion/complete-value
+              (completion/reference-check-contract (class (float-array 0)))
+              '(do (clojure.core/swap! events clojure.core/conj :operand) input))
+        run (compiled ['input 'events] (list 'do term '(clojure.core/swap! events clojure.core/conj :later)))
+        branch (compiled ['input 'events] (list 'if false term nil))]
+    (let [events (atom [])]
+      (is (= [:operand :later] (run nil events)))
+      (is (= [:operand :later] @events)))
+    (let [events (atom [])]
+      (is (= ClassCastException (:error (outcome run "wrong Class" events))))
+      (is (= [:operand] @events)))
+    (let [events (atom [])]
+      (is (nil? (branch "wrong Class" events)))
+      (is (empty? @events))))
+  (let [term (completion/complete-value (completion/reference-check-contract String) '(throw failure))
+        run (compiled ['failure] term)
+        failure (Exception. "original failure")]
+    (is (identical? failure (try (run failure) (catch Throwable error error))))))
+
+(deftest lexical-reference-check-retains-the-exact-class-loader-identity
+  ;; Same binary name in two loaders. Descriptor-based CHECKCAST emission would
+  ;; resolve a different Class or fail to load this private owner's Class.
+  (let [writer (clojure.asm.ClassWriter. 0)
+        binary-name "raster.test.IsolatedReferenceCompletion"
+        _ (.visit writer clojure.asm.Opcodes/V1_8 clojure.asm.Opcodes/ACC_PUBLIC
+                  "raster/test/IsolatedReferenceCompletion" nil "java/lang/Object" nil)
+        _ (.visitEnd writer)
+        bytes (.toByteArray writer)
+        first-class (.defineClass (clojure.lang.DynamicClassLoader.) binary-name bytes nil)
+        second-class (.defineClass (clojure.lang.DynamicClassLoader.) binary-name bytes nil)
+        first-array (java.lang.reflect.Array/newInstance first-class (int 0))
+        second-array (java.lang.reflect.Array/newInstance second-class (int 0))
+        contract (completion/reference-check-contract (class first-array))
+        term (completion/complete-value contract 'input)
+        run (compiled ['input] term)
+        recur-term (completion/complete-value contract '(recur (clojure.core/+ i 1)))
+        run-loop (compiled [] (list 'loop* '[i (long 0)]
+                                   (list 'if '(clojure.core/< i 1) recur-term nil)))]
+    (is (= (.getName (class first-array)) (.getName (class second-array))))
+    (is (not (identical? (class first-array) (class second-array))))
+    (is (identical? first-array (run first-array)))
+    (is (nil? (run nil)))
+    (is (nil? (run-loop)) "A divergent operand must not push the Class before recur")
+    (is (= ClassCastException (:error (outcome run second-array))))))
 
 (deftest integral-outlining-composes-an-original-call-with-its-input-completion
   (doseq [[caller carrier] [[#'integral-long-caller Long/TYPE]

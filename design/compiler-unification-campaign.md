@@ -30,6 +30,32 @@ items 3 and 5; it does not replace the other six obligations.
 
 #### Reviewed continuation: close the producer, not individual optimizer copies
 
+October 22 boundary checkpoint: selected helper emission capture is shared by AD
+and compiler normalization, with original definition observations retained across
+explicit owned preparation. Primitive-array helpers can expose their actual
+primitive return bridge without being admitted as scalar leaves. The JVM emitter
+can replay a saved Float/Double/Long body context before outer boxing and retains
+lexical reference checks, including exact Class-loader identity and operand-first
+failure/recur order. The real training MSE body agrees with its original owned
+invocation for changed inputs and failing reads. No whole-body import or resident
+gradient admission is enabled by these mechanisms.
+
+Qualification remains incomplete: the focused boundary gate passes 96 tests /
+1,331 assertions, but a wider first run found 18 failures and one error in the
+existing reduction-correspondence namespace. Its isolated and warm reruns pass
+(43 tests / 871 assertions); this cold/order discrepancy remains open, rather
+than being dismissed as a baseline or hidden by warming. A clean REPL reproduces
+18 failures and two errors in that wider gate, including a stale original
+numeric-helper observation during owned preparation. The new real-MSE tests
+explicitly request public dtype specialization without numerical execution;
+they do not require a previously materialized mangled helper. Exact-head CI at
+5dde4f1c is red in unit, OpenCL and GPU fixtures. The fixture failure remains the
+public softmax scalar quotient's unclosed source arithmetic. The draft is not
+merge-ready. The next acceptance milestone is still the unchanged resident
+forward/gradient/update/replay path, followed by broad green CI and measurement.
+
+The earlier checkpoints below describe prerequisite evidence, not completion.
+
 Prerequisite qualification: scalar PE and simplification now preserve existing
 ValueCompletion terms as evaluation boundaries. The simplifier validates the
 reserved syntax before descent and simplifies only the operand, retaining the

@@ -79,6 +79,27 @@
           (is (= Object (:return-class result)))
           (is (zero? @calls)))))))
 
+(deftest selected-capture-never-restamps-a-definition-changed-by-preparation
+  (with-selected-definition
+    '[double]
+    (fn [{:keys [operation implementation arity method receiver-var calls]}]
+      (let [preparations (atom 0)
+            reason (try
+                     (boundary/capture-selected-emission!
+                      operation implementation arity method
+                      (fn [selected]
+                        (is (identical? receiver-var selected))
+                        (swap! preparations inc)
+                        ;; Each preparation changes the originally observed
+                        ;; definition. A fresh post-prepare snapshot cannot make
+                        ;; that attempt valid, even when its root is unchanged.
+                        (alter-meta! selected assoc ::preparation-revision (Object.))))
+                     :accepted
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
+        (is (= :stale-definition-proof-input reason))
+        (is (= 3 @preparations) "Only the existing whole-owner bounded retry applies")
+        (is (zero? @calls))))))
+
 (deftest stale-source-or-executable-evidence-is-unknown
   (with-selected-definition
     '[double]

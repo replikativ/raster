@@ -4363,56 +4363,10 @@
           result)))))
 
 (defn- capture-selected-helper-emission
-  "Capture an emission through an already resolved global typed call.
-   No operand tags select a method here. The original call-site producer must
-   prove global lexical correspondence and supply its actual resolved Method.
-   Realizing the selected lazy implementation never executes its numeric body.
-   Capture is independent of derivative activity: an inactive call still needs
-   the same source/receiver ownership and historical-input checks."
+  "AD and generated-program normalization share the selected physical producer."
   [operation implementation-op argument-count resolved-method]
-  (let [select! (fn []
-                  (let [signature (call-boundary/selected-typed-signature
-                                   operation implementation-op argument-count resolved-method)]
-                    (when-not (= :known (:status signature))
-                      (throw (ex-info "paired helper has no verified selected typed invocation"
-                                      {:reason :ad-paired-helper-selected-definition
-                                       :operation operation :implementation-op implementation-op
-                                       :decline (:reason signature)})))
-                    signature))
-        initial (select!)
-        _ (rcore/ensure-current-owned-bytecode! (get-in initial [:definition :receiver-var]))
-        {:keys [definition declaring-class] :as signature} (select!)
-        {:keys [source-var receiver-var parameters tags return-tag entry]} definition
-        emission (:raster.core/bytecode-emission (meta receiver-var))]
-    (when-not (and (= :jvm-bytecode (:backend emission))
-                   (identical? (:implementation emission) @receiver-var)
-                   (identical? (:implementation emission) (:typed-impl entry))
-                   (= (:params emission) parameters) (= (:tags emission) tags)
-                   (= (:return-tag emission) return-tag)
-                   (identical? (:source-ns emission) (.ns ^clojure.lang.Var source-var))
-                   (= (:typed-interface emission) (:typed-iface entry)))
-      (throw (ex-info "selected helper does not own its retained bytecode emission"
-                      {:reason :ad-paired-helper-emission-correspondence
-                       :operation operation :implementation-op implementation-op})))
-    (let [observations (mapv method-entry/var-snapshot [source-var receiver-var])
-          selection-guard
-          (fn []
-            (let [current (select!)]
-              (when-not (and (every? method-entry/var-snapshot-current? observations)
-                             (identical? declaring-class (:declaring-class current))
-                             (identical? source-var (get-in current [:definition :source-var]))
-                             (identical? receiver-var (get-in current [:definition :receiver-var]))
-                             (identical? (:implementation emission)
-                                         (get-in current [:definition :entry :typed-impl])))
-                (throw (ex-info "selected paired helper definition changed"
-                                {:reason :ad-paired-helper-selected-definition
-                                 :operation operation :implementation-op implementation-op})))))
-          emission-guard (method-entry/prepare-emission-input-guard! emission)
-          guard (fn [] (selection-guard)
-                  (emission-guard)
-                  nil)
-          _ (guard)]
-      {:emission emission :guard guard :signature signature :method resolved-method})))
+  (call-boundary/capture-selected-emission!
+   operation implementation-op argument-count resolved-method rcore/ensure-current-owned-bytecode!))
 
 (defn- get-selected-paired-helper-program
   "Derive the paired program from the actual selected emission. Runtime owners
