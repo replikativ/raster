@@ -171,11 +171,15 @@
     (entry/assert-definition-inputs-current! observations)
     true))
 
+(declare completed-reference-root-input)
+
 (defn normalize-frontend-bindings
   "Uniquify the exact authenticated frontend, retaining actual construction edges.
    The witness is producer-local: do not put it in compiler options, IR metadata
-   or portable artifacts. It proves no completion, inlining or execution rights."
-  [frontend parameters]
+   or portable artifacts. An optional opaque completed root carries its own
+   constructor authority; normalization alone proves no completion or execution."
+  ([frontend parameters] (normalize-frontend-bindings frontend parameters nil))
+  ([frontend parameters completed-call]
   (when (and frontend entry/*emission-inputs*)
     (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
     (when-not (= parameters (get-in frontend [:source-entry :params]))
@@ -184,25 +188,40 @@
     (with-local-history
       (fn []
         (entry/observe-frontend-source-identity! frontend)
-        (let [parameters (mapv #(if (symbol? %) (symbol (name %)) %) parameters)
+        (let [completed (when completed-call (completed-reference-root-input frontend completed-call))
+              _ (when (and completed-call (nil? completed))
+                  (throw (ex-info "source normalization requires its exact completed root call"
+                                  {:reason :source-normalization-completed-call-mismatch})))
+              input-body (if completed [(:expression completed)] (:body frontend))
+              original-nodes (when completed
+                               (doto (java.util.Collections/newSetFromMap (java.util.IdentityHashMap.))
+                                 (.addAll (filter seq? (tree-seq coll? seq (:body frontend))))))
+              parameters (mapv #(if (symbol? %) (symbol (name %)) %) parameters)
               occurrences (volatile! [])
               renamed (with-hygienic-renamings
-                        (:body frontend) parameters
+                        input-body parameters
                         #(mapv (fn [ordinal expression]
                                  (util/uniquify-rebindings
                                   parameters expression
                                   (fn [original constructed renaming bound]
                                     (when (and (seq? original)
+                                               (or (nil? completed)
+                                                   (identical? original (:expression completed))
+                                                   (.contains ^java.util.Set original-nodes original))
                                                (not (contains? '#{quote clojure.core/quote}
                                                                (first original))))
                                       (vswap! occurrences conj
-                                              {:original original :constructed constructed
-                                               :root ordinal :renaming renaming :bound bound})))))
-                               (range) (:body frontend)))
+                                              (cond-> {:original (if (identical? original (:expression completed))
+                                                                   (:original completed) original)
+                                                       :constructed constructed
+                                                       :root ordinal :renaming renaming :bound bound}
+                                                (identical? original (:expression completed))
+                                                (assoc :completed-call completed-call)))))))
+                               (range) input-body))
               body (:body renamed)]
           {:walked-body body
            :source-normalization (SourceNormalization. frontend body @occurrences
-                                                       (:renamings renamed) @entry/*emission-inputs*)})))))
+                                                       (:renamings renamed) @entry/*emission-inputs*)}))))))
 
 (defn normalization-occurrence
   "Query a unique exact constructed occurrence under its original history.
@@ -431,7 +450,11 @@
                (let [params (get-in callee [:source-entry :params])
                      tags (get-in callee [:source-entry :tags])
                      source-ns (get-in callee [:source-entry :source-ns])
-                     imported (prepare-inline-body callee (:body callee) params tags source-ns)
+                     ;; Raw import is deliberately separate from call construction:
+                     ;; later wiring the public import producer must not recurse
+                     ;; through itself or lose the original callee boundary.
+                     imported (with-local-history
+                                #(prepare-body callee (:body callee) params tags source-ns true))
                      body (first (effective-body (:walked-body imported)))
                      all-symbols (filter symbol? (tree-seq coll? seq [original body params]))
                      built
@@ -478,6 +501,13 @@
       (entry/adopt-definition-inputs! (.-observations constructed))
       (entry/adopt-definition-inputs! {:producer-inputs [constructed]})
       {:original (.-original constructed) :expression (.-expression constructed)})))
+
+(defn- completed-reference-root-input [frontend constructed]
+  (when (and (instance? CompletedReferenceCall constructed)
+             (identical? frontend (.-caller ^CompletedReferenceCall constructed))
+             (= 1 (count (:body frontend)))
+             (identical? (first (:body frontend)) (.-original ^CompletedReferenceCall constructed)))
+    (completed-reference-call-view constructed)))
 
 (defn original-builder-invocation-view
   "Relate one recorded builder's imported callee to an actual original selected call.

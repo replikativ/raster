@@ -25,9 +25,33 @@
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
+
+(deftest legacy-source-reconstruction-cannot-enter-bytecode-owned-completions
+  (let [context (completion/bytecode-operand-context {})
+        operand '(outer ((raster.ad.reverse/value+grad (var unsupported-helper)) x))]
+    (doseq [contract [(completion/bytecode-reference-input-contract Object context)
+                      (completion/bytecode-integral-input-contract Long/TYPE context)
+                      (completion/bytecode-floating-input-contract Double/TYPE context)
+                      (completion/bytecode-result-context-contract context :ref)]]
+      (let [region (completion/complete-value contract operand)
+            hoisted (#'inline/hoist-nested-vg ['answer region] [region])
+            rewritten (#'inline/rewrite-D-calls-in-form region)]
+        (is (completion/bytecode-context-form? region))
+        (is (false? (:changed? hoisted)))
+        (is (identical? region (second (:bindings hoisted))))
+        (is (identical? region (first (:body hoisted))))
+        (is (empty? (:bindings rewritten)))
+        (is (identical? region (:form rewritten)))
+        (is (identical? region (#'inline/inline-invk region)))
+        (is (identical? region (#'inline/resolve-dispatch-walk region {})))))
+    (is (false? (completion/bytecode-context-form?
+                 (completion/complete-value completion/object-input-contract operand)))
+        "source Object completion is not silently relabelled as bytecode authority")
+    (is (false? (completion/bytecode-context-form? '(ordinary-call x))))))
 
 (deftest no-op-ad-hoisting-preserves-exact-source-occurrences
   (let [leaf (with-meta '(helper x) {:source-marker :leaf})

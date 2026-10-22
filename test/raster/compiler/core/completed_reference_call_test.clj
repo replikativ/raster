@@ -4,6 +4,7 @@
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
 (defonce events (atom []))
@@ -118,6 +119,48 @@
             (let [value (float-array [1.0 4.0])]
               (is (identical? (when-not (neg? count) value) (f value count))))
             (is (= [:argument :delegate] @events))))))))
+
+(deftest completed-root-normalization-retains-the-original-call-boundary
+  (prepare! (core/resolve-deftm-var #'delegated-reference {:dtype :float}))
+  (with-call
+    '(raster.compiler.core.completed-reference-call-test/delegated-reference xs unused)
+    'count
+    (fn [{:keys [frontend original]}]
+      (let [original-body (:body frontend)
+            constructed (transport/construct-original-reference-call frontend original)
+            normalized (transport/normalize-frontend-bindings
+                        frontend (get-in frontend [:source-entry :params]) constructed)
+            root (first (:walked-body normalized))
+            origin (transport/normalization-occurrence (:source-normalization normalized) root)]
+        (is (some? constructed))
+        (is (identical? original-body (:body frontend)) "the frozen frontend is not rewritten")
+        (is (identical? original (:original origin)))
+        (is (identical? constructed (:completed-call origin)))
+        (is (identical? frontend (:frontend origin)))
+        (let [protected (last root)]
+          (is (completion/bytecode-context-form? protected))
+          (with-redefs-fn {#'inline/try-resolve-deftm
+                          (fn [& _] (throw (AssertionError. "legacy inliner entered completed body")))}
+            #(is (identical? protected (#'inline/inline-invk protected))))
+          (is (identical? protected (#'inline/resolve-dispatch-walk protected {})))
+          (is (identical? protected (:form (#'inline/rewrite-D-calls-in-form protected))))
+          (let [expanded (inline/expand-for-backends root)]
+            (is (some (fn [node] (identical? protected node)) (tree-seq coll? seq expanded))
+                "backend expansion retains the whole canonical argument/return boundary")))
+        (doseq [expression (filter #(and (seq? %) (= '.invk (first %)))
+                                  (tree-seq coll? seq root))]
+          (is (nil? (transport/normalization-occurrence (:source-normalization normalized) expression))
+              "an imported callee occurrence does not acquire caller-source authority"))
+        (doseq [f [(compiled frontend original) (compiled frontend root)]
+                count [-1 0 5]]
+          (reset! events [])
+          (let [value (float-array [3.0])]
+            (is (identical? (when-not (neg? count) value) (f value count))))
+          (is (= [:delegate] @events)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact completed root"
+                             (transport/normalize-frontend-bindings
+                              frontend (get-in frontend [:source-entry :params])
+                              (transport/completed-reference-call-view constructed))))))))
 
 (deftest constructor-rejects-copied-occurrences-and-retains-stale-history
   (with-call 'xs 'count

@@ -191,6 +191,14 @@
   (when (canonical-form? expression)
     {:contract (second expression) :operand (nth expression 2)}))
 
+(defn bytecode-context-form?
+  "A canonical region whose reconstruction needs original bytecode authority.
+   Shape recognition is a rewrite barrier, not proof of ownership or execution."
+  [expression]
+  (contains? #{:jvm-bytecode-reference-input :jvm-bytecode-integral-input
+               :jvm-bytecode-floating-input :jvm-bytecode-result-context}
+             (get-in (canonical-parts expression) [:contract :source-context])))
+
 (defn object-value-declaration
   "An exact Object completion preserves an explicitly declared logical value.
    This conveys no presence or physical carrier and does not infer from hints.

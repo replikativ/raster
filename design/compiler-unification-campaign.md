@@ -419,6 +419,24 @@ The next step is construction-edge integration at both owned normalization
 producers, followed by complete helper-interval/result correspondence. No
 production normalization fallback is removed by the unwired constructor alone.
 
+The first normalization consumer now accepts the opaque completed-call value
+explicitly for its exact original root, not a compiler-option flag or caller map.
+The immutable frontend remains unchanged; the normalization edge joins the
+constructed root back to its original call and retained constructor. Imported
+callee nodes do not acquire caller-source origins. The constructor uses raw body
+import, separately from the public helper-import producer, to prevent accidental
+recursive construction during later integration. Default production normalization
+is unchanged pending full interval admission.
+
+Canonical bytecode input/result contexts are now shared rewrite barriers for
+legacy helper expansion, dispatch rewriting, AD application hoisting and D-call
+rewriting. This is shape-based protection, not inferred ownership or an AD rule;
+source Object completion is not relabelled bytecode-owned. Tests retain the
+delegated call and actual argument/return region through backend expansion.
+A fresh REPL first passed the constructor/transport gate (27 tests / 241
+assertions); the subsequent affected 17-namespace gate passed 265 tests / 2,774
+assertions. No whole-draft, numerical-GPU or performance acceptance follows.
+
 The campaign consumer uses the existing authenticated frontend/module-history
 observation boundary, not an editable return map. Cold queries do not compile;
 promotion requires a fresh owner, and the old cold history becomes stale. Missing,

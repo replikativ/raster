@@ -15,6 +15,7 @@
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.par :as par]
@@ -724,7 +725,8 @@
   (let [changed? (atom false)
         hoist-barrier? (fn [expression]
                          (and (seq? expression)
-                              (or (contains? '#{quote clojure.core/quote} (first expression))
+                              (or (completion/bytecode-context-form? expression)
+                                  (contains? '#{quote clojure.core/quote} (first expression))
                                   (form/introduces-scope? expression)
                                   (form/binding-form? expression))))
         rebuild util/remake-if-changed
@@ -1104,6 +1106,9 @@
    lifted vg bindings that need to be prepended."
   [form]
   (cond
+    (completion/bytecode-context-form? form)
+    {:form form :bindings []}
+
     (not (seq? form))
     {:form form :bindings []}
 
@@ -1524,6 +1529,10 @@
   ([form] (inline-invk form {}))
   ([form {:keys [preserve-templates?] :as policy}]
    (cond
+     ;; Re-emitting these operands/bodies belongs to their retained producer.
+     ;; Ordinary helper expansion cannot erase saved argument/return semantics.
+     (completion/bytecode-context-form? form) form
+
      (and (seq? form) (= '.invk (first form)) (>= (count form) 2))
      (let [impl-sym (second form)
            rkey (recursion-key impl-sym)
@@ -1841,6 +1850,8 @@
    Also resolves constant var references (e.g. raster.numeric/neg-inf)."
   [expr env]
   (cond
+    (completion/bytecode-context-form? expr) expr
+
     ;; Resolve constant var references (plain values like neg-inf, pi)
     ;; Skip: functions, generic dispatch vars, deftm impl singletons
     (and (symbol? expr) (namespace expr) (not (contains? env expr)))
