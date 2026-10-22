@@ -18,6 +18,131 @@
 (defonce input-calls (atom 0))
 (def binding-events (atom []))
 
+(deftest carrier-planning-never-promotes-a-logical-hint-to-a-physical-fact
+  (let [ctx {:source-ns *ns*} x (with-meta 'x {:tag 'double})]
+    (is (nil? (bytecode/plan-form-carrier x {'x {:hint 'double :verified true}} ctx)))
+    (is (= :ref (bytecode/plan-form-carrier x {'x {:type :ref :hint 'double}} ctx)))
+    (doseq [[value expected] [[(long 1) :long] [(int 1) :int] [(float 1) :float]
+                             [1.0 :double] [nil :ref] [true :bool] [\a :int]]]
+      (is (= expected (bytecode/plan-form-carrier value {} ctx))))
+    (doseq [expression '[unknown (if flag 1.0 2.0) (do side-effect 1.0)
+                        (clojure.core/+ 1 2) (clojure.core/double unknown)
+                        (clojure.core/long 1 2)]]
+      (is (nil? (bytecode/plan-form-carrier expression {} ctx))))
+    (is (= :double (bytecode/plan-form-carrier '(clojure.core/double x)
+                                                               {'x {:type :ref}} ctx)))
+    (is (nil? (bytecode/plan-form-carrier '(clojure.core/double x)
+                                        {'x {:type :ref} 'clojure.core/double {:type :ref}} ctx)))
+    (is (nil? (bytecode/plan-form-carrier 1N {} ctx)))
+    (is (= :ref (bytecode/plan-argument-carrier 1.0 Object {} ctx)))
+    (is (= :double (bytecode/plan-argument-carrier 1.0 Float/TYPE {} ctx)))
+    (is (nil? (bytecode/plan-argument-carrier 1.0 nil {} ctx)))
+    (is (= {:locals {} :bindings []} (bytecode/plan-flat-bindings [] {} ctx)))
+    (is (nil? (bytecode/plan-flat-bindings '[x 1.0] {'x {:type :double}} ctx)))
+    (is (nil? (bytecode/plan-form-carrier
+               (completion/complete-value (completion/reference-check-contract String) "valid") {} ctx))
+        "Source CHECKCAST recipes have no direct bytecode completion implementation yet")
+    (let [id (with-meta 'boxed-number {:raster.type/tag 'double})
+          plan (bytecode/plan-flat-bindings
+                [id (completion/complete-value completion/object-input-contract 1.0)] {} ctx)]
+      (is (= :ref (get-in plan [:bindings 0 :raw-type])))
+      (is (= Object (get-in plan [:bindings 0 :after :reference-class]))))
+    (doseq [bindings ['[x] '(x 1.0) '[x y y 1.0] '[x 1.0 x 2.0]
+                      '[x (if flag 1.0 2.0)] [(with-meta 'x {:tag 'NotAnActualClass}) nil]]]
+      (is (nil? (bytecode/plan-flat-bindings bindings {} ctx))))
+    (let [contract (completion/bytecode-result-context-contract
+                    (completion/bytecode-operand-context {}) :ref)]
+      (is (nil? (bytecode/plan-form-carrier (completion/complete-value contract 1.0) {} ctx)))
+      (is (= :ref (bytecode/plan-form-carrier (completion/complete-value contract nil) {} ctx))))
+    (let [contract (completion/bytecode-floating-input-contract
+                    Double/TYPE (completion/bytecode-operand-context {}))]
+      (is (nil? (bytecode/plan-form-carrier (completion/complete-value contract 1.0) {} ctx))
+          "A target recipe without its original raw-input facts grants no plan"))))
+
+(deftest planned-bindings-match-the-emitter-and-are-revalidated
+  (let [source-ns (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+        context {:source-ns source-ns}
+        bindings ['first 'input 'boxed (completion/complete-value completion/object-input-contract 'first)
+                  'converted '(clojure.core/double boxed)]
+        scope (list 'let* bindings 'converted)
+        body [scope]
+        interface (types/ensure-fn-interface! ['double])
+        {:keys [implementation emission]}
+        (core/emit-owned-bytecode! bytecode/compile-typed-impl! "raster.compiled.PlannedBindings"
+                                  '[input] ['double] 'Object body source-ns (:iface-name interface) 'planned-bindings)
+        locals (:locals (bytecode/retained-body-context emission))
+        plan (bytecode/plan-flat-bindings bindings locals context)]
+    (is (= (count (:bindings plan)) 3))
+    (doseq [[index entry] (map-indexed vector (:bindings plan))]
+      (let [observed (bytecode/retained-input-binding-context emission body scope index)]
+        (is (identical? (:initializer entry)
+                        (nth (second (:source-input observed)) (inc (* 2 index)))))
+        (is (= (:raw-type entry) (get-in observed [:after :type])))
+        (is (= (:after entry) (dissoc (:after observed) :slot)))))
+    (is (= 2.5 (implementation 2.5)))
+    (with-redefs [bytecode/plan-form-carrier (fn [& _] :float)]
+      (is (= :bytecode-binding-plan-mismatch
+             (try (bytecode/compile-typed-impl! "raster.compiled.ForgedBindingPlan"
+                                              '[input] ['double] 'Object '[(let* [x 1.0] x)]
+                                              source-ns (:iface-name interface)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest typed-invocation-planning-retains-the-emitter-context
+  (let [interface (types/ensure-fn-interface! ['double])
+        receiver (with-meta 'example/selected {:tag (:iface-name interface)
+                                              :raster.type/ret-tag 'double})
+        ctx {:source-ns (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)}
+        ordinary (bytecode/typed-invocation-plan receiver 1 {} ctx)]
+    (is (identical? (:iface-class interface) (:interface ordinary)))
+    (is (= [Double/TYPE] (:parameter-carriers ordinary)))
+    (is (identical? Object (:interface-result-class ordinary)))
+    (is (identical? Double/TYPE (:primitive-result-class ordinary)))
+    (is (true? (:global? ordinary)))
+    (doseq [context [(assoc ctx :object-call-result? true)
+                     (assoc ctx :preserve-source-call-results? true)
+                     (bytecode/binding-initializer-context ctx)]]
+      (is (nil? (:primitive-result-class (bytecode/typed-invocation-plan receiver 1 {} context)))))
+    (let [call (list '.invk receiver 1.0)
+          result-term (fn [context]
+                        (completion/complete-value
+                         (completion/bytecode-result-context-contract
+                          (completion/bytecode-operand-context context) :ref) call))]
+      (is (= :ref (bytecode/plan-form-carrier
+                    (completion/complete-value completion/object-input-contract call) {} ctx)))
+      (is (= :ref (bytecode/plan-form-carrier
+                    (result-term (bytecode/binding-initializer-context ctx)) {} ctx)))
+      (is (nil? (bytecode/plan-form-carrier (result-term {}) {} ctx))))
+    (is (false? (:global? (bytecode/typed-invocation-plan receiver 1 {receiver {:hint (:iface-name interface)}} ctx))))
+    (doseq [verified? [true false]]
+      (is (nil? (bytecode/plan-form-carrier (list '.invk receiver 1.0)
+                                          {receiver {:type :ref :verified verified? :hint (:iface-name interface)}} ctx))
+          "Neither verified nor guarded local receivers are global inline candidates"))
+    (is (nil? (bytecode/typed-invocation-plan 'example/untyped 1 {} ctx)))
+    (is (thrown? clojure.lang.ExceptionInfo (bytecode/typed-invocation-plan receiver 2 {} ctx)))))
+
+(deftest typed-invocation-plan-matches-an-emitted-initializer
+  (let [source-ns (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+        source (core/resolve-deftm-var #'retained-helper)
+        receiver-var (ns-resolve source-ns (symbol (str (:name (meta source)) "-impl")))
+        _ (core/ensure-current-owned-bytecode! receiver-var)
+        interface (types/ensure-fn-interface! ['double])
+        receiver (with-meta (symbol (str (ns-name source-ns)) (name (:name (meta receiver-var))))
+                             {:tag (:iface-name interface) :raster.type/ret-tag 'double})
+        call (list '.invk receiver 'input)
+        body [(list 'let* ['result call] 'result)]
+        {:keys [implementation emission]}
+        (core/emit-owned-bytecode! bytecode/compile-typed-impl! "raster.compiled.TypedInvocationPlan"
+                                  '[input] ['double] 'Object body source-ns
+                                  (:iface-name interface) 'invocation-plan)
+        observed (bytecode/retained-input-invocation-context emission body call)
+        plan (bytecode/typed-invocation-plan receiver 1 {}
+                                           (bytecode/binding-initializer-context {:source-ns source-ns}))]
+    (is (= (:method plan) (:method observed)))
+    (is (= :global-typed-indy (:invocation-mode observed)))
+    (is (identical? (:interface-result-class plan) (:return-carrier observed)))
+    (is (= (:parameter-carriers plan) (mapv :parameter-carrier (:input-completions observed))))
+    (is (= 2.5 (implementation 2.5)))))
+
 (deftest lexical-binding-completion-plan-is-the-emitted-boundary
   (let [source-ns (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
         interface (types/ensure-fn-interface! ['Object])]

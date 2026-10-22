@@ -64,6 +64,29 @@ The combined seven-namespace gate also passes after a clean capped REPL restart:
 reloaded while retaining old captures; those old diagnostic captures were
 discarded rather than interpreted as production evidence.
 
+The same emitter now provides narrow non-emitting physical carrier planning for
+SSA locals/literals, supported core casts, Object/result completions, lexical
+let spines and global typed invocations. Actual typed-call selection and cast
+result mechanisms are shared with emission. A known initializer plan is checked
+against actual emitted carrier; unsupported cases abstain without changing the
+general emitter. The planner performs compiler-time resolution, not numerical
+execution. It establishes no totality, purity, return payload, ownership or
+permission to move a source evaluation. Logical primitive hints on Object values
+remain Object facts. Dynamic/local receivers, unresolved reference hints,
+unsupported control flow and input recipes without original raw facts refuse.
+
+Independent review caught a planner/emitter mismatch for source CHECKCAST recipes;
+those now abstain because the direct bytecode completion path does not implement
+them. A forged raw plan is rejected by actual emission. The affected ten-namespace
+gate passes 178 tests / 2,568 assertions. A non-emitting full-spine check, seeded
+only by the existing physical entry's parameter facts, plans all 25 unchanged
+training-gradient bindings and matches their actual raw/completed emission facts.
+The unchanged CPU gradient remains within the independent explicit-FP32 oracle:
+weighted-gradient errors are 0 (rows 1) and 1.86e-9 (rows 3).
+No discarded module was emitted for analysis. Pre-freeze helper expansion,
+completion preservation and unchanged resident training acceptance remain open;
+neither broad CI nor a compile-time speedup is established by this receipt.
+
 The next production change should share target-neutral generated-program
 canonicalization before the owned AD entry is frozen. A REPL-only experiment
 using existing generic resolution, helper expansion and PE changes the training
