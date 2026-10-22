@@ -625,11 +625,16 @@
    otherwise retain the nested body's lexical scopes for recursive expansion.
    This construction is NOT a completion, correspondence or execution proof."
   [{:keys [params tags walked-body source-import prepared-program projection-mode] :as callee}
-   args source-env subst-fn result-sym caller]
+   args source-env subst-fn result-sym caller & [reserved-symbols]]
   (if prepared-program
-    (let [{:keys [bindings result-form]}
+    (let [projection
           ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
-           prepared-program args projection-mode source-env caller)]
+           prepared-program args projection-mode source-env caller)
+          {:keys [bindings result-form]}
+          (source-transport/consume-prepared-program-projection
+           projection {:kind (if result-sym :binding :nested) :destination result-sym
+                       :reserved-symbols (when reserved-symbols
+                                           (into reserved-symbols (keys source-env)))})]
       (if result-sym
         {:argument-bindings [] :bindings (conj bindings [result-sym result-form])}
         {:argument-bindings [] :body (list 'let* (vec (mapcat identity bindings)) result-form)}))
@@ -1253,6 +1258,9 @@
    (inline-one-pass form subst-fn skip-ad-rule-check? false))
   ([form subst-fn skip-ad-rule-check? ad-only?]
    (let [[_ bindings-vec0 & body-exprs-raw0] form
+         prepared-reservations
+         (when source-transport/*prepared-program-consumer*
+           (into (set (keys *param-env*)) (filter symbol?) (tree-seq coll? seq form)))
          ;; F1: hoist nested value+grad/grad applications out of any init/body
          ;; sub-position into their own preceding binding, so the binding-level AD
          ;; machinery (value+grad-call? + vg-elements + resolve-vg-nth) fires. A
@@ -1350,7 +1358,12 @@
                  (reset! any-inlined? true))
              (if vg-info
            ;; value+grad call → inline AD transform
-               (if-let [vg-result (inline-value+grad-call vg-info :param-env @type-env)]
+               (if-let [vg-result
+                        (when-let [projection (inline-value+grad-call vg-info :param-env @type-env)]
+                          (source-transport/consume-prepared-program-projection
+                           projection {:kind :binding :destination sym
+                                       :reserved-symbols (when prepared-reservations
+                                                           (into prepared-reservations (keys @type-env)))}))]
                  (do
                    (doseq [[bsym bexpr] (:bindings vg-result)]
                      (swap! result-pairs conj [bsym bexpr]))
@@ -1419,7 +1432,8 @@
                  ;; reports "No AD template for <callee>".) A deftm call with the wrong
                  ;; number of args is always a bug — say so, at the call.
                                  _ (check-inline-arity! head params args init)
-                                 expansion (build-inline-expansion deftm-info args @type-env subst-fn sym init)]
+                                 expansion (build-inline-expansion deftm-info args @type-env subst-fn sym init
+                                                                   prepared-reservations)]
                              (swap! result-pairs into (:bindings expansion))
                              (reset! any-inlined? true)
             ;; Record the inlined function's return type so subsequent

@@ -106,6 +106,25 @@ specialization state while preserving its Var/table for redefinition. It is a
 sequential operation, not revocation of captured implementations or a concurrent
 reload fence. It does not replace any compiler migration acceptance gate.
 
+The first pre-rewrite import hook is now implemented on the draft branch for
+both direct AD applications and authenticated captured prepared callables. A
+compilation-local consumer receives the exact live projection before append,
+and returns fresh, metadata-free output ports with the original nil slots and
+alias partition. Copied, repeated, nested or colliding placements refuse before
+any import can be closed. With no consumer, ordinary expansion is unchanged.
+This is not yet a production ParallelProgram importer: no training admission
+or resident-memory permission follows from capturing the projection.
+
+Combined reused-REPL qualification of the import hook, source transport,
+prepared frontend and generated entry passes 58 tests / 407 assertions. That
+run exposed and then qualified a narrow lifecycle repair: owned bytecode may
+reconstruct its exact current original source after AD rules change. Old
+emissions and prepared executables remain stale; a captured dynamic gradient
+retains its own invocation guard even when a direct gradient constructor in
+the same caller is rebuilt. General emission retries do not gain this renewal
+permission. These focused results do not replace the draft's still-red unit,
+fixture-generation and OpenCL CI gates.
+
 The earlier checkpoints below describe prerequisite evidence, not completion.
 
 Prerequisite qualification: scalar PE and simplification now preserve existing

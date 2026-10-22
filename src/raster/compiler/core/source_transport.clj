@@ -246,6 +246,69 @@
 
 (def ^:dynamic ^:private *source-construction-observer* nil)
 
+(def ^:dynamic *prepared-program-consumer*
+  "Compiler-local prepared-module consumer, nil for ordinary source expansion.
+   Receives an exact recorded projection event and its inliner placement and
+   returns fresh, metadata-free symbolic output ports, preserving nil slots and
+   the original slot alias partition. The
+   consumer must retain and validate the complete typed module separately; this
+   hook grants no execution, conversion, storage or placement permission. A
+   consumer must not publish a module before the whole compilation validates;
+   its provisional state must be discarded on refusal or retry."
+  nil)
+
+(declare construction-leaf normalized-construction-occurrence prepared-projection-event)
+
+(defn- slot-aliases [slots]
+  (second
+   (reduce (fn [[seen result] [ordinal slot]]
+             (if (contains? seen slot)
+               [seen (conj result (get seen slot))]
+               [(assoc seen slot ordinal) (conj result ordinal)]))
+           [{} []] (map-indexed vector slots))))
+
+(defn consume-prepared-program-projection
+  "Cut an exact prepared projection before its raw bindings enter source passes.
+   Default expansion is unchanged. An installed consumer must replace the WHOLE
+   region with explicit ports; there is no partial import or fallback on refusal.
+   No owner or typed object is placed in the returned source expressions."
+  [projection placement]
+  (if-not *prepared-program-consumer*
+    projection
+    (let [event (when *source-construction-observer*
+                  (*source-construction-observer*
+                   :prepared-program-consume {:projection projection}))]
+      (when-not (and event (contains? #{:value+grad :grad} (:mode event))
+                     (vector? (:elements projection))
+                     (= :binding (:kind placement))
+                     (symbol? (:destination placement))
+                     (nil? (namespace (:destination placement)))
+                     (set? (:reserved-symbols placement)))
+        (throw (ex-info "prepared module needs its original binding occurrence"
+                        {:reason :unclosed-prepared-program-placement
+                         :placement placement})))
+      (let [ports (*prepared-program-consumer* event placement)
+            elements (:elements projection)
+            mode (:mode event)
+            scalar? (:scalar-result? projection)
+            reserved (into (conj (:reserved-symbols placement) (:destination placement))
+                           (concat (map first (:bindings projection))
+                                   (mapcat util/free-syms (:arguments event))))]
+        (when-not (and (vector? ports) (= (count elements) (count ports))
+                       (= (mapv nil? elements) (mapv nil? ports))
+                       (= (slot-aliases elements) (slot-aliases ports))
+                       (every? #(or (nil? %)
+                                    (and (symbol? %) (nil? (namespace %))
+                                         (nil? (meta %)) (not (contains? reserved %)))) ports))
+          (throw (ex-info "prepared module ports violate the ordered result boundary"
+                          {:reason :unclosed-prepared-program-outputs
+                           :mode mode :expected-slots (count elements)})))
+        (assoc projection
+               :bindings [] :elements ports
+               :loss-sym (when (= :value+grad mode) (first ports))
+               :grad-syms (if (= :value+grad mode) (vec (rest ports)) ports)
+               :result-form (if (and (= :grad mode) scalar?) (first ports) ports))))))
+
 (defn observe-type-elaboration!
   "Observe an actual constructor return, only inside the owner-local source phase.
    This retains origins, not equivalence, types, completion or execution evidence."
@@ -297,11 +360,24 @@
         (entry/assert-producer-current! normalization)
         (entry/adopt-definition-inputs! (.-observations ^SourceNormalization normalization))
         (let [edges (volatile! []) builders (volatile! [])
+              consumed (java.util.IdentityHashMap.)
               result (binding [*source-construction-observer*
                                (fn [kind event]
                                  (case kind
                                    :type-elaboration (vswap! edges conj event)
                                    :prepared-program-projection (vswap! edges conj event)
+                                   :prepared-program-consume
+                                   (do
+                                     (entry/assert-producer-current! normalization)
+                                     (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
+                                     (let [projection-event
+                                           (prepared-projection-event
+                                            @edges (:projection event)
+                                            #(normalized-construction-occurrence normalization @edges %))]
+                                       (when (and projection-event
+                                                  (not (.containsKey consumed (:occurrence projection-event))))
+                                         (.put consumed (:occurrence projection-event) true)
+                                         projection-event)))
                                    :builder-expansion (vswap! builders conj event)))]
                        (construct))]
           {:form result
@@ -340,6 +416,14 @@
               (when (= 1 (count outgoing))
                 (recur (:original edge) (conj chain edge) (dec remaining))))))))))
 
+(defn- normalized-construction-occurrence
+  [normalization edges constructed]
+  (let [ordinary (filterv #(not= :prepared-program-projection (:construction-kind %)) edges)]
+    (when-let [leaf (construction-leaf ordinary constructed)]
+      (when-let [origin (normalization-occurrence normalization (:value leaf))]
+        (assoc origin :normalized (:value leaf) :constructed constructed
+                      :construction-edges (:edges leaf))))))
+
 (defn construction-occurrence
   "Follow unique actual construction edges back to normalization. Never search by equality.
    A changed tag proves origin only; copied/shared/branching/cyclic histories abstain."
@@ -349,12 +433,19 @@
      (when (and entry/*emission-inputs* (instance? SourceConstruction input))
        (entry/assert-producer-current! input)
        (entry/adopt-definition-inputs! (.-observations ^SourceConstruction input))
-       (let [^SourceConstruction input input
-             edges (filterv #(not= :prepared-program-projection (:construction-kind %)) (.-edges input))]
-         (when-let [leaf (construction-leaf edges constructed)]
-           (when-let [origin (normalization-occurrence (.-normalization input) (:value leaf))]
-             (assoc origin :normalized (:value leaf) :constructed constructed
-                           :construction-edges (:edges leaf)))))))))
+       (let [^SourceConstruction input input]
+         (normalized-construction-occurrence (.-normalization input) (.-edges input) constructed))))))
+
+(defn- prepared-projection-event
+  [edges projection caller-origin]
+  (let [events (filterv #(= :prepared-program-projection (:construction-kind %)) edges)
+        matches (filterv #(identical? projection (:projection %)) events)]
+    (when (= 1 (count matches))
+      (let [event (first matches)
+            callers (filterv #(identical? (:caller event) (:caller %)) events)]
+        (when (= 1 (count callers))
+          (when-let [origin (caller-origin (:caller event))]
+            (assoc event :caller-origin origin)))))))
 
 (defn prepared-program-projection-view
   "Read an exact recorded prepared projection rooted in the original caller.
@@ -364,15 +455,8 @@
   (entry/call-with-optional-definition-inputs
    (fn []
      (when (and entry/*emission-inputs* (instance? SourceConstruction input))
-       (let [events (filterv #(= :prepared-program-projection (:construction-kind %))
-                             (.-edges ^SourceConstruction input))
-             matches (filterv #(identical? projection (:projection %)) events)]
-         (when (= 1 (count matches))
-           (let [event (first matches)
-                 callers (filterv #(identical? (:caller event) (:caller %)) events)]
-             (when (= 1 (count callers))
-               (when-let [origin (construction-occurrence input (:caller event))]
-                 (assoc event :caller-origin origin))))))))))
+       (prepared-projection-event (.-edges ^SourceConstruction input) projection
+                                  #(construction-occurrence input %))))))
 
 (defn prepared-program-binding-occurrence
   "Relate a constructed initializer to its prepared-program binding ordinal.
