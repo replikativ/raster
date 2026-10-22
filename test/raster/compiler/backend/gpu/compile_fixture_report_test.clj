@@ -163,6 +163,29 @@
                             (throw cancelled)))
                       nil (catch Exception error error))))))
 
+(deftest public-contraction-fixtures-preserve-their-declared-storage
+  (require 'raster.compiler.backend.gpu.kernel-body-compile-fixtures)
+  (let [fixture-ns 'raster.compiler.backend.gpu.kernel-body-compile-fixtures
+        generate (ns-resolve fixture-ns 'equation-first-artifacts)
+        wrapper (ns-resolve fixture-ns 'compile-public-fixture)
+        double-contract (ns-resolve 'raster.linalg.contract 'contract-mm)
+        float-contract (ns-resolve 'raster.compiler.fixtures.contractions 'fixed-matmul)]
+    (doseq [target [:cuda :hip]]
+      (let [calls (atom [])]
+        (with-redefs-fn
+          {wrapper (fn [function options & _]
+                     (swap! calls conj [function options])
+                     {:kernels []})}
+          #(doall (generate target {:subgroup-size 32 :max-workgroup-size 1024
+                                    :compute-capability [8 0]})))
+        (is (= [:double]
+               (mapv #(get-in % [1 :dtype])
+                     (filter #(identical? double-contract (first %)) @calls))))
+        (is (= [:float :float]
+               (mapv #(get-in % [1 :dtype])
+                     (filter #(identical? float-contract (first %)) @calls)))
+            "both FP32 multiply-add policy fixtures remain covered")))))
+
 (deftest both-public-target-groups-precede-private-generation
   (require 'raster.compiler.backend.gpu.kernel-body-compile-fixtures)
   (let [fixture-ns 'raster.compiler.backend.gpu.kernel-body-compile-fixtures
