@@ -5,6 +5,7 @@
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.cuda-codegen :as cuda-emit]
+            [raster.compiler.backend.gpu.compile-fixture-report :as report]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.backend.gpu.hip-matrix-candidate-test :as hip-matrix-fixture]
@@ -469,6 +470,22 @@
          :descriptor {:device-type :gpu :backend :hip :vendor "AMD"
                       :subgroup-size 32 :max-workgroup-size 1024}}})
 
+(defn- compile-public-fixture
+  [function options & captured-target]
+  (let [context {:function (symbol (str (ns-name (:ns (meta function))))
+                                   (str (:name (meta function))))
+                 :target (:target options) :dtype (:dtype options)}
+        context (cond-> context (:schedule options) (assoc :schedule (:schedule options)))]
+    ;; Progress belongs on stderr; successful CLI stdout remains the source-file list.
+    (binding [*out* *err*] (println "Compiling public GPU fixture" context))
+    (report/attempt!
+     context
+     #(let [compilation (apply equation-first/compile function options captured-target)]
+        (when-not (seq (:kernels compilation))
+          (throw (ex-info "public compile fixture produced no kernels"
+                          {:reason :gpu-public-fixture-empty})))
+        compilation))))
+
 (defn- public-widened-register-artifacts
   "Compile fixtures retain Float storage and explicit Double arithmetic through the public API."
   [device-id]
@@ -477,7 +494,7 @@
     (mapcat
      (fn [policy]
        (:kernels
-        (equation-first/compile
+        (compile-public-fixture
          #'contractions/fixed-matmul
          {:target device-id :dtype :float
           :schedule {:precision :f32-storage-f64-arithmetic-rte-f32
@@ -502,183 +519,183 @@
      device-id {:type target
                 :name (str "Synthetic " (name target) " public compile gate")
                 :capabilities capabilities})
-    (vec
-     (concat
+    (report/collect!
+     #(concat
       (public-widened-register-artifacts device-id)
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'mixed-storage/mixed-scale
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'mixed-storage/double-reduction-float-result
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'mixed-storage/double-fold-float-storage
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'mixed-storage/double-exponential-float-storage
                  (merge mixed-storage/policy {:target device-id :dtype :float})))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'mixed-storage/mixed-scale-energy-gradient
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'symbolic-storage/regrouped-map {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'symbolic-storage/prefix-map {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/floating-three-stage! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/checked-long-stage! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/floating-result-transform! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/floating-decoded-stages! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/widening-decoded-stages! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/packed-three-stage! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/decoded-byte-three-wide! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/widened-byte-three-wide! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/floating-stages-double-output! {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/double-stages-float-identity-output! {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/decoded-byte-single-stage! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/packed-byte-single-stage! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/decoded-byte-explicit-accumulator! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/explicit-double-accumulator-epilogue! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'staged-public/byte-products-float-accumulation! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-dot {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'nn/softmax {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'nn/softmax-cross-entropy {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'nn/loss-fn {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'nn/dense-backward-db {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'nn/dense-backward-dW {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-long-state {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'checked-casts/narrow-rows! {:target device-id :dtype :long}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-checked-rng {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-active-ids {:target device-id :dtype :int}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-butterfly! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-arrays/argmax-rows! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-arrays/scale-clamp-exp {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-arrays/dot-rows-dbias {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-arrays/masked-mse-loss-into! {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-arrays/masked-mse-loss-backward {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-loss/cross-entropy-loss-into! {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-loss/cross-entropy-loss-backward {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/im2col-2d! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/maxpool2d! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/group-norm-backward-dx {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/group-norm-jvp-dx {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/batch-norm {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-arrays/sum-kv-heads {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/rms-norm-reassociated! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/rms-norm-chunked {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/rms-norm-chunked-backward-dx {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/generate-dropout-mask-seeded {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-cooperative-mixed-folds!
                  {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-map {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'multilevel/prolong-constant-2d! {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'multilevel/restrict-average-2d! {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'pde/periodic-heat-step-2d! {:target device-id :dtype :double}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-scan {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-stencil {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-gather {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-scatter {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-strided-gather {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'public-c-family-strided-scatter {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'contract/contract-mm {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'qk/qmatmul-q4k-dp4a-rows! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'qk/qmatmul-q4k-product-rows! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'qk/quant-act-i8-rows-gpu! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'qk/quant-act-q8k-rows-gpu! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'qk/quant-act-q8k-padded-rows-gpu! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'qk/quant-act-q8k-cooperative-rows-gpu!
                  {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'qk/quant-act-q8k-cooperative-padded-rows-gpu!
                  {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'ggml-kernels/qdot-q6-K-rows!
                  {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'ggml-kernels/qdot-q4-K-rows!
                  {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/layer-norm-reassociated! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-nn/gelu-erf-mul-strided! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-attention/rope-prefill-strided! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-attention/attn-prefill-out-strided! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-attention/attn-prefill-softmax {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-attention/attn-prefill-softmax! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-attention/gqa-decode-attention-buf!
                  {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
+      (:kernels (compile-public-fixture
                  #'dl-attention/gqa-causal-mha-jvp
                  {:target device-id :dtype :float}))
       (mapcat (fn [[source dtype]]
-                (:kernels (equation-first/compile source {:target device-id :dtype dtype})))
+                (:kernels (compile-public-fixture source {:target device-id :dtype dtype})))
               extrema/cases)))))
 
 (defn- write-artifact!
@@ -703,8 +720,8 @@
     (collective-combine/validate! algebra 37 emitted)
     (get-in emitted [:graph :nodes 0 :operation])))
 
-(defn emit-target!
-  [root target]
+(defn- emit-target-with-public!
+  [root target public-artifacts]
   (let [{:keys [suffix descriptor]} (get targets target)
         dialect (gpu-target/kernel-body-c-dialect descriptor)
         _ (when-not dialect
@@ -733,8 +750,7 @@
                    plan pipelined-schedule dialect descriptor)
         swizzled-pipelined (attention-emit/emit-fp16-pipelined
                             plan swizzled-pipelined-schedule dialect descriptor)
-        tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
-        public-artifacts (equation-first-artifacts target descriptor)]
+        tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)]
     (into [(write-artifact! directory suffix "reference-attention" reference)
            (write-artifact! directory suffix "typed-collective-sum"
                             (collective-combine-artifact '+ 0.0 dialect descriptor))
@@ -1005,9 +1021,26 @@
               (write-artifact! directory suffix (str "tiled-" index) artifact))
             (executable/artifacts tiled))))))
 
+(defn emit-target!
+  [root target]
+  (emit-target-with-public! root target
+                            (equation-first-artifacts target (get-in targets [target :descriptor]))))
+
+(defn emit-all!
+  "Check both public target groups before private fixture generation can fail.
+   The enclosing report preserves their refusals if later generation also fails."
+  [root]
+  (report/collect!
+   #(let [public-groups (mapv (fn [target]
+                                [target (equation-first-artifacts
+                                         target (get-in targets [target :descriptor]))])
+                              [:cuda :hip])]
+      (mapcat (fn [[target artifacts]] (emit-target-with-public! root target artifacts))
+              public-groups))))
+
 (defn -main
   [& [root]]
-  (let [root (or root "gpu-compile-gates")]
-    (doseq [target [:cuda :hip]
-            file (emit-target! root target)]
+  (let [root (or root "gpu-compile-gates")
+        files (emit-all! root)]
+    (doseq [file files]
       (println file))))
