@@ -30,15 +30,22 @@ items 3 and 5; it does not replace the other six obligations.
 
 #### Reviewed continuation: close the producer, not individual optimizer copies
 
-October 22 boundary checkpoint: selected helper emission capture is shared by AD
+October 22 boundary checkpoint (draft implementation, not released acceptance):
+selected helper emission capture is shared by AD
 and compiler normalization, with original definition observations retained across
 explicit owned preparation. Primitive-array helpers can expose their actual
 primitive return bridge without being admitted as scalar leaves. The JVM emitter
 can replay a saved Float/Double/Long body context before outer boxing and retains
 lexical reference checks, including exact Class-loader identity and operand-first
 failure/recur order. The real training MSE body agrees with its original owned
-invocation for changed inputs and failing reads. No whole-body import or resident
-gradient admission is enabled by these mechanisms.
+invocation for changed inputs and failing reads. A shared generated-program
+canonicalizer now imports supported whole helper bodies before the one owned AD
+entry is frozen; runtime and compiler consume the same physical program. It
+retains actual entry Method identity, positional argument conversions, lexical
+reference checks, selected helper return contexts and original/new-namespace
+lookup dependencies. Unsupported expansion abstains transactionally. The affected
+reused-REPL gate passes 149 tests / 1,669 assertions. This does not establish
+resident gradient admission or broad CI acceptance.
 
 New generated ABI inputs use the resolved Method's positional Classes and the
 shared bytecode argument/adaptation mechanisms, not Clojure source-policy casts.
@@ -47,17 +54,57 @@ final emission. Object consumption records the carrier after boxing. No receiver
 term, source-occurrence proof, or placement authority is synthesized. This matters
 at Float overflow: JVM d2f/Number.floatValue is not a checked core/float cast.
 
-Qualification remains incomplete: the affected boundary gate passes 98 tests /
-1,371 assertions. A wider clean run initially found 18 failures and two errors.
-Separating retryable compiler production from read-only test collectors removes
-the stale-owner errors, without changing production guards. That same clean gate
-still has 18 failures (75 tests / 1,200 assertions), localized to Float reduction
-consumer observations; warm reruns pass. This remaining discrepancy is not a
-baseline waiver or broad green CI. The real-MSE tests explicitly request public
-dtype specialization rather than borrowing a warmed mangled helper. The draft
-remains unmergeable until the unchanged resident forward/gradient/update/replay
-path, all broad gates, and subsequent measurements are qualified. The public
-softmax scalar quotient's unclosed source arithmetic is also still open.
+Qualification remains incomplete. The Float reduction fixture now explicitly
+prepares its frontend before opening a read-only interval; the reused 75-test /
+1,200-assertion gate passes, but that is not fresh broad CI evidence. At draft
+head b2ee1b6f, public GPU fixture generation attempted 172 requests, passed 140,
+and reported 32 failures across source coverage, checked floating conversions,
+address certificates and a mismatched declared dtype. Head 373f0d74 corrects the
+double-declared contraction fixture and corresponding callers without silently
+retyping its source; separate FP32 fixtures remain covered. Its fixture CI now
+passes 142 of 172 requests, with 30 remaining failures; unit CI is also red.
+The unchanged resident forward/gradient/update/replay path, broad gates and
+subsequent measurements remain mandatory. The public softmax scalar quotient's
+unclosed source arithmetic is also still open.
+
+The next cut is an existing-IR module boundary, not more final-tree matching.
+An instrumented public training compilation creates its prepared projection
+inside `:fixpoint`. Before the next tagging call, its 25 projected bindings have
+already become 34 bindings with no exact projected binder/initializer pairs
+remaining. Final-tree `prepared-program-binding-occurrence` cannot certify this
+interval. Merely moving a query to `pass-lower` is also insufficient: direct
+equation-first compilation does not necessarily inline AD in that pass.
+
+The reviewed continuation is:
+
+1. Consume the exact prepared projection at its inliner construction boundary,
+   before raw bindings are appended. One compilation-local mechanism must cover
+   direct AD applications and authenticated captured prepared callables, including
+   applications exposed by later inlining. Keep opaque ownership out of AST
+   metadata, portable IR and semantic fingerprints.
+2. Account for every physical completion as an exact typed operation or an
+   ordered host invocation action. Public input checks precede acquisition;
+   internal reference checks need actual producer/alias facts. Never cast a
+   DeviceBuffer as a JVM array or infer raw carriers from logical type hints.
+3. Import the generated region and caller continuation into the existing
+   ParallelProgram/InvocationPlan composition. Preserve explicit output ports
+   and source order; do not build an alternate AD executor or expose a typed
+   object to generic S-expression passes. Initially refuse overlapping regions,
+   internal escapes and unproved cross-boundary fusion.
+4. Close only the exact prepared-import occurrence after its complete argument,
+   equation, storage and result boundary validates. Count overflow, allocation
+   failure, array bounds, aliases, lifetimes and publication remain independent
+   obligations; whole-region ownership grants none of them automatically.
+5. Qualify unchanged public local-gradient-sum, then forward/VJP/update, using
+   rows 1/3, changed inputs, JVM/OpenCL/Level Zero comparisons and repeated
+   resident execution. Negative controls must show failing preflight before
+   acquisition, and copied/stale owners or incomplete regions must refuse.
+
+The separate REPL-lifecycle addition `unregister!` is merged as #1563 after all
+seven exact-head gates passed. It clears a generic's methods, templates and
+specialization state while preserving its Var/table for redefinition. It is a
+sequential operation, not revocation of captured implementations or a concurrent
+reload fence. It does not replace any compiler migration acceptance gate.
 
 The earlier checkpoints below describe prerequisite evidence, not completion.
 
