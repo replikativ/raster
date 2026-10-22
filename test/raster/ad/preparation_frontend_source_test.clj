@@ -288,11 +288,17 @@
   (doseq [[wrt expected] [[[] [25.0 nil nil]] [[0] [25.0 6.0 nil]] [[1] [25.0 nil 8.0]]]]
     (let [prepared (reverse/prepare-value+grad #'two-squared-loss wrt)
           projection (reverse/project-prepared-value+grad-call prepared '[a b] :value+grad {})
-          execute (eval (completion/project-to-jvm-source
-                         (list 'fn* '[a b]
-                               (list 'let* (vec (mapcat identity (:bindings projection)))
-                                     (:elements projection)))))]
-      (is (= expected (execute 3.0 4.0)))
+          ;; A structural compiler projection consumes explicitly typed ports;
+          ;; it does not promise erasure of physical contexts into generic fn*.
+          {:keys [methods]} (bytecode/compile-specialized-class!
+                            "raster.compiled.PreparedProjectionTest"
+                            [{:name 'run :params [(with-meta 'a {:tag 'double})
+                                                (with-meta 'b {:tag 'double})]
+                              :return-tag 'Object :source-ns *ns*
+                              :walked-body [(list 'let* (vec (mapcat identity (:bindings projection)))
+                                                  (:elements projection))]}])]
+      (is (= expected (.invoke ^java.lang.reflect.Method (get methods 'run) nil
+                              (object-array [3.0 4.0]))))
       (is (= expected
              (((deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad)) prepared)
               3.0 4.0)))

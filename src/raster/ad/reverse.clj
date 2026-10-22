@@ -6046,6 +6046,16 @@
   (let [{:keys [params tags walked-body source-ns]} program
         policy (get-in frontend [:source-entry :source-policy])
         interface (types/ensure-fn-interface! tags)
+        expected-method (:raster.compiler.backend.jvm.generated-body/entry-method program)
+        _ (when (and (contains? program :raster.compiler.backend.jvm.generated-body/entry-method)
+                     (not (and (instance? java.lang.reflect.Method expected-method)
+                               (identical? (:iface-class interface)
+                                           (.getDeclaringClass ^java.lang.reflect.Method expected-method))
+                               (= expected-method
+                                  (first (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                                                 (.getDeclaredMethods ^Class (:iface-class interface))))))))
+            (throw (ex-info "Generated body normalization and emission have different interface Methods"
+                            {:reason :ad-generated-entry-method-mismatch})))
         {:keys [implementation emission]}
         (source-policy/call-with-policy
          policy
@@ -6126,9 +6136,19 @@
                               (if (contains? active p)
                                 (and (symbol? slot) (contains? visible slot))
                                 (nil? slot)))) params))
-         (assoc program :walked-body [normalized] :result-sym (first outputs)
-                        :param-adj-syms (mapv #(nth outputs (inc (get positions %)))
-                                             (:candidate-params parameter-plan))))))))
+         (let [program (assoc program :walked-body [normalized] :result-sym (first outputs)
+                              :param-adj-syms (mapv #(nth outputs (inc (get positions %)))
+                                                   (:candidate-params parameter-plan)))
+               interface (when (and (vector? (:tags program))
+                                    (= (count params) (count (:tags program))))
+                           (types/ensure-fn-interface! (:tags program)))
+               method (when interface
+                        (first (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                                       (.getDeclaredMethods ^Class (:iface-class interface)))))
+               canonical (when method
+                           ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/normalize-program)
+                            program method capture-selected-helper-emission))]
+           (or canonical program)))))))
 
 (defn- build-grad-walked-body
   "Build the AD-transformed walked body for a deftm var.

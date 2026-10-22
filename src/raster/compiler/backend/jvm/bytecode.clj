@@ -3930,6 +3930,23 @@
       (when (plan-form-carrier expression locals (object-input-context ctx)) :ref)
       (plan-form-carrier expression locals ctx))))
 
+(defn ^:no-doc resolved-parameter-locals
+  "Seed a new physical program's locals from an already resolved Method.
+   No logical tags, source hints or overload selection supply carrier facts.
+   These describe the Method entry only, not nullness, bounds or ownership."
+  [resolved-method parameters]
+  (when (and (instance? java.lang.reflect.Method resolved-method)
+             (vector? parameters) (every? symbol? parameters)
+             (= (count parameters) (count (set parameters)))
+             (= (count parameters) (.getParameterCount ^java.lang.reflect.Method resolved-method)))
+    (let [classes (vec (.getParameterTypes ^java.lang.reflect.Method resolved-method))
+          carriers (mapv class-type->stack classes)]
+      (when (every? #{:ref :int :long :float :double :bool} carriers)
+        (into {} (map (fn [id carrier cls]
+                        [id (cond-> {:type carrier}
+                              (= :ref carrier) (assoc :reference-class cls))])
+                      parameters carriers classes))))))
+
 (defn ^:no-doc plan-resolved-invocation-inputs
   "Construct inputs for a new physical program using an already resolved Method.
    No overload/source dispatch or receiver expression is synthesized. The owner

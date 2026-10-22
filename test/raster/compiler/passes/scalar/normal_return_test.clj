@@ -19,7 +19,9 @@
 
 (deftest completion-presence-does-not-infer-a-payload-or-authorize-execution
   (doseq [contract [completion/object-input-contract
-                    (completion/reference-check-contract Number)]]
+                    (completion/reference-check-contract Number)
+                    (completion/bytecode-reference-input-contract
+                     (class (double-array 0)) (completion/bytecode-operand-context {}))]]
     (is (= {:presence :absent}
            (normal/result-fact (completion/complete-value contract nil))))
     (is (= {:presence :unknown}
@@ -29,7 +31,9 @@
                                {'input {:presence :present :array-tag 'doubles}}))))
   (doseq [contract [(completion/primitive-input-contract Double/TYPE {:unchecked-math false})
                     (completion/bytecode-floating-input-contract
-                     Float/TYPE (completion/bytecode-operand-context {}))]]
+                     Float/TYPE (completion/bytecode-operand-context {}))
+                    (completion/bytecode-integral-input-contract
+                     Long/TYPE (completion/bytecode-operand-context {}))]]
     (is (= {:presence :present}
            (normal/result-fact (completion/complete-value contract 'unknown))))
     (is (= {:presence :no-return}
