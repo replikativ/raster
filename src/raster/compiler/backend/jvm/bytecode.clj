@@ -921,6 +921,43 @@
                (= (:emitted-result-type owner) (:emitted-result-type record))
                (string? (:return-descriptor owner)))
       (assoc record :owner owner))))
+(defn- retained-return-bridge
+  "Validate the shared actual wrapper/body edge, without choosing a return recipe."
+  [emission]
+  (let [implementation (:implementation emission)
+        candidates (filterv #(and (identical? implementation (:implementation %))
+                                  (identical? (:body emission) (:body %)))
+                            (:typed-return-bridges emission))
+        context (retained-body-context emission)]
+    (when (and implementation context (= 1 (count candidates)))
+      (let [{:keys [result-carrier interface invocation-method
+                    compute-method parameter-carriers compute-parameter-carriers] :as bridge}
+            (first candidates)]
+        (when (and (identical? Object result-carrier)
+                   (class? interface) (.isInterface ^Class interface)
+                   (.isInstance ^Class interface implementation)
+                   (instance? java.lang.reflect.Method invocation-method)
+                   (instance? java.lang.reflect.Method compute-method)
+                   (= compute-method (:method context))
+                   (= (.descriptorString (.getReturnType ^java.lang.reflect.Method compute-method))
+                      (:return-descriptor context))
+                   (= "invk" (.getName ^java.lang.reflect.Method invocation-method))
+                   (identical? interface (.getDeclaringClass ^java.lang.reflect.Method invocation-method))
+                   (identical? Object (.getReturnType ^java.lang.reflect.Method invocation-method))
+                   (java.lang.reflect.Modifier/isStatic (.getModifiers ^java.lang.reflect.Method compute-method))
+                   (= "compute_static" (.getName ^java.lang.reflect.Method compute-method))
+                   (vector? parameter-carriers)
+                   (= parameter-carriers compute-parameter-carriers
+                      (vec (.getParameterTypes ^java.lang.reflect.Method invocation-method))
+                      (vec (.getParameterTypes ^java.lang.reflect.Method compute-method)))
+                   (= (count (:params emission)) (count parameter-carriers))
+                   (every? true? (map (fn [parameter carrier]
+                                       (= (class-type->stack carrier)
+                                          (get-in context [:locals parameter :type])))
+                                     (:params emission) parameter-carriers))
+                   (completion/bytecode-operand-context? (:result-context context)))
+          (me/assert-emission-inputs-current! emission)
+          (assoc bridge :body-context context))))))
 
 (defn ^:no-doc retained-typed-return-bridge
   "Observe an actual unguarded primitive-static-return → Object invk boxing edge.
@@ -930,43 +967,31 @@
    reference conversion. Consumers additionally own the selected receiver and
    all original argument completions and definition guards."
   [emission]
-  (let [implementation (:implementation emission)
-        candidates (filterv #(and (identical? implementation (:implementation %))
-                                  (identical? (:body emission) (:body %)))
-                            (:typed-return-bridges emission))
-        context (retained-body-context emission)]
-    (when (and implementation context (= 1 (count candidates)))
-      (let [{:keys [kind payload-carrier result-carrier interface invocation-method
-                    compute-method parameter-carriers compute-parameter-carriers] :as bridge}
-            (first candidates)]
-        (when (and (= :boxed-primitive-static-return kind)
-                   (contains? #{Double/TYPE Float/TYPE Long/TYPE} payload-carrier)
-                   (identical? Object result-carrier)
-                   (class? interface) (.isInterface ^Class interface)
-                   (.isInstance ^Class interface implementation)
-                   (instance? java.lang.reflect.Method invocation-method)
-                   (instance? java.lang.reflect.Method compute-method)
-                   (= "invk" (.getName ^java.lang.reflect.Method invocation-method))
-                   (identical? interface (.getDeclaringClass ^java.lang.reflect.Method invocation-method))
-                   (identical? Object (.getReturnType ^java.lang.reflect.Method invocation-method))
-                   (identical? payload-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
-                   (java.lang.reflect.Modifier/isStatic (.getModifiers ^java.lang.reflect.Method compute-method))
-                   (= "compute_static" (.getName ^java.lang.reflect.Method compute-method))
-                   (vector? parameter-carriers)
-                   (= parameter-carriers compute-parameter-carriers
-                      (vec (.getParameterTypes ^java.lang.reflect.Method invocation-method))
-                      (vec (.getParameterTypes ^java.lang.reflect.Method compute-method)))
-                   (every? #{Double/TYPE Float/TYPE Long/TYPE} parameter-carriers)
-                   (= (count (:params emission)) (count parameter-carriers))
-                   (every? true? (map (fn [parameter carrier]
-                                       (= (class-type->stack carrier)
-                                          (get-in context [:locals parameter :type])))
-                                     (:params emission) parameter-carriers))
-                   (= (class-type->stack payload-carrier)
-                      (:return-stack-type context) (:emitted-result-type context))
-                   (= (completion/bytecode-operand-context {}) (:result-context context)))
-          (me/assert-emission-inputs-current! emission)
-          (assoc bridge :body-context context))))))
+  (when-let [{:keys [kind payload-carrier compute-method parameter-carriers body-context] :as bridge}
+             (retained-return-bridge emission)]
+    (when (and (= :boxed-primitive-static-return kind)
+               (contains? #{Double/TYPE Float/TYPE Long/TYPE} payload-carrier)
+               (identical? payload-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
+               (every? #{Double/TYPE Float/TYPE Long/TYPE} parameter-carriers)
+               (= (class-type->stack payload-carrier)
+                  (:return-stack-type body-context) (:emitted-result-type body-context))
+               (= (completion/bytecode-operand-context {}) (:result-context body-context)))
+      bridge)))
+
+(defn ^:no-doc retained-reference-return-bridge
+  "Observe an actual unguarded reference-static-return → Object invk pass-through.
+   This preserves reference identity, not a primitive payload or non-nullness.
+   The consumer must replay the whole body under its saved result context AND
+   retain the static Method's actual return CHECKCAST when its Class is not Object.
+   No selected-call, argument completion, imported-body or placement proof follows."
+  [emission]
+  (when-let [{:keys [kind body-return-carrier compute-method body-context] :as bridge}
+             (retained-return-bridge emission)]
+    (when (and (= :reference-static-return kind)
+               (class? body-return-carrier) (not (.isPrimitive ^Class body-return-carrier))
+               (identical? body-return-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
+               (= :ref (:return-stack-type body-context) (:emitted-result-type body-context)))
+      bridge)))
 
 (defn- retain-call-observation!
   "Retain one actual emitter observation per original call occurrence.
@@ -6064,24 +6089,25 @@
         cls (.defineClass loader class-name bytes nil)
         _ (initialize-literals! cls @(:values literal-owner))
         methods (into {} (map (fn [ms]
-                               [(:name ms)
-                                (first (filter #(= (.getName %) (:method-name ms))
-                                               (.getMethods cls)))])
-                             method-specs))
+                              [(:name ms)
+                               (first (filter #(= (.getName %) (:method-name ms))
+                                              (.getMethods cls)))])
+                            method-specs))
         _ (when me/*emission-inputs*
             (doseq [spec fn-specs
                     :let [body (:walked-body spec)
-                          token (::body-occurrence (meta body))]
+                          token (::body-occurrence (meta body))
+                          method (get methods (:name spec))]
                     :when token]
               (swap! me/*emission-inputs* update-in [:body-contexts token]
                      (fn [record]
                        (if (and (= :known (:status record))
                                 (identical? body (:body record)))
-                         (assoc record :method (get methods (:name spec)))
+                         (assoc record :method method
+                                :return-descriptor (.descriptorString
+                                                    (.getReturnType ^java.lang.reflect.Method method)))
                          record)))))]
-    {:class cls
-     :bytes bytes
-     :methods methods})))
+    {:class cls :bytes bytes :methods methods})))
 
 ;; ================================================================
 ;; deftm bytecode compilation
@@ -6759,13 +6785,17 @@
                                                    (do (emit-load-and-cast code)
                                                        ;; Record this actual unguarded wrapper edge,
                                                        ;; not a logical return-tag interpretation.
-                                                       (when (and (= ret-cd obj-cd)
-                                                                  (contains? #{Double/TYPE Float/TYPE Long/TYPE}
-                                                                             (.getReturnType compute-method)))
-                                                         (reset! return-bridge
-                                                                 {:kind :boxed-primitive-static-return
-                                                                  :payload-carrier (.getReturnType compute-method)
-                                                                  :result-carrier Object}))
+                                                       (when (= ret-cd obj-cd)
+                                                         (let [carrier (.getReturnType compute-method)]
+                                                           (cond
+                                                             (contains? #{Double/TYPE Float/TYPE Long/TYPE} carrier)
+                                                             (reset! return-bridge
+                                                                     {:kind :boxed-primitive-static-return
+                                                                      :payload-carrier carrier :result-carrier Object})
+                                                             (not (.isPrimitive ^Class carrier))
+                                                             (reset! return-bridge
+                                                                     {:kind :reference-static-return
+                                                                      :body-return-carrier carrier :result-carrier Object}))))
                                                        (let [crd (.descriptorString ^ClassDesc compute-ret-cd)]
                                                          (cond
                                                            (= crd "D") (emit-box-to-ref code :double)
