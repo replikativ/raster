@@ -854,7 +854,13 @@
    coverage decline preserves the original source and remains visible beside any later TypedSOAC
    decline; certified contradictions are never converted into fallback."
   [source opts abstract-machine]
-  (let [;; A public array's backing capacity is independent of each traversal.
+  (let [;; Late buffer/representation rewrites can introduce whole sequential
+        ;; wrappers after expansion. Normalize those once at shared semantic
+        ;; admission, without moving work out of calls or vector operands.
+        source (if (device/gpu-target? (:target-device opts))
+                 (inline/flatten-nested-lets source)
+                 source)
+        ;; A public array's backing capacity is independent of each traversal.
         ;; Semantic owners must prove their logical access footprint separately.
         values (merge (when (device/gpu-target? (:target-device opts))
                         (into {} (map (fn [[parameter t]]
