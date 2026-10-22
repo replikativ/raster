@@ -44,6 +44,11 @@
                  (some parallel-source? (concat (map second pairs) (nnext expression))))
         prefix))))
 
+(defn- direct-invocation-root? [expression]
+  (when (seq? expression)
+    (let [{:keys [dispatch? lexical-callee]} (descriptor/call-description expression)]
+      (and dispatch? (not lexical-callee)))))
+
 (defn begin
   "Retain the exact authenticated frontend BEFORE source normalization.
    Parameters are the original declaration's ordered symbols. Unsupported roots
@@ -55,13 +60,39 @@
                (= parameters (get-in frontend [:source-entry :params]))
                (every? symbol? parameters) (= (count parameters) (count (set parameters))))
       (let [scope (first (:body frontend))
-            pairs (flat-prefix scope)]
+            ;; A direct call can expose a host prefix only after its selected
+            ;; body is imported. Retain its original occurrence now; an empty
+            ;; prefix is not correspondence to any subsequently inserted step.
+            pairs (or (flat-prefix scope)
+                      (when (direct-invocation-root? scope) []))]
         (when (and pairs
                    (= (count (concat parameters (map first pairs)))
                       (count (set (concat parameters (map first pairs))))))
           ;; Shadowed declarations need a richer occurrence relation, not a
           ;; symbol-map guess that conflates two binders of the same spelling.
           (PrefixInput. frontend parameters scope pairs))))))
+
+(defn prepare-prefix-entry!
+  "Explicitly prepare the original caller of a retained direct-call root.
+   This exposes original argument/completion observations before helper import.
+   It executes no argument or model code and grants no prefix correspondence.
+   Promotions escape to the producer's existing whole-attempt retry."
+  [input prepare!]
+  (when (instance? PrefixInput input)
+    (let [frontend (.-frontend ^PrefixInput input)
+          scope (.-scope ^PrefixInput input)]
+      (when (and (empty? (.-pairs ^PrefixInput input))
+                 (identical? scope (first (:body frontend)))
+                 (direct-invocation-root? scope)
+                 ;; Only the first-argument nested boundary is supported by
+                 ;; this producer family. Do not warm every scalar-call root
+                 ;; or search arbitrary later arguments for a matching helper.
+                 (direct-invocation-root? (first (descriptor/call-args scope))))
+        (let [caller (entry/assert-frontend-selection!
+                      frontend (get-in frontend [:source-entry :source-var]))]
+          (when-let [receiver (:receiver-var caller)]
+            (entry/prepare-owned-definition-inputs! prepare! [receiver])
+            true))))))
 
 (defn- direct-reduction-pairs [scope]
   (when (and (seq? scope) (contains? form/let-heads (first scope))

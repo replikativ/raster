@@ -742,6 +742,7 @@
                                            (:raster.core/deftm-params (meta resolved-var)))
          reduction-input (source-prefix/begin-reduction-interval
                           retained-frontend (:raster.core/deftm-params (meta resolved-var)))
+         _ (source-prefix/prepare-prefix-entry! prefix-input rcore/ensure-current-owned-bytecode!)
          _ (source-prefix/prepare-reduction-entry! reduction-input rcore/ensure-current-owned-bytecode!)
          normalized-input (when retained-frontend
                             (source-transport/normalize-frontend-bindings

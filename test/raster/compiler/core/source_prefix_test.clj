@@ -22,6 +22,10 @@
 
 (deftm literal-count [unused :- Long] :- Long 7)
 
+(deftm direct-scalar-root [n :- Long] :- Long (numeric/* n 2))
+(deftm first-argument-call-root [n :- Long] :- Long (numeric/* (numeric/+ n 1) 2))
+(deftm later-argument-call-root [n :- Long] :- Long (numeric/* 2 (numeric/+ n 1)))
+
 (deftm unused-checked-helper-input [rows :- Long chunks :- Long] :- (Array double)
   (let [size (literal-count (numeric/* rows chunks))
         out (double-array size)]
@@ -67,6 +71,32 @@
                                        result))]
           (equation/compile function {:target target :dtype :double} descriptor))]
     (assoc @observed :compilation compilation)))
+
+(deftest direct-root-preparation-is-bounded-and-never-executes-source
+  (doseq [[function candidate?] [[#'direct-scalar-root false]
+                                [#'first-argument-call-root true]
+                                [#'later-argument-call-root false]]]
+    (let [resolved (core/resolve-deftm-var function)]
+      (core/prepare-deftm-frontend! resolved)
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frontend (entry/original-source-frontend resolved)
+               input (prefix/begin frontend (get-in frontend [:source-entry :params]))
+               calls (atom [])
+               prepare! #(swap! calls conj %)]
+           (is (some? input) "retention alone is not preparation or correspondence")
+           (is (= (when candidate? true) (prefix/prepare-prefix-entry! input prepare!)))
+           (is (= (if candidate? [(get-in frontend [:definition :receiver-var])] []) @calls))
+           (reset! calls [])
+           (doseq [foreign [nil {}]]
+             (is (nil? (prefix/prepare-prefix-entry! foreign prepare!))))
+           (when candidate?
+             (with-redefs [entry/assert-frontend-selection!
+                           (fn [& _] (throw (ex-info "wrong original receiver" {:reason :test-selection})))]
+               (is (= :test-selection
+                      (try (prefix/prepare-prefix-entry! input prepare!) nil
+                           (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+           (is (empty? @calls) "failed selection/foreign input never reaches preparation")))))))
 
 (deftest source-phase-history-is-local-and-checked-before-prefix-verification
   (let [{:keys [inputs construction correspondence]} (capture #'selected-prefix)

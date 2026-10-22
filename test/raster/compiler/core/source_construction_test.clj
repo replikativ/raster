@@ -7,6 +7,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.source-prefix-test :as fixture]
             [raster.compiler.core.source-transport :as transport]
+            [raster.compiler.core.source-prefix :as prefix]
             [raster.compiler.core.util :as util]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.equation-first :as equation]
@@ -277,10 +278,14 @@
           (entry/assert-definition-inputs-current! inputs))))))
 
 (deftest unchanged-training-imports-obey-the-nested-substitution-law
-  (prepare-original-training-loss!)
+  ;; The public compiler must prepare the ORIGINAL direct-call root itself.
+  ;; No numerical call or test-only caller warmup may supply this evidence.
   (let [captured (atom nil) construct transport/with-source-construction-history
+        prepared (atom []) prepare! core/ensure-current-owned-bytecode!
         target :ocl:training-substitution-test]
-    (with-redefs [transport/with-source-construction-history
+    (with-redefs [core/ensure-current-owned-bytecode!
+                  (fn [receiver] (swap! prepared conj receiver) (prepare! receiver))
+                  transport/with-source-construction-history
                   (fn [normalization run]
                     (let [result (construct normalization run)]
                       (reset! captured (assoc result :normalization normalization))
@@ -294,6 +299,14 @@
        (let [events (:builder-expansions (phase-view @captured))
              selected (filterv #(contains? '#{raster.dl.nn/linear-nb raster.dl.loss/mse-loss}
                                            (descriptor/semantic-op (:caller %))) events)]
+         (let [frontend (entry/original-source-frontend (core/resolve-deftm-var #'training/local-loss))
+               input (prefix/begin frontend (get-in frontend [:source-entry :params]))]
+           (is (some? input))
+           (is (some #(identical? % (get-in frontend [:definition :receiver-var])) @prepared)
+               "original caller preparation is part of public compilation")
+           (with-redefs [core/ensure-current-owned-bytecode!
+                         (fn [_] (throw (AssertionError. "source query attempted preparation")))]
+             (is (some? (prefix/begin frontend (get-in frontend [:source-entry :params]))))))
          (is (= '#{raster.dl.nn/linear-nb raster.dl.loss/mse-loss}
                 (set (map #(descriptor/semantic-op (:caller %)) selected))))
          (doseq [event selected]

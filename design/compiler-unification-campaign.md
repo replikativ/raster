@@ -430,6 +430,46 @@ it must not waive those obligations based on this native test receipt. The full 
 softmax/source-completion CI failure and unchanged resident training acceptance remain
 open; no merge or whole-campaign completion is established.
 
+### October 22 unchanged-training boundary preparation
+
+The unchanged public `local-loss` source compiles to portable numerical intent,
+but host-result execution still refuses before acquiring device storage:
+`:unclosed-ordered-source-executor`, first ScalarCompute, the imported allocation
+extent `rows * 1`. Ordinary resident `lower` separately and correctly requires
+the explicit host-result API for this scalar-returning function.
+
+The original body is a direct call, not a flat let prefix. `begin` now retains
+that exact root without claiming any inserted prefix correspondence. The public
+producer explicitly prepares its original caller before normalization when the
+first argument is itself a direct selected call. This uses the existing observed
+definition batch and whole-attempt retry; it executes no model code. Direct scalar
+roots and nested calls in later arguments cause no new preparation. The training
+construction regression no longer supplies a test-only caller warmup. Public
+compilation now supplies the original linear, allocator and MSE call frames.
+
+Affected namespace qualification passes 33 tests / 392 assertions in the capped
+REPL. An earlier run also exposed a cold numerical helper promotion invalidating
+the historical owner in `completed-training-helper-retains-the-whole-cpu-loss`
+(`oftype_m_floats_float-impl`); the subsequent warm run passes. This is not a
+fresh-process qualification or a reason to weaken lifecycle guards.
+
+A REPL experiment composes the actual five original linear argument regions,
+then both original allocator argument regions. It preserves the original array
+identity, actual primitive Long completion and checked multiplication overflow.
+This is not resident admission: original-to-final placement, selected-call
+completion and the allocated result's resident logical view remain unclosed.
+
+Review caught an important distinction: the actual global typed call emits
+arguments followed by `invokedynamic`, not a receiver read followed by arguments.
+The recorded `:receiver-input` is observational, not evidence that a receiver load
+executed. Do not add a synthetic receiver evaluation. Continue the bounded prefix
+closure through actual invocation-mode/linkage evidence and the existing prepared
+argument executors; do not introduce a second scalar interpreter or registry.
+
+All eight campaign completion obligations remain open. The broad draft stays held;
+the exact `63fd5efd` setup/build checks pass while source fixtures and OpenCL fail,
+and the test gate was still pending at the latest inspection.
+
 ### October 22 completed source-step correspondence checkpoint
 
 `project-typed-reduce` now exposes the existing semantic reduction description
