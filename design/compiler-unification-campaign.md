@@ -323,8 +323,10 @@ this is not a fresh-process or whole-draft result. Campaign synchronization of
 the squash preserves the independently qualified integration source unchanged.
 
 The next construction change must replace retrospective argument matching with
-completed slots at the shared inline builder. Its acceptance boundary is the
-whole selected call interval, not only a successfully evaluated allocation count:
+completed slots at the original-source producer boundaries. The shared inline
+builder consumes that construction; it cannot query a source-phase certificate
+that does not exist until after it returns. Its acceptance boundary is the whole
+selected call interval, not only a successfully evaluated allocation count:
 
 1. Authenticate the actual selected receiver, Method and each original operand
    context. Logical scalar tags do not determine the physical completion recipe.
@@ -378,6 +380,46 @@ the actual Method-return CHECKCAST when non-Object, and preserve wrapper referen
 identity. Extend the existing emitted return-bridge producer for that edge;
 do not reinterpret its primitive payload proof or add a caller-editable authority.
 Primitive boxed helpers retain their calls until their distinct recipe closes.
+
+### October 21 reference-return production and constructor insertion point
+
+PR #1562 landed as `4e15484d` after all seven exact-head CI gates succeeded.
+The existing wrapper producer records an actual unguarded reference-static-return
+edge, separate from primitive boxing. Shared validation now ties the saved whole
+body to its actual generated Method and return descriptor; a same-ABI foreign
+Method cannot supply a return CHECKCAST Class. The primitive observer retains its
+previous restrictions. Main-based qualification passed 110 tests / 1,396 assertions.
+
+The campaign consumer uses the existing authenticated frontend/module-history
+observation boundary, not an editable return map. Cold queries do not compile;
+promotion requires a fresh owner, and the old cold history becomes stale. Missing,
+copied or foreign modules publish no observations. A real training compilation
+qualifies `[F` reference bridges for `linear-nb` and its nested `alloc-like`, while
+MSE correctly does not acquire one. These observations still do not close return
+substitution or final placement. Twelve integrated namespaces pass 158 tests /
+1,995 assertions, zero failures/errors; this is not whole-draft CI acceptance.
+
+Implementation review refined the next insertion point to the two existing owned
+source producers: `normalize-frontend-bindings` for the root and
+`prepare-inline-body` before callee hygiene/qualification. They have authentic
+frontends and exact original call occurrences, unlike the later shared builder.
+One shared constructor must authenticate selection, receiver, all original input
+contexts, imported callee and reference return bridge; emit every ordered completed
+slot; substitute only those values; and wrap the whole body in its saved result
+context plus actual Method-return CHECKCAST. Existing hygiene, qualification and
+sequential flattening then operate on this construction. Keep the frozen frontend
+identity unchanged. Do not manufacture a partial `SourceConstruction`, grow a
+retrospective resolver graph or interpret call frames at runtime.
+
+Initially support stable global typed receivers and the represented reference
+return recipe. Lexical/guarded receivers and unsupported primitive returns retain
+their original calls; later inlining must not erase their still-unclosed boundaries.
+Unavailable/cold evidence also retains the original call without silently warming
+JIT state. Explicit preparation and whole-owner retry remain producer lifecycle
+steps. Native TypedSOAC intrinsics keep their direct semantic contracts and do not
+acquire a blanket JVM compilation prerequisite. Acceptance must close one entire
+reference-returning helper interval, including unused inputs and delegation, not
+only execute its product/count operand.
 
 ### October 21 typed reduction identity and rewalk qualification
 
