@@ -361,6 +361,61 @@
       (is (entry/assert-definition-inputs-current! @parent)))
     (is (nil? (binding [entry/*emission-inputs* nil] (entry/frontend-return-bridge frontend))))))
 
+(deftest reference-return-observations-retain-only-the-authenticated-whole-module
+  (let [scope (create-ns (gensym "raster.reference-return-owner."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        ;; A primitive dimension selects the typed-wrapper path under test;
+        ;; a reference-only identity may use the ordinary IFn implementation.
+        (eval '(raster.core/deftm reference [xs :- (Array float) count :- Long] :- (Array float) xs)))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'reference) {:dtype :float})
+            _ (core/prepare-deftm-frontend! source)
+            implementation (receiver source)
+            before-implementation (var-get implementation)
+            cold (entry/original-source-frontend source)]
+        (is (some? cold))
+        (entry/assert-frontend-source! cold source)
+        (is (nil? (:emission cold)))
+        (with-redefs [core/ensure-bytecode-implementation!
+                      (fn [& _] (throw (AssertionError. "reference return query forced JIT")))]
+          (is (nil? (entry/frontend-reference-return-bridge cold))))
+        (is (identical? before-implementation (var-get implementation)))
+        (is (nil? (:raster.core/bytecode-emission (meta implementation))))
+        ;; Promotion replaces the implementation. A producer that observed its
+        ;; cold root must retry under a fresh owner, not refresh that history.
+        (let [cold-history @entry/*emission-inputs*
+              frontend (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+                         (captured source))
+              parent (atom {:static [] :values []}) before @parent
+              metadata (meta source)]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (entry/assert-definition-inputs-current! cold-history)))
+          (binding [entry/*emission-inputs* parent]
+            (doseq [changed [(assoc frontend :emission (into {} (:emission frontend)))
+                             (assoc-in frontend [:emission :implementation] (Object.))
+                             (assoc-in frontend [:emission :typed-return-bridges] [])]]
+              (is (nil? (entry/frontend-reference-return-bridge changed)))
+              (is (identical? before @parent)))
+            (let [bridge (entry/frontend-reference-return-bridge frontend)]
+              (is (= :reference-static-return (:kind bridge)))
+              (is (= "[F" (.getName ^Class (:body-return-carrier bridge))))
+              (is (identical? (:implementation frontend) (:implementation bridge)))
+              (is (not-any? #(contains? bridge %) [:non-null? :payload-carrier :executor])))
+            (is (= 1 (count (:producer-inputs @parent))))
+            (is (entry/assert-definition-inputs-current! @parent))
+            (try
+              (alter-meta! source assoc :raster.core/source-policy {:unchecked-math true})
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (entry/frontend-reference-return-bridge frontend)))
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (entry/assert-definition-inputs-current! @parent)))
+              (finally (reset-meta! source metadata)))
+            (is (entry/assert-definition-inputs-current! @parent)))
+          (is (nil? (binding [entry/*emission-inputs* nil]
+                      (entry/frontend-reference-return-bridge frontend))))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest refused-physical-observations-retain-no-speculative-inputs
   (let [frontend (captured #'source-binding)
         scope (first (:body frontend)) original (nth (second scope) 1)

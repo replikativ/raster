@@ -925,6 +925,15 @@
   (frontend-emission-observation
    frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge) %)))
 
+(defn frontend-reference-return-bridge
+  "Observe the exact owned implementation's reference→Object pass-through.
+   Preserve its whole body context and actual Method-return CHECKCAST. This grants
+   neither non-nullness nor source expansion/placement. Queries never compile;
+   successful observations retain the complete original module history."
+  [frontend]
+  (frontend-emission-observation
+   frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-reference-return-bridge) %)))
+
 (defn frontend-reduction-emission
   "Observe an unchanged frozen frontend reduction through its actual emitter.
    Cold/legacy entries and transformed inputs abstain without emission or source
