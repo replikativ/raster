@@ -152,9 +152,9 @@
         forbidden (fn [& _] (throw (AssertionError. "owned source fell back to typed interpretation")))]
     (with-redefs [scalar/evaluate-invocation-step forbidden scalar/evaluate-host-equation forbidden
                   owner/evaluate-ordered-invocation-step
-                  (fn [c step values]
+                  (fn [c step values & public-arguments]
                     (swap! calls conj (:id step))
-                    (original c step values))]
+                    (apply original c step values public-arguments))]
       (is (map? (equation-first/lower compilation [1])))
       (is (= 2 (count @calls)))
       (is (= 2 (count (distinct @calls)))))))

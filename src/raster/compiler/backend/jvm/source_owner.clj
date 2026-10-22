@@ -310,6 +310,99 @@
            (when (and projection (= expected actual) (.isPrimitive ^Class actual))
              (compile-scalar-projection step expression ports projection source-ns policy collector))))))))
 
+(defn- prepare-nested-invocation-input-step
+  [step facts frontend program prefix-correspondence body-entry]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [kind parent child boundaries expression]}
+                (source-prefix/original-step prefix-correspondence frontend program step)]
+       (when (= :nested-invocation-input kind)
+         (let [public (:parameters body-entry)
+               public-carriers (mapv #(get-in body-entry [:parameter-facts % :carrier]) public)
+               public-indices (zipmap public (range))
+               formals (mapv :formal (:argument-slots parent))
+               formal-indices (zipmap formals (range))
+               regions
+               (fn [frame]
+                 (let [invocation (:original-invocation frame)]
+                   (mapv #(entry/prepare-frontend-invocation-input!
+                           (get-in invocation [:caller-origin :frontend])
+                           (:original-call invocation) %)
+                         (range (count (:argument-slots frame))))))
+               parent-regions (regions parent)
+               child-regions (regions child)
+               positions (fn [indices region]
+                           (when region
+                             (let [result (mapv indices (:parameters region))]
+                               (when (every? some? result) result))))
+               parent-positions (mapv #(positions public-indices %) parent-regions)
+               child-positions (mapv #(positions formal-indices %) child-regions)
+               completed-carriers (mapv #(get-in % [:input-completion :parameter-carrier]) parent-regions)
+               carrier-match? (fn [region indices carriers]
+                                (and region indices (instance? Method (:method region))
+                                     (= (mapv carriers indices)
+                                        (vec (.getParameterTypes ^Method (:method region))))))
+               ports (scalar-ports step facts)
+               operand-positions (mapv #(get public-indices (:symbol %)) ports)
+               ;; Capture AFTER preparing every region. Runtime checks this
+               ;; immutable history, never a mutable compile-time collector.
+               boundary-observations @entry/*emission-inputs*
+               boundary-current!
+               (fn []
+                 (entry/assert-definition-inputs-current! boundary-observations)
+                 (doseq [{:keys [receiver implementation]} boundaries]
+                   (when-not (and (.hasRoot ^clojure.lang.Var receiver)
+                                  (not (.isDynamic ^clojure.lang.Var receiver))
+                                  (nil? (.getThreadBinding ^clojure.lang.Var receiver))
+                                  (identical? implementation (.getRawRoot ^clojure.lang.Var receiver)))
+                     (throw (ex-info "original global call target changed at its argument boundary"
+                                     {:reason :stale-ordered-dispatch-target})))))]
+           (when (and (= public (get-in frontend [:source-entry :params]))
+                      (every? class? public-carriers)
+                      (= (count formals) (count (set formals)) (count parent-regions))
+                      (seq parent-regions) (= 2 (count child-regions))
+                      (every? some? (concat parent-regions child-regions parent-positions child-positions ports operand-positions))
+                      (every? true? (map #(carrier-match? %1 %2 public-carriers) parent-regions parent-positions))
+                      (every? true? (map #(carrier-match? %1 %2 completed-carriers) child-regions child-positions))
+                      (every? #(= Long/TYPE (:carrier %)) ports)
+                      (= :long (dtype/canon (get-in step [:value :dtype])))
+                      (= Long/TYPE (get-in (last child-regions) [:input-completion :parameter-carrier])))
+             (boundary-current!)
+             {:step step :expression expression :ports ports :public-parameters public
+              :result-facts {:carrier Long/TYPE :boxed-carrier Long :non-null? true}
+              :execute
+              (fn [operand-values arguments]
+                (when-not (and (vector? arguments) (= (count public) (count arguments))
+                               (every? true? (map (fn [^Class carrier value]
+                                                   (if (.isPrimitive carrier)
+                                                     (identical? (get types/primitive-info
+                                                                      (symbol (.getName carrier)))
+                                                                 (class value))
+                                                     (.isInstance carrier value)))
+                                                 public-carriers arguments))
+                               (every? true? (map (fn [parameter value]
+                                                   (if-let [required (get-in body-entry [:parameter-facts parameter
+                                                                                        :required-array-class])]
+                                                     (identical? required (class value)) true)) public arguments))
+                               (every? true? (map (fn [index value]
+                                                   (= value (nth arguments index)))
+                                                 operand-positions operand-values)))
+                  (throw (ex-info "nested source arguments differ from the original public invocation"
+                                  {:reason :ordered-nested-source-arguments})))
+                (boundary-current!)
+                ;; Actual original argument regions execute left-to-right, even
+                ;; when the extent does not use their values. No receiver operand
+                ;; is evaluated for global typed invokedynamic calls.
+                (let [completed (mapv (fn [region indices]
+                                        (apply (:invoke region) (mapv arguments indices)))
+                                      parent-regions parent-positions)]
+                  (boundary-current!)
+                  (let [inputs (mapv (fn [region indices]
+                                       (apply (:invoke region) (mapv completed indices)))
+                                     child-regions child-positions)]
+                    (boundary-current!)
+                    (last inputs))))})))))))
+
 (defn- prepare-original-invocation-step
   [step facts source-ns policy collector frontend program prefix-correspondence]
   (entry/call-with-optional-definition-inputs
@@ -390,6 +483,8 @@
           (cond
             (invocation/scalar-compute? step)
             (if-let [prepared (or (prepare-primitive-scalar-step step facts source-ns policy collector)
+                                 (prepare-nested-invocation-input-step step facts frontend program
+                                                                       prefix-correspondence entry)
                                  (prepare-original-invocation-step step facts source-ns policy collector
                                                                    frontend program prefix-correspondence))]
               (-> state
@@ -642,7 +737,9 @@
 (defn evaluate-ordered-invocation-step
   "Execute one prepared original source occurrence without typed-region coercions.
    No lookup, compilation, nominal redispatch or expression retry occurs at invocation."
-  [{:keys [ordered-source-owner semantic emitted]} step operand-values]
+  ([compilation step operand-values]
+   (evaluate-ordered-invocation-step compilation step operand-values nil))
+  ([{:keys [ordered-source-owner semantic emitted]} step operand-values public-arguments]
   (let [^OrderedSourceOwner owner (assert-ordered-source! ordered-source-owner semantic emitted)
         prepared (get-in (.-scalar-source owner) [:steps (:id step)])]
     (when-not (and prepared (identical? step (:step prepared)))
@@ -658,13 +755,15 @@
                       (throw (ex-info "source operand differs from its actual body-entry carrier"
                                       {:reason :ordered-scalar-source-arguments :symbol symbol})))
                     value)) (:ports prepared))
-          result (try ((:execute prepared) arguments)
+          result (try (if (:public-parameters prepared)
+                        ((:execute prepared) arguments public-arguments)
+                        ((:execute prepared) arguments))
                       (finally (assert-ordered-source! owner semantic emitted)))
           expected (get-in prepared [:result-facts :boxed-carrier])]
       (when-not (identical? expected (class result))
         (throw (ex-info "source result differs from its prepared physical carrier"
                         {:reason :ordered-scalar-source-result :step (:id step)})))
-      {:type (dtype/canon (get-in step [:value :dtype])) :value result})))
+      {:type (dtype/canon (get-in step [:value :dtype])) :value result}))))
 
 (defn assert-ordered-executor-coverage!
   "Preflight the entire validated source order before capture, retirement or source effects.
@@ -681,6 +780,7 @@
         steps (into {} (map (juxt :id identity)) (:steps plan))
         equations (into {} (map (juxt :id identity)) (:equations semantic))
         scalar-source (when ordered-source-owner (.-scalar-source ^OrderedSourceOwner ordered-source-owner))
+        nested-public-arguments? (some :public-parameters (vals (:steps scalar-source)))
         refuse! (fn [source-entry context]
                   (let [step (get steps (:invocation-step source-entry))
                         original (source-prefix/original-step
@@ -704,7 +804,10 @@
                                            (or (:entry-ports scalar-source)
                                                (repeat (count (:parameters plan)) nil)))
             :when (seq source-actions)]
-      (when-let [array-class (:required-array-class port)]
+      (when-let [array-class (or (:required-array-class port)
+                                (when (and nested-public-arguments?
+                                           (some-> ^Class (:carrier port) .isArray))
+                                  (:carrier port)))]
         (when-not (identical? array-class (class argument))
           (refuse! nil {:public-array-parameter (:symbol parameter)})))
       (when (empty? (get-in parameter [:value :shape]))

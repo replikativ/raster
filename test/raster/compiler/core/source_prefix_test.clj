@@ -53,7 +53,9 @@
 (defn- reclose [& arguments]
   (entry/call-with-definition-inputs #(apply prefix/close arguments)))
 
-(defn- capture [function]
+(defn- capture
+  ([function] (capture function {:dtype :double}))
+  ([function options]
   (let [observed (atom {})
         begin prefix/begin close prefix/close
         target :ocl:source-prefix-proof
@@ -69,8 +71,8 @@
                                               :construction (nth arguments 5 nil)
                                               :correspondence result)
                                        result))]
-          (equation/compile function {:target target :dtype :double} descriptor))]
-    (assoc @observed :compilation compilation)))
+          (equation/compile function (assoc options :target target) descriptor))]
+    (assoc @observed :compilation compilation))))
 
 (deftest direct-root-preparation-is-bounded-and-never-executes-source
   (doseq [[function candidate?] [[#'direct-scalar-root false]

@@ -430,6 +430,56 @@ it must not waive those obligations based on this native test receipt. The full 
 softmax/source-completion CI failure and unchanged resident training acceptance remain
 open; no merge or whole-campaign completion is established.
 
+### October 22 executable unchanged training loss
+
+The unchanged `distributed-training/local-loss` now executes through the public
+explicit host-result API on OpenCL and Level Zero. Two nonzero batch shapes match
+both the ordinary JVM function and an independent dense scalar oracle. Replaying
+each executable after changing weights and observations returns the changed loss.
+The test observes actual device graph execution; it is not a CPU fallback receipt.
+This qualifies the forward loss only, not a resident gradient/update, GSDM, Gemma,
+SFT, or broad model performance.
+
+The repair connects the original root call's exact argument-0 occurrence to its
+selected nested call and first allocator initializer. Existing checked construction
+frames relate the allocator's sole lifted argument to final scalar position 0 and
+its immediately adjacent allocation at position 1. Result materialization, shape
+and initialization are independently validated against the invocation plan. No
+model names, generated-name searches, second interpreter, or proof registry are
+used in production. Only exact candidate occurrences receive ancestry traversal.
+
+The existing ordered owner prepares original argument regions positionally: all
+parent arguments, including unused ones, complete left-to-right before allocator
+arguments. Actual method carriers are checked across both compositions. Global
+typed calls link after arguments; no synthetic receiver read is inserted and the
+outer loss dispatch boundary is not crossed early. Frozen history is checked at
+the nested boundaries. A fresh query owner reacquires dispatch/return evidence;
+execution never rereads a mutable compilation collector.
+
+Adversarial checks cover changed/reordered prefixes, duplicate occurrences, wrong
+root input edges, slot order/ancestry, altered return bridges, stale selections,
+wrong public carriers, and collector mutation after preparation. Null/wrong arrays
+and scalar carriers refuse before session acquisition for this admitted family.
+Short input buffers refuse before a numerical device launch and poison replay.
+Negative and `2^31` counts preserve `NegativeArraySizeException`; a source `2^32`
+count wrapping to zero refuses the incompatible native extent without acquiring
+GPU storage. General JVM exception equivalence for arbitrary array code remains
+outside this bounded qualification.
+
+Independent review accepted the bounded integration after immutable-history and
+fresh-owner fixes. The affected regression group passes 110 tests / 1,195 assertions;
+the device test passes 22 assertions across OpenCL and Level Zero. These receipts
+are not a full suite or performance benchmark. PR #1539 remains draft while broad
+source/OpenCL gates fail.
+
+The next unchanged `local-gradient-sum` probe first exposed cold definition-input
+invalidation. A later diagnostic reaches a stable coverage refusal: two uncertified
+host scalars, the forward loss quotient (`clojure.core//`) and MSE gradient scale
+(`raster.numeric//`). Retain the cold lifecycle failure as a separate qualification
+obligation; do not call warmed compilation a fix. Continue through these actual
+scalar completion boundaries with retained physical evidence, not exemptions by
+operation name. Gradient/update/replay and all eight completion gates remain open.
+
 ### October 22 unchanged-training boundary preparation
 
 The unchanged public `local-loss` source compiles to portable numerical intent,

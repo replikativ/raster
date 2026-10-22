@@ -1590,7 +1590,9 @@
                                                                             caller-options))
                   (or (:invocation-step entry) equation)
                   (invocation-link/advance-host-source
-                   state (partial source-owner/evaluate-ordered-invocation-step compilation)
+                   state (fn [step operands]
+                           (source-owner/evaluate-ordered-invocation-step
+                            compilation step operands (vec arguments)))
                    nil caller-options)
                   :else (update state :source-cursor inc))]
             (assert-ordered-source! compilation)

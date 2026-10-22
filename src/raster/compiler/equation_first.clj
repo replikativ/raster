@@ -865,7 +865,9 @@
                  "source-free compilation cannot evaluate a host invocation step or equation"
                  {:function (:function compilation)}))
         evaluate-step (cond
-                        owned-prefix (partial source-owner/evaluate-ordered-invocation-step compilation)
+                        owned-prefix (fn [step operands]
+                                       (source-owner/evaluate-ordered-invocation-step
+                                        compilation step operands (vec arguments)))
                         source-ns (partial scalar/evaluate-invocation-step source-ns)
                         :else unsupported-host-evaluation)
         materialized

@@ -499,6 +499,146 @@
                         (same-expression? expected final-expression {} declarations)))
                  [expression materialized])))))
 
+(defn- reference-indy-boundary [frame]
+  ;; :receiver-input is synthetic for this mode. The emitter evaluates all
+  ;; arguments and then links the selected target; it never loads a receiver.
+  ;; Existing definition observations use effective Var values. Restricting
+  ;; dynamic bindings ensures those observations also describe the raw root
+  ;; used by indy; this is admission, not an extra source receiver operation.
+  (let [original (:original-invocation frame)
+        call (:call-context original)
+        selected (:selected-callee original)
+        frontend (get-in original [:builder :callee-import :frontend])
+        implementation (:implementation frontend)
+        receiver (get-in selected [:definition :receiver-var])
+        symbol (:receiver call)
+        bridge (when frontend (entry/frontend-reference-return-bridge frontend))]
+    (when (and bridge (= :global-typed-indy (:invocation-mode call))
+               (var? receiver) (not (.isDynamic ^clojure.lang.Var receiver))
+               (nil? (.getThreadBinding ^clojure.lang.Var receiver))
+               (symbol? symbol) (namespace symbol)
+               (identical? receiver (some-> (find-ns (clojure.core/symbol (namespace symbol)))
+                                           (.findInternedVar (clojure.core/symbol (name symbol)))))
+               (.hasRoot ^clojure.lang.Var receiver)
+               (identical? implementation (.getRawRoot ^clojure.lang.Var receiver))
+               (identical? implementation (get-in selected [:definition :entry :typed-impl]))
+               (identical? implementation (:implementation bridge))
+               (= symbol (get-in call [:receiver-input :operand]))
+               (empty? (get-in call [:receiver-input :ports]))
+               (= (:method call) (:invocation-method selected) (:invocation-method bridge))
+               (= Object (:return-carrier call) (:result-carrier selected) (:result-carrier bridge))
+               (= (:parameter-carriers selected) (:parameter-carriers bridge)
+                  (mapv :parameter-carrier (:input-completions call))))
+      {:receiver receiver :implementation implementation :bridge bridge :frame frame})))
+
+(defn- close-nested-prefix
+  "Close only an original first-argument call's first allocator initializer.
+   Match actual construction frames, then verify their positional prefix and
+   adjacent allocation against the final plan. This is not execution admission."
+  [^PrefixInput input normalization normalized represented program construction]
+  (let [frontend (.-frontend input)
+        parameters (.-parameters input)
+        scope (.-scope input)
+        origin (transport/normalization-occurrence normalization normalized)
+        view (transport/source-construction-view construction normalization represented)
+        events (:builder-expansions view)
+        frame (fn [predicate]
+                ;; Select occurrences before traversing their selected ancestry.
+                ;; Computing a recursive frame for every event makes a large
+                ;; construction pay the full ancestry search repeatedly.
+                (let [found (filterv predicate events)]
+                  (when (= 1 (count found))
+                    ((requiring-resolve 'raster.compiler.passes.scalar.inline/nested-original-call-frame)
+                     construction (:expansion (first found))))))
+        original-event? (fn [original event]
+                          (let [occurrence (transport/construction-occurrence construction (:caller event))]
+                            (and (identical? original (:original occurrence))
+                                 (identical? frontend (:frontend occurrence)))))
+        root (frame #(original-event? scope %))
+        edge (when root (entry/frontend-invocation-input-source frontend scope 0))
+        parent (when edge (frame #(original-event? (:source-input edge) %)))
+        imported (get-in parent [:original-invocation :builder :callee-import :frontend])
+        body (when (= 1 (count (:body imported))) (first (:body imported)))
+        first-initializer (when (and (seq? body) (contains? form/let-heads (first body))
+                                     (vector? (second body)) (even? (count (second body))))
+                            (nth (second body) 1 nil))
+        parent-expansion (get-in parent [:original-invocation :builder :expansion])
+        child (when (seq? first-initializer)
+                (frame (fn [event]
+                         (let [derived ((requiring-resolve 'raster.compiler.passes.scalar.inline/nested-substitution-call-origin)
+                                        construction parent-expansion (:caller event))]
+                           (and (identical? first-initializer (get-in derived [:origin :original]))
+                                (identical? imported (get-in derived [:origin :frontend])))))))
+        parent-boundary (when parent (reference-indy-boundary parent))
+        child-boundary (when child (reference-indy-boundary child))
+        declarations (zipmap parameters (get-in frontend [:source-entry :tags]))
+        original-arguments (get-in parent [:original-invocation :source-arguments])
+        parent-slots (:argument-slots parent)
+        child-slots (:argument-slots child)
+        bindings (get-in child [:substitution :argument-bindings])
+        represented-pairs (flat-prefix represented)
+        final-pairs (flat-prefix (:source program))
+        ;; The allocator's single nontrivial argument is evaluated and bound
+        ;; before its actual body. Its generated name is related positionally.
+        renaming (when (= 1 (count bindings))
+                   (prefix-renaming bindings (vec (take 1 represented-pairs)) parameters declarations))
+        plan (get-in program [:attributes :invocation-plan])]
+    (when (and (empty? (.-pairs input)) root edge parent-boundary child-boundary
+               (identical? scope (get-in root [:original-invocation :original-call]))
+               (identical? frontend (get-in root [:original-invocation :caller-origin :frontend]))
+               (identical? (:operand edge) (get-in root [:original-invocation :call-context :inputs 0 :operand]))
+               (identical? (:source-input edge) (get-in parent [:original-invocation :original-call]))
+               (identical? frontend (get-in parent [:original-invocation :caller-origin :frontend]))
+               (identical? first-initializer (get-in child [:original-invocation :original-call]))
+               (identical? imported (get-in child [:original-invocation :caller-origin :frontend]))
+               (identical? parent-expansion (get-in child [:parent-frame :original-invocation :builder :expansion]))
+               (identical? frontend (:frontend origin)) (identical? scope (:original origin))
+               (empty? (get-in parent [:substitution :argument-bindings]))
+               (= (count original-arguments) (count parent-slots))
+               (every? true? (map (fn [argument slot]
+                                   (and (or (instance? Long argument)
+                                            (and (symbol? argument) (contains? declarations argument)))
+                                        (same-expression? argument (:argument slot) {} declarations)))
+                                 original-arguments parent-slots))
+               (= 2 (count child-slots)) (= 1 (count bindings))
+               (= (:binder (nth child-slots 1)) (ffirst bindings))
+               (identical? (:argument (nth child-slots 1)) (second (first bindings)))
+               (nil? (:binder (first child-slots))) renaming
+               (>= (count represented-pairs) 2) (>= (count final-pairs) 2)
+               (nil? (get-in plan [:attributes :parameter-projection]))
+               (= parameters (mapv :symbol (:parameters plan))))
+      (invocation/validate-against! plan program)
+      (let [order (invocation/source-order plan program)
+            steps (into {} (map (juxt :id identity)) (:steps plan))
+            [scalar-position allocation-position] order
+            scalar (get steps (:invocation-step scalar-position))
+            allocation (get steps (:invocation-step allocation-position))
+            [represented-id expression] (first represented-pairs)
+            [final-id final-expression] (first final-pairs)
+            [allocation-id allocation-expression] (second final-pairs)
+            expected-allocation (get-in child [:substitution :body])
+            values (into (:values program)
+                         (keep #(when (and (:symbol %) (:value %)) [(:symbol %) (:value %)]))
+                         (concat (:parameters plan) (:steps plan)))]
+        (when (and (invocation/scalar-compute? scalar) (invocation/buffer-allocation? allocation)
+                   (= 0 (:position scalar-position)) (= 1 (:position allocation-position))
+                   (= represented-id final-id (:symbol scalar) (:binding scalar-position))
+                   (= allocation-id (:symbol allocation) (:binding allocation-position) (:storage allocation-position))
+                   (= :long (dtype/canon (get-in scalar [:value :dtype])))
+                   (scalar-source-corresponds? expression final-expression scalar nil declarations)
+                   (same-expression? expected-allocation (second (second represented-pairs)) renaming declarations)
+                   (= (first (second represented-pairs)) allocation-id)
+                   (same-expression? (second (second represented-pairs)) allocation-expression {} declarations)
+                   (source/allocation-corresponds? allocation-expression (:value allocation)
+                                                  (:initialization allocation) values))
+          (PrefixCorrespondence.
+           input program
+           [{:kind :nested-invocation-input :ordinal 0 :scope scope
+             :binding represented-id :expression expression :step scalar :result-expression final-expression
+             :construction construction :normalization normalization :represented represented
+             :parent parent :child child :boundaries [parent-boundary child-boundary]
+             :allocation allocation}]))))))
+
 (defn close
   "Verify the complete bounded transformation at the equation-first producer.
    Intermediate forms are checked in their actual phase order. The exact final
@@ -512,7 +652,9 @@
    ;; observations alone must not bypass its complete prefix/metadata/order checks.
    (when (or (nil? construction)
              (transport/source-construction-view construction normalization represented))
-     (close input normalization normalized represented program)))
+     (if (and (instance? PrefixInput input) (empty? (.-pairs ^PrefixInput input)) construction)
+       (close-nested-prefix input normalization normalized represented program construction)
+       (close input normalization normalized represented program))))
   ([input normalization normalized represented program]
   (when (and (instance? PrefixInput input)
              (flat-prefix (:source program))
@@ -570,7 +712,34 @@
       (when (identical? frontend (.-frontend input))
         (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
         (entry/observe-frontend-source-identity! frontend)
-        (.-entries ^PrefixCorrespondence correspondence)))))
+        (let [entries (.-entries ^PrefixCorrespondence correspondence)]
+          (if-not (some #(= :nested-invocation-input (:kind %)) entries)
+            entries
+            (entry/call-with-definition-inputs
+             (fn []
+               (entry/observe-frontend-source-identity! frontend)
+               (let [refreshed
+                     (mapv
+                      (fn [{:keys [kind construction normalization represented boundaries] :as original}]
+                        (if-not (= :nested-invocation-input kind)
+                          original
+                          (do
+                            (entry/assert-producer-current! construction)
+                            (when (transport/source-construction-view construction normalization represented)
+                              ;; The construction phase predates these dispatch/return
+                              ;; joins. Reacquire their actual guards under THIS owner.
+                              (let [current (mapv #(reference-indy-boundary (:frame %)) boundaries)
+                                    fields [:kind :result-carrier :body-return-carrier :invocation-method
+                                            :compute-method :parameter-carriers :compute-parameter-carriers]]
+                                (when (and (every? some? current)
+                                           (every? true? (map (fn [old new]
+                                                               (and (identical? (:receiver old) (:receiver new))
+                                                                    (identical? (:implementation old) (:implementation new))
+                                                                    (= (select-keys (:bridge old) fields)
+                                                                       (select-keys (:bridge new) fields))))
+                                                             boundaries current)))
+                                  (assoc original :boundaries current))))))) entries)]
+                 (when (every? some? refreshed) refreshed))))))))))
 
 (defn original-terminal-invocation
   "Read only an exact source-owned terminal join. Maps/copies are not authority.
@@ -743,12 +912,12 @@
                callees
                (into []
                      (keep
-                      (fn [{:keys [expression step]}]
+                      (fn [{:keys [expression step kind]}]
                         (entry/call-with-optional-definition-inputs
                          (fn []
                            (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
                                  (descriptor/call-description expression)]
-                             (when (and signature (invocation/scalar-compute? step)
+                             (when (and (nil? kind) signature (invocation/scalar-compute? step)
                                         dispatch? (not lexical-callee)
                                         (every? #(or (instance? Long %)
                                                      (and (symbol? %) (contains? long-ports %)))
