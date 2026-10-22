@@ -81,17 +81,20 @@
             (go* [expression env]
               (when (seq? expression) (source-hints! (first expression) nil source-ns))
               (cond
-                (and (:invocation contract) (identical? expression (:body contract)))
+                (and (:invocation contract)
+                     (identical? expression (get contract :invocation-expression (:body contract))))
                 (let [bridge (:invocation contract)
                       arguments (mapv #(go % env) (descriptor/call-args expression))]
-                  (when-not (every? #(= Long/TYPE (:carrier %)) arguments)
-                    (fail! "original invocation requires completed primitive Long operands" {}))
+                  (when-not (= (or (:invocation-carriers contract)
+                                  (vec (repeat (count arguments) Long/TYPE)))
+                               (mapv :carrier arguments))
+                    (fail! "original invocation requires its completed primitive operands" {}))
                   (assoc (resolved (:invocation-method bridge)
                                    (capture! (:implementation bridge)) (mapv :source arguments))
                          ;; This is the actual Object invocation, not its static
                          ;; compute method. The original owner separately proves
                          ;; the conditional normal-return boxing correspondence.
-                         :boxed-carrier Long :non-null? true))
+                         :boxed-carrier (or (:invocation-payload-class contract) Long) :non-null? true))
                 (symbol? expression)
                 (or (when-let [value (get env expression)]
                       (update value :source with-meta (meta expression)))
@@ -249,7 +252,20 @@
               (let [result (go* expression env)]
                 ;; Validate hints against the actual projected Method/local
                 ;; carrier, never use the hint to select that carrier.
-                (source-hints! expression (:carrier result) source-ns)
+                (if (and (:invocation-expression contract)
+                         (identical? expression (:invocation-expression contract)))
+                  (let [tag (:tag (meta expression))
+                        payload (get-in contract [:invocation :payload-carrier])]
+                    ;; The original owned bytecode observes this exact call as
+                    ;; Object despite its retained logical payload annotation.
+                    ;; Keep the actual Method result Object; no return cast or
+                    ;; materialization completion is being erased here.
+                    (when (some (fn [hint]
+                                  (and hint (not= payload (get types/tag->java-class hint))))
+                                [tag (:raster.type/tag (meta expression))])
+                      (fail! "terminal invocation hint differs from its observed payload" {}))
+                    (source-hints! (vary-meta expression dissoc :tag) (:carrier result) source-ns))
+                  (source-hints! expression (:carrier result) source-ns))
                 result))]
       (let [input (fresh "terminal_inputs__")
             projected
@@ -288,6 +304,60 @@
                                                                :double Double/TYPE :long Long/TYPE)})
                          (invocation/terminal-parameters contract))]
     (project* (assoc contract :parameters parameters) source-ns false)))
+
+(defn project-terminal-invocation
+  "Project an owner-authenticated nested terminal invocation using its actual Method.
+   The owner must first join the exact source interval and terminal contract.
+   This checks physical export/argument/return compatibility, not producer/read
+   semantics. It does not add helper resolution to ordinary terminal projection."
+  [contract source-ns expression observation]
+  (let [bridge (get-in observation [:consumer :computation :bridge])
+        call (get-in observation [:consumer :invocation])
+        method (:invocation-method bridge)
+        producer-id (get-in observation [:producer :binding :binder])
+        producer-fact (get-in observation [:producer :completed-value])
+        producer-class (or (:builtin-class producer-fact) (:carrier producer-fact))
+        dtype (cond (contains? #{Float Float/TYPE} producer-class) :float
+                    (contains? #{Double Double/TYPE} producer-class) :double)
+        body (:body contract)
+        binder (get-in observation [:consumer :binding :binder])
+        parameters (invocation/terminal-parameters contract)]
+    (when-not (and (= :boxed-primitive-static-return (:kind bridge))
+                   (= Object (:result-carrier bridge))
+                   (contains? #{Float/TYPE Double/TYPE} (:payload-carrier bridge))
+                   (instance? Method method) (= method (:method call))
+                   (= Object (.getReturnType ^Method method))
+                   (= :ref (get-in observation [:consumer :binding :after :type]))
+                   (= Object (get-in observation [:consumer :binding :after :reference-class]))
+                   (seq? body) (= 'let* (first body)) (= 3 (count body))
+                   (vector? (second body)) (= 2 (count (second body)))
+                   (= binder (first (second body)) (nth body 2))
+                   (identical? expression (second (second body)))
+                   (every? (fn [symbol]
+                             (and (not (contains? (meta symbol) :param-tags))
+                                  (every? #(or (nil? %)
+                                               (= (:payload-carrier bridge) (get types/tag->java-class %)))
+                                          [(:tag (meta symbol)) (:raster.type/tag (meta symbol))])))
+                           [(first (second body)) (nth body 2)])
+                   (.isInstance (.getDeclaringClass ^Method method) (:implementation bridge))
+                   (= (:parameter-carriers bridge) (vec (.getParameterTypes ^Method method)))
+                   (every? #{Float/TYPE Double/TYPE} (:parameter-carriers bridge))
+                   (= 1 (count parameters)) dtype
+                   (= producer-id (:symbol (first parameters)))
+                   (= dtype (:dtype (first parameters)))
+                   (= (:parameter-carriers bridge) (mapv :parameter-carrier (:input-completions call))))
+      (fail! "terminal invocation lacks exact original FP export/call correspondence" {}))
+    (project*
+     ;; The only terminal local is the observed Object result, immediately
+     ;; returned unchanged. Elide that alias, not a source call/completion.
+     ;; Keeping its logical primitive tag on a Clojure let would introduce an
+     ;; unboxing absent from the original emitted Object local.
+     (assoc contract :body expression
+            :parameters [{:symbol producer-id :carrier (if (= :float dtype) Float/TYPE Double/TYPE)}]
+            :invocation bridge :invocation-expression expression
+            :invocation-carriers (:parameter-carriers bridge)
+            :invocation-payload-class (if (= Float/TYPE (:payload-carrier bridge)) Float Double))
+     source-ns false)))
 
 (defn- scalar-contract [expression parameters source-policy]
   (when-not (= {:unchecked-math false} source-policy)

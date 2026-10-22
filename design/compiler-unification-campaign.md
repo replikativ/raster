@@ -458,6 +458,43 @@ be reported as completing zero/null/read semantics. Source-free compile entries
 and generic frontend admission remain unchanged. Final affected source gate now
 passes 103 tests / 1,599 assertions; this does not resolve the broad draft CI.
 
+The conditional terminal-consumer half is now implemented through the existing
+source-prefix correspondence representation and TerminalResultOwner, with no
+new runtime, cache or portable IR. The owner joins the original unchanged
+two-binding source through its actual normalization/construction phases to the
+exact final terminal contract and equation/export endpoint. It invokes the
+captured interface Method through shared ordered-call normalization. The actual
+Method result and observed consumer storage remain Object. An immediately
+returned, single Object alias is elided rather than emitted with an inferred
+primitive local hint; both source tags must match the independently observed
+boxed payload, and conflicting hints/param-tags refuse. Explicit mismatching
+owned-mode input refuses rather than falling back to ordinary projection.
+
+Crucially, the numerical frontend changes accumulator/index/input annotations.
+Those are NOT waived or accepted as numerical correspondence: the retained
+producer endpoints explicitly carry `:status :unproved`. Tests supply the
+original source's completed reduction value to the terminal owner and compare
+the resulting whole consumer against original execution. This is conditional
+consumer qualification, not GPU producer qualification. The default
+equation-first path is deliberately not wired to this capability until the
+independent producer/count/read execution proof is connected.
+
+An independent reviewer found no normal-path semantic blocker for this scope;
+its malformed-source hardening and explicit-mode refusal fixes are included.
+The affected nine-namespace REPL gate passes 141 tests / 2,187 assertions,
+including split/unsplit Float/Double, counts0/1, non-exact Float reciprocals,
+changed inputs, copied/foreign phase/program/contract boundaries, rollback,
+malformed source and conflicting-hint controls. Broad draft CI remains held.
+
+Next input execution work reuses InvocationMaterializationState and ordered raw
+arguments: owner-authorized existing buffer parameters may remain pending, never
+fabricated MaterializedBuffers, until the reduction cursor checks original entry
+CHECKCAST/null/bounds semantics and materializes actual demanded storage. Factor
+the existing parameter materializer instead of duplicating shape/alias rules.
+The zero case also needs validated empty-domain emission that removes unused
+pointer demand: current SegRed still carries its masked input pointer. A nullable
+entry CHECKCAST is not a nonnull read proof; deferral alone does not solve count0.
+
 PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
 Its shared bytecode completion emitter now represents actual Int/Long invocation
 parameter conversions without substituting Clojure checked casts. The distinction

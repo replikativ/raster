@@ -5,6 +5,10 @@
             [raster.numeric :as numeric]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-prefix :as prefix]
+            [raster.compiler.core.source-transport :as transport]
+            [raster.compiler.equation-first :as equation]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
+            [raster.compiler.backend.jvm.terminal-source :as terminal-source]
             [raster.compiler.ir.par :as par-ir]
             [raster.compiler.backend.jvm.split :as split]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
@@ -97,6 +101,46 @@
         (with-redefs [split/estimate-form-size (constantly (if split? 1000000 0))]
           (run (captured (ns-resolve scope 'objective)))))
       (finally (remove-ns (ns-name scope)))))))
+
+(defn- with-terminal-interval [float? split? count-expression run]
+  (with-fresh-reduction-binding
+    float? split? count-expression
+    (fn [original]
+      (let [retained (atom {})
+            begin prefix/begin
+            normalize transport/normalize-frontend-bindings
+            construct transport/with-source-construction-history
+            captured
+            (with-redefs-fn
+              {#'prefix/begin
+               (fn [frontend parameters]
+                 (swap! retained assoc :input (prefix/begin-reduction-interval frontend parameters))
+                 (begin frontend parameters))
+               #'transport/normalize-frontend-bindings
+               (fn [frontend parameters & options]
+                 (let [result (apply normalize frontend parameters options)]
+                   (swap! retained assoc :normalization (:source-normalization result)
+                          :normalized (first (:walked-body result)))
+                   result))
+               #'transport/with-source-construction-history
+               (fn [normalization build]
+                 (let [result (construct normalization build)]
+                   (swap! retained assoc :represented (:form result)
+                          :construction (:source-construction result))
+                   result))
+               (ns-resolve 'raster.compiler.equation-first 'compile-semantic)
+               (fn [context program]
+                 (assoc @retained :frontend (:retained-frontend context) :program program
+                        :source-var (:source-var context)))}
+              #(equation/compile (get-in original [:source-entry :source-var])
+                                 {:target :ocl:reduction-terminal-test
+                                  :dtype (if float? :float :double)}
+                                 {:device-id :ocl:reduction-terminal-test :device-type :gpu
+                                  :backend :ocl :subgroup-dialect :opencl-portable
+                                  :max-workgroup-size 256}))]
+        ;; No numerical execution occurs inside the compiler's retryable proof
+        ;; transaction. The namespace/definition owner remains live for run.
+        (run captured)))))
 
 (deftest extracted-reduction-keeps-actual-helper-return-and-binding-boundaries
   (doseq [float? [false true]]
@@ -218,6 +262,90 @@
                   (get-in frontend [:source-entry :params]))
                  nil
                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))))
+
+(deftest actual-terminal-interval-projects-the-selected-interface-call
+  (doseq [float? [false true] split? [false true] count [0 1]]
+    (with-terminal-interval
+      float? split? count
+      (fn [{:keys [input normalization normalized represented program construction frontend source-var]}]
+        (let [joined (prefix/close-reduction-terminal input normalization normalized represented program construction)
+              contract (get-in program [:attributes :invocation-plan :attributes :terminal-host-result])
+              invocation (prefix/original-terminal-invocation joined frontend program contract)]
+          (is (some? joined))
+          (is (some? invocation))
+          (when joined
+            (let [owner (source-owner/compile-terminal-result program contract source-var frontend joined)
+                  array-of (if float? float-array double-array)
+                  box (if float? float double)
+                  implementation (:implementation frontend)]
+              (doseq [value [2.0 3.0 4.0 7.0 -2.0]]
+                (let [sum (box (if (zero? count) 0.0 value))
+                      expected (implementation (array-of [value]))
+                      actual (source-owner/invoke-terminal-result owner program contract [sum])]
+                  (is (= (class expected) (class actual)))
+                  (is (= expected actual)))))))))))
+
+(deftest terminal-interval-requires-exact-owned-phase-and-contract-boundaries
+  (with-terminal-interval
+    false false 1
+    (fn [{:keys [input normalization normalized represented program construction frontend source-var]}]
+      (let [close #(prefix/close-reduction-terminal %1 %2 %3 %4 %5 %6)
+            joined (close input normalization normalized represented program construction)
+            contract (get-in program [:attributes :invocation-plan :attributes :terminal-host-result])
+            query #(prefix/original-terminal-invocation %1 %2 %3 %4)
+            original (query joined frontend program contract)
+            copied-contract (into {} contract)
+            reason (fn [run] (try (run) nil (catch clojure.lang.ExceptionInfo failure
+                                            (:reason (ex-data failure)))))]
+        (is (some? joined))
+        (is (= :unproved (get-in original [:producer-source :status])))
+        (is (identical? (:source (first (:equations program)))
+                        (get-in original [:producer-source :constructed])))
+        (doseq [[a b c d e f]
+                [[nil normalization normalized represented program construction]
+                 [input nil normalized represented program construction]
+                 [input normalization (apply list normalized) represented program construction]
+                 [input normalization normalized (apply list represented) program construction]
+                 [input normalization normalized represented program nil]
+                 [input normalization normalized represented (assoc program :source nil) construction]
+                 [input normalization normalized represented (assoc program :source 42) construction]
+                 [input normalization normalized represented (assoc program :source '(let* 42 nil)) construction]
+                 [input normalization normalized represented
+                  (assoc program :source (list 'let* (second (:source program)) 0.0)) construction]
+                 [input normalization normalized represented
+                  (assoc-in program [:attributes :invocation-plan :steps] [{}]) construction]]]
+          (let [before @entry/*emission-inputs*]
+            (is (nil? (close a b c d e f)))
+            (is (identical? before @entry/*emission-inputs*))))
+        (doseq [[a b c d]
+                [[{} frontend program contract]
+                 [joined (into {} frontend) program contract]
+                 [joined frontend (into {} program) contract]
+                 [joined frontend program copied-contract]]]
+          (let [before @entry/*emission-inputs*]
+            (is (nil? (query a b c d)))
+            (is (identical? before @entry/*emission-inputs*))))
+        (is (= :unclosed-terminal-source-projection
+               (reason #(source-owner/compile-terminal-result program contract source-var frontend)))
+            "conditional correspondence does not enable default source admission")
+        (doseq [metadata [{:tag 'float :raster.type/tag 'double}
+                          {:tag 'double :raster.type/tag 'float}
+                          {:tag 'double :raster.type/tag 'double :param-tags []}]]
+          (let [expression (with-meta (:expression original) metadata)
+                altered (assoc-in contract [:body] (list 'let* ['reciprocal expression] 'reciprocal))]
+            (is (= :unclosed-terminal-source-projection
+                   (reason #(terminal-source/project-terminal-invocation
+                             altered (get-in frontend [:source-entry :source-ns])
+                             expression (:observation original)))))))
+        (is (= :terminal-source-interval-correspondence
+               (reason #(source-owner/compile-terminal-result
+                         program copied-contract source-var frontend joined))))
+        (is (= :terminal-source-interval-correspondence
+               (reason #(source-owner/compile-terminal-result
+                         program contract source-var frontend {}))))
+        (is (= :terminal-source-interval-correspondence
+               (reason #(source-owner/compile-terminal-result
+                         program contract source-var frontend false))))))))
 
 (deftest original-closed-count-is-not-a-constructed-domain-proof
   (doseq [split? [false true]

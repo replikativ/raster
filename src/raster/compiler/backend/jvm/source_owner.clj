@@ -163,10 +163,15 @@
 
    This compiles the region's source Object result context, not an arbitrary
    original bytecode method's return descriptor. It grants no physical export,
-   producer completion, device observation or whole-invocation result proof."
+   producer completion, device observation or whole-invocation result proof.
+   An optional exact interval correspondence selects the bounded original
+   interface-call projection; a supplied mismatching correspondence refuses.
+   This does not close its outstanding numerical-producer obligations."
   ([program contract source-var]
    (compile-terminal-result program contract source-var nil))
   ([program contract source-var frontend]
+   (compile-terminal-result program contract source-var frontend nil))
+  ([program contract source-var frontend correspondence]
   (let [{:keys [collector metadata source-ns policy]} (original-source-context! source-var :unowned-terminal-source)]
     ;; A logical dtype is not evidence of the actual source method's carrier.
     ;; Authenticate the frontend and full original argument order independently
@@ -186,7 +191,14 @@
     (invocation/validate-terminal-source-result!
      contract program {:source-policy policy :source-namespace (ns-name source-ns)
                        :public-parameters (get-in program [:attributes :invocation-plan :parameters])})
-    (let [projection (terminal-source/project contract source-ns)
+    (let [original (source-prefix/original-terminal-invocation correspondence frontend program contract)
+          _ (when (and (some? correspondence) (nil? original))
+              (throw (ex-info "terminal invocation differs from its original owned interval"
+                              {:reason :terminal-source-interval-correspondence})))
+          projection (if original
+                       (terminal-source/project-terminal-invocation
+                        contract source-ns (:expression original) (:observation original))
+                       (terminal-source/project contract source-ns))
           return-tag (get metadata :raster.core/return-tag 'Object)
           result-facts (:result-facts projection)
           ;; Source annotations are not evidence that final unboxing/checkcast

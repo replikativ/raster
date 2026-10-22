@@ -253,7 +253,10 @@
         (and constructor-tag (not (contains? left :tag))
              (= constructor-tag (:tag right)) (= left (dissoc right :tag))))))
 
-(defn- same-expression? [original transformed renaming declarations]
+(defn- same-expression?
+  ([original transformed renaming declarations]
+   (same-expression? original transformed renaming declarations false))
+  ([original transformed renaming declarations unchanged-scopes?]
   (and (source-metadata-compatible? original transformed declarations)
        (cond
          (symbol? original)
@@ -266,12 +269,15 @@
 
          (seq? original)
          (and (seq? transformed)
-              ;; The bounded relation has no nested binding/closure scopes.
-              ;; Their capture-avoiding transport must be proved separately.
-              (nil? (form/scope-info original))
-              (nil? (form/scope-info transformed))
+              ;; Ordinary prefix verification admits no nested scopes. The
+              ;; source-interval check may retain unchanged scoped syntax, but
+              ;; never transports a renaming across a lexical boundary.
+              (or (and unchanged-scopes? (empty? renaming))
+                  (and (nil? (form/scope-info original))
+                       (nil? (form/scope-info transformed))))
               (= (count original) (count transformed))
-              (every? true? (map #(same-expression? %1 %2 renaming declarations) original transformed)))
+              (every? true? (map #(same-expression? %1 %2 renaming declarations unchanged-scopes?)
+                                original transformed)))
 
          (instance? Double original)
          (and (instance? Double transformed)
@@ -287,7 +293,96 @@
              (boolean? original) (char? original) (integer? original))
          (and (= (class original) (class transformed)) (= original transformed))
 
-         :else (identical? original transformed))))
+         :else (identical? original transformed)))))
+
+(defn close-reduction-terminal
+  "Relate an unchanged owned reduction/consumer scope to its exact terminal suffix.
+   All source phases are checked, not searched for a matching call. Nested scopes
+   must be unchanged: this verifier performs no binder renaming or substitution.
+   This grants terminal invocation correspondence only, not numerical producer,
+   read-domain, input materialization or resident execution permission."
+  [input normalization normalized represented program construction]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and (instance? PrefixInput input) (map? program)
+                (vector? (:equations program)) (map? (:attributes program))
+                (transport/source-construction-view construction normalization represented))
+       (let [^PrefixInput input input
+             frontend (.-frontend input)
+             scope (.-scope input)
+             origin (transport/normalization-occurrence normalization normalized)
+             declarations (zipmap (.-parameters input) (get-in frontend [:source-entry :tags]))
+             unchanged? (fn [left right]
+                          (let [a (direct-reduction-pairs left) b (direct-reduction-pairs right)]
+                            (and a b
+                                 (= (first left) (first right))
+                                 (or (source-metadata-compatible? left right declarations)
+                                     ;; This phase drops the outer let's logical
+                                     ;; result annotation. It is not a source
+                                     ;; cast or a declaration of a local carrier;
+                                     ;; every child/checkpoint is checked below.
+                                     (and (not (contains? (significant-metadata left) :tag))
+                                          (= (dissoc (significant-metadata left) :raster.type/tag)
+                                             (significant-metadata right))))
+                                 (every? true?
+                                         (map (fn [[id expression] [other replacement]]
+                                                (and (same-expression? id other {} declarations)
+                                                     (same-expression? expression replacement {} declarations true)))
+                                              a b))
+                                 (same-expression? (nth left 2) (nth right 2) {} declarations))))
+             pairs (direct-reduction-pairs represented)
+             [[producer-id producer] [consumer-id consumer]] pairs
+             final (:source program)
+             tail (when (and (seq? final) (= 3 (count final))) (nth final 2))
+             contract (get-in program [:attributes :invocation-plan :attributes :terminal-host-result])
+             equation (first (:equations program))
+             observation (observed-reduction-interval input)
+             fact (get-in observation [:producer :completed-value])
+             physical (or (:builtin-class fact) (:carrier fact))
+             result-dtype (cond (contains? #{Float Float/TYPE} physical) :float
+                                (contains? #{Double Double/TYPE} physical) :double)
+             final-producer (when (and (seq? final) (vector? (second final))
+                                       (= 2 (count (second final))))
+                              (second (second final)))]
+         (when (and origin observation (:closed-count observation) pairs
+                    (identical? frontend (:frontend origin))
+                    (identical? scope (:original origin))
+                    (unchanged? scope normalized)
+                    (unchanged? normalized represented)
+                    (= (.-parameters input)
+                       (mapv :symbol (get-in program [:attributes :invocation-plan :parameters])))
+                    (nil? (get-in program [:attributes :invocation-plan :attributes :parameter-projection]))
+                    (empty? (get-in program [:attributes :invocation-plan :steps]))
+                    (= 1 (count (:equations program)))
+                    (seq? final) (contains? form/let-heads (first final))
+                    (= (significant-metadata represented) (significant-metadata final))
+                    (vector? (second final)) (= 2 (count (second final)))
+                    (= producer-id (first (second final)))
+                    result-dtype (= result-dtype (get-in program [:values producer-id :dtype]))
+                    (identical? (:source equation) (second (second final)))
+                    (= [producer-id] (:results equation))
+                    (seq? tail) (contains? form/let-heads (first tail)) (= 3 (count tail))
+                    (vector? (second tail)) (= 2 (count (second tail)))
+                    (= consumer-id (first (second tail)) (nth tail 2))
+                    (same-expression? consumer-id (first (second tail)) {} declarations)
+                    (same-expression? (nth represented 2) (nth tail 2) {} declarations)
+                    (same-expression? consumer (second (second tail)) {} declarations)
+                    (identical? tail (:body contract))
+                    (= [{:symbol producer-id :value producer-id
+                         :dtype (get-in program [:values producer-id :dtype])
+                         :producer-equation (:id equation) :result-position 0}]
+                       (:parameters contract))
+                    (empty? (:public-scalar-parameters contract)))
+           (PrefixCorrespondence.
+            input program [{:kind :reduction-terminal :contract contract
+                            :expression (second (second tail))
+                            ;; The numerical frontend changes reduction index
+                            ;; and operand annotations. This join does NOT prove
+                            ;; those changes preserve source execution. Retain
+                            ;; the actual endpoints as an outstanding obligation.
+                            :producer-source {:original producer :constructed final-producer
+                                              :status :unproved}
+                            :observation observation}])))))))
 
 (defn- prefix-renaming [original transformed parameters parameter-declarations]
   (when (= (count original) (count transformed))
@@ -401,6 +496,20 @@
         (entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
         (entry/observe-frontend-source-identity! frontend)
         (.-entries ^PrefixCorrespondence correspondence)))))
+
+(defn original-terminal-invocation
+  "Read only an exact source-owned terminal join. Maps/copies are not authority.
+   Recheck original completion observations under the current enclosing history."
+  [correspondence frontend program contract]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (let [entries (owned-entries correspondence frontend program)
+           candidate (when (= 1 (count entries)) (first entries))]
+       (when (and (= :reduction-terminal (:kind candidate))
+                  (identical? contract (:contract candidate)))
+         (when-let [observation (observed-reduction-interval
+                                 (.-input ^PrefixCorrespondence correspondence))]
+           (assoc candidate :observation observation)))))))
 
 (defn original-step
   "Query an exact constructed step under its exact original frontend/program.
