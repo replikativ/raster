@@ -349,6 +349,25 @@ obligations until their complete intervals are represented. The existing two-
 equation training loss and softmax's scalar-after-reduction case are acceptance
 workloads, not reasons to bypass an unresolved interval.
 
+Fresh coherent campaign integration of the outlining consumer passed nine
+completion/bytecode/AD/construction namespaces: 121 tests / 1,570 assertions,
+zero failures or errors. The duplicated raw integral outliner branch is removed;
+the existing CHECKCAST path, positional completion validation, historical owner
+guards and terminal-region implementation remain. Independent integration review
+found no blocker. These targeted checks do not supersede the known broad-draft CI
+failures or qualify the draft for merging.
+
+A separate REPL construction probe confirms the next gap rather than merely
+inferring it from code: an actual typed helper with an unused Long formal throws
+on a nil argument; the existing expansion emits no argument bindings and returns
+`5`. Constructing three explicit original observed integral completions before
+the same scope-aware substitution restores both the nil failure and normal result.
+The original retained invocation nevertheless reports an **Object** return, even
+for this Long helper. Thus the prototype does not prove a return recipe or grant
+production expansion, and cannot justify dropping the return-boundary gate.
+The local reproduction is `.internal/probe-unused-formal-completion.clj`; it is
+diagnostic evidence, not a permanent passing regression or a shipped inliner fix.
+
 ### October 21 typed reduction identity and rewalk qualification
 
 Focused PR #1554 (`0b839b48`, based on main `5baa8b30`) replaces the
