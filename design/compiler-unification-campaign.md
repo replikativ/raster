@@ -146,6 +146,29 @@ case rather than adding a parallel fixture. Its focused case passes 1 test / 73
 assertions; the construction/import/inliner group now passes 67 / 561. Independent
 review confirmed that outlining remains explicit and grants no prefix replay.
 
+The second review found a missing right-endpoint obligation in the initial slice
+plan: the product's executable and final allocation metadata do not prove absence
+of intervening original helper work. The actual chain must also close `alloc-like`
+delegation to `zeros-like`, its receiver and all formal completions, the exact
+original array constructor/count, zero initialization and helper return
+completions. `direct-allocation-projection` can certify a selected helper whose
+entire original body is a direct constructor; it cannot retrospectively certify
+its enclosing delegation interval. `allocation-corresponds?` checks logical
+constructor/shape/initialization, while SourceOwner's extent-availability check
+does not establish the missing source interval.
+
+Likewise the pre-kernel prefix includes the post-allocation `oftype` arguments,
+which still lack their independent source-constant/substitution completion. Do
+not admit the product merely because today's `local-loss` later refuses a missing
+MSE executor: that incidental failure is not a safety authority. The default next
+vertical must finish the complete prefix before granting public execution. A
+smaller internal interval is useful only if an independently derived unresolved
+enclosing-frame obligation still prevents whole-plan admission. Add controls
+with effects/throws between product and constructor, after construction before
+helper return, and in a later GEMM argument; each unrepresented operation must
+prevent admission. This is a strengthened completion requirement, not a new
+function registry or permission to evaluate the numerical body on the CPU.
+
 ### October 21 selected ancestry for imported helper calls
 
 Imported call origins now feed the existing selected-call contract, rather than
