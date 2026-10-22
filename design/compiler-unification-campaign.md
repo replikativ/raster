@@ -104,6 +104,31 @@ idempotence and the flat binding planner, and discharge completion facts only
 from the final actual entry. Do not move the full device normalizer into runtime
 preparation. The existing-IR module import still has these obligations:
 
+The generated-helper construction now exposes an authenticated binding spine
+before its sole outer emission. Each original initializer replays its retained
+physical context before its exact reference check; alpha-renaming maps the
+complete binding interval by ordinal. Multi-statement tails use the original
+terminal-context owner: each discarded statement becomes a binding around
+`(do statement nil)` under that saved context. The helper's final result/Object/
+reference wrappers remain on the final value. Generic ANF still treats these
+wrappers as barriers.
+
+Before publishing GeneratedPreparationOwner, actual emission must discharge all
+expected local type/hint/verified/reference-Class facts and every completion
+occurrence. Missing, ambiguous or altered facts refuse publication. A failed
+check can leave an unpublished generated class; this is a resource/performance
+obligation, not permission to publish a partially validated owner.
+
+The shared JVM body emitter now stops after divergence. The formerly duplicated
+`do` path delegates to it, so both use the same discard/pop/pop2 and void-context
+rules. Focused qualification: 125 tests / 1,658 assertions pass in the existing
+capped REPL, including negative context/local-fact cases and changed-input
+training oracles. A fresh unchanged training preparation has 55 bindings and 64
+completion nodes, all 64 observed in its actual generated entry. Unlike the old
+wrapper-free diagnostic skeleton, this count retains and validates conversions.
+This still does not establish TypedSOAC admission or resident training execution;
+the owned importer must lower those contexts and numerical regions together.
+
 1. Consume the exact prepared projection at its inliner construction boundary,
    before raw bindings are appended. One compilation-local mechanism must cover
    direct AD applications and authenticated captured prepared callables, including

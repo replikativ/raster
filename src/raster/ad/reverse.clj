@@ -6066,6 +6066,8 @@
         _ (when-not implementation
             (throw (ex-info "Generated AD bytecode entry could not be emitted"
                             {:reason :ad-generated-entry-unavailable})))
+        _ ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/validate-program-emission!)
+           program emission)
         pending (filterv #(map? (get-in % [:metadata :raster.core/jit-spec]))
                          (:dependency-snapshots emission))]
     ;; Only prepare receivers actually consumed by this completed emitter.

@@ -8,6 +8,7 @@
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.pe :as pe]
             [raster.compiler.passes.scalar.simplify :as simplify]
             [raster.compiler.fixtures.distributed-training :as training]))
@@ -15,6 +16,19 @@
 (deftm unused-argument-helper [value :- (Array float) unused :- Double] :- (Array float)
   (aset value 0 (float (+ 1.0 (aget value 0))))
   value)
+
+(deftm ordered-body-helper [state :- (Array float) x :- Double] :- (Array float)
+  (let [alias state
+        rounded (int x)
+        negative? (< x 0.0)]
+    (aset alias 0 (float rounded))
+    (double x)
+    (long rounded)
+    (int rounded)
+    false
+    nil
+    (when negative? (aset alias 1 (float -1.0)))
+    alias))
 
 (defn- interface-method [tags]
   (let [interface (types/ensure-fn-interface! tags)]
@@ -27,14 +41,91 @@
 
 (defn- emit [program]
   (let [interface (types/ensure-fn-interface! (:tags program))]
-    (:implementation
-     (core/emit-owned-bytecode!
+    (let [emitted (core/emit-owned-bytecode!
       bytecode/compile-typed-impl! "raster.compiled.GeneratedBodyTest"
       (:params program) (:tags program) 'Object (:walked-body program)
-      (:source-ns program) (:iface-name interface) 'generated-body-test nil))))
+      (:source-ns program) (:iface-name interface) 'generated-body-test nil)]
+      (generated/validate-program-emission! program (:emission emitted))
+      (:implementation emitted))))
 
 (defn- invoke [function arguments]
   (clojure.lang.Reflector/invokeInstanceMethod function "invk" (object-array arguments)))
+
+(defn- helper-program [source]
+  (let [operation (symbol (str (ns-name (.ns source))) (str (:name (meta source))))
+        source (core/resolve-deftm-var source)
+        receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))
+        _ (core/ensure-current-owned-bytecode! receiver)
+        emission (:raster.core/bytecode-emission (meta receiver))
+        receiver-symbol (with-meta (symbol (str (ns-name (.ns receiver))) (str (:name (meta receiver))))
+                          {:tag (:typed-interface emission)})]
+    {:params '[state x] :tags '[Object Object] :source-ns *ns*
+     :walked-body [(list 'let* ['result (with-meta (list '.invk receiver-symbol 'state 'x)
+                                         {:raster.op/original operation})]
+                         'result)]}))
+
+(deftest anchored-statement-spines-preserve-discard-context-and-local-facts
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program (helper-program #'ordered-body-helper)
+           method (interface-method (:tags program))
+           normalized (generated/normalize-program program method capture!)
+           original (emit program)
+           compiled (emit normalized)
+           pairs (partition 2 (second (first (:walked-body normalized))))]
+       (is (some? normalized))
+       (is (< 3 (count pairs)))
+       (is (some (fn [[_ value]]
+                   (when-let [{:keys [contract operand]} (completion/canonical-parts value)]
+                     (and (= :jvm-bytecode-result-context (:source-context contract))
+                          (seq? operand) (= 'do (first operand))
+                          (= 3 (count operand)) (nil? (last operand)))))
+                 pairs))
+       (doseq [x [2.75 -3.25 0.0]]
+         (let [left (float-array [10.0 20.0]) right (aclone left)]
+           (is (identical? left (invoke original [left x])))
+           (is (identical? right (invoke compiled [right x])))
+           (is (= (vec left) (vec right)))))
+       (let [before @entry/*emission-inputs*]
+         (with-redefs [bytecode/retained-terminal-context (fn [& _] nil)]
+           (is (nil? (generated/normalize-program program method capture!))))
+         (is (identical? before @entry/*emission-inputs*)))))))
+
+(deftest generated-publication-rejects-missing-context-and-changed-local-facts
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program (helper-program #'ordered-body-helper)
+           normalized (generated/normalize-program program (interface-method (:tags program)) capture!)
+           interface (types/ensure-fn-interface! (:tags normalized))
+           emitted (core/emit-owned-bytecode!
+                    bytecode/compile-typed-impl! "raster.compiled.GeneratedValidationTest"
+                    (:params normalized) (:tags normalized) 'Object (:walked-body normalized)
+                    (:source-ns normalized) (:iface-name interface) 'generated-validation nil)
+           check (fn [] (try (generated/validate-program-emission! normalized (:emission emitted))
+                            :accepted
+                            (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+           observe bytecode/retained-input-binding-context]
+       (is (= :accepted (check)))
+       (with-redefs [bytecode/retained-input-completion-context (fn [& _] nil)]
+         (is (= :generated-body-completion-context (check))))
+       (doseq [[field value] [[:hint 'Object] [:verified :invalid] [:reference-class String]]]
+         (with-redefs [bytecode/retained-input-binding-context
+                       (fn [& arguments]
+                         (when-let [context (apply observe arguments)]
+                           (assoc-in context [:after field] value)))]
+           (is (= :generated-body-local-facts (check)))))
+       (let [completion-observation bytecode/retained-input-completion-context]
+         (with-redefs [bytecode/retained-input-completion-context
+                       (fn [& arguments]
+                         (when-let [context (apply completion-observation arguments)]
+                           (update-in context [:operand-context :void-context] not)))]
+           (is (= :generated-body-completion-context (check)))))
+       (is (= :generated-body-completion-context
+              (try
+                (generated/validate-program-emission!
+                 (update normalized :walked-body #(with-meta (apply list %) nil)) (:emission emitted))
+                :accepted
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
 
 (defn- observe [function arguments]
   (try
