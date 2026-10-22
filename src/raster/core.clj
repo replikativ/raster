@@ -693,7 +693,14 @@
       (if-not (or failure missing-walk?)
         emission
         (do
-          (when (and failure (not (me/retryable-emission-change? failure)))
+          ;; A generated AD module may outlive its rule epoch while its
+          ;; original source remains current. Only this authenticated source
+          ;; reconstruction may renew it; an emit-only retry must not reuse
+          ;; that transformed module or bless its old owner.
+          (when (and failure
+                     (not (or (me/retryable-emission-change? failure)
+                              (= :ad-prepared-program-stale-rules
+                                 (:reason (ex-data failure))))))
             (throw failure))
           (let [{:keys [source-name params tags return-tag source-ns typed-interface
                         annotations source-body] :as lineage} (:source-entry emission)]

@@ -171,6 +171,66 @@
         (is (identical? fresh (reverse/assert-prepared-program-source! fresh)))
         (is (= [9.0 6.0] (result fresh 3.0)))))))
 
+(deftest rule-renewal-rebuilds-source-without-reviving-old-generated-programs
+  (gradient-calling-root 3.0)
+  (let [source (core/resolve-deftm-var #'gradient-calling-root)
+        receiver (ns-resolve (:ns (meta source))
+                             (symbol (str (:name (meta source)) "-impl")))
+        emission (core/ensure-current-owned-bytecode! receiver)
+        prepared (reverse/prepare-value+grad #'squared-loss [0])
+        execute ((deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad)) prepared)
+        reason (fn [f] (try (f) nil
+                            (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        revision (templates/registry-revision)]
+    (try
+      (with-redefs [templates/registry-revision (constantly (inc revision))]
+        (is (= :ad-prepared-program-stale-rules
+               (reason #(entry/assert-emission-inputs-current! emission))))
+        (is (= :ad-prepared-program-stale-rules (reason #(execute 3.0))))
+        (let [fresh (core/ensure-current-owned-bytecode! receiver)]
+          (is (not (identical? emission fresh)))
+          (is (not (identical? (:implementation emission) (:implementation fresh))))
+          (is (identical? fresh (entry/assert-emission-inputs-current! fresh)))
+          (is (= 6.0 (gradient-calling-root 3.0)))
+          (is (= :ad-prepared-program-stale-rules
+                 (reason #(entry/assert-emission-inputs-current! emission))))
+          (is (= :ad-prepared-program-stale-rules (reason #(execute 3.0))))))
+      (finally
+        ;; The temporary epoch also invalidates the replacement on unwind.
+        ;; Leave a genuinely current implementation for subsequent REPL tests.
+        (let [restored (core/ensure-current-owned-bytecode! receiver)]
+          (is (identical? restored (entry/assert-emission-inputs-current! restored))))))))
+
+(deftest source-renewal-cannot-launder-a-captured-stale-gradient
+  (let [scope (create-ns (gensym "raster.ad.captured-rule-renewal."))
+        captured (reverse/value+grad #'squared-loss :wrt [0])
+        revision (templates/registry-revision)]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (intern scope 'captured captured)
+        (eval '(raster.core/deftm caller [x :- Double] :- Double
+                 (raster.numeric/+
+                  (clojure.core/nth
+                   ((raster.ad.reverse/value+grad
+                     (var raster.ad.preparation-frontend-source-test/squared-loss) :wrt [0]) x) 1)
+                  (clojure.core/nth (captured x) 1)))))
+      (let [root (ns-resolve scope 'caller)
+            source (core/resolve-deftm-var root)
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))]
+        (is (= 12.0 (root 3.0)))
+        (core/ensure-current-owned-bytecode! receiver)
+        (with-redefs [templates/registry-revision (constantly (inc revision))]
+          ;; The direct constructor can renew. The dynamic captured call is
+          ;; not expanded by AD-only source renewal and must retain its own
+          ;; runtime owner guard, rather than becoming a fresh gradient.
+          (let [fresh (core/ensure-current-owned-bytecode! receiver)]
+            (is (identical? fresh (entry/assert-emission-inputs-current! fresh))))
+          (is (= :ad-prepared-program-stale-rules
+                 (try (root 3.0) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest frozen-source-rejects-a-same-signature-owner-from-another-implementation
   (is (= 9.0 (squared-loss 3.0)))
   (is (= 4.0 (same-signature-owner-donor 3.0)))
