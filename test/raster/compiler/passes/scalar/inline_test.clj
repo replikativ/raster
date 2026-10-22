@@ -104,7 +104,7 @@
                   '(let* [result (do (record! :prefix)
                                     (let* [x (record! :body)] x)
                                     (record! :suffix))] result)]]
-    (let [normalized (inline/flatten-nested-lets source {:sequential-only? true})
+    (let [normalized (inline/flatten-nested-lets source)
           run (fn [expression]
                 (let [trace (atom [])
                       f (eval (list 'fn '[record!] expression))
@@ -117,7 +117,52 @@
                   '(loop* [i 0] (let* [x i] x))
                   '(fn* [a] (let* [x a] x))]]
     (let [source (list 'let* ['result opaque] 'result)]
-      (is (= source (inline/flatten-nested-lets source {:sequential-only? true}))))))
+      (is (= source (inline/flatten-nested-lets source))))))
+
+(defn- run-normalization [source]
+  (let [trace (atom [])
+        callee (atom (fn [& arguments] [:original arguments]))
+        record! (fn [event] (swap! trace conj event) event)
+        replace-callee! (fn []
+                          (swap! trace conj :replacement)
+                          (reset! callee (fn [& arguments] [:replacement arguments]))
+                          2)
+        execute (eval (list 'fn '[record! callee replace-callee!] source))]
+    (try {:value (execute record! callee replace-callee!) :trace @trace}
+         (catch Throwable error {:error (class error) :trace @trace}))))
+
+(deftest default-wrapper-normalization-preserves-operand-and-callee-order
+  (doseq [source
+          ['(let* [answer [(record! :first) (let* [value (record! :second)] 2)]] answer)
+           '(let* [answer (vector (record! :first) (let* [value (record! :second)] 2))] answer)
+           '(let* [answer (@callee 1 (let* [value (replace-callee!)] value))] answer)
+           '(let* [answer (do (record! :first)
+                             (let* [value (record! :second)] value)
+                             (record! :third))] answer)]]
+    (is (= (run-normalization source)
+           (run-normalization (inline/flatten-nested-lets source)))))
+  (let [source '(let* [answer [(record! :first) (let* [value (record! :second)] 2)]] answer)
+        result (run-normalization (inline/flatten-nested-lets source))]
+    (is (= {:value [:first 2] :trace [:first :second]} result)))
+  (let [source '(let* [answer (@callee 1 (let* [value (replace-callee!)] value))] answer)
+        result (run-normalization (inline/flatten-nested-lets source))]
+    (is (= {:value [:original '(1 2)] :trace [:replacement]} result))))
+
+(deftest default-wrapper-normalization-preserves-first-failure-and-formal-conversion
+  (doseq [source
+          ['(let* [answer [(throw (IllegalStateException. "first"))
+                          (let* [value (record! :second)] value)]] answer)
+           '(let* [answer (vector (aget (double-array 0) 0)
+                                 (let* [value (record! :second)] value))] answer)
+           ;; The ^long hint selects the primitive formal. Its implicit
+           ;; unboxing must fail BEFORE the second argument's lexical region.
+           '(let* [answer (Math/addExact ^long (identity nil)
+                                        (let* [value (record! :second)] (long 1)))] answer)]]
+    (let [original (run-normalization source)
+          actual (run-normalization (inline/flatten-nested-lets source))]
+      (is (class? (:error original)))
+      (is (empty? (:trace original)))
+      (is (= original actual)))))
 
 (deftest value-gradient-projection-indices-use-checked-constant-evidence
   (let [elements {'vg ['primal 'gradient]}]
