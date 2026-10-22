@@ -24,6 +24,8 @@
       (eval '(raster.core/deftm model [x :- Double] :- Double x))
       (let [v (ns-resolve scope 'model)
             table (:raster.core/dispatch-table (meta v))
+            captured-dispatcher @v
+            captured-target (:target-fn (first (get @table 1)))
             operation (symbol (str (ns-name scope)) "model")
             signature (inference/registered-call-signature operation '[long])
             inputs (atom {:static [] :values []})
@@ -49,10 +51,15 @@
                     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
         (is (nil? (inference/registered-call-signature operation '[long])))
         (is (thrown? clojure.lang.ExceptionInfo (v 3)))
+        (is (thrown? clojure.lang.ExceptionInfo (captured-dispatcher 3)))
+        (is (number? (captured-target 3))
+            "selected implementations are not revoked or unloaded")
         (is (identical? v (core/unregister! v)) "idempotent")
         (eval '(raster.core/deftm model [x :- Long y :- Long] :- Long x))
         (is (identical? v (ns-resolve scope 'model)))
         (is (= 7 (v 7 9)))
+        (is (= 7 (captured-dispatcher 7 9))
+            "captured generic dispatchers observe the same mutable table")
         (is (thrown? clojure.lang.ExceptionInfo (v 7)))))))
 
 (deftest templates-cannot-regenerate-unregistered-overloads
@@ -90,6 +97,22 @@
          (try (core/unregister! 'identity) nil
               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
   (is (= 4 (identity 4))))
+
+(deftest a-detached-generic-var-cannot-clear-the-live-registry
+  (with-scope
+    (fn [scope]
+      (eval '(raster.core/deftm model [x :- Long] :- Long x))
+      (let [detached (ns-resolve scope 'model)
+            old-table (:raster.core/dispatch-table (meta detached))]
+        (ns-unmap scope 'model)
+        (eval '(raster.core/deftm model [x :- Long] :- Long x))
+        (let [live (ns-resolve scope 'model)]
+          (is (not (identical? detached live)))
+          (is (identical? old-table (:raster.core/dispatch-table (meta live))))
+          (is (= :invalid-generic-function
+                 (try (core/unregister! detached) nil
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+          (is (= 3 (live 3))))))))
 
 (deftest empty-generics-replace-the-checkers-old-callable-signature
   (with-scope

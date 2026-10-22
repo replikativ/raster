@@ -20,7 +20,7 @@
       (:require [raster.core :refer [deftm ftm defvalue defabstract defval
                  specialize
                                      methods-of ambiguities print-methods
-                                     invoke prefer-method! remove-method!]]
+                                     invoke prefer-method! remove-method! unregister!]]
                 [raster.numeric :refer [+ - * / zero? min max abs sqrt pow
                                         mod rem quot
                                         bit-and bit-or bit-xor bit-not

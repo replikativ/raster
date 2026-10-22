@@ -1424,7 +1424,7 @@
     ;; A replacement generic must not inherit the old associative folding law.
     ;; register-method! intentionally inherits this flag during ordinary extension.
     (alter-meta! fn-var #(-> %
-                            (dissoc :raster.core/reducible)
+                            (dissoc :raster.core/reducible :no-inline)
                             (assoc :arglists nil :raster.compiler/host-only false)))
     (bump-compiler-definition-revision!)
     ;; Retain the empty table for future checker initialization, and replace
