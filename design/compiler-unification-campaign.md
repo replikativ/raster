@@ -264,6 +264,13 @@ qualify the broad draft for merge or establish resident training execution.
 
 ### October 21 DeepSeek inference reference integration
 
+The recovered full source review is retained locally in
+`.internal/deepseek-inference-requirements-20261021.md` (ignored, not a portable
+repository artifact). It records source-line evidence and the exact dirty-consumer
+boundary; the pinned requirements and acceptance gates below remain the tracked
+campaign record. Recovery rechecked pins without builds, model downloads or
+changes to pretrained-rstr.
+
 Read-only research verified the official [DeepInfer](https://github.com/deepseek-ai/DeepInfer)
 release and its exact dependency pins. Shallow sibling checkouts, without models,
 builds or submodule initialization, are available for reproducible source study:
@@ -296,6 +303,51 @@ real-weight training, durable publication or actual multi-host acceptance. The
 immediate continuation remains the local source/semantic ownership repair, then
 content-aware prepared replay and encoded/ragged composition qualification. No
 SM100, Ascend, model download or cloud dependency enters the hot development loop.
+
+### October 21 integral call-completion prerequisite and next construction gate
+
+PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
+Its shared bytecode completion emitter now represents actual Int/Long invocation
+parameter conversions without substituting Clojure checked casts. The distinction
+is observable: the original JVM Double-to-Int path saturates, whereas source
+`int` can throw. The campaign integration retains the separate reference-result
+context and its stricter AD refusal; merging this prerequisite changes no campaign
+execution admission by itself.
+
+PR #1561 is the separately reviewed consumer: original input outlining selects
+the contract from the actual Method Class, while the AD producer explicitly
+requires a floating completion and matching floating Method return. Targeted
+qualification passed 97 tests / 1,221 assertions in the bounded existing REPL;
+this is not a fresh-process or whole-draft result. Until its exact-head CI and
+merge are verified, it remains pending, not landed evidence.
+
+The next construction change must replace retrospective argument matching with
+completed slots at the shared inline builder. Its acceptance boundary is the
+whole selected call interval, not only a successfully evaluated allocation count:
+
+1. Authenticate the actual selected receiver, Method and each original operand
+   context. Logical scalar tags do not determine the physical completion recipe.
+2. Evaluate receiver, then **every** positional argument and completion once in
+   original order, including unused arguments, before entering the callee body.
+3. Substitute completed values, not uncompleted operands. Preserve original
+   return completion separately; an Object result and a primitive payload are
+   not interchangeable. Unrepresented return adaptation retains/refuses the call.
+4. Consume this construction through existing prefix/source-owner/scalar-compute
+   machinery. Do not introduce a call-frame interpreter or let a product/count
+   executor authorize an unclosed enclosing helper interval.
+5. Require complete coverage before executing any prefix effect. Controls must
+   cover a failing earlier conversion, unused throwing argument, wrong array
+   Class before an overflowing count, effects between count and constructor,
+   effects after allocation before helper return, later numerical arguments,
+   and omitted/reordered/duplicated/copied slot occurrences.
+
+First qualify original public primitive Long/literal inputs and already completed
+public arrays with independently checked runtime Class. CHECKCAST alone proves
+neither non-nullness nor safe access. Computed array arguments, helper delegation,
+return adaptation and resident producer/count correspondence remain explicit
+obligations until their complete intervals are represented. The existing two-
+equation training loss and softmax's scalar-after-reduction case are acceptance
+workloads, not reasons to bypass an unresolved interval.
 
 ### October 21 typed reduction identity and rewalk qualification
 
