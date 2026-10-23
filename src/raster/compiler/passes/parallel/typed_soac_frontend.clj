@@ -6130,10 +6130,15 @@
                     (let [projection (descriptor/direct-allocation-projection expr values)
                           constructor (:constructor projection)
                           helper-extent (when (:helper projection)
-                                          (descriptor/array-allocation-size constructor))]
+                                          (descriptor/array-allocation-size constructor))
+                          core-extent (descriptor/array-allocation-size expr)
+                          ;; aclone is an exact core copy primitive, not a size-only constructor
+                          ;; or a helper whose spelling can establish correspondence.
+                          core-copy? (and (some? (descriptor/core-array-copy-source expr))
+                                          (not (contains? util/*shadowing-locals* (first expr))))]
                       (when-let [extent (or (when (and helper-extent (length-expression? helper-extent))
                                              helper-extent)
-                                            (allocation-length expr))]
+                                            (when (or core-extent core-copy?) (allocation-length expr)))]
                         (cond-> {:destination sym :source-binding-id id
                                  :source-expression expr
                                  :extent (canonical-extent shape-equalities values extent)
@@ -6143,6 +6148,70 @@
                                             (declared-type array-types sym))}
                           (:helper projection) (assoc :source-projection projection)))))))
           descriptions)))
+
+(defn- source-storage-values
+  "Thread existing logical values through source bindings without inventing array capacity.
+   Alias facts preserve the complete value verbatim. They describe conditional logical storage,
+   not completion of a reference cast, a null check, or evaluation of a helper argument."
+  [descriptions array-types scalar-types source-scalar-types values shape-equalities]
+  (let [local-ids (set (map :sym descriptions))
+        initial-values
+        (reduce-kv (fn [known id dt]
+                     (if (contains? local-ids id) known
+                         (merge-value known id (tensor-value dt []) shape-equalities)))
+                   values scalar-types)]
+    (reduce
+     (fn [{:keys [values] :as state} {:keys [kind sym expr] :as description}]
+       (let [alias (when (and (= :scalar kind) (symbol? expr)) (get values expr))
+             array-dtype (declared-type array-types sym)
+             scalar-dtype (get source-scalar-types sym)
+             _ (when (and array-dtype scalar-dtype)
+                 (fail! :source-value-conflict
+                        "one source binding cannot be declared both array and scalar"
+                        {:id sym :array-dtype array-dtype :scalar-dtype scalar-dtype}))
+             alias? (and alias (or array-dtype scalar-dtype))
+             _ (when alias?
+                 (when-not (and (= :tensor (:kind alias))
+                                (= (dtype/canon (or array-dtype scalar-dtype))
+                                   (dtype/canon (:dtype alias)))
+                                (= (boolean array-dtype) (boolean (seq (:shape alias))))
+                                (or (nil? (get values sym)) (= alias (get values sym))))
+                   (fail! :source-value-conflict
+                          "a source alias must preserve the complete existing AbstractValue"
+                          {:id sym :source expr :source-value alias :first (get values sym)})))
+             allocations
+             (into []
+                   (filter
+                    (fn [{:keys [extent]}]
+                      ;; A retained declaration describes a carrier, not a completed value.
+                      ;; Even a core allocator cannot publish a later local extent early.
+                      (every? #(contains? values %)
+                              (filter #(or (contains? local-ids %)
+                                           (contains? source-scalar-types %))
+                                      (util/free-syms extent)))))
+                   (allocation-contracts [description] array-types source-scalar-types
+                                         values shape-equalities))
+             values (cond
+                      alias? (assoc values sym alias)
+                      (and (= :scalar kind) scalar-dtype (nil? array-dtype))
+                      (merge-value values sym (tensor-value scalar-dtype []) shape-equalities)
+                      :else values)
+             values
+             (reduce (fn [known {:keys [destination extent dtype]}]
+                       (let [prior (get known destination)]
+                         (if (and dtype
+                                  (or (nil? prior)
+                                      (and (= {:kind :plain} (:representation prior))
+                                           (nil? (:logical-layout prior))
+                                           (= 1 (count (:shape prior))))))
+                           (merge-value known destination
+                                        (if prior (assoc prior :shape [extent])
+                                            (tensor-value dtype [extent]))
+                                        shape-equalities)
+                           known)))
+                     values allocations)]
+         (-> state (assoc :values values) (update :allocations into allocations))))
+     {:values initial-values :allocations []} descriptions)))
 
 (defn- source-storage-analysis
   "Establish allocation-owned extents before a consumer can infer element shapes.
@@ -6159,21 +6228,12 @@
                   (if (and (= :scalar kind) scalar-dtype)
                     (assoc types sym scalar-dtype) types))
                 scalar-types descriptions)
-        allocations (allocation-contracts descriptions array-types source-scalar-types values
-                                          shape-equalities)
-        values (reduce (fn [known {:keys [destination extent dtype]}]
-                         (let [prior (get known destination)]
-                           (if (and dtype
-                                    (or (nil? prior)
-                                        (and (= {:kind :plain} (:representation prior))
-                                             (nil? (:logical-layout prior))
-                                             (= 1 (count (:shape prior))))))
-                             (merge-value known destination
-                                          (if prior (assoc prior :shape [extent])
-                                              (tensor-value dtype [extent]))
-                                          shape-equalities)
-                             known)))
-                       values allocations)]
+        {:keys [values allocations]}
+        (source-storage-values descriptions array-types
+                               (if (some? public-parameters)
+                                 (select-keys scalar-types public-parameters) scalar-types)
+                               source-scalar-types
+                               values shape-equalities)]
     {:descriptions (preserve-map-storage-inputs descriptions values)
      :values values :allocations allocations}))
 
@@ -6614,14 +6674,6 @@
                                       (update :extent #(canonical-extent shape-equalities values %))
                                       (assoc :dtype (:dtype (get values (:destination allocation))))))
                                 allocations)
-              ;; An allocation-only public dimension need not appear in a numerical equation.
-              ;; Retain its declared type now; inserting the initializer later makes it an
-              ;; ordinary operation input. Do not infer a missing declaration from its name.
-              values (reduce (fn [values {:keys [extent]}]
-                               (if-let [declared (and (symbol? extent)
-                                                     (get source-scalar-types extent))]
-                                 (merge-value values extent (tensor-value declared []) shape-equalities)
-                                 values)) values allocations)
               ;; Helper correspondence requires the completed retained argument
               ;; environment, including allocation-only scalar parameters.
               allocations (mapv (fn [allocation]

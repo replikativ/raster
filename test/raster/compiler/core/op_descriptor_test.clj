@@ -10,6 +10,16 @@
   (is (not (descriptor/cast-op? 'other/unchecked-float)))
   (is (nil? (descriptor/cast-floating-narrowing 'clojure.core/double))))
 
+(deftest core-copy-identity-is-not-a-nominal-allocation-classification
+  (let [operand (with-meta 'x {:tag 'floats})]
+    (is (identical? operand (descriptor/core-array-copy-source
+                            (list 'clojure.core/aclone operand)))))
+  (doseq [expression ['(aclone x) '(other/aclone x)
+                      '(clojure.core/aclone x y)
+                      (with-meta '(.invk fake x) {:raster.op/original 'clojure.core/aclone})
+                      (with-meta '(clojure.core/aclone x) {:raster.op/lexical-callee true})]]
+    (is (nil? (descriptor/core-array-copy-source expression)))))
+
 (deftest allocation-argument-literals-must-have-exact-primitive-carriers
   (is (= {:dtype :long :shape []} (descriptor/direct-allocation-argument-value 1 {})))
   (is (= {:dtype :float :shape []} (descriptor/direct-allocation-argument-value (float 1) {})))

@@ -47,6 +47,109 @@
       (is (nil? (:raster.type/tag (meta (second expression)))))
       (is (= 'long (:raster.type/tag (meta (second (:expr description)))))))))
 
+(deftest allocation-helpers-require-definition-correspondence
+  (with-redefs [descriptor/direct-allocation-projection (fn [& _] nil)]
+    (doseq [expression ['(raster.arrays/alloc-like x n)
+                        (with-meta '(.invk forged-helper x n)
+                          {:raster.op/original 'raster.arrays/alloc-like})]]
+      (is (empty? (#'frontend/allocation-contracts
+                   [{:kind :scalar :id 0 :sym 'out :expr expression}]
+                   {'x :float 'out :float} {'n :long}
+                   {'x (av/tensor {:dtype :float :shape ['n]})} {})))))
+  (is (= ['n]
+         (mapv :extent (#'frontend/allocation-contracts
+                        [{:kind :scalar :id 0 :sym 'out :expr '(clojure.core/float-array n)}]
+                        {'out :float} {'n :long} {} {})))))
+
+(deftest source-storage-aliases-preserve-complete-values-in-order
+  (let [value (assoc (av/tensor {:dtype :float :shape [2 3]})
+                     :logical-layout {:kind :strided}
+                     :ownership {:kind :owned})
+        descriptions [{:kind :scalar :id 0 :sym 'a :expr 'x}
+                      {:kind :scalar :id 1 :sym 'b :expr 'a}]
+        analyze (fn [arrays scalars values]
+                  (#'frontend/source-storage-values descriptions arrays {} scalars values {}))
+        arrays {'x :float 'a :float 'b :float}
+        result (analyze arrays {} {'x value})]
+    (is (identical? value (get-in result [:values 'a])))
+    (is (identical? value (get-in result [:values 'b])))
+    (is (empty? (:values (analyze arrays {} {})))
+        "dtype declarations alone cannot supply a missing public capacity")
+    (doseq [[arrays scalars values]
+            [[(assoc arrays 'b :double) {} {'x value}]
+             [(dissoc arrays 'b) {'b :float} {'x value}]
+             [arrays {'b :float} {'x value}]
+             [arrays {} {'x value 'b (assoc value :shape [6])}]
+             [arrays {} {'x value 'b (dissoc value :logical-layout)}]]]
+      (is (= :source-value-conflict
+             (try (analyze arrays scalars values) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest source-storage-publishes-local-scalars-only-after-their-binding
+  (let [seen (atom [])
+        descriptions [{:kind :scalar :id 0 :sym 'before :expr '(raster.arrays/alloc-like x size)}
+                      {:kind :scalar :id 1 :sym 'size :expr '(clojure.core/* m n)}
+                      {:kind :scalar :id 2 :sym 'after :expr '(raster.arrays/alloc-like x size)}]
+        x (av/tensor {:dtype :float :shape ['m 'n]})
+        result
+        (with-redefs [descriptor/direct-allocation-projection
+                      (fn [expression values]
+                        (when (= 'raster.arrays/alloc-like (first expression))
+                          (swap! seen conj values)
+                          (when (and (get values 'x) (get values 'size))
+                            {:constructor '(clojure.core/float-array size)
+                             :helper {:test-correspondence true}})))]
+          (#'frontend/source-storage-values descriptions
+           {'x :float 'before :float 'after :float}
+           {'m :long 'n :long 'size :long}
+           {'m :long 'n :long 'size :long}
+           {'x x} {}))]
+    (is (= 2 (count @seen)))
+    (is (nil? (get (first @seen) 'size)))
+    (is (= [] (:shape (get (second @seen) 'size))))
+    (is (= :long (:dtype (get (second @seen) 'size))))
+    (is (identical? x (get (second @seen) 'x)))
+    (is (= ['after] (mapv :destination (:allocations result))))
+    (is (= ['size] (get-in result [:values 'after :shape])))))
+
+(deftest core-allocation-cannot-publish-a-future-extent-from-its-declaration
+  (let [result (#'frontend/source-storage-values
+                [{:kind :scalar :id 0 :sym 'before :expr '(clojure.core/float-array size)}
+                 {:kind :scalar :id 1 :sym 'size :expr '(clojure.core/* m n)}
+                 {:kind :scalar :id 2 :sym 'after :expr '(clojure.core/float-array size)}]
+                {'before :float 'after :float}
+                {'m :long 'n :long 'size :long}
+                {'m :long 'n :long 'size :long} {} {})]
+    (is (= ['after] (mapv :destination (:allocations result))))
+    (is (nil? (get-in result [:values 'before])))
+    (is (= ['size] (get-in result [:values 'after :shape])))))
+
+(deftest scalar-declarations-outside-the-public-interface-do-not-become-entry-values
+  (let [analyze (fn [parameters]
+                  (#'frontend/source-storage-analysis
+                   [['out '(clojure.core/float-array n)]]
+                   :float {'out :float} {'n :long} false {} {} parameters))]
+    (is (empty? (:allocations (analyze []))))
+    (is (nil? (get-in (analyze []) [:values 'n])))
+    (is (= [] (get-in (analyze '[n]) [:values 'n :shape])))
+    (is (= ['out] (mapv :destination (:allocations (analyze '[n])))))))
+
+(deftest explicit-core-copy-retains-its-source-shape-without-inventing-input-capacity
+  (let [analyze (fn [expression]
+                  (#'frontend/source-storage-values
+                   [{:kind :scalar :id 0 :sym 'out :expr expression}]
+                   {'input :float 'out :float} {} {} {} {}))
+        expression '(clojure.core/aclone input)
+        result (analyze expression)]
+    (is (= '[(clojure.core/alength input)] (get-in result [:values 'out :shape])))
+    (is (nil? (get-in result [:values 'input])))
+    (is (identical? expression (get-in result [:allocations 0 :source-expression])))
+    (is (= :copy (get-in result [:allocations 0 :initialization])))
+    (is (empty? (:allocations (analyze '(aclone input))))
+        "an unqualified spelling is not authenticated in the compiler's ambient namespace")
+    (is (empty? (:allocations
+                 (analyze (with-meta expression {:raster.op/lexical-callee true})))))))
+
 (deftest late-host-integral-boundaries-require-public-scalar-dependency-closure
   (let [checked (with-meta 'checked {:raster.type/tag 'int})
         input (with-meta 'n {:raster.type/tag 'long})
@@ -891,14 +994,16 @@
             (get-in (dialect/facts program) [:attributes :allocations])))]
     (doseq [[allocation initialization]
             [['(clojure.core/float-array n) :zero]
-             ['(raster.math/zeros-like input n) :zero]
-             ['(raster.math/alloc-like input n) :unspecified]
              ['(clojure.core/aclone input) :copy]]]
       (is (= [{:destination 'output :source-binding-id 0
                :source-expression allocation
                :extent 'n
                :initialization initialization :dtype :float}]
              (contracts allocation))))
+    ;; Allocator spelling is not a definition-backed helper contract. Positive
+    ;; selected-helper coverage lives in allocation-frontend-source-test.
+    (is (empty? (contracts '(raster.math/zeros-like input n))))
+    (is (empty? (contracts '(raster.math/alloc-like input n))))
     (is (empty? (contracts '(clojure.core/float-array n 7))))
     (is (empty? (contracts '(clojure.core/float-array [1.0 2.0]))))))
 
@@ -3047,10 +3152,10 @@
              (get-in (analyze [[(with-meta 'capacity {:raster.type/tag tag}) expression]
                                ['a allocation]] scalar-types)
                      [:values 'a :shape]))))
-    (is (= '[capacity]
-           (get-in (analyze (vec (reverse pairs)) {'rows :long 'width :long})
-                   [:values 'a :shape]))
-        "a future definition cannot justify an earlier allocation")
+    (let [reversed (analyze (vec (reverse pairs)) {'rows :long 'width :long})]
+      (is (nil? (get-in reversed [:values 'a])))
+      (is (empty? (:allocations reversed))
+          "a future definition cannot justify an earlier allocation"))
     (let [self-length '(clojure.core/alength a)
           self-pairs [[(with-meta 'capacity {:raster.type/tag 'long}) self-length]
                       ['a allocation]]]

@@ -75,6 +75,15 @@
   [expression]
   (array-alloc-size expression))
 
+(defn core-array-copy-source
+  "The operand of an exact qualified primitive clone, not nominal helper classification.
+   This retains a producer expression; it proves neither successful evaluation nor capacity."
+  [expression]
+  (when (and (seq? expression) (= 2 (count expression))
+             (= 'clojure.core/aclone (first expression))
+             (not (:raster.op/lexical-callee (meta expression))))
+    (second expression)))
+
 (defn- param-derived?
   "True if expr depends only on param-set symbols (transitively through bindings)."
   [expr param-set binding-map environment]

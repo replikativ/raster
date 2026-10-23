@@ -28,6 +28,35 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 ordered-storage checkpoint: source storage analysis now threads actual
+AbstractValues through bindings in source order. Public scalar declarations may
+supply scalar carriers, but later local declarations cannot authorize an earlier
+allocation. Exact aliases preserve the complete existing value, including shape,
+layout and ownership; conflicting kind/dtype or an altered destination value is
+rejected. Missing public array facts do not acquire a synthesized capacity.
+
+Non-core allocation helpers now require the selected definition's direct constructor
+projection. A recognizable allocator name or forged operation metadata is insufficient.
+Exact core size-only constructors and primitive `aclone` retain their contracts.
+The late allocation-dimension declaration fallback has been removed: an allocation
+consumer cannot manufacture its own missing scalar value. The former reversed-binding
+capacity test now requires refusal instead of retaining an unavailable future extent.
+Positive helper coverage uses an actual independently compiled `deftm` definition.
+
+Focused storage checks pass eight tests / 57 assertions; the real selected-helper
+namespace passes three tests / 19 assertions and the shared descriptor namespace
+passes ten tests / 157 assertions. Prepared-module controls pass 14 tests / 155
+assertions. The full frontend namespace reports 151 tests / 953 assertions with
+the same remaining 18 failures and one error.
+The actual generated training capture still has six declined bindings and no
+allocation contracts, and remains unadmitted. These are not waived gates.
+
+Compound helper-size extraction remains pending. Generic ANF naming is not yet safe:
+moving a size before a helper may move it ahead of the exemplar's reference adaptation.
+The phase must join the exact input/body completion spine to its ordered runtime
+preflight before such extraction can be admitted. Logical AV propagation alone does
+not prove null behavior, CHECKCAST completion, or argument conversion order.
+
 October 22 description-boundary checkpoint: the existing frontend now separates
 its one description/storage analysis from continuation through unchanged admission
 and equation construction. Both continuations remain private. Each description

@@ -2,12 +2,46 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core]
             [raster.compiler.core.method-entry :as entry]
-            [raster.compiler.core.op-descriptor :as descriptor]))
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]))
 
 (defmacro allocate-body [n] `(float-array ~n))
 (core/deftm allocate-helper [ref :- (Array float) n :- Long] :- (Array float)
   (allocate-body n))
 (core/deftm scalar-helper [x :- Double] :- Double (+ x 1.0))
+(core/deftm storage-helper [ref :- (Array float) n :- Long] :- (Array float)
+  (float-array n))
+
+(deftest ordered-storage-facts-reach-the-actual-selected-allocation-helper
+  (let [v (core/resolve-deftm-var #'storage-helper {:dtype :float})
+        implementation (symbol (str (:ns (meta v))) (str (:name (meta v)) "-impl"))
+        _ (core/ensure-bytecode-implementation!
+           (ns-resolve (:ns (meta v)) (symbol (name implementation))))
+        call (with-meta (list '.invk implementation 'alias 'size)
+               {:raster.op/original 'raster.compiler.allocation-frontend-source-test/storage-helper})
+        descriptions [{:kind :scalar :id 0 :sym 'alias :expr 'x}
+                      {:kind :scalar :id 1 :sym 'size :expr '(clojure.core/* m n)}
+                      {:kind :scalar :id 2 :sym 'out :expr call}]
+        x (av/tensor {:dtype :float :shape ['m 'n]})
+        analyze (fn [descriptions values]
+                  (#'frontend/source-storage-values descriptions
+                   {'x :float 'alias :float 'out :float}
+                   {'m :long 'n :long}
+                   {'m :long 'n :long 'size :long} values {}))
+        result (analyze descriptions {'x x})
+        allocation (first (:allocations result))]
+    (is (= 1 (count (:allocations result))))
+    (is (= 'out (:destination allocation)))
+    (is (= implementation (get-in allocation [:source-projection :helper :implementation])))
+    (is (= ['alias 'size] (get-in allocation [:source-projection :helper :arguments])))
+    (is (identical? call (:source-expression allocation)))
+    (is (identical? x (get-in result [:values 'alias])))
+    (is (= :float (get-in result [:values 'out :dtype])))
+    (is (empty? (:allocations (analyze descriptions {})))
+        "array element declarations do not invent exemplar capacity")
+    (is (empty? (:allocations (analyze (subvec (vec descriptions) 2) {'x x 'alias x})))
+        "a future or missing scalar binding cannot be supplied by helper shape inference")))
 
 (deftest refused-helper-analysis-does-not-become-a-source-import
   (let [v (core/resolve-deftm-var #'scalar-helper {:dtype :double})
