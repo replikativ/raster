@@ -912,12 +912,36 @@
                                                 {:scalar-types (:scalar-types options)}))
         promoted (route/promote-program parallel options)
         shape-equation (first (:equations promoted))
-        prefix-symbols (mapv :symbol (get-in promoted [:attributes :invocation-plan :steps]))]
+        plan (get-in promoted [:attributes :invocation-plan])
+        prefix-symbols (mapv :symbol (:steps plan))
+        shared (first (invocation/source-order plan promoted))]
     (is (= '[size] (:results shape-equation)))
     (is (true? (get-in shape-equation [:attributes :graph-shape-definition])))
     (is (true? (get-in shape-equation [:attributes :host-only])))
+    (is (empty? (:operations shape-equation)))
+    (is (identical? (:algorithm (first (:equations parallel))) (:algorithm shape-equation)))
+    (is (identical? (:source (first (:equations parallel))) (:source shape-equation)))
+    (is (= (get-in parallel [:equations 0 :attributes :required-evaluation])
+           (get-in shape-equation [:attributes :required-evaluation])))
+    (is (= (:id shape-equation) (:equation shared)))
+    (is (= 1 (count (filter #(= 'size (:symbol %)) (:steps plan)))))
+    (is (= (:id (first (:steps plan))) (:invocation-step shared)))
     (is (some #{'size} prefix-symbols)
-        "the same pure size is materialized before allocation and retained as graph proof")))
+        "the checked size is materialized before allocation and retained as graph proof")
+    (let [calls (atom [])
+          evaluate (fn [step operands]
+                     (swap! calls conj (:symbol step))
+                     (typed-scalar/evaluate-invocation-step *ns* step operands))]
+      (materialization/materialize plan [(float-array 1) 1 1] evaluate)
+      (is (= '[size] @calls))
+      (reset! calls [])
+      (is (thrown? ArithmeticException
+                   (materialization/materialize plan [(float-array 1) Long/MAX_VALUE 2] evaluate)))
+      (is (= '[size] @calls) "overflow precedes allocation and has one evaluator"))
+    (doseq [changed [(assoc-in plan [:steps 0 :region]
+                              '(lambda [nrows width] (region [] [(clojure.core/* nrows width 2)])))
+                     (assoc-in plan [:steps 0 :symbol] 'foreign-size)]]
+      (is (thrown? clojure.lang.ExceptionInfo (invocation/source-order changed promoted))))))
 
 (defn- retained-length-leaves [source]
   (walk/postwalk
@@ -1459,21 +1483,29 @@
         promoted (route/promote-program parallel options)
         plan (get-in promoted [:attributes :invocation-plan])
         prefix-steps (:steps plan)
-        checked-step (first (filter #(= 'checked (:symbol %)) prefix-steps))]
-    (is (= '[map]
+        checked-step (first (filter #(= 'checked (:symbol %)) prefix-steps))
+        proof-equation (first (:equations promoted))
+        shared (first (filter #(= 'checked (:binding %)) (invocation/source-order plan promoted)))]
+    (is (= '[scalar map]
            (mapv #(soac/operation-kind (first (soac/equations (:algorithm %))))
                  (:equations promoted))))
     (is (invocation/scalar-compute? checked-step))
     (is (= 1 (count (filter #(= 'checked (:symbol %)) prefix-steps))))
-    (is (some #{'checked} (:inputs promoted))
-        "the attested invocation result is the map's explicit typed scalar input")
+    (is (not (some #{'checked} (:inputs promoted))))
+    (is (true? (get-in proof-equation [:attributes :host-only])))
+    (is (true? (get-in proof-equation [:attributes :graph-shape-definition])))
+    (is (empty? (:operations proof-equation)))
+    (is (identical? (:algorithm (first (:equations parallel))) (:algorithm proof-equation)))
+    (is (= (:id checked-step) (:invocation-step shared)))
+    (is (= (:id proof-equation) (:equation shared))
+        "the one source binding owns both its evaluator and nonexecuting proof term")
     (let [evaluations (atom 0)
           evaluator (fn [step _]
                       (swap! evaluations inc)
                       {:type (get-in step [:value :dtype]) :value 1})]
       (materialization/materialize plan [(double-array 1) 1] evaluator)
       (is (= 1 @evaluations)
-          "the checked shape is owned by one invocation ScalarCompute, not a host equation too"))
+          "the checked shape has one ScalarCompute evaluator; its host equation has no operations"))
     (let [out (double-array [0.0])
           evaluations (atom 0)
           checked-int (fn [step operands]

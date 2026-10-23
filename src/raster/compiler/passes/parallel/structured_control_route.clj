@@ -295,9 +295,9 @@
                         host? (host-invocation-equation? available program-outputs
                                                            shape-scalars source-prefix?
                                                            required? equation)
-                        ;; Shape-required checked values become public invocation inputs. Other
-                        ;; required checks retain a host-only equation; only explicit shape facts
-                        ;; grant graph-shape proof status.
+                        ;; Shape definitions retain their typed proof term.
+                        ;; Other required checks retain a host-only equation
+                        ;; without acquiring graph-shape proof status.
                         graph-shape? (true? (get-in equation
                                                     [:attributes :graph-shape-definition]))
                         ;; A preceding exceptional scalar which stays in the device equation
@@ -309,12 +309,17 @@
                                          (not (effects/removable-expr? expression))))
                                 (assoc :source-prefix? false))]
                     (cond
-                      (and host? exceptional-shape?)
-                      ;; The checked algebra moves, with its typed closed region, into the
-                      ;; InvocationPlan ScalarCompute. Removing this equation makes the value an
-                      ;; explicit program input and leaves the attested plan as its sole evaluator.
+                      (and host? (or graph-shape? exceptional-shape?))
+                      ;; Keep the original typed shape algebra as a proof term.
+                      ;; The matching InvocationPlan ScalarCompute is still its
+                      ;; sole evaluator; slicing/scheduling must not lose the
+                      ;; checked product's successful-return equality witness.
                       (-> state
-                          (update :hoisted conj equation)
+                          (update :retained conj
+                                  (-> equation
+                                      (assoc :operations [])
+                                      (update :attributes assoc :host-only true
+                                              :graph-shape-definition true)))
                           (update :available into (:results equation)))
 
                       (and host? required? (not (effects/removable-expr? expression)))
@@ -327,22 +332,9 @@
                                       (update :attributes assoc :host-only true)))
                           (update :available into (:results equation)))
 
-                      (and host? (not graph-shape?))
+                      host?
                       (-> state
                           (update :hoisted conj equation)
-                          (update :available into (:results equation)))
-
-                      (and host? graph-shape?)
-                      ;; Allocation consumes this scalar on the host and target narrowing
-                      ;; consumes its exact typed equation as proof. Keep one explicit host-only
-                      ;; equation in program order; the invocation prefix materializes the same
-                      ;; pure definition before allocating storage.
-                      (-> state
-                          (update :retained conj
-                                  (-> equation
-                                      (assoc :operations [])
-                                      (update :attributes assoc :host-only true
-                                              :graph-shape-definition true)))
                           (update :available into (:results equation)))
 
                       :else

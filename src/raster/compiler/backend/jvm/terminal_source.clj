@@ -247,6 +247,19 @@
                             (static-call clojure.lang.Numbers
                                          (source-arithmetic/numbers-method-name (name operation))
                                          (mapv :carrier arguments) (mapv :source arguments))))
+                        (and typed-context? (= 'clojure.core/quot operation))
+                        (do
+                          (intrinsic-current! v operation)
+                          ;; This exact overload matches both core's inline and
+                          ;; the typed emitter's LDIV, including MIN/-1 and /0.
+                          ;; Int, mixed, floating and Object inputs do not share
+                          ;; that correspondence and remain outside this rule.
+                          (when-not (and (= 2 (count arguments))
+                                         (every? #(= Long/TYPE (:carrier %)) arguments))
+                            (fail! "terminal quotient needs its exact Long operand carriers"
+                                   {:head head :carriers (mapv :carrier arguments)}))
+                          (static-call clojure.lang.Numbers "quotient"
+                                       [Long/TYPE Long/TYPE] (mapv :source arguments)))
                         (or (:macro metadata) (:inline metadata) (nil? v))
                         (fail! "terminal call has no owned non-expanding projection" {:head head})
                         typed-context?
@@ -407,8 +420,8 @@
   "Project one closed scalar fragment from actual physical body-entry facts.
    Parameters carry :symbol and actual :carrier Class, never a logical dtype.
    Only checked Long arithmetic, explicit Int/Long conversions over primitive
-   integral values, and the existing Double arithmetic/casts have
-   source/typed-bytecode correspondence here. Long division, unknown helpers,
+   integral values, exact Long quotients, and the existing Double arithmetic/casts
+   have source/typed-bytecode correspondence here. Other division, unknown helpers,
    unproved input conversions and buffer-shaped ports refuse. This is source
    projection, not proof that the surrounding typed region's coercions agree."
   [expression parameters source-ns source-policy]

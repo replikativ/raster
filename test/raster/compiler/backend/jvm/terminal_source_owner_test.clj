@@ -3,7 +3,9 @@
             [raster.core :as core]
             [raster.compiler.backend.jvm.source-owner :as owner]
             [raster.compiler.backend.jvm.terminal-source :as terminal]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
@@ -32,6 +34,45 @@
                           (fn [params body] (list 'fn* params body))
                           (merge projection {:source-policy {:unchecked-math false}
                                              :source-ns (the-ns 'raster.compiler.backend.jvm.terminal-source-owner-test)})))
+
+(deftest long-quotient-projection-matches-core-and-actual-bytecode
+  (let [source-ns (the-ns 'raster.compiler.backend.jvm.terminal-source-owner-test)
+        expression '(clojure.core/quot left right)
+        ports [{:symbol 'left :carrier Long/TYPE} {:symbol 'right :carrier Long/TYPE}]
+        projection (traced-scalar expression ports :typed-scalar)
+        execute (compile-traced projection)
+        interface (types/ensure-fn-interface! '[long long])
+        {:keys [implementation]}
+        (core/emit-owned-bytecode!
+         bytecode/compile-typed-impl! "raster.compiled.LongQuotientParity"
+         '[left right] '[long long] 'long [expression] source-ns (:iface-name interface) 'long-quotient-parity)
+        observe (fn [f] (try [:value (f)] (catch ArithmeticException _ [:error ArithmeticException])))]
+    (is (= Long/TYPE (get-in projection [:result-facts :carrier])))
+    (let [method (some #(when (= "quotient" (.getName ^java.lang.reflect.Method %)) %)
+                       (:methods projection))]
+      (is (= clojure.lang.Numbers (.getDeclaringClass ^java.lang.reflect.Method method)))
+      (is (= [Long/TYPE Long/TYPE] (vec (.getParameterTypes ^java.lang.reflect.Method method)))))
+    (is (= 2 ((compile-traced (traced-scalar '(quot left right) ports :typed-scalar)) [5 2])))
+    (doseq [[left right] [[5 2] [-5 2] [5 -2] [-5 -2] [0 -1]
+                         [Long/MIN_VALUE 1] [Long/MIN_VALUE -1] [Long/MAX_VALUE 2]
+                         [Long/MAX_VALUE Long/MAX_VALUE] [1 0] [0 0] [Long/MIN_VALUE 0]]]
+      (is (= (observe #(quot left right))
+             (observe #(implementation left right))
+             (observe #(execute [left right])))
+          (str "exact Long quotient boundary: " left " / " right)))
+    (doseq [carriers [[Integer/TYPE Integer/TYPE] [Long/TYPE Integer/TYPE]
+                      [Float/TYPE Float/TYPE] [Double/TYPE Double/TYPE] [Object Object]]]
+      (is (= :unclosed-terminal-source-projection
+             (reason #(traced-scalar expression (mapv (fn [port carrier] (assoc port :carrier carrier))
+                                                      ports carriers) :typed-scalar)))))
+    (is (= :unclosed-terminal-source-projection
+           (reason #(traced-scalar expression ports :clojure-source))))
+    (doseq [expression ['(quot left) '(quot left right right)]]
+      (is (= :unclosed-terminal-source-projection
+             (reason #(traced-scalar expression ports :typed-scalar)))))
+    (with-redefs [clojure.core/quot (fn [& _] 99)]
+      (is (= :terminal-intrinsic-definition-mismatch
+             (reason #(traced-scalar expression ports :typed-scalar)))))))
 
 (deftest scalar-trace-retains-exact-occurrences-and-selected-method-plans
   (let [expression '(clojure.core/+ left (clojure.core/* right 2.0))

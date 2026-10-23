@@ -10176,3 +10176,34 @@ CI remained red: unit training composition has two equation-first coverage
 errors; OpenCL reports one failure and twenty errors across training, PDE/AMR,
 effect/control and checked-stage boundaries. These are unresolved campaign
 obligations, not accepted skips or permission to merge.
+
+### Keep checked shape algebra through scheduling (2026-10-22)
+
+The indexed-attention CI failure exposed a lost proof boundary: promotion moved
+a checked allocation-size computation into `InvocationPlan` and removed its typed
+equation. Logical footprint validation and later equation slicing could no longer
+prove the same size. Promotion now retains that original algorithm/source/value
+evidence as an empty-operation, host-only graph-shape equation, using the existing
+representation for shape proofs. Its shared source-order entry still has exactly
+one `ScalarCompute` evaluator. Overflow and earlier source failures remain ordered
+before allocation; no evaluation is duplicated. The pure and checked shape cases
+share one retention branch. Experimental extra invocation-proof queries were
+removed rather than introducing a second proof route or synthetic equations.
+
+The resulting public indexed compilation proceeds to the existing ordered host
+executor. Its Long head-dimension quotient now has an exact typed-only projection
+through `Numbers.quotient(long,long)` and the original core intrinsic snapshot.
+Primitive Long operands are required; Int, mixed, floating, Object, wrong-arity
+and ordinary-source contexts remain refused. This is not GPU division admission.
+Core, actual typed bytecode and projected JVM checks cover sign/truncation,
+MIN/-1, zero divisors, Method identity and intrinsic replacement. Adding this
+bootstrap assumption requires a fresh compiler process, not a snapshot refresh.
+The complete generated-training import and all seven CI gates remain obligations.
+
+Qualification: the fresh single capped REPL passes the Long quotient parity
+probe; the complete terminal-source ownership namespace passes 31 tests / 441
+assertions, and four focused shape-order/overflow tests pass 78 assertions.
+The public indexed reference roundtrip passes 27 assertions on Intel Arc OpenCL
+and 27 on Level Zero, including repeated execution at edge counts 4, 1 and 0
+against the independent segmented-reduction reference. No performance claim or
+broader training/PDE coverage is inferred from these checks.
