@@ -5,6 +5,7 @@
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.generated-body :as generated]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -329,6 +330,34 @@
            (with-redefs [bytecode/retained-input-body-context
                          (fn [& arguments] (update-in (apply query arguments) [:locals formal :slot] inc))]
              (is (nil? (#'module/input-port-origin joined current final formal physical))))))))))
+
+(deftest real-prepared-allocations-compose-without-fabricating-exemplar-values
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           view (module/view phase source)
+           joined (first (:import-origins view))
+           roots (filterv :argument-construction (get-in joined [:call :root-bindings]))]
+       (is (= 3 (count roots)))
+       (doseq [root roots]
+         (let [inputs (mapv (fn [argument]
+                              (module/input-occurrence
+                               phase source (get-in joined [:binding-origins (:call-binding-index argument)
+                                                           :origins 0 :binding])))
+                            (get-in root [:argument-construction :arguments]))
+               facts (into {} (map (fn [input]
+                                    [(first (:binding input))
+                                     {:carrier (get-in input [:argument :completion :parameter-carrier])}])) inputs)
+               [_ expression] (get-in joined [:binding-origins (:call-binding-index root) :origins 0 :binding])
+               projection (descriptor/direct-allocation-projection expression {} facts)
+               completed-size (first (:binding (second inputs)))]
+           (is (every? some? inputs))
+           (is (= (list 'clojure.core/float-array completed-size) (:constructor projection)))
+           (is (= 'raster.arrays/zeros-like
+                  (get-in projection [:helper :definition :delegation :operation])))))
+       (is (false? (:admitted? (module/view phase source))))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
 
 (deftest staged-input-ports-execute-the-original-size-region
   (entry/call-with-definition-inputs

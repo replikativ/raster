@@ -173,10 +173,9 @@
 
 (deftm alloc-like "Allocate a zero-initialized array of length n matching ref's element type."
   (All [T] [ref :- (Array T), n :- Long] :- (Array T)
-  ;; Body uses T which gets substituted to concrete type at specialization.
-  ;; double → (double-array n), float → (float-array n), etc.
-  ;; We need concrete impls since array constructors aren't polymorphic in JVM.
-  ;; Workaround: register concrete overloads directly.
+  ;; Specialization selects zeros-like's concrete element-type overload.
+  ;; Keep this as ordinary typed forwarding; allocation analysis composes the
+  ;; selected definitions rather than assigning special meaning to this name.
        (zeros-like ref n)))
 
 ;; ================================================================

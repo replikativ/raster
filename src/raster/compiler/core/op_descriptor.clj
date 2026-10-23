@@ -870,6 +870,76 @@
       (and value (not= logical physical)) nil
       :else physical)))
 
+(declare direct-allocation-projection-in-context)
+
+(defn- forwarding-allocation-definition
+  "Compose exact, physically authenticated identity forwarding to a constructor.
+   Only a single returned call forwarding every formal once in source order is
+   covered. The original outer input checks remain the caller's obligations.
+   Matching completed physical inputs and the known leaf result make the nested
+   parameter/return adaptations total, including nullable array references."
+  [frontend selected visited]
+  (let [body (:body frontend)
+        parameters (get-in frontend [:source-entry :params])
+        tags (get-in frontend [:source-entry :tags])
+        call (when (= 1 (count body)) (first body))
+        {:keys [dispatch? lexical-callee semantic-op implementation-op arguments]} (call-description call)]
+    (when (and dispatch? (not lexical-callee) (symbol? implementation-op) (namespace implementation-op)
+               (vector? parameters) (= parameters arguments)
+               (= (count parameters) (count (distinct parameters))))
+      (let [operation (or semantic-op (mangled/impl->op implementation-op))
+            inner (method-entry/selected-parameter-carriers operation implementation-op (count arguments))
+            entry (method-entry/frontend-body-entry-carriers frontend (get-in frontend [:source-entry :source-var]))
+            observed (method-entry/frontend-completed-invocation-context frontend call)
+            bridge (method-entry/frontend-reference-return-bridge frontend)
+            carriers (:parameter-carriers selected)
+            method (:method observed)
+            compute (:compute-method bridge)
+            locals (get-in bridge [:body-context :locals])]
+        (when (and inner entry observed bridge
+                   (= parameters (:parameters entry))
+                   (= carriers (:parameter-carriers inner)
+                      (mapv #(get-in entry [:parameter-facts % :carrier]) parameters))
+                   (= Object (:result-carrier selected) (:result-carrier inner) (:return-carrier observed))
+                   (instance? java.lang.reflect.Method method)
+                   (not (.isVarArgs ^java.lang.reflect.Method method))
+                   (= method (:invocation-method inner))
+                   (= (:invocation-method selected) (:invocation-method bridge))
+                   (instance? java.lang.reflect.Method compute)
+                   (= carriers (vec (.getParameterTypes ^java.lang.reflect.Method compute)))
+                   (identical? (get-in selected [:definition :entry :typed-impl]) (:implementation frontend))
+                   (identical? (:implementation frontend) (:implementation bridge))
+                   (= :global-typed-indy (:invocation-mode observed))
+                   (= implementation-op (:receiver observed) (get-in observed [:receiver-input :operand]))
+                   (empty? (get-in observed [:receiver-input :ports]))
+                   (= (count parameters) (count (:inputs observed)) (count (:input-completions observed)))
+                   (every? true?
+                           (map (fn [parameter carrier input completed]
+                                  (let [port (get locals parameter)]
+                                    (and (= parameter (:operand input))
+                                         (identical? (:operand input) (:operand completed))
+                                         (= {parameter port} (:ports input))
+                                         (= carrier (:parameter-carrier completed))
+                                         (if (.isPrimitive ^Class carrier)
+                                           (and (= :identity (:adaptation completed))
+                                                (= (:type port) (:emitted-type completed)))
+                                           (and (= :checkcast (:adaptation completed))
+                                                (= :ref (:type port) (:emitted-type completed))
+                                                (= carrier (:reference-class port)))))))
+                                parameters carriers (:inputs observed) (:input-completions observed))))
+          (let [facts (zipmap parameters (map #(hash-map :carrier %) carriers))
+                projection (direct-allocation-projection-in-context call {} facts visited)
+                constructor (:constructor projection)
+                result-class (some (fn [[_ row]]
+                                     (when (= (first constructor) (:jvm-array-constructor row))
+                                       (Class/forName (:jvm-array-class-name row)))) dtype/dtype-info)]
+            (when (and (:helper projection) result-class
+                       (= result-class (:body-return-carrier bridge)))
+              ;; Only semantic correspondence data leaves this query. Actual
+              ;; Methods/modules stay in the collector's original producer history.
+              {:parameters parameters :parameter-tags tags :constructor constructor
+               :delegation (:helper projection)})))))))
+
 (defn- direct-allocation-projection-in-context
   "Project an exact constructor or a definition-derived direct allocation helper.
 
@@ -878,7 +948,9 @@
    primitive literals with matching retained types/carriers: substitution cannot discard evaluation of
    an unused argument, duplicate a check, or reorder call-argument effects. Returned helper data
    is correspondence material, not a frozen-definition/completion certificate."
-  [expression values carrier-facts]
+  ([expression values carrier-facts]
+   (direct-allocation-projection-in-context expression values carrier-facts []))
+  ([expression values carrier-facts visited]
   (if (array-allocation-size expression)
     {:constructor expression}
     (let [{:keys [implementation-op arguments lexical-callee dispatch? semantic-op]} (call-description expression)
@@ -891,8 +963,10 @@
                  (every? #(some? (allocation-argument-kind % values carrier-facts)) arguments))
         ;; Mangling is only a lookup address. The existing registered MethodEntry must prove
         ;; the exact executable receiver and delegated source; no overload is inferred here.
-        (when-let [{v :source-var} (select!)]
-          (when (and (var? v) (:raster.core/deftm (meta v)))
+        (when-let [{v :source-var {implementation :typed-impl} :entry} (select!)]
+          (when (and (var? v) (:raster.core/deftm (meta v))
+                     (not-any? (fn [[source previous]]
+                                 (and (identical? v source) (identical? implementation previous))) visited))
             ;; Prepare the same original producer used by JIT and scalar import.
             ;; A walked cache can predate the actual implementation's expansion.
             ((requiring-resolve 'raster.core/prepare-deftm-frontend!) v)
@@ -903,8 +977,13 @@
                   observations (mapv method-entry/var-snapshot
                                      (distinct (keep #(get selected %) [:source-var :generic-var :receiver-var])))
                   definition (when frontend
-                               (:direct-allocation
-                                (detect-buffer-semantics-from-source v (:body frontend))))
+                               (or (:direct-allocation
+                                    (detect-buffer-semantics-from-source v (:body frontend)))
+                                   (when-let [physical (method-entry/selected-parameter-carriers
+                                                      operation implementation-op (count arguments))]
+                                     (when (identical? v (get-in physical [:definition :source-var]))
+                                       (forwarding-allocation-definition
+                                        frontend physical (conj visited [v implementation]))))))
                   {:keys [parameters parameter-tags constructor]} definition
                   compatible? (fn [argument tag]
                                 (let [array? (types/array-tag? tag)
@@ -924,7 +1003,7 @@
                   (when (array-allocation-size projected)
                     {:constructor projected
                      :helper {:operation operation :implementation implementation-op :definition definition
-                              :arguments arguments}}))))))))))
+                              :arguments arguments}})))))))))))
 
 (defn direct-allocation-projection
   "Derive constructor correspondence from the selected original frontend.

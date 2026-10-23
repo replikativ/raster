@@ -28,6 +28,31 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 forwarding-composition checkpoint: selected allocation helpers now
+compose through a returned global typed call forwarding every formal exactly
+once, in source order. This is not allocator-name recognition or a recursive
+extension of the old general buffer-rewrite detector. The actual emitted call,
+selected invocation Method, outer physical entry and reference-return bridge
+must agree. Primitive input adaptations are identities; nullable array checks
+target the same exact Class; the direct leaf constructor must produce the outer
+compute method's actual array result Class. Any unproved edge refuses.
+
+Nested input/return adaptations are discharged by that narrow composition law,
+not silently left pending for consumers to ignore. Original definition/module
+histories stay in the existing collector. Delegation data contains only semantic
+constructor/interface descriptions, not Methods, executors or private owners.
+Cycles are rejected by source-Var/implementation identity. Computed, literal,
+dropped, duplicated and permuted forwarding arguments are outside this rule.
+
+All three unchanged generated `alloc-like` calls now project through `zeros-like`
+to their own completed size bindings without any exemplar AV or invented capacity.
+The prepared import still stays open and unadmitted. Five affected owner/helper/
+legality namespaces pass 81 tests / 976 assertions, including two-hop forwarding,
+physical-evidence mutations, full-chain stale-history controls, and JVM constructor
+result/exception comparisons. Independent review approved the complete diff.
+This closes the delegated-helper limitation noted in the checkpoint below, not
+whole source/InvocationPlan finalization or resident training acceptance.
+
 October 23 allocation-kind checkpoint: definition-derived direct helper projection
 can consume existing primitive/primitive-array carrier facts independently of a
 full AbstractValue. This proves only type/kind compatibility. An unused exemplar
