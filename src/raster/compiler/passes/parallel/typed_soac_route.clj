@@ -1728,7 +1728,7 @@
               (assoc admitted :terminal-scalars-materialized 0)))))
       (assoc admitted :terminal-scalars-materialized 0))))
 
-(defn- attempt-normalized
+(defn ^:no-doc attempt-normalized
   "Consume one exact normalized source. Normalization is owned by the caller;
    all existing whole-source validation, liveness and scheduling remain shared.
    This private continuation grants no prepared-import or source-owner admission."

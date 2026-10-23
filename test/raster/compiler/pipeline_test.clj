@@ -10,6 +10,7 @@
             [raster.compiler.passes.scalar.local-products :as local-products]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ad.flatten :as flat]
             [raster.compiler.ir.dialects :as dialects]
@@ -262,6 +263,27 @@
         #(let [refused (#'pipeline/pass-soac-fuse source {:target-device :ocl:late-wrapper :dtype :float})]
            (is (= source (:form refused)) "refusal keeps the original nested source")
            (is (= :disabled (get-in refused [:stats :compatibility-fusion]))))))))
+
+(deftest normalized-semantic-admission-does-not-rewrite-or-normalize-source
+  (let [source '(let* [result (raster.par/rng-fill! seeds n base-seed)] result)
+        options {:target-device :ocl:normalized-source :dtype :long
+                 :array-types {'seeds :long} :scalar-types {'n :int 'base-seed :long}}
+        normalized (typed-frontend/normalize-source source options)
+        seen (atom [])
+        project @#'typed-route/source-projection
+        result
+        (with-redefs-fn
+          {#'pipeline/prepare-semantic-source (fn [& _] (throw (AssertionError. "representation replay")))
+           #'typed-frontend/normalize-source (fn [& _] (throw (AssertionError. "normalization replay")))
+           #'typed-route/attempt (fn [& _] (throw (AssertionError. "ordinary route replay")))
+           #'typed-route/source-projection (fn [form options]
+                                             (swap! seen conj form)
+                                             (project form options))}
+          #(pipeline/normalized-semantic-program-attempt normalized options))]
+    (is (identical? normalized (first @seen)))
+    (is (some? (:program result)))
+    (is (true? (get-in result [:stats :typed-validated])))
+    (is (= :analyzed-source (get-in result [:stats :front-end])))))
 
 (deftest certified-butterfly-enters-the-typed-effect-vertical
   (let [source '(let* [step (raster.par/butterfly! re im i half wr wi base)] step)

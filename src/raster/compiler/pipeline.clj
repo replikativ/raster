@@ -894,34 +894,38 @@
       (core-hw/abstract-machine (or target-descriptor (core-hw/descriptor-for target-device)))
       (catch Throwable _ nil))))
 
-(defn- semantic-program-attempt
-  "Try the finite semantic-program variants in specificity order.
+(defn ^:no-doc prepare-semantic-source
+  "Representation-only canonicalization before semantic source normalization.
+   A prepared producer must run this before sealing its source origins, never
+   rewrite the sealed source by reentering ordinary fusion afterward."
+  [source opts]
+  ;; Physical parameter derivation precedes this shared GPU admission
+  ;; boundary. Array ABI descriptors permit nullable references, not
+  ;; nonnull claims; Object completion keeps that same reference.
+  ;; Late representation rewrites can introduce whole sequential wrappers;
+  ;; normalize here without lifting call/vector operands (main #1558).
+  (if (device/gpu-target? (:target-device opts))
+    (inline/flatten-nested-lets
+     (local-products/project-storage-alias-snapshots
+      source
+      (merge (into {} (keep (fn [[parameter t]]
+                             (when-let [tag (:array-tag (dtype/info t))]
+                               [parameter {:presence :unknown :array-tag tag}])))
+                   (:array-types opts))
+             (into {} (keep (fn [[parameter t]]
+                              (when (#{:float :double} t)
+                                [parameter {:presence :present :scalar-type t
+                                            :producer-scalar-type t}])))
+                   (:scalar-types opts)))
+      nil))
+    source))
 
-   Structured control is currently GPU-only until the equation-first JVM schedule lands. A
-   coverage decline preserves the original source and remains visible beside any later TypedSOAC
-   decline; certified contradictions are never converted into fallback."
-  [source opts abstract-machine]
-  (let [;; Physical parameter derivation precedes this shared GPU admission
-        ;; boundary. Array ABI descriptors permit nullable references, not
-        ;; nonnull claims; Object completion keeps that same reference.
-        ;; Late representation rewrites can introduce whole sequential wrappers;
-        ;; normalize here without lifting call/vector operands (main #1558).
-        source (if (device/gpu-target? (:target-device opts))
-                 (inline/flatten-nested-lets
-                  (local-products/project-storage-alias-snapshots
-                   source
-                  (merge (into {} (keep (fn [[parameter t]]
-                                         (when-let [tag (:array-tag (dtype/info t))]
-                                           [parameter {:presence :unknown :array-tag tag}])))
-                               (:array-types opts))
-                         (into {} (keep (fn [[parameter t]]
-                                          (when (#{:float :double} t)
-                                            [parameter {:presence :present :scalar-type t
-                                                        :producer-scalar-type t}])))
-                               (:scalar-types opts)))
-                   nil))
-                 source)
-        ;; A public array's backing capacity is independent of each traversal.
+(defn- semantic-program-attempt*
+  "Share structured/functional admission and its diagnostics. The two internal
+   callers select ordinary versus already-normalized syntax, not different
+   legality rules or permission to admit a prepared import."
+  [source opts abstract-machine typed-attempt]
+  (let [;; A public array's backing capacity is independent of each traversal.
         ;; Semantic owners must prove their logical access footprint separately.
         values (merge (when (device/gpu-target? (:target-device opts))
                         (into {} (map (fn [[parameter t]]
@@ -940,7 +944,7 @@
                      (structured-route/attempt source common))]
     (if (:program structured)
       structured
-      (let [typed (typed-soac-route/attempt
+      (let [typed (typed-attempt
                    source (:dtype opts) (:array-types opts)
                    {:resident-reductions? (or (true? (:resident-reductions? opts))
                                               (device/gpu-target? (:target-device opts)))
@@ -965,6 +969,21 @@
         (cond-> (or typed {})
           (:declined structured)
           (assoc :structured-control-declined (:declined structured)))))))
+
+(defn- semantic-program-attempt
+  "Try structured control and ordinary TypedSOAC with shared representation preparation."
+  [source opts abstract-machine]
+  (semantic-program-attempt* (prepare-semantic-source source opts) opts abstract-machine
+                             typed-soac-route/attempt))
+
+(defn ^:no-doc normalized-semantic-program-attempt
+  "Consume a producer's already-normalized source without representation rewrites
+   or another normalization. Ordinary whole-source validation and optimization
+   remain unchanged. Pending prepared components must not enter this route."
+  [source opts]
+  (semantic-program-attempt* source opts
+                             (abstract-machine-for-target (:target-device opts) (:target-descriptor opts))
+                             typed-soac-route/attempt-normalized))
 
 (defn- unfused-compatibility
   "Keep unsupported source byte-for-byte while exposing why no certified fusion ran."

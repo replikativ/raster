@@ -28,6 +28,39 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 production sequencing finding: simply wiring the shared constructor
+to all pre-SoA passes is NOT sufficient. Deferred AD leaves the original
+value+grad/nth-dependent consumer unfinished at the GPU fixpoint census. The
+census correctly rejects it. Running whole-source fixpoint after inserting an
+import would instead rewrite its retained binding occurrences. Neither disabling
+the census nor inventing output tags is an acceptable repair.
+
+The reviewed next construction order is to discover the actual canonical
+prepared calls once, keep their real ports and original binding manifests, and
+prepare only the authored straight-line segments between those imports. Existing
+global value/gradient tuple projection resolves authored nth operations. Segment
+preparation must retain cross-segment live-outs and explicitly transport its
+construction history and shifted cut positions. Generated binding member objects
+must not pass through ordinary fixpoint, rewalk or DCE. Their emitted physical
+binding contexts supply nullable conditional result carriers; scalar-only
+normal-return facts must not be treated as array evidence. No consumer annotation
+or input exemplar extent supplies a missing result carrier.
+
+Typedness accounting must cover every assembled binding: ordinary authored
+census evidence or exact original imported physical evidence, followed by the
+existing complete pending conversion/source/order/storage/owner obligations.
+An imported-span exemption is not such evidence. Missing producers, duplicate
+cuts, reordered/mutated bindings, lost live-outs, stale original inputs and an
+actually untyped authored consumer must all refuse. This sequencing is still
+implementation work, not a completed training vertical.
+
+The ordinary semantic route now has one representation canonicalizer and one
+internal already-normalized entry sharing structured/functional selection and
+all existing admission/optimization behavior. The pipeline gate passes 31 tests /
+213 assertions, including a real RNG-map case that forbids repeated
+representation rewriting, ordinary routing or normalization. This seam alone
+does not grant prepared-import admission.
+
 October 23 original-input execution preparation: the prepared phase can now
 outline an exact scalar argument through its original bytecode emitter. The
 adapter joins the original ordered physical ports and checks the entire planned
