@@ -166,6 +166,70 @@
        (is (identical? normalized (module/normalized-source phase)))
        (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
 
+(deftest authored-preparation-assembles-one-and-two-imports-without-rewriting-them
+  (doseq [[source expected-imports] [[#'training/local-gradient-sum 1] [#'two-gradient-imports 2]]]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [root (core/resolve-deftm-var source)
+             _ (core/prepare-deftm-frontend! root)
+             frontend (entry/original-source-frontend root)
+             phase (module/capture frontend {:dtype :float})
+             normalized (module/normalized-source phase)
+             view (module/view phase normalized)
+             layout (module/authored-layout phase normalized)
+             tags (zipmap (get-in frontend [:source-entry :params]) (get-in frontend [:source-entry :tags]))
+             imported-ids (into #{} (mapcat #(map first (:bindings %)))
+                                (filter #(= :import (:kind %)) layout))
+             calls (atom [])
+             result (#'module/prepare-authored-layout
+                     layout tags (assoc (:options view) :target-device :ocl:authored-assembly)
+                     (fn [source options]
+                       (is (not-any? imported-ids (take-nth 2 (second source))))
+                       (swap! calls conj {:source source :environment (:param-env options)})
+                       (pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes options)))
+             result-pairs (vec (partition 2 (second (:source result))))]
+         (is (= expected-imports (count @calls) (count (:imports result))))
+         (doseq [[original assembled] (map vector (:imports view) (:imports result))]
+           (let [start (get-in assembled [:assembly :start])
+                 bindings (get-in original [:call :bindings])
+                 actual (subvec result-pairs start (+ start (count bindings)))]
+             (is (identical? (:call original) (:call assembled)))
+             (is (every? true? (map (fn [a b] (every? true? (map identical? a b))) bindings actual)))
+             (is (= start (count (get-in assembled [:assembly :prefix]))))))
+         (when (= 2 expected-imports)
+           (let [later-outputs (remove nil? (get-in view [:imports 1 :call :outputs]))]
+             (is (not-any? (set later-outputs) (keys (:environment (first @calls)))))))
+         (is (= expected-imports (count (:unclosed-source-imports @entry/*emission-inputs*))))
+         (is (identical? normalized (module/normalized-source phase))))))))
+
+(deftest authored-preparation-refuses-lost-exports-and-unavailable-values
+  (let [a (with-meta 'a {:raster.type/tag 'long})
+        layout [{:kind :authored :start 0 :end 1 :bindings [[a 1]] :live-outs [a]}
+                {:kind :authored :start 1 :end 1 :bindings [] :live-outs [] :tail [a]}]
+        prepare #'module/prepare-authored-layout]
+    (doseq [change [(fn [_ _] '(let* [] []))
+                    (fn [_ _] '(let* [] [a]))
+                    (fn [_ _] '(let* [a not-yet-produced] [a]))]]
+      (is (= :unclosed-prepared-module-phase (reason #(prepare layout {} {} change)))))
+    (is (= :unclosed-prepared-module-phase
+           (reason #(prepare (pop layout) {} {} (fn [source _] source)))))
+    (doseq [[entry change]
+            [[{'x 'long} (fn [_ _] '(let* [x 99 a 1] [a]))]
+             [{} (fn [_ _] '(let* [a 1 a 2] [a]))]]]
+      (is (= :unclosed-prepared-module-phase (reason #(prepare layout entry {} change)))))
+    (let [later (assoc-in layout [1 :bindings] [['later 2]])]
+      (is (= :unclosed-prepared-module-phase
+             (reason #(prepare later {} {} (fn [_ _] '(let* [later 99 a 1] [a])))))))
+    (let [seen (atom [])
+          result (prepare layout {} {:scalar-types {'future :long}
+                                     :values {'future :unavailable 'a :not-yet-produced}}
+                          (fn [source options] (swap! seen conj options) source))]
+      (is (= 'long (get-in (second @seen) [:param-env 'a])))
+      (is (every? #(not (contains? (:scalar-types %) 'future)) @seen))
+      (is (every? #(not (contains? (:values %) 'future)) @seen))
+      (is (every? #(not (contains? (:values %) 'a)) @seen))
+      (is (= 1 (quot (count (second (:source result))) 2))))))
+
 (deftest ordinary-multiform-source-keeps-every-statement-in-order
   (entry/call-with-definition-inputs
    (fn []

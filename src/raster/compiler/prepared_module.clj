@@ -10,6 +10,7 @@
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.util :as util]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.scalar.inline :as inline]))
 
@@ -452,6 +453,100 @@
     (let [layout (authored-source-layout (:source context) (:imports context))]
       (entry/assert-producer-current! phase)
       layout)))
+
+(defn- prepare-authored-layout
+  "Prepare only authored regions, exporting every intermediate definition.
+   The compiler callback transforms syntax; its return value is not admission.
+   Imports retain original member objects and acquire explicit assembly offsets."
+  [layout entry-tags options prepare-segment]
+  (when-not (and (vector? layout) (seq layout)
+                 (= :authored (:kind (peek layout))) (contains? (peek layout) :tail))
+    (refuse! "authored preparation has no final source continuation" {}))
+  (let [original-ids (mapv first (mapcat :bindings layout))
+        entry-scope (set (keys entry-tags))
+        reserved (into entry-scope original-ids)]
+    (when-not (= (count original-ids) (count (set original-ids)))
+      (refuse! "authored preparation requires unique source binding identities" {}))
+    (loop [remaining layout environment entry-tags scope (set (keys entry-tags))
+           occupied (set (keys entry-tags))
+           output [] segments [] imports []]
+      (if-let [{:keys [kind bindings live-outs tail] :as segment} (first remaining)]
+        (case kind
+          :authored
+          (if (and (empty? bindings) (not (contains? segment :tail)))
+            (recur (next remaining) environment scope occupied output
+                   (conj segments (assoc segment :prepared-bindings [] :assembly-start (count output))) imports)
+            (let [source (list* 'let* (vec (mapcat identity bindings))
+                                (if (contains? segment :tail) tail [live-outs]))
+                  missing (binding [util/*shadowing-locals* scope]
+                            (remove scope (util/free-syms source)))
+                  _ (when (seq missing)
+                      (refuse! "authored segment refers outside its preceding lexical scope"
+                               {:start (:start segment) :unavailable (set missing)}))
+                  visible (into scope (map first) bindings)
+                  segment-options (reduce (fn [options key]
+                                            (if (contains? options key)
+                                              (update options key select-keys visible) options))
+                                          (assoc options :param-env environment)
+                                          [:array-types :scalar-types])
+                  segment-options (cond-> segment-options
+                                    (contains? segment-options :values) (update :values select-keys entry-scope))
+                  prepared (prepare-segment source segment-options)
+                  prepared-pairs (pairs prepared)
+                  prepared-ids (mapv first prepared-pairs)
+                  own-ids (set (map first bindings))
+                  prepared-tail (vec (drop 2 prepared))
+                  defined (into scope (map first) prepared-pairs)
+                  prepared-tags (reduce (fn [tags [id _]]
+                                          (if-let [tag (types/sym-type-tag id)]
+                                            (assoc tags id tag) (dissoc tags id)))
+                                        {} prepared-pairs)
+                  missing (binding [util/*shadowing-locals* scope]
+                            (remove scope (util/free-syms prepared)))]
+              (when (or (not= (count prepared-ids) (count (set prepared-ids)))
+                        (some occupied prepared-ids)
+                        (some #(and (contains? reserved %) (not (contains? own-ids %))) prepared-ids))
+                (refuse! "authored preparation would capture another source binding"
+                         {:start (:start segment) :bindings prepared-ids}))
+              (when (seq missing)
+                (refuse! "authored preparation introduced an unavailable value"
+                         {:start (:start segment) :unavailable (set missing)}))
+              (when (and (not (contains? segment :tail))
+                         (not (and (= [live-outs] prepared-tail) (every? defined live-outs))))
+                (refuse! "authored preparation changed its exported lexical boundary"
+                         {:start (:start segment) :end (:end segment)}))
+              (recur (next remaining)
+                     (merge (apply dissoc environment live-outs) (select-keys prepared-tags live-outs))
+                     (into scope live-outs)
+                     (into occupied prepared-ids)
+                     (into output prepared-pairs)
+                     (conj segments (assoc segment :source source :prepared prepared
+                                                  :prepared-bindings prepared-pairs
+                                                  :assembly-start (count output)))
+                     imports)))
+
+          :import
+          (let [import (:import segment)
+                assembled (assoc import :assembly {:original-start (:start segment)
+                                                  :start (count output) :prefix output})]
+            (when (some occupied (map first bindings))
+              (refuse! "import assembly would shadow an earlier binding" {:start (:start segment)}))
+            (recur (next remaining)
+                   (reduce (fn [environment context]
+                             (if context (assoc environment (:output context) (:tag context)) environment))
+                           environment (:outputs segment))
+                   (into scope (keep :output) (:outputs segment))
+                   (into occupied (map first) bindings)
+                   (into output bindings)
+                   (conj segments (assoc segment :assembly-start (count output)))
+                   (conj imports assembled)))
+
+          (refuse! "unknown authored preparation segment" {:kind kind}))
+        (let [last-segment (peek segments)
+              tail (if-let [prepared (:prepared last-segment)]
+                     (drop 2 prepared) (:tail last-segment))]
+          {:source (list* 'let* (vec (mapcat identity output)) tail)
+           :segments segments :imports imports :environment environment})))))
 
 (defn- final-binding-origin [binding-origin]
   ;; No reconstruction of a split reduction or derived normalization temporary.

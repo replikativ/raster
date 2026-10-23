@@ -28,6 +28,30 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 authored preparation/assembly checkpoint: a private constructor now
+runs the existing preparation pipeline only on authored segments, retaining all
+intermediate exports and splicing original imported binding members unchanged.
+Its assembly records distinguish original cut positions from new offsets/prefixes.
+Those records are construction data, not a new source owner or permission to
+reuse old normalized origins. Source-history composition is still required before
+the assembled source can enter the production constructor/finalizer.
+
+Lexical checks cover both original and prepared segments. Separate visible-scope
+and occupied-flat-binding sets prevent introduced locals from shadowing entry
+values, earlier temporaries or reserved later source/import names; duplicate
+bindings refuse. Only actual authored exports carry types to the next segment.
+Existing AVs are restricted to the original entry scope throughout: neither
+same-segment nor later-defined locals borrow future value/presence/capacity facts.
+Imported outputs retain their independently checked conditional declarations.
+
+One- and two-import fixtures pass full authored preparation while retaining
+markers, unchanged imported spans and source identity of the original phase.
+Export loss, unavailable values, name capture and future-fact leakage have
+negative controls. Independent review identified and verified fixes for the
+hygiene and AV-leakage gaps. The affected gate passes 123 tests / 1,363 assertions.
+This is not yet whole-source typing/owner closure, real resident training
+acceptance or resolution of the red public compile fixtures.
+
 October 23 authored-layout checkpoint: exact retained cut manifests now partition
 the original constructed source into authored segments and imported spans. No
 generated-name search is used; the original imported binding members are retained
