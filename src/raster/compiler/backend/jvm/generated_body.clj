@@ -289,13 +289,29 @@
                        :candidate-id candidate-id :candidate-expression candidate-expression
                        :id id :expression expression})
                     (partition 2 (second (:original proposal)))
-                    (partition 2 (second (:source proposal))) body-bindings)]
+                    (partition 2 (second (:source proposal))) body-bindings)
+        ;; Declarations for the candidate normalizer, NOT completed input/body
+        ;; facts. The unchanged pending obligations still own every conversion.
+        root-requirements
+        (into {} (keep (fn [{:keys [original-id id]}]
+                         (when-let [dt (fact-dtype (get (:normal-return-facts proposal) original-id))]
+                           [id dt]))) roots)
+        normalization-requirements
+        (reduce (fn [requirements {:keys [slot source-dtype target-dtype]}]
+                  (let [{:keys [object-binder input-binder parameter-class]} slot
+                        array-dtype (dtype/dtype-for-jvm-array-class parameter-class)]
+                    (cond-> requirements
+                      source-dtype (assoc-in [:scalar-types object-binder] source-dtype)
+                      target-dtype (assoc-in [:scalar-types input-binder] target-dtype)
+                      array-dtype (update :array-types assoc object-binder array-dtype input-binder array-dtype))))
+                {:scalar-types root-requirements :array-types {}} input-obligations)]
     {:proposal proposal :argument-plan plan :input-obligations input-obligations
      :qualified-source qualified :hygienic-source hygienic :projected-source projected
      :qualification-lookups @lookups :qualification-construction @qualification-construction
      :alpha-construction @alpha-construction
      :substitution-construction @substitution-construction
      :root-bindings roots
+     :normalization-requirements normalization-requirements
      :bindings (into (into staged (map :binding input-obligations)) body-bindings)
      :outputs (mapv #(if (symbol? %) (with-meta % nil) %) outputs)
      :admitted? false}))

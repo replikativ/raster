@@ -10034,11 +10034,41 @@ tests. The exact-head CI for 8cb5408c also remains red: distributed training and
 fixture emission decline unclosed generated completions; OpenCL additionally
 exposes unchecked scalar/stage-observation and resident-step-count obligations.
 
-Next, a private phase owner must seal the actual source-construction and
-normalization histories and join every final binding to its physical module
-obligations. Neither observer data nor logical dtype declarations can close the
-prepared-import marker. Publication still requires complete ordered execution,
-completion, storage, runtime-view and output accounting.
+The private `prepared-module` phase now owns that early consumer: it obtains the
+actual generated physical entry, adopts the existing AD producer, constructs the
+pending call itself, and checks a bijection between minted calls and actual cuts.
+It seals the actual normalization once under the retained source history, rechecks
+physical entry and namespace identity, and maps each call binding and completion
+obligation through its exact cut insertion interval to final normalized positions.
+Reduction and continuation remain two positions belonging to one original module
+binding. Input obligations retain both Object staging and conversion positions.
+The assumed staged-input/conversion/body layout is independently checked before
+using positional arithmetic; a generator layout change cannot silently reassign
+an obligation. Supplied and generated normalization declarations use conflict-
+checked canonical unions, including scalar/array kind conflicts.
+
+This is construction only, not a second executor or a production frontend
+permission. `view` requires the private phase and its exact normalized object;
+copied context maps have no standalone authority. No phase object enters portable
+IR. The first vertical supports direct public-parameter arguments, unchanged copy
+allocation spines, and completion contexts under root binding initializers. Other
+shapes explicitly refuse until their construction correspondence is represented.
+Neither observer data nor logical dtype declarations close the prepared-import
+marker. The real training fixture still has six scalar/storage coverage refusals.
+
+The reviewed phase/dtype/generated-body gate passes 26 tests / 293 assertions in
+the reused capped REPL. Negative controls cover changed physical entry identity,
+missing/corrupt histories, conflicting declarations, count-preserving source
+reordering, and a generator staging-layout change. Canonical primitive-array
+Class lookup is shared with the existing dtype facets rather than duplicated.
+
+Next is integration with the existing equation-first frontend and OrderedSourceOwner:
+carry the private phase outside the AST, attach all required obligation identities
+to the complete equation/InvocationPlan spine, and prepare scalar continuations at
+their existing source-order positions. A numerical reduction must execute once;
+outlining its original whole initializer on the host is forbidden. Publication
+still requires complete ordered execution, completion, storage, runtime-view and
+output accounting. No global scalar admission waiver or fallback is acceptable.
 
 ### Observable scalar checkpoints alongside resident state
 

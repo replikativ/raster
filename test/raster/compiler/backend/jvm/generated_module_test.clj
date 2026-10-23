@@ -129,6 +129,12 @@
     (is (= :reference-check (:classification reference)))
     (is (identical? array-class (get-in reference [:slot :parameter-class])))
     (is (identical? (first facts) (:input-fact floating)))
+    (is (= :double (get-in call [:normalization-requirements :scalar-types
+                                 (get-in floating [:slot :object-binder])])))
+    (is (= :float (get-in call [:normalization-requirements :scalar-types
+                                (get-in floating [:slot :input-binder])])))
+    (is (= :double (get-in call [:normalization-requirements :array-types
+                                 (get-in reference [:slot :input-binder])])))
     (is (every? #(= :pending (:status %)) input-obligations))
     (is (every? completion/canonical-form? (mapcat (juxt :object-context :conversion-context)
                                                   input-obligations)))
