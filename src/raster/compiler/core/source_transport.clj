@@ -269,12 +269,13 @@
 
 (defn- prepared-binding-site?
   [placement event]
-  (let [{:keys [scope index prefix]} (:binding-site placement)
+  (let [{:keys [scope index prefix live-symbols]} (:binding-site placement)
         bindings (when (and (seq? scope) (form/binding-form? scope)) (second scope))]
     (and (vector? bindings) (even? (count bindings))
          (integer? index) (<= 0 index) (< index (quot (count bindings) 2))
          (identical? (:destination placement) (nth bindings (* 2 index)))
          (identical? (:caller event) (nth bindings (inc (* 2 index))))
+         (set? live-symbols) (every? symbol? live-symbols)
          (vector? prefix)
          (every? #(and (vector? %) (= 2 (count %)) (symbol? (first %))) prefix))))
 
@@ -282,7 +283,11 @@
   "Cut an exact prepared projection before its raw bindings enter source passes.
    Default expansion is unchanged. An installed consumer must replace the WHOLE
    region with explicit ports; there is no partial import or fallback on refusal.
-   No owner or typed object is placed in the returned source expressions."
+   A canonical importer may return {:ports :bindings :import}; its complete fresh
+   spine is inserted at this exact site. The private import record must retain
+   the same event and remain pending. This is construction, not admission: the
+   original unclosed import marker is never cleared here. Ports-only consumers
+   remain useful for bounded diagnostics. No owner/typed object enters the AST."
   [projection placement]
   (if-not *prepared-program-consumer*
     projection
@@ -299,7 +304,11 @@
         (throw (ex-info "prepared module needs its original binding occurrence"
                         {:reason :unclosed-prepared-program-placement
                          :placement placement})))
-      (let [ports (*prepared-program-consumer* event placement)
+      (let [response (*prepared-program-consumer* event placement)
+            canonical? (map? response)
+            ports (if canonical? (:ports response) response)
+            bindings (if canonical? (:bindings response) [])
+            import (when canonical? (:import response))
             elements (:elements projection)
             mode (:mode event)
             scalar? (:scalar-result? projection)
@@ -319,10 +328,37 @@
           (throw (ex-info "prepared module ports violate the ordered result boundary"
                           {:reason :unclosed-prepared-program-outputs
                            :mode mode :expected-slots (count elements)})))
+        (when canonical?
+          (let [ids (when (vector? bindings) (mapv first (filter vector? bindings)))]
+            (when-not (and (= #{:ports :bindings :import} (set (keys response)))
+                           (vector? bindings)
+                           (every? #(and (vector? %) (= 2 (count %))) bindings)
+                           (= (count ids) (count bindings) (count (set ids)))
+                           (every? #(and (symbol? %) (nil? (namespace %))
+                                         (nil? (meta %))
+                                         (not (contains? reserved %))) ids)
+                           (every? (set ids) (remove nil? ports))
+                           (map? import) (identical? event (:event import))
+                           (or (not (contains? import :admitted?)) (false? (:admitted? import)))
+                           (= :pending (:status import)))
+              (throw (ex-info "prepared module canonical spine is not a complete fresh pending import"
+                              {:reason :unclosed-prepared-program-bindings}))))
+          (let [initial (get-in placement [:binding-site :live-symbols])
+                known (into (into reserved initial) (map first bindings))]
+            (binding [util/*shadowing-locals* known]
+              (reduce (fn [live [id expression]]
+                        (let [missing (remove live (util/free-syms expression))]
+                          (when (seq missing)
+                            (throw (ex-info "prepared module initializer is not closed at its ordered cut"
+                                            {:reason :unclosed-prepared-program-bindings
+                                             :binder id :unavailable (set missing)})))
+                          (conj live id)))
+                      initial bindings))))
         (*source-construction-observer*
-         :prepared-program-cut {:event event :placement placement :ports ports})
+         :prepared-program-cut (cond-> {:event event :placement placement :ports ports}
+                                 canonical? (assoc :canonical-bindings bindings :import import)))
         (assoc projection
-               :bindings [] :elements ports
+               :bindings bindings :elements ports
                :loss-sym (when (= :value+grad mode) (first ports))
                :grad-syms (if (= :value+grad mode) (vec (rest ports)) ports)
                :result-form (if (and (= :grad mode) scalar?) (first ports) ports))))))

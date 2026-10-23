@@ -101,6 +101,85 @@
                        projection {:kind :binding :destination 'result})))))
     (is (zero? @calls))))
 
+(deftest canonical-import-inserts-only-its-pending-spine-at-the-owned-cut
+  (let [seen (atom nil)
+        bindings '[ [module_loss 1.0] [module_gradient 2.0]]
+        imported (expand #'ordered-root
+                         (fn [event placement]
+                           (let [import {:event event :status :pending}]
+                             (reset! seen [event placement import])
+                             {:ports '[module_loss module_gradient nil]
+                              :bindings bindings :import import}))
+                         inline/inline-ad-applications)
+        [event placement import] @seen
+        cut (first (:prepared-program-cuts (construction-view imported)))
+        source-bindings (vec (partition 2 (second (:form imported))))
+        ids (mapv first source-bindings)
+        loss-index (.indexOf ids 'module_loss)
+        raw-ids (set (map first (get-in event [:projection :bindings])))]
+    (is (pos? loss-index) "the already-constructed prefix remains before the module")
+    (is (= bindings (subvec source-bindings loss-index (+ loss-index 2))))
+    (is (< (+ loss-index 1) (dec (count source-bindings)))
+        "the caller continuation remains after the module")
+    (is (not-any? raw-ids ids))
+    (is (identical? placement (:placement cut)))
+    (is (identical? bindings (:canonical-bindings cut)))
+    (is (identical? import (:import cut)))
+    (is (= :pending (get-in cut [:import :status])))
+    (is (some #(and (= :prepared-reverse-ad (first %))
+                    (identical? (:occurrence event) (nth % 2 nil)))
+              (get-in imported [:observations :unclosed-source-imports]))
+        "construction never grants execution or clears the source import")))
+
+(deftest canonical-import-refuses-incomplete-capturing-or-preclosed-spines
+  (doseq [change [(fn [r _] (assoc r :bindings '([module_loss 1.0])))
+                  (fn [r _] (assoc r :bindings '[[]]))
+                  (fn [r _] (assoc r :bindings '[[module_loss 1.0] [module_loss 2.0]]))
+                  (fn [r _] (assoc r :bindings '[[module_loss 1.0]]))
+                  (fn [r _] (update r :bindings conj ['foreign/name 0]))
+                  (fn [r _] (update r :bindings conj [(with-meta 'annotated {:tag 'double}) 0]))
+                  (fn [r placement] (update r :bindings conj [(:destination placement) 0]))
+                  (fn [r placement]
+                    (update r :bindings conj [(first (second (get-in placement [:binding-site :scope]))) 0]))
+                  (fn [r _] (assoc-in r [:import :event] {}))
+                  (fn [r _] (assoc-in r [:import :status] :closed))
+                  (fn [r _] (assoc-in r [:import :admitted?] true))
+                  (fn [r _] (assoc-in r [:bindings 0 1] 'module_gradient))
+                  (fn [r _] (assoc-in r [:bindings 0 1] 'module_loss))
+                  (fn [r _] (assoc-in r [:bindings 0 1] 'unknown_input))
+                  (fn [r _] (assoc r :bindings '[[module_loss count]
+                                                              [count 1.0]
+                                                              [module_gradient module_loss]]))
+                  (fn [r placement]
+                    (assoc-in r [:bindings 0 1] (:destination placement)))
+                  (fn [r placement]
+                    (let [{:keys [scope index]} (:binding-site placement)]
+                      (assoc-in r [:bindings 0 1] (nth (second scope) (* 2 (inc index))))))
+                  (fn [r _] (assoc r :extra true))]]
+    (is (= :unclosed-prepared-program-bindings
+           (reason #(expand #'ordered-root
+                            (fn [event placement]
+                              (change {:ports '[module_loss module_gradient nil]
+                                       :bindings '[[module_loss 1.0] [module_gradient 2.0]]
+                                       :import {:event event :status :pending}}
+                                      placement))
+                            inline/inline-ad-applications))))))
+
+(deftest canonical-initializers-see-live-parameters-prefix-and-earlier-module-bindings
+  (let [seen (atom nil)]
+    (expand #'ordered-root
+            (fn [event placement]
+              (reset! seen placement)
+              (let [prior (ffirst (get-in placement [:binding-site :prefix]))]
+                {:ports '[module_loss module_gradient nil]
+                 :bindings [['module_loss prior]
+                            ['module_gradient '(clojure.core/+ module_loss x)]]
+                 :import {:event event :status :pending :admitted? false}}))
+            inline/inline-ad-applications)
+    (is (contains? (get-in @seen [:binding-site :live-symbols]) 'x))
+    (is (contains? (get-in @seen [:binding-site :live-symbols])
+                   (ffirst (get-in @seen [:binding-site :prefix]))))))
+
 (deftest grad-mode-keeps-its-own-ordered-slots-without-a-loss-port
   (let [seen (atom nil)
         imported (expand #'grad-root

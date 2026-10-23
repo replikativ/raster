@@ -28,6 +28,32 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 canonical-module construction checkpoint: generated-body projection
+now inventories each actual emitted completion as a pending obligation. It
+requires the original physical entry, parameter carriers and flat SSA spine;
+copied or ambiguous occurrences, unknown numeric payloads and unsupported
+conversion policies refuse the whole proposal. Numeric conversions use the
+existing scalar-conversion contract, not a new type or operation registry.
+The proposal is explicitly non-admitted: removing completion syntax from a
+candidate does not discharge its checks, boxing or source-evaluation semantics.
+
+The early prepared-module cut can insert a complete canonical binding spine
+instead of only diagnostic ports. Its private pending import retains the exact
+projection event. Insertion preserves the source prefix and continuation,
+inactive output slots and result aliases. Fresh IDs cannot capture original
+locals; sequential initializer closure uses the registered site's live locals
+and earlier inserted IDs, never the broader reservation set containing later
+locals. The original unclosed import marker remains fatal. This mechanism
+does not yet install a production importer or admit resident training.
+
+Fresh-worker CI exposed a missing forward declaration for the boxed-entry
+descriptor helper which a warm REPL concealed. The declaration is fixed in
+0b9ea1a6; fresh CI qualification is still required. Existing red gates are not
+waived, and this checkpoint does not establish a performance improvement.
+The affected reused-REPL gate passes 104 tests / 970 assertions across source
+transport/construction, prepared imports, inlining, and generated boxed-entry
+and module proposals. Independent review approved this construction-only slice.
+
 October 22 prepared-module positioning checkpoint: the early AD module cut now
 retains the inliner's actual scope, binding ordinal and already-constructed prefix.
 Compilation-local identity registration authenticates both the scope and the exact

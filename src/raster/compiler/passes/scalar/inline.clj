@@ -1321,7 +1321,8 @@
              ;; Only rewrite D-as-value when D appears as an argument to non-pointwise ops.
              init init-raw
              binding-site (when prepared-scope
-                            {:scope prepared-scope :index source-index :prefix @result-pairs})
+                            {:scope prepared-scope :index source-index :prefix @result-pairs
+                             :live-symbols (into (set (keys @type-env)) (map first @result-pairs))})
              _ (when binding-site
                  (source-transport/observe-prepared-program-binding-site! binding-site))
              ;; Detect (value+grad f) or (grad f) partial application

@@ -6,29 +6,44 @@
   (:require [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
-            [raster.compiler.core.value-completion :as completion]))
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]))
 
 (defn- decline! [message data]
   (throw (ex-info message (assoc data :reason :generated-body-unsupported))))
+
+(defn ^:no-doc physical-entry-view
+  "Read the same generated body/parameter/wrapper boundary used by runtime.
+   No equal reconstructed body, implementation or parameter vector can stand
+   in for that boundary. The caller still retains its enclosing producer."
+  [{:keys [emission input-body implementation interface-class]} parameters]
+  (let [bridge (bytecode/retained-boxed-entry-bridge emission)]
+    (when-not (and bridge (vector? parameters)
+                   (bytecode/retained-input-body-context emission input-body)
+                   (identical? parameters (:params emission))
+                   (identical? implementation (:implementation emission))
+                   (identical? interface-class (:interface bridge))
+                   (= (count parameters) (count (get-in bridge [:boxed-entry :parameter-carriers])))
+                   (= (count parameters) (count (set parameters))))
+      (throw (ex-info "Generated call has no exact boxed entry input boundary"
+                      {:reason :generated-body-boxed-entry-inputs})))
+    {:bridge bridge :body input-body
+     :parameter-carriers (get-in bridge [:boxed-entry :parameter-carriers])}))
 
 (defn instantiate-boxed-entry-inputs
   "Construct the input boundary of an authenticated generated public entry.
    All original operands complete in Object context before any wrapper conversion,
    just as applyTo/invoke does. The caller must retain the physical owner/guard;
    these bindings alone grant no numerical realization or portable import."
-  [{:keys [emission input-body implementation interface-class]} parameters arguments]
-  (let [bridge (bytecode/retained-boxed-entry-bridge emission)
-        carriers (get-in bridge [:boxed-entry :parameter-carriers])]
-    (when-not (and bridge (vector? parameters) (vector? arguments)
-                   (bytecode/retained-input-body-context emission input-body)
-                   (identical? parameters (:params emission))
-                   (identical? implementation (:implementation emission))
-                   (identical? interface-class (:interface bridge))
-                   (= (count parameters) (count arguments) (count carriers))
-                   (= (count parameters) (count (set parameters))))
+  [{:keys [input-body] :as physical} parameters arguments]
+  (let [{:keys [bridge parameter-carriers]} (physical-entry-view physical parameters)
+        carriers parameter-carriers]
+    (when-not (and (vector? arguments) (= (count parameters) (count arguments) (count carriers)))
       (throw (ex-info "Generated call has no exact boxed entry input boundary"
                       {:reason :generated-body-boxed-entry-inputs})))
     (let [used (volatile! (into (set parameters) (filter symbol?)
@@ -54,6 +69,135 @@
        :bindings (into objects inputs)
        :substitutions (into {} (map (juxt :formal :input-binder)) slots)
        :boxed-entry-bridge bridge})))
+
+(defn- fact-dtype [fact]
+  ;; Invert the existing builtin carrier table; no new type/function registry.
+  ;; Object itself is not a numeric type. Only an independently established
+  ;; exact builtin payload may supply its conditional normal-return dtype.
+  (some (fn [[tag boxed]]
+          (when (or (identical? boxed (:builtin-class fact))
+                    (identical? (types/tag->java-class tag) (:carrier fact)))
+            (dtype/dtype-for-scalar-tag tag)))
+        types/primitive-info))
+
+(defn propose-value-source
+  "Construct a canonical-source candidate plus EVERY outstanding completion.
+
+   This is deliberately not an executable, equivalence certificate or admission
+   capability. The enclosing importer must discharge every retained context,
+   box/reference check and conversion against typed producers and ordered runtime
+   checks, including the normalization trace and output uses. Its prepared import
+   stays open until the complete source/typed/InvocationPlan join validates.
+   Unsupported conversions or missing/copy/ambiguous occurrences refuse the whole
+   candidate. Quoted data is opaque. No numerical body executes here."
+  [{:keys [emission input-body] :as physical} parameters]
+  (let [{:keys [parameter-carriers]} (physical-entry-view physical parameters)
+        [head bindings outputs :as source] (when (= 1 (count input-body)) (first input-body))]
+    (when-not (and (= 'let* head) (= 3 (count source))
+                   (vector? bindings) (even? (count bindings)) (vector? outputs)
+                   (every? symbol? (take-nth 2 bindings))
+                   (= (quot (count bindings) 2) (count (set (take-nth 2 bindings))))
+                   (not-any? (set parameters) (take-nth 2 bindings)))
+      (decline! "Generated module requires its complete flat binding and result spine" {}))
+    (let [resolve-completion
+          (fn [node]
+            (or (bytecode/retained-input-completion-context emission input-body node)
+                (throw (ex-info "Generated completion has no unique emitted occurrence"
+                                {:reason :unclosed-generated-module-completion :expression node}))))
+          seed (into {} (keep (fn [[id ^Class carrier]]
+                                (when (.isPrimitive carrier)
+                                  [id {:carrier carrier :presence :present}])))
+                     (map vector parameters parameter-carriers))
+          facts (normal-return/completed-scalar-bindings
+                 (partition 2 bindings) seed (:source-ns emission)
+                 #(:result-fact (resolve-completion %)))
+          root-locals
+          (reduce (fn [locals [ordinal [id _]]]
+                    (let [record (bytecode/retained-input-binding-context emission input-body source ordinal)]
+                      (when-not record
+                        (decline! "Generated module lost its emitted root binding" {:binder id}))
+                      (assoc locals id (:after record))))
+                  (:locals (bytecode/retained-input-body-context emission input-body))
+                  (map-indexed vector (partition 2 bindings)))
+          obligations (volatile! [])
+          seen (java.util.IdentityHashMap.)]
+      (letfn [(walk [node path]
+                (cond
+                  (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+                  (and (seq? node) (= completion/completion-symbol (first node)))
+                  (let [{:keys [contract operand]} (completion/canonical-parts node)
+                        observed (resolve-completion node)
+                        _ (when (.containsKey seen node)
+                            (throw (ex-info "Generated module repeats one completion occurrence"
+                                            {:reason :unclosed-generated-module-completion :path path})))
+                        _ (.put seen node true)
+                        value (walk operand (conj path :operand))
+                        context (:source-context contract)
+                        conversion? (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                                                 :jvm-bytecode-boxed-parameter-input} context)
+                        numeric? (and conversion? (.isPrimitive ^Class (:target-carrier contract)))
+                        lexical-facts (into {}
+                                            (filter (fn [[id _]]
+                                                      (and (contains? (:locals-before observed) id)
+                                                           (= (get root-locals id)
+                                                              (get (:locals-before observed) id)))))
+                                            facts)
+                        source-fact (when numeric?
+                                      (normal-return/completed-scalar-fact
+                                       operand lexical-facts (:source-ns emission)
+                                       #(:result-fact (resolve-completion %))))
+                        from (when numeric?
+                               (or (when (contains? #{:int :long :float :double :bool}
+                                                    (:input-carrier observed))
+                                     (if (= :bool (:input-carrier observed)) :boolean (:input-carrier observed)))
+                                   (fact-dtype source-fact)))
+                        to (when numeric?
+                             (some (fn [[tag _]]
+                                     (when (identical? (types/tag->java-class tag) (:target-carrier contract))
+                                       (dtype/dtype-for-scalar-tag tag))) types/primitive-info))
+                        operation (when to (symbol "clojure.core" (str "unchecked-" (name to))))
+                        policy (when (and from to (not= from to))
+                                 (conversion/source-policy from to operation))
+                        projected
+                        (cond
+                          (= :jvm-primitive-input context)
+                          (decline! "Source-policy input completion needs its own ordered projection" {:path path})
+                          (and numeric? (or (nil? from) (nil? to)))
+                          (decline! "Generated numeric completion lacks its exact builtin source payload"
+                                    {:path path :source-fact source-fact :contract contract})
+                          (and numeric? (not= from to))
+                          (if policy
+                            (let [[rounding overflow] policy]
+                              (list conversion/scalar-convert-symbol
+                                    {:source-dtype from :target-dtype to :rounding rounding :overflow overflow
+                                     :source-op operation} value))
+                            (decline! "Generated numeric completion has no exact scalar conversion"
+                                      {:path path :source from :target to}))
+                          :else value)]
+                    (vswap! obligations conj {:source node :path path :observed observed
+                                              :classification
+                                              (case context
+                                                :jvm-object-input :object-materialization
+                                                :jvm-bytecode-result-context :result-context
+                                                (:jvm-checkcast :jvm-bytecode-reference-input) :reference-check
+                                                (if numeric?
+                                                  (if (= from to) :numeric-identity :scalar-conversion)
+                                                  :reference-check))
+                                              :candidate projected :status :pending
+                                              :source-fact source-fact :source-dtype from :target-dtype to})
+                    projected)
+                  (or (seq? node) (vector? node))
+                  (util/remake-if-changed node (mapv #(walk %1 (conj path %2)) node (range)))
+                  ;; Maps and sets are not executable numerical scopes; keep
+                  ;; opaque values rather than inventing their evaluation order.
+                  (coll? node) (if (completion/contains-completion? node)
+                                (decline! "Completion in an unordered value container is not a module region"
+                                          {:path path}) node)
+                  :else node))]
+        (let [candidate (walk source [])]
+          {:source candidate :original source :physical physical
+           :normal-return-facts facts :completion-obligations @obligations
+           :admitted? false})))))
 
 (defn- reference-check [carrier value]
   (if (or (nil? carrier) (= Object carrier)) value
