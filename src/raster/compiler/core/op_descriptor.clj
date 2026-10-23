@@ -847,15 +847,38 @@
       (when-let [dtype (some-> argument types/literal-tag dtype/dtype-for-scalar-tag dtype/canon)]
         {:dtype dtype :shape []}))))
 
+(defn- allocation-argument-kind
+  "Type compatibility only, not an AbstractValue or successful input completion.
+   A retained physical carrier can identify an unused array exemplar without
+   inventing its capacity. Explicit unknown/conflicting facts must not disappear
+   behind a logical value. Only lexical arguments and exact literals are covered."
+  [argument values carrier-facts]
+  (let [value (direct-allocation-argument-value argument values)
+        logical (when (and value (dtype/known? (:dtype value)))
+                  {:dtype (dtype/canon (:dtype value)) :array? (boolean (seq (:shape value)))})
+        supplied? (and (symbol? argument) (contains? carrier-facts argument))
+        carrier (when supplied? (get-in carrier-facts [argument :carrier]))
+        physical (when (class? carrier)
+                   (if-let [dt (dtype/dtype-for-jvm-array-class carrier)]
+                     {:dtype dt :array? true}
+                     (when (.isPrimitive ^Class carrier)
+                       (when-let [dt (dtype/dtype-for-scalar-tag (symbol (.getName ^Class carrier)))]
+                         {:dtype dt :array? false}))))]
+    (cond
+      (not supplied?) logical
+      (nil? physical) nil
+      (and value (not= logical physical)) nil
+      :else physical)))
+
 (defn- direct-allocation-projection-in-context
   "Project an exact constructor or a definition-derived direct allocation helper.
 
    Helpers require the selected qualified implementation's actual retained deftm body, not a
    registered alloc-form or allocator basename. Actual arguments must be bound values or exact
-   primitive literals with matching retained types: substitution cannot discard evaluation of
+   primitive literals with matching retained types/carriers: substitution cannot discard evaluation of
    an unused argument, duplicate a check, or reorder call-argument effects. Returned helper data
    is correspondence material, not a frozen-definition/completion certificate."
-  [expression values]
+  [expression values carrier-facts]
   (if (array-allocation-size expression)
     {:constructor expression}
     (let [{:keys [implementation-op arguments lexical-callee dispatch? semantic-op]} (call-description expression)
@@ -865,7 +888,7 @@
                      (method-entry/selected-definition operation implementation-op (count arguments))
                      (method-entry/direct-selected-definition operation implementation-op (count arguments)))]
       (when (and (not lexical-callee) (symbol? implementation-op) (namespace implementation-op)
-                 (every? #(some? (direct-allocation-argument-value % values)) arguments))
+                 (every? #(some? (allocation-argument-kind % values carrier-facts)) arguments))
         ;; Mangling is only a lookup address. The existing registered MethodEntry must prove
         ;; the exact executable receiver and delegated source; no overload is inferred here.
         (when-let [{v :source-var} (select!)]
@@ -887,9 +910,9 @@
                                 (let [array? (types/array-tag? tag)
                                       expected (if array? (dtype/dtype-for-array-tag tag)
                                                    (dtype/dtype-for-scalar-tag tag))
-                                      actual (direct-allocation-argument-value argument values)]
+                                      actual (allocation-argument-kind argument values carrier-facts)]
                                   (and expected (= (dtype/canon expected) (:dtype actual))
-                                       (= array? (boolean (seq (:shape actual)))))))]
+                                       (= array? (:array? actual)))))]
               (when (and definition (= (count parameters) (count arguments) (count parameter-tags))
                          (every? true? (map compatible? arguments parameter-tags))
                          (identical? root (.getRawRoot ^clojure.lang.Var v))
@@ -905,11 +928,15 @@
 
 (defn direct-allocation-projection
   "Derive constructor correspondence from the selected original frontend.
-   Literal facts or metadata alone grant neither source lifetime nor completion."
-  [expression values]
-  (method-entry/call-with-definition-inputs
-   #(method-entry/call-with-optional-definition-inputs
-     (fn [] (direct-allocation-projection-in-context expression values)))))
+   Literal facts or metadata alone grant neither source lifetime nor completion.
+   The compiler-internal third argument carries existing {:carrier Class} facts,
+   not array extents. The producer still owes those facts' occurrence/history and
+   the original argument checks/order. No logical value is created or refined."
+  ([expression values] (direct-allocation-projection expression values {}))
+  ([expression values carrier-facts]
+   (method-entry/call-with-definition-inputs
+    #(method-entry/call-with-optional-definition-inputs
+      (fn [] (direct-allocation-projection-in-context expression values carrier-facts))))))
 
 (defn- unwrap-array-arg
   "Unwrap a cast wrapper around an array argument — (double arr) → arr,

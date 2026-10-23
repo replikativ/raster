@@ -28,6 +28,30 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 allocation-kind checkpoint: definition-derived direct helper projection
+can consume existing primitive/primitive-array carrier facts independently of a
+full AbstractValue. This proves only type/kind compatibility. An unused exemplar
+supplies no capacity; the constructor's completed size remains its extent producer.
+Explicit malformed or incompatible carriers cannot be masked by a logical value.
+Boxed classes, object arrays and unsupported primitive carriers refuse. Logical
+dtype aliases now canonicalize through the common dtype table. Core constructors
+and original selected-definition/frontend guards retain their existing behavior.
+Focused helper/descriptor checks pass 14 tests / 208 assertions. The wider allocation
+gate passes 34 tests / 369 assertions after replacing a stale constructor-cast AST
+assertion with the actual retained parameter contract and JVM result/size-failure
+parity. The same stale assertion failed against the committed descriptor in the
+same process. This leaf comparison grants no wrapper conversion or reference-check
+authority; invalid inputs remain source-owner obligations. Independent review
+approved the complete carrier/legality diff.
+
+The real module still declines: its `alloc-like` specialization forwards to
+`zeros-like`, while the helper detector currently certifies only direct core
+constructors. Carrier compatibility alone does not close this delegation. The
+next proof must compose the selected original definitions and their exact
+forwarded physical interfaces, retain nested completion obligations, and reject
+cycles/extra computations. Do not recursively broaden the older general buffer
+rewrite detector or grant allocation admission merely from an allocator name.
+
 October 23 input-correspondence checkpoint: the existing prepared phase can now
 query each exact staged allocator input without compiling or executing it. Physical
 formal/root ports join their actual bytecode local facts, original binding ordinal,

@@ -13,6 +13,54 @@
 (core/deftm storage-helper [ref :- (Array float) n :- Long] :- (Array float)
   (float-array n))
 
+(deftest selected-helper-carriers-do-not-invent-exemplar-capacity
+  (let [v (core/resolve-deftm-var #'storage-helper {:dtype :float})
+        implementation (symbol (str (:ns (meta v))) (str (:name (meta v)) "-impl"))
+        _ (core/ensure-bytecode-implementation!
+           (ns-resolve (:ns (meta v)) (symbol (name implementation))))
+        call (with-meta (list '.invk implementation 'x 'size)
+               {:raster.op/original 'raster.compiler.allocation-frontend-source-test/storage-helper})
+        facts {'x {:carrier (class (float-array 0))} 'size {:carrier Long/TYPE}}
+        projected (descriptor/direct-allocation-projection call {} facts)
+        x (av/tensor {:dtype :float :shape [3 5] :ownership :borrowed})
+        values {'x x 'size (av/tensor {:dtype :long :shape []})}]
+    (is (nil? (descriptor/direct-allocation-projection call {})))
+    (is (= '(clojure.core/float-array size) (:constructor projected)))
+    (is (= #{:constructor :helper} (set (keys projected))))
+    (is (= #{:operation :implementation :definition :arguments} (set (keys (:helper projected)))))
+    (is (= ['x 'size] (get-in projected [:helper :arguments])))
+    (is (= projected (descriptor/direct-allocation-projection call values facts)))
+    (is (= projected (descriptor/direct-allocation-projection
+                      call {'x (assoc x :dtype :f32) 'size (av/tensor {:dtype :i64 :shape []})})))
+    (is (identical? x (get values 'x)))
+    (is (= [3 5] (:shape x)))
+    (doseq [bad [(dissoc facts 'x) (dissoc facts 'size)
+                 (assoc facts 'x nil) (assoc facts 'size {})
+                 (assoc-in facts ['x :carrier] Object)
+                 (assoc-in facts ['x :carrier] (class (object-array 0)))
+                 (assoc-in facts ['x :carrier] (class (double-array 0)))
+                 (assoc-in facts ['size :carrier] Long)
+                 (assoc-in facts ['size :carrier] Number)
+                 (assoc-in facts ['size :carrier] Integer/TYPE)
+                 (assoc-in facts ['size :carrier] Short/TYPE)
+                 (assoc-in facts ['size :carrier] Boolean/TYPE)
+                 (assoc-in facts ['size :carrier] Character/TYPE)]]
+      (is (nil? (descriptor/direct-allocation-projection call {} bad))))
+    (doseq [bad [(assoc facts 'x nil) (assoc facts 'size {})
+                 (assoc-in facts ['x :carrier] nil)
+                 (assoc-in facts ['x :carrier] Object)
+                 (assoc-in facts ['x :carrier] Float/TYPE)
+                 (assoc-in facts ['x :carrier] (class (double-array 0)))
+                 (assoc-in facts ['size :carrier] Long)
+                 (assoc-in facts ['size :carrier] Double/TYPE)]]
+      (is (nil? (descriptor/direct-allocation-projection call values bad))
+          "an existing logical value cannot conceal an explicit incompatible carrier"))
+    (is (nil? (descriptor/direct-allocation-projection
+               (with-meta (list '.invk implementation 'x '(clojure.core/inc size)) (meta call))
+               {} facts)))
+    (is (= {:constructor '(clojure.core/float-array n)}
+           (descriptor/direct-allocation-projection '(clojure.core/float-array n) {} {'n {:carrier Object}})))))
+
 (deftest ordered-storage-facts-reach-the-actual-selected-allocation-helper
   (let [v (core/resolve-deftm-var #'storage-helper {:dtype :float})
         implementation (symbol (str (:ns (meta v))) (str (:name (meta v)) "-impl"))

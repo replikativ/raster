@@ -45,8 +45,17 @@
             call (make-call '[x cnt])
             values {'x {:dtype :double :shape ['m]} 'cnt {:dtype :long :shape []}}
             projection (descriptor/direct-allocation-projection call values)]
-        (is (= '(clojure.core/double-array (clojure.core/long cnt)) (:constructor projection))
-            "projection retains the helper's explicit parameter conversion")
+        (is (= '(clojure.core/double-array cnt) (:constructor projection)))
+        (is (= '[doubles long] (get-in projection [:helper :definition :parameter-tags]))
+            "the actual Long parameter contract is retained, not invented as a source cast")
+        (let [original (ns-resolve source (symbol (name op)))
+              projected (eval (list 'fn '[cnt] (:constructor projection)))
+              observe (fn [invoke]
+                        (try (let [array (invoke)] {:class (class array) :length (alength array)})
+                             (catch Throwable error {:error (class error)})))]
+          (doseq [ref [nil (double-array 0)] count [-1 0 3]]
+            (is (= (observe #(original ref count)) (observe #(projected count)))
+                "unused nullable exemplars and constructor size failures preserve JVM behavior")))
         (is (= implementation (get-in projection [:helper :implementation])))
         (is (= ['x 'cnt] (get-in projection [:helper :arguments])))
         (doseq [selected [(ns-resolve source (symbol (name implementation)))
