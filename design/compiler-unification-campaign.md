@@ -10138,3 +10138,41 @@ this is not a controlled compile-time benchmark. Full 2-layer/32-dimensional
 GSDM statistical training, Adam/EMA coverage, real-weight Gemma adapter gates,
 and normalized AD general composition/default migration remain separate open
 acceptance obligations.
+
+### Pre-emission generated numerical templates (2026-10-22)
+
+`generated-body/normalize-program` now constructs the numerical template and its
+complete pending completion manifest before the first outer generated entry is
+emitted. The unchanged completion-bearing program remains the CPU runtime body.
+After existing local/context validation, publication retains the identical
+template under the existing GeneratedPreparationOwner; there is no new registry
+or execution convention. Unsupported template construction or an unavailable
+complete occurrence inventory leaves CPU execution available without authorizing
+a numerical import. Stale owners and mismatched owned contracts still fail.
+
+Each completion traversal occurrence has its own manifest token and, where
+needed, fresh conversion hole. Shared source objects do not share holes. The
+emitter supplies an exact ordered occurrence inventory, not inferred syntax
+equivalence or dynamic branch order. Queries validate the dependency lineage
+once for the complete inventory. Copies, missing/extra/ambiguous records and
+unemitted unreachable occurrences cannot close it; quoted data stays opaque.
+
+`propose-value-source` now requires this retained template. It refines only
+numeric boundary holes using actual raw operands or independent normal-return
+facts, never the same conversion's result as its source type. Explicit primitive
+input recipes use the existing scalar-conversion policy at construction time and
+are checked against actual emission. The former post-emission numerical AST
+reconstruction is removed. Wrapper/check obligations remain pending, and source
+imports remain open until the existing normalization/TypedSOAC/InvocationPlan
+closure is complete. This change is not production training admission.
+
+The actual distributed-training body joins all 64 manifest entries to their
+emitted occurrences; only two conversions require deferred numeric refinement.
+Focused tests cover shared/nested occurrences, stale and copied owners, CPU
+divergence preservation, publication identity, and Float checkpoint raw-bit
+agreement through Double conversion (signed zero, subnormals, overflow, infinity
+and NaN). The broader seven-gate PR requirement is unchanged. Exact-head `aadb9c33`
+CI remained red: unit training composition has two equation-first coverage
+errors; OpenCL reports one failure and twenty errors across training, PDE/AMR,
+effect/control and checked-stage boundaries. These are unresolved campaign
+obligations, not accepted skips or permission to merge.

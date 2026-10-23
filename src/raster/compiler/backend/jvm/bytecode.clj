@@ -881,6 +881,16 @@
     (when-let [observed (retained-binding-context emission owned index)]
       (assoc observed :source-input original))))
 
+(defn- retained-owned-completion-context [emission owned]
+  (let [token (::completion-occurrence (meta owned))
+        record (get (:completion-contexts emission) token)]
+    (when (and (= :jvm-bytecode (:backend emission)) token
+               (identical? owned (get (:completion-catalog emission) token))
+               (= :known (:status record))
+               (identical? token (::completion-occurrence (meta (:expression record))))
+               (= (:contract (completion/canonical-parts owned)) (:contract record)))
+      (assoc record :source owned))))
+
 (defn ^:no-doc retained-input-completion-context
   "Read one exact canonical completion from its actual owned emission.
    Raw operand, completed and parent-visible carriers are distinct. A :ref
@@ -890,15 +900,36 @@
    missing and multiply-emitted occurrences abstain; stale owners fail."
   [emission input-body original]
   (when-let [owned (input-origin emission input-body original :completion)]
-    (let [token (::completion-occurrence (meta owned))
-          record (get (:completion-contexts emission) token)]
-      (when (and (= :jvm-bytecode (:backend emission)) token
-                 (identical? owned (get (:completion-catalog emission) token))
-                 (= :known (:status record))
-                 (identical? token (::completion-occurrence (meta (:expression record))))
-                 (= (:contract (completion/canonical-parts owned)) (:contract record)))
-        (me/assert-emission-inputs-current! emission)
-        (assoc record :source-input original :source owned)))))
+    (when-let [record (retained-owned-completion-context emission owned)]
+      (me/assert-emission-inputs-current! emission)
+      (assoc record :source-input original))))
+
+(defn ^:no-doc retained-input-completion-spine
+  "Read ALL exact completion occurrences in retained annotation traversal order.
+   This quote-aware postorder inventory is not runtime branch execution order.
+   Shared input expressions have distinct catalog-owned occurrences; this does
+   not weaken the unique-object query. The input body must be the actual emitter
+   input and its complete occurrence catalog must be covered, with every context
+   known and uniquely owned. Missing/extra/copied/re-emitted records abstain.
+   This is physical validation data, not source equivalence or admission."
+  [emission input-body]
+  (when-let [origins (:input-origins emission)]
+    (when (and (= :jvm-bytecode (:backend emission))
+               (instance? InputOrigins origins)
+               (identical? input-body (.-input-body ^InputOrigins origins))
+               (identical? (:body emission) (.-emitted-body ^InputOrigins origins)))
+      (let [entries (get (.-families ^InputOrigins origins) :completion [])
+            catalog (:completion-catalog emission)
+            records (mapv (fn [[original owned]]
+                            (when-let [record (retained-owned-completion-context emission owned)]
+                              (assoc record :source-input original))) entries)
+            tokens (mapv #(-> % :source meta ::completion-occurrence) records)]
+        (when (and (= (count entries) (count catalog) (count (:completion-contexts emission)))
+                   (every? some? records)
+                   (= (count tokens) (count (set tokens)))
+                   (= (set tokens) (set (keys catalog))))
+          (me/assert-emission-inputs-current! emission)
+          records)))))
 
 (defn ^:no-doc retained-body-context
   "Original parameter locals of this emission's actual whole numerical body."

@@ -85,6 +85,54 @@
              (try (observe emission body expression) nil
                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
 
+(deftest completion-spine-preserves-shared-occurrences-without-borrowing-owners
+  (let [inner (completion/complete-value completion/object-input-contract 'x)
+        outer (completion/complete-value completion/object-input-contract inner)
+        body [(list 'do outer inner)]
+        {:keys [implementation emission]} (emit body)
+        spine (bytecode/retained-input-completion-spine emission body)]
+    (is (= "value" (implementation "value")))
+    (is (= 3 (count spine)))
+    (is (every? true? (map identical? [inner outer inner] (map :source-input spine))))
+    (is (not (identical? (:source (first spine)) (:source (last spine)))))
+    (is (nil? (observe emission body inner)) "the unique-source query remains strict")
+    (is (some? (observe emission body outer)))
+    (is (nil? (bytecode/retained-input-completion-spine emission (mapv identity body))))
+    (is (nil? (bytecode/retained-input-completion-spine
+               (assoc emission :body (mapv identity (:body emission))) body)))
+    (let [guards (atom 0)
+          guard entry/assert-emission-inputs-current!]
+      (with-redefs [entry/assert-emission-inputs-current!
+                    (fn [owner] (swap! guards inc) (guard owner))]
+        (is (= 3 (count (bytecode/retained-input-completion-spine emission body))))
+        (is (= 1 @guards) "validate dependency lineage once, not once per occurrence")))
+    (let [token (first (keys (:completion-contexts emission)))]
+      (doseq [changed [(update emission :completion-contexts dissoc token)
+                       (assoc-in emission [:completion-contexts token :status] :ambiguous)
+                       (assoc-in emission [:completion-contexts (Object.)] {:status :known})
+                       (update emission :completion-catalog dissoc token)]]
+        (is (nil? (bytecode/retained-input-completion-spine changed body)))))
+    (with-redefs [entry/assert-emission-inputs-current!
+                  (fn [_] (throw (ex-info "stale test owner" {:reason :stale-definition-proof-input})))]
+      (is (= :stale-definition-proof-input
+             (try (bytecode/retained-input-completion-spine emission body) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest completion-spine-keeps-quoted-syntax-opaque
+  (let [expression (completion/complete-value completion/object-input-contract 'x)
+        body [(list 'let* ['quoted (list 'quote expression)] 'quoted)]
+        {:keys [emission]} (emit body)]
+    (is (= [] (bytecode/retained-input-completion-spine emission body)))))
+
+(deftest completion-spine-does-not-omit-unemitted-unreachable-occurrences
+  (let [expression (completion/complete-value completion/object-input-contract 'x)
+        body [(list 'do '(throw x) expression)]
+        {:keys [implementation emission]} (emit body)]
+    (is (= 1 (count (:completion-catalog emission))))
+    (is (empty? (:completion-contexts emission)))
+    (is (nil? (bytecode/retained-input-completion-spine emission body)))
+    (is (thrown? IllegalStateException (implementation (IllegalStateException. "stop"))))))
+
 (deftest exact-nonbootstrap-array-class-is-retained-without-inference
   (let [donor (:implementation (emit ['x]))
         array (java.lang.reflect.Array/newInstance (class donor) 0)

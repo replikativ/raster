@@ -84,7 +84,11 @@
 
 (defn- project-numeric-completion [value from target details]
   (let [to (fact-dtype {:carrier target})
-        operation (when to (symbol "clojure.core" (str "unchecked-" (name to))))
+        ;; Core has no unchecked-double. Its ordinary double cast performs the
+        ;; same primitive numeric adaptation; narrowing keeps the explicit
+        ;; unchecked spelling and must still resolve through the shared policy.
+        operation (when to (if (= :double to) 'clojure.core/double
+                               (symbol "clojure.core" (str "unchecked-" (name to)))))
         policy (when (and from to (not= from to)) (conversion/source-policy from to operation))]
     (when-not (and from to)
       (decline! "Generated numeric completion lacks an unambiguous builtin source and target"
@@ -100,111 +104,192 @@
                       (decline! "Generated numeric completion has no exact scalar conversion"
                                 (assoc details :source from :target to))))}))
 
-(defn propose-value-source
-  "Construct a canonical-source candidate plus EVERY outstanding completion.
+(defn- lexical-id? [id] (and (symbol? id) (nil? (namespace id))))
 
-   This is deliberately not an executable, equivalence certificate or admission
-   capability. The enclosing importer must discharge every retained context,
-   box/reference check and conversion against typed producers and ordered runtime
-   checks, including the normalization trace and output uses. Its prepared import
-   stays open until the complete source/typed/InvocationPlan join validates.
-   Unsupported conversions or missing/copy/ambiguous occurrences refuse the whole
-   candidate. Quoted data is opaque. No numerical body executes here."
-  [{:keys [emission input-body] :as physical} parameters]
-  (let [{:keys [parameter-carriers]} (physical-entry-view physical parameters)
-        [head bindings outputs :as source] (when (= 1 (count input-body)) (first input-body))]
-    (when-not (and (= 'let* head) (= 3 (count source))
+(defn- generated-flat-source! [input-body parameters]
+  (let [[head bindings outputs :as source] (when (= 1 (count input-body)) (first input-body))]
+    (when-not (and (vector? parameters)
+                   (every? lexical-id? parameters)
+                   (= (count parameters) (count (set parameters)))
+                   (= 'let* head) (= 3 (count source))
                    (vector? bindings) (even? (count bindings)) (vector? outputs)
-                   (every? symbol? (take-nth 2 bindings))
+                   (every? lexical-id? (take-nth 2 bindings))
                    (= (quot (count bindings) 2) (count (set (take-nth 2 bindings))))
                    (not-any? (set parameters) (take-nth 2 bindings)))
       (decline! "Generated module requires its complete flat binding and result spine" {}))
-    (let [resolve-completion
-          (fn [node]
-            (or (bytecode/retained-input-completion-context emission input-body node)
-                (throw (ex-info "Generated completion has no unique emitted occurrence"
-                                {:reason :unclosed-generated-module-completion :expression node}))))
-          seed (into {} (keep (fn [[id ^Class carrier]]
-                                (when (.isPrimitive carrier)
-                                  [id {:carrier carrier :presence :present}])))
-                     (map vector parameters parameter-carriers))
-          facts (normal-return/completed-scalar-bindings
-                 (partition 2 bindings) seed (:source-ns emission)
-                 #(:result-fact (resolve-completion %)))
-          root-locals
-          (reduce (fn [locals [ordinal [id _]]]
-                    (let [record (bytecode/retained-input-binding-context emission input-body source ordinal)]
-                      (when-not record
-                        (decline! "Generated module lost its emitted root binding" {:binder id}))
-                      (assoc locals id (:after record))))
-                  (:locals (bytecode/retained-input-body-context emission input-body))
-                  (map-indexed vector (partition 2 bindings)))
-          obligations (volatile! [])
-          seen (java.util.IdentityHashMap.)]
-      (letfn [(walk [node path]
-                (cond
-                  (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
-                  (and (seq? node) (= completion/completion-symbol (first node)))
-                  (let [{:keys [contract operand]} (completion/canonical-parts node)
-                        observed (resolve-completion node)
-                        _ (when (.containsKey seen node)
-                            (throw (ex-info "Generated module repeats one completion occurrence"
-                                            {:reason :unclosed-generated-module-completion :path path})))
-                        _ (.put seen node true)
-                        value (walk operand (conj path :operand))
-                        context (:source-context contract)
-                        conversion? (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input
-                                                 :jvm-bytecode-boxed-parameter-input} context)
-                        numeric? (and conversion? (.isPrimitive ^Class (:target-carrier contract)))
-                        lexical-facts (into {}
-                                            (filter (fn [[id _]]
-                                                      (and (contains? (:locals-before observed) id)
-                                                           (= (get root-locals id)
-                                                              (get (:locals-before observed) id)))))
-                                            facts)
-                        source-fact (when numeric?
-                                      (normal-return/completed-scalar-fact
-                                       operand lexical-facts (:source-ns emission)
-                                       #(:result-fact (resolve-completion %))))
-                        from (when numeric?
-                               (or (when (contains? #{:int :long :float :double :bool}
-                                                    (:input-carrier observed))
-                                     (if (= :bool (:input-carrier observed)) :boolean (:input-carrier observed)))
-                                   (fact-dtype source-fact)))
-                        numeric (when numeric?
-                                  (project-numeric-completion value from (:target-carrier contract)
-                                                              {:path path :source-fact source-fact}))
-                        to (:target-dtype numeric)
-                        projected
-                        (cond
-                          (= :jvm-primitive-input context)
-                          (decline! "Source-policy input completion needs its own ordered projection" {:path path})
-                          numeric? (:candidate numeric)
-                          :else value)]
-                    (vswap! obligations conj {:source node :path path :observed observed
-                                              :classification
-                                              (case context
-                                                :jvm-object-input :object-materialization
-                                                :jvm-bytecode-result-context :result-context
-                                                (:jvm-checkcast :jvm-bytecode-reference-input) :reference-check
-                                                (if numeric?
-                                                  (:classification numeric)
-                                                  :reference-check))
-                                              :candidate projected :status :pending
-                                              :source-fact source-fact :source-dtype from :target-dtype to})
-                    projected)
-                  (or (seq? node) (vector? node))
-                  (util/remake-if-changed node (mapv #(walk %1 (conj path %2)) node (range)))
-                  ;; Maps and sets are not executable numerical scopes; keep
-                  ;; opaque values rather than inventing their evaluation order.
-                  (coll? node) (if (completion/contains-completion? node)
-                                (decline! "Completion in an unordered value container is not a module region"
-                                          {:path path}) node)
-                  :else node))]
-        (let [candidate (walk source [])]
-          {:source candidate :original source :physical physical
-           :normal-return-facts facts :completion-obligations @obligations
-           :admitted? false})))))
+    source))
+
+(defn construct-value-source-template
+  "Construct the pending numerical template BEFORE outer entry emission.
+
+   Only explicit primitive input recipes determine a conversion here. Unknown
+   reference payload conversions remain fresh canonical-completion holes, one
+   per traversal occurrence even when the original expression object is shared.
+   All wrappers/checks remain pending manifest obligations. No emitted result,
+   inferred scalar default, physical observation or numerical evaluation is used.
+   The owning preparation must retain this exact template and later validate its
+   complete occurrence spine; the returned map alone grants no admission."
+  [input-body parameters]
+  (let [source (generated-flat-source! input-body parameters)
+        obligations (volatile! [])]
+    (letfn [(walk [node path]
+              (cond
+                (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+                (and (seq? node) (= completion/completion-symbol (first node)))
+                (let [parts (or (completion/canonical-parts node)
+                                (throw (ex-info "Malformed generated value completion"
+                                                {:reason :invalid-value-completion :path path})))
+                      {:keys [contract operand]} parts
+                      value (walk operand (conj path :operand))
+                      context (:source-context contract)
+                      _ (when (= :jvm-primitive-input context)
+                          (decline! "Source-policy input completion needs its own ordered projection"
+                                    {:path path}))
+                      numeric? (and (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                                                :jvm-bytecode-boxed-parameter-input} context)
+                                    (.isPrimitive ^Class (:target-carrier contract)))
+                      raw (:expected-input-carrier contract)
+                      from (when (and numeric? (contains? #{:int :long :float :double} raw)) raw)
+                      numeric (when from
+                                (project-numeric-completion value from (:target-carrier contract) {:path path}))
+                      hole (when (and numeric? (nil? numeric))
+                             (completion/complete-value contract value))
+                      candidate (or (:candidate numeric) hole value)]
+                  (vswap! obligations conj
+                          {:token (Object.) :source node :path path :contract contract
+                           :candidate candidate :hole hole :status :pending
+                           :source-dtype (:source-dtype numeric) :target-dtype (:target-dtype numeric)
+                           :classification (case context
+                                             :jvm-object-input :object-materialization
+                                             :jvm-bytecode-result-context :result-context
+                                             :jvm-checkcast :reference-check
+                                             (if numeric? (or (:classification numeric) :numeric-boundary-hole)
+                                                 (if (identical? Object (:target-carrier contract))
+                                                   :reference-identity :reference-check)))})
+                  candidate)
+                (or (seq? node) (vector? node))
+                (util/remake-if-changed node (mapv #(walk %1 (conj path %2)) node (range)))
+                (coll? node) (if (completion/contains-completion? node)
+                              (decline! "Completion in an unordered value container is not a module region"
+                                        {:path path}) node)
+                :else node))]
+      (let [candidate (walk source [])]
+        {:input-body input-body :parameters parameters :original source :source candidate
+         :completion-obligations @obligations :admitted? false}))))
+
+(defn- with-value-source-template [program]
+  (try
+    (assoc program ::value-source-template-candidate
+           (construct-value-source-template (:walked-body program) (:params program)))
+    (catch clojure.lang.ExceptionInfo error
+      (if (= :generated-body-unsupported (:reason (ex-data error)))
+        program
+        (throw error)))))
+
+(defn- template-completion-spine! [template input-body parameters spine]
+  (let [obligations (:completion-obligations template)]
+    (when-not (and template (identical? input-body (:input-body template))
+                   (identical? parameters (:parameters template))
+                   (identical? (first input-body) (:original template))
+                   (vector? obligations) (some? spine)
+                   (= (count obligations) (count spine))
+                   (= (count obligations) (count (set (map :token obligations))))
+                   (every? (fn [[obligation record]]
+                             (and (:token obligation) (= :pending (:status obligation))
+                                  (identical? (:source obligation) (:source-input record))
+                                  (= (:contract obligation) (:contract record))
+                                  (or (not (contains? (:contract obligation) :expected-input-carrier))
+                                      (= :diverge (:input-carrier record))
+                                      (= (get-in obligation [:contract :expected-input-carrier])
+                                         (:input-carrier record)))))
+                           (map vector obligations spine)))
+      (throw (ex-info "Generated template lacks its complete original completion occurrence spine"
+                      {:reason :unclosed-generated-module-completion})))
+    spine))
+
+(defn retain-value-source-template
+  "Attach the SAME pre-emission template after actual emission validation.
+   The enclosing GeneratedPreparationOwner remains the publication authority.
+   Unsupported construction omits the template without disabling CPU AD."
+  [program {:keys [emission input-body] :as physical}]
+  (if-let [template (::value-source-template-candidate program)]
+    (if-let [spine (bytecode/retained-input-completion-spine emission input-body)]
+      (do (template-completion-spine! template input-body (:params program) spine)
+          (assoc physical ::value-source-template template))
+      ;; A missing/unemitted occurrence cannot authorize a numerical import,
+      ;; but need not invalidate the original CPU implementation.
+      physical)
+    physical))
+
+(defn propose-value-source
+  "Refine only the pending numeric boundary holes of the retained template.
+   Numerical operations come from pre-emission construction, not reconstructed
+   outer JVM code. Every check/box/completion remains pending; the surrounding
+   importer still owes source, normalization, typed and InvocationPlan closure.
+   No posthoc reconstruction fallback is available on this production path."
+  [{:keys [emission input-body] :as physical} parameters]
+  (let [{:keys [parameter-carriers]} (physical-entry-view physical parameters)
+        template (::value-source-template physical)
+        _ (when-not template
+            (decline! "Generated module has no retained pre-emission numerical template" {}))
+        spine (template-completion-spine!
+               template input-body parameters
+               (bytecode/retained-input-completion-spine emission input-body))
+        [_ bindings _ :as source] (:original template)
+        ;; Normal-return analysis may use an exact unique operand completion.
+        ;; Shared syntax with distinct lexical occurrences supplies no global
+        ;; fact; occurrence-specific raw input records remain available below.
+        contexts (java.util.IdentityHashMap.)
+        _ (doseq [record spine]
+            (let [node (:source-input record)]
+              (.put contexts node (when-not (.containsKey contexts node) record))))
+        resolve-fact (fn [node] (:result-fact (.get contexts node)))
+        seed (into {} (keep (fn [[id ^Class carrier]]
+                              (when (.isPrimitive carrier) [id {:carrier carrier :presence :present}])))
+                   (map vector parameters parameter-carriers))
+        facts (normal-return/completed-scalar-bindings
+               (partition 2 bindings) seed (:source-ns emission) resolve-fact)
+        root-locals
+        (reduce (fn [locals [ordinal [id _]]]
+                  (let [record (bytecode/retained-input-binding-context emission input-body source ordinal)]
+                    (when-not record
+                      (decline! "Generated module lost its emitted root binding" {:binder id}))
+                    (assoc locals id (:after record))))
+                (:locals (bytecode/retained-input-body-context emission input-body))
+                (map-indexed vector (partition 2 bindings)))
+        replacements (java.util.IdentityHashMap.)
+        obligations
+        (mapv
+         (fn [obligation observed]
+           (if-let [hole (:hole obligation)]
+             (let [{:keys [contract operand]} (completion/canonical-parts (:source obligation))
+                   lexical-facts (into {}
+                                       (filter (fn [[id _]]
+                                                 (and (contains? (:locals-before observed) id)
+                                                      (= (get root-locals id)
+                                                         (get (:locals-before observed) id))))) facts)
+                   fact (normal-return/completed-scalar-fact operand lexical-facts
+                                                           (:source-ns emission) resolve-fact)
+                   raw (:input-carrier observed)
+                   from (or (when (contains? #{:int :long :float :double} raw) raw)
+                            (fact-dtype fact))
+                   numeric (project-numeric-completion (nth hole 2) from (:target-carrier contract)
+                                                       {:path (:path obligation) :source-fact fact})]
+               (.put replacements hole (:candidate numeric))
+               (merge obligation numeric {:observed observed :source-fact fact}))
+             (assoc obligation :observed observed)))
+         (:completion-obligations template) spine)]
+    (letfn [(specialize [node]
+              (cond
+                (.containsKey replacements node) (specialize (.get replacements node))
+                (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+                (or (seq? node) (vector? node))
+                (util/remake-if-changed node (mapv specialize node))
+                :else node))]
+      {:source (specialize (:source template)) :original source :physical physical
+       :template template :normal-return-facts facts
+       :completion-obligations (mapv #(update % :candidate specialize) obligations)
+       :admitted? false})))
 
 (defn- validate-call-spine! [source binding-count output-count]
   (let [[head bindings outputs] (when (seq? source) source)
@@ -212,7 +297,7 @@
     (when-not (and (= 'let* head) (= 3 (count source))
                    (vector? bindings) (= (* 2 binding-count) (count bindings))
                    (= binding-count (count (set ids)))
-                   (every? #(and (symbol? %) (nil? (namespace %))) ids)
+                   (every? lexical-id? ids)
                    (vector? outputs) (= output-count (count outputs)))
       (decline! "Generated call construction did not preserve the complete flat spine" {})))
   source)
@@ -627,8 +712,9 @@
                      ids (vec (take-nth 2 bindings))]
                  (when-not (= (count ids) (count (set ids)))
                    (decline! "Generated helper bindings collide with their caller" {}))
-                 (assoc program ::entry-method method ::binding-facts @imported-facts :walked-body
-                        [(with-meta (list head bindings outputs) (meta body))])))))))))
+                 (with-value-source-template
+                   (assoc program ::entry-method method ::binding-facts @imported-facts :walked-body
+                          [(with-meta (list head bindings outputs) (meta body))]))))))))))
    (catch clojure.lang.ExceptionInfo error
      (if (= :generated-body-unsupported (:reason (ex-data error))) nil (throw error)))))
 

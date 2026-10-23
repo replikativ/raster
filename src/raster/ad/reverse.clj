@@ -6086,9 +6086,11 @@
        {:definition-proofs (into {} (map (juxt :var identity)) pending)})
       (method-entry/prepare-pending-definition-inputs!
        rcore/ensure-current-owned-bytecode! (mapv :var pending)))
-    {:implementation implementation :emission emission :input-body walked-body
-     :interface-class (:iface-class interface) :source-policy policy
-     :guard (method-entry/prepare-emission-input-guard! emission)}))
+    ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/retain-value-source-template)
+     program
+     {:implementation implementation :emission emission :input-body walked-body
+      :interface-class (:iface-class interface) :source-policy policy
+      :guard (method-entry/prepare-emission-input-guard! emission)})))
 
 (defn- freeze-generated-preparation [program frontend template-revision parameter-plan]
   (if-not frontend

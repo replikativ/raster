@@ -16,12 +16,148 @@
 
 (defn- emit [parameters tags body]
   (let [interface (types/ensure-fn-interface! tags)
+        template (try (generated/construct-value-source-template body parameters)
+                      (catch clojure.lang.ExceptionInfo error
+                        (when-not (= :generated-body-unsupported (:reason (ex-data error)))
+                          (throw error))))
         emitted (core/emit-owned-bytecode!
                  bytecode/compile-typed-impl! "raster.compiled.GeneratedModuleTest"
                  parameters tags 'Object body
                  (the-ns 'raster.compiler.backend.jvm.generated-module-test)
                  (:iface-name interface) 'generated-module-test)]
-    (assoc emitted :input-body body :interface-class (:iface-class interface))))
+    (generated/retain-value-source-template
+     (cond-> {:params parameters} template (assoc ::generated/value-source-template-candidate template))
+     (assoc emitted :input-body body :interface-class (:iface-class interface)))))
+
+(deftest pre-emission-template-does-not-reconstruct-numerics-from-physical-code
+  (let [parameters '[x]
+        context (completion/bytecode-operand-context {})
+        contract (completion/planned-bytecode-input-contract Float/TYPE context :double)
+        input (completion/complete-value contract 'x)
+        boxed (completion/complete-value completion/object-input-contract 'converted)
+        arithmetic '(clojure.core/* converted converted)
+        body [(list 'let* ['converted input 'boxed boxed 'square arithmetic] '[square boxed])]
+        template (with-redefs [bytecode/retained-input-completion-context
+                              (fn [& _] (throw (AssertionError. "physical observation during construction")))]
+                   (generated/construct-value-source-template body parameters))
+        obligations (:completion-obligations template)
+        candidate (second (:source template))]
+    (is (identical? body (:input-body template)))
+    (is (identical? parameters (:parameters template)))
+    (is (identical? arithmetic (nth candidate 5)))
+    (is (false? (:admitted? template)))
+    (is (conversion/canonical-form? (second candidate)))
+    (is (= [:double :float] ((juxt :source-dtype :target-dtype) (first obligations))))
+    (is (= [:scalar-conversion :object-materialization] (mapv :classification obligations)))
+    (is (every? #(and (= :pending (:status %)) (nil? (:observed %))) obligations))
+    (is (not (completion/contains-completion? (:source template))))))
+
+(deftest template-holes-belong-to-occurrences-not-source-object-identities
+  (let [parameters '[x]
+        contract (completion/bytecode-floating-input-contract
+                  Float/TYPE (completion/bytecode-operand-context {}))
+        shared (completion/complete-value contract 'x)
+        quoted (list 'quote shared)
+        body [(list 'let* ['left shared 'right shared 'quoted quoted] '[left right quoted])]
+        template (generated/construct-value-source-template body parameters)
+        [left right :as obligations] (:completion-obligations template)]
+    (is (= 2 (count obligations)))
+    (is (identical? shared (:source left)))
+    (is (identical? shared (:source right)))
+    (is (not (identical? (:token left) (:token right))))
+    (is (not (identical? (:hole left) (:hole right))))
+    (is (= [[1 1] [1 3]] (mapv :path obligations)))
+    (is (every? #(and (= :numeric-boundary-hole (:classification %))
+                     (nil? (:source-dtype %))
+                     (completion/canonical-form? (:hole %))) obligations))
+    (is (identical? quoted (nth (second (:source template)) 5)))
+    (is (every? #(= (meta shared) (meta (:hole %))) obligations)
+        "fresh holes carry only the existing completion constructor's metadata")))
+
+(deftest malformed-template-completion-cannot-become-an-erased-wrapper
+  (is (= :invalid-value-completion
+         (try (generated/construct-value-source-template
+               [(list 'let* ['value (list completion/completion-symbol {:source-context :unknown} 'x)]
+                      '[value])] '[x])
+              nil
+              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+
+(deftest templates-require-lexical-parameter-and-binding-identities
+  (doseq [[parameters bindings] [['[x/y] '[value 1.0]]
+                                 [[1] '[value 1.0]]
+                                 ['[x] '[scope/value 1.0]]]]
+    (is (= :generated-body-unsupported
+           (try (generated/construct-value-source-template [(list 'let* bindings '[value])] parameters)
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest retained-templates-join-nested-shared-completions-in-annotation-order
+  (let [parameters '[x]
+        inner (completion/complete-value completion/object-input-contract 'x)
+        outer (completion/complete-value completion/object-input-contract inner)
+        reference (completion/complete-value (completion/bytecode-boxed-parameter-contract Object) 'x)
+        bytecode-reference (completion/complete-value
+                            (completion/bytecode-reference-input-contract
+                             Object (completion/bytecode-operand-context {})) 'x)
+        body [(list 'let* ['left outer 'right inner 'reference reference 'bytecode-reference bytecode-reference]
+                    '[left right reference bytecode-reference])]
+        physical (emit parameters '[Object] body)
+        template (::generated/value-source-template physical)
+        proposal (generated/propose-value-source physical parameters)]
+    (is (identical? template (:template proposal)))
+    (is (= 5 (count (:completion-obligations proposal))))
+    (is (every? true? (map identical? [inner outer inner reference bytecode-reference]
+                          (map :source (:completion-obligations proposal)))))
+    (is (= [:object-materialization :object-materialization :object-materialization
+            :reference-identity :reference-identity]
+           (mapv :classification (:completion-obligations proposal))))
+    (is (identical? (:source template) (:source proposal)) "no numerical spine rebuild when there are no holes")
+    (is (= :generated-body-unsupported
+           (try (generated/propose-value-source (dissoc physical ::generated/value-source-template) parameters)
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest unavailable-completion-spines-do-not-disable-the-original-cpu-entry
+  (let [parameters '[x]
+        contract (completion/planned-bytecode-input-contract
+                  Double/TYPE (completion/bytecode-operand-context {}) :double)
+        divergence (completion/complete-value contract '(throw x))
+        later (completion/complete-value completion/object-input-contract 'x)
+        body [(list 'let* ['value (list 'do divergence later)] '[value])]
+        physical (emit parameters '[Object] body)]
+    (is (nil? (::generated/value-source-template physical)))
+    (is (thrown? IllegalStateException ((:implementation physical) (IllegalStateException. "stop"))))
+    (is (= :generated-body-unsupported
+           (try (generated/propose-value-source physical parameters) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+  (let [parameters '[x]
+        contract (completion/planned-bytecode-input-contract
+                  Double/TYPE (completion/bytecode-operand-context {}) :double)
+        body [(list 'let* ['value (completion/complete-value contract '(throw x))] '[value])]
+        physical (emit parameters '[Object] body)]
+    (is (some? (::generated/value-source-template physical))
+        "a divergent operand has no normal carrier to contradict the planned conversion")
+    (is (thrown? IllegalStateException ((:implementation physical) (IllegalStateException. "stop"))))))
+
+(deftest template-boundary-specialization-preserves-floating-checkpoints
+  (let [parameters '[x]
+        context (completion/bytecode-operand-context {})
+        inner (completion/complete-value
+               (completion/planned-bytecode-input-contract Float/TYPE context :double) 'x)
+        outer (completion/complete-value
+               (completion/bytecode-floating-input-contract Double/TYPE context) inner)
+        body [(list 'let* ['value outer] '[value])]
+        physical (emit parameters '[double] body)
+        proposal (generated/propose-value-source physical parameters)
+        projected (conversion/project-canonical-to-source (:source proposal))
+        compiled (emit parameters '[double] [projected])]
+    (is (= 1 (count (filter :hole (get-in proposal [:template :completion-obligations])))))
+    (is (not (completion/contains-completion? (:source proposal))))
+    (doseq [x [0.0 -0.0 1.25 (/ 1.0 3.0) Double/MIN_VALUE Double/MAX_VALUE
+               Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
+      (is (= (Double/doubleToRawLongBits (double (first ((:implementation physical) x))))
+             (Double/doubleToRawLongBits (double (first ((:implementation compiled) x)))))
+          (str "float checkpoint followed by double conversion: " x)))))
 
 (deftest a-proposal-retains-every-context-and-is-not-admission
   (let [parameters '[x]
@@ -201,6 +337,10 @@
            source (:source proposal)
            obligations (:completion-obligations proposal)
            expected (filter completion/canonical-form? (tree-seq coll? seq original))]
+       (is (some? (::generated/value-source-template-candidate prepared)))
+       (is (identical? (::generated/value-source-template-candidate prepared)
+                       (::generated/value-source-template physical)))
+       (is (identical? (::generated/value-source-template physical) (:template proposal)))
        (is (false? (:admitted? proposal)))
        (is (= (count expected) (count obligations)))
        (is (pos? (count obligations)))
