@@ -69,6 +69,103 @@
          (is (nil? (#'frontend/continue-source-components* components))))
        (is (false? (:admitted? view)))))))
 
+(deftest authored-layout-preserves-every-cut-and-uses-emitted-output-carriers
+  (doseq [[source expected-imports] [[#'training/local-gradient-sum 1] [#'two-gradient-imports 2]]]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [root (core/resolve-deftm-var source)
+             _ (core/prepare-deftm-frontend! root)
+             phase (module/capture (entry/original-source-frontend root) {:dtype :float})
+             normalized (module/normalized-source phase)
+             view (module/view phase normalized)
+             layout (module/authored-layout phase normalized)
+             original-pairs (partition 2 (second (:source view)))
+             rebuilt-pairs (mapcat :bindings layout)
+             imports (filter #(= :import (:kind %)) layout)
+             authored (filter #(= :authored (:kind %)) layout)]
+         (is (= (inc (* 2 expected-imports)) (count layout)))
+         (is (= expected-imports (count imports)))
+         (is (= (count original-pairs) (count rebuilt-pairs)))
+         (is (every? true? (map (fn [a b] (every? true? (map identical? a b))) original-pairs rebuilt-pairs)))
+         (is (every? #(= (:live-outs %) (mapv first (:bindings %))) authored))
+         (is (= (vec (drop 2 (:source view))) (:tail (last authored))))
+         (doseq [[stage import] (map vector imports (:imports view))]
+           (is (identical? import (:import stage)))
+           (is (identical? (:bindings (:call import)) (:bindings stage)))
+           (is (= '[double floats] (mapv :tag (remove nil? (:outputs stage)))))
+           (let [array-output (second (:outputs stage))]
+             (is (identical? (class (float-array 0))
+                            (get-in array-output [:binding-context :after :reference-class])))
+             (is (not-any? #(contains? array-output %) [:presence :shape :capacity :admitted?]))))
+         (is (nil? (module/authored-layout phase (apply list normalized))))
+         (is (= expected-imports (count (:unclosed-source-imports @entry/*emission-inputs*)))))))))
+
+(deftest authored-layout-refuses-damaged-intervals-and-output-carriers
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           normalized (module/normalized-source phase)
+           {:keys [source imports]} (module/view phase normalized)
+           import (first imports)
+           layout #'module/authored-source-layout
+           query bytecode/retained-input-binding-context]
+       (doseq [changed [[import import]
+                        [(update-in import [:call :bindings] subvec 1)]
+                        [(assoc-in import [:placement :binding-site :prefix] [['wrong 1]])]
+                        [(update-in import [:call :outputs] (comp vec reverse))]]]
+         (is (= :unclosed-prepared-module-phase (reason #(layout source changed)))))
+       (doseq [change [(fn [record] (assoc-in record [:after :reference-class] Object))
+                       (fn [record] (assoc-in record [:after :verified] false))]]
+         (with-redefs [bytecode/retained-input-binding-context
+                       (fn [& args]
+                         (let [record (apply query args)]
+                           (if (identical? (class (float-array 0)) (get-in record [:after :reference-class]))
+                             (change record) record)))]
+           (is (= :unclosed-prepared-module-phase
+                  (reason #(module/authored-layout phase normalized))))))
+       (doseq [change [(constantly nil)
+                       #(assoc % :binder 'unrelated)
+                       #(assoc-in % [:after :reference-class] String)]]
+         (with-redefs [bytecode/retained-input-binding-context (fn [& args] (change (apply query args)))]
+           (is (= :unclosed-prepared-module-phase
+                  (reason #(module/authored-layout phase normalized))))))
+       (let [scalar (first (get-in import [:call :outputs]))
+             scalar-root (first (filter #(= scalar (:id %)) (get-in import [:call :root-bindings])))]
+         (doseq [edit [#(assoc-in % [:call :proposal :normal-return-facts (:original-id scalar-root) :carrier] Double/TYPE)
+                       #(assoc-in % [:call :proposal :normal-return-facts (:original-id scalar-root) :builtin-class] String)]]
+           (is (= :unclosed-prepared-module-phase
+                  (reason #(layout source [(edit import)]))))))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
+(deftest actual-authored-training-consumer-prepares-without-rewriting-its-import
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [original-frontend (source-frontend)
+           phase (module/capture original-frontend {:dtype :float :segmented-plans? true})
+           normalized (module/normalized-source phase)
+           view (module/view phase normalized)
+           layout (module/authored-layout phase normalized)
+           imported (first (filter #(= :import (:kind %)) layout))
+           authored (last layout)
+           tags (into {} (keep #(when % [(:output %) (:tag %)])) (:outputs imported))
+           environment (merge (zipmap (get-in original-frontend [:source-entry :params])
+                                      (get-in original-frontend [:source-entry :tags])) tags)
+           source (list* 'let* (vec (mapcat identity (:bindings authored))) (:tail authored))
+           prepared (pipeline/run-passes
+                     source pipeline/gpu-resident-pre-soa-passes
+                     (assoc (:options view) :target-device :ocl:authored-training-consumer
+                                            :param-env environment))
+           census (last @pipeline/fixpoint-census)]
+       (is (= :final (:label census)))
+       (is (zero? (:non-exempt-untagged census)))
+       (is (zero? (:undevirtualized census)))
+       (is (some #(and (seq? %) (= '.invk (first %))
+                       (= 'raster.numeric/_star__m_float_float-impl (second %)))
+                 (tree-seq coll? seq prepared)))
+       (is (identical? (get-in imported [:import :call :bindings]) (:bindings imported)))
+       (is (identical? normalized (module/normalized-source phase)))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
 (deftest ordinary-multiform-source-keeps-every-statement-in-order
   (entry/call-with-definition-inputs
    (fn []

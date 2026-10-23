@@ -28,6 +28,26 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 authored-layout checkpoint: exact retained cut manifests now partition
+the original constructed source into authored segments and imported spans. No
+generated-name search is used; the original imported binding members are retained
+unchanged and every authored definition remains a cross-segment live-out. Outputs
+join original root ordinals to verified emitted binding contexts. Array declarations
+use the actual primitive-array Class, not a hint; boxed scalar payload declarations
+additionally require the guarded normal-return fact to match that physical carrier.
+Missing/misdirected records, unverified/wrong carriers, malformed cut intervals and
+changed result slots refuse. This query performs no preparation, assembly or admission.
+
+The real training consumer is now a regression for isolated authored preparation:
+using these conditional declarations, the unchanged GPU pre-SoA pipeline selects
+Float multiplication and its final census has zero non-exempt untagged bindings
+and zero undevirtualized calls. Imported bindings are never passed to that pipeline,
+and the original pending marker remains. A two-import REPL control also retains
+the intermediate value/gradient live-out tuple exactly. The affected gate passes
+90 tests / 1,119 assertions; independent review approved the implementation and
+its mutation controls. Source assembly/history composition and whole-source
+finalization still remain, as do the red public fixtures and all campaign gates.
+
 October 23 production sequencing finding: simply wiring the shared constructor
 to all pre-SoA passes is NOT sufficient. Deferred AD leaves the original
 value+grad/nth-dependent consumer unfinished at the GPU fixpoint census. The

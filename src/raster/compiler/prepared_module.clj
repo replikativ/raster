@@ -9,6 +9,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-transport :as transport]
+            [raster.compiler.core.types :as types]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.scalar.inline :as inline]))
 
@@ -373,6 +374,84 @@
   (when (and entry/*emission-inputs* (instance? PreparedModulePhase phase))
     (entry/assert-producer-current! phase)
     (:normalized (.-context ^PreparedModulePhase phase))))
+
+(defn- import-output-contexts
+  [{:keys [call physical]}]
+  (when-not (= (:outputs call) (nth (:projected-source call) 2 nil))
+    (refuse! "prepared outputs differ from their original substituted result" {}))
+  (mapv
+   (fn [output]
+     (when output
+       (let [roots (filterv #(= output (:id %)) (:root-bindings call))
+             root (when (= 1 (count roots)) (first roots))
+             record (when root
+                      (bytecode/retained-input-binding-context
+                       (:emission physical) (:input-body physical)
+                       (get-in call [:proposal :original]) (:root-index root)))
+             after (:after record)
+             array-dtype (when (= :ref (:type after))
+                           (dtype/dtype-for-jvm-array-class (:reference-class after)))
+             normal-fact (get-in call [:proposal :normal-return-facts (:original-id root)])
+             scalar-tag
+             (if (= :ref (:type after))
+               (when (and (identical? (:reference-class after) (:carrier normal-fact))
+                          (:builtin-class normal-fact))
+                 (some (fn [[tag carrier]]
+                         (when (identical? carrier (:builtin-class normal-fact)) tag))
+                       types/primitive-info))
+               (when (contains? #{:int :long :float :double :bool} (:type after))
+                 (if (= :bool (:type after)) 'boolean (symbol (name (:type after))))))
+             tag (or (when array-dtype (dtype/array-tag-for-dtype array-dtype)) scalar-tag)]
+         (when-not (and root record (true? (:verified after))
+                        (= (:original-id root) (:binder record)) tag)
+           (refuse! "prepared output lacks its original emitted carrier"
+                    {:output output :root-index (:root-index root)}))
+         ;; This is a declaration conditional on the import's normal return,
+         ;; not presence, capacity, successful completion or executable authority.
+         {:output output :root root :binding-context record :tag tag
+          :normal-return-fact (when scalar-tag normal-fact)})))
+   (:outputs call)))
+
+(defn- authored-source-layout
+  [source imports]
+  (let [source-pairs (pairs source)]
+    (loop [remaining imports cursor 0 stages []]
+      (if-let [import (first remaining)]
+        (let [prefix (get-in import [:placement :binding-site :prefix])
+              bindings (get-in import [:call :bindings])
+              start (count prefix)
+              end (+ start (count bindings))]
+          (when-not (and (vector? prefix) (vector? bindings)
+                         (<= cursor start end (count source-pairs))
+                         (seq bindings)
+                         (every? true? (map same-pair? prefix (subvec source-pairs 0 start)))
+                         (every? true? (map same-pair? bindings (subvec source-pairs start end)))
+                         (generated/value-source-binding-layout (:call import))
+                         (identical? (:physical import) (get-in import [:call :proposal :physical])))
+            (refuse! "authored preparation lost an exact nonoverlapping import interval"
+                     {:start start :end end :previous-end cursor}))
+          (recur (next remaining) end
+                 (conj stages
+                       {:kind :authored :start cursor :end start
+                        :bindings (subvec source-pairs cursor start)
+                        :live-outs (mapv first (subvec source-pairs cursor start))}
+                       {:kind :import :start start :end end :import import :bindings bindings
+                        :outputs (import-output-contexts import)})))
+        (conj stages {:kind :authored :start cursor :end (count source-pairs)
+                      :bindings (subvec source-pairs cursor)
+                      :live-outs (mapv first (subvec source-pairs cursor))
+                      :tail (vec (drop 2 source))})))))
+
+(defn ^:no-doc authored-layout
+  "Partition this phase's pre-normalization source by its exact retained cuts.
+   Every authored binding is a live-out until a later assembly proves otherwise.
+   Imported output declarations come from original emitted binding contexts.
+   This query neither prepares segments nor grants assembly/import admission."
+  [phase normalized]
+  (when-let [context (view phase normalized)]
+    (let [layout (authored-source-layout (:source context) (:imports context))]
+      (entry/assert-producer-current! phase)
+      layout)))
 
 (defn- final-binding-origin [binding-origin]
   ;; No reconstruction of a split reduction or derived normalization temporary.
