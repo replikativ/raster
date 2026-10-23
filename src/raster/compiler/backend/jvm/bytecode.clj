@@ -1069,7 +1069,7 @@
                (= :ref (:return-stack-type body-context) (:emitted-result-type body-context)))
       bridge)))
 
-(declare boxed-parameter-plan)
+(declare boxed-parameter-plan class-desc-of-class)
 
 (defn ^:no-doc retained-boxed-entry-bridge
   "Authenticate the actual generated public applyTo/invoke parameter boundary.
