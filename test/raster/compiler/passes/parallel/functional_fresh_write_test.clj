@@ -47,6 +47,20 @@
         (is (seq (:declines result)))
         (is (= original (:form result)))))))
 
+(deftest source-read-obligations-survive-functional-canonicalization
+  (let [read (with-meta '(clojure.core/aget data i)
+               {:raster.type/tag 'double :raster.effect/preserve-evaluation true})
+        original (source [['out '(clojure.core/double-array size)]
+                          ['effect (effect (store read))]] 'out)
+        result (frontend/canonicalize-fresh-full-write-maps
+                original (assoc facts :array-types {'data :double}))
+        mapped (second (second (partition 2 (second (:form result)))))]
+    (is (= 1 (count (:rewrites result))))
+    (is (= 'raster.par/map! (first mapped)))
+    (is (= read (last mapped)))
+    (is (:raster.effect/preserve-evaluation (meta (last mapped))))
+    (is (= '(clojure.core/double-array size) (second (second (:form result)))))))
+
 (deftest final-double-value-does-not-hide-intermediate-float-rounding
   (let [original (source [['out '(clojure.core/double-array size)]
                           ['effect (effect (store (typed

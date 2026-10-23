@@ -7,22 +7,23 @@
    ~12 special forms (`let*`/`loop*`/`case*`/`if`). `clojure.walk/macroexpand-all`
    would strip metadata (the :raster.type/tag, :raster.op/original the backends
    rely on), so we re-implement it preserving meta."
-  (:refer-clojure :exclude []))
+  (:refer-clojure :exclude [])
+  (:require [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.util :as util]))
 
 (defn walk-preserving-meta
   "Like clojure.walk/walk but preserves metadata on forms."
   [inner outer form]
   (let [m (meta form)
         result (cond
-                 (list? form)   (outer (apply list (map inner form)))
-                 (seq? form)    (outer (doall (map inner form)))
-                 (vector? form) (outer (mapv inner form))
+                 (or (seq? form) (vector? form))
+                 (outer (util/remake-if-changed form (mapv inner form)))
                  (record? form) (outer (reduce-kv (fn [r k v] (assoc r k (inner v))) form form))
                  (map? form)    (outer (into (empty form)
                                              (map (fn [[k v]] [(inner k) (inner v)]) form)))
                  (set? form)    (outer (into (empty form) (map inner form)))
                  :else          (outer form))]
-    (if (and m (instance? clojure.lang.IObj result))
+    (if (and (not (identical? form result)) m (instance? clojure.lang.IObj result))
       (with-meta result (merge (meta result) m))
       result)))
 
@@ -71,7 +72,11 @@
    ;; (quote ...) as a :leaf and never descends; we must match that contract here, or
    ;; macroexpand would rewrite macros/classes sitting in head position INSIDE quoted
    ;; data (e.g. '(let [a 1] a) -> '(let* [a 1] a)), silently corrupting it.
-   (if (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form)))
+   (if (or (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form)))
+           ;; Compiler-owned completion operands are already walked under
+           ;; their retained input context; generic macroexpansion must not
+           ;; reconstruct them as new source computations.
+           (completion/canonical-form? form))
      form
      (let [expanded (if (and (seq? form)
                              (not (and (symbol? (first form)) (skip-head? (first form)))))
@@ -80,7 +85,7 @@
            m (meta form)
            result (walk-preserving-meta #(macroexpand-all-preserving % skip-head?)
                                         carry-let-init-type-meta expanded)]
-       (if (and m (instance? clojure.lang.IObj result))
+       (if (and (not (identical? form result)) m (instance? clojure.lang.IObj result))
          (with-meta result (merge (meta result) m))
          result)))))
 

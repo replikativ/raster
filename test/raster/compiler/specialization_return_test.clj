@@ -64,7 +64,8 @@
                           (thrown #(#'core/register-parametric-specialization!
                                     (symbol (str (ns-name source)) "boxed-result")
                                     {:annotations '[T] :ret-annotation 'Target :type-vars '[T]
-                                     :params '[x] :body '(double x) :source-ns source}
+                                     :params '[x] :body '(double x) :source-ns source
+                                     :source-policy {:unchecked-math false}}
                                     {'T 'double} [])))
               "Number accepts boxed Double even though caller's Target is String")))
       (finally (remove-ns (ns-name source)) (remove-ns (ns-name caller))))))

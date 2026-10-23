@@ -5,9 +5,33 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.core.util :as util]))
 
-;; ================================================================
-;; free-syms: scoped free variable collection
-;; ================================================================
+(deftest postwalk-observes-final-reconstruction-without-changing-results
+  (let [inner (with-meta '(inc 1) {:line 12})
+        quoted (list 'quote '(hidden child))
+        source [inner quoted]
+        events (atom [])
+        output (util/postwalk-preserving-meta
+                (fn [node] (if (identical? node inner) (with-meta '(dec 1) {:line 19}) node))
+                source
+                (fn [original constructed]
+                  (swap! events conj [original constructed])
+                  :ignored))]
+    (is (= '[(dec 1) (quote (hidden child))] output))
+    (is (= {:line 19} (meta (first output))))
+    (is (identical? source (first (last @events))))
+    (is (identical? output (second (last @events))))
+    (is (some #(and (identical? inner (first %))
+                    (identical? (first output) (second %))) @events))
+    (is (not-any? #(identical? (second quoted) (first %)) @events))
+    (let [seen (atom [])
+          unchanged (util/postwalk-preserving-meta
+                     identity source
+                     (fn [original _]
+                       (swap! seen conj original)
+                       ;; An independently invoked walk has no inherited observer.
+                       (util/postwalk-preserving-meta identity [:independent])))]
+      (is (identical? source unchanged))
+      (is (not-any? #{:independent} @seen)))))
 
 (deftest no-op-reconstruction-preserves-occurrences-not-just-equality
   (doseq [original [(with-meta '(callee value) {:line 7 :tag 'double})
@@ -24,6 +48,124 @@
       (is (= (count longer) (count (util/remake-if-changed original longer))))))
   (doseq [empty-form ['() []]]
     (is (identical? empty-form (util/remake-if-changed empty-form [])))))
+
+(deftest metadata-preserving-walk-reuses-unchanged-occurrences-in-source-order
+  (doseq [quote-head '[quote clojure.core/quote]]
+   (let [leaf (symbol "value")
+        quoted (list quote-head '(unvisited payload))
+        source (with-meta [(list 'callee leaf) quoted] {:line 9})
+        seen (atom [])
+        unchanged (util/postwalk-preserving-meta #(do (swap! seen conj %) %) source)]
+    (is (identical? source unchanged))
+    (is (= ['callee leaf (first source) quoted source] @seen))
+    (let [retagged (with-meta leaf {:tag 'float})
+          changed (util/postwalk-preserving-meta
+                   #(if (identical? leaf %) retagged %) source)]
+      (is (= source changed))
+      (is (not (identical? source changed)))
+      (is (identical? retagged (second (first changed))))
+      (is (identical? quoted (second changed)))
+      (is (identical? (meta source) (meta changed)))))))
+
+(deftest retained-invocation-reconstruction-shares-the-canonical-metadata-contract
+  (let [impl 'raster.numeric/_star__m_double_double-impl
+        left (with-meta (symbol "left") {:tag 'double})
+        right (symbol "right")
+        source (util/make-invk impl [left right] {:line 17})]
+    (is (identical? source (util/remake-invk-if-changed source impl [left right])))
+    (let [retagged (with-meta left {:tag 'float})
+          changed (util/remake-invk-if-changed source impl [retagged right])]
+      (is (= source changed))
+      (is (not (identical? source changed)))
+      (is (identical? retagged (nth changed 2)))
+      (is (identical? right (nth changed 3)))
+      (is (= (meta source) (meta changed))))
+    (let [untagged (with-meta (list '.invk impl left right) {:line 17})
+          repaired (util/remake-invk-if-changed untagged impl [left right])]
+      (is (not (identical? untagged repaired)))
+      (is (= (meta source) (meta repaired))))
+    (let [explicit (vary-meta source assoc :raster.op/original 'example/original)]
+      (is (identical? explicit (util/remake-invk-if-changed explicit impl [left right])))
+      (is (= (meta (util/make-invk impl [left right] (meta explicit))) (meta explicit))))))
+
+(deftest uniquification-observes-actual-reconstruction-with-lexical-scope
+  (let [events (atom [])
+        shared '(clojure.core/inc x)
+        source (list 'let* ['x 1] (list 'let* ['x shared] shared))
+        result (util/uniquify-rebindings
+                #{} source (fn [original constructed renaming bound]
+                             (swap! events conj [original constructed renaming bound])
+                             :not-a-replacement))
+        matches (filterv #(identical? shared (first %)) @events)
+        inner (nth result 2)
+        renamed (first (second inner))]
+    (is (= 2 (count matches)))
+    (is (not (identical? (second (first matches)) (second (second matches)))))
+    (is (= {} (nth (first matches) 2)) "inner initializer sees outer x")
+    (is (= {'x renamed} (nth (second matches) 2)) "inner body sees the new x")
+    (is (not= :not-a-replacement result))
+    (is (= 3 ((eval (list 'fn [] result)))))
+    (is (identical? source (ffirst (take-last 1 @events)))))
+  (let [failure (Exception. "observer")]
+    (is (identical? failure
+                   (try (util/uniquify-rebindings #{} '(inc 1)
+                                                   (fn [& _] (throw failure)))
+                        (catch Exception error error))))))
+
+(deftest independent-normalization-does-not-inherit-an-enclosing-observer
+  (let [events (atom []) outside '(clojure.core/inc foreign)]
+    (util/uniquify-rebindings
+     #{} '(clojure.core/inc x)
+     (fn [original & _]
+       (swap! events conj original)
+       (util/uniquify-rebindings #{} outside)))
+    (is (not-any? #(identical? outside %) @events))))
+
+(deftest quoted-data-is-opaque-to-uniquification-observation
+  (doseq [head '[quote clojure.core/quote]]
+    (let [data '(let* [x 2] x) source (list head data) events (atom [])
+          result (util/uniquify-rebindings #{'x} source (fn [original & _] (swap! events conj original)))]
+      (is (identical? source result))
+      (is (identical? data (second result)))
+      (is (= 1 (count @events))))))
+
+;; ================================================================
+;; free-syms: scoped free variable collection
+;; ================================================================
+
+(deftest named-lambda-self-is-one-shared-scope-across-arities
+  (let [source '(fn* self
+                 ([n] (self n 0))
+                 ([n acc] (if (clojure.core/zero? n) acc
+                            (self (clojure.core/dec n) (clojure.core/+ acc n)))))
+        renamed (util/alpha-convert source)
+        substituted (util/subst-syms {'self 'unrelated} source)]
+    (is (= #{} (util/free-syms source)))
+    (is (= source substituted) "the recursive name is not a free callee")
+    (is (not= 'self (second renamed)))
+    (is (= 21 ((eval source) 6) ((eval renamed) 6)))
+    (is (= 13 ((eval renamed) 4 3)))
+    (is (= #{} (util/free-syms renamed)))))
+
+(deftest named-lambda-self-does-not-capture-a-substituted-outer-value
+  (let [source '(fn* self [n]
+                 (clojure.core/+ x (if (clojure.core/zero? n) 0
+                                    (self (clojure.core/dec n)))))
+        projected (util/subst-syms {'x 'self} source)]
+    (is (not= 'self (second projected)))
+    (is (= #{'self} (util/free-syms projected)))
+    (is (= 16 ((eval (list 'fn* '[self] (list projected 3))) 4)))))
+
+(deftest lexical-vector-rewrites-retain-runtime-product-metadata
+  (let [marker {:origin :source-product}
+        product (with-meta ['x (with-meta ['x] marker)] marker)]
+    (doseq [rewritten [(util/subst-syms {'x 'y} product)
+                       (util/alpha-convert {'x 'y} product)]]
+      (is (= ['y ['y]] rewritten))
+      (is (= marker (meta rewritten)))
+      (is (= marker (meta (second rewritten)))))
+    (is (= ['x ['x]] product))
+    (is (= marker (meta product)))))
 
 (deftest result-effect-branches-bind-only-their-continuation
   (let [source '(effect-region []
@@ -242,7 +384,9 @@
 
 (deftest subst-syms-quote-opaque-test
   (testing "quote is opaque to substitution"
-    (is (= '(quote (+ a a)) (util/subst-syms '{a A} '(quote (+ a a)))))))
+    (doseq [quoted ['(quote (+ a a)) '(clojure.core/quote (+ a a))]]
+      (is (identical? quoted (util/subst-syms '{a A} quoted)))
+      (is (identical? quoted (util/alpha-convert {'a 'A} quoted))))))
 
 (deftest fold-local-scope-utils-test
   (let [fold '(fold {:accumulator acc :index i :identity 0.0 :dtype :float
@@ -268,6 +412,49 @@
             atoms (set (flatten result))]
         (is (= #{'base 'n 'x} (util/free-syms result)))
         (is (not-any? atoms '[acc i off value]))))))
+
+(deftest substitution-construction-observer-preserves-scopes-and-the-empty-fast-path
+  (let [source '(ftm [x] :raster.walker/source-body [(g x)] (.invk impl (g x)))
+        events (atom []) leaf (fn [env value] (get env value value))
+        actual (util/subst-syms '{g h} source leaf #(swap! events conj [%1 %2 %3]))
+        calls (filter #(= '(g x) (first %)) @events)]
+    (is (= (util/subst-syms '{g h} source) actual))
+    (is (= 2 (count calls)))
+    (is (every? #(= '(h x) (second %)) calls)))
+  (let [source '(letfn* [f (fn* [x] (f x))] (g n))
+        events (atom [])]
+    (is (identical? source
+                    (util/subst-syms {} source (fn [env value] (get env value value))
+                                     #(swap! events conj [%1 %2 %3]))))
+    (is (= 1 (count @events)))
+    (is (identical? source (ffirst @events)))))
+
+(deftest alpha-construction-observer-follows-the-shared-lexical-traversal
+  (let [quoted '(quote [(opaque x)])
+        init '(seed n)
+        step '(step i acc)
+        source (list 'let* ['x init]
+                     (list 'loop* ['i 0 'acc 'x]
+                           (list 'if '(done i) quoted (list 'recur '(inc i) step))))
+        events (atom [])
+        result (util/alpha-convert {} source #(swap! events conj [%1 %2 %3]))
+        observed (fn [original] (first (filter #(identical? original (first %)) @events)))
+        [_ constructed env] (observed step)]
+    (is (identical? result (second (observed source))))
+    (is (empty? (nth (observed init) 2)))
+    (is (= #{'x 'i 'acc} (set (keys env))))
+    (is (= (list 'step (get env 'i) (get env 'acc)) constructed))
+    (is (identical? quoted (second (observed quoted))))
+    (is (nil? (observed (first (second quoted)))))
+    (is (= #{'n 'seed 'done 'step} (disj (util/free-syms result) 'inc))))
+  (doseq [[source expected]
+          [['(letfn* [f (fn* [x] (f x))] (f n)) #{'f}]
+           ['(ftm [x] :raster.walker/source-body [(aux x)] (body x)) #{'x}]]]
+    (let [events (atom [])
+          _ (util/alpha-convert {} source #(swap! events conj [%1 %2 %3]))
+          calls (filter #(and (seq? (first %)) (contains? '#{f aux body} (ffirst %))) @events)]
+      (is (seq calls))
+      (is (every? #(every? (set (keys (nth % 2))) expected) calls)))))
 
 (deftest ftm-source-body-stays-in-sync
   (testing "subst/alpha rename the ftm :raster.walker/source-body CONSISTENTLY with the walked body"

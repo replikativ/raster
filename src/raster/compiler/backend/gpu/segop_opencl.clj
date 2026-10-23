@@ -83,7 +83,7 @@
   (let [graph-shapes (graph-array-shapes kernel-graph)
         shapes (merge array-shapes graph-shapes)]
     (when kernel-graph
-      (doseq [input (:inputs operation)]
+      (doseq [input (segop/operation-inputs operation)]
         (when-not (get graph-shapes input)
           (throw (ex-info "graph input has no retained storage capacity"
                           {:reason :kernel-body-input-capacity-unresolved

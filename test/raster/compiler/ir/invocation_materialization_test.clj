@@ -102,6 +102,129 @@
 (defn- materialization-reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(defn- deferred-parameter-plan []
+  (let [left (array-value :double '(extent left))
+        right (array-value :double '(extent right))]
+    (invocation/from-prefix
+     {:id :deferred-parameter-state :parameters '[left n right]
+      :parameter-values {'left left 'n (scalar :long) 'right right}
+      :bindings [] :binding-values {}
+      :program-values {'left left 'n (scalar :long) 'right right}
+      :program-inputs '[left n right] :program-outputs '[left]})))
+
+(deftest deferred-parameters-preserve-ordinals-and-borrowed-reference-identity
+  (let [plan (deferred-parameter-plan)
+        [left-id n-id right-id] (mapv :id (:parameters plan))]
+    (doseq [left [(double-array [1.0 2.0]) (double-array [4.0])]]
+      (let [right (double-array [3.0])
+            arguments [left 7 right]
+            initial (materialization/begin-materialization plan arguments #{left-id right-id})
+            partial (materialization/materialize-demanded-parameters initial #{right-id})
+            realized (materialization/materialize-demanded-parameters partial #{left-id})
+            eager (materialization/begin-materialization plan arguments)]
+        (is (= {n-id {:type :long :value 7}} (:values initial)))
+        (is (= {'left left-id 'n n-id 'right right-id} (:lexical initial)))
+        (is (= 0 (get-in initial [::materialization/deferred-parameters left-id :parameter-position])))
+        (is (= 2 (get-in initial [::materialization/deferred-parameters right-id :parameter-position])))
+        (is (identical? left (get-in initial [::materialization/deferred-parameters left-id :source])))
+        (is (identical? right (get-in initial [::materialization/deferred-parameters right-id :source])))
+        (is (empty? (:program-buffers (materialization/prefix-bindings initial))))
+        (is (= #{'right} (set (keys (:program-buffers (materialization/prefix-bindings partial))))))
+        (is (not (contains? (:values initial) left-id)) "no nil or dummy buffer placeholder")
+        (is (= :invocation-materialization-pending-parameters
+               (materialization-reason #(materialization/finish-materialization partial))))
+        (is (= eager realized))
+        (is (identical? left (get-in realized [:values left-id :source])))
+        (is (= (materialization/finish-materialization eager)
+               (materialization/finish-materialization realized)))
+        (is (= realized (materialization/materialize-demanded-parameters realized #{left-id})))))))
+
+(deftest deferred-reference-is-not-a-read-or-storage-proof
+  (let [plan (deferred-parameter-plan)
+        [left-id n-id right-id] (mapv :id (:parameters plan))
+        right (double-array 1)
+        initial (materialization/begin-materialization plan [nil 7 right] #{left-id})]
+    (is (= :invocation-materialization-buffer
+           (materialization-reason #(materialization/begin-materialization plan [nil 7 right]))))
+    (is (identical? initial (materialization/validate-state! initial)))
+    (is (nil? (get-in initial [::materialization/deferred-parameters left-id :source])))
+    (is (not (contains? (:values initial) left-id)))
+    (is (= :invocation-materialization-pending-parameters
+           (materialization-reason #(materialization/finish-materialization initial))))
+    (is (= :invocation-materialization-buffer
+           (materialization-reason #(materialization/materialize-demanded-parameters initial #{left-id}))))
+    (is (identical? right (get-in initial [:values right-id :source])))
+    (let [redirected (assoc-in initial [::materialization/deferred-parameters left-id :source]
+                              (double-array 2))]
+      (is (identical? redirected (materialization/validate-state! redirected))
+          "structural validation is not raw-reference ownership authentication")
+      (is (= :invocation-materialization-pending-parameters
+             (materialization-reason #(materialization/finish-materialization redirected)))))
+    (doseq [selection [#{n-id} #{:unknown} [left-id] nil]]
+      (is (= :invocation-materialization-deferred-parameters
+             (materialization-reason #(materialization/begin-materialization plan [nil 7 right] selection))))
+      (is (= :invocation-materialization-parameter-demand
+             (materialization-reason #(materialization/materialize-demanded-parameters initial selection)))))
+    (doseq [pending [nil []
+                     {left-id {:source nil :parameter-position 2}}
+                     {left-id {:source nil :parameter-position Long/MAX_VALUE}}
+                     {left-id {:source nil :parameter-position 0 :claimed-read-proof true}}
+                     {n-id {:source 7 :parameter-position 1}}]]
+      (is (= :invocation-materialization-deferred-parameters
+             (materialization-reason
+              #(materialization/validate-state! (assoc initial ::materialization/deferred-parameters pending))))))
+    (is (= :invocation-materialization-prefix
+           (materialization-reason
+            #(materialization/validate-state! (assoc-in initial [:values left-id] nil)))))))
+
+(deftest deferred-input-cannot-feed-shape-clone-or-alias-steps
+  (let [array (array-value :double '(extent x))]
+    (doseq [[expression expected]
+            [['(int (alength x)) :invocation-materialization-shape-source]
+             ['(aclone x) :invocation-materialization-clone-source]
+             ['x :invocation-materialization-step]]]
+      (let [value (if (seq? expression)
+                    (if (= 'int (first expression)) (scalar :int) array) array)
+            plan (invocation/from-prefix
+                  {:id :deferred-consumer :parameters '[x] :parameter-values {'x array}
+                   :bindings [['result expression]] :binding-values {'result value}
+                   :program-values {'result value} :program-inputs '[result] :program-outputs '[result]})
+            id (:id (first (:parameters plan)))
+            initial (materialization/begin-materialization plan [(double-array 3)] #{id})
+            evaluations (atom 0)]
+        (is (= expected (materialization-reason
+                         #(materialization/materialize-next initial (fn [& _] (swap! evaluations inc))))))
+        (is (zero? @evaluations))
+        (let [ready (materialization/materialize-demanded-parameters initial #{id})]
+          (is (some? (materialization/finish-materialization
+                      (materialization/materialize-next ready nil)))))))))
+
+(deftest demand-keeps-existing-dtype-shape-and-projection-validation
+  (let [base (deferred-parameter-plan)
+        id (:id (first (:parameters base)))
+        projection {:public-parameters '[left n right]
+                    :physical-parameters [{:symbol 'left :binding 'left}
+                                          {:symbol 'n :binding 'n}
+                                          {:symbol 'right :binding 'right}]}
+        projected (assoc-in base [:attributes :parameter-projection] projection)]
+    (is (some? (invocation/validate! projected)))
+    (is (some? (materialization/begin-materialization projected [(double-array 2) 7 (double-array 1)])))
+    (is (= :invocation-materialization-deferred-parameters
+           (materialization-reason
+            #(materialization/begin-materialization projected [nil 7 (double-array 1)] #{id}))))
+    (let [pending (materialization/begin-materialization base [(float-array 2) 7 (double-array 1)] #{id})]
+      (is (= :invocation-materialization-buffer-dtype
+             (materialization-reason #(materialization/materialize-demanded-parameters pending #{id}))))))
+  (let [array (array-value :double 3)
+        plan (invocation/from-prefix
+              {:id :deferred-static-shape :parameters '[x] :parameter-values {'x array}
+               :bindings [] :binding-values {} :program-values {'x array}
+               :program-inputs '[x] :program-outputs '[x]})
+        id (:id (first (:parameters plan)))
+        pending (materialization/begin-materialization plan [(double-array 2)] #{id})]
+    (is (= :invocation-materialization-buffer-shape
+           (materialization-reason #(materialization/materialize-demanded-parameters pending #{id}))))))
+
 (deftest incremental-materialization-shares-the-eager-interpreter
   (let [plan (fixture-plan)
         arguments [(double-array [1.0 2.0 3.0]) 0.25 7]

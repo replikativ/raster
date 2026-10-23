@@ -105,7 +105,11 @@
       acc)))
 
 (deftest loop-recur-test
-  (is (== 45 (compile-and-run #'bc-sum-to :args [10]))))
+  (let [compiled (binding [mm/*disable-mem-merge* true]
+                   (pipeline/compile-aot #'bc-sum-to))]
+    (doseq [n [0 1 10 100000]]
+      (is (= (bc-sum-to n) (compiled n))
+          (str "integer reduction keeps Long storage, including a sum wider than Int: " n)))))
 
 ;; ================================================================
 ;; do (sequential effects)

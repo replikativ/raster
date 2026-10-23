@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.soac-dialect :as soac]))
 
 (defn- fail! [reason message data]
@@ -118,11 +119,21 @@
    Prefix allocation is retained only when an emitted graph still names that value.  A graph
    refinement can therefore eliminate a semantic temporary without leaving dead resident scratch."
   [parallel-program device-id]
+  (stage-result/refuse-unobserved! parallel-program :resident-marker-projection)
   (let [program (emitted-program/validate! parallel-program)
         plan (some-> program :attributes :invocation-plan invocation/validate!)]
     (when-not plan
       (fail! :resident-projection-invocation
              "resident emitted-program projection requires its typed invocation plan" {}))
+    (when-let [step (first (filter invocation/reference-completion? (:steps plan)))]
+      ;; Graph liveness does not make a source check removable. This projection
+      ;; has no source executor, even when no numerical graph reads its result.
+      (fail! :unclosed-invocation-reference-completion
+             "resident marker projection cannot discard a retained reference check"
+             {:step (:id step)}))
+    (when (get-in plan [:attributes :terminal-host-result])
+      (fail! :explicit-host-result-required
+             "resident marker projection cannot discard terminal host observation" {}))
     (let [operations (numerical-operations program)
           dispatches (mapv (comp dispatch/with-registration-key graph-dispatch) (range) operations)
           graphs (mapv dispatch/default-alternative dispatches)

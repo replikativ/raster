@@ -158,12 +158,20 @@
                                  :equation equation-id :results results})))
             result (first results)
             result-dtype (:dtype (get values result))
+            resident? (resident/resident-scalar-value? (get values result))
+            ;; Host materialization and target scheduling share the exact payload transport.
+            ;; A resident rank-zero capture is an array here, not a scalar ABI argument.
+            physical (when resident?
+                       (device-scalar/projection (dialect/equation-subprogram program equation)))
+            locals (if physical
+                     (mapv #(update % :init projection/scalar-folds->source) (:locals physical))
+                     region-locals)
+            body (if physical (projection/scalar-folds->source (:body physical)) (first bodies))
             ;; The shared dtype vocabulary rejects storage-only/unknown JVM scalar types.
             scalar-tag (dtype/scalar-tag-for-dtype result-dtype)
             source (materialize-region
-                    region-locals
-                    (invocation-source/typed-store-value (symbol "clojure.core" (name scalar-tag)) (first bodies)))
-            resident? (resident/resident-scalar-value? (get values result))]
+                    locals
+                    (invocation-source/typed-store-value (symbol "clojure.core" (name scalar-tag)) body))]
         (if resident?
           (let [effect (gensym (str "typed_soac_scalar_" equation-id "__"))
                 store (list 'clojure.core/aset result 0 source)]
@@ -567,11 +575,9 @@
                                        (cond-> {:raster.type/tag tag} array? (assoc :tag tag)))])))
                       (:values facts))
         projected (dialect/remap-values program symbols)
-        projected (dialect/make
-                   (reduce (fn [facts [index equation]]
-                             (assoc-in facts [:equations (second equation) :provenance :source-binding-id] index))
-                           (dialect/facts projected) (map-indexed vector (dialect/equations projected)))
-                   (dialect/equations projected) (dialect/outputs projected))
+        projected (dialect/rebase-source-bindings
+                   projected (into {} (map-indexed (fn [index equation] [(second equation) index]))
+                                   (dialect/equations projected)))
         pairs (mapcat #(let [equation-id (second %)]
                          (:pairs (realize-equation projected %
                                                    (contains? fresh-segmented-reductions
@@ -1461,7 +1467,7 @@
         ;; An allocator extent can be computed in an earlier component and absent from every
         ;; numerical operand/axis here. Prior source definitions are incoming values, not local
         ;; host bindings still waiting to execute. Keep current/later definitions unavailable.
-        facts (-> source-facts
+        facts (-> (dialect/project-equation-facts source-facts equation-ids)
                   (assoc :inputs inputs :equations equation-facts :effects effects)
                   (update-in [:attributes :source-bindings]
                              #(filterv (complement prior-definitions) %))
@@ -1722,29 +1728,26 @@
               (assoc admitted :terminal-scalars-materialized 0)))))
       (assoc admitted :terminal-scalars-materialized 0))))
 
-(defn attempt
-  "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
-   no parallel binding is in this closed subset. Internal :host-scalars? admits host-only packets
-   through the same frontend; their caller must independently certify purity and storage algebra.
-   It does not authorize a device schedule or alter default scalar-only admission."
-  ([form dtype]
-   (attempt form dtype {}))
-  ([form dtype array-types]
-   (attempt form dtype array-types {}))
-  ([form dtype array-types {:keys [resident-reductions? resident-initialization?
+(defn ^:no-doc attempt-normalized
+  "Consume one exact normalized source. Normalization is owned by the caller;
+   all existing whole-source validation, liveness and scheduling remain shared.
+   This private continuation grants no prepared-import or source-owner admission."
+  [form dtype array-types {:keys [resident-reductions? resident-initialization?
                                    resident-uniform-input-loads?
-                                   scalar-types values abstract-machine segmented-plans?
-                                   preserve-declared-array-storage? host-scalars?]
+                                   scalar-types values abstract-machine segmented-plans? source-ns
+                                   preserve-declared-array-storage? host-scalars? terminal-host-results?
+                                   public-parameters]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
-     (let [form (frontend/normalize-source form {:array-types array-types
-                                                 :scalar-types scalar-types})]
        (try
          (let [frontend-options {:dtype dtype :array-types array-types
+                                 :source-ns source-ns
                                  :scalar-types scalar-types :values values
+                                 :public-parameters public-parameters
                                  :host-scalars? host-scalars?
                                  :segmented-plans? segmented-plans?
                                  :preserve-declared-array-storage? preserve-declared-array-storage?}
+               form (if terminal-host-results? (frontend/terminal-host-source form frontend-options) form)
                live-projection (validated-live-source-projection form frontend-options)
                {live-form :form :keys [projection typed-input admitted? bindings-removed
                                        terminal-scalars-materialized]}
@@ -1798,4 +1801,19 @@
              {:declined {:reason (:reason (ex-data exception))
                          :message (.getMessage exception)
                          :details (ex-data exception)}}
-             (throw exception))))))))
+             (throw exception))))))
+
+(defn attempt
+  "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
+   no parallel binding is in this closed subset. Internal :host-scalars? admits host-only packets
+   through the same frontend; their caller must independently certify purity and storage algebra.
+   It does not authorize a device schedule or alter default scalar-only admission."
+  ([form dtype] (attempt form dtype {}))
+  ([form dtype array-types] (attempt form dtype array-types {}))
+  ([form dtype array-types options]
+   (when (and (seq? form) (contains? #{'let 'let*} (first form)))
+     (attempt-normalized
+      (frontend/normalize-source form {:array-types array-types
+                                       :source-ns (:source-ns options)
+                                       :scalar-types (:scalar-types options)})
+      dtype array-types options))))

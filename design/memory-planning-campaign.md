@@ -204,7 +204,9 @@ initialization and escape analysis. Certification cannot drop the original seman
 This is physical-storage retention, not a snapshot of an earlier SSA version: two compiler names
 sharing one storage identity still need a separate value-version/tape proof. In particular,
 the existing `Compiled` wrapper exposes its executable and cannot silently opt into private
-reuse. Resident leases, structured replay and AD tape lifetime integration remain open. This
+reuse. Synchronous output leases are implemented as described below. Their integration with
+private resident-output reuse, structured replay, asynchronous lifetimes and AD residual
+retention remains open. This
 GPU-local proof does not supersede the JVM/source memory passes, so none is deleted on that claim.
 
 ## Semantic value retention

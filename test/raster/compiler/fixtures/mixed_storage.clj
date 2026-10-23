@@ -1,10 +1,21 @@
 (ns raster.compiler.fixtures.mixed-storage
   (:require [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
+            [raster.numeric :as numeric]
             [raster.par :as par]
             [raster.ad.reverse :as reverse]))
 
 (def policy {:preserve-declared-array-storage? true})
+
+(deftm float-reduction-double-quotient
+  [values :- (Array float)] :- Double
+  (let [total (par/reduce acc (float 0.0) i 4 (numeric/+ acc (aget values i)))]
+    (/ total 2.0)))
+
+(deftm object-context-array-map
+  [values :- (Array double)] :- (Array double)
+  (let [mapped (par/map [i (alength values)] (* (aget values i) 2.0))]
+    (nth [mapped mapped] 0)))
 
 (deftm double-exponential-float-storage
   "Explicit Double transcendental evaluation followed by one Float storage conversion."
@@ -23,9 +34,42 @@
            (recur (inc j) (+ acc (double (aget x j))))
            acc))))))
 
+(deftm dynamic-double-fold-float-storage
+  [x :- (Array float) n :- Long] :- (Array float)
+  (let [out (arrays/zeros-like x 1)]
+    (par/map! out i 1 nil
+      (float
+       (loop [j 0 acc (double 0.0)]
+         (if (< j n)
+           (recur (inc j) (+ acc (double (aget x j))))
+           acc))))))
+
 (deftm mixed-scale
   [coefficient :- Double values :- (Array float)] :- (Array float)
   (par/scale coefficient values))
+
+(deftm checked-product-shaped-map
+  "Independent allocation and map extent definitions retain checked Long products."
+  [coefficient :- Double values :- (Array float) rows :- Long columns :- Long] :- (Array float)
+  (let [out (float-array (* rows columns))]
+    (par/map-void! i (* rows columns)
+      (let [row (quot i columns)
+            column (rem i columns)]
+        (aset out i (float (* coefficient (double (aget values (+ (* row columns) column))))))))
+    out))
+
+(deftm checked-scale-effect!
+  "A checked write-only map whose public result is Void, not the destination."
+  [coefficient :- Double values :- (Array float) out :- (Array float) n :- Long] :- Void
+  (par/map-void! i n
+    (aset out i (float (* coefficient (double (aget values i)))))))
+
+(deftm checked-scale-effect-result
+  "Compose a Void checked helper with a genuinely private returned destination."
+  [coefficient :- Double values :- (Array float) n :- Long] :- (Array float)
+  (let [out (float-array n)]
+    (checked-scale-effect! coefficient values out n)
+    out))
 
 (deftm double-reduction-float-result
   [values :- (Array double)] :- Float
@@ -33,6 +77,28 @@
                           (+ acc (aget values i)))
         ^float result (float total)]
     result))
+
+(deftm double-reduction-float-roundtrip
+  [values :- (Array double)] :- Double
+  (let [total (par/reduce acc 0.0 i (alength values)
+                          (+ acc (aget values i)))]
+    (double (float total))))
+
+(deftm public-scaled-reduction-float-roundtrip
+  [coefficient :- Double, values :- (Array double)] :- Double
+  (let [total (par/reduce acc 0.0 i (alength values) (+ acc (aget values i)))]
+    (double (float (* total coefficient)))))
+
+(deftm public-affine-reduction-float-roundtrip
+  [offset :- Long, values :- (Array double), coefficient :- Double] :- Double
+  (let [total (par/reduce acc 0.0 i (alength values) (+ acc (aget values i)))]
+    (double (float (+ (* total coefficient) (double offset))))))
+
+(deftm scaled-reduction-float-roundtrip
+  [values :- (Array double)] :- Double
+  (let [total (par/reduce acc 0.0 i (alength values)
+                          (+ acc (aget values i)))]
+    (double (float (* total 1.5)))))
 
 (deftm mixed-scale-energy
   [coefficient :- Float values :- (Array double)] :- Double

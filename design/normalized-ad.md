@@ -1,5 +1,61 @@
 # Normalized AD design proposal
 
+## Shared typed generated entry
+
+An owned source reverse-AD preparation now eagerly emits one JVM entry using
+the same owned bytecode producer as `deftm`. Its immutable prepared program
+retains that implementation, emission history, physical parameter interface and
+original input body. Runtime execution reuses this entry; compiler consumers
+query its actual binding and invocation observations. There is no additional
+global executable cache, namespace publication or generated-source interpreter.
+Ownerless legacy source and separately owned residual programs remain distinct
+capabilities; this does not grant them the new entry's evidence.
+
+This deliberately makes the generated boundary **typed**, rather than treating
+logical binding declarations as comments in an untyped `eval` function. Declared
+parameters are converted at entry, in order, including unused parameters.
+Generated binding casts occur at their emitted positions. Consequently invalid
+arguments may fail earlier than in the old evaluated wrapper; this is an explicit
+runtime contract change, not an inferred equivalence for ill-typed Clojure code.
+The retained source policy still governs checked arithmetic and conversions.
+Runtime guards fence source, rule and emitted-dependency staleness before and
+after successful invocation. Physical entry construction evaluates no model body.
+It may materialize an observed lazy helper through the existing non-evaluating
+compiler entry. Promotion invalidates the old observations and retries the whole
+preparation; the rejected generated module is never restamped as current.
+Both small and wide IFn entries share ordered parameter conversions and reject
+wrong arity. Wide entries call their emitted static owner directly, not reflection.
+
+Captured `value+grad` and `grad` functions retain this exact prepared program.
+The authenticated program owns one-shot callable identity slots; copying function
+metadata cannot authorize projecting another function as that gradient. Generic
+inlining reads the observed callable snapshot and uses the same prepared-call
+projector as a syntactic AD call, rather than importing raw walked-body metadata.
+`grad` executes and projects the guarded value+grad entry; its logical derivative
+body remains available to higher-order AD with the original producer retained.
+These projections still leave their semantic source-import obligation open.
+The no-doc preparation map is compiler-internal producer state, not an untrusted
+publication API or persistent artifact format. A separately optimized
+`:compile? true` runtime does not export the generated entry's body as its own
+source: until that pipeline artifact supplies its own projection relation it
+remains runtime-callable without captured inlining eligibility.
+
+An observed CHECKCAST does not establish that it is total. Eliminating an alias
+still requires equal physical carriers or independently proved reference-payload
+correspondence, including null behavior and the exact selected helper's return
+bridge. Likewise a literal propagation owes its original class/raw bits and
+consumer completion. Whole generated-source import, original argument order,
+device count/read/bounds, placement and storage lifetime remain separate gates.
+
+Reading guide (2026-10-20): distinguish the intended normalized algebra from implemented
+families. Start with [Current implementation boundary](#current-implementation-boundary) for
+the opt-in host/device matrix. Source/default AD, JVM-owned numerical regions and normalized
+host/device families are not interchangeable execution paths. Sections describing an initial
+Double-carry domain or a particular helper vertical qualify that family, not all loop AD.
+Fresh ownership, source projection, numerical correspondence and device execution are separate
+gates; the [current campaign](compiler-unification-campaign.md#reviewed-next-vertical-source-correspondence-through-resident-training)
+keeps the prepared reverse-AD semantic import explicitly open until its bounded projection closes.
+
 ## Ordered generated-call source owner
 
 The shared `core/ordered-call` consumer normalizes an already-resolved JVM

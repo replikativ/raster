@@ -30,14 +30,17 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.pipeline :as pl]
             [raster.compiler.source-dependencies :as source-dependencies]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.core :as rcore]
             [raster.gpu.core :as gpu]
             [raster.gpu.invocation-observation :as observation]
@@ -375,7 +378,9 @@
                   (equation-artifact-store/store-artifact!
                    *equation-artifact-store* (:semantic-fingerprint key) identity value caller-options))
                 (catch Exception error
-                  {:status :write-failed :error-class (.getName (class error))})))]
+                  (cond-> {:status :write-failed :error-class (.getName (class error))}
+                    (keyword? (:reason (ex-data error)))
+                    (assoc :artifact-reason (:reason (ex-data error)))))))]
         (reset! persistent-report
                 (cond
                   (not persistent?) {:status :ineligible}
@@ -1045,10 +1050,12 @@
 
 (defn- prepare-ordered-equation-first
   "Retain semantic ports and the same compiled template without inventing a concrete LinkPlan.
-   This constructor is not automatic route selection. Its public invocation/capability gates
-   must land before ordinary lowering may select it."
+   Public route selection delegates capability, owner and executor preflight here;
+   unsupported contracts refuse before source evaluation or device acquisition."
   [compilation args opts template-report]
   (let [started (System/nanoTime)
+        _ (source-owner/assert-ordered-compilation-source! compilation)
+        _ (stage-result/refuse-unobserved! compilation :prepare-ordered-equation-first)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
         _ (when (or (get-in invocation-plan [:attributes :parameter-projection])
                     (some seq ((juxt :donate :outputs :taps) opts))
@@ -1058,7 +1065,8 @@
         caller-options (when (contains? opts :scalar-math)
                          {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math opts))})
         initial (invocation-link/validate-ordered-source-actions!
-                 (invocation-link/begin-ordered-realization compilation args caller-options))
+                 (source-owner/begin-ordered-realization compilation args caller-options))
+        _ (source-owner/assert-ordered-executor-coverage! compilation initial args)
         available (materialization/prefix-bindings (:materialization initial))
         buffers (:program-buffers available)
         parameters (:parameters invocation-plan)
@@ -1141,65 +1149,70 @@
                       (let [compile-template #(equation-first/compile fn-var compilation-options target-descriptor)]
                         (if caller-math-options
                           (stable-compilation-template template-key :equation-first compile-template caller-math-options)
-                          (stable-compilation-template template-key :equation-first compile-template))))
-        lowering-started (System/nanoTime)
-        retained-validation (if caller-math-options
-                              (owned-emitted-validation @template-owner compilation caller-math-options)
-                              (owned-emitted-validation @template-owner compilation))
-        equation-lower-phases (atom nil)
-        projection-ns (atom 0)
-        result (binding [equation-first/*lower-observer*
-                         #(reset! equation-lower-phases %)]
-                 (let [project
-                       (fn [plan]
-                    (let [started (System/nanoTime)
-                          projected (project-equation-first-boundary plan compilation args opts)]
-                      (reset! projection-ns (- (System/nanoTime) started))
-                      projected))]
-                   (if caller-math-options
-                     (equation-first/lower compilation args project retained-validation caller-math-options)
-                     (equation-first/lower compilation args project retained-validation))))
-        equation-lower-ns (- (System/nanoTime) lowering-started @projection-ns)
-        plan (:plan result)
-        {:keys [in-tree out-tree donated]} (:projection result)
-        attributes (:attributes plan)
-        public-bindings (:public-buffer-bindings attributes)
-        parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
-        parameter-projection (get-in compilation [:semantic :attributes :invocation-plan :attributes :parameter-projection])
-        logical-binding (into {} (map (juxt :symbol :binding)) (:physical-parameters parameter-projection))
-        public-parameters (or (:public-parameters parameter-projection) (mapv :symbol parameters))
-        public-arrays (vec (distinct (for [{:keys [symbol]} parameters
-                                          :when (contains? public-bindings symbol)]
-                                      (get logical-binding symbol symbol))))
-        public-array-set (set public-arrays)
-        certification-started (System/nanoTime)
-        lowering (if caller-math-options
-                   (invocation-link/certify-final-projection result caller-math-options)
-                   (invocation-link/certify-final-projection result))
-        invocation-certification-ns (- (System/nanoTime) certification-started)
-        lowering-ns (- (System/nanoTime) lowering-started)
-        steps (equation-first-kernel-steps compilation)
-        descriptor {:all-params public-parameters
-                    :array-params public-arrays
-                    :scalar-params (filterv #(not (contains? public-array-set %)) public-parameters)
-                    :parameter-projection parameter-projection
-                    :steps steps :result-sym nil :equation-first? true}
-        schedule (assoc (get-in compilation [:options :schedule])
-                        :compiler :equation-first :stats (:stats compilation))
-        report {:kind :equation-first
-                :timing-source :host-monotonic
-                :total-ns (- (System/nanoTime) preparation-started)
-                :template @template-report
-                :link-plan-lowering-ns lowering-ns
-                :phases-ns {:equation-lower equation-lower-ns
-                            :role-projection @projection-ns
-                            :invocation-certification invocation-certification-ns}
-                :equation-lower-phases-ns @equation-lower-phases
-                :nodes (count (get-in lowering [:plan :nodes]))
-                :instances (count (get-in lowering [:plan :instances]))}]
-    (seal-artifact
-     (cond-> (->Prepared lowering in-tree out-tree donated schedule target descriptor args report nil)
-       caller-math-options (assoc :math-request caller-math-options)))))
+                          (stable-compilation-template template-key :equation-first compile-template))))]
+    ;; Select from reconstructed semantic obligations, never by catching a failed
+    ;; eager lowering. The ordered constructor retains its narrower public API.
+    (if (seq (invocation/ordered-host-actions
+               (get-in compilation [:semantic :attributes :invocation-plan]) (:semantic compilation)))
+      (prepare-ordered-equation-first compilation args opts @template-report)
+      (let [lowering-started (System/nanoTime)
+            retained-validation (if caller-math-options
+                                  (owned-emitted-validation @template-owner compilation caller-math-options)
+                                  (owned-emitted-validation @template-owner compilation))
+            equation-lower-phases (atom nil)
+            projection-ns (atom 0)
+            result (binding [equation-first/*lower-observer*
+                             #(reset! equation-lower-phases %)]
+                     (let [project
+                           (fn [plan]
+                        (let [started (System/nanoTime)
+                              projected (project-equation-first-boundary plan compilation args opts)]
+                          (reset! projection-ns (- (System/nanoTime) started))
+                          projected))]
+                       (if caller-math-options
+                         (equation-first/lower compilation args project retained-validation caller-math-options)
+                         (equation-first/lower compilation args project retained-validation))))
+            equation-lower-ns (- (System/nanoTime) lowering-started @projection-ns)
+            plan (:plan result)
+            {:keys [in-tree out-tree donated]} (:projection result)
+            attributes (:attributes plan)
+            public-bindings (:public-buffer-bindings attributes)
+            parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
+            parameter-projection (get-in compilation [:semantic :attributes :invocation-plan :attributes :parameter-projection])
+            logical-binding (into {} (map (juxt :symbol :binding)) (:physical-parameters parameter-projection))
+            public-parameters (or (:public-parameters parameter-projection) (mapv :symbol parameters))
+            public-arrays (vec (distinct (for [{:keys [symbol]} parameters
+                                              :when (contains? public-bindings symbol)]
+                                          (get logical-binding symbol symbol))))
+            public-array-set (set public-arrays)
+            certification-started (System/nanoTime)
+            lowering (if caller-math-options
+                       (invocation-link/certify-final-projection result caller-math-options)
+                       (invocation-link/certify-final-projection result))
+            invocation-certification-ns (- (System/nanoTime) certification-started)
+            lowering-ns (- (System/nanoTime) lowering-started)
+            steps (equation-first-kernel-steps compilation)
+            descriptor {:all-params public-parameters
+                        :array-params public-arrays
+                        :scalar-params (filterv #(not (contains? public-array-set %)) public-parameters)
+                        :parameter-projection parameter-projection
+                        :steps steps :result-sym nil :equation-first? true}
+            schedule (assoc (get-in compilation [:options :schedule])
+                            :compiler :equation-first :stats (:stats compilation))
+            report {:kind :equation-first
+                    :timing-source :host-monotonic
+                    :total-ns (- (System/nanoTime) preparation-started)
+                    :template @template-report
+                    :link-plan-lowering-ns lowering-ns
+                    :phases-ns {:equation-lower equation-lower-ns
+                                :role-projection @projection-ns
+                                :invocation-certification invocation-certification-ns}
+                    :equation-lower-phases-ns @equation-lower-phases
+                    :nodes (count (get-in lowering [:plan :nodes]))
+                    :instances (count (get-in lowering [:plan :instances]))}]
+        (seal-artifact
+         (cond-> (->Prepared lowering in-tree out-tree donated schedule target descriptor args report nil)
+           caller-math-options (assoc :math-request caller-math-options)))))))
 
 (defn lower
   "Lower a deftm Var into an allocation-free `Prepared` artifact.
@@ -1207,6 +1220,10 @@
    `:compiler :equation-first` selects the typed SOAC→scheduled KernelBody→LinkPlan vertical.
    `:resident-descriptor` remains the default during migration. Selection is explicit: the
    equation-first compiler never falls back to a resident descriptor after a coverage failure.
+
+   Source actions after numerical work select ordered semantic preparation. It does not expose
+   a single static LinkPlan/certificate and cannot yet compose, donate, expose explicit outputs /
+   taps, borrow a session or profile. Unsupported capabilities fail before source/device effects.
 
    Equation-first aggregate roles/constants may name a logical root or an exact vector field path.
    Written aggregate leaves require explicit `:state` intent. `:outputs` accepts exact vector paths
@@ -1334,6 +1351,9 @@
                         {:reason :compiled-execution-identity-incomplete
                          :persistence-blockers persistence-blockers
                          :source-dependency-blockers source-dependency-blockers
+                         :artifact-store-report
+                         (select-keys (:persistent-artifact (:template report))
+                                      [:status :artifact-reason :error-class])
                          :retained-artifact? (boolean (seq retained-artifact))})))
       (if caller-options
         (invocation-link/verify! lowering caller-options)

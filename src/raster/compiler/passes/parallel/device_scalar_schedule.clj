@@ -7,6 +7,7 @@
    source-result projection remain later activation obligations."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
@@ -56,6 +57,14 @@
        ;; that capture requires the existing explicit resident-load transport, never rank guessing.
        (nil? (:memory-space value))))
 
+(defn- resident-scalar-capture?
+  [value]
+  (and (= :tensor (:kind value)) (= [] (:shape value))
+       (dtype/known? (:dtype value)) (= (:dtype value) (dtype/canon (:dtype value)))
+       (= {:kind :resident-scalar-buffer :elements 1} (:representation value))
+       (= :device (:memory-space value))
+       (default-value-facets? value)))
+
 (defn projection
   "Project one validated ScalarIR equation to its exact extent-one SegMap fields."
   [program]
@@ -92,26 +101,51 @@
                    resident-result? (default-value-facets? result-value)
                    (set/subset? (set (keys attributes)) #{:dtypes :attributes})
                    (empty? (:attributes attributes))
-                   (set/subset? (set (keys equation-attributes)) #{:source-prefix?})
+                   (set/subset? (set (keys equation-attributes))
+                                #{:source-prefix? :required-evaluation})
                    (or (not (contains? equation-attributes :source-prefix?))
                        (boolean? (:source-prefix? equation-attributes)))
                    (empty? (dialect/result-storage facts equation-id))
                    (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
-                   (every? #(or (tensor-capture? %) (scalar-capture? %)) capture-values))
+                   (every? #(or (tensor-capture? %) (scalar-capture? %)
+                                (resident-scalar-capture? %)) capture-values))
       (throw (ex-info "device scalar lowering requires one closed typed scalar result"
                       {:reason :typed-soac-device-scalar-subset
                        :equation equation-id :kind kind :results results
                        :physical-results physical-results :captures captures})))
-    (let [substitutions (zipmap parameters captures)
+    (let [resident-parameters (into #{} (keep-indexed (fn [index value]
+                                                       (when (resident-scalar-capture? value)
+                                                         (nth parameters index)))) capture-values)
+          _ (when (some #(contains? resident-parameters (:sym %))
+                        (mapcat descriptor/aget-reads (concat (map :init locals) body-results)))
+              (throw (ex-info "a logical scalar capture is a payload, not an indexable array"
+                              {:reason :typed-soac-device-scalar-subset :equation equation-id})))
+          reserved (into (set (keys values)) (filter symbol? (tree-seq coll? seq equation)))
+          payloads
+          (:payloads
+           (reduce (fn [{:keys [reserved] :as state} [parameter capture]]
+                     (if (contains? resident-parameters parameter)
+                       (let [id (fresh-id reserved "payload")]
+                         (-> state (update :reserved conj id)
+                             (update :payloads conj
+                                     {:parameter parameter :capture capture
+                                      :id id :dtype (get-in values [capture :dtype])})))
+                       state))
+                   {:reserved reserved :payloads []} (map vector parameters captures)))
+          substitutions (merge (zipmap parameters captures)
+                               (into {} (map (juxt :parameter :id)) payloads))
           locals (mapv #(update % :init (fn [init] (util/subst-syms substitutions init)))
                        locals)
+          locals (into (mapv (fn [{:keys [id dtype capture]}]
+                               {:id id :dtype dtype :init (list 'clojure.core/aget capture 0)})
+                             payloads) locals)
           body (util/subst-syms substitutions (first body-results))
           arrays (into #{} (keep-indexed (fn [index capture]
-                                           (when (tensor-capture? (nth capture-values index))
+                                           (when (or (tensor-capture? (nth capture-values index))
+                                                     (resident-scalar-capture? (nth capture-values index)))
                                              capture))) captures)
           scalars (set/difference (set captures) arrays)
-          reserved (into (set (keys values))
-                         (filter symbol? (tree-seq coll? seq equation)))
+          reserved (into reserved (map :id payloads))
           index (fresh-id reserved "index")
           flat-index (fresh-id (conj reserved index) "flat_index")]
       {:equation-id equation-id

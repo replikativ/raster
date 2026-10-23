@@ -23,7 +23,11 @@
           :invocation ['[x] '[double] 'double [(typed-call '(local-value x))] 'double]
           :index ['[values x] '[doubles long] 'double
                   '[(clojure.core/aget values (local-value x))] 'long]
-          :allocation ['[x] '[long] 'doubles '[(double-array (local-value x))] 'long])
+          :allocation ['[x] '[long] 'doubles '[(double-array (local-value x))] 'long]
+          :reduction ['[x] '[long] 'double
+                      '[(raster.par/reduce sum 0.0 i (local-value x) (+ sum 1.0))] 'long]
+          :terminal ['[x] '[double] 'double '[(let* [copy x] (local-value copy))] 'double]
+          :terminal-control ['[x] '[double] 'double '[(let* [copy x] copy)] 'double])
         source-ns (the-ns 'raster.compiler.backend.jvm.owned-input-dependency-test)
         emitter
         (fn [class-name _params _tags _return body source-ns & _]
@@ -47,7 +51,7 @@
   (try (run) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
 (deftest every-owned-input-family-refuses-unretained-original-siblings
-  (doseq [family [:invocation :index :allocation]]
+  (doseq [family [:invocation :index :allocation :reduction :terminal]]
     (let [{:keys [implementation emission]} (original-module family)
           before @global-calls
           source (first (:body emission))
@@ -59,13 +63,27 @@
             :index [[(double-array [3.0 5.0 7.0]) 1] 7.0 bytecode/retained-array-read
                     bytecode/compile-array-index-region [:input :unretained-sibling-calls?]]
             :allocation [[2] 3 bytecode/retained-zero-array-allocation
-                         bytecode/compile-array-count-region [:count :unretained-sibling-calls?]])
+                         bytecode/compile-array-count-region [:count :unretained-sibling-calls?]]
+            :reduction [[2] 3.0 bytecode/retained-reduction-emission
+                        bytecode/compile-reduction-count-region [:bound :unretained-sibling-calls?]]
+            :terminal [[-2.0] -1.0 bytecode/retained-terminal-context
+                       bytecode/compile-terminal-result-region [:unretained-sibling-calls?]])
           actual (apply implementation arguments)]
       (is (= expected (if (= :allocation family) (alength ^doubles actual) actual)))
       (is (= before @global-calls) "the original class selects its own sibling")
       (is (true? (get-in (observe emission source) flag-path)))
       (is (= :unsupported-bytecode-input-callees (reason #(outline emission source))))
       (is (= before @global-calls) "refusal cannot execute the unrelated global"))))
+
+(deftest terminal-with-no-sibling-dependency-still-outlines
+  (let [{:keys [implementation emission]} (original-module :terminal-control)
+        scope (first (:body emission))
+        observed (bytecode/retained-terminal-context emission scope)
+        region (bytecode/compile-terminal-result-region emission scope)]
+    (is (false? (:unretained-sibling-calls? observed)))
+    (doseq [value [-2.0 -0.0 Double/POSITIVE_INFINITY Double/NaN]]
+      (is (= (Double/doubleToRawLongBits (implementation value))
+             (Double/doubleToRawLongBits ((:invoke region) value)))))))
 
 (deftest ordinary-global-calls-still-outline-without-rebinding
   (let [{:keys [implementation emission]} (original-module :invocation false)

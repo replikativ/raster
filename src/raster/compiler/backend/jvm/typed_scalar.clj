@@ -81,7 +81,12 @@
 
 (defn- invoke-operation
   [source-ns expression environment]
-  (let [operation (descriptor/semantic-op expression)
+  (let [{:keys [dispatch? lexical-callee]} (descriptor/call-description expression)
+        _ (when (or dispatch? lexical-callee)
+            (fail! :typed-scalar-owned-source-required
+                   "selected source calls require their original receiver and argument-completion context"
+                   {:expression expression}))
+        operation (descriptor/semantic-op expression)
         arguments (descriptor/call-args expression)]
     (when-not operation
       (fail! :typed-scalar-operation "typed scalar call has no retained semantic operation"
@@ -131,8 +136,13 @@
   "Interpret one proven-pure scalar expression in `environment`.
 
    Symbols name typed region operands/locals. Calls are dispatched by their retained semantic
-   identity; unknown or effectful expressions fail loudly."
-  [source-ns environment expression]
+   identity; unknown or effectful expressions fail loudly. A selected source call is not a
+   semantic generic call. The optional compiler-owned source executor evaluates the WHOLE
+   expression under its original namespace/policy and completion contexts, not pre-evaluated
+   arguments. Its owner must prepare/cache the executable and guard its historical inputs."
+  ([source-ns environment expression]
+   (evaluate-expression source-ns environment expression nil))
+  ([source-ns environment expression execute-source]
   (let [source-ns (namespace-object source-ns)]
     (cond
       (or (number? expression) (boolean? expression) (nil? expression)) expression
@@ -148,17 +158,23 @@
         (when-not (= :pure (effects/analyze-effect expression))
           (fail! :typed-scalar-effect "JVM scalar backend only executes proven-pure expressions"
                  {:expression expression :effect (effects/analyze-effect expression)}))
-        (invoke-operation source-ns expression environment))
+        (if execute-source
+          (execute-source expression environment)
+          (invoke-operation source-ns expression environment)))
       :else
       (fail! :typed-scalar-expression "JVM scalar backend cannot execute this typed scalar value"
-             {:expression expression :type (type expression)}))))
+             {:expression expression :type (type expression)})))))
 
 (defn evaluate-array-size
   "Evaluate one admitted size-only primitive-array constructor operand exactly once.
    Core constructors use Number.intValue, not checked `int` or long launch-extent arithmetic.
    This performs neither allocation nor initialization and grants no native capacity proof."
-  [source-ns environment expression]
-  (let [source-value (evaluate-expression source-ns environment expression)]
+  ([source-ns environment expression]
+   (evaluate-array-size source-ns environment expression nil))
+  ([source-ns environment expression execute-source]
+  (let [source-value (if execute-source
+                       (evaluate-expression source-ns environment expression execute-source)
+                       (evaluate-expression source-ns environment expression))]
     (when-not (instance? Number source-value)
       (fail! :typed-scalar-array-size
              "size-only array realization requires a numeric constructor operand"
@@ -166,14 +182,18 @@
     (let [elements (.intValue ^Number source-value)]
       (when (neg? elements)
         (throw (NegativeArraySizeException. (str elements))))
-      {:source-value source-value :elements elements})))
+      {:source-value source-value :elements elements}))))
 
 (defn evaluate-region
   "Execute a canonical TypedSOAC lambda for ordered typed scalar operands.
 
    `result-dtypes` must align with the region's declared result expressions. The return value is
-   an ordered vector of `{:type dtype :value value}` maps suitable for compiler/runtime ABIs."
-  [source-ns lambda operands result-dtypes]
+   an ordered vector of `{:type dtype :value value}` maps suitable for compiler/runtime ABIs.
+   The optional source executor does not remove declared local/result conversions. Its producer
+   must independently establish that these checkpoints correspond to original source completion."
+  ([source-ns lambda operands result-dtypes]
+   (evaluate-region source-ns lambda operands result-dtypes nil))
+  ([source-ns lambda operands result-dtypes execute-source]
   (let [{:keys [parameters locals body-results]} (soac/lambda-parts lambda)
         operands (vec operands)
         result-dtypes (vec result-dtypes)]
@@ -195,17 +215,16 @@
           (reduce (fn [environment {:keys [id dtype init]}]
                     (assoc environment id
                            (coerce-value dtype
-                                         (evaluate-expression source-ns environment init))))
+                                         (evaluate-expression source-ns environment init execute-source))))
                   initial locals)]
       (mapv (fn [expression result-dtype]
               {:type (dtype/canon result-dtype)
                :value (coerce-value result-dtype
-                                    (evaluate-expression source-ns environment expression))})
-            body-results result-dtypes))))
+                                    (evaluate-expression source-ns environment expression execute-source))})
+            body-results result-dtypes)))))
 
-(defn evaluate-invocation-step
-  "InvocationMaterialization evaluator for one closed ScalarCompute step."
-  [source-ns step operand-values]
+(defn- evaluate-invocation-step*
+  [source-ns step operand-values execute-source]
   (let [{:keys [parameters]} (soac/lambda-parts (:region step))
         operands (mapv (fn [parameter]
                          (or (get operand-values parameter)
@@ -214,11 +233,22 @@
                                     {:parameter parameter :available (set (keys operand-values))})))
                        parameters)]
     (first (evaluate-region source-ns (:region step) operands
-                            [(get-in step [:value :dtype])]))))
+                            [(get-in step [:value :dtype])] execute-source))))
+
+(defn evaluate-invocation-step
+  "InvocationMaterialization evaluator for one closed ScalarCompute step."
+  ([source-ns step operand-values]
+   (evaluate-invocation-step* source-ns step operand-values nil))
+  ([source-ns step operand-values execute-source]
+   (evaluate-invocation-step* source-ns step operand-values execute-source)))
 
 (defn evaluate-host-equation
-  "EmittedParallelProgramCall evaluator for one host-only TypedSOAC equation."
-  [source-ns equation {:keys [operands values buffer-shapes]}]
+  "EmittedParallelProgramCall evaluator for one host-only TypedSOAC equation.
+   Buffer operands here are shape descriptions, not source arrays. An optional source executor
+   must not pass those stand-ins to original array-taking calls without an audited projection."
+  ([source-ns equation context]
+   (evaluate-host-equation source-ns equation context nil))
+  ([source-ns equation {:keys [operands values buffer-shapes]} execute-source]
   (let [algorithm (soac/validate! (:algorithm equation))
         operands (reduce-kv (fn [operands id value]
                               (assoc operands id
@@ -243,7 +273,7 @@
                                                  :available (set (keys environment))})))
                                    captures)
                    produced (evaluate-region source-ns lambda arguments
-                                             (mapv #(get-in values [% :dtype]) results))]
+                                             (mapv #(get-in values [% :dtype]) results) execute-source)]
                (into environment (map vector results produced)))))
          operands (soac/equations algorithm))]
-    (select-keys environment (:results equation))))
+    (select-keys environment (:results equation)))))

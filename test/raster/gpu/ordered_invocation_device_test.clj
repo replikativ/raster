@@ -5,6 +5,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.ordered-invocation-realization-test :as allocation-fixture]
+            [raster.compiler.fixtures.distributed-training :as training]
             [raster.dl.gpu-grad-parity :as ze-probe]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as ocl-probe]
@@ -83,6 +84,60 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(defn- dense-loss-oracle [^floats theta ^floats x ^floats y rows width]
+  ;; Independent scalar arithmetic; fixture values are binary fractions whose
+  ;; products and sums fit FP32 exactly before the final division by rows.
+  (/ (reduce + 0.0
+             (for [row (range rows)]
+               (let [prediction (reduce + 0.0 (for [column (range width)]
+                                                (* (double (aget x (+ (* row width) column)))
+                                                   (double (aget theta column)))))
+                     difference (- prediction (double (aget y row)))]
+                 (* difference difference))))
+     (double rows)))
+
+(defn- check-unchanged-training-loss! [target]
+  (let [cases (mapv (fn [{:keys [x y rows]}]
+                      (let [theta (training/initial-theta)
+                            arguments [theta x y (long rows) (long 17)]
+                            before (apply training/local-loss arguments)]
+                        (is (= before (apply dense-loss-oracle arguments)))
+                        {:arguments arguments :before before}))
+                    (training/batches [1 3]))
+        compilation (equation-first/compile #'training/local-loss
+                                           {:target target :dtype :float
+                                            :schedule {:precision :f32-scalar}})
+        launches (atom 0) run-graph! gpu/run-kernel-graph!]
+    (doseq [{:keys [arguments before]} cases]
+      (let [[theta _ y] arguments]
+        (with-open [artifact (link/instantiate-host-result! compilation arguments)]
+          (with-redefs [gpu/run-kernel-graph!
+                        (fn [& args] (swap! launches inc) (apply run-graph! args))]
+            (is (= before (link/run-host-result! artifact)))
+            (aset-float theta 0 (+ (aget ^floats theta 0) (float 0.125)))
+            (aset-float y 0 (- (aget ^floats y 0) (float 0.25)))
+            (let [expected (apply dense-loss-oracle arguments)]
+              (is (not= before expected))
+              (is (= expected (link/run-host-result! artifact))
+                  "the same executable observes changed weights and observations"))))))
+    (is (pos? @launches) "numerical stages actually execute through the device graph")
+    (let [arguments (assoc (:arguments (first cases)) 1 (float-array 1))]
+      (with-open [artifact (link/instantiate-host-result! compilation arguments)]
+        (with-redefs [gpu/run-kernel-graph!
+                      (fn [& _] (throw (AssertionError. "short input reached a numerical device launch")))]
+          (is (instance? clojure.lang.ExceptionInfo
+                         (try (link/run-host-result! artifact) nil
+                              (catch clojure.lang.ExceptionInfo error error))))
+          (is (= :link-execution-poisoned (reason #(link/run-host-result! artifact)))
+              "failed input validation cannot publish or replay an old result"))))))
+
+(deftest unchanged-training-loss-uses-original-prefix-and-replays-changed-inputs
+  (doseq [[target available? skip!] [[:ocl:0 @ocl-probe/opencl-available? ocl-probe/opencl-skip!]
+                                    [:ze:0 @ze-probe/gpu-available? ze-probe/gpu-skip!]]]
+    (if available?
+      (check-unchanged-training-loss! target)
+      (skip! "unchanged training loss with nested allocation prefix"))))
 
 (defn- check-source-allocation-zeroing! [target]
   (let [session (gpu/make-session target)]

@@ -137,6 +137,41 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn checked-float-stage-body
+  "Qualification fixture, NOT a production checked-stage schedule. Each lane
+   records its conversion status and writes a Float only on source-valid input.
+   Both status branches write on every replay, including success after failure."
+  [width]
+  (let [failure [(body/->ScalarStore 'status ['lane] (body/literal 1 :int) nil)
+                 (body/->Yield [])]
+        success [(body/->ScalarCompute (body/value 'converted :float)
+                                       (body/cast-expression 'operand :float :nearest-even :ieee))
+                 (body/->ScalarStore 'out ['lane] 'converted nil)
+                 (body/->ScalarStore 'status ['lane] (body/literal 0 :int) nil)
+                 (body/->Yield [])]]
+    (body/make
+     {:id [:checked-float-stage width]
+      :parameters [(body/->KernelParameter 'x :input :double [width] :global
+                                           (layout/row-major [width] :double) :input)
+                   (body/->KernelParameter 'out :output :float [width] :global
+                                           (layout/row-major [width] :float) :result)
+                   (body/->KernelParameter 'status :output :int [width] :global
+                                           (layout/row-major [width] :int) :status)]
+      :indices [(body/->IndexBinding 'lane :group 0)]
+      :operations
+      [(body/->ScalarLoad (body/value 'operand :double) 'x ['lane] nil nil :cached)
+       (body/->ScalarCompute (body/value 'below :predicate)
+                            (body/scalar-expression :lt :predicate
+                              ['operand (body/literal (- (double Float/MAX_VALUE)) :double)]))
+       (body/->ScalarCompute (body/value 'above :predicate)
+                            (body/scalar-expression :gt :predicate
+                              ['operand (body/literal (double Float/MAX_VALUE) :double)]))
+       (body/->IfRegion 'below failure
+                       [(body/->IfRegion 'above failure success []) (body/->Yield [])] [])]
+      :launch (launch/spec {:workgroup-size [1] :group-count [width]})
+      :provenance {:dialect :test}
+      :attributes {:kind :checked-stage-qualification}})))
+
 (defn scalar-while-body
   "One lane-local, loop-carried condition shared by verifier and all C-family gates."
   []

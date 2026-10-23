@@ -5,10 +5,13 @@
   arithmetic forms and iterates bottom-up to a fixed point. Typed .invk
   boundaries are retained; generic algebra may simplify their children but
   cannot erase selected operand conversions or result rounding."
-  (:require [pattern :refer [rule rule-list simplifier]]
+  (:require [clojure.walk :as walk]
+            [pattern :refer [rule rule-list simplifier]]
             [pattern.nanopass.dialect :refer [=> dialects]]
             [raster.compiler.ir.dialects]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.util :as util]
             [raster.compiler.passes.scalar.effects :as effects]))
 
 ;; ================================================================
@@ -90,7 +93,12 @@
   ;; A typed call includes operand conversion and result rounding. Generic
   ;; algebra is not authority to erase that signature-selected boundary.
   ;; Bottom-up traversal still simplifies its children.
-  (if (or (not (seq? form)) (= '.invk (first form)))
+  (when (and (seq? form) (= completion/completion-symbol (first form))
+             (not (completion/canonical-form? form)))
+    (throw (ex-info "Malformed reserved value completion during simplification"
+                    {:reason :invalid-value-completion :expression form})))
+  (if (or (not (seq? form)) (= '.invk (first form))
+          (completion/canonical-form? form))
     form
     (try
       (or (all-rules form) form)
@@ -105,6 +113,38 @@
   [form]
   (simplify-form form))
 
+(defn- simplify-tree [expression]
+  ;; Pattern's generic simplifier descends every seqable value before applying
+  ;; a rule. Here contracts and quoted data are explicitly not executable code.
+  (cond
+    (and (seq? expression) (contains? '#{quote clojure.core/quote} (first expression)))
+    expression
+
+    (and (seq? expression) (= completion/completion-symbol (first expression)))
+    (if-let [{:keys [contract operand]} (completion/canonical-parts expression)]
+      (util/remake-if-changed expression
+                              [completion/completion-symbol contract (simplify-tree operand)])
+      (throw (ex-info "Malformed reserved value completion during simplification"
+                      {:reason :invalid-value-completion :expression expression})))
+
+    :else
+    (let [children (cond
+                     (or (seq? expression) (vector? expression))
+                     (util/remake-if-changed expression (mapv simplify-tree expression))
+                     (coll? expression)
+                     (let [changed? (volatile! false)
+                           result (walk/walk
+                                   (fn [child]
+                                     (let [result (simplify-tree child)]
+                                       (when-not (identical? child result) (vreset! changed? true))
+                                       result)) identity expression)]
+                       (if-not @changed? expression
+                         (if (instance? clojure.lang.IObj result)
+                           (with-meta result (meta expression)) result)))
+                     :else expression)
+          result (simplify-form children)]
+      (if (identical? children result) children (recur result)))))
+
 (def algebraic-simplify
   "Bottom-up algebraic simplification on S-expressions.
   Applies rules to all subexpressions, iterating to fixed point.
@@ -114,7 +154,7 @@
 
   Dialect: CSEEliminated => Simplified"
   (dialects (=> CSEEliminated Simplified)
-            (simplifier (rule '?->form (simplify-form form)))))
+            simplify-tree))
 
 (defn simplify
   "Simplify a walked S-expression using the canonical rule-based simplifier."

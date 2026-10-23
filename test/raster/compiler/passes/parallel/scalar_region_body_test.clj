@@ -1,17 +1,23 @@
 (ns raster.compiler.passes.parallel.scalar-region-body-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :as core]
+            [raster.dl.loss :as loss]
             [raster.compiler.backend.gpu.kernel-body-opencl :as emit]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.scalar-conversion :as conversion]
+            [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segred-body :as segred]
             [raster.compiler.passes.parallel.scalar-region-lower :as result-region]
+            [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- lowerer []
@@ -20,6 +26,206 @@
      {:array-types {'x :float} :arrays #{'x} :scalar-types {'i :int}
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
+
+(defn- fp-correspondence
+  [type init step & {:keys [arrays facts accumulator actual-step bound source-ns]
+                    :or {arrays {} facts {} accumulator 'acc bound 'count
+                         source-ns (the-ns 'raster.compiler.passes.parallel.scalar-region-body-test)}}]
+  (let [source (list 'raster.par/reduce accumulator init 'i bound step)
+        product (reduction/make
+                 {:components [{:id :sum :accumulator accumulator :neutral init :dtype type :result 'sum}]
+                  :index 'i :step (reduction/->ReductionRegion [] [(or actual-step step)] {})})]
+    (entry/call-with-definition-inputs
+     #(scalar/check-reduction-fp-correspondence
+       source product {:source-ns source-ns :array-types arrays :scalar-facts facts}))))
+
+(deftest original-mse-operator-and-quotient-have-separate-owned-facts
+  (loss/mse-loss (float-array [1.0]) (float-array 1) 1)
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [source (core/resolve-deftm-var #'loss/mse-loss {:dtype :float})
+           frontend (entry/original-source-frontend source)
+           quotient (first (:body frontend))
+           original (second quotient)
+           observed (entry/frontend-reduction-emission frontend original)
+           product (reduction/make
+                    {:components [{:id :sum :accumulator (nth original 1)
+                                   :neutral (nth original 2) :dtype :float :result 'sum}]
+                     :index (nth original 3)
+                     :step (reduction/->ReductionRegion [] [(nth original 5)] {})})
+           source-ns (:ns (meta source))
+           operator (scalar/check-reduction-fp-correspondence
+                      original product {:source-ns source-ns
+                                        :array-types {'pred :float 'target :float}})
+           denominator (normal/completed-scalar-fact (nth quotient 2) {} source-ns)
+           parent (scalar/checked-core-fp-evaluation
+                    quotient [(:result-fact observed) denominator] source-ns)]
+       (is (some? (:root-result observed)))
+       (is (= {:carrier Object :presence :present :builtin-class Float} (:result-fact observed)))
+       (is (= :float (:dtype operator)))
+       (is (= :unproved (get-in operator [:source-count-obligation :domain-correspondence])))
+       (is (= Double/TYPE (:carrier denominator)))
+       (is (= Double/TYPE (:result-carrier parent)))
+       (is (not (contains? operator :carrier)))
+       (is (not (contains? parent :count)))))))
+
+(def ^:private opaque-count-evaluations (atom 0))
+
+(defn observable-count-probe []
+  (swap! opaque-count-evaluations inc)
+  2)
+
+(deftest opaque-original-count-is-an-obligation-not-a-domain-proof
+  (reset! opaque-count-evaluations 0)
+  (doseq [bound [(inc (long Integer/MAX_VALUE))
+                '(clojure.core/aget counts 0)
+                '(raster.compiler.passes.parallel.scalar-region-body-test/observable-count-probe)]]
+    (let [proof (fp-correspondence :double 0.0 '(clojure.core/+ acc 1.0) :bound bound)]
+      (is (= :conditional-fp-reduction-correspondence (:scope proof)))
+      (is (= {:conversion :checked-int :evaluation :original-position
+              :domain-correspondence :unproved} (:source-count-obligation proof)))
+      (is (not-any? #(contains? proof %) [:extent :count :nonthrowing? :removable? :algebra]))))
+  (is (zero? @opaque-count-evaluations)))
+
+(deftest conditional-reduction-correspondence-is-not-a-completion-or-schedule-proof
+  (doseq [[type init] [[:float (float 0.0)] [:double 0.0]]
+          bound [-1 0 1 'count]]
+    (let [proof (fp-correspondence type init '(clojure.core/+ acc (clojure.core/aget x i))
+                                   :arrays {'x type} :bound bound)]
+      (is (= {:scope :conditional-fp-reduction-correspondence :dtype type
+              :checkpoints-preserved? true :zero-trip :initializer
+              :source-count-obligation {:conversion :checked-int :evaluation :original-position
+                                        :domain-correspondence :unproved}}
+             proof))
+      (is (not-any? #(contains? proof %) [:carrier :nonthrowing? :removable? :algebra]))))
+  (is (some? (fp-correspondence :float (float 0.0)
+                                '(let* [d (clojure.core/- (clojure.core/aget x i)
+                                                        (clojure.core/aget y i))]
+                                   (clojure.core/+ acc (clojure.core/* d d)))
+                                :arrays {'x :float 'y :float})))
+  (is (some? (fp-correspondence :double 0.0 '(clojure.core/+ acc value)
+                                :facts {'value {:carrier Double/TYPE :presence :present}}))))
+
+(deftest conditional-reduction-retains-source-width-and-initializer-checkpoints
+  (let [float-acc (with-meta 'acc {:raster.type/tag 'float})]
+    (is (some? (fp-correspondence :float 0.0 '(clojure.core/+ acc (clojure.core/aget x i))
+                                  :accumulator float-acc :arrays {'x :float})))
+    (doseq [init [0.0 '(clojure.core/double 0.0)]]
+      (is (nil? (fp-correspondence :float init '(clojure.core/+ acc (clojure.core/aget x i))
+                                   :arrays {'x :float}))))
+    (is (nil? (fp-correspondence :float '(clojure.core/double 0.0)
+                                 '(clojure.core/+ acc (clojure.core/aget x i))
+                                 :accumulator float-acc :arrays {'x :float}))))
+  (doseq [step [(with-meta '(clojure.core/+ acc (clojure.core/aget x i))
+                          {:raster.type/tag 'double})
+                (with-meta '(clojure.core/+ acc (clojure.core/aget x i))
+                  {:raster.type/tag 'float :tag 'double})
+                '(clojure.core/+ acc 1.0)
+                '(let* [d (clojure.core/double (clojure.core/aget x i))]
+                   (clojure.core/+ acc d))]]
+    (is (nil? (fp-correspondence :float (float 0.0) step :arrays {'x :float}))))
+  (is (nil? (fp-correspondence :float (float 0.0)
+                               '(clojure.core/+ acc (clojure.core/aget x i))
+                               :arrays {'x :float}
+                               :actual-step '(clojure.core/float
+                                              (clojure.core/+ (clojure.core/double acc)
+                                                              (clojure.core/double (clojure.core/aget x i))))))))
+
+(deftest conditional-reduction-abstains-on-unknown-storage-calls-and-index-uses
+  (doseq [[step arrays facts]
+          [['(clojure.core/+ acc (clojure.core/aget x i)) {} {}]
+           ['(clojure.core/+ acc (clojure.core/aget x (clojure.core/+ i 1))) {'x :float} {}]
+           ['(clojure.core/+ acc i) {} {'i {:carrier Float/TYPE :presence :present}}]
+           ['(clojure.core/+ acc value) {} {'value {:carrier Double/TYPE :presence :unknown}}]
+           ['(clojure.core/+ acc (opaque value)) {} {}]
+           ['(+ acc (clojure.core/aget x i)) {'x :float} {}]
+           ['(let* [x (clojure.core/float 1.0)] (clojure.core/aget x i)) {'x :float} {}]
+           ['(let* [i (clojure.core/float 1.0)] (clojure.core/aget x i)) {'x :float} {}]]]
+    (is (nil? (fp-correspondence :float (float 0.0) step :arrays arrays :facts facts))))
+  (is (nil? (fp-correspondence :double 0.0
+                               (nth (iterate #(list 'clojure.core/double %) 'acc) 130))))
+  (is (nil? (fp-correspondence :double 0.0 (cons 'clojure.core/+ (repeat 1.0)))))
+  (is (nil? (fp-correspondence
+             :double 0.0
+             (list 'let* (vec (mapcat #(vector (symbol (str "x" %)) 1.0) (range 4000))) 'acc))))
+  (is (nil? (fp-correspondence
+             :double 0.0
+             (with-meta '(clojure.core/+ acc 1.0) {:raster.op/lexical-callee true}))))
+  (binding [entry/*emission-inputs* nil]
+    (is (nil? (scalar/check-reduction-fp-correspondence
+               '(raster.par/reduce acc 0.0 i 1 (clojure.core/+ acc 1.0)) nil
+               {:source-ns *ns*})))))
+
+(deftest conditional-reduction-does-not-authenticate-a-remapped-qualified-operation
+  (let [caller (create-ns (gensym "raster.correspondence.caller."))
+        foreign (create-ns (gensym "raster.correspondence.foreign."))]
+    (try
+      (intern foreign '+ (fn [& _] (throw (AssertionError. "analysis must not execute it"))))
+      (binding [*ns* caller] (alias 'clojure.core (ns-name foreign)))
+      (is (= :intrinsic-source-definition-mismatch
+             (try (fp-correspondence :double 0.0 '(clojure.core/+ acc 1.0) :source-ns caller)
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (finally (remove-ns (ns-name caller)) (remove-ns (ns-name foreign))))))
+
+(deftest conditional-reduction-bare-casts-own-their-actual-lookup
+  (let [step '(let* [d (clojure.core/- (float (clojure.core/aget x i))
+                                     (float (clojure.core/aget y i)))]
+                (clojure.core/+ acc (clojure.core/* d d)))
+        prove #(fp-correspondence :float '(float 0.0) step :arrays {'x :float 'y :float})]
+    (is (= :float (:dtype (prove))))
+    (is (= :float
+           (:dtype (fp-correspondence
+                     :float '(float 0.0) step :arrays {'x :float 'y :float}
+                     :actual-step '(clojure.core/+ acc
+                                    (let* [d (clojure.core/- (float (clojure.core/aget x i))
+                                                            (float (clojure.core/aget y i)))]
+                                      (clojure.core/* d d)))))))
+    (binding [util/*shadowing-locals* #{'float}]
+      (is (nil? (prove))))
+    (is (nil? (fp-correspondence :float (float 0.0) '(float acc)
+                                 :facts {'float {:carrier Object :presence :unknown}})))
+    (is (nil? (fp-correspondence :float (float 0.0)
+                                 '(let* [float (clojure.core/float 1.0)] (float acc)))))
+    (let [caller (create-ns (gensym "raster.correspondence.cast-lookup."))]
+      (try
+        (intern caller 'float (fn [& _] (throw (AssertionError. "analysis executed a replacement"))))
+        (is (= :intrinsic-source-definition-mismatch
+               (try (fp-correspondence :float '(float 0.0) step
+                                       :source-ns caller :arrays {'x :float 'y :float})
+                    nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+        (finally (remove-ns (ns-name caller)))))
+    (let [before (meta #'clojure.core/float)]
+      (try
+        (alter-meta! #'clojure.core/float assoc :inline (fn [& _] (throw (AssertionError. "replacement inline"))))
+        (is (= :intrinsic-source-definition-mismatch
+               (try (prove) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+        (finally (reset-meta! #'clojure.core/float before))))))
+
+(deftest conditional-reduction-administrative-equivalence-keeps-read-order-and-count
+  (doseq [[source actual]
+          [['(let* [u (clojure.core/aget x i) v (clojure.core/aget y i)]
+               (clojure.core/+ acc (clojure.core/* u v)))
+            '(clojure.core/+ acc (let* [v (clojure.core/aget y i) u (clojure.core/aget x i)]
+                                  (clojure.core/* u v)))]
+           ['(let* [u (clojure.core/aget x i)] (clojure.core/+ acc (clojure.core/* u u)))
+            '(clojure.core/+ acc (clojure.core/* (clojure.core/aget x i) (clojure.core/aget x i)))]
+           ['(let* [unused (clojure.core/aget x i)] (clojure.core/+ acc (clojure.core/aget y i)))
+            '(clojure.core/+ acc (clojure.core/aget y i))]]]
+    (is (nil? (fp-correspondence :float (float 0.0) source
+                                 :arrays {'x :float 'y :float} :actual-step actual)))))
+
+(deftest conditional-reduction-literal-comparison-retains-exact-floating-bits
+  (doseq [[type positive negative] [[:float (float 0.0) (float -0.0)] [:double 0.0 -0.0]]]
+    (is (nil? (fp-correspondence type positive (list 'clojure.core/* 'acc positive)
+                                 :actual-step (list 'clojure.core/* 'acc negative)))))
+  (let [nan-a (Double/longBitsToDouble 9221120237041090561)
+        nan-b (Double/longBitsToDouble 9221120237041090561)]
+    (is (= :double (:dtype (fp-correspondence
+                            :double 0.0 (list 'clojure.core/* 'acc nan-a)
+                            :actual-step (list 'clojure.core/* 'acc nan-b)))))))
 
 (deftest comparison-operands-retain-independent-source-widths
   (doseq [strict? [false true]
@@ -142,7 +348,7 @@
           narrow-call (with-meta (list raster-call '(aget x i)) {:raster.type/tag 'float})
           wide-call (with-meta (list java-call '(double (aget x i))) {:raster.type/tag 'double})
           narrow (lower narrow-call :float {'i :int})
-          wide (lower (list 'float wide-call) :float {'i :int})
+          wide (lower wide-call :float {'i :int})
           math-calls #(filter (fn [operation] (= operator (get-in operation [:expression :op])))
                               (:operations %))]
       (is (= [:float] (mapv #(get-in % [:expression :result-type]) (math-calls narrow))))
@@ -158,8 +364,10 @@
         result (lower 'java.lang.Float/NEGATIVE_INFINITY :float {})]
     (is (= :float (:type result)))
     (is (= Float/NEGATIVE_INFINITY (get-in result [:result :value])))
-    (is (= :float (:type (lower '(float Double/NEGATIVE_INFINITY) :float {})))
-        "a closed Java numeric field retains its source width across an explicit cast")
+    (is (= :checked-floating-conversion
+           (try (lower '(float Double/NEGATIVE_INFINITY) :float {}) nil
+                (catch clojure.lang.ExceptionInfo e (:rule (ex-data e)))))
+        "a closed throwing source conversion is not an IEEE constant")
     (is (= 'Float/NEGATIVE_INFINITY
            (:result (lower 'Float/NEGATIVE_INFINITY :float
                            {'Float/NEGATIVE_INFINITY :float})))
@@ -234,11 +442,13 @@
                           ((:cast legacy) {:operations [] :result 'x :type :long} :int 'x)))
                    [:expression :options]))
         "an implicit conversion without a strict owner retains the legacy wrap policy")
-    (doseq [form ['(clojure.core/int f) '(clojure.core/unchecked-int f)]]
-      (is (= {:rounding :toward-zero :overflow :saturate}
-             (get-in (last (:operations (lower form :int {'f :double})))
-                     [:expression :options]))
-          "checked and unchecked integer casts share Java's floating narrowing semantics"))
+    (is (= :checked-floating-conversion
+           (try (lower '(clojure.core/int f) :int {'f :double}) nil
+                (catch clojure.lang.ExceptionInfo e (:rule (ex-data e))))))
+    (is (= {:rounding :toward-zero :overflow :saturate}
+           (get-in (last (:operations (lower '(clojure.core/unchecked-int f) :int {'f :double})))
+                   [:expression :options]))
+        "only unchecked floating-to-integer casts grant saturation")
     (let [widened (lower '(clojure.core/long i) :long {'i :int})
           identity-cast (lower '(clojure.core/int i) :int {'i :int})]
       (is (= {:rounding :exact :overflow :exact}
@@ -527,8 +737,13 @@
   (let [factory scalar/make-lowerer
         calls (atom [])
         coordinates (atom [])
-        expression (list 'float (with-meta '(+ (aget x (+ i 1)) scale)
-                                  {:raster.type/tag 'double}))
+        numeric-expression (with-meta '(+ (aget x (+ i 1)) scale)
+                             {:raster.type/tag 'double})
+        expression (dialect/scalar-convert
+                    {:source-dtype :double :target-dtype :float
+                     :rounding :nearest-even :overflow :ieee
+                     :source-op 'clojure.core/unchecked-float}
+                    numeric-expression)
         options {:index 'i :coordinate 'i :dtype :float
                  :arrays #{'x} :array-types {'x :int}
                  :scalars #{'scale} :scalar-types {'scale :double}
@@ -559,7 +774,11 @@
            (mapv #(get-in % [:result :type]) [promote add narrow])))
     (is (= {:rounding :exact :overflow :exact} (get-in promote [:expression :options])))
     (is (= {:rounding :nearest-even :overflow :ieee}
-           (get-in narrow [:expression :options])))))
+           (get-in narrow [:expression :options])))
+    (is (= :checked-floating-conversion
+           (try (segred/lower-element-operations (list 'float numeric-expression) options) nil
+                (catch clojure.lang.ExceptionInfo e (:missing-rule (ex-data e)))))
+        "an implicit result coercion does not license an explicit checked source cast")))
 
 (deftest reduction-literal-conversion-is-not-contextual-literal-typing
   (let [expression (with-meta '(+ scale 0.1) {:raster.type/tag 'float})
@@ -661,7 +880,7 @@
 (deftest scalar-casts-use-the-shared-descriptor-vocabulary
   (doseq [[head target source overflow]
           [['byte :byte :long :trap] ['int :int :long :trap]
-           ['long :long :int :exact] ['float :float :double :ieee]
+           ['long :long :int :exact]
            ['double :double :float :exact]]
           qualified? [false true]]
     (let [head (if qualified? (symbol "clojure.core" (name head)) head)
@@ -860,13 +1079,65 @@
     (is (= 'value (first (get-in (last (:operations checked)) [:expression :arguments])))
         "the typed term preserves its declared-source operand")))
 
-(deftest floating-source-casts-retain-jvm-saturation-semantics
+(deftest floating-source-casts-distinguish-checked-and-saturating-semantics
   (let [lower (:lower (lowerer))]
-    (doseq [[form expected] [['(long value) :long] ['(int value) :int]]]
+    (doseq [source [:float :double]
+            [form expected] [['(long value) :long] ['(int value) :int]]]
+      (is (= :checked-floating-conversion
+             (try (lower form expected {'value source}) nil
+                  (catch clojure.lang.ExceptionInfo e (:rule (ex-data e)))))))
+    (doseq [source [:float :double]]
+      (let [lowered (lower '(clojure.core/unchecked-int value) :int {'value source})
+            options (get-in (last (:operations lowered)) [:expression :options])]
+        (is (= {:rounding :toward-zero :overflow :saturate} options))
+        (is (= :int (:type lowered)))))
+    (doseq [[form expected] [['(long 1.75) :long] ['(int 1.75) :int]
+                            [(list 'int Double/NaN) :int]]]
       (let [lowered (lower form expected {'value :float})
             options (get-in (last (:operations lowered)) [:expression :options])]
         (is (= {:rounding :toward-zero :overflow :saturate} options))
         (is (= expected (:type lowered)))))))
+
+(deftest floating-trapping-casts-cannot-fall-through-to-a-target-c-cast
+  (doseq [source [:float :double] target [:int :long]]
+    (let [kernel (body/make
+                  {:id :checked-floating-cast
+                   :parameters [(body/->KernelParameter 'value :scalar source [] nil nil :parameter)
+                                (body/->KernelParameter 'out :output target [1] :global
+                                                       (layout/row-major [1] target) :result)]
+                   :operations [(body/->ScalarCompute
+                                 (body/value 'converted target)
+                                 (body/cast-expression 'value target :toward-zero :trap))
+                                (body/->ScalarStore 'out [0] 'converted nil)]
+                   :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                   :provenance {:dialect :test} :attributes {}})]
+      (doseq [dialect [:opencl-portable :cuda :hip]]
+        (is (= :kernel-body-c-cast-policy
+               (try (emit/emit-scalar-kernel "checked_floating_cast" kernel
+                                             {:target-dialect dialect}) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
+
+(deftest checked-floating-source-conversion-cannot-become-an-ieee-device-cast
+  (let [lower (:lower (lowerer))
+        attributes {:source-dtype :double :target-dtype :float
+                    :rounding :nearest-even :overflow :trap :source-op 'clojure.core/float}]
+    (doseq [expression ['(clojure.core/float value)
+                        (dialect/scalar-convert attributes 'value)]]
+      (is (= :checked-floating-conversion
+             (try (lower expression :float {'value :double}) nil
+                  (catch clojure.lang.ExceptionInfo e (:rule (ex-data e)))))))
+    (is (= :checked-floating-conversion
+           (try (lower '(clojure.core/float Double/MIN_VALUE)
+                       :float {'Double/MIN_VALUE :double}) nil
+                (catch clojure.lang.ExceptionInfo e (:rule (ex-data e)))))
+        "a declared value is not constant evidence from its apparent field spelling")
+    (doseq [expression ['(clojure.core/unchecked-float value)
+                        (dialect/scalar-convert
+                         (assoc attributes :overflow :ieee :source-op 'clojure.core/unchecked-float)
+                         'value)]]
+      (is (= {:rounding :nearest-even :overflow :ieee}
+             (get-in (last (:operations (lower expression :float {'value :double})))
+                     [:expression :options]))))))
 
 (deftest unary-subtraction-retains-floating-sign-and-integral-overflow
   (doseq [type [:float :double :int :long]]

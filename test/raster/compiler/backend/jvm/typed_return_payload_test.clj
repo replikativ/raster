@@ -5,6 +5,12 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
+            [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (def ^:private fp {:carrier Double/TYPE :presence :present})
@@ -23,15 +29,19 @@
       {:scope scope :generic (ns-resolve scope '*) :source source
        :receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))})))
 
+(defn- fixture-call [fixture]
+  ;; Keep deliberately misleading nominal metadata distinct from the actual
+  ;; fixture receiver. Host execution must follow the latter.
+  (with-meta
+    (list '.invk (symbol (str (:scope fixture))
+                         (str (:name (meta (:receiver fixture))))) 'a 'b)
+    {:raster.op/original 'raster.numeric/*}))
+
 (defn- with-selected-fixture [fixture run!]
   ;; Only the original operation's table selects this actual typed call. No
   ;; numerical invocation goes through the temporarily described generic root.
   (let [generic #'n/* original (meta generic)
-        receiver (:receiver fixture)
-        call (with-meta
-               (list '.invk (symbol (str (:scope fixture))
-                                    (str (:name (meta receiver)))) 'a 'b)
-               {:raster.op/original 'raster.numeric/*})]
+        call (fixture-call fixture)]
     (try
       (alter-meta! generic assoc :raster.core/dispatch-table
                    (:raster.core/dispatch-table (meta (:generic fixture))))
@@ -112,6 +122,54 @@
             (is (nil? (payload call [fp {:carrier Object :presence :unknown}])))
             (is (nil? (payload call [fp]))))))
       (finally (remove-ns (ns-name scope))))))
+
+(deftest checked-payload-composition-is-sequential-and-capture-safe
+  (doseq [source-body ['(clojure.core/+ (clojure.core/* x y) -0.0)
+                      '(clojure.core/double x)
+                      '(clojure.core/double -0.0)]]
+    (let [{:keys [scope receiver] :as fixture} (fixture! "raster.payload-composition." source-body)]
+      (try
+        (with-selected-fixture
+          fixture
+          (fn [call]
+            (core/ensure-bytecode-implementation! receiver)
+            (let [proof (payload call [fp fp])
+                  ;; Actual argument identities deliberately collide with the old recipe's
+                  ;; definition names. A tree substitution would capture these references.
+                  ids '[scalar-value-1 scalar-value-2]
+                  arguments (mapv (fn [id] {:operations [] :result id :type :double}) ids)
+                  builder #(scalar/make-lowerer
+                            {:scalar-types (zipmap ids (repeat :double))
+                             :arrays #{} :array-types {} :index-scope #{}
+                             :source-region [ids (:computation proof)] :id-prefix "replayed"
+                             :lower-index (fn [& _] (throw (AssertionError. "payload used an index")))
+                             :decline! (fn [& _] (throw (AssertionError. "closed payload declined")))})
+                  instantiate (fn [p] (#'scalar/instantiate-checked-fp-payload p arguments (builder)))
+                  composed (instantiate proof)]
+              (is (some? proof))
+              (is (some? composed))
+              (doseq [[x y] [[3.0 2.0] [-0.0 2.0] [1.0 Double/POSITIVE_INFINITY]
+                             [Double/NaN 1.0]]]
+                (let [expected (execute-fp-program (:computation proof)
+                                                 (zipmap (:parameters proof) [x y]))
+                      actual (execute-fp-program composed (zipmap ids [x y]))]
+                  (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual)))))
+              (when (>= (count (get-in proof [:computation :operations])) 2)
+                (let [operations (get-in proof [:computation :operations])
+                      first-op (first operations)
+                      second-id (get-in operations [1 :result :id])]
+                  (doseq [changed [(assoc-in proof [:computation :operations 0 :expression :arguments 0] 'free)
+                                   (assoc-in proof [:computation :operations 0 :expression :arguments 0] second-id)
+                                   (assoc-in proof [:computation :operations] [first-op first-op])
+                                   (assoc-in proof [:computation :operations 0]
+                                             (body/->ScalarLoad (body/value 'loaded :double)
+                                                                'foreign [0] nil nil :cached))
+                                   (assoc-in proof [:computation :operations 0 :result :id]
+                                             (first (:parameters proof)))
+                                   (assoc-in proof [:computation :result] 'free)
+                                   (assoc-in proof [:computation :type] :float)]]
+                    (is (nil? (instantiate changed)))))))))
+        (finally (remove-ns (ns-name scope)))))))
 
 (deftest actual-long-boxing-is-payload-evidence-not-a-primitive-source-carrier
   (let [{:keys [scope receiver] :as fixture}
@@ -253,3 +311,209 @@
     (is (= Double/TYPE (#'scalar/completed-fp-body-carrier body {'x Double/TYPE 'y Double/TYPE})))
     (is (nil? (#'scalar/completed-fp-body-carrier body {'x Double/TYPE 'y Double/TYPE} true))
         "every admitted node must agree before its SSA can become a payload recipe")))
+
+(deftest nonthrowing-intrinsic-evidence-does-not-invent-a-result-carrier-recipe
+  (let [descriptor intrinsics/descriptor
+        expression '(clojure.core/+ x y)
+        carriers {'x Double/TYPE 'y Double/TYPE}]
+    (is (= Double/TYPE (#'scalar/completed-fp-body-carrier expression carriers)))
+    ;; Model independently extending descriptor totality, without changing
+    ;; source identity or teaching this arithmetic-only summary a new recipe.
+    (doseq [facts [{:arity 2 :kind :fn :primitive-fp-total true :c {:fn "hypot"}}
+                  {:arity 2 :kind :infix :primitive-fp-total true :c "%"}]]
+      (with-redefs [intrinsics/descriptor (fn [op]
+                                          (if (= op 'clojure.core/+) facts (descriptor op)))]
+        (is (nil? (#'scalar/completed-fp-body-carrier expression carriers)))))
+    (with-redefs [intrinsics/descriptor
+                  (fn [op]
+                    (if (= op 'clojure.core/exp)
+                      {:arity 1 :kind :fn :primitive-fp-total true :c {:fn "exp"}}
+                      (descriptor op)))]
+      (is (nil? (#'scalar/completed-fp-body-carrier '(clojure.core/exp x) carriers))))))
+
+(defn- canonical-operation [expression]
+  (entry/call-with-definition-inputs #(scalar/canonical-selected-fp-operation expression)))
+
+(deftest canonical-arithmetic-keeps-callee-correspondence-and-object-result-separate
+  (doseq [[tag body carrier] [['Double '(clojure.core/* x y) Double/TYPE]
+                              ['Float '(clojure.core/float (clojure.core/* x y)) Float/TYPE]]]
+    (let [{:keys [scope] :as fixture} (fixture! "raster.canonical-body." body tag)]
+      (try
+        (with-selected-fixture
+          fixture
+          (fn [call]
+            (with-redefs [core/ensure-bytecode-implementation!
+                          (fn [& _] (throw (AssertionError. "correspondence forced the JIT")))]
+              (let [proof (canonical-operation call)]
+                (is (= :canonical-selected-fp-operation (:scope proof)))
+                (is (= :* (:operation proof)))
+                (is (= [carrier carrier] (:parameter-carriers proof)))
+                (is (= Object (:result-carrier proof)))
+                (is (= carrier (:payload-carrier proof)))
+                (is (not (contains? proof :nonthrowing?)))
+                ;; A real selected Object/Float or Object/Double result is not
+                ;; a primitive operand for its enclosing core overload.
+                (let [init (if (= carrier Float/TYPE) (float 0.0) 0.0)
+                      type (if (= carrier Float/TYPE) :float :double)
+                      step (list 'clojure.core/+ 'acc call)
+                      source (list 'raster.par/reduce 'acc init 'i 'count step)
+                      product (reduction/make
+                               {:components [{:id :sum :accumulator 'acc :neutral init
+                                              :dtype type :result 'sum}]
+                                :index 'i :step (reduction/->ReductionRegion [] [step] {})})]
+                  (is (nil? (entry/call-with-definition-inputs
+                             #(scalar/check-reduction-fp-correspondence
+                               source product {:source-ns scope :array-types {}
+                                               :scalar-facts {'a {:carrier carrier :presence :present}
+                                                              'b {:carrier carrier :presence :present}}})))))))))
+        (finally (remove-ns (ns-name scope)))))))
+
+(deftest canonical-operation-does-not-follow-a-nominal-multiply-name
+  (doseq [body ['(clojure.core// x y)
+                '(clojure.core/* y x)
+                '(clojure.core/* x x)
+                '(clojure.core/+ (clojure.core/* x y) 1.0)
+                '(clojure.core/double (clojure.core/float (clojure.core/* x y)))]]
+    (let [{:keys [scope] :as fixture} (fixture! "raster.noncanonical-body." body)]
+      (try
+        (with-selected-fixture fixture #(is (nil? (canonical-operation %))))
+        (finally (remove-ns (ns-name scope)))))))
+
+(deftest selected-float-width-cannot-be-overridden-by-a-double-result-stamp
+  (let [{:keys [scope] :as fixture}
+        (fixture! "raster.selected-width." '(clojure.core/float (clojure.core/* x y)) 'Float)]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (let [float-call (with-meta call (assoc (meta call) :tag 'float))
+                lowered (entry/call-with-definition-inputs
+                         #(let [builder (scalar/make-lowerer
+                                         {:scalar-types {'a :float 'b :float}
+                                          :lower-index (fn [expression _] expression)
+                                          :decline! (fn [rule message data]
+                                                      (throw (ex-info message (assoc data :rule rule))))})]
+                            ((:lower builder) float-call :float {})))]
+            (is (= :float (:type lowered)))
+            (is (= :float (get-in (last (:operations lowered)) [:expression :result-type]))))
+          (let [stamped-call (with-meta call (assoc (meta call) :tag 'double))]
+            (is (= Float/TYPE (:payload-carrier (canonical-operation stamped-call))))
+            (is (= :selected-scalar-source-width
+                   (entry/call-with-definition-inputs
+                    #(try
+                       (let [builder (scalar/make-lowerer
+                                      {:scalar-types {'a :float 'b :float}
+                                       :lower-index (fn [expression _] expression)
+                                       :decline! (fn [rule message data]
+                                                   (throw (ex-info message (assoc data :rule rule))))})]
+                         ((:lower builder) stamped-call :double {})
+                         nil)
+                       (catch clojure.lang.ExceptionInfo error
+                         (or (:rule (ex-data error)) (ex-data error))))))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest selected-source-host-call-does-not-redispatch-its-nominal-operation
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.selected-host-source." '(clojure.core// x y))]
+    (try
+      (let [call (fixture-call fixture)]
+          (core/ensure-bytecode-implementation! receiver)
+          (is (= 2.0 (clojure.lang.Reflector/invokeInstanceMethod
+                       @receiver "invk" (object-array [4.0 2.0]))))
+          (is (= :typed-scalar-owned-source-required
+                 (try (typed-scalar/evaluate-expression scope {'a 4.0 'b 2.0} call)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+          (is (= :typed-scalar-owned-source-required
+                 (try (typed-scalar/evaluate-expression scope {} call)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+              "do not begin argument evaluation before refusing a missing source context")
+          (entry/call-with-definition-inputs
+           (fn []
+             (let [projection (entry/selected-parameter-carriers
+                               (symbol (str (ns-name scope)) "*") (second call) 2)
+                   method (:invocation-method projection)
+                   policy (:raster.core/source-policy (meta (:source fixture)))
+                   _ (is (instance? java.lang.reflect.Method method)
+                         (pr-str {:missing-selected-host-method (nil? method)
+                                  :projection-present (some? projection)
+                                  :source-policy policy}))
+                   collector entry/*emission-inputs*
+                   execute (source-owner/compile-function
+                            '[a b] call (fn [parameters body] (list 'fn* parameters body))
+                            {:source-policy policy :source-ns scope :captures []
+                             :reference-bindings {} :methods [method]
+                             :guard #(entry/assert-definition-inputs-current! @collector)})
+                   observations @collector
+                   evaluate-source (fn [expression environment]
+                                     (assert (identical? call expression))
+                                     (entry/assert-definition-inputs-current! observations)
+                                     (let [result (execute (get environment 'a) (get environment 'b))]
+                                       (entry/assert-definition-inputs-current! observations)
+                                       result))
+                   region (soac/lambda-form '[a b] [call])]
+               (doseq [[a b] [[4.0 2.0] [-9.0 3.0] [0.0 2.0]]]
+                 (let [expected (clojure.lang.Reflector/invokeInstanceMethod
+                                 @receiver "invk" (object-array [a b]))]
+                   (is (= expected (typed-scalar/evaluate-expression
+                                    scope {'a a 'b b} call evaluate-source)))
+                   (is (= [{:type :double :value expected}]
+                          (typed-scalar/evaluate-region
+                           scope region [{:type :double :value a} {:type :double :value b}]
+                           [:double] evaluate-source)))))
+               (is (thrown? NullPointerException
+                            (typed-scalar/evaluate-expression
+                             scope {'a nil 'b 2.0} call evaluate-source)))
+               (let [ordered (with-meta
+                               (list '.invk (second call) '(clojure.core/double a)
+                                     '(clojure.core// 1 0))
+                               (meta call))
+                     execute-ordered (source-owner/compile-function
+                                      '[a] ordered (fn [parameters body] (list 'fn* parameters body))
+                                      {:source-policy policy :source-ns scope :captures []
+                                       :reference-bindings {} :methods [method]
+                                       :guard #(entry/assert-definition-inputs-current! @collector)})
+                     ordered-observations @collector
+                     evaluate-ordered (fn [expression environment]
+                                        (assert (identical? ordered expression))
+                                        (entry/assert-definition-inputs-current! ordered-observations)
+                                        (try (execute-ordered (get environment 'a))
+                                             (finally
+                                               (entry/assert-definition-inputs-current!
+                                                ordered-observations))))]
+                 (is (thrown? NullPointerException
+                              (typed-scalar/evaluate-expression
+                               scope {'a nil} ordered evaluate-ordered)))
+                 (is (thrown? ArithmeticException
+                              (typed-scalar/evaluate-expression
+                               scope {'a 1.0} ordered evaluate-ordered))))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest scalar-lowering-refuses-an-actually-selected-noncanonical-implementation
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.selected-source-guard." '(clojure.core// x y))]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (is (some? (entry/call-with-definition-inputs
+                      #(entry/selected-parameter-carriers 'raster.numeric/* (second call) 2))))
+          (is (= :selected-scalar-source-correspondence
+                 (entry/call-with-definition-inputs
+                  #(try
+                     (let [builder (scalar/make-lowerer
+                                    {:scalar-types {'a :double 'b :double}
+                                     :lower-index (fn [expression _] expression)
+                                     :decline! (fn [rule message data]
+                                                 (throw (ex-info message (assoc data :rule rule))))})]
+                       ((:lower builder) call :double {})
+                       nil)
+                     (catch clojure.lang.ExceptionInfo error
+                       (or (:rule (ex-data error)) (ex-data error)))))))))
+      ;; Only after the cold-source refusal: establish the actual implementation
+      ;; oracle independently, without changing the retained alias table mid-query.
+      (core/ensure-bytecode-implementation! receiver)
+      (is (= 2.0 (clojure.lang.Reflector/invokeInstanceMethod
+                   @receiver "invk" (object-array [4.0 2.0]))))
+      (finally (remove-ns (ns-name scope))))))

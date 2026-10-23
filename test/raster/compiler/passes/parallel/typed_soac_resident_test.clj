@@ -616,6 +616,32 @@
         (is (zero? (:resident-uniform-input-closures stats)) (name label))
         (is (= candidate result) (name label))))))
 
+(deftest scalar-closure-phase-facts-are-bookkeeping-not-placement-authority
+  (let [program (uniform-clock-program)
+        facts (dialect/facts program)
+        info (some (fn [equation]
+                     (let [info (fusion/equation-info equation)]
+                       (when (some #{'step} (:results info)) info)))
+                   (dialect/equations program))]
+    ;; Isolate bookkeeping from the fixture's arithmetic completion obligation.
+    ;; An identity of the already typed capture is independently total.
+    (let [identity-info (assoc info :body-results [(first (:parameters info))])]
+      (doseq [root? [false true]
+              attributes [{} {:source-prefix? true} {:before-parallel? false}
+                          {:source-prefix? true :before-parallel? true}
+                          {:source-prefix? false :before-parallel? false}]]
+        (is (#'resident/pristine-scalar-equation?
+             (assoc-in facts [:equations (:id info) :attributes] attributes) identity-info root?)
+            (str "boolean phase bookkeeping is not placement authority: " attributes)))
+      (doseq [root? [false true]
+            attributes [{:source-prefix? nil} {:before-parallel? 1}
+                        {:source-prefix? :true} {:before-parallel? nil}
+                        {:source-prefix? true :before-parallel? false :unknown true}
+                        {:source-prefix? true :required-evaluation {:ordering :source}}]]
+      (is (not (#'resident/pristine-scalar-equation?
+                (assoc-in facts [:equations (:id info) :attributes] attributes) identity-info root?))
+          (str "malformed or non-bookkeeping facts must refuse: " attributes))))))
+
 (deftest scalar-closure-requires-canonical-pristine-scalar-facts
   (let [program (uniform-clock-program)
         facts (dialect/facts program)

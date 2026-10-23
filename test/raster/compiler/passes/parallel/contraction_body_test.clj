@@ -205,6 +205,31 @@
     (is (= :double (:actual failure)))
     (is (= :segmap (:strategy failure)))))
 
+(deftest checked-map-epilogues-refuse-before-legacy-emission
+  (doseq [[expression output-dtype]
+          [['(clojure.core/double (clojure.core/float acc)) :double]
+           ['(clojure.core/float (clojure.core/+ acc 3.0)) :float]]]
+    (let [verified (facts/from-components
+                    {:out 'C :free-axes '[[i 2] [j 5]] :contract-axes []
+                     :body '(clojure.core/+ (clojure.core/aget A i) (clojure.core/aget A j))
+                     :dtype :double
+                     :opts {:out-dtype output-dtype
+                            :epilogue {:acc 'acc :expr expression :dtype output-dtype
+                                       :operands [] :scalars []}}})
+          legacy-calls (atom 0)
+          failure (with-redefs [emit/generate-segmap-nd-kernel
+                               (fn [& _]
+                                 (swap! legacy-calls inc)
+                                 (throw (AssertionError. "checked conversion reached legacy emitter")))]
+                    (try
+                      (route/route-contraction nil :facts verified :dtype :double)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error (ex-data error))))]
+      (is (= :contraction-checked-conversion-observation-required (:reason failure)))
+      (is (= :checked-floating-conversion (get-in failure [:schedule-decline :reason])))
+      (is (= :none (:fallback failure)))
+      (is (zero? @legacy-calls)))))
+
 (deftest zero-contract-closed-result-transform-uses-completed-element
   (let [transform {:acc 'acc :expr '(clojure.core/+ acc 3.0)
                    :dtype :double :operands [] :scalars []}
@@ -225,7 +250,7 @@
     (is (identical? kernel (body/validate! kernel)))
     (is (= 2 (count (filter #(= 'A (:buffer %)) (:operations kernel)))))
     (is (= 1 (count (filter #(= 'C (:buffer %)) (:operations kernel)))))
-    (let [converted (assoc transform :expr '(clojure.core/double (clojure.core/float acc)))
+    (let [converted (assoc transform :expr '(clojure.core/double (clojure.core/unchecked-float acc)))
           converted-facts (facts/from-components
                            (assoc (select-keys verified
                                                [:out :free-axes :contract-axes :body :dtype])

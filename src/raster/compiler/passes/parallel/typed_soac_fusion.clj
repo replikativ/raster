@@ -309,6 +309,7 @@
   [program equation-id]
   (let [facts (get-in (dialect/facts program) [:equations equation-id])]
     (and (empty? (:effects facts))
+         (nil? (dialect/required-evaluation program equation-id))
          ;; Alias-aware fusion can be added once legality is proved. Until then, equation results
          ;; are treated as fresh SSA values and any explicit alias contract declines fusion.
          (empty? (:aliases facts)))))
@@ -358,7 +359,8 @@
         facts (dialect/facts program)]
     (every? (fn [equation]
               (let [equation-facts (get-in facts [:equations (second equation)])]
-                (and (empty? (:effects equation-facts))
+                (and (nil? (dialect/required-evaluation program (second equation)))
+                     (empty? (:effects equation-facts))
                      (empty? (:aliases equation-facts)))))
             (subvec equations (inc left-index) right-index))))
 
@@ -378,7 +380,9 @@
    fusion across them."
   [program left right]
   (let [facts (dialect/facts program)
-        barriers (set (get-in facts [:attributes :host-binding-ids]))]
+        barriers (into (set (get-in facts [:attributes :host-binding-ids]))
+                       (map :source-binding-id)
+                       (vals (get-in facts [:attributes :required-evaluations])))]
     (if (empty? barriers)
       true
       (let [positions (set/union (equation-source-binding-ids facts (:id left))
@@ -641,8 +645,9 @@
                                                          (first (:results consumer))))))
            :when (fusible-equation? program (:id producer))
            :when (fusible-equation? program (:id consumer))
-           ;; A direct Float/Double conversion cannot trap or observe memory. It can move
-           ;; across pure SSA equations, but never across a physical effect/alias boundary.
+           ;; Only conversions which pass the independent fusibility/completion
+           ;; gates above may move across pure SSA equations, never a physical
+           ;; effect/alias boundary. A source Double-to-Float cast can trap.
            ;; Nontrivial scalar epilogues retain the existing adjacent-only policy.
            :when (or (= consumer-index (inc producer-index))
                      (and (scalar-region/completed-floating-conversion?
@@ -1611,9 +1616,9 @@
    fan-out materialized when no target performance description can justify recomputation."
   ([program]
    (fusion-fixpoint program nil))
-  ([program abstract-machine]
-   (dialect/validate! program)
-   (loop [program program
+  ([producer abstract-machine]
+   (dialect/validate! producer)
+   (loop [program producer
           vertical 0
           horizontal 0
           iterations 0
@@ -1645,6 +1650,7 @@
                        stats {:vertical vertical
                               :horizontal horizontal
                               :iterations (inc iterations)}]
-                   [program (cond-> stats
+                   [(dialect/assert-required-evaluations-preserved! producer program)
+                    (cond-> stats
                               (seq ordered-placements)
                               (assoc :placements ordered-placements))]))))))))))

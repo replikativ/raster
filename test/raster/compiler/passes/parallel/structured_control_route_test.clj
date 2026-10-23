@@ -7,6 +7,7 @@
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.mixed-storage :as mixed-storage]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.dialects :as dialects]
@@ -40,6 +41,34 @@
             [raster.numeric :as numeric]
             [raster.nn :as nn]
             [raster.ode.pde :as pde]))
+
+(deftest scalar-reduction-domain-retains-one-host-shape-executor
+  (let [compilation (equation-first/compile #'mixed-storage/double-reduction-float-result
+                                           (merge mixed-storage/policy {:target :ocl:0 :dtype :double}))
+        semantic (:semantic compilation)
+        plan (get-in semantic [:attributes :invocation-plan])
+        equation (first (:equations semantic))
+        result (first (:results equation))
+        step (first (:steps plan))
+        public (mapv :symbol (:parameters plan))
+        prefix #(#'route/invocation-prefix % public (:values %))]
+    (is (true? (get-in equation [:attributes :host-only])))
+    (is (true? (get-in equation [:attributes :graph-shape-definition])))
+    (is (empty? (:operations equation)))
+    (is (= [] (get-in semantic [:values (first (:outputs semantic)) :shape])))
+    (is (= 1 (count (:steps plan))))
+    (is (invocation/shape-projection? step))
+    (is (= result (:symbol step)))
+    (is (= :long (get-in step [:value :dtype])))
+    (is (= (:id step) (:invocation-step (first (invocation/source-order plan semantic)))))
+    (is (= plan (invocation/validate-against! plan semantic)))
+    (is (= [result] (mapv first (prefix semantic))))
+    (doseq [attributes [{:host-only false :graph-shape-definition true}
+                        {:host-only :yes :graph-shape-definition true}
+                        {:host-only true :graph-shape-definition false}
+                        {:host-only true :graph-shape-definition :yes}]]
+      (is (empty? (prefix (update-in semantic [:equations 0 :attributes] merge attributes)))
+          "only the earlier planner's exact host-only graph-shape grant adds this root"))))
 
 (deftest diagnostic-pipeline-reports-an-emitted-structured-program
   (let [diagnostic (pipeline/show-pipeline
@@ -883,12 +912,36 @@
                                                 {:scalar-types (:scalar-types options)}))
         promoted (route/promote-program parallel options)
         shape-equation (first (:equations promoted))
-        prefix-symbols (mapv :symbol (get-in promoted [:attributes :invocation-plan :steps]))]
+        plan (get-in promoted [:attributes :invocation-plan])
+        prefix-symbols (mapv :symbol (:steps plan))
+        shared (first (invocation/source-order plan promoted))]
     (is (= '[size] (:results shape-equation)))
     (is (true? (get-in shape-equation [:attributes :graph-shape-definition])))
     (is (true? (get-in shape-equation [:attributes :host-only])))
+    (is (empty? (:operations shape-equation)))
+    (is (identical? (:algorithm (first (:equations parallel))) (:algorithm shape-equation)))
+    (is (identical? (:source (first (:equations parallel))) (:source shape-equation)))
+    (is (= (get-in parallel [:equations 0 :attributes :required-evaluation])
+           (get-in shape-equation [:attributes :required-evaluation])))
+    (is (= (:id shape-equation) (:equation shared)))
+    (is (= 1 (count (filter #(= 'size (:symbol %)) (:steps plan)))))
+    (is (= (:id (first (:steps plan))) (:invocation-step shared)))
     (is (some #{'size} prefix-symbols)
-        "the same pure size is materialized before allocation and retained as graph proof")))
+        "the checked size is materialized before allocation and retained as graph proof")
+    (let [calls (atom [])
+          evaluate (fn [step operands]
+                     (swap! calls conj (:symbol step))
+                     (typed-scalar/evaluate-invocation-step *ns* step operands))]
+      (materialization/materialize plan [(float-array 1) 1 1] evaluate)
+      (is (= '[size] @calls))
+      (reset! calls [])
+      (is (thrown? ArithmeticException
+                   (materialization/materialize plan [(float-array 1) Long/MAX_VALUE 2] evaluate)))
+      (is (= '[size] @calls) "overflow precedes allocation and has one evaluator"))
+    (doseq [changed [(assoc-in plan [:steps 0 :region]
+                              '(lambda [nrows width] (region [] [(clojure.core/* nrows width 2)])))
+                     (assoc-in plan [:steps 0 :symbol] 'foreign-size)]]
+      (is (thrown? clojure.lang.ExceptionInfo (invocation/source-order changed promoted))))))
 
 (defn- retained-length-leaves [source]
   (walk/postwalk
@@ -1008,6 +1061,24 @@
    (#'route/validate-source-result!
     (with-source-return parallel expression)
     (merge {:source-ns *ns* :public-parameters '[x n]} options))))
+
+(deftest terminal-extraction-refuses-ambiguous-source-site-claims
+  (let [parallel (scalar-reduction-program :double)
+        equation (first (:equations parallel))
+        duplicate (assoc equation :id :duplicate-site :results ['duplicate-result])
+        ambiguous (update parallel :equations conj duplicate)]
+    (is (= :structured-control-terminal-source-site
+           (reason-of #(#'route/terminal-source-program ambiguous))))))
+
+(deftest terminal-extraction-retains-shape-dependencies-outside-equation-operands
+  (let [parallel (scalar-reduction-program :double)
+        source (:source parallel)
+        shaped (-> parallel
+                   (assoc :source (list (first source)
+                                        (conj (second source) 'extent '(long n))
+                                        '(float extent)))
+                   (assoc-in [:values 'x :shape] ['extent]))]
+    (is (= shaped (#'route/terminal-source-program shaped)))))
 
 (deftest scalar-return-projection-requires-proved-identity-casts
   (testing "canonical Double, Float, and Long identities preserve the exact logical output"
@@ -1345,13 +1416,61 @@
                  :array-types {'out :double} :scalar-types {'n :long}}
         parallel (:program (typed-route/attempt source :double {'out :double}
                                                 {:scalar-types (:scalar-types options)}))
-        promoted (route/promote-program parallel options)]
+        promoted (route/promote-program parallel options)
+        equation (first (:equations promoted))
+        plan (get-in promoted [:attributes :invocation-plan])
+        checked-steps (filter #(= 'checked (:symbol %)) (:steps plan))]
     (is (= '[scalar map]
            (mapv #(soac/operation-kind (first (soac/equations (:algorithm %))))
                  (:equations promoted))))
-    (is (not-any? #(= 'checked (:symbol %))
-                  (get-in promoted [:attributes :invocation-plan :steps]))
-        "the checked equation remains in program order instead of becoming a prunable prefix")))
+    (is (true? (get-in equation [:attributes :host-only])))
+    (is (not (get-in equation [:attributes :graph-shape-definition]))
+        "an unused required evaluation is not a shape proof")
+    (is (empty? (:operations equation)))
+    (is (= 1 (count checked-steps)))
+    (is (invocation/scalar-compute? (first checked-steps)))
+    (is (= (:id (first checked-steps))
+           (:invocation-step (first (invocation/source-order plan promoted)))))
+    (let [calls (atom [])
+          evaluate (fn [step operands]
+                     (swap! calls conj (:symbol step))
+                     {:type (get-in step [:value :dtype])
+                      :value (int (:value (get operands 'n)))})]
+      (materialization/materialize plan [(double-array 1) 1] evaluate)
+      (is (= '[checked] @calls))
+      (reset! calls [])
+      (is (thrown? ArithmeticException
+                   (materialization/materialize plan [(double-array 1) 2147483648] evaluate)))
+      (is (= '[checked] @calls)
+          "an unused checked conversion still traps, and has exactly one evaluator"))
+    (doseq [obligation [nil
+                        {:source-binding-id 0 :flags #{} :ordering :source}
+                        {:source-binding-id 1 :flags #{:checked-source-cast} :ordering :source}]]
+      (is (some? (reason-of #(route/promote-program
+                             (assoc-in parallel [:equations 0 :attributes :required-evaluation]
+                                       obligation) options)))
+          "missing or corrupted obligations cannot grant host execution"))
+    (let [without-obligation
+          (-> parallel
+              (update-in [:equations 0 :attributes] dissoc :required-evaluation)
+              (update-in [:equations 0 :algorithm]
+                         (fn [algorithm]
+                           (soac/make
+                            (-> (soac/facts algorithm)
+                                (update-in [:attributes :required-evaluations] dissoc 0)
+                                (update-in [:equations 0 :attributes] dissoc :required-evaluation))
+                            (soac/equations algorithm) (soac/outputs algorithm)))))]
+      (is (= :structured-control-required-evaluation
+             (reason-of #(route/promote-program without-obligation options)))
+          "deleting both matching catalogs does not erase a source evaluation obligation"))
+    (is (= :structured-control-required-evaluation
+           (reason-of #(route/promote-program
+                        (assoc parallel :source
+                               '(let* [checked (clojure.core/int 1)
+                                       effect (raster.par/map-void! i n
+                                                (clojure.core/aset out i 1.0))] effect))
+                        options)))
+        "a changed source cannot reuse the old evaluation root")))
 
 (deftest checked-source-prefix-shapes-are-materialized-once-before-launch
   (let [source '(let* [checked (clojure.core/int n)
@@ -1364,21 +1483,29 @@
         promoted (route/promote-program parallel options)
         plan (get-in promoted [:attributes :invocation-plan])
         prefix-steps (:steps plan)
-        checked-step (first (filter #(= 'checked (:symbol %)) prefix-steps))]
-    (is (= '[map]
+        checked-step (first (filter #(= 'checked (:symbol %)) prefix-steps))
+        proof-equation (first (:equations promoted))
+        shared (first (filter #(= 'checked (:binding %)) (invocation/source-order plan promoted)))]
+    (is (= '[scalar map]
            (mapv #(soac/operation-kind (first (soac/equations (:algorithm %))))
                  (:equations promoted))))
     (is (invocation/scalar-compute? checked-step))
     (is (= 1 (count (filter #(= 'checked (:symbol %)) prefix-steps))))
-    (is (some #{'checked} (:inputs promoted))
-        "the attested invocation result is the map's explicit typed scalar input")
+    (is (not (some #{'checked} (:inputs promoted))))
+    (is (true? (get-in proof-equation [:attributes :host-only])))
+    (is (true? (get-in proof-equation [:attributes :graph-shape-definition])))
+    (is (empty? (:operations proof-equation)))
+    (is (identical? (:algorithm (first (:equations parallel))) (:algorithm proof-equation)))
+    (is (= (:id checked-step) (:invocation-step shared)))
+    (is (= (:id proof-equation) (:equation shared))
+        "the one source binding owns both its evaluator and nonexecuting proof term")
     (let [evaluations (atom 0)
           evaluator (fn [step _]
                       (swap! evaluations inc)
                       {:type (get-in step [:value :dtype]) :value 1})]
       (materialization/materialize plan [(double-array 1) 1] evaluator)
       (is (= 1 @evaluations)
-          "the checked shape is owned by one invocation ScalarCompute, not a host equation too"))
+          "the checked shape has one ScalarCompute evaluator; its host equation has no operations"))
     (let [out (double-array [0.0])
           evaluations (atom 0)
           checked-int (fn [step operands]
@@ -1390,7 +1517,7 @@
       (is (= 1 @evaluations))
       (is (= [0.0] (vec out))
           "the invalid extent traps during invocation, before any device write")))
-  (testing "a prior exceptional scalar remains an ordering barrier"
+  (testing "required prefix scalars execute once, in order, even when the first is unused"
     (let [source '(let* [first-check (clojure.core/int limit)
                          checked (clojure.core/int n)
                          result (raster.par/map! out i checked double 1.0)]
@@ -1399,9 +1526,54 @@
                    :array-types {'out :double}
                    :scalar-types {'limit :long 'n :long}}
           parallel (:program (typed-route/attempt source :double {'out :double}
-                                                  {:scalar-types (:scalar-types options)}))]
-      (is (= :structured-control-invocation-prefix
-             (reason-of #(route/promote-program parallel options))))))
+                                                  {:scalar-types (:scalar-types options)}))
+          promoted (route/promote-program parallel options)
+          plan (get-in promoted [:attributes :invocation-plan])
+          calls (atom [])
+          evaluate (fn [step operands]
+                     (swap! calls conj (:symbol step))
+                     {:type (get-in step [:value :dtype])
+                      :value (int (:value (get operands
+                                              (if (= 'first-check (:symbol step)) 'limit 'n))))})]
+      (is (= '[first-check checked] (mapv :symbol (:steps plan))))
+      (is (true? (get-in promoted [:equations 0 :attributes :host-only])))
+      (materialization/materialize plan [(double-array 1) 1 1] evaluate)
+      (is (= '[first-check checked] @calls))
+      (reset! calls [])
+      (is (thrown? ArithmeticException
+                   (materialization/materialize plan [(double-array 1) 2147483648 1] evaluate)))
+      (is (= '[first-check] @calls)
+          "the first failure prevents evaluation of the later checked shape")
+      (reset! calls [])
+      (is (thrown? ArithmeticException
+                   (materialization/materialize plan [(double-array 1) 1 2147483648] evaluate)))
+      (is (= '[first-check checked] @calls))))
+  (testing "a required checked shape cannot move ahead of preceding device work"
+    (let [source '(let* [first-map (raster.par/map! out i n double 1.0)
+                         checked (clojure.core/int n)
+                         result (raster.par/map! scratch i checked double
+                                                (clojure.core/aget out i))] result)
+          options {:dtype :double :public-parameters '[out scratch n]
+                   :array-types {'out :double 'scratch :double}
+                   :scalar-types {'n :long}}
+          attempted (typed-route/attempt source :double (:array-types options)
+                                         {:scalar-types (:scalar-types options)})]
+      (is (nil? (:program attempted)))
+      (is (= :typed-soac-source-coverage (get-in attempted [:declined :reason])))
+      (is (= :uncertified-host-scalar (get-in attempted [:declined :bindings 0 :reason])))
+      (is (= 'checked (get-in attempted [:declined :bindings 0 :binding])))
+      (let [attempted (typed-route/attempt source :double (:array-types options) options)
+            promoted (route/promote-program (:program attempted) options)
+            plan (get-in promoted [:attributes :invocation-plan])
+            order (invocation/source-order plan promoted)]
+        (is (= '[first-map checked result] (vec (keep :binding order))))
+        (is (some? (:equation (first order))))
+        (is (= (:id (first (:steps plan))) (:invocation-step (second order))))
+        (is (= '[checked] (mapv :symbol (:steps plan))))
+        (is (not-any? #(and (= [:binding 'checked] (:site %))
+                           (true? (get-in % [:attributes :host-only])))
+                      (:equations promoted))
+            "public host inputs retain their late source position, not a pre-device equation"))))
   (testing "an omitted host effect ends the authoritative source prefix"
     (let [source '(let* [host-write (clojure.core/aset scratch 0 2.0)
                          checked (clojure.core/int n)

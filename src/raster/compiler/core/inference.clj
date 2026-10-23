@@ -22,6 +22,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]))
 
 (def ^:private tc-check-form-info-fn
@@ -960,6 +961,29 @@ stable physical-leaf order on every backend."}
   [fn-sym arg-tags]
   (:signature (registered-call-selection fn-sym arg-tags)))
 
+(defn- resolve-call-signature
+  [fn-sym table arg-tags]
+  (let [specialize! (fn []
+                      (when (try-parametric-specialize! fn-sym arg-tags)
+                        (resolve-method-entry (get-dispatch-table fn-sym) arg-tags)))
+        direct (resolve-method-entry table arg-tags)
+        result (cond
+                 (and direct (parametric-fallback-entry? (:entry direct) arg-tags))
+                 (or (specialize!) direct)
+                 direct direct
+                 :else (specialize!))]
+    (method-signature fn-sym result)))
+
+(defn specialize-call-signature
+  "Use ordinary compiler dispatch for an already-inferred complete tag tuple.
+   Shares try-resolve-call's parametric/concrete priority without fabricating
+   argument forms. May instantiate a parametric specialization, never invokes
+   the function. Selection is not formal-completion or execution evidence."
+  [fn-sym arg-tags]
+  (when (and (vector? arg-tags) (every? some? arg-tags))
+    (when-let [table (get-dispatch-table fn-sym)]
+      (resolve-call-signature fn-sym table arg-tags))))
+
 (defn try-resolve-call
   "Try to resolve a deftm call to a direct mangled call.
   type-env: {sym → {:tag, :fn-info, :element}}
@@ -988,22 +1012,8 @@ stable physical-leaf order on every backend."}
                                 (when (and (seq? form) (contains? types/primitive-info (first form)))
                                   (first form))
                                 extra))
-                          arg-forms (or extra-tags (repeat nil)))
-           specialize! (fn []
-                         (when (try-parametric-specialize! fn-sym arg-tags)
-                           ;; Re-read table after specialization added the entry
-                           (resolve-method-entry (get-dispatch-table fn-sym) arg-tags)))
-           direct (resolve-method-entry table arg-tags)
-           result (cond
-                    ;; A generic parametric fallback matched concrete array args —
-                    ;; specialize to the concrete element type and prefer it.
-                    (and direct (parametric-fallback-entry? (:entry direct) arg-tags))
-                    (or (specialize!) direct)
-                    ;; Concrete/promoted match — use it directly.
-                    direct direct
-                    ;; No entry at all — try parametric specialization.
-                    :else (specialize!))]
-       (method-signature fn-sym result)))))
+                          arg-forms (or extra-tags (repeat nil)))]
+       (resolve-call-signature fn-sym table arg-tags)))))
 
 ;; ================================================================
 ;; aget/rewritten-tag inference
@@ -1248,6 +1258,13 @@ stable physical-leaf order on every backend."}
      (let [head (first rewritten-form)]
        (or
         (cond
+          (and (completion/canonical-form? rewritten-form)
+               (= completion/object-input-contract
+                  (:contract (completion/canonical-parts rewritten-form))))
+          (let [operand (:operand (completion/canonical-parts rewritten-form))]
+            (or (infer-expr-tag operand type-env *ns*)
+                (infer-rewritten-tag operand nil type-env)))
+
            ;; Primitive cast — (double x), (long x), etc.
           (and (not (contains? type-env head))
                (or (descriptor/cast-result-tag head)
@@ -1826,9 +1843,39 @@ stable physical-leaf order on every backend."}
 
 (defn qualify-body-symbols
   "Qualify unqualified symbols in a walked body to their source namespace.
-	Skips: params, special forms, Java classes, already-qualified symbols."
-  [body source-ns param-set]
-  (let [;; Symbols that should not be namespace-qualified: form heads,
+   Lexical scopes come from form/scope-info; quoted data is opaque. Structural
+   classes use class-only qualification, independently of lexical binders.
+   An optional observer receives the actual resolution decisions; it is not a
+   source correspondence or permission to execute the transformed body. A separate
+   optional construction observer receives actual [original constructed bound]
+   returns, without conflating those origins with resolution or equivalence."
+  ([body source-ns param-set] (qualify-body-symbols body source-ns param-set nil))
+  ([body source-ns param-set observe!]
+   (qualify-body-symbols body source-ns param-set observe! nil))
+  ([body source-ns param-set observe! construct!]
+  (let [resolve! (fn [symbol]
+                   (let [result (try (ns-resolve source-ns symbol) (catch Exception _ nil))]
+                     (when observe! (observe! {:kind :symbol-resolution :source-ns source-ns
+                                              :symbol symbol :result result}))
+                     result))
+        namespace! (fn [symbol]
+                     (let [result (find-ns symbol)]
+                       (when observe! (observe! {:kind :namespace-resolution :source-ns source-ns
+                                                :symbol symbol :result result}))
+                       result))
+        alias! (fn [symbol]
+                 (let [result (get (ns-aliases source-ns) symbol)]
+                   (when observe! (observe! {:kind :alias-resolution :source-ns source-ns
+                                            :symbol symbol :result result}))
+                   result))
+        class-symbol (fn [value]
+                       (if (symbol? value)
+                         (let [resolved (resolve! value)]
+                           (if (class? resolved)
+                             (with-meta (symbol (.getName ^Class resolved)) (meta value))
+                             value))
+                         value))
+        ;; Symbols that should not be namespace-qualified: form heads,
         ;; cast/alloc/array ops, and special literals. Uses centralized
         ;; registries so adding a new form/op automatically excludes it.
         non-qualifiable?
@@ -1840,9 +1887,11 @@ stable physical-leaf order on every backend."}
               (descriptor/aset-op? sym)
               (= 'alength sym)))
         qualify (fn qualify [expr bound]
-                  (cond
+                  (let [original expr
+                        constructed
+                   (cond
                     (symbol? expr)
-                    (cond
+                    (with-meta (cond
                       (or (contains? param-set expr)
                           (contains? bound expr)
                           (non-qualifiable? expr))
@@ -1851,7 +1900,7 @@ stable physical-leaf order on every backend."}
                            (let [name-str (name expr)]
                              (and (seq name-str)
                                   (Character/isUpperCase ^char (first name-str)))))
-                      (let [resolved (try (ns-resolve source-ns expr) (catch Exception _ nil))]
+                      (let [resolved (resolve! expr)]
                         (cond
                           (var? resolved)
                           (symbol (str (.name (.ns ^clojure.lang.Var resolved)))
@@ -1862,23 +1911,11 @@ stable physical-leaf order on every backend."}
                           (class? resolved)
                           (symbol (.getName ^Class resolved))
                           :else expr))
-                      (and (namespace expr)
-                           (try (the-ns (symbol (namespace expr))) true
-                                (catch Exception _ false)))
-                      expr
-                      ;; Java static-call head `Class/method` where the namespace
-                      ;; part is a simple (imported) class name, not a loaded ns:
-                      ;; qualify Class to its FQN so the backend resolves it with no
-                      ;; ns context (e.g. MemorySegment/ofArray ->
-                      ;; java.lang.foreign.MemorySegment/ofArray when inlined out of
-                      ;; the ns that imported it).
-                      (and (namespace expr)
-                           (class? (try (ns-resolve source-ns (symbol (namespace expr)))
-                                        (catch Exception _ nil))))
-                      (symbol (.getName ^Class (ns-resolve source-ns (symbol (namespace expr))))
-                              (name expr))
                       :else
-                      (if-let [v (try (ns-resolve source-ns expr) (catch Exception _ nil))]
+                      ;; Resolve in the ORIGINAL namespace before interpreting a
+                      ;; qualifier as a globally loaded namespace. A local alias
+                      ;; of that spelling may designate a different namespace.
+                      (if-let [v (resolve! expr)]
                         (cond
                           ;; var: qualify to ns/sym
                           (var? v) (symbol (str (.name (.ns ^clojure.lang.Var v)))
@@ -1887,45 +1924,56 @@ stable physical-leaf order on every backend."}
                           ;; -> (new X a), exposing X): qualify to its FQN
                           (class? v) (symbol (.getName ^Class v))
                           :else expr)
-                        expr))
+                        (if (namespace expr)
+                          (let [qualifier (symbol (namespace expr))]
+                            (if-let [alias (alias! qualifier)]
+                              ;; An unresolved member must remain unresolved in
+                              ;; its original alias target, never fall through to
+                              ;; a same-spelled global namespace or Class.
+                              (symbol (str (ns-name alias)) (name expr))
+                              (if (namespace! qualifier)
+                                expr
+                                (let [owner (resolve! qualifier)]
+                                  (if (class? owner)
+                                    (symbol (.getName ^Class owner) (name expr))
+                                    expr)))))
+                          expr))) (meta expr))
+                    (and (seq? expr) (contains? #{'quote 'clojure.core/quote} (first expr))) expr
+                    (and (seq? expr) (= completion/completion-symbol (first expr)))
+                    (if-let [{:keys [contract operand]} (completion/canonical-parts expr)]
+                      ;; Completion contracts are compiler data, not executable
+                      ;; source. Resolve only the operand in its lexical scope;
+                      ;; never qualify the marker or symbols inside a recipe.
+                      (util/remake-if-changed expr [(first expr) contract (qualify operand bound)])
+                      (throw (ex-info "Malformed reserved value completion during source qualification"
+                                      {:reason :invalid-value-completion :expression expr})))
                     (seq? expr)
-                    (let [h (first expr)]
-                      (case (when (symbol? h) (symbol (name h)))
-                        (let* loop*)
-                        (let [bindings (second expr)
-                              pairs (partition 2 bindings)
-                              new-bindings
-                              (loop [ps (seq pairs) b bound acc []]
-                                (if-not ps
-                                  (vec (mapcat identity acc))
-                                  (let [[sym init] (first ps)
-                                        qinit (qualify init b)
-                                        b' (conj b sym)]
-                                    (recur (next ps) b' (conj acc [sym qinit])))))
-                              new-bound (into bound (map first pairs))
-                              body-forms (drop 2 expr)
-                              qbody (map #(qualify % new-bound) body-forms)]
-                          (with-meta (apply list h new-bindings qbody) (meta expr)))
-                        fn*
-                        (let [arities (rest expr)
-                              qualify-arity
-                              (fn [arity]
-                                (let [params-vec (first arity)
-                                      fn-bound (into bound (filter symbol? params-vec))
-                                      qbody (map #(qualify % fn-bound) (rest arity))]
-                                  (apply list params-vec qbody)))]
-                          (with-meta
-                            (if (vector? (first arities))
-                              (let [params-vec (first arities)
-                                    fn-bound (into bound (filter symbol? params-vec))
-                                    qbody (map #(qualify % fn-bound) (rest arities))]
-                                (apply list h params-vec qbody))
-                              (apply list h (map qualify-arity arities)))
-                            (meta expr)))
+                    (let [expr (form/map-structural-classes class-symbol expr)]
+                      (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expr)]
+                        (let [scope! (fn [{:keys [binders inits body aux] :as scope}]
+                                       (let [[body-bound inits]
+                                             (if sequential?
+                                               (reduce (fn [[bound rewritten] [binder init]]
+                                                         [(cond-> bound (symbol? binder) (conj binder))
+                                                          (conj rewritten (qualify init bound))])
+                                                       [bound []] (map vector binders inits))
+                                               (let [inner (into bound (filter symbol? binders))]
+                                                 [inner (mapv #(qualify % (if rec? inner bound)) inits)]))]
+                                         (cond-> (assoc scope :inits inits :body (mapv #(qualify % body-bound) body))
+                                           aux (assoc :aux (mapv #(qualify % body-bound) aux)))))]
+                          (rebuild (mapv scope! scopes) (mapv #(qualify % bound) outer)))
                         (with-meta (apply list (map #(qualify % bound) expr)) (meta expr))))
-                    (vector? expr) (mapv #(qualify % bound) expr)
-                    :else expr))]
-    (qualify body #{})))
+                    (vector? expr) (with-meta (mapv #(qualify % bound) expr) (meta expr))
+                    (record? expr) (reduce-kv (fn [result key value]
+                                               (assoc result key (qualify value bound))) expr expr)
+                    (map? expr) (with-meta (into (empty expr) (map (fn [[key value]]
+                                                                   [(qualify key bound) (qualify value bound)])) expr)
+                                          (meta expr))
+                    (set? expr) (with-meta (into (empty expr) (map #(qualify % bound)) expr) (meta expr))
+                    :else expr)]
+                    (when construct! (construct! original constructed bound))
+                    constructed))]
+    (qualify body #{}))))
 
 ;; ================================================================
 ;; Late-pipeline type inference (moved from inline.clj to break cycle)
@@ -2029,6 +2077,12 @@ stable physical-leaf order on every backend."}
    Metadata-based inference is the primary mechanism."
   [expr env]
   (cond
+    (and (completion/canonical-form? expr)
+         (= completion/object-input-contract (:contract (completion/canonical-parts expr))))
+    ;; Object completion changes storage/evaluation context, not the logical
+    ;; numerical type. This is not presence or primitive carrier evidence.
+    (infer-arg-tag (:operand (completion/canonical-parts expr)) env)
+
     ;; A present local with unknown type masks outer/retained evidence, exactly as
     ;; the walker masks nil-tag local records. Absence and unknown are not the same.
     (symbol? expr) (if (contains? env expr)

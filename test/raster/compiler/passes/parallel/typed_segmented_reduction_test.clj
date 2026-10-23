@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-facts :as contraction]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.numerical-contract :as numerics]
@@ -63,6 +64,60 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest scalar-fold-projection-reuses-recurrence-proof-without-erasing-checkpoints
+  (let [element '(clojure.core/float (clojure.core/* x y))
+        attributes (fn [body]
+                     {:accumulators '[acc] :identities [(float 0.0)] :dtypes [:float]
+                      :algebra [(scan/certify-reassociation {:acc 'acc :init (float 0.0)
+                                                           :lambda body} :float)]})
+        project (fn [body] (#'projection/scalar-fold-parts (attributes body) body))]
+    (doseq [accumulator ['acc '(clojure.core/float acc)]]
+      (let [parts (project (list 'clojure.core/+ accumulator element))]
+        (is (= 'clojure.core/+ (:combine parts)))
+        (is (= element (:element parts)))))
+    (doseq [accumulator [(with-meta '(clojure.core/float acc)
+                           {:raster.effect/preserve-evaluation true})
+                         (with-meta '(clojure.core/float acc)
+                           {:raster.effect/source-reference-cast true})
+                         (with-meta '(.invk untrusted acc)
+                           {:raster.op/original 'clojure.core/float})]]
+      (is (= :typed-soac-contract-projection
+             (reason #(project (list 'clojure.core/+ accumulator element))))))
+    (is (= :typed-soac-contract-projection
+           (reason #(project (list 'clojure.core/+ element 'acc))))
+        "commutative certification does not authorize reversing this ordered projection")
+    (let [body (list 'clojure.core/+ '(float acc) element)
+          attrs (attributes body)]
+      (is (= :typed-soac-contract-projection
+             (binding [util/*shadowing-locals* #{'float}]
+               (reason #(#'projection/scalar-fold-parts attrs body))))))
+    (let [body (list 'let* ['value element] '(clojure.core/+ acc value))
+          projected (project body)]
+      (is (= (list 'let* ['value element] 'value) (:element projected))
+          "the once-per-element region and its rounding checkpoint remain intact"))))
+
+(deftest validated-segmented-equation-retains-its-cast-wrapped-element
+  (let [source (program)
+        [equation] (dialect/equations source)
+        {:keys [attributes arrays captures lambda]} (dialect/operation-parts equation)
+        {:keys [parameters body-results]} (dialect/lambda-parts lambda)
+        body (first body-results)
+        changed (list (first body) '(clojure.core/float acc)
+                      (list 'clojure.core/float (nth body 2)))
+        attributes (assoc attributes :algebra
+                          [(scan/certify-reassociation {:acc 'acc :init 0.0 :lambda changed} :float)])
+        changed-equation (list '= (second equation) (nth equation 2)
+                               (list 'segmented-reduce attributes arrays captures
+                                     (dialect/lambda-form parameters [] [changed])))
+        checked (dialect/make (dialect/facts source) [changed-equation] (dialect/outputs source))
+        components (projection/segmented-reduce-contract-components checked changed-equation)]
+    (is (= 'clojure.core/float (first (:body components))))
+    (is (= :float (:dtype components)))
+    (is (= 'C (:out components)))
+    (is (= :body-has-unmodeled-terms
+           (:reason (contraction/dense-matrix-view
+                     (contraction/from-components components)))))))
 
 (deftest segmented-projection-and-lowering-use-the-same-validated-policy-scope
   (let [retained numerics/retained-source-arithmetic

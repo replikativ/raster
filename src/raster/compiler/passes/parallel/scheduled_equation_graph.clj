@@ -425,7 +425,7 @@
                                 (nil? (:logical-layout value))
                                 (not (unresolved-capacity? input value elements)))
                        [input [(if (= 0 elements) (launch/product 0) elements)]]))))
-           (:inputs operation))}))
+           (segop/operation-inputs operation))}))
 
 (defn- product-read-requirements
   "Optional minimum capacities from typed product loads, never guessed from loop size alone."
@@ -438,7 +438,7 @@
                         (let [value (get values id)]
                           (and (= {:kind :plain} (:representation value))
                                (nil? (:logical-layout value)))))
-                      (:inputs operation)))
+                      (segop/operation-inputs operation)))
        (let [derived
              (try
                (product-regions/dense-read-requirements
@@ -657,7 +657,7 @@
                                    id (launch/rebind-expression extent derived-scalars)))
                   marked-inputs
                   (set/intersection
-                   (set (:inputs operation))
+                   (segop/operation-inputs operation)
                    (set (mapcat #(get-in (soac/operation-parts %)
                                         [:attributes :attributes :pointwise-storage-inputs])
                                 (filter #(= (second %) (:algorithm-equation operation))
@@ -667,14 +667,14 @@
                          (some (fn [id]
                              (unresolved-capacity? id (get values id)
                                                    (get-in buffer-specs [id :elements])))
-                           (:inputs operation)))
+                           (segop/operation-inputs operation)))
                      (every? (fn [id]
                           (let [value (get values id)]
                             (or (not (unresolved-capacity?
                                       id value (get-in buffer-specs [id :elements])))
                                 (and (= {:kind :plain} (:representation value))
                                      (nil? (:logical-layout value))))))
-                        (:inputs operation)))
+                        (segop/operation-inputs operation)))
               (let [pure-map? (and (segop/seg-map? operation)
                                    (:out-sym operation)
                                    (not (seq (get-in operation [:scalar-region :effects]))))
@@ -690,7 +690,7 @@
                                     (get transform-read-requirements (:algorithm-equation operation)))
                     static-reads (when (and pure-map?
                                             (some #(not (contains? optional-reads %))
-                                                  (:inputs operation)))
+                                                  (segop/operation-inputs operation)))
                                    (map-body/static-read-requirements operation map-read-options))
                     source-requirements (merge-with (fn [left right]
                                           (if (= left right) left (launch/maximum left right)))
@@ -831,10 +831,23 @@
              ;; Derived scalar definitions are deliberately absent here.  They are proof terms
              ;; in the retained ParallelProgram prefix, not descriptive graph attributes.
              :attributes attributes})
+           ;; A graph's DAG, not the backend's current queue discipline, owns ordering.
+           ;; Conservatively retain the selected source sequence in regions containing a
+           ;; required evaluation. Pure regions keep their ordinary hazard-only DAG.
+           ordered-nodes (if (seq (get-in (soac/facts algorithm)
+                                         [:attributes :required-evaluations]))
+                           (mapv (fn [index node]
+                                   (if (zero? index) node
+                                     (update node :dependencies
+                                             #(vec (distinct
+                                                    (conj % (:id (nth (:nodes kernel-graph)
+                                                                     (dec index)))))))))
+                                 (range) (:nodes kernel-graph))
+                           (:nodes kernel-graph))
            nodes (mapv (fn [node certificate]
                          (cond-> node certificate
                            (assoc :read-capacity-certificate certificate)))
-                       (:nodes kernel-graph) read-capacity-certificates)]
+                       ordered-nodes read-capacity-certificates)]
        (graph/validate! (assoc kernel-graph :nodes nodes))))))
 
 (defn validate-projection!
@@ -881,6 +894,8 @@
         algorithms (mapv (comp soac/validate! :algorithm) equations)
         equation-forms (vec (mapcat soac/equations algorithms))
         equation-facts (apply merge (map (comp :equations soac/facts) algorithms))
+        required-evaluations (apply merge (map #(get-in (soac/facts %) [:attributes :required-evaluations])
+                                               algorithms))
         inputs (program/infer-inputs equations)
         outputs (region-outputs parallel-program equations indices)
         effects (reduce set/union #{} (map (comp :effects soac/facts) algorithms))]
@@ -892,7 +907,8 @@
        :effects effects
        :provenance {:source-dialect :typed-soac
                     :pass :scheduled-equation-region}
-       :attributes {:equation-region (mapv :id equations)}})
+       :attributes (cond-> {:equation-region (mapv :id equations)}
+                     (seq required-evaluations) (assoc :required-evaluations required-evaluations))})
      equation-forms outputs)))
 
 (defn make-for-equations

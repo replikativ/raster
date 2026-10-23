@@ -20,6 +20,44 @@
       (is (= [derivative] (vec gradient)))
       (is (= [curvature] (vec product))))))
 
+(deftest residual-storage-is-the-ordered-free-projection-of-the-reverse-region
+  (let [forward '[dead (aget observations 99) payload (* x x) count callback]
+        piece {:fwd-bindings forward
+               :rev-bindings '[answer (let* [local count] (local payload))]
+               :param-adj-syms '[answer]}
+        projected (#'reverse/retain-live-residual-values piece)]
+    (is (identical? forward (:fwd-bindings projected)))
+    (is (= '[payload count] (:saved-values projected)))
+    (is (= (:rev-bindings piece) (:rev-bindings projected)))
+    (is (= [] (:saved-values
+               (#'reverse/retain-live-residual-values
+                (assoc piece :rev-bindings '[answer (quote [payload count])])))))))
+
+(deftm selected-forward-only-read
+  [x :- Double observations :- (Array double) counts :- (Array long) flag :- Long] :- Double
+  (if (= flag 1)
+    (let [tick (aset counts 0 (inc (aget counts 0)))
+          unused (aget observations 0)]
+      (n/* x x))
+    (n/* x 3.0)))
+
+(deftest residual-liveness-is-not-permission-to-drop-forward-evaluation
+  (doseq [compile? [false true]]
+    (let [gradient (reverse/value+grad #'selected-forward-only-read :wrt [0] :compile? compile?)
+          counts (long-array 1)]
+      (when compile?
+        (is (true? (:raster.ad.reverse/compiled? (meta gradient)))
+            (str (:raster.ad.reverse/compile-failure (meta gradient)))))
+      (is (thrown? ArrayIndexOutOfBoundsException
+                   (gradient 2.0 (double-array 0) counts 1)))
+      (is (= [1] (vec counts)) "selected forward effect precedes the failed unused read")
+      (is (= [6.0 3.0 nil nil nil]
+             (gradient 2.0 (double-array 0) counts 0)))
+      (is (= [1] (vec counts)) "unselected branch is not executed")
+      (is (= [4.0 4.0 nil nil nil]
+             (gradient 2.0 (double-array [9.0]) counts 1)))
+      (is (= [2] (vec counts)) "selected branch is evaluated once"))))
+
 (deftest nonempty-replay-ports-are-flat-anf-values
   (with-bindings {#'reverse/*gensym-counter* (atom 0)}
     (with-redefs-fn

@@ -560,7 +560,12 @@
          (empty? (:effects equation-facts))
          (empty? (:aliases equation-facts))
          (empty? (get-in equation-facts [:attributes :result-storage]))
-         (set/subset? (set (keys (:attributes equation-facts))) #{:source-prefix?})
+         ;; Phase facts are historical bookkeeping, not placement authority.
+         ;; The enclosing closure checks positions, dependencies and host uses;
+         ;; totality below remains independently necessary for movement.
+         (set/subset? (set (keys (:attributes equation-facts)))
+                      #{:source-prefix? :before-parallel?})
+         (every? boolean? (vals (:attributes equation-facts)))
          (= #{:dtypes} (set (keys (:attributes info))))
          (empty? (get-in info [:attributes :attributes]))
          (= [(:dtype value)] (get-in info [:attributes :dtypes]))
@@ -1301,7 +1306,10 @@
                                  results)))
                      infos))
         candidate-roots (set/union candidate-roots demanded-roots)
-        scalar-defs (scalar-definitions equations)
+        required-scalars (into #{} (mapcat #(nth % 2))
+                               (filter #(dialect/required-evaluation program (second %)) equations))
+        ;; Required occurrences are execution roots, never substitution recipes.
+        scalar-defs (apply dissoc (scalar-definitions equations) required-scalars)
         dependent (dependent-scalars scalar-defs candidate-roots)
         escaping-dependent
         (set (filter (fn [value]
@@ -1339,7 +1347,8 @@
             (->> infos
                  (remove #(and (= :scalar (:kind %))
                                (some removed-scalars (:results %))))
-                 (mapv #(rewrite-consumer % values scalar-defs removed-scalars roots))
+                 (mapv #(if (dialect/required-evaluation program (:id %)) %
+                            (rewrite-consumer % values scalar-defs removed-scalars roots)))
                  (mapv #(promote-result-transform-loads % roots))
                  (mapv emit-equation))
             equation-ids (set (map second rewritten))
@@ -1384,15 +1393,20 @@
         [result {:resident-reductions (count roots)
                  :inlined-scalars (count removed-scalars)}]))))
 
+(declare realize-required-device-scalars)
+
 (defn ^:no-doc realize-source-free-reductions
   "Apply the shared reduction realization transaction before source-free promotion.
 
-   This entry deliberately excludes terminal ScalarIR realization. Internal reductions which are
+   This entry excludes public terminal ScalarIR realization. Required internal scalar occurrences
+   retain separate audited singleton stages. Internal reductions which are
    independently eligible under the existing complete producer/use/facet audit are realized even
    without a public-output demand. Every requested public ID must additionally pass the stricter
    output-only demand proof."
   [program resident-outputs]
-  (realize-reductions program resident-outputs))
+  (let [[program reduction-stats] (realize-reductions program resident-outputs)
+        [program scalar-stats] (realize-required-device-scalars program)]
+    [program (merge reduction-stats scalar-stats)]))
 
 (defn- lexical-call-marker?
   [form]
@@ -1406,7 +1420,8 @@
    Source dtypes come from capture AVs and typed locals. The result AV is checked only after the
    body derives its own dtype. This proof admits the bounded singleton read grammar and rejects
    trapping KernelBody operations; it neither emits nor schedules the result."
-  [program equation]
+  ([program equation] (strict-device-scalar-body? program equation false))
+  ([program equation floating-only?]
   (let [decline! (fn [rule message data]
                    (throw (ex-info message (assoc data :reason rule
                                                   :device-scalar-eligibility true))))]
@@ -1459,11 +1474,17 @@
           result-dtype (:dtype projected)
           operations (concat (:operations lowered) (:operations body-value))]
         (and lowered body-value (= result-dtype body-derived (:type body-value))
-             (nontrapping-scalar-operations? operations)))
+             (nontrapping-scalar-operations? operations)
+             (or (not floating-only?)
+                 (and (contains? #{:float :double} result-dtype)
+                      (not-any? #(contains? #{:byte :int :long}
+                                            (get-in % [:expression :result-type]))
+                                (tree-seq #(or (map? %) (sequential? %))
+                                          #(if (map? %) (vals %) (seq %)) operations))))))
       (catch clojure.lang.ExceptionInfo exception
         (if (or (:device-scalar-eligibility (ex-data exception))
                 (= :typed-soac-device-scalar-subset (:reason (ex-data exception))))
-          false (throw exception))))))
+          false (throw exception)))))))
 
 (defn public-scalar-unused-in-program?
   "A public checkpoint may precede later effects only when it has no semantic consumers.
@@ -1490,25 +1511,18 @@
                         (first results)))))
           (dialect/equations program))))
 
-(defn- terminal-device-scalar-candidate
-  "Return one observable ScalarIR checkpoint whose singleton storage dependency is proved.
+(defn- unused-device-scalar-candidate
+  "Return one unused ScalarIR checkpoint whose singleton storage dependency is proved.
 
    Writer lookup is performed over the complete ordered equation vector before any candidate index
    is selected. Exactly one earlier complete singleton writer is required; a future/latest writer,
    partial effect, public array read, or non-prefix produced scalar capture refuses. Observable
    tensor outputs and later independent effects are preserved; any internal use of the checkpoint
    refuses. A transported selection is only a candidate hint, never residency authority."
-  [program]
+  [program outputs]
   (let [facts (dialect/facts program)
         equations (dialect/equations program)
         positions (into {} (map-indexed (fn [index equation] [(second equation) index])) equations)
-        program-outputs (public-scalar-results program (dialect/outputs program))
-        selection (get-in facts [:attributes :public-scalar-checkpoint] ::absent)
-        outputs (if (= ::absent selection)
-                  program-outputs
-                  (if (and (vector? selection) (= 1 (count selection))
-                           (some #{(first selection)} program-outputs))
-                    selection []))
         candidate (when (= 1 (count outputs))
                     (some #(when (= outputs (nth % 2)) %) equations))
         candidate-index (some-> candidate second positions)
@@ -1521,9 +1535,15 @@
                           (vals info-by-id)))
         host-reads (set (get-in facts [:attributes :host-read-values]))
         captures (:captures info)
-        shaped (filterv #(seq (get-in facts [:values % :shape])) captures)
-        scalars (filterv #(empty? (get-in facts [:values % :shape])) captures)
+        storage? #(or (seq (get-in facts [:values % :shape]))
+                      (resident-scalar-value? (get-in facts [:values %])))
+        shaped (filterv storage? captures)
+        scalars (filterv (complement storage?) captures)
         storage (first shaped)
+        resident-storage? (and (= [] (get-in facts [:values storage :shape]))
+                               (= {:kind resident-representation :elements 1}
+                                  (get-in facts [:values storage :representation]))
+                               (= :device (get-in facts [:values storage :memory-space])))
         aliases (mapcat :aliases (vals (:equations facts)))
         storage-component (when storage (alias-component aliases storage))
         allocation (when storage
@@ -1539,10 +1559,11 @@
                                       (< site (:source-binding-id allocation))))
                               equations)))
         singleton-capacity?
-        (if allocation
+        (if resident-storage? true
+         (if allocation
           (extent-proof/same-volume? allocation-environment
                                      (:extent allocation) [1])
-          (= [1] (get-in facts [:values storage :shape])))
+          (= [1] (get-in facts [:values storage :shape]))))
         writers
         (when storage
           (into []
@@ -1572,36 +1593,69 @@
                (public-scalar-unused-in-program? facts equations (first outputs))
                (= 1 (count shaped)) singleton-capacity? allocation-before-writer?
                (empty? (set/intersection host-reads storage-component))
-               (exact-plain-tensor? (get-in facts [:values storage])
-                                    (get-in facts [:values storage :shape]))
+               (or resident-storage?
+                   (exact-plain-tensor? (get-in facts [:values storage])
+                                        (get-in facts [:values storage :shape])))
                writer (< (:position writer) candidate-index)
-               (= [1] (write-coverage/symbolic-complete-write-shape
+               (= (if resident-storage? [] [1]) (write-coverage/symbolic-complete-write-shape
                        facts (:equation writer) (:logical writer)))
                (every? scalar-prefix? scalars)
                (exact-plain-scalar-value? (get-in facts [:values (first outputs)])))
       candidate)))
+
+(defn- terminal-device-scalar-candidate [program]
+  (let [program-outputs (public-scalar-results program (dialect/outputs program))
+        selection (get-in (dialect/facts program) [:attributes :public-scalar-checkpoint] ::absent)
+        outputs (if (= ::absent selection) program-outputs
+                    (if (and (vector? selection) (= 1 (count selection))
+                             (some #{(first selection)} program-outputs)) selection []))]
+    (unused-device-scalar-candidate program outputs)))
+
+(defn- checked-device-scalar-projection [program equation floating-only?]
+  (let [result (first (nth equation 2))
+        marked (-> program dialect/facts
+                   (assoc-in [:values result :representation]
+                             {:kind resident-representation :elements 1})
+                   (assoc-in [:values result :memory-space] :device)
+                   (dialect/make (dialect/equations program) (dialect/outputs program)))]
+    (when (strict-device-scalar-body? marked equation floating-only?) marked)))
 
 (defn terminal-device-scalar-projection
   "Return the audited resident projection, or nil for an unsupported terminal scalar.
    Source normalization and residency use this same admission proof."
   [program]
   (when-let [equation (terminal-device-scalar-candidate program)]
-    (let [result (first (nth equation 2))
-          marked (-> program
-                     dialect/facts
-                     (assoc-in [:values result :representation]
-                               {:kind resident-representation :elements 1})
-                     (assoc-in [:values result :memory-space] :device)
-                     (dialect/make (dialect/equations program) (dialect/outputs program)))]
-      (when (strict-device-scalar-body? marked equation) marked))))
+    (checked-device-scalar-projection program equation false)))
+
+(defn required-device-scalar-projection
+  "Realize one unused required scalar at its original occurrence, not as a public result.
+   Only a preserved, otherwise total typed numerical evaluation is eligible. Source reference,
+   unchecked/unknown completion and checked exceptional obligations are not waived by this API."
+  [program result]
+  (dialect/validate! program)
+  (when (not (some #{result} (dialect/outputs program)))
+    (when-let [equation (unused-device-scalar-candidate program [result])]
+      (when (= #{:preserve-source-evaluation}
+               (:flags (dialect/required-evaluation program (second equation))))
+        (checked-device-scalar-projection program equation true)))))
+
+(defn- realize-required-device-scalars [program]
+  (reduce (fn [[program stats] equation]
+            (if-let [marked (and (dialect/required-evaluation program (second equation))
+                                (= 1 (count (nth equation 2)))
+                                (required-device-scalar-projection program (first (nth equation 2))))]
+              [(dialect/assert-required-evaluations-preserved! program marked)
+               (update stats :resident-required-scalars inc)]
+              [program stats]))
+          [program {:resident-required-scalars 0}] (dialect/equations program)))
 
 (defn- realize-terminal-device-scalar [program]
   (if-let [marked (terminal-device-scalar-projection program)]
     [marked {:resident-terminal-scalars 1}]
     [program {:resident-terminal-scalars 0}]))
 
-(defn validated-terminal-resident-output
-  "Independently reconstruct terminal residency from the enclosing semantic equation spine.
+(defn- validated-scalar-context
+  "Independently reconstruct scalar residency from the enclosing semantic equation spine.
    A resident AV or an isolated ScalarIR equation is not activation authority."
   [parallel-program result]
   (let [equations (:equations parallel-program)
@@ -1616,8 +1670,7 @@
                            (filter #(seq (get-in terminal-facts [:values % :shape]))
                                    (:captures (dialect/operation-parts terminal-equation))))
         allocated (set (map :destination (get-in parallel-program [:attributes :allocations])))]
-    (when (and (some #{result} (:outputs parallel-program))
-               (= {:kind :resident-scalar-buffer :elements 1} (:representation outer))
+    (when (and (= {:kind :resident-scalar-buffer :elements 1} (:representation outer))
                (= :device (:memory-space outer))
                (every? dialect/program-form? algorithms)
                ;; A compatibility join cannot create the singleton-capacity premise. A capture
@@ -1663,16 +1716,30 @@
                          (assoc-in [:values result :representation] {:kind :plain})
                          (assoc-in [:values result :memory-space] nil)
                          (dialect/make (vec (mapcat dialect/equations algorithms))
-                                       (:outputs parallel-program)))
-            audited (when (= [result] (public-scalar-results unmarked (:outputs parallel-program)))
+                                       (:outputs parallel-program)))]
+        {:unmarked unmarked :outer outer}))))
+
+(defn validated-terminal-resident-output
+  "Revalidate public scalar placement against the enclosing semantic program."
+  [parallel-program result]
+  (when (some #{result} (:outputs parallel-program))
+    (when-let [{:keys [unmarked outer]} (validated-scalar-context parallel-program result)]
+      (let [audited (when (= [result] (public-scalar-results unmarked (:outputs parallel-program)))
                       (terminal-device-scalar-projection unmarked))]
         (when (and audited
-                   (semantic/equivalent? outer (get-in (dialect/facts audited) [:values result])))
-          outer)))))
+                   (semantic/equivalent? outer (get-in (dialect/facts audited) [:values result]))) outer)))))
+
+(defn validated-required-resident-output
+  "Revalidate an internal required singleton occurrence, including writer and use closure."
+  [parallel-program result]
+  (when-let [{:keys [unmarked outer]} (validated-scalar-context parallel-program result)]
+    (when-let [audited (required-device-scalar-projection unmarked result)]
+      (when (semantic/equivalent? outer (get-in (dialect/facts audited) [:values result])) outer))))
 
 (defn realize
   "Realize audited reduction residents and one bounded direct terminal ScalarIR result."
   [program]
   (let [[program reduction-stats] (realize-reductions program [])
+        [program required-stats] (realize-required-device-scalars program)
         [program scalar-stats] (realize-terminal-device-scalar program)]
-    [program (merge reduction-stats scalar-stats)]))
+    [program (merge reduction-stats required-stats scalar-stats)]))

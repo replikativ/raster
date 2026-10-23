@@ -7,6 +7,7 @@
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.report :as report]
+            [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.quant.kernels-k :as qk]
             [raster.quant.pack :as pack]
@@ -238,9 +239,9 @@
       (is (= (vec expected-bsums) (vec equal-bsums)) "equal-width adapter agrees on sums"))))
 
 (deftest q4k-projection-shares-weights-across-activation-rows
-  (let [nrows 3 in 512 out 11
-        x (gen (* nrows in) 81)
-        W (gen (* out in) 82)
+  (doseq [[nrows in out seed] [[3 512 11 81] [1 256 7 91] [2 768 5 101]]]
+  (let [x (gen (* nrows in) seed)
+        W (gen (* out in) (inc seed))
         {:keys [wq da db aq bq]} (q/quantize-weight-q4k W q/q4-K)
         wp (bytes->ints-le wq)
         xp (int-array (* nrows (quot in 4)))
@@ -264,7 +265,7 @@
           (is (< (Math/abs (- (aget actual (+ (* row out) o)) (aget expected o))) 1e-3)
               (str "Q4_K row " row ", output " o))
           (is (< (Math/abs (- (aget product-actual (+ (* row out) o)) (aget expected o))) 1e-3)
-              (str "product Q4_K row " row ", output " o)))))))
+              (str "product Q4_K row " row ", output " o))))))))
 
 (deftest q4k-product-preserves-the-public-abi-and-fuses-through-the-general-schedule
   (let [target :ze:q4k-legacy-abi-product-test
@@ -279,6 +280,13 @@
                                             {:target target :dtype :float})
         artifact (first (:kernels compilation))]
     (is (= 1 (count (:kernels compilation))))
+    (is (contains? (kernel-body/required-scalar-dtypes
+                    (get-in artifact [:provenance :scheduled-operation :body :operations]))
+                   :double)
+        "Float storage does not erase Double evaluation requirements")
+    (is (re-find #"cl_khr_fp64" (:source artifact)))
+    (is (re-find #"rstr_narrow_f64_f32_rte" (:source artifact))
+        "the explicit carry boundary emits IEEE narrowing, not a checked source float")
     (is (= 1 (get-in compilation [:stats :emission :product-consumer-regions-emitted])))
     (is (= :subgroup-product-ordered-consumer
            (get-in artifact [:attributes :kernel-body :schedule :strategy])))

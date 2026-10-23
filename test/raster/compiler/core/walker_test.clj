@@ -16,6 +16,18 @@
   ([form] (walker/walk-body form {:type-env {}}))
   ([form flat-env] (walker/walk-body form {:type-env (te flat-env)})))
 
+(deftest qualified-clojure-calls-preserve-reference-arguments
+  ;; A logical numeric type cannot authorize changing an Object-consuming
+  ;; Clojure call into an unbox/rebox operation. Java static calls use their
+  ;; separate resolved-Class interop path.
+  (doseq [source ['(clojure.core/identical? saved copy)
+                  '(clojure.core/identity saved)]]
+    (let [walked (wb source {'saved 'double 'copy 'double})]
+      (is (= (rest source) (rest walked)))))
+  (let [walked (wb '(Math/sqrt x) {'x 'double})]
+    (is (= 'double (:raster.type/tag (meta walked))))
+    (is (= 3.0 ((eval (list 'fn '[x] walked)) 9.0)))))
+
 (deftest reduction-accumulator-type-survives-initializer-lowering
   (doseq [[tag initializer lowered]
           [['float '(float 0.0) 'java.lang.Float/NEGATIVE_INFINITY]

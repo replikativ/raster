@@ -43,7 +43,8 @@
         equation-facts (fn [index]
                          (assoc (soac/default-equation-facts
                                  {:front-end :analyzed-source :source-binding-id index})
-                                :attributes {:source-prefix? (zero? index)}))]
+                                :attributes {:source-prefix? (zero? index)
+                                             :before-parallel? (zero? index)}))]
     (soac/make
      (soac/default-program-facts
       {:values values :inputs '[x scale n]

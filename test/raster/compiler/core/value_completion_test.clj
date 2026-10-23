@@ -1,9 +1,72 @@
 (ns raster.compiler.core.value-completion-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as completion]))
 
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
+
+(deftest boxed-entry-results-carry-the-explicit-builtin-target-declaration
+  (doseq [[tag carrier] (concat (map (fn [[tag _]] [tag (types/tag->java-class tag)])
+                                    types/primitive-info)
+                               types/primitive-array-info)]
+    (let [operand (with-meta 'value {:raster.type/tag 'wrong :tag 'Object
+                                    :line 7 :raster.effect/effectful true})
+          term (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier) operand)]
+      (is (= {:line 7 :raster.type/tag tag} (meta term)))
+      (is (identical? operand (:operand (completion/canonical-parts term))))
+      (is (identical? carrier (get-in (completion/canonical-parts term) [:contract :target-carrier])))
+      (is (nil? (completion/object-value-declaration term)))))
+  (doseq [carrier [Object String java.lang.Number (class (object-array 0))]]
+    (let [term (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier)
+                                          (with-meta 'value {:tag 'double :raster.type/tag 'float}))]
+      (is (empty? (meta term)) "unknown/reference target must not inherit an operand's numeric type"))))
+
+(deftest boxed-entry-contract-is-a-distinct-bytecode-only-boundary
+  (doseq [carrier [Double/TYPE Float/TYPE Long/TYPE Integer/TYPE Boolean/TYPE
+                   Byte/TYPE Short/TYPE Character/TYPE Object String (class (float-array 0))]]
+    (let [contract (completion/bytecode-boxed-parameter-contract carrier)
+          term (completion/complete-value contract 'input)]
+      (is (completion/canonical-contract? contract))
+      (is (completion/bytecode-context-form? term))
+      (is (= :unsupported-value-completion-source-context
+             (try (completion/project-to-jvm-source term) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (not (completion/canonical-contract? (assoc contract :payload :double))))))
+  (doseq [carrier [Void/TYPE nil 'double]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (completion/bytecode-boxed-parameter-contract carrier)))))
+
+(deftest bytecode-result-context-is-not-an-object-input-or-numeric-proof
+  (let [context (completion/bytecode-operand-context {})
+        contract (completion/bytecode-result-context-contract context :ref)
+        term (completion/complete-value contract (with-meta 'x {:tag 'double :raster.type/tag 'float}))]
+    (is (completion/canonical-form? term))
+    (is (empty? (meta term)))
+    (is (nil? (completion/object-value-declaration term)))
+    (is (completion/contains-completion? term))
+    (is (= :unsupported-value-completion-source-context
+           (try (completion/project-to-jvm-source term) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (doseq [changed [(assoc contract :result-carrier :void)
+                     (assoc contract :payload Float)
+                     (assoc contract :presence :present)
+                     (update contract :operand-context dissoc :void-context)
+                     (assoc-in contract [:operand-context :void-context] nil)
+                     (assoc-in contract [:operand-context :extra] false)]]
+      (is (not (completion/canonical-contract? changed))))
+    (doseq [carrier [:void :diverge Object]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (completion/bytecode-result-context-contract context carrier))))))
+
+(deftest integer-and-boolean-result-contexts-retain-distinct-raw-carriers
+  (doseq [carrier [:int :bool]]
+    (let [contract (completion/bytecode-result-context-contract
+                    (completion/bytecode-operand-context {}) carrier)]
+      (is (completion/canonical-contract? contract))
+      (is (= carrier (:result-carrier contract)))
+      (is (nil? (completion/object-value-declaration
+                 (completion/complete-value contract 'operand)))))))
 
 (deftest retained-context-barrier-is-quote-opaque-and-includes-invalid-terms
   (let [term (completed 'x)

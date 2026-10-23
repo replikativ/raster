@@ -73,6 +73,12 @@
             {}
             (concat (:parameters plan) (:steps plan)))))
 
+(defn- program-call-scalars
+  "Project the larger invocation environment onto declared numerical program values.
+   Public source-only arguments remain invocation-owned, never emitted runtime ports."
+  [program scalars]
+  (select-keys scalars (keys (:values program))))
+
 (defn- concrete-shape
   [id abstract scalars buffers storage]
   (mapv
@@ -551,10 +557,33 @@
     (assoc layout :nodes (mapv #(assoc % :role (get refresh (:id %))) (:nodes layout))
                   :entry-refresh refresh)))
 
+(defn- terminal-export-contracts
+  [semantic-program program projections]
+  (when-let [contract (get-in semantic-program [:attributes :invocation-plan :attributes :terminal-host-result])]
+    (mapv
+     (fn [{:keys [value dtype producer-equation result-position] :as parameter}]
+       (let [equation (some #(when (= producer-equation (:id %)) %) (:equations program))
+             operation (first (:operations equation))
+             projection (when operation (emitted-program/operation-projection projections operation))
+             physical (get-in projection [:physical-results value])
+             graph (get-in projection [:boundary :graph])
+             output (some #(when (= physical (:id %)) %) (:outputs graph))]
+         (when-not (and equation (not (true? (get-in equation [:attributes :host-only])))
+                        (= 1 (count (:operations equation)))
+                        (= value (nth (:results equation) result-position nil))
+                        (= dtype (:dtype output)) (= 1 (:elements output)))
+           (fail! :invocation-terminal-export
+                  "terminal parameter lacks an exact one-element emitted output ABI"
+                  {:parameter parameter :physical physical :output output}))
+         (assoc parameter :physical-value physical)))
+     (:parameters contract))))
+
 (defn ^:no-doc begin-ordered-realization
   "Begin owner-local realization without evaluating invocation steps or acquiring resources.
    The returned map is runtime construction state, not a portable completion certificate."
-  [compilation arguments caller-options]
+  ([compilation arguments caller-options]
+   (begin-ordered-realization compilation arguments caller-options #{}))
+  ([compilation arguments caller-options deferred-parameters]
   (let [semantic-program (:semantic compilation)
         invocation (get-in semantic-program [:attributes :invocation-plan])
         invocation (invocation/validate-against! invocation semantic-program)
@@ -573,16 +602,19 @@
       (fail! :invocation-ordered-program
              "ordered realization requires the exact retained semantic and emitted boundary" {}))
     {:program program :source-order order :source-cursor 0
+     :terminal-exports (terminal-export-contracts semantic-program program (:projections checked))
      :source-realizations (into {} (keep (fn [entry]
                                           (when-let [action (invocation-source/realization-action semantic-program entry)]
                                             [(:position entry) action]))) order)
-     :materialization (materialization/begin-materialization invocation arguments)
+     :materialization (materialization/begin-materialization invocation arguments deferred-parameters)
      :realized {:buffers {} :storage {} :loop-scratch {}}
      :acquired-storage #{}
      :source-allocations (into {} (map (juxt :destination :source-expression))
                               (get-in semantic-program [:attributes :allocations]))
+     :source-allocation-projections (into {} (map (juxt :destination :source-projection))
+                                        (get-in semantic-program [:attributes :allocations]))
      :projections (:projections checked) :target (:target compilation)
-     :caller-options caller-options}))
+     :caller-options caller-options})))
 
 (defn- validate-source-result-allocation! [state entry action]
   (let [destination (:binding action)
@@ -613,6 +645,11 @@
             :let [step (get steps (:invocation-step entry))
                   equation (get equations (:equation entry))
                   action (get (:source-realizations state) (:position entry))]]
+      (when (and (:terminal-result entry)
+                 (not (and (= [:return] (:terminal-result entry))
+                           (= (:position entry) (dec (count (:source-order state))))
+                           (seq (:terminal-exports state)))))
+        (fail! :invocation-ordered-source-action "invalid terminal observation entry" {:entry entry}))
       (when (or (and (:realization entry)
                      (not (contains? #{:result-allocation :storage-alias} (:kind action))))
                 (and step (not (or (invocation/scalar-compute? step)
@@ -626,6 +663,33 @@
       (when (= :result-allocation (:kind action))
         (validate-source-result-allocation! state entry action))))
   state)
+
+(defn ^:no-doc terminal-export-layout
+  "Resolve terminal exports from already realized producer storage. This acquires no storage
+   and supplies no completion evidence; the execution owner must prove initialized views."
+  [state]
+  (let [entry (nth (:source-order state) (:source-cursor state) nil)]
+    (when-not (and (:terminal-result entry) (nil? (:pending state))
+                   (= (:source-cursor state) (dec (count (:source-order state)))))
+      (fail! :invocation-terminal-order "terminal observation is not the next completed source boundary" {}))
+    (let [exports
+          (mapv
+           (fn [{:keys [value physical-value dtype] :as export}]
+             (let [token (get-in state [:realized :buffers value])
+                   physical-token (get-in state [:realized :buffers physical-value])
+                   storage (get-in state [:realized :storage token])]
+               (when-not (and token (= token physical-token)
+                              (contains? (:acquired-storage state) token)
+                              (= dtype (get-in storage [:abstract :dtype]))
+                              (= 1 (reduce *' 1 (:shape storage)))
+                              (nil? (:source storage)) (nil? (:backing storage)))
+                 (fail! :invocation-terminal-storage
+                        "terminal export differs from acquired producer storage" {:export export}))
+               (assoc export :node token)))
+           (:terminal-exports state))
+          layout (storage-link-layout (:realized state) {} (:target state) #{}
+                                      (vec (distinct (map :node exports))))]
+      (assoc layout :exports exports))))
 
 (defn ^:no-doc ordered-input-arguments
   "Preflight primitive host-array replacements without evaluating source steps or mutating an
@@ -711,7 +775,8 @@
           ;; host callback. The host constructor validates that same result, not a second eval.
           host-step (when equation
                       (program-call/make-host-equation-step
-                       (:program state) (:id equation) buffers scalars
+                       (:program state) (:id equation) buffers
+                       (program-call-scalars (:program state) scalars)
                        (if step
                          (fn [_ _] {(first (:results equation))
                                     (get-in (run-step!) [:values (:id step)])})
@@ -726,10 +791,9 @@
         host-step (update :host-scalars merge (:results host-step))
         host-step (assoc-in [:host-steps (:id equation)] host-step)))))
 
-(defn ^:no-doc prepare-source-allocation
-  "Prepare the exact next source allocation, not an unspecified numerical result buffer.
-   evaluate-size is the trusted typed host evaluator returning the source value and its actual
-   constructor count. Acquisition and zero initialization must complete before cursor advance."
+(defn- source-allocation-request
+  "Validate source constructor count/shape only. No allocation, initialization,
+   acquisition acknowledgement, pending action or cursor advancement is produced."
   [state evaluate-size caller-options]
   (when-not (= caller-options (:caller-options state))
     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
@@ -753,7 +817,8 @@
     (when auxiliary? (validate-source-result-allocation! state entry action))
     (when (and (:helper projection)
                (not (semantic/equivalent? (select-keys projection [:constructor :helper])
-                                         (:source-projection step))))
+                                         (or (:source-projection step)
+                                             (get-in state [:source-allocation-projections destination])))))
       (fail! :invocation-ordered-allocation-definition
              "allocation helper differs from this invocation's retained constructor definition"
              {:entry entry}))
@@ -767,6 +832,7 @@
           _ (doseq [argument (get-in projection [:helper :arguments])]
               (when-not (or (contains? scalars argument)
                             (contains? (:program-buffers available) argument)
+                            (descriptor/direct-allocation-argument-value argument {})
                             (contains? (:acquired-storage state)
                                        (get-in state [:realized :buffers argument])))
                 (fail! :invocation-ordered-allocation-argument
@@ -789,35 +855,109 @@
           (fail! :invocation-ordered-allocation-shape
                  "retained storage differs from the evaluated source constructor count"
                  {:shape shape :constructor-count elements :destination destination}))
-        (let [step (when-let [id (:invocation-step entry)]
-                     (let [next-step (nth (get-in materialization [:plan :steps])
-                                          (:next-step materialization) nil)]
-                       (when-not (and (= id (:id next-step))
-                                      (invocation/buffer-allocation? next-step))
-                         (fail! :invocation-ordered-allocation-step
-                                "source allocation differs from the next invocation step" {:entry entry}))
-                       next-step))
-              materialization (if step (materialization/materialize-next materialization nil)
-                                  materialization)
-              [realized token]
-              (if step
-                (let [buffer (get-in materialization [:values (:id step)])
-                      token (:id buffer)]
-                  [(-> (:realized state)
-                       (assoc-in [:buffers destination] token)
-                       (add-storage token destination abstract shape nil :zero)) token])
-                (allocate-result (:realized state) (get-in materialization [:plan :id])
-                                 destination abstract scalars :result))
-              _ (when (contains? (:acquired-storage state) token)
-                  (fail! :invocation-ordered-allocation-acquired
-                         "source allocation is already acquired in this invocation" {:storage token}))
-              realized (assoc-in realized [:storage token :initialization] :zero)
-              layout (storage-link-layout realized scalars (:target state) #{token} [token])]
-          {:state (assoc state :realized realized :materialization materialization
-                               :pending {:kind :source-allocation :storage token
-                                         :source-cursor (:source-cursor state)})
-           :nodes (:nodes layout) :values (:values layout)
-           :storage token :initialization :zero :elements elements})))))
+        {:entry entry :destination destination :abstract abstract :materialization materialization
+         :scalars scalars :shape shape :elements elements}))))
+
+(defn- materialize-source-allocation [{:keys [entry materialization]}]
+  (let [step (when-let [id (:invocation-step entry)]
+               (let [next-step (nth (get-in materialization [:plan :steps])
+                                    (:next-step materialization) nil)]
+                 (when-not (and (= id (:id next-step))
+                                (invocation/buffer-allocation? next-step))
+                   (fail! :invocation-ordered-allocation-step
+                          "source allocation differs from the next invocation step" {:entry entry}))
+                 next-step))]
+    {:step step :materialization (if step (materialization/materialize-next materialization nil)
+                                    materialization)}))
+
+(defn ^:no-doc prepare-source-allocation
+  "Prepare the exact next source allocation, not an unspecified numerical result buffer.
+   evaluate-size is the trusted typed host evaluator returning the source value and its actual
+   constructor count. Acquisition and zero initialization must complete before cursor advance."
+  [state evaluate-size caller-options]
+  (let [{:keys [entry destination abstract scalars shape elements] :as request}
+        (source-allocation-request state evaluate-size caller-options)
+        {:keys [step materialization]} (materialize-source-allocation request)
+        [realized token]
+        (if step
+          (let [buffer (get-in materialization [:values (:id step)])
+                token (:id buffer)]
+            [(-> (:realized state)
+                 (assoc-in [:buffers destination] token)
+                 (add-storage token destination abstract shape nil :zero)) token])
+          (allocate-result (:realized state) (get-in materialization [:plan :id])
+                           destination abstract scalars :result))
+        _ (when (contains? (:acquired-storage state) token)
+            (fail! :invocation-ordered-allocation-acquired
+                   "source allocation is already acquired in this invocation" {:storage token}))
+        realized (assoc-in realized [:storage token :initialization] :zero)
+        layout (storage-link-layout realized scalars (:target state) #{token} [token])]
+    {:state (assoc state :realized realized :materialization materialization
+                         :pending {:kind :source-allocation :storage token
+                                   :source-cursor (:source-cursor state)})
+     :nodes (:nodes layout) :values (:values layout)
+     :storage token :initialization :zero :elements elements}))
+
+(defn ^:no-doc materialize-owned-source-prefix
+  "Pure eager counterpart of ordered source-prefix execution.
+   Walk source order, not just invocation steps: a constructor may have no step.
+   Scalar work runs once; each source count is checked before later scalar work.
+   The returned materialization grants NO acquired/initialized/native-root facts.
+   Late host actions remain ordered-runtime obligations, never hoisted here."
+  [initial evaluate-step evaluate-size caller-options]
+  (let [plan (get-in initial [:materialization :plan])]
+    (when-not (= caller-options (:caller-options initial))
+      (fail! :invocation-ordered-request "eager specialization cannot change its caller math request" {}))
+    (when (or (seq (:acquired-storage initial)) (:pending initial)
+              (seq (:host-scalars initial)) (seq (:host-steps initial))
+              (some seq (map (:realized initial) [:buffers :storage :loop-scratch]))
+              (not= 0 (:source-cursor initial))
+              (not= 0 (get-in initial [:materialization :next-step])))
+      (fail! :invocation-eager-source-start "eager source specialization requires a fresh prefix" {}))
+    (when (seq (invocation/ordered-host-actions plan (:program initial)))
+      (fail! :ordered-source-execution-required "late host work cannot be eagerly specialized" {}))
+    (loop [state initial]
+      (let [entry (nth (:source-order state) (:source-cursor state) nil)
+            equation (when (:equation entry)
+                       (some #(when (= (:equation entry) (:id %)) %) (get-in state [:program :equations])))
+            action (get (:source-realizations state) (:source-cursor state))
+            step (when (:invocation-step entry)
+                   (nth (:steps plan) (get-in state [:materialization :next-step]) nil))]
+        (cond
+          (or (nil? entry) (and equation (not (true? (get-in equation [:attributes :host-only])))))
+          (let [_ (when (some #(or (invocation/scalar-compute? %)
+                                  (invocation/shape-projection? %))
+                              (drop (get-in state [:materialization :next-step]) (:steps plan)))
+                    (fail! :invocation-eager-source-unconsumed
+                           "source computations must execute at their retained source positions" {}))
+                finished (loop [materialization (:materialization state)]
+                           (if (= (:next-step materialization) (count (:steps plan)))
+                             materialization
+                             (recur (materialization/materialize-next materialization evaluate-step))))]
+            (materialization/finish-materialization finished))
+
+          (or (:storage entry) (= :result-allocation (:kind action)))
+          (let [request (source-allocation-request state evaluate-size caller-options)
+                materialized (materialize-source-allocation request)]
+            (recur (-> state (assoc :materialization (:materialization materialized))
+                       (update :source-cursor inc))))
+
+          (or (and step (or (invocation/scalar-compute? step) (invocation/shape-projection? step))) equation)
+          (recur (advance-host-source state evaluate-step nil caller-options))
+
+          (= :storage-alias (:kind action))
+          (let [materialized (if (:invocation-step entry)
+                               (do
+                                 (when-not (and (= (:invocation-step entry) (:id step))
+                                                (invocation/value-alias? step))
+                                   (fail! :invocation-eager-source-alias "source alias differs from the next step" {}))
+                                 (materialization/materialize-next (:materialization state) nil))
+                               (:materialization state))]
+            (recur (-> state (assoc :materialization materialized) (update :source-cursor inc))))
+
+          :else
+          (fail! :invocation-eager-source-entry "source prefix has no closed specialization action"
+                 {:entry entry}))))))
 
 (defn ^:no-doc advance-source-alias
   "Bind one validated source alias to already acquired storage. This neither acquires storage
@@ -850,9 +990,10 @@
           (update :source-cursor inc)))))
 
 (defn ^:no-doc realize-ready-equation
-  "Realize only the next numerical source entry into an ordinary concrete graph LinkPlan.
+  "Realize the next numerical source entry into a graph plan or explicit pending observed entry.
    This neither executes nor advances the cursor. Its conditional entry contract must be
-   satisfied by the enclosing owner, and produced views become ready only after completion."
+   satisfied by the enclosing owner. Checked success views require observation, not merely
+   binding, buffer acquisition or device completion."
   [state equation-id caller-options]
   (when-not (= caller-options (:caller-options state))
     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
@@ -893,7 +1034,8 @@
                                             (:values program) scalars (:projections state))
           result-views (into {} (keep :result-view) (vals (:storage realized)))
           {:keys [call buffers]} (program-call/make-equation-call
-                                 program equation-id (:buffers realized) scalars result-views caller-options)
+                                 program equation-id (:buffers realized) (program-call-scalars program scalars)
+                                 result-views caller-options)
           _ (when (seq (:result-views call))
               (fail! :invocation-ordered-result-views
                      "ready graph stages must retain logical prefix-result contracts before admission"
@@ -902,33 +1044,68 @@
           outputs (vec (distinct (vals (:outputs call))))
           tokens (vec (distinct (concat (vals (:buffers call)) outputs)))
           layout (storage-link-layout realized scalars (:target state) (set outputs) tokens)
+          projection (emitted-program/operation-projection (:projections state)
+                                                            (first (:operations equation)))
+          private-source-results
+          (let [checked-outputs (set (map :output (:stage-results projection)))]
+            (let [created (into #{}
+                                (keep (fn [[position {:keys [kind binding]}]]
+                                        (when (and (< position (:source-cursor state))
+                                                   (= :result-allocation kind))
+                                          (get buffers binding))))
+                                (:source-realizations state))
+                  created (into created
+                                (keep-indexed
+                                 (fn [position entry]
+                                   (when (and (< position (:source-cursor state))
+                                              (contains? (:source-allocations state) (:storage entry)))
+                                     (get buffers (:storage entry)))))
+                                (:source-order state))]
+              ;; Both explicit constructors and generated result allocations
+              ;; are source-created storage. Aliases follow their same token.
+              ;; This is only a private-output requirement, not live ownership.
+              (set/intersection created (set (keep buffers checked-outputs)))))
           nodes (mapv (fn [node]
                         (if (contains? acquired (get-in node [:view :allocation :id]))
                           ;; Existing roots are conditional inputs to this stage. Retaining
                           ;; their old host initializer would silently overwrite earlier work.
-                          (assoc node :source nil :role (if (some #{(:id node)} outputs) :state :input))
+                          (assoc node :source nil
+                                 :role (if (some #{(:id node)} outputs)
+                                         ;; A preceding owned source allocation is
+                                         ;; still invocation-private, not caller state.
+                                         ;; The runtime must prove its actual live
+                                         ;; acquisition separately before execution.
+                                         (if (contains? private-source-results (:id node)) :internal :state)
+                                         :input))
                           node))
                       (:nodes layout))
           instance-id [:ordered-equation equation-id]
           instance (link/graph-instance
                     {:id instance-id :graph (:graph call) :bindings (:buffers call)
-                     :scalar-values (:scalar-values call)})
+                     :scalar-values (:scalar-values call)
+                     :attributes {:emitted-equation-source {:program program :equation-id equation-id}}})
           request {:id [(get-in materialization [:plan :id]) :stage equation-id]
                    :target (:target state) :nodes nodes :values (:values layout)
                    :instances [instance] :outputs outputs
                    :aliases (into #{} (map set)
                                   (bview/overlapping-id-pairs (map (juxt :id :view) nodes)))}
+          pending (when (seq (:stage-results projection))
+                    (link/make-pending-observed-entry (:boundary projection) request caller-options))
           {:keys [plan effect-evidence]}
-          (if (nil? caller-options)
-            (link/make-with-effect-evidence request)
-            (link/make-with-effect-evidence request caller-options))
-          contract (first (link/relative-entry-contracts! plan effect-evidence
-                                                         [[instance-id]] caller-options))]
-      {:state (assoc state :realized realized
+          (when-not pending
+            (if (nil? caller-options)
+              (link/make-with-effect-evidence request)
+              (link/make-with-effect-evidence request caller-options)))
+          contract (if pending (:entry-contract pending)
+                       (first (link/relative-entry-contracts! plan effect-evidence
+                                                              [[instance-id]] caller-options)))]
+      (cond-> {:state (assoc state :realized realized
                            :pending {:equation equation-id :source-cursor (:source-cursor state)})
-       :call call :stage-plan plan :effect-evidence effect-evidence :entry-contract contract
+       :call call :entry-contract contract
        :new-storage (select-keys (:storage realized)
-                                 (remove #(contains? acquired %) tokens))})))
+                                 (remove #(contains? acquired %) tokens))}
+        pending (assoc :pending-observed-entry pending :stage-layout (:layout pending))
+        (not pending) (assoc :stage-plan plan :effect-evidence effect-evidence)))))
 
 (defn- lower-in-context
   "Lower one specialized invocation and matching emitted program into a validated LinkPlan.
@@ -942,6 +1119,10 @@
   [materialized parallel-program target evaluate-host project retained-validation caller-options
    & [source-state]]
   (let [materialized (materialization/validate! materialized)
+        _ (when (and (get-in materialized [:plan :attributes :terminal-host-result])
+                     (not (:terminal-observed? source-state)))
+            (fail! :explicit-host-result-required
+                   "terminal observation cannot be lowered as an eager resident invocation" {}))
         ;; Without a retained owner, independently prove this exact program once for this
         ;; synchronous lowering. The same sealed report feeds the storage/call/final phases;
         ;; it is never published as authority on the returned plan or bound around callbacks.
@@ -982,7 +1163,7 @@
                                                     (:values parallel-program) shape-scalars
                                                     (:projections retained-validation))
                            initial (:equations parallel-program)))
-        call-scalars (select-keys shape-scalars (keys (:values parallel-program)))
+        call-scalars (program-call-scalars parallel-program shape-scalars)
         ;; Shape-only invocation scalars are part of the physical program contract even when no
         ;; kernel ABI consumes them. Retain them in the call so logical N-D values can be proved
         ;; element-equivalent to flattened result storage at the LinkPlan boundary.
@@ -1343,16 +1524,78 @@
           (assoc-in [:instances 0 :roles] compiler-roles)
           (assoc-in [:attributes :public-buffer-roles] roles)))))
 
+(defn- require-completed-source!
+  [state caller-options]
+  (when-not (= caller-options (:caller-options state))
+    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
+  (when-not (and (nil? (:pending state))
+                 (= (:source-cursor state) (count (:source-order state)))
+                 (or (empty? (:terminal-exports state)) (:terminal-observed? state)))
+    (fail! :invocation-ordered-incomplete "source work has not completed" {})))
+
+(defn ^:no-doc ordered-observation-occurrences
+  "Derive required observations from every emitted source occurrence, including
+   unused results. This is an obligation map, never evidence of execution."
+  [state]
+  (let [equations (into {} (map (juxt :id identity)) (get-in state [:program :equations]))]
+    (into {}
+          (keep-indexed
+           (fn [position entry]
+             (when-let [equation (get equations (:equation entry))]
+               (let [observations (into [] (mapcat #(-> (emitted-program/operation-projection
+                                                         (:projections state) %) :stage-results))
+                                        (:operations equation))]
+                 (when (seq observations)
+                   [position {:equation (:id equation) :observations observations}])))))
+          (:source-order state))))
+
+(defn- completed-storage-boundary
+  [state caller-options bindings]
+  (require-completed-source! state caller-options)
+  (let [scalars (merge (invocation-shape-scalars (:materialization state))
+                       (:program-scalars bindings) (:host-scalars state))
+        realized (:realized state)
+        output-bindings (program-call/project-output-bindings
+                         (:program state) (:buffers realized) scalars)
+        outputs (into [] (keep (fn [id]
+                                (let [binding (get output-bindings id)]
+                                  (when-not (typed-scalar? binding) [id binding]))))
+                      (get-in state [:program :outputs]))
+        tokens (mapv second outputs)
+        layout (storage-link-layout realized scalars (:target state) (set tokens)
+                                    (keys (:storage realized)))
+        ;; Initializers have already run. This boundary must not replay them.
+        nodes (mapv #(assoc % :source nil) (:nodes layout))]
+    (link/make-storage-boundary
+     {:id [(get-in state [:materialization :plan :id]) :completed-storage]
+      :target (:target state) :nodes nodes :values (:values layout) :outputs (vec (distinct tokens))
+      :aliases (into #{} (map set) (bview/overlapping-id-pairs (map (juxt :id :view) nodes)))
+      :attributes {:source :typed-invocation :semantic-outputs outputs
+                   :compiler-buffer-bindings (:buffers realized)}})))
+
+(defn ^:no-doc finish-ordered-storage-boundary
+  "Project completed source storage after strict whole-invocation materialization.
+   The runtime must still check observations, initialized ranges and live acquired roots."
+  [state caller-options]
+  (completed-storage-boundary state caller-options
+                              (materialization/finish-materialization (:materialization state))))
+
+(defn ^:no-doc finish-ordered-prefix-storage-boundary
+  "Project available storage without claiming a completed MaterializedInvocation.
+   The SourceOwner caller owes original-source completion and exact unread-parameter identity
+   and demand checks. This pure projection grants no execution or lifetime authority."
+  [state caller-options]
+  (let [materialized (materialization/validate-state! (:materialization state))]
+    (when-not (= (:next-step materialized) (count (get-in materialized [:plan :steps])))
+      (fail! :invocation-ordered-incomplete "invocation suffix is still unevaluated" {}))
+    (completed-storage-boundary state caller-options (materialization/prefix-bindings materialized))))
+
 (defn ^:no-doc finish-ordered-realization
   "Construct and independently validate the ordinary whole-program boundary after source work.
    Cached host results are looked up, not recomputed. Zeroed source allocations remain conditional
    initialized inputs; the runtime must prove their actual completed initialization before export."
   [state caller-options]
-  (when-not (= caller-options (:caller-options state))
-    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
-  (when-not (and (nil? (:pending state))
-                 (= (:source-cursor state) (count (:source-order state))))
-    (fail! :invocation-ordered-incomplete "source work has not completed" {}))
+  (require-completed-source! state caller-options)
   (let [materialized (materialization/finish-materialization (:materialization state))
         initialized-tokens (into #{}
                                  (keep (fn [[token storage]]

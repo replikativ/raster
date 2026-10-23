@@ -4,6 +4,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.scalar.local-products :as products]
@@ -15,6 +16,55 @@
   (fn [test!]
     (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
       (test!))))
+
+(deftest a-boxed-entry-logical-declaration-is-not-an-owned-producer-fact
+  (let [term (completion/complete-value
+              (completion/bytecode-boxed-parameter-contract Float/TYPE) 'input)]
+    (is (= 'float (:raster.type/tag (meta term))))
+    (is (nil? (normal/completed-scalar-fact term {} *ns*)))
+    (is (nil? (normal/completed-scalar-fact term {'input {:carrier Object}} *ns*)))))
+
+(deftest completion-presence-does-not-infer-a-payload-or-authorize-execution
+  (doseq [contract [completion/object-input-contract
+                    (completion/reference-check-contract Number)
+                    (completion/bytecode-reference-input-contract
+                     (class (double-array 0)) (completion/bytecode-operand-context {}))]]
+    (is (= {:presence :absent}
+           (normal/result-fact (completion/complete-value contract nil))))
+    (is (= {:presence :unknown}
+           (normal/result-fact (completion/complete-value contract 'unknown))))
+    (is (= {:presence :present :array-tag 'doubles}
+           (normal/result-fact (completion/complete-value contract 'input)
+                               {'input {:presence :present :array-tag 'doubles}}))))
+  (doseq [contract [(completion/primitive-input-contract Double/TYPE {:unchecked-math false})
+                    (completion/bytecode-floating-input-contract
+                     Float/TYPE (completion/bytecode-operand-context {}))
+                    (completion/bytecode-integral-input-contract
+                     Long/TYPE (completion/bytecode-operand-context {}))]]
+    (is (= {:presence :present}
+           (normal/result-fact (completion/complete-value contract 'unknown))))
+    (is (= {:presence :no-return}
+           (normal/result-fact (completion/complete-value contract '(throw error))))))
+  (is (= {:presence :unknown}
+         (normal/result-fact (list completion/completion-symbol
+                                   (assoc completion/object-input-contract :policy :invalid) nil)))))
+
+(deftest proved-completion-presence-must-not-erase-a-reference-check
+  (let [contract (completion/reference-check-contract Number)
+        source (list 'let* ['before '(clojure.core/aset events 0 7)
+                            'checked (completion/complete-value contract "not a Number")
+                            'after '(clojure.core/aset events 1 11)]
+                     '(if (clojure.core/nil? checked) 1 2))
+        lowered (:form (dce/eliminate-dead-bindings (products/lower-local-products source)))
+        outcome (fn [expression]
+                  (let [events (int-array [0 0])
+                        projected (completion/project-to-jvm-source expression nil
+                                                                     {Number 'checked-class})
+                        f (eval (list 'fn ['checked-class 'events] projected))]
+                    (try {:value (f Number events) :events (vec events)}
+                         (catch Throwable error {:error (class error) :events (vec events)}))))]
+    (is (= {:error ClassCastException :events [7 0]}
+           (outcome source) (outcome lowered)))))
 
 (deftest presence-refinement-must-not-delete-a-trapping-read
   (doseq [size [0 1]]

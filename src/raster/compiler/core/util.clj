@@ -73,7 +73,7 @@
      (symbol? e) (if (free-leaf? e bound) #{e} #{})
 
      ;; quote is opaque — its contents are data, not code
-     (and (seq? e) (= 'quote (first e))) #{}
+     (and (seq? e) (contains? #{'quote 'clojure.core/quote} (first e))) #{}
 
      (seq? e)
      (if-let [{:keys [scopes outer sequential? rec?]} (form/scope-info e)]
@@ -143,19 +143,19 @@
    a binder free in some smap value → alpha-rename it so substituted values keep
    referring to the OUTER binding. `leaf-fn` is the symbol-substitution policy
    (see subst-syms)."
-  [smap {:keys [binders inits body aux]} sequential? rec? leaf-fn]
+  [smap {:keys [binders inits body aux]} sequential? rec? leaf-fn observe!]
   (if sequential?
     ;; let*/loop*: thread — init_k sees bound + prior binders
     (let [[sm binders' inits']
           (reduce (fn [[sm bs is] [b i]]
-                    (let [i'   (subst-syms sm i leaf-fn)
+                    (let [i'   (subst-syms sm i leaf-fn observe!)
                           cap? (and (symbol? b) (contains? (smap-value-frees sm) b))
                           [b' sm'] (if cap?
                                      (let [f (fresh-like b)] [f (assoc (dissoc sm b) b f)])
                                      [b (if (symbol? b) (dissoc sm b) sm)])]
                       [sm' (conj bs b') (conj is i')]))
                   [smap [] []] (map vector binders inits))]
-      {:binders binders' :inits inits' :body (mapv #(subst-syms sm % leaf-fn) body)})
+      {:binders binders' :inits inits' :body (mapv #(subst-syms sm % leaf-fn observe!) body)})
     ;; fn*/letfn*/par/catch/dotimes: all binders enter scope at once
     (let [vfrees (smap-value-frees smap)
           [binders' rename]
@@ -168,18 +168,27 @@
       {:binders binders'
        ;; only :rec? forms (letfn*) let inits see the binders; others' inits
        ;; (none, in the closed core) would see the outer smap
-       :inits (mapv #(subst-syms (if rec? inner smap) % leaf-fn) inits)
-       :body  (mapv #(subst-syms inner % leaf-fn) body)
+       :inits (mapv #(subst-syms (if rec? inner smap) % leaf-fn observe!) inits)
+       :body  (mapv #(subst-syms inner % leaf-fn observe!) body)
        ;; :aux (ftm source-body) shares the arity scope — rename it CONSISTENTLY
        ;; with the body so the raw AD payload never desyncs from the walked code.
-       :aux  (some->> aux (mapv #(subst-syms inner % leaf-fn)))})))
+       :aux  (some->> aux (mapv #(subst-syms inner % leaf-fn observe!)))})))
 
 (defn subst-scoped
   "Capture-avoiding substitution for an IR owner's separately stored binders and ordered body.
    Returns the common scope-info shape; uses the same scope engine as subst-syms."
   [smap binders body]
   (subst-scope smap {:binders binders :inits [] :body body}
-               false false (fn [sm expression] (get sm expression expression))))
+               false false (fn [sm expression] (get sm expression expression)) nil))
+
+(defn subst-symbol-preserving-meta
+  "Shared symbol substitution leaf retaining use-site type/call metadata."
+  [smap expr]
+  (let [replacement (get smap expr expr)]
+    (if (and (not (identical? replacement expr))
+             (symbol? replacement) (meta expr))
+      (vary-meta replacement merge (meta expr))
+      replacement)))
 
 (defn subst-syms
   "Capture-avoiding substitution of free symbol occurrences per
@@ -192,29 +201,35 @@
 
    `leaf-fn` (optional) is the symbol-substitution policy `(fn [smap sym] -> expr)`;
    default is plain `(get smap sym sym)`. Pass a custom leaf to preserve use-site
-   metadata onto the replacement (the inliner does this for type-tag propagation)."
+   metadata onto the replacement (the inliner does this for type-tag propagation).
+   Optional observe! receives [original constructed substitution-env] at actual
+   returns. The existing empty-map fast path remains opaque to nested traversal."
   ([smap expr] (subst-syms smap expr (fn [sm e] (get sm e e))))
-  ([smap expr leaf-fn]
-   (if (empty? smap)
+  ([smap expr leaf-fn] (subst-syms smap expr leaf-fn nil))
+  ([smap expr leaf-fn observe!]
+   (let [constructed
+    (if (empty? smap)
      expr
      (cond
        (symbol? expr) (leaf-fn smap expr)
 
-       (and (seq? expr) (= 'quote (first expr))) expr
+       (and (seq? expr) (contains? #{'quote 'clojure.core/quote} (first expr))) expr
 
        (seq? expr)
        (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expr)]
-         (rebuild (mapv #(subst-scope smap % sequential? rec? leaf-fn) scopes)
-                  (mapv #(subst-syms smap % leaf-fn) outer))
-         (remake-from expr (map #(subst-syms smap % leaf-fn) expr)))
+         (rebuild (mapv #(subst-scope smap % sequential? rec? leaf-fn observe!) scopes)
+                  (mapv #(subst-syms smap % leaf-fn observe!) outer))
+         (remake-from expr (map #(subst-syms smap % leaf-fn observe!) expr)))
 
-       (vector? expr) (mapv #(subst-syms smap % leaf-fn) expr)
+       (vector? expr) (with-meta (mapv #(subst-syms smap % leaf-fn observe!) expr) (meta expr))
        ;; IR records (KernelBody IndexExpr, SegOps, ...) are maps whose type must survive:
        ;; substitute inside their fields, never `empty` them.
-       (record? expr) (reduce-kv (fn [r k v] (assoc r k (subst-syms smap v leaf-fn))) expr expr)
-       (map? expr) (into (empty expr) (map (fn [[k v]] [(subst-syms smap k leaf-fn) (subst-syms smap v leaf-fn)]) expr))
-       (set? expr) (into (empty expr) (map #(subst-syms smap % leaf-fn) expr))
-       :else expr))))
+       (record? expr) (reduce-kv (fn [r k v] (assoc r k (subst-syms smap v leaf-fn observe!))) expr expr)
+       (map? expr) (into (empty expr) (map (fn [[k v]] [(subst-syms smap k leaf-fn observe!) (subst-syms smap v leaf-fn observe!)]) expr))
+       (set? expr) (into (empty expr) (map #(subst-syms smap % leaf-fn observe!) expr))
+       :else expr))]
+     (when observe! (observe! expr constructed smap))
+     constructed)))
 
 (declare alpha-convert)
 
@@ -222,34 +237,38 @@
   "Alpha-rename one scope's binders to fresh names, threading env correctly:
    sequential inits see prior binders; :rec? inits see all binders; otherwise
    inits see only the enclosing env."
-  [env {:keys [binders inits body aux]} sequential? rec?]
+  [env {:keys [binders inits body aux]} sequential? rec? observe!]
   (if sequential?
     (let [[env' binders' inits']
           (reduce (fn [[env bs is] [b i]]
-                    (let [i' (alpha-convert env i)            ;; init sees prior binders
+                    (let [i' (alpha-convert env i observe!)   ;; init sees prior binders
                           [b' env'] (if (symbol? b)
                                       (let [f (fresh-like b)] [f (assoc env b f)])
                                       [b env])]
                       [env' (conj bs b') (conj is i')]))
                   [env [] []] (map vector binders inits))]
-      {:binders binders' :inits inits' :body (mapv #(alpha-convert env' %) body)})
+      {:binders binders' :inits inits' :body (mapv #(alpha-convert env' % observe!) body)})
     (let [pairs (mapv (fn [b] [b (if (symbol? b) (fresh-like b) b)]) binders)
           env'  (into env (filter (comp symbol? first) pairs))
           binders' (mapv second pairs)]
       {:binders binders'
-       :inits (mapv #(alpha-convert (if rec? env' env) %) inits)
-       :body  (mapv #(alpha-convert env' %) body)
+       :inits (mapv #(alpha-convert (if rec? env' env) % observe!) inits)
+       :body  (mapv #(alpha-convert env' % observe!) body)
        ;; ftm source-body (:aux) shares the arity scope — rename consistently
-       :aux  (some->> aux (mapv #(alpha-convert env' %)))})))
+       :aux  (some->> aux (mapv #(alpha-convert env' % observe!)))})))
 
 (defn alpha-convert
   "Alpha-rename EVERY bound variable in a closed-core form to a fresh gensym,
    consistently rewriting references through env. Generic over form/scope-info.
    Use to make hygienic copies of a body (e.g. unrolled fold iterations) so two
-   copies don't conflate their loop indices / accumulators. `quote` is opaque."
+   copies don't conflate their loop indices / accumulators. `quote` is opaque.
+   Optional observe! receives each actual [original constructed lexical-env]
+   return; it supplies occurrence provenance, not an equivalence proof."
   ([form] (alpha-convert {} form))
-  ([env form]
-   (cond
+  ([env form] (alpha-convert env form nil))
+  ([env form observe!]
+   (let [constructed
+    (cond
      ;; Preserve the reference's metadata (esp. :raster.type/tag) onto the fresh
      ;; name — else a re-walk after inlining can't re-devirtualize arithmetic whose
      ;; operand type lived only on the renamed symbol (e.g. an inlined SDPA's
@@ -263,17 +282,19 @@
                       (if (and (not (identical? r form)) (symbol? r) (meta form))
                         (with-meta r (merge (meta form) (meta r)))
                         r))
-     (and (seq? form) (= 'quote (first form))) form
+     (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) form
      (seq? form)
      (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)]
-       (rebuild (mapv #(alpha-scope env % sequential? rec?) scopes)
-                (mapv #(alpha-convert env %) outer))
-       (remake-from form (map #(alpha-convert env %) form)))
-     (vector? form) (mapv #(alpha-convert env %) form)
-     (record? form) (reduce-kv (fn [r k v] (assoc r k (alpha-convert env v))) form form)
-     (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k) (alpha-convert env v)]) form))
-     (set? form) (into (empty form) (map #(alpha-convert env %) form))
-     :else form)))
+       (rebuild (mapv #(alpha-scope env % sequential? rec? observe!) scopes)
+                (mapv #(alpha-convert env % observe!) outer))
+       (remake-from form (map #(alpha-convert env % observe!) form)))
+     (vector? form) (with-meta (mapv #(alpha-convert env % observe!) form) (meta form))
+     (record? form) (reduce-kv (fn [r k v] (assoc r k (alpha-convert env v observe!))) form form)
+     (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k observe!) (alpha-convert env v observe!)]) form))
+     (set? form) (into (empty form) (map #(alpha-convert env % observe!) form))
+     :else form)]
+     (when observe! (observe! form constructed env))
+     constructed)))
 
 (defn alpha-normalize
   "Canonicalize compiler freshness suffixes on lexical binders in a closed-core form.
@@ -312,6 +333,8 @@
 
 (declare uniquify*)
 
+(def ^:dynamic ^:private *uniquify-observer* nil)
+
 (defn- uniquify-scope
   "Uniquify one scope's binders, threading [env bound]: a binder that SHADOWS a
    name already in `bound` is renamed to a fresh name (and recorded in env);
@@ -341,9 +364,9 @@
 
 (defn- uniquify*
   [env bound form]
-  (cond
+  (let [result (cond
     (symbol? form) (get env form form)
-    (and (seq? form) (= 'quote (first form))) form
+    (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
     (seq? form)
     (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)]
       (rebuild (mapv #(uniquify-scope env bound % sequential? rec?) scopes)
@@ -353,7 +376,13 @@
     (record? form) (reduce-kv (fn [r k v] (assoc r k (uniquify* env bound v))) form form)
     (map? form) (into (empty form) (map (fn [[k v]] [(uniquify* env bound k) (uniquify* env bound v)]) form))
     (set? form) (into (empty form) (map #(uniquify* env bound %) form))
-    :else form))
+    :else form)]
+    ;; Observe the actual reconstruction, never a second walk or a replacement
+    ;; returned by the observer. Scope maps are the immutable lexical inputs to
+    ;; this exact recursive invocation. Disabled observation allocates no event.
+    (when *uniquify-observer*
+      (*uniquify-observer* form result env bound))
+    result))
 
 (defn scope-blind-substitution-safe?
   "Is a scope-BLIND symbol substitution of `smap` over `expr` provably equivalent to the
@@ -406,9 +435,18 @@
    buffer conflates the input and output buffers in materialize/buffer analysis —
    the output alloc is bound to `up`, so the map body's read of `up` resolves to
    the uninitialized output. Distinct SSA names remove the hazard (matches what a
-   hand-written distinct binding does)."
+   hand-written distinct binding does).
+
+   Optional observer receives [original constructed lexical-renaming bound-names]
+   after each actual recursive reconstruction; its return value is ignored.
+   Quoted data is opaque. Observation alone grants no source/execution authority."
   ([form] (uniquify-rebindings #{} form))
-  ([params form] (uniquify* {} (set params) form)))
+  ([params form] (uniquify-rebindings params form nil))
+  ([params form observe!]
+   ;; Each public invocation owns its observer. A nested independent call from
+   ;; an allocator/observer must not pollute its enclosing reconstruction trace.
+   (binding [*uniquify-observer* observe!]
+     (uniquify* {} (set params) form))))
 
 (defn remake
   "Construct a new list form preserving metadata from orig.
@@ -466,21 +504,26 @@
   "Bottom-up tree rewrite that preserves metadata on every rebuilt collection.
 
    Quoted data is opaque. A replacement returned by `f` keeps its own metadata; metadata from the
-   replaced node is not incorrectly transferred onto a semantically different value."
-  [f expression]
-  (letfn [(go [form]
-            (f
-             (cond
-               (and (seq? form) (= 'quote (first form))) form
-               (seq? form) (remake-from form (map go form))
-               (vector? form) (with-meta (mapv go form) (meta form))
-               (record? form) (reduce-kv (fn [r k v] (assoc r k (go v))) form form)
-               (map? form) (with-meta
-                             (into (empty form) (map (fn [[k v]] [(go k) (go v)])) form)
-                             (meta form))
-               (set? form) (with-meta (into (empty form) (map go) form) (meta form))
-               :else form)))]
-    (go expression)))
+   replaced node is not incorrectly transferred onto a semantically different value.
+   Unchanged seq/vector children retain the original occurrence, not an equal copy.
+   Optional observer receives [original constructed] at each actual recursive
+   reconstruction; its return value is ignored and grants no semantic authority."
+  ([f expression] (postwalk-preserving-meta f expression nil))
+  ([f expression observe!]
+   (letfn [(go [form]
+             (let [constructed
+                   (f (cond
+                        (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
+                        (or (seq? form) (vector? form)) (remake-if-changed form (mapv go form))
+                        (record? form) (reduce-kv (fn [r k v] (assoc r k (go v))) form form)
+                        (map? form) (with-meta
+                                      (into (empty form) (map (fn [[k v]] [(go k) (go v)])) form)
+                                      (meta form))
+                        (set? form) (with-meta (into (empty form) (map go) form) (meta form))
+                        :else form))]
+               (when observe! (observe! form constructed))
+               constructed))]
+     (go expression))))
 
 (defn call-head
   "Extract the head symbol from a call expression.
@@ -513,6 +556,10 @@
   [impl-sym]
   (mangled/impl->op impl-sym))
 
+(defn- invk-metadata [impl-sym original-meta]
+  (let [op (or (:raster.op/original original-meta) (impl->op impl-sym))]
+    (cond-> (or original-meta {}) op (assoc :raster.op/original op))))
+
 (defn make-invk
   "Construct a (.invk impl args...) form with :raster.op/original metadata.
    Always attaches {:raster.op/original original-op} so downstream passes can identify the operation.
@@ -520,10 +567,16 @@
   ([impl-sym args]
    (make-invk impl-sym args nil))
   ([impl-sym args original-meta]
-   (let [op (or (:raster.op/original original-meta) (impl->op impl-sym))
-         m (cond-> (or original-meta {})
-             op (assoc :raster.op/original op))]
-     (with-meta (list* '.invk impl-sym args) m))))
+   (with-meta (list* '.invk impl-sym args) (invk-metadata impl-sym original-meta))))
+
+(defn remake-invk-if-changed
+  "Reconstruct a retained invocation with make-invk's metadata contract.
+   Unchanged ordered children AND metadata retain the original occurrence.
+   An explicit original operation remains authoritative over mangled spelling."
+  [original impl-sym args]
+  (let [rebuilt (remake-if-changed original (list* (first original) impl-sym args))
+        desired (invk-metadata impl-sym (meta original))]
+    (if (= desired (meta rebuilt)) rebuilt (with-meta rebuilt desired))))
 
 (defn void-form?
   "Does this form have NO return value — i.e. is it a statement rather than an expression?

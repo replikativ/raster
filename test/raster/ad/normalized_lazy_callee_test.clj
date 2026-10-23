@@ -20,7 +20,7 @@
       (with-redefs [core/do-bytecode-upgrade!
                     (fn [& args]
                       (is (= [v 'lazy '[x] '[double] 'double '[x] source-ns nil
-                              :annotations nil :source-body nil] (vec args)))
+                              :annotations nil :source-body nil :source-policy nil] (vec args)))
                       (swap! calls inc)
                       (alter-var-root v (constantly compiled)))]
         (core/ensure-bytecode-implementation! v)

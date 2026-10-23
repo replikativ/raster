@@ -45,3 +45,63 @@
   (is (nil? (constant/value 'java.lang.user/MAX_VALUE)))
   (is (nil? (constant/value 'user/MAX_VALUE)))
   (is (nil? (constant/value '(int user/MAX_VALUE)))))
+
+(deftest source-constant-evidence-retains-checked-floating-conversions
+  (doseq [value [0.0 -0.0 Math/PI Double/NaN]]
+    (is (= (Float/floatToIntBits (float value))
+           (Float/floatToIntBits
+            (:value (constant/source-value (list 'clojure.core/float value)))))))
+  (is (= {:value 1.0} (constant/source-value '(clojure.core/double 1.0))))
+  (is (= {:value 1.0} (constant/source-value '(clojure.core/double (clojure.core/float 1.0)))))
+  (doseq [value [Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+    (is (thrown? IllegalArgumentException (float value)))
+    (is (nil? (constant/source-value (list 'clojure.core/float value))))
+    (is (Float/isInfinite (:value (constant/value (list 'clojure.core/float value))))))
+  (doseq [expression ['(float 1.0) '(clojure.core/float x) '(clojure.core/byte 256)
+                      '(clojure.core/double (do (effect!) 1.0))
+                      '(clojure.core/double java.lang.Double/POSITIVE_INFINITY)
+                      (with-meta '(clojure.core/double 1.0) {:raster.op/lexical-callee true})]]
+    (is (nil? (constant/source-value expression)) (str expression))))
+
+(deftest source-literal-proofs-use-the-actual-floating-carrier
+  (doseq [[carrier source-oracles]
+          [[:double [[(quote clojure.core/byte) (fn [^double v] (byte v))]
+                     [(quote clojure.core/int) (fn [^double v] (int v))]
+                     [(quote clojure.core/long) (fn [^double v] (long v))]]]
+           [:float [[(quote clojure.core/byte) (fn [^double v] (byte (unchecked-float v)))]
+                    [(quote clojure.core/int) (fn [^double v] (int (unchecked-float v)))]
+                    [(quote clojure.core/long) (fn [^double v] (long (unchecked-float v)))]]]]
+          [source-op oracle] source-oracles
+          v [0.0 -0.0 1.75 127.5 -128.5 2147483647.5 -2147483648.5
+             (Math/nextDown (double Long/MAX_VALUE)) (double Long/MAX_VALUE)
+             (Math/nextUp (double Long/MAX_VALUE))
+             (Math/nextDown (double Long/MIN_VALUE)) (double Long/MIN_VALUE)
+             Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/NaN]]
+    (let [value (if (= :float carrier) (unchecked-float v) v)
+          expected (try {:value (oracle (double value))}
+                        (catch IllegalArgumentException _ nil))
+          evidence (constant/source-value (list source-op value))]
+      (is (= (if (= :float carrier) Float Double) (class value)))
+      (is (= expected evidence) (str carrier " " source-op " " value)))))
+
+(deftest constant-proof-depth-abstains-without-executing-or-overflowing
+  (let [expression (nth (iterate #(list 'clojure.core/double %) 1.0) 1024)]
+    (is (nil? (constant/source-value expression)))
+    (is (nil? (constant/value expression)))
+    (is (= expression (constant/literal-or-original expression)))))
+
+(deftest unchecked-float-source-evidence-preserves-ieee-narrowing
+  (doseq [value [0.0 -0.0 Math/PI Double/MAX_VALUE Double/POSITIVE_INFINITY
+                 Double/NEGATIVE_INFINITY Double/NaN]]
+    (let [form (list 'clojure.core/unchecked-float value)
+          expected (Float/floatToIntBits (unchecked-float value))]
+      (is (= expected (Float/floatToIntBits (:value (constant/source-value form)))))
+      (is (= expected (Float/floatToIntBits (:value (constant/value form)))))))
+  (doseq [expression ['(unchecked-float 1.0) '(other/unchecked-float 1.0)
+                      '(clojure.core/unchecked-float nil)
+                      '(clojure.core/unchecked-float true)
+                      '(clojure.core/unchecked-float (do (effect!) 1.0))
+                      '(clojure.core/unchecked-float 1.0 2.0)
+                      (with-meta '(clojure.core/unchecked-float 1.0)
+                        {:raster.op/lexical-callee true})]]
+    (is (nil? (constant/source-value expression)) (str expression))))

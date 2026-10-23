@@ -19,14 +19,86 @@
   dispatch: it is always a bug, and the inliner must say so AT THE CALL — naming the
   callee and both arities."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.par]
             [raster.numeric]
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.util :as util]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
+
+(defn- compile-projected-entry [[head parameters & body]]
+  ;; Generated preparation includes bytecode-owned completion syntax. Exercise
+  ;; its actual consumer, never eval a source approximation of that syntax.
+  (assert (and (= 'fn head) (vector? parameters)))
+  (let [tags (vec (repeat (count parameters) 'Object))
+        interface (types/ensure-fn-interface! tags)]
+    (:implementation
+     (core/emit-owned-bytecode!
+      bytecode/compile-typed-impl! "raster.compiled.InlineProjectionTest"
+      parameters tags 'Object (vec body)
+      (the-ns 'raster.compiler.passes.scalar.inline-test)
+      (:iface-name interface) 'inline-projection-test))))
+
+(deftest helper-expansion-keeps-opaque-occurrences-and-quoted-data
+  (let [call (util/make-invk 'example/opaque_m_double-impl ['x])]
+    (with-redefs-fn {#'inline/try-resolve-deftm (constantly nil)}
+      #(doseq [source [call
+                      (with-meta (list 'outer call 'y) {:line 27})
+                      (with-meta [call 'y] {:line 28})
+                      (list 'let* ['saved call] 'saved)
+                      (list 'do call 'x)]]
+         (is (identical? source (#'inline/inline-invk source))))))
+  (with-redefs-fn {#'inline/try-resolve-deftm
+                  (fn [& _] (throw (Exception. "quoted helper was resolved")))}
+    #(doseq [head '[quote clojure.core/quote]]
+       (let [source (list head '(.invk example/helper x))]
+         (is (identical? source (#'inline/inline-invk source)))))))
+
+(deftest legacy-source-reconstruction-cannot-enter-bytecode-owned-completions
+  (let [context (completion/bytecode-operand-context {})
+        operand '(outer ((raster.ad.reverse/value+grad (var unsupported-helper)) x))]
+    (doseq [contract [(completion/bytecode-reference-input-contract Object context)
+                      (completion/bytecode-integral-input-contract Long/TYPE context)
+                      (completion/bytecode-floating-input-contract Double/TYPE context)
+                      (completion/bytecode-result-context-contract context :ref)]]
+      (let [region (completion/complete-value contract operand)
+            hoisted (#'inline/hoist-nested-vg ['answer region] [region])
+            rewritten (#'inline/rewrite-D-calls-in-form region)]
+        (is (completion/bytecode-context-form? region))
+        (is (false? (:changed? hoisted)))
+        (is (identical? region (second (:bindings hoisted))))
+        (is (identical? region (first (:body hoisted))))
+        (is (empty? (:bindings rewritten)))
+        (is (identical? region (:form rewritten)))
+        (is (identical? region (#'inline/inline-invk region)))
+        (is (identical? region (#'inline/resolve-dispatch-walk region {})))))
+    (is (false? (completion/bytecode-context-form?
+                 (completion/complete-value completion/object-input-contract operand)))
+        "source Object completion is not silently relabelled as bytecode authority")
+    (is (false? (completion/bytecode-context-form? '(ordinary-call x))))))
+
+(deftest tracked-gradient-tuples-cannot-rewrite-a-sealed-bytecode-region
+  (let [region (completion/complete-value
+                (completion/bytecode-reference-input-contract
+                 Object (completion/bytecode-operand-context {}))
+                '(clojure.core/nth vg 1))
+        source (list 'let* ['vg '((raster.ad.reverse/value+grad (var example/loss)) x)
+                           'ordinary '(clojure.core/nth vg 1) 'sealed region]
+                     ['ordinary region])
+        expanded (with-redefs [inline/inline-value+grad-call
+                              (fn [& _] {:bindings [] :elements [17.0 23.0]})]
+                   (:form (#'inline/inline-one-pass source)))
+        bindings (into {} (map vec (partition 2 (second expanded))))]
+    (is (= 23.0 (get bindings 'ordinary)) "tracked VG projection is exercised outside the region")
+    (is (identical? region (get bindings 'sealed)))
+    (is (identical? region (second (last expanded))))))
 
 (deftest no-op-ad-hoisting-preserves-exact-source-occurrences
   (let [leaf (with-meta '(helper x) {:source-marker :leaf})
@@ -78,6 +150,28 @@
       (is (= 4 (count (:bindings result))))
       (is (identical? quoted (second (nth (:bindings result) 3)))))))
 
+(deftest actual-inliner-retains-formal-class-import-history
+  (let [name (gensym "raster.formal.qualification.")
+        source (create-ns name)]
+    (try
+      (binding [*ns* source]
+        (clojure.core/refer 'clojure.core)
+        (.importClass ^clojure.lang.Namespace source java.util.Date)
+        (eval '(raster.core/deftm helper [unused :- Date] :- Long (let [one 1] one))))
+      (binding [entry/*emission-inputs* (atom {:static [] :values []})]
+        (let [helper (ns-resolve source 'helper_m_Date)
+              info (#'inline/try-resolve-walked-body helper)
+              inputs @entry/*emission-inputs*]
+          (is (= '[java.util.Date] (:tags info)))
+          (is (seq (:walked-body info)))
+          (is (entry/assert-definition-inputs-current! inputs))
+          (ns-unmap source 'Date)
+          (.importClass ^clojure.lang.Namespace source java.sql.Date)
+          (is (= :stale-source-resolution
+                 (try (entry/assert-definition-inputs-current! inputs) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+      (finally (remove-ns name)))))
+
 (deftest anf-bindings-carry-existing-result-types-without-reinference
   (let [result (with-meta 'rhs {:raster.type/tag 'doubles})
         effect (with-meta 'effect {:raster.effect/effectful true})
@@ -118,6 +212,16 @@
                   '(fn* [a] (let* [x a] x))]]
     (let [source (list 'let* ['result opaque] 'result)]
       (is (= source (inline/flatten-nested-lets source))))))
+
+(deftest wrapper-normalization-does-not-discard-evaluation-denials
+  (let [wrapped (with-meta '(let* [unused (clojure.core// x 0)] 7.0)
+                  {:raster.effect/preserve-evaluation true})
+        source (list 'let* ['result wrapped] 'result)]
+      (let [normalized (inline/flatten-nested-lets source)
+            initializer (nth (second normalized) 1)]
+        (is (= wrapped initializer))
+        (is (true? (:raster.effect/preserve-evaluation (meta initializer))))
+        (is (false? (effects/removable-expr? initializer))))))
 
 (defn- run-normalization [source]
   (let [trace (atom [])
@@ -240,12 +344,34 @@
 (deftm argument-effect-loss [x :- Double unused :- Double] :- Double
   (* x x))
 
+(deftest gradient-result-selection-does-not-copy-unchanged-prepared-initializers
+  (let [captured (atom nil)
+        project inline/inline-value+grad-call
+        source '(let* [vg ((raster.ad.reverse/value+grad
+                            (var raster.compiler.passes.scalar.inline-test/option-loss)
+                            :wrt [0]) x y)]
+                  (clojure.core/nth vg 1))
+        expanded (with-redefs [inline/inline-value+grad-call
+                              (fn [& arguments]
+                                (let [result (apply project arguments)]
+                                  (reset! captured result)
+                                  result))]
+                   (:form (#'inline/inline-one-pass source)))
+        final-bindings (into {} (map vec) (partition 2 (second expanded)))
+        initializers (filter (comp seq? second) (:bindings @captured))]
+    (is (seq initializers))
+    (doseq [[id initializer] initializers]
+      (is (identical? initializer (get final-bindings id)))
+      (is (= (meta initializer) (meta (get final-bindings id)))))
+    (is (= (second (:elements @captured)) (get final-bindings (last expanded))))
+    (is (= 7.0 ((compile-projected-entry (list 'fn '[x y] expanded)) 2.0 3.0)))))
+
 (deftest ad-arguments-evaluate-once-in-source-order-even-when-unused
   (doseq [mode [:value+grad :grad]]
     (let [expanded (inline/inline-value+grad-call
                     {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
                      :args '[(draw :first) (draw :unused)] :mode mode})
-          f (eval (list 'fn '[draw]
+          f (compile-projected-entry (list 'fn '[draw]
                         (list 'let* (vec (mapcat identity (:bindings expanded)))
                               (:elements expanded))))
           trace (atom [])
@@ -277,10 +403,13 @@
   (let [expanded (inline/inline-value+grad-call
                   {:var-sym 'raster.compiler.passes.scalar.inline-test/option-one-loss
                    :args '[(clojure.core/float (draw))] :mode :value+grad})
-        [argument expression] (first (:bindings expanded))]
-    (is (= '(clojure.core/float (draw)) expression))
-    (is (= 'float (:raster.type/tag (meta argument)))
-        "the Double formal must not widen the lifted Float producer")))
+        [argument expression] (first (:bindings expanded))
+        [_ converted] (second (:bindings expanded))]
+    (is (= completion/object-input-contract (:contract (completion/canonical-parts expression))))
+    (is (= '(clojure.core/float (draw)) (:operand (completion/canonical-parts expression)))
+        "the original Float producer completes before the Double parameter conversion")
+    (is (nil? (meta argument)) "the Object staging port is not stamped with a formal dtype")
+    (is (identical? Double/TYPE (:target-carrier (:contract (completion/canonical-parts converted)))))))
 
 (deftm option-overloaded-loss [x :- Float n :- Long] :- Float
   (raster.numeric/* x x))
@@ -295,7 +424,7 @@
           result (inline/inline-value+grad-call
                   {:var-sym callee :args '[x n] :mode :value+grad}
                   :param-env {'x tag 'n 'long})
-          f (eval (list 'fn '[x n]
+          f (compile-projected-entry (list 'fn '[x n]
                         (list 'let* (vec (mapcat identity (:bindings result)))
                               (:elements result))))
           actual (f argument (long 3))]
@@ -327,14 +456,14 @@
                              :mode :reverse :wrt [0])
                    vg (gradient x y)] vg)]]
     (let [expanded (inline/inline-deftm-calls source)
-          f (eval (list 'fn '[x y] expanded))]
+          f (compile-projected-entry (list 'fn '[x y] expanded))]
       (is (= [10.0 7.0 nil] (f 2.0 3.0)))
       (is (= ((rev/value+grad #'option-loss :wrt [0]) 2.0 3.0) (f 2.0 3.0)))))
   (let [source '(let* [gradient ((raster.ad.reverse/grad
                                   (var raster.compiler.passes.scalar.inline-test/option-loss)
                                   :wrt [0]) x y)] gradient)
         expanded (inline/inline-deftm-calls source)
-        f (eval (list 'fn '[x y] expanded))]
+        f (compile-projected-entry (list 'fn '[x y] expanded))]
     (is (= [7.0 nil] (f 2.0 3.0))))
   (doseq [source ['(let* [g ((raster.ad.reverse/grad
                              (var raster.compiler.passes.scalar.inline-test/option-one-loss)
@@ -344,14 +473,14 @@
                                     :wrt [0])
                           g (gradient x)] g)]]
     (let [expanded (inline/inline-deftm-calls source)
-          f (eval (list 'fn '[x] expanded))]
+          f (compile-projected-entry (list 'fn '[x] expanded))]
       (is (= ((rev/grad #'option-one-loss :wrt [0]) 2.0) (f 2.0)))
       (is (= 4.0 (f 2.0)))))
   (let [source '(let* [vg ((raster.ad.reverse/value+grad
                             (var raster.compiler.passes.scalar.inline-test/option-loss)
                             :wrt []) x y)] vg)
         expanded (inline/inline-deftm-calls source)
-        f (eval (list 'fn '[x y] expanded))]
+        f (compile-projected-entry (list 'fn '[x y] expanded))]
     (is (= [10.0 nil nil] (f 2.0 3.0))))
   (doseq [wrt [[-1] [2] [0 0]]]
     (is (thrown? clojure.lang.ExceptionInfo
@@ -416,6 +545,54 @@
                    '(.invk example/constant 1 (swap! calls inc))]]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Arity mismatch"
                              (#'inline/inline-invk call)))))))
+
+(deftest both-inline-entrypoints-share-ordered-expansion-construction
+  (let [build @#'inline/build-inline-expansion
+        modes (atom [])
+        info {:params '[unused value] :tags '[int long]
+              :walked-body '[(let* [copy value]
+                               (swap! calls conj :callee)
+                               (+ copy copy))]}]
+    (with-redefs-fn
+      {#'inline/try-resolve-deftm (fn [& _] info)
+       #'inline/build-inline-expansion
+       (fn [callee args environment substitute result caller & placement]
+         (swap! modes conj (if result :binding :nested))
+         (apply build callee args environment substitute result caller placement))}
+      (fn []
+        (doseq [mode [:binding :nested]
+                [first-value expected-events expected-result]
+                [[3 [:first :second :callee] [:value 14]]
+                 [4294967296 [:first] [:error ArithmeticException]]]]
+          (let [arguments [(list 'int (list 'do '(swap! calls conj :first) first-value))
+                           '(do (swap! calls conj :second) 7)]
+                expression (if (= :binding mode)
+                             (:form (#'inline/inline-one-pass
+                                     (list 'let* ['result (list* 'example/helper arguments)] 'result)))
+                             (#'inline/inline-invk (list* '.invk 'example/helper arguments)))
+                actual (eval (list 'let ['calls '(atom [])]
+                                   [(list 'try [:value expression]
+                                          (list 'catch 'Throwable 'error
+                                                [:error '(class error)]))
+                                    '(deref calls)]))]
+            (is (= [expected-result expected-events] actual))))))
+    (is (= [:binding :binding :nested :nested] @modes))))
+
+(deftest both-inline-entrypoints-retain-every-body-form
+  (with-redefs-fn
+    {#'inline/try-resolve-deftm
+     (fn [& _] {:params [] :tags []
+               :walked-body '[(swap! calls conj :first) (swap! calls conj :second) 42]})}
+    (fn []
+      (doseq [expression [(:form (#'inline/inline-one-pass
+                                 '(let* [result (example/helper)] result)))
+                          (#'inline/inline-invk '(.invk example/helper))]]
+        (is (= [42 [:first :second]]
+               (eval (list 'let ['calls '(atom [])] [expression '(deref calls)])))))
+      (binding [inline/*inline-size-limit* 6]
+        (is (= '(.invk example/helper)
+               (#'inline/inline-invk '(.invk example/helper)))
+            "the size budget must cover the whole body, not just its first form")))))
 
 (deftest unused-collection-arguments-still-evaluate-their-elements
   (with-redefs-fn {#'inline/try-resolve-deftm

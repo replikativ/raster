@@ -1,6 +1,7 @@
 (ns raster.compiler.core.call-boundary-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.call-boundary :as boundary]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.types :as types])
   (:import [java.lang.reflect Proxy InvocationHandler Method]
            [clojure.asm ClassWriter Opcodes]))
@@ -78,6 +79,30 @@
           (is (= expected (:parameter-classes result)))
           (is (= Object (:return-class result)))
           (is (zero? @calls)))))))
+
+(deftest selected-capture-never-restamps-a-definition-changed-by-preparation
+  (doseq [nested? [false true]]
+   (with-selected-definition
+    '[double]
+    (fn [{:keys [operation implementation arity method receiver-var calls]}]
+      (let [preparations (atom 0)
+            reason (binding [entry/*emission-inputs* (when nested? (atom {:static [] :values []}))]
+                    (try
+                     (boundary/capture-selected-emission!
+                      operation implementation arity method
+                      (fn [selected]
+                        (is (identical? receiver-var selected))
+                        (swap! preparations inc)
+                        ;; Each preparation changes the originally observed
+                        ;; definition. A fresh post-prepare snapshot cannot make
+                        ;; that attempt valid, even when its root is unchanged.
+                        (alter-meta! selected assoc ::preparation-revision (Object.))))
+                     :accepted
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+        (is (= :stale-definition-proof-input reason))
+        (is (= (if nested? 1 3) @preparations)
+            "A nested owner must propagate staleness, never retry around the parent's history")
+        (is (zero? @calls)))))))
 
 (deftest stale-source-or-executable-evidence-is-unknown
   (with-selected-definition

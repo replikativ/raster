@@ -143,6 +143,30 @@
         (ra/aset out i (ra/aget src index))))
     (par/reduce total 0.0 i size (n/+ total (ra/aget out i)))))
 
+(deftm fresh-map-with-unused-source-read
+  [x :- Double data :- (Array double) size :- Long] :- Double
+  (let [out (double-array size)]
+    (par/map-void! i size
+      (let [ignored (ra/aget data i)]
+        (ra/aset out i (n/* x x))))
+    (par/reduce total 0.0 i size (n/+ total (ra/aget out i)))))
+
+(deftest map-derivation-keeps-nonremovable-pure-source-evaluations
+  (let [prepared (rev/prepare-value+grad #'fresh-map-with-unused-source-read [0])
+        reverse (rev/value+grad #'fresh-map-with-unused-source-read :wrt [0])
+        forward (jvp/jvp #'fresh-map-with-unused-source-read :wrt [0])
+        data (double-array [7.0 8.0])]
+    (is (some #(and (seq? %) (= 'clojure.core/aget (first %))
+                    (:raster.effect/preserve-evaluation (meta %)))
+              (tree-seq coll? seq (:walked-body prepared)))
+        "source read obligations survive AD map canonicalization")
+    (is (= [18.0 12.0 nil nil] (reverse 3.0 data 2)))
+    (is (= [18.0 12.0] (forward 3.0 data 2 1.0)))
+    (doseq [execute [fresh-map-with-unused-source-read reverse
+                     (fn [x data size] (forward x data size 1.0))]]
+      (is (thrown? ArrayIndexOutOfBoundsException (execute 3.0 (double-array 0) 1)))
+      (is (thrown? NegativeArraySizeException (execute 3.0 data -1))))))
+
 (deftest fresh-gather-write-transposes-repeated-indices
   (let [src (double-array [2.0 3.0 5.0])
         indices (long-array [2 0 2])

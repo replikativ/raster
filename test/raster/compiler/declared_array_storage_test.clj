@@ -9,9 +9,11 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.dl.loss :as loss]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.hardware-fixture :as hardware-fixture]
             [raster.runtime.hardware :as hardware]))
 
@@ -25,6 +27,13 @@
              :capabilities {:total-eus 32 :subgroup-sizes [16]
                             :max-workgroup-size 1024 :shared-local-memory 65536}})
     (f)))
+
+(deftest shared-semantic-entry-discharges-array-reference-snapshots
+  (is (= [3.0 -4.0]
+         (vec (storage/object-context-array-map (double-array [1.5 -2.0])))))
+  (let [compiled (equation-first/compile #'storage/object-context-array-map
+                                       (merge policy {:target target :dtype :double}))]
+    (is (= :typed-parallel (get-in compiled [:semantic :dialect])))))
 
 (defn- pointer-types [artifact]
   (into {} (keep (fn [slot]
@@ -103,12 +112,16 @@
                      #'storage/mixed-scale-energy-gradient
                      (merge policy {:target target :dtype :double}))
         output (first (get-in compilation [:semantic :outputs]))]
-    (is (= :float (get-in compilation [:semantic :values output :dtype]))))
-  (let [outcome (compiled/lower
+    (is (= :double (get-in compilation [:semantic :values output :dtype])))
+    (is (= [:double] (mapv :dtype (get-in compilation [:semantic :attributes :invocation-plan
+                                                    :attributes :terminal-host-result :parameters]))))
+    (is (some? (:terminal-source-owner compilation))))
+  (is (= :explicit-host-result-required
+         (try (compiled/lower
                    #'storage/mixed-scale-energy-gradient
                    [(float 2.0) (double-array [1.5 -2.0])]
-                   (merge policy {:compiler :equation-first :target target :dtype :double}))]
-    (is (= [:float] (mapv :dtype (filter #(empty? (:shape %)) (:out-tree outcome)))))))
+                   (merge policy {:compiler :equation-first :target target :dtype :double}))
+              nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
 
 (deftest completed-conversion-has-distinct-partial-and-terminal-storage
   (let [compiled (equation-first/compile
@@ -117,10 +130,36 @@
         outputs (mapv (fn [artifact]
                         (mapv :dtype (filter #(= :output (:kind %)) (:abi artifact))))
                       (:kernels compiled))]
-    (is (= [[:double] [:float]] outputs))
+    ;; Checked Float conversion is host observation, not an IEEE device cast.
+    (is (= [[:double] [:double]] outputs))
+    (is (get-in compiled [:semantic :attributes :invocation-plan :attributes :terminal-host-result]))
     (is (every? #(= :double (:dtype %))
                 (mapcat #(filter (fn [slot] (= :input (:kind slot))) (:abi %))
                         (:kernels compiled))))))
+
+(deftest terminal-contract-and-owner-preflight-cannot-be-discarded
+  (let [x (double-array [1.5 -2.0])
+        _ (storage/mixed-scale-energy-gradient (float 2.0) x)
+        compilation (equation-first/compile #'storage/mixed-scale-energy-gradient
+                                            (merge policy {:target target :dtype :double}))
+        semantic (:semantic compilation)
+        plan (get-in semantic [:attributes :invocation-plan])
+        args [(float 2.0) x]
+        opened (atom 0)
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= [:return] (:terminal-result (last (invocation/source-order plan semantic)))))
+    (is (= :invocation-terminal-correspondence
+           (reason #(invocation/validate-against!
+                     (assoc-in plan [:attributes :terminal-host-result :body] nil) semantic))))
+    (is (= :invocation-terminal-effects
+           (reason #(invocation/validate-against! plan
+                                                 (update semantic :effects disj :ordered-host-observation)))))
+    (with-redefs [gpu/make-session (fn [& _] (swap! opened inc) (throw (AssertionError. "preflight opened a session")))]
+      (is (= :explicit-host-result-required
+             (reason #(link/instantiate-ordered-invocation! compilation args {}))))
+      (is (= :terminal-source-owner-mismatch
+             (reason #(link/instantiate-host-result! (dissoc compilation :terminal-source-owner) args))))
+      (is (= 0 @opened)))))
 
 (deftest one-derivation-separates-storage-from-scalar-computation
   (let [params '[weights state n scale] tags '[floats doubles long double]]

@@ -16,6 +16,7 @@
   (:require [beichte.core :as b]
             [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -165,36 +166,60 @@
                          dtype/dtype-for-scalar-tag)
           target (some-> (descriptor/semantic-op expression) descriptor/cast-result-tag
                          dtype/dtype-for-scalar-tag)]
-      (or (some? (numeric-constant/value expression))
+      (or (some? (when-let [operation (descriptor/semantic-op expression)]
+                   (when (descriptor/cast-op? operation)
+                     (numeric-constant/source-value
+                      (apply list (symbol "clojure.core" (name operation))
+                             (descriptor/call-args expression))))))
           (and source target
-               (= [:exact :exact] (scalar-conversion/policy source target)))))))
+               (contains? #{[:exact :exact] [:nearest-even :exact]}
+                          (scalar-conversion/source-policy
+                           source target (descriptor/semantic-op expression))))))))
 
-(defn- source-cast-flags
-  "Evaluation obligations for source casts derived from the shared descriptor.
+(defn- source-evaluation-flags
+  "Evaluation obligations for source conversions/arithmetic from shared descriptors.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   checked integral casts remain conservatively non-removable. Local product
+   checked integral/Float casts remain conservatively non-removable.
+   Arithmetic purity proves neither successful operand completion nor absence
+   of overflow/division errors. Keep that obligation until a source-owned proof
+   closes it; logical dtype tags are not physical operand evidence. Local product
    lowering additionally retains its generic factory's reference conversion
    obligation explicitly. Untyped scoped binders require their own type evidence;
    this does not globally reinterpret their casts as reference conversions."
   [expr]
   (into #{}
    (mapcat (fn [node]
-           (when (seq? node)
-             (let [operation (descriptor/semantic-op node)]
-               (when (descriptor/cast-op? operation)
+             (let [operation (when (seq? node) (descriptor/semantic-op node))]
                     (cond-> []
-                        (and (not (proven-total-cast? node))
+                        (and (seq? node)
+                             (or (contains? #{:+ :- :* :div :neg :quot :rem :mod}
+                                            (intrinsics/canonical operation))
+                                 (descriptor/increment-op? operation)
+                                 (descriptor/decrement-op? operation)))
+                        (conj :unclosed-source-arithmetic)
+                        (and (seq? node) (not (proven-total-cast? node))
+                             (descriptor/cast-op? operation)
                              (= :reject (descriptor/cast-integral-narrowing operation))
-                             (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
+                             (or (contains? '#{byte int long} (descriptor/cast-result-tag operation))
+                                 (= :checked (descriptor/cast-floating-narrowing operation))))
                         (conj :checked-source-cast)
                         ;; This is denial-only evidence from the source factory:
                         ;; no optimizer may erase its conversion merely because
                         ;; the projected field is not otherwise used.
                         (true? (:raster.effect/source-reference-cast (meta node)))
-                        (conj :source-reference-cast))))))
-         (tree-seq coll? seq expr))))
+                        (conj :source-reference-cast)
+                        ;; A value proof consumed by simplification is not a
+                        ;; proof that its original evaluation can disappear.
+                        ;; This obligation is independent of numeric width,
+                        ;; external purity, and actual primitive/Object storage.
+                        (true? (:raster.effect/preserve-evaluation (meta node)))
+                        (conj :preserve-source-evaluation))))
+         (tree-seq #(and (coll? %)
+                         (not (and (seq? %)
+                                   (contains? '#{quote clojure.core/quote} (first %)))))
+                   seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)
 
@@ -260,7 +285,11 @@
    context; cached source analysis must not survive helper redefinition."
   [expr]
   (if (not (seq? expr))
-    {:effect :pure :flags #{}}
+    ;; Collection literals evaluate their children. They are not scalar leaves,
+    ;; and their evaluation/exception obligations must survive DCE and CSE too.
+    (if (coll? expr)
+      (analyze-descriptor expr)
+      {:effect :pure :flags (source-evaluation-flags expr)})
     (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
                    [(descriptor-key expr) proof])
@@ -274,21 +303,32 @@
 
 (defn- analyze-descriptor
   [expr]
+  ;; A failed optional purity analysis cannot discharge independently retained
+  ;; source obligations. Read those from original syntax, not its Beichte-only
+  ;; call projection, and merge them even when that analysis abstains.
   (try
-    (let [semantic-expr (semantic-calls expr)
-          locals (collect-locals semantic-expr)
-          context (b/make-context {:registry (:registry @raster-context)})
-          result (b/analyze-full semantic-expr context locals)
-          result (if (map? result)
-                   (update result :flags #(or % #{}))
-                   {:effect (or result :io) :flags #{}})]
-      (update result :flags into (source-cast-flags semantic-expr)))
-    (catch Exception _
-      ;; Conservative: unknown = effectful
-      {:effect :io :flags #{}})
-    (catch StackOverflowError _
-      ;; Deep expressions overflow tools.analyzer — assume effectful
-      {:effect :io :flags #{}})))
+   (let [obligations (source-evaluation-flags expr)
+        result
+        (try
+          (let [semantic-expr (semantic-calls expr)
+                locals (collect-locals semantic-expr)
+                context (b/make-context {:registry (:registry @raster-context)})
+                result (b/analyze-full semantic-expr context locals)]
+            (if (map? result)
+              (update result :flags #(or % #{}))
+              {:effect (or result :io) :flags #{}}))
+          (catch Exception _
+            ;; Conservative: unknown = effectful, not obligation-free.
+            {:effect :io :flags #{}})
+          (catch StackOverflowError _
+            ;; Deep expressions overflow tools.analyzer — assume effectful.
+            {:effect :io :flags #{}}))]
+    (update result :flags into obligations))
+   ;; Obligation discovery is optional analysis too. If it cannot complete,
+   ;; retain a NON-WAIVABLE unknown obligation, not a preservation-only marker
+   ;; whose ordering could be relaxed by an independent total-value proof.
+   (catch Exception _ {:effect :io :flags #{:unclosed-source-obligations}})
+   (catch StackOverflowError _ {:effect :io :flags #{:unclosed-source-obligations}})))
 
 (defn removable-expr?
   "True if an unused expression can be dropped without changing semantics."

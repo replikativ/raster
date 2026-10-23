@@ -311,7 +311,11 @@
    not a rewrite, scheduling choice, or independent execution certificate. Unknown/indirect
    coordinates still decline. Combine/post-result reads are not justified by this domain."
   [operation options]
-  (when (and (nil? (:lambda operation))
+  (if (segop/empty-scalar-reduction? operation)
+    ;; The empty fold never enters its element region. A completed-result transform still runs
+    ;; once and retains its independently certified singleton reads, unlike fold-only captures.
+    (into {} (map (fn [id] [id 1])) (segop/operation-inputs operation))
+    (when (and (nil? (:lambda operation))
              (= 1 (count (get-in operation [:space :dims]))))
     (let [operator (:reduction operation)
           region (cond
@@ -339,7 +343,7 @@
                     reads (into {} (map (fn [id] [id 1]))
                                 (set/intersection
                                  (set (:inputs operation))
-                                 (set (get-in operator [:attributes :resident-scalar-captures])))))))))
+                                 (set (get-in operator [:attributes :resident-scalar-captures]))))))))))
 
 (defn- static-extent
   [expression]

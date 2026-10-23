@@ -1,7 +1,41 @@
 (ns raster.compiler.passes.scalar.effects-test
   (:require [clojure.test :refer [deftest is]]
+            [beichte.core :as beichte]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.op-descriptor :as descriptor]))
+
+(deftest consumed-value-proofs-retain-source-evaluation
+  (doseq [source ['(clojure.core/+ x y) '(clojure.core// x y)
+                  (with-meta '(.invk raster.numeric/_plus__m_long_long-impl x y)
+                    {:raster.op/original 'raster.numeric/+})]]
+    (let [expression (vary-meta source assoc :raster.effect/preserve-evaluation true)]
+      (is (contains? (:flags (effects/descriptor expression)) :preserve-source-evaluation))
+      (is (false? (effects/removable-expr? expression)))
+      (is (false? (effects/cse-safe-expr? expression))))))
+
+(deftest optional-purity-abstention-cannot-drop-source-obligations
+  (doseq [failure [(IllegalArgumentException. "unsupported analysis")
+                   (StackOverflowError. "bounded analyzer refusal")]
+          [expression flag]
+          [[(with-meta '(unknown/effect x) {:raster.effect/preserve-evaluation true})
+            :preserve-source-evaluation]
+           [(with-meta '(unknown/conversion x) {:raster.effect/source-reference-cast true})
+            :source-reference-cast]
+           ['(clojure.core/int x) :checked-source-cast]]]
+    (with-redefs [beichte/analyze-full (fn [& _] (throw failure))]
+      ;; Call the analyzer directly so an unrelated cached purity result cannot
+      ;; hide the abstention path under test.
+      (let [result (#'effects/analyze-descriptor expression)]
+        (is (= :io (:effect result)))
+        (is (contains? (:flags result) flag))))))
+
+(deftest optional-obligation-abstention-retains-a-generic-denial
+  (doseq [failure [(IllegalArgumentException. "unsupported obligation analysis")
+                   (StackOverflowError. "bounded obligation refusal")]]
+    (with-redefs-fn {#'effects/source-evaluation-flags (fn [& _] (throw failure))}
+      #(let [result (#'effects/analyze-descriptor '(clojure.core/double 1.0))]
+         (is (= :io (:effect result)))
+         (is (contains? (:flags result) :unclosed-source-obligations))))))
 
 (deftest storage-contracts-deny-cse-without-body-analysis
   (doseq [contract [{:buffer-write {:mode :overwrite :buf-arg-idx 0}}
@@ -72,8 +106,9 @@
           {:raster.op/original 'raster.numeric/*
            :raster.type/tag 'long :tag 'long})
         unknown-call '(.invk user/unknown-impl rows width)]
-    (is (= {:effect :pure :flags #{}} (effects/descriptor pure-call)))
-    (is (effects/removable-expr? pure-call))
+    (is (= {:effect :pure :flags #{:unclosed-source-arithmetic}} (effects/descriptor pure-call)))
+    (is (not (effects/removable-expr? pure-call))
+        "external purity and logical Long tags do not prove successful operand completion")
     (is (not (effects/removable-expr? unknown-call))
         "an invk without certified semantic metadata remains conservative")))
 
@@ -113,6 +148,27 @@
                       :checked-source-cast))
       "the op descriptor's explicit wrapping cast has no checked exception obligation"))
 
+(deftest checked-floating-casts-retain-source-evaluation-before-canonicalization
+  (let [wide (with-meta 'wide {:tag 'double})
+        narrow (with-meta 'narrow {:tag 'float})]
+    (doseq [expression [(list 'clojure.core/float wide)
+                        '(clojure.core/float Double/MAX_VALUE)
+                        '(clojure.core/float Double/POSITIVE_INFINITY)
+                        '(let* [unused (clojure.core/float wide)] 7)]]
+      (is (contains? (:flags (effects/descriptor expression)) :checked-source-cast))
+      (is (not (effects/removable-expr? expression))))
+    (doseq [expression [(list 'clojure.core/float narrow)
+                        '(clojure.core/float 1.0)
+                        '(clojure.core/unchecked-float wide)]]
+      (is (not (contains? (:flags (effects/descriptor expression)) :checked-source-cast))))))
+
+(deftest lexical-float-callees-do-not-acquire-a-core-cast-contract
+  (doseq [expression [(with-meta '(float x) {:raster.op/lexical-callee true})
+                      (with-meta '(.invk local/float-impl x)
+                        {:raster.op/lexical-callee true :raster.op/original 'clojure.core/float})]]
+    (is (nil? (descriptor/semantic-op expression)))
+    (is (not (contains? (:flags (effects/descriptor expression)) :checked-source-cast)))))
+
 (deftest generated-reference-conversions-retain-their-evaluation-obligation
   (let [cast '(clojure.core/double x)
         retained (with-meta cast {:raster.effect/source-reference-cast true})
@@ -135,5 +191,24 @@
                                    :raster.type/tag 'long :tag 'long})]
     (is (= form certified))
     (is (not (effects/removable-expr? form)))
-    (is (effects/removable-expr? certified))
+    (is (= :pure (:effect (effects/descriptor certified))))
+    (is (contains? (:flags (effects/descriptor certified)) :unclosed-source-arithmetic))
+    (is (not (effects/removable-expr? certified)))
     (is (not (effects/removable-expr? form)) "a cached certified result is not reused")))
+
+(deftest unresolved-source-arithmetic-retains-normal-completion
+  (doseq [expression ['(clojure.core/+ x y) '(clojure.core/- x)
+                      '(clojure.core/* x y) '(clojure.core// x y)
+                      '(clojure.core/quot x y) '(clojure.core/rem x y)
+                      '(clojure.core/mod x y) '(clojure.core/inc x)
+                      '(clojure.core/dec x) '(clojure.core/unchecked-multiply x y)
+                      (with-meta '(.invk raster.numeric/_star__m_double_double-impl x y)
+                        {:raster.op/original 'raster.numeric/* :raster.type/tag 'double})]]
+    (is (contains? (:flags (effects/descriptor expression)) :unclosed-source-arithmetic))
+    (is (not (effects/removable-expr? expression)))
+    (is (not (effects/cse-safe-expr? expression)))))
+
+(deftest quoted-arithmetic-and-conversions-are-data-not-completion-obligations
+  (doseq [head '[quote clojure.core/quote]]
+    (is (empty? (:flags (effects/descriptor
+                        (list head '(clojure.core/+ (clojure.core/int x) y))))))))

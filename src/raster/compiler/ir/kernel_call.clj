@@ -9,6 +9,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.scalar-range :as scalar-range])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -196,6 +197,7 @@
     (throw (ex-info "kernel call must be a KernelCall value"
                     {:call call :actual (type call)})))
   (let [{:keys [artifact arguments geometry]} call
+        _ (stage-result/refuse-unobserved! artifact :kernel-call)
         artifact (kart/validate! artifact)
         abi (:abi artifact)
         arguments (kabi/validate-arguments! abi arguments)
@@ -321,6 +323,7 @@
    keep its partial result entirely on device)."
   ([artifact arguments] (make artifact arguments {}))
   ([artifact arguments {:keys [group-count resolve-value]}]
+   (stage-result/refuse-unobserved! artifact :make-kernel-call)
    (let [artifact (kart/validate! artifact)
          arguments (kabi/validate-arguments! (:abi artifact) arguments)
          ;; Extent/range checks precede launch realization.  Otherwise a negative bound can first

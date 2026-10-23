@@ -3,16 +3,33 @@
             [clojure.test :refer [deftest testing is]]
             [pattern.nanopass.dialect :as nanopass]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.simplify :as simplify]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.scalar.local-products :as local-products]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ad.flatten :as flat]
             [raster.compiler.ir.dialects :as dialects]
             [raster.ad.reverse :as rad]))
+
+(deftest boxed-entry-construction-transports-types-through-the-existing-census
+  (let [floating (completion/complete-value (completion/bytecode-boxed-parameter-contract Float/TYPE) 'input)
+        array (completion/complete-value
+               (completion/bytecode-boxed-parameter-contract (class (double-array 0))) 'array)
+        source (list 'let* ['floating floating 'storage array] '[floating storage])
+        tagged (#'pipeline/tag-expr-types source {'input 'Object 'array 'Object})
+        declarations (mapv #(get (meta %) :raster.type/tag) (take-nth 2 (second tagged)))
+        census (#'pipeline/record-fixpoint-census! :final tagged
+                {:target-device :cuda:equation-first-compile-gate})]
+    (is (= '[float doubles] declarations))
+    (is (zero? (:non-exempt-untagged census)))
+    (is (zero? (:undevirtualized census)))
+    (is (completion/contains-completion? tagged)
+        "typedness does not erase the conversion or discharge its owner")))
 
 (defn- isolated-fixpoint [input expand]
   ;; Isolate termination from producer behavior. Real compiled workloads remain
@@ -163,7 +180,16 @@
         carried (#'pipeline/carry-void-binding-contracts form)
         inner-binder (-> carried second second (nth 2) second first)]
     (is (:raster.effect/effectful (meta (first (second carried)))))
-    (is (:raster.effect/effectful (meta inner-binder)))))
+    (is (:raster.effect/effectful (meta inner-binder)))
+    (is (identical? carried (#'pipeline/carry-void-binding-contracts carried)))))
+
+(deftest void-contract-analysis-preserves-value-regions-and-quoted-data
+  (doseq [form ['(let* [x (outer (inner value))] x)
+                '(let* [x (let* [saved value] (outer saved))] x)
+                '(quote (let* [_ (dotimes [i n] (clojure.core/aset output i 0.0))] nil))
+                '(clojure.core/quote
+                   (let* [_ (dotimes [i n] (clojure.core/aset output i 0.0))] nil))]]
+    (is (identical? form (#'pipeline/carry-void-binding-contracts form)))))
 
 (deftest void-contract-carrying-marks-only-unused-effect-loop-results
   (let [effect-loop '(loop* [i 0]
@@ -237,6 +263,34 @@
         #(let [refused (#'pipeline/pass-soac-fuse source {:target-device :ocl:late-wrapper :dtype :float})]
            (is (= source (:form refused)) "refusal keeps the original nested source")
            (is (= :disabled (get-in refused [:stats :compatibility-fusion]))))))))
+
+(deftest normalized-semantic-admission-does-not-rewrite-or-normalize-source
+  (let [source '(let* [result (raster.par/rng-fill! seeds n base-seed)] result)
+        options {:target-device :ocl:normalized-source :dtype :long
+                 :array-types {'seeds :long} :scalar-types {'n :int 'base-seed :long}}
+        normalized (typed-frontend/normalize-source source options)
+        seen (atom [])
+        structured-seen (atom [])
+        discover structured-route/attempt
+        project @#'typed-route/source-projection
+        result
+        (with-redefs-fn
+          {#'pipeline/prepare-semantic-source (fn [& _] (throw (AssertionError. "representation replay")))
+           #'typed-frontend/normalize-source (fn [& _] (throw (AssertionError. "normalization replay")))
+           #'typed-route/attempt (fn [& _] (throw (AssertionError. "ordinary route replay")))
+           #'structured-route/attempt (fn [form options]
+                                       (swap! structured-seen conj form)
+                                       (discover form options))
+           #'typed-route/source-projection (fn [form options]
+                                             (swap! seen conj form)
+                                             (project form options))}
+          #(pipeline/normalized-semantic-program-attempt normalized options source))]
+    (is (= 1 (count @structured-seen)))
+    (is (identical? source (first @structured-seen)))
+    (is (identical? normalized (first @seen)))
+    (is (some? (:program result)))
+    (is (true? (get-in result [:stats :typed-validated])))
+    (is (= :analyzed-source (get-in result [:stats :front-end])))))
 
 (deftest certified-butterfly-enters-the-typed-effect-vertical
   (let [source '(let* [step (raster.par/butterfly! re im i half wr wi base)] step)

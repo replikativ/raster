@@ -3,8 +3,38 @@
             [raster.core :refer [deftm]]
             [raster.numeric :as n]
             [raster.ad.reverse :as reverse]
+            [raster.ad.accumulation :as accumulation]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.passes.scalar.local-products :as products]))
+
+(deftest absent-cotangent-identity-retains-object-context-and-helper-ownership
+  (let [facts [{:presence :absent} {:presence :unknown}]
+        call '(raster.ad.reverse/grad-acc missing value)
+        projected (:expression (accumulation/project-absent-identity call facts))]
+    (is (= {:contract completion/object-input-contract :operand 'value}
+           (completion/canonical-parts projected)))
+    (let [execute (eval (list 'fn '[value] (completion/project-to-jvm-source projected))) ]
+      (doseq [value [nil (Double. 1.25) (float-array [1]) (Object.) "opaque"]]
+        (is (identical? value (execute value)))))
+    (is (nil? (accumulation/project-absent-identity call [{:presence :unknown} {:presence :unknown}])))
+    (is (nil? (accumulation/project-absent-identity call [{:presence :present} {:presence :unknown}])))
+    (is (nil? (accumulation/project-absent-identity
+                '(raster.ad.reverse/grad-acc (do (effect) nil) value) facts)))
+    (is (nil? (accumulation/project-absent-identity
+                (vary-meta call assoc :raster.op/lexical-callee true) facts)))
+    (doseq [flag [:raster.effect/preserve-evaluation :raster.effect/source-reference-cast]]
+      (is (nil? (accumulation/project-absent-identity (vary-meta call assoc flag true) facts))))
+    (with-redefs [reverse/grad-acc (fn [_ _] :replaced)]
+      (is (nil? (accumulation/project-absent-identity call facts)))))
+  (let [source '(let* [missing nil] (raster.ad.reverse/grad-acc value missing))
+        lowered (products/lower-local-products source)
+        execute (fn [body] (eval (list 'fn '[value] (completion/project-to-jvm-source body))))]
+    (is (not-any? #(= 'raster.ad.reverse/grad-acc %) (tree-seq coll? seq lowered)))
+    (doseq [value [nil (Double. 1.25) (Object.)]]
+      (is (identical? value ((execute source) value)))
+      (is (identical? value ((execute lowered) value))))))
 
 (deftm projected-product [x :- Double] :- Double
   (let [seed 1.0
@@ -36,7 +66,85 @@
                    (.close ^java.lang.AutoCloseable compiled)))))))
 
 (defn- run [expression & arguments]
-  (apply (eval (list 'fn* '[x calls] expression)) arguments))
+  (apply (eval (list 'fn* '[x calls] (completion/project-to-jvm-source expression))) arguments))
+
+(deftest local-product-analysis-keeps-unchanged-scalar-occurrences
+  (doseq [expression [(with-meta '(opaque (clojure.core/double x) calls) {:line 37})
+                      (with-meta '[(opaque x) calls] {:line 38})]]
+    (is (identical? expression (products/lower-local-products expression))))
+  (let [source '(let* [value (clojure.core/double x)]
+                 (if (clojure.core/nil? value) :absent :present))
+        lowered (products/lower-local-products source)]
+    (is (not (identical? source lowered)))
+    (is (= :present (run lowered 2.0 nil)))
+    (is (thrown? NullPointerException (run lowered nil nil)))))
+
+(deftm observed-product-field [x :- Double] :- Double
+  (let [product [(clojure.core/* x x)]]
+    (if (identical? (nth product 0) (nth product 0)) 1.0 0.0)))
+
+(deftm observed-product-aliases [x :- Double] :- Double
+  (let [product [(clojure.core/* x x)]
+        saved (nth product 0)
+        copy saved]
+    (if (identical? saved copy) 1.0 0.0)))
+
+(deftest product-fields-retain-the-original-object-snapshot
+  (doseq [function [#'observed-product-field #'observed-product-aliases]]
+    (let [compiled (pipeline/compile-aot function :dtype :double)]
+      (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+        (is (= 1.0 (function x) (compiled x))))))
+  (let [source '(let* [p [(clojure.core/* (clojure.core/double x) 2.0)]
+                       q p
+                       first-field (clojure.core/nth q 0)
+                       second-field (clojure.core/nth p 0)]
+                 (clojure.core/identical? first-field second-field))
+        lowered (products/lower-local-products source)]
+    (is (completion/contains-completion? lowered))
+    (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+      (is (true? (run source x nil)))
+      (is (true? (run lowered x nil))))))
+
+(deftest object-snapshots-compose-with-reference-consumers-and-captures
+  ;; Identity is not peculiar to identical?: storing a key, returning a field
+  ;; from a closure, and selecting a product arm all observe the same snapshot.
+  (doseq [source
+          ['(let* [p [(clojure.core/double x)]
+                   saved (fn* [] (clojure.core/nth p 0))]
+              (clojure.core/identical? (saved) (saved)))
+           '(let* [p (if (pos? x) [(clojure.core/double x)]
+                         [(clojure.core/double (- x))])
+                   keys (java.util.IdentityHashMap.)]
+              (.put keys (clojure.core/nth p 0) :saved)
+              (= :saved (.get keys (clojure.core/nth p 0))))
+           '(let* [p [(clojure.core/double x)]
+                   saved (clojure.core/nth p 0)]
+              (loop* [i 0]
+                (if (< i 3) (recur (inc i))
+                    (clojure.core/identical? saved (clojure.core/nth p 0)))))]]
+    (let [lowered (products/lower-local-products source)]
+      (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+        (is (true? (run source x nil)))
+        (is (true? (run lowered x nil))))))
+  (let [source '(let* [p [(clojure.core/double x) (clojure.core/double x)]]
+                 (clojure.core/identical? (clojure.core/nth p 0)
+                                         (clojure.core/nth p 1)))
+        lowered (products/lower-local-products source)]
+    (doseq [x [-3.5 -0.0 0.0 Math/PI]]
+      (is (false? (run source x nil)))
+      (is (false? (run lowered x nil))))))
+
+(deftest snapshot-completion-preserves-failure-before-later-field-effects
+  (let [source '(let* [p [(clojure.core/double x)
+                         (do (swap! calls conj :later) 2.0)]]
+                 (clojure.core/nth p 0))
+        lowered (products/lower-local-products source)
+        invoke (fn [expression calls]
+                 (try (run expression nil calls) :returned
+                      (catch Throwable failure (class failure))))
+        a (atom []) b (atom [])]
+    (is (= NullPointerException (invoke source a) (invoke lowered b)))
+    (is (= [] @a @b))))
 
 (deftest scalar-accumulation-lowering-requires-independent-present-carriers
   (let [source '(let* [left (clojure.core/double x)
@@ -130,6 +238,44 @@
   (let [cast (with-meta '(clojure.core/double x) {:raster.op/lexical-callee true})
         source (list 'let* ['value cast] '(clojure.core/nil? value))]
     (is (= source (products/lower-local-products source)))))
+
+(deftest prepared-nested-presence-retains-evaluation-order-and-null-failure
+  (let [source '(let* [before (swap! calls conj :before)
+                       value (let* [saved (do (swap! calls conj :value) x)]
+                               (clojure.core/double saved))]
+                 (if (clojure.core/nil? value)
+                   :absent
+                   (do (swap! calls conj :after) :present)))
+        normalize #(entry/call-with-definition-inputs
+                    (fn [] (products/lower-local-products
+                            % {:source-ns (the-ns 'raster.compiler.passes.scalar.local-products-test)
+                               :completed-presence? true})))
+        lowered (normalize source)]
+    (is (some #{'clojure.core/nil?}
+              (tree-seq coll? seq (products/lower-local-products source))))
+    (is (not-any? #{'clojure.core/nil?} (tree-seq coll? seq lowered)))
+    (is (= lowered (normalize lowered)))
+    (doseq [expression [source lowered]]
+      (let [calls (atom [])]
+        (is (= :present (run expression 2.0 calls)))
+        (is (= [:before :value :after] @calls)))
+      (let [calls (atom [])]
+        (is (thrown? NullPointerException (run expression nil calls)))
+        (is (= [:before :value] @calls)))))
+  (let [source '(let* [value (let* [saved x]
+                               (if (clojure.core/nil? saved) nil
+                                   (clojure.core/double saved)))]
+                 (if (clojure.core/nil? value) :absent :present))
+        lowered (products/lower-local-products
+                 source {:source-ns *ns* :completed-presence? true})]
+    ;; A cast in only one arm does not prove that the join is present.
+    (doseq [x [nil 2.0]]
+      (is (= (run source x nil) (run lowered x nil)))))
+  (is (= :local-product-source-context
+         (try (products/lower-local-products
+               '(let* [x 1.0] x) {:completed-presence? true})
+              nil
+              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
 
 (deftest conditional-products-preserve-selected-effects-and-lexical-scope
   (let [source '(let* [outside (do (swap! calls conj :prefix) 7.0)
@@ -265,6 +411,41 @@
         calls (atom 0)]
     (is (= :good (run (products/lower-local-products source) nil calls)))
     (is (= 1 @calls))))
+
+(deftest inline-projections-reuse-ordered-product-completion
+  (let [source '(clojure.core/nth
+                 [(do (swap! calls conj :first) x)
+                  (do (swap! calls conj :second) (clojure.core// 1 x))] 0)
+        lowered (products/lower-local-products source)]
+    (is (not-any? #{'clojure.core/nth} (tree-seq coll? seq lowered)))
+    (doseq [x [0 2]]
+      (let [outcome (fn [form]
+                      (let [calls (atom [])]
+                        (assoc (try {:value (run form x calls)}
+                                    (catch Throwable e {:error (class e)}))
+                               :trace @calls)))
+            expected (outcome source)]
+        (is (= [:first :second] (:trace expected)))
+        (is (= expected (outcome lowered)))))))
+
+(deftest inline-product-projections-preserve-existing-reference-identity
+  (let [source '(clojure.core/identical? x (clojure.core/nth [x x] 0))
+        lowered (products/lower-local-products source)]
+    (doseq [x [nil (Double/valueOf 1234.5) (Float/valueOf (float 1234.5)) (double-array 0)]]
+      (is (true? (run source x nil)))
+      (is (true? (run lowered x nil))))))
+
+(deftest inline-projections-do-not-consume-default-or-trapping-index-evaluation
+  (doseq [source ['(clojure.core/nth [x] 0 (do (swap! calls inc) 9))
+                  '(clojure.core/nth [x] 2)
+                  '(clojure.core/nth [] 0)
+                  '(clojure.core/nth [x] (int 4294967296))]]
+    (is (= source (products/lower-local-products source))))
+  (let [source '(clojure.core/nth [x] 0 (do (swap! calls inc) 9))]
+    (doseq [form [source (products/lower-local-products source)]]
+      (let [calls (atom 0)]
+        (is (= 7 (run form 7 calls)))
+        (is (= 1 @calls))))))
 
 (deftest known-seed-removes-an-unknown-product-branch-without-arithmetic-rewrites
   (let [source '(let* [dy 1.0

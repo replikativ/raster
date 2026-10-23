@@ -98,6 +98,20 @@
   "True if this stack type is a JVM primitive (not :ref, :void, or :diverge)."
   [t] (case t (:double :float :int :long :bool) true false))
 
+(defn- primitive-carrier-class [stack-type]
+  (when (primitive? stack-type)
+    (types/tag->java-class (if (= :bool stack-type) 'boolean (symbol (name stack-type))))))
+
+(defn- completed-primitive-result-fact
+  "Actual primitive completion, optionally boxed by its parent consumption.
+   Conditional on normal return only: no totality or evaluation permission."
+  [completed returned]
+  (when-let [carrier (primitive-carrier-class completed)]
+    (when (or (= completed returned) (= :ref returned))
+      {:carrier (if (= :ref returned) Object carrier)
+       :presence :present
+       :builtin-class (get types/primitive-info (symbol (.getName ^Class carrier)))})))
+
 (defn- diverge?
   "True if this form never completes normally (throw, recur).
   Distinguished from :void which means 'no value but execution continues'."
@@ -272,7 +286,13 @@
     (false? form) :bool
     (number? form) (numeric-literal-stack-type form)
     (and (seq? form)
-         (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input}
+         (= :jvm-bytecode-result-context
+            (get-in (completion/canonical-parts form) [:contract :source-context])))
+    (get-in (completion/canonical-parts form) [:contract :result-carrier])
+    (and (seq? form)
+         (contains? #{:jvm-bytecode-boxed-parameter-input
+                      :jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                      :jvm-bytecode-reference-input}
                     (get-in (completion/canonical-parts form) [:contract :source-context])))
     ;; The completed carrier is an explicit physical result of this validated
     ;; emitter contract, not a logical metadata hint or operand-type guess.
@@ -329,6 +349,7 @@
     (= (name h) "long")   :long
     (= (name h) "int")    :int
     (= (name h) "float")  :float
+    (and (= 'clojure.core/unchecked-float h) (= 2 (count form))) :float
         ;; Arithmetic: JVM numeric promotion — all-float → float, all-integer
         ;; → int/long (any long ⇒ long), anything unknown/mixed-float → double.
         ;; The old rule hard-defaulted every non-float case to :double, typing
@@ -615,13 +636,15 @@
     (vector? form) (with-meta (mapv desugar-invk form) (meta form))
     :else form))
 
+(deftype ^:private InputOrigins [input-body emitted-body families])
+
 (defn ^:no-doc retain-invocation-occurrences
   "Give each executable call occurrence an emission-local identity.
    Run after semantic source transforms, before backend macroexpansion. This
    catalog is private to the owning emission, not a source/cache identity or
    authority reconstructed by comparing expressions. Quoted values stay opaque."
   [body]
-  (let [catalog (atom {}) scopes (atom {}) reductions (atom {})]
+  (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) completions (atom {}) origins (atom {})]
     (letfn [(visit [expression]
               (if (and (seq? expression)
                        (contains? #{'quote 'clojure.core/quote} (first expression)))
@@ -630,27 +653,40 @@
                             visit identity
                             (if (instance? clojure.lang.IObj expression)
                               (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence
-                                         ::reduction-occurrence ::reduction-witness ::reduction-role)
+                                         ::reduction-occurrence ::reduction-witness ::reduction-role
+                                         ::completion-occurrence)
                               expression))]
                   (cond
+                    (completion/canonical-form? node)
+                    (let [token (Object.)
+                          owned (vary-meta node assoc ::completion-occurrence token)]
+                      (swap! completions assoc token owned)
+                      (swap! origins update :completion (fnil conj []) [expression owned])
+                      owned)
                     (par/par-reduce-form? node)
                     (let [token (Object.)
                           owned (vary-meta node assoc ::reduction-occurrence token)]
                       (swap! reductions assoc token owned)
+                      (swap! origins update :reduction (fnil conj []) [expression owned])
                       owned)
                     (form-ir/binding-form? node)
                     (let [token (Object.)
                           owned (vary-meta node assoc ::binding-scope-occurrence token)]
                       (swap! scopes assoc token owned)
+                      (swap! origins update :binding (fnil conj []) [expression owned])
                       owned)
                     (not (form-ir/call-form? node)) node
                     :else
                     (let [token (Object.)
                           owned (vary-meta node assoc ::call-occurrence token)]
                       (swap! catalog assoc token owned)
+                      (swap! origins update :invocation (fnil conj []) [expression owned])
                       owned)))))]
       (let [owned (with-meta (mapv visit body) {::body-occurrence (Object.)})]
-        {:body owned :catalog @catalog :binding-catalog @scopes :reduction-catalog @reductions}))))
+        {:body owned :catalog @catalog :binding-catalog @scopes :reduction-catalog @reductions
+         :completion-catalog @completions
+         :input-origins (when (seq @origins)
+                          (InputOrigins. body owned @origins))}))))
 
 (defn- retain-reduction-observation! [ctx role observation]
   (when (and me/*emission-inputs* (= role (::reduction-role ctx)))
@@ -662,6 +698,21 @@
                (fn [contexts]
                  (assoc contexts key (if (contains? contexts key)
                                        {:status :ambiguous} record))))))))
+
+(defn- retain-reduction-root-result! [ctx body result-type]
+  ;; The initializer and nested exit contexts are not the region-entry context.
+  ;; Attach this observation only to the exact root whose bound was emitted.
+  (when (and me/*emission-inputs* (= :bound-scope (::reduction-role ctx)))
+    (when-let [witness (::reduction-witness ctx)]
+      (swap! me/*emission-inputs* update-in [:reduction-contexts [witness :bound-scope]]
+             (fn [record]
+               (if (and (= :known (:status record))
+                        (identical? (::call-expression ctx) (:expression record))
+                        (not (contains? record :root-result)))
+                 (assoc record :root-result
+                        {:body body :context (completion/bytecode-operand-context ctx)
+                         :result-type result-type})
+                 {:status :ambiguous}))))))
 
 (defn- reduction-label-id! [label]
   ;; Label implementations may retain the entire mutable CodeBuilder. Retain
@@ -696,10 +747,27 @@
                                           {:status :ambiguous} record))))
         expanded))))
 
+(defn- reduction-result-fact
+  "Normal-return fact for the observed carry load and divergent-if boxing path.
+   A primitive slot is not a primitive region result. Unknown exit routes abstain."
+  [exit]
+  (let [carry-type (get-in exit [:local :type])
+        payload (case carry-type :float Float :double Double nil)]
+    (when (and payload (= :ref (:result-type exit))
+               (or (= carry-type (:input-type exit))
+                   ;; emit-result-form may have boxed the primitive load already;
+                   ;; this is legal only in its explicitly observed Object context.
+                   (and (= :ref (:input-type exit))
+                        (true? (get-in exit [:context :object-result?])))))
+      {:carrier Object :presence :present :builtin-class payload})))
+
 (defn ^:no-doc retained-reduction-emission
   "Collect actual expansion/slot/backedge observations for an ORIGINAL region.
    This is not permission to reparse source or differentiate arbitrary loops.
-   A consumer still owes count/init/control, read, replay and step proofs."
+   :result-fact, when present, describes only the actual normal-return carrier
+   and boxed FP payload. It proves neither successful evaluation nor numerical
+   equivalence to another reduction. A consumer still owes count/init/control,
+   read, replay and step proofs, and must retain this emission's source owner."
   [emission original]
   (let [token (::reduction-occurrence (meta original))
         expansion (get (:reduction-expansions emission) token)
@@ -709,6 +777,7 @@
         loop-entry (get contexts [witness :loop])
         backedge (get contexts [witness :recur])
         exit (get contexts [witness :exit])
+        bound-bindings (second (:expression bound))
         variables (:variables loop-entry)]
     (when (and (= :jvm-bytecode (:backend emission)) token witness
                (identical? original (get (:reduction-catalog emission) token))
@@ -722,21 +791,64 @@
                (= (second variables) (:value exit))
                (= (get-in loop-entry [:locals (second variables)]) (:local exit))
                (= 1 (:binding-count bound))
+               (= 'let* (first (:expression bound)))
+               (vector? bound-bindings) (= 2 (count bound-bindings))
+               (identical? (:binder bound) (first bound-bindings))
+               (identical? (:initializer bound) (second bound-bindings))
+               (completion/bytecode-operand-context? (:context bound))
                (= :int (get-in bound [:after :type]))
                (= (:after bound) (get-in loop-entry [:outer-locals (:binder bound)]))
+               (= (assoc (:before bound) (:binder bound) (:after bound))
+                  (:outer-locals loop-entry))
                (= [(nth original 3) (nth original 1)] variables)
                (= (mapv #(get (:locals loop-entry) %) variables) (:targets backedge))
                (some? (:label-id loop-entry))
                (identical? (:label-id loop-entry) (:label-id backedge)))
       (me/assert-emission-inputs-current! emission)
-      {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge :exit exit})))
+      (let [result-fact (reduction-result-fact exit)]
+        (cond-> {:source original :expansion expansion :bound bound :loop loop-entry :recur backedge :exit exit}
+          (and (= 1 (count (get-in bound [:root-result :body])))
+               (identical? (:expression loop-entry) (first (get-in bound [:root-result :body])))
+               (= (get-in bound [:root-result :context])
+                  (completion/bytecode-operand-context (get-in bound [:root-result :context])))
+               (= (:result-type exit) (get-in bound [:root-result :result-type])))
+          (assoc :root-result (:root-result bound))
+          result-fact (assoc :result-fact result-fact))))))
+
+(defn- input-origin
+  "Producer-local identity relation, not a syntax matcher or physical proof."
+  [emission input-body original family]
+  (when-let [origins (:input-origins emission)]
+    (when (and (instance? InputOrigins origins)
+               (identical? input-body (.-input-body ^InputOrigins origins))
+               (identical? (:body emission) (.-emitted-body ^InputOrigins origins)))
+      (let [matches (filterv #(identical? original (first %))
+                             (get (.-families ^InputOrigins origins) family))]
+        (when (= 1 (count matches))
+          (second (first matches)))))))
+
+(defn ^:no-doc retained-input-reduction-emission
+  "Follow a producer-retained input occurrence to its actual emitted reduction.
+   Requires the EXACT emitter input body and a unique original object occurrence.
+   This does not match equal source, cross AD/SIMD rewrites, or authenticate a
+   frozen frontend by itself; its caller must retain that frontend's source owner."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :reduction)]
+    (when-let [observed (retained-reduction-emission emission owned)]
+      (assoc observed :source-input original))))
 
 (defn- retain-binding-context! [ctx binding-count index binder initializer before after]
   (when-let [token (::binding-scope-occurrence ctx)]
     (when-let [inputs me/*emission-inputs*]
       (let [key [token index]
             record {:status :known :binding-count binding-count :binder binder :initializer initializer
-                    :before before :after after}]
+                    :before before :after after
+                    ;; Do not walk every initializer to compute its free ports.
+                    ;; Most retained bindings are never outlined. Save only the
+                    ;; immutable emission facets needed by a requested region.
+                    :input-context (completion/bytecode-operand-context ctx)
+                    :local-callee-names (:local-callee-names ctx)
+                    :element-type (:element-type ctx)}]
         (swap! inputs update :binding-contexts
                (fn [contexts]
                  (if (contains? contexts key)
@@ -761,6 +873,64 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
+(defn ^:no-doc retained-input-binding-context
+  "Follow an exact emitter-input scope to its observed sequential binding.
+   The ordinal and physical context remain owned by retained-binding-context."
+  [emission input-body original index]
+  (when-let [owned (input-origin emission input-body original :binding)]
+    (when-let [observed (retained-binding-context emission owned index)]
+      (assoc observed :source-input original))))
+
+(defn- retained-owned-completion-context [emission owned]
+  (let [token (::completion-occurrence (meta owned))
+        record (get (:completion-contexts emission) token)]
+    (when (and (= :jvm-bytecode (:backend emission)) token
+               (identical? owned (get (:completion-catalog emission) token))
+               (= :known (:status record))
+               (identical? token (::completion-occurrence (meta (:expression record))))
+               (= (:contract (completion/canonical-parts owned)) (:contract record)))
+      (assoc record :source owned))))
+
+(defn ^:no-doc retained-input-completion-context
+  "Read one exact canonical completion from its actual owned emission.
+   Raw operand, completed and parent-visible carriers are distinct. A :ref
+   carrier proves no runtime Class, presence or permission to erase a check.
+   :source is the catalog-owned node, :expression is the backend-rebuilt node;
+   their occurrence join does not prove operand syntax equivalence. Copies,
+   missing and multiply-emitted occurrences abstain; stale owners fail."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :completion)]
+    (when-let [record (retained-owned-completion-context emission owned)]
+      (me/assert-emission-inputs-current! emission)
+      (assoc record :source-input original))))
+
+(defn ^:no-doc retained-input-completion-spine
+  "Read ALL exact completion occurrences in retained annotation traversal order.
+   This quote-aware postorder inventory is not runtime branch execution order.
+   Shared input expressions have distinct catalog-owned occurrences; this does
+   not weaken the unique-object query. The input body must be the actual emitter
+   input and its complete occurrence catalog must be covered, with every context
+   known and uniquely owned. Missing/extra/copied/re-emitted records abstain.
+   This is physical validation data, not source equivalence or admission."
+  [emission input-body]
+  (when-let [origins (:input-origins emission)]
+    (when (and (= :jvm-bytecode (:backend emission))
+               (instance? InputOrigins origins)
+               (identical? input-body (.-input-body ^InputOrigins origins))
+               (identical? (:body emission) (.-emitted-body ^InputOrigins origins)))
+      (let [entries (get (.-families ^InputOrigins origins) :completion [])
+            catalog (:completion-catalog emission)
+            records (mapv (fn [[original owned]]
+                            (when-let [record (retained-owned-completion-context emission owned)]
+                              (assoc record :source-input original))) entries)
+            tokens (mapv #(-> % :source meta ::completion-occurrence) records)]
+        (when (and (= (count entries) (count catalog) (count (:completion-contexts emission)))
+                   (every? some? records)
+                   (= (count tokens) (count (set tokens)))
+                   (= (set tokens) (set (keys catalog))))
+          (me/assert-emission-inputs-current! emission)
+          records)))))
+
 (defn ^:no-doc retained-body-context
   "Original parameter locals of this emission's actual whole numerical body."
   [emission]
@@ -772,6 +942,77 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
+(defn ^:no-doc retained-input-body-context
+  "Authenticate the complete original input body against this actual emission.
+   Original and catalogued bodies need not be identical. Their private input
+   origins retain that join; a copied equal vector does not acquire it."
+  [emission input-body]
+  (let [origins (:input-origins emission)]
+    (when (or (identical? input-body (:body emission))
+              (and (instance? InputOrigins origins)
+                   (identical? input-body (.-input-body ^InputOrigins origins))
+                   (identical? (:body emission) (.-emitted-body ^InputOrigins origins))))
+      (retained-body-context emission))))
+
+(declare physical-operand-input)
+
+(defn- retain-terminal-context!
+  "Observe only the actual outer lexical tail, after its bindings have been emitted.
+   This records physical context; it grants neither portability nor replay permission."
+  [ctx binding-count body locals result-type]
+  (let [token (::binding-scope-occurrence ctx)]
+    (when (and token (identical? token (::body-scope-occurrence ctx)) me/*emission-inputs*)
+      (let [record (merge (dissoc (physical-operand-input (cons 'do body) locals ctx) :operand)
+                          {:status :known :scope (::call-expression ctx)
+                           :binding-count binding-count :body (vec body)
+                           :element-type (:element-type ctx) :emitted-result-type result-type})]
+        (swap! me/*emission-inputs*
+               (fn [inputs]
+                 (let [contexts (:terminal-contexts inputs)
+                       observed (if (contains? contexts token) {:status :ambiguous} record)]
+                   (-> inputs
+                       (assoc-in [:terminal-contexts token] observed)
+                       (assoc-in [:body-contexts (::body-occurrence ctx) :terminal-context]
+                                 observed)))))))))
+
+(defn ^:no-doc retained-terminal-context
+  "Query the emitted tail of an ORIGINAL whole-body lexical scope.
+   The ports are actual final locals, not logical type guesses. Initializers are
+   excluded. A copied scope, split/repeated emission or missing return owner refuses.
+   Consumers still owe effect, physical-export and terminal scheduling proofs."
+  [emission scope]
+  (let [token (::binding-scope-occurrence (meta scope))
+        body (:body emission)
+        owner (retained-body-context emission)
+        record (get (:terminal-contexts emission) token)
+        actual (:scope record)
+        final-locals
+        (when (and owner (= :known (:status record)))
+          (reduce (fn [locals index]
+                    (let [binding (retained-binding-context emission scope index)]
+                      (if (and binding (= locals (:before binding)))
+                        (assoc locals (:binder binding) (:after binding))
+                        (reduced nil))))
+                  (:locals owner) (range (:binding-count record))))
+        expected-ports
+        (when final-locals
+          (let [visible (set (keys final-locals))
+                free (binding [util/*shadowing-locals* visible]
+                       (util/free-syms (cons 'do (drop 2 actual))))]
+            (select-keys final-locals (filter visible free))))]
+    (when (and owner token (= 1 (count body)) (identical? scope (first body))
+               (identical? scope (get (:binding-catalog emission) token))
+               (= :known (:status record))
+               (identical? record (:terminal-context owner))
+               (identical? token (::binding-scope-occurrence (meta actual)))
+               (= (:binding-count record) (quot (count (second scope)) 2))
+               (= (:binding-count record) (quot (count (second actual)) 2))
+               (= (count (:body record)) (count (drop 2 actual)))
+               (every? true? (map identical? (:body record) (drop 2 actual)))
+               final-locals (= expected-ports (:ports record))
+               (= (:emitted-result-type owner) (:emitted-result-type record))
+               (string? (:return-descriptor owner)))
+      (assoc record :owner owner))))
 (defn- retained-return-bridge
   "Validate the shared actual wrapper/body edge, without choosing a return recipe."
   [emission]
@@ -810,6 +1051,27 @@
           (me/assert-emission-inputs-current! emission)
           (assoc bridge :body-context context))))))
 
+(defn ^:no-doc retained-primitive-body-return-bridge
+  "Observe the actual primitive compute return and its Object wrapper boxing.
+   Unlike the scalar-leaf query, the body may take primitive arrays; this does
+   not assert purity, non-nullness, read bounds, or placement. Exact interface
+   and compute parameter equality is checked by the shared bridge observer."
+  [emission]
+  (when-let [{:keys [kind payload-carrier compute-method parameter-carriers body-context] :as bridge}
+             (retained-return-bridge emission)]
+    (when (and (= :boxed-primitive-static-return kind)
+               (contains? #{Double/TYPE Float/TYPE Long/TYPE} payload-carrier)
+               (identical? payload-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
+               (every? (fn [^Class carrier]
+                         (or (contains? #{Double/TYPE Float/TYPE Long/TYPE} carrier)
+                             (and (.isArray carrier)
+                                  (.isPrimitive (.getComponentType carrier)))))
+                       parameter-carriers)
+               (= (class-type->stack payload-carrier)
+                  (:return-stack-type body-context) (:emitted-result-type body-context))
+               (= (completion/bytecode-operand-context {}) (:result-context body-context)))
+      bridge)))
+
 (defn ^:no-doc retained-typed-return-bridge
   "Observe an actual unguarded primitive-static-return → Object invk boxing edge.
    This is payload correspondence, not permission to erase an Object use or
@@ -818,15 +1080,9 @@
    reference conversion. Consumers additionally own the selected receiver and
    all original argument completions and definition guards."
   [emission]
-  (when-let [{:keys [kind payload-carrier compute-method parameter-carriers body-context] :as bridge}
-             (retained-return-bridge emission)]
-    (when (and (= :boxed-primitive-static-return kind)
-               (contains? #{Double/TYPE Float/TYPE Long/TYPE} payload-carrier)
-               (identical? payload-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
-               (every? #{Double/TYPE Float/TYPE Long/TYPE} parameter-carriers)
-               (= (class-type->stack payload-carrier)
-                  (:return-stack-type body-context) (:emitted-result-type body-context))
-               (= (completion/bytecode-operand-context {}) (:result-context body-context)))
+  (when-let [{:keys [parameter-carriers] :as bridge}
+             (retained-primitive-body-return-bridge emission)]
+    (when (every? #{Double/TYPE Float/TYPE Long/TYPE} parameter-carriers)
       bridge)))
 
 (defn ^:no-doc retained-reference-return-bridge
@@ -843,6 +1099,36 @@
                (identical? body-return-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
                (= :ref (:return-stack-type body-context) (:emitted-result-type body-context)))
       bridge)))
+
+(declare boxed-parameter-plan class-desc-of-class)
+
+(defn ^:no-doc retained-boxed-entry-bridge
+  "Authenticate the actual generated public applyTo/invoke parameter boundary.
+   The shared emitted recipes and compute Classes describe conversions only;
+   caller evaluation order and numerical/placement admission remain separate."
+  [emission]
+  (when-let [{:keys [boxed-entry compute-parameter-carriers] :as bridge}
+             (retained-return-bridge emission)]
+    (let [{:keys [parameter-carriers plans apply-to-method invoke-method]} boxed-entry
+          implementation (:implementation emission)
+          owner (class implementation)
+          arity (count compute-parameter-carriers)
+          method? (fn [method name parameters]
+                    (and (instance? java.lang.reflect.Method method)
+                         (identical? owner (.getDeclaringClass ^java.lang.reflect.Method method))
+                         (= name (.getName ^java.lang.reflect.Method method))
+                         (not (java.lang.reflect.Modifier/isStatic (.getModifiers ^java.lang.reflect.Method method)))
+                         (java.lang.reflect.Modifier/isPublic (.getModifiers ^java.lang.reflect.Method method))
+                         (identical? Object (.getReturnType ^java.lang.reflect.Method method))
+                         (= parameters (vec (.getParameterTypes ^java.lang.reflect.Method method)))))]
+      (when (and (vector? parameter-carriers)
+                 (= parameter-carriers compute-parameter-carriers)
+                 (= plans (mapv #(boxed-parameter-plan (class-desc-of-class %)) parameter-carriers))
+                 (method? apply-to-method "applyTo" [clojure.lang.ISeq])
+                 (if (<= arity 20)
+                   (method? invoke-method "invoke" (vec (repeat arity Object)))
+                   (nil? invoke-method)))
+        (assoc bridge :boxed-entry boxed-entry)))))
 
 (defn- retain-call-observation!
   "Retain one actual emitter observation per original call occurrence.
@@ -869,22 +1155,7 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
-(defn- method-local-callee-candidate?
-  "Conservative denial for operands whose original method-local callees are
-   not retained by the input outliner. Match the emitter's actual lookup keys;
-   this is not a function registry, dispatch proof or purity analysis."
-  [expression ctx]
-  (cond
-    (and (seq? expression) (contains? #{'quote 'clojure.core/quote} (first expression))) false
-    (completion/canonical-parts expression)
-    (method-local-callee-candidate? (:operand (completion/canonical-parts expression)) ctx)
-    :else
-    (boolean
-     (or (and (seq? expression) (symbol? (first expression))
-              (or (contains? (:typed-sibling-methods ctx) (name (first expression)))
-                  (contains? (:sibling-methods ctx) (str (first expression)))))
-         (and (coll? expression)
-              (some #(method-local-callee-candidate? % ctx) expression))))))
+(declare method-local-callee-candidate?)
 
 (defn- physical-operand-input
   "Describe an operand using its actual lexical ports and retained context."
@@ -898,7 +1169,7 @@
      :ports (select-keys locals (filter visible free))}))
 
 (defn- retain-invocation-context!
-  [method receiver arguments mode return-carrier locals ctx]
+  [method receiver arguments mode return-carrier completions locals ctx]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
       (let [input #(physical-operand-input % locals ctx)
@@ -909,6 +1180,8 @@
                     :invocation-mode mode :return-carrier return-carrier
                     :element-type (:element-type ctx)
                     :inputs (mapv input arguments)}
+                     (and (not guarded?) completions)
+                     (assoc :input-completions completions)
                      guarded? (assoc :reason :runtime-selected-input-context))]
         (retain-call-observation! ctx :invocation-contexts record
                                   :repeated-emitted-invocation-context)))))
@@ -919,6 +1192,15 @@
    Copies, missing/cloned contexts and stale dependencies cannot establish it."
   [emission expression]
   (retained-call-observation emission expression :invocation-contexts))
+
+(defn ^:no-doc retained-input-invocation-context
+  "Follow an exact emitter-input call to its actual invocation observation.
+   Unlike retained-input-call-context, this follows a frontend origin, not a
+   nested emitted operand edge. Neither observer grants semantic admission."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [observed (retained-invocation-context emission owned)]
+      (assoc observed :source-input original))))
 
 (defn ^:no-doc retained-input-call-context
   "Follow an actual emitted input edge to its nested invocation context.
@@ -937,7 +1219,8 @@
 (defn ^:no-doc retained-input-source-context
   "Associate a compound input with its ORIGINAL owned source occurrence.
    This proves correspondence, not semantic equivalence of arbitrary expanded
-   syntax. Consumers must still close the admitted lexical/read/call region.
+   syntax. Immediate call, binding, reduction and canonical completion origins
+   are supported. Consumers must still close the admitted lexical/read/call region.
    A transformed wrapper without the same immediate occurrence refuses."
   [emission original input-index]
   (when-let [parent (retained-invocation-context emission original)]
@@ -950,6 +1233,7 @@
               actual (:operand input)
               scope-token (::binding-scope-occurrence (meta source))
               call-token (::call-occurrence (meta source))
+              completed (retained-owned-completion-context emission source)
               reduction (retained-reduction-emission emission source)]
           (when (or (and scope-token
                          (identical? source (get (:binding-catalog emission) scope-token))
@@ -957,20 +1241,45 @@
                     (and call-token
                          (identical? source (get (:invocation-catalog emission) call-token))
                          (identical? call-token (::call-occurrence (meta actual))))
+                    ;; A canonical input completion is its own catalogued occurrence.
+                    ;; Preserve the immediate wrapper, not just a nested call token.
+                    (and completed
+                         (or (identical? actual source)
+                             (identical? actual (:expression completed))))
                     ;; Reduction expansion changes the immediate input's
                     ;; syntax. Its actual emitted bound scope, not a copied
                     ;; source token, establishes this parent/region edge.
                     (and reduction (identical? actual (get-in reduction [:bound :expression]))))
             (assoc input :source-original source)))))))
 
-(defn- retain-floating-conversion! [ctx operand input-type target-carrier locals]
+(defn ^:no-doc retained-input-invocation-input-source
+  "Join a frontend argument to the actual whole invocation's emitted input.
+   Both edges come from this producer: InputOrigins and the positional retained
+   input/source context. Missing or transformed wrappers abstain; equal syntax
+   is not correspondence. This is origin only, not equivalence or admission."
+  [emission input-body original input-index]
+  (when-let [owned-parent (input-origin emission input-body original :invocation)]
+    (let [arguments (vec (util/call-args original))]
+      (when (and (integer? input-index) (<= 0 input-index) (< input-index (count arguments)))
+        (let [source (nth arguments input-index)
+              owned-source (or (input-origin emission input-body source :invocation)
+                               (input-origin emission input-body source :binding)
+                               (input-origin emission input-body source :reduction)
+                               (input-origin emission input-body source :completion))
+              input (retained-input-source-context emission owned-parent input-index)]
+          (when (and owned-source input (identical? owned-source (:source-original input)))
+            (assoc input :source-input source)))))))
+
+(defn- retain-floating-conversion! [ctx operand input-type target-carrier locals & [source-operation]]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
       (let [free (binding [util/*shadowing-locals* (set (keys locals))] (util/free-syms operand))
             record {:status :known :expression (::call-expression ctx)
                     :operand operand :input-type input-type :target-carrier target-carrier
+                    :conversion-kind (if source-operation :source-cast :jvm-coerce)
                     :context (completion/bytecode-operand-context ctx)
-                    :ports (select-keys locals free)}]
+                    :ports (select-keys locals free)}
+            record (cond-> record source-operation (assoc :source-operation source-operation))]
         (retain-call-observation! ctx :floating-conversion-contexts record nil)))))
 
 (defn ^:no-doc retained-floating-conversion
@@ -1087,16 +1396,22 @@
   (let [stmts (butlast forms)
         last-form (last forms)
         void-ctx (assoc (dissoc ctx :object-result?) :void-context true)]
-    (doseq [s stmts]
-      (let [t (emit-form code s locals void-ctx)]
-        (when-not (#{:void :diverge} t)
-          (if (two-slot? t) (.pop2 code) (.pop code)))))
-    (if (seq forms)
-      ;; Preserve void-context if the enclosing form is already in void context.
-      ;; Otherwise dissoc so the last form's value is kept on the stack.
-      (emit-result-form code last-form locals
-                 (if (:void-context ctx) ctx (dissoc ctx :void-context)))
-      :void)))
+    (loop [remaining (seq stmts)]
+      (if (seq remaining)
+        (let [s (first remaining)
+              t (emit-form code s locals void-ctx)]
+          (if (= :diverge t)
+            :diverge
+            (do
+              (when-not (= :void t)
+                (if (two-slot? t) (.pop2 code) (.pop code)))
+              (recur (next remaining)))))
+        (if (seq forms)
+          ;; Preserve void-context if the enclosing form is already in void context.
+          ;; Otherwise dissoc so the last form's value is kept on the stack.
+          (emit-result-form code last-form locals
+                            (if (:void-context ctx) ctx (dissoc ctx :void-context)))
+          :void)))))
 
 ;; Counter for unique anonymous class names
 (def ^:private anon-counter (atom 0))
@@ -1337,7 +1652,8 @@
                                                                     ;; stack-map frame → VerifyError in SIMD closures).
                                                                     :element-type          (:element-type ctx)
                                                                     :sibling-methods       (:sibling-methods ctx)
-                                                                    :typed-sibling-methods (:typed-sibling-methods ctx)}
+                                                                    :typed-sibling-methods (:typed-sibling-methods ctx)
+                                                                    :local-callee-names (:local-callee-names ctx)}
                                                          expanded-body (map macroexpand-all-preserving body)
                                                          ret-type (emit-body code expanded-body param-locals inner-ctx)]
                                                ;; Box and return
@@ -2348,6 +2664,15 @@
   [emission original]
   (retained-call-observation emission original :array-read-contexts))
 
+(defn ^:no-doc retained-input-array-read
+  "Follow an exact emitter-input read to its actual array/index completion context.
+   Uses the existing producer-local call origin; equal source, copied annotations and
+   extracted/reconstructed reads without that edge abstain. No successful read is proved."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [observed (retained-array-read emission owned)]
+      (assoc observed :source-input original :source owned))))
+
 (defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals proof]
   (when me/*emission-inputs*
     (retain-call-observation!
@@ -2505,13 +2830,23 @@
         ;; Already a typed array on the stack
         (do (.arraylength code) :int)))))
 
+(defn- primitive-core-cast-carrier
+  "Physical result of the core cast cases implemented by this emitter."
+  [head-name]
+  (case head-name
+    "double" :double
+    ("float" "unchecked-float") :float
+    "int" :int
+    "long" :long
+    nil))
+
 (defn- emit-source-integral-cast
   "Checked source conversions, not method/array ABI coercions. Select the
    Clojure runtime overload from the actual emitted operand carrier."
   [code head-name args locals ctx]
   (when (= 1 (count args))
     (let [input (emit-form code (first args) locals ctx)
-          result (if (= "int" head-name) :int :long)]
+          result (primitive-core-cast-carrier head-name)]
       (if (= :diverge input)
         :diverge
         (do
@@ -2694,10 +3029,29 @@
     ;; Casts
     "double" (let [t (emit-form code (first args) locals ctx)]
                (retain-floating-conversion! ctx (first args) t Double/TYPE locals)
-               (if (= t :double) t (do (emit-coerce code t :double) :double)))
-    "float"  (let [t (emit-form code (first args) locals ctx)]
-               (retain-floating-conversion! ctx (first args) t Float/TYPE locals)
-               (if (= t :float) t (do (emit-coerce code t :float) :float)))
+               (if (= t :double) t (do (emit-coerce code t :double)
+                                          (primitive-core-cast-carrier head-name))))
+    ("float" "unchecked-float")
+    (when (= 1 (count args))
+      (let [t (emit-form code (first args) locals ctx)]
+        (if (= :diverge t)
+          :diverge
+          (let [input (case t
+                        :int I-cd :long J-cd :float F-cd :double D-cd
+                        ;; Boolean is not numeric. Preserve the core Object overload's
+                        ;; failure instead of silently converting its JVM int encoding.
+                        :bool (do (emit-box-to-ref code t) obj-cd)
+                        :void (do (.aconst_null code) obj-cd)
+                        :ref obj-cd)]
+            (retain-floating-conversion! ctx (first args) t Float/TYPE locals
+                                         (if (= "float" head-name)
+                                           'clojure.core/float 'clojure.core/unchecked-float))
+            ;; Explicit core casts use RT's source overload, not the raw JVM
+            ;; coercion used to satisfy an already resolved method descriptor.
+            ;; In particular float(Double/MAX_VALUE) must throw, not become +Inf.
+            (.invokestatic code rt-cd (if (= "float" head-name) "floatCast" "uncheckedFloatCast")
+                           (MethodTypeDesc/of F-cd (into-array ClassDesc [input])))
+            (primitive-core-cast-carrier head-name)))))
     ("int" "long") (emit-source-integral-cast code head-name args locals ctx)
     ;; Arithmetic — dispatched to emit-arithmetic helper
     ("+" "-" "*" "/") (retain-primitive-index-route! ctx :primitive-arithmetic
@@ -2874,7 +3228,13 @@
 (defn- is-clojure-core? [head ctx]
   (and (symbol? head)
        (let [src-ns (or (:source-ns ctx) *ns*)]
-         (or (= (namespace head) "clojure.core")
+         (or (when (= (namespace head) "clojure.core")
+               ;; Qualified intrinsics also belong to the original lookup
+               ;; history. Later source-body analyses cannot recreate an edge
+               ;; omitted by this producer after the helper is already warm.
+               (when-let [v (ns-resolve src-ns head)]
+                 (when (var? v) (me/observe-definition-input! v src-ns head)))
+               true)
              (and (nil? (namespace head))
                   (when-let [v (ns-resolve src-ns head)]
                     (when (var? v)
@@ -2944,6 +3304,35 @@
   (if (= Object carrier)
     (emit-object-value code expression locals ctx)
     (emit-form code expression locals ctx)))
+
+(defn- typed-input-adaptation [actual carrier]
+  (cond
+    (not= actual (class-type->stack carrier)) :coerce
+    (and (= actual :ref) (not= carrier Object)) :checkcast
+    :else :identity))
+
+(defn- emit-typed-input-adaptation
+  "The actual typed invocation's post-operand conversion, shared with completion."
+  [code actual carrier]
+  (case (typed-input-adaptation actual carrier)
+    :coerce (emit-coerce code actual (class-type->stack carrier))
+    :checkcast (.checkcast code (class-desc-of carrier))
+    :identity nil))
+
+(defn- emit-typed-call-arguments
+  "Emit the actual typed invocation's inputs once, in order. Optional owner-local
+   observations describe the conversion AFTER operand emission, not inferred
+   source types or permission to omit the operand's own evaluation/boxing."
+  [code arguments parameter-types locals ctx observe?]
+  (let [observations (when observe? (volatile! []))]
+    (doseq [[argument ^Class carrier] (map vector arguments parameter-types)]
+      (let [actual (emit-argument-value code argument carrier locals ctx)
+            adaptation (typed-input-adaptation actual carrier)]
+        (emit-typed-input-adaptation code actual carrier)
+        (when observations
+          (vswap! observations conj {:operand argument :emitted-type actual
+                                     :parameter-carrier carrier :adaptation adaptation}))))
+    (when observations @observations)))
 
 (defn- emit-java-static-call
   "Emit bytecode for Java static method calls (e.g. Math/sin, System/arraycopy).
@@ -3290,7 +3679,12 @@
 
     ;; ---- Sibling method call ----
         (and (symbol? head) (get (:sibling-methods ctx) (str head)))
-        (let [{:keys [method-name method-type param-descs owner]} (get (:sibling-methods ctx) (str head))]
+        (let [{:keys [method-name method-type param-descs owner body-token]}
+              (get (:sibling-methods ctx) (str head))
+              completions (when (and me/*emission-inputs* body-token
+                                     (= owner (:class-desc ctx))
+                                     (= (count args) (count param-descs)))
+                            (atom []))]
           (doseq [[a pd] (map vector args (concat param-descs (repeat obj-cd)))]
             (let [t (if (.equals ^ClassDesc pd obj-cd)
                       (emit-object-value code a locals ctx)
@@ -3304,8 +3698,23 @@
               (if (and (= t :ref) (= target-st :ref) (not (.equals ^ClassDesc pd obj-cd)))
                 (.checkcast code pd)
                 (when (not= t target-st)
-                  (emit-coerce code t target-st)))))
+                  (emit-coerce code t target-st)))
+              (when completions
+                (swap! completions conj {:emitted-type t :target-stack-type target-st
+                                         :parameter-descriptor (.descriptorString ^ClassDesc pd)}))))
           (.invokestatic code (or owner (:class-desc ctx)) method-name method-type)
+          ;; An extraction-local static call is not a selected typed-indy call.
+          ;; Record what was actually emitted; resolve its Method only against
+          ;; the exact helper body's late attachment in the owning module.
+          (when completions
+            (retain-call-observation!
+             ctx :invocation-contexts
+             {:status :known :invocation-mode :module-static
+              :target-body body-token :target-owner owner :target-name method-name
+              :target-descriptor (.descriptorString ^MethodTypeDesc method-type)
+              :inputs (mapv #(physical-operand-input % locals ctx) args)
+              :input-completions @completions}
+             :repeated-emitted-invocation-context))
           ;; Return type from method descriptor
           (let [ret-cd (.returnType method-type)]
             (cond (.equals ^ClassDesc ret-cd D-cd) :double
@@ -3461,6 +3870,335 @@
 ;; keeping emit-form itself under the 64KB method size limit).
 ;; ---------------------------------------------------------------------------
 
+(defn- method-local-callee-candidate?
+  "Conservative denial for operands whose original method-local callees are
+   not retained by the input outliner. Match the emitter's actual lookup keys;
+   this is not a function registry, dispatch proof or purity analysis."
+  [expression ctx]
+  (let [names (or (:local-callee-names ctx)
+                  {:typed (set (keys (:typed-sibling-methods ctx)))
+                   :untyped (set (keys (:sibling-methods ctx)))})
+        ctx (assoc ctx :local-callee-names names)]
+   (cond
+    (and (seq? expression) (contains? #{'quote 'clojure.core/quote} (first expression))) false
+    (completion/canonical-parts expression)
+    (method-local-callee-candidate? (:operand (completion/canonical-parts expression)) ctx)
+    :else
+    (boolean
+     (or (and (seq? expression) (symbol? (first expression))
+              (or (contains? (:typed names) (name (first expression)))
+                  (contains? (:untyped names) (str (first expression)))))
+         (and (coll? expression)
+              (some #(method-local-callee-candidate? % ctx) expression)))))))
+
+(defn ^:no-doc binding-initializer-context
+  "The actual lexical initializer context, shared with pre-emission planning.
+   This chooses evaluation context, not a value's physical carrier."
+  [ctx]
+  (assoc (dissoc ctx :void-context :object-result?) :preserve-source-call-results? true))
+
+(defn- object-input-context [ctx]
+  (assoc (dissoc ctx :object-result? :void-context :object-call-result?)
+         :preserve-source-call-results? true))
+
+(defn ^:no-doc binding-hint
+  "The existing emitter's lexical hint selection, not raw carrier inference.
+   Consumers must independently establish the initializer stack type before
+   planning its completion. Kept shared so pre-emission work cannot invent a
+   second alias/return/interop hint policy."
+  [sym init locs ctx]
+  (or (:tag (meta sym))
+        (:raster.type/tag (meta sym))
+        ;; Alias: inherit from source
+        (when (symbol? init)
+          (:hint (get locs init)))
+        ;; Call to deftm: use return-tag from var metadata
+        (when (and (seq? init) (symbol? (first init)))
+          (try (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) (first init))]
+                 (when (var? v)
+                   (:raster.core/return-tag (meta v))))
+               (catch Exception _ nil)))
+        ;; .invk call: read return-tag from walker metadata on impl symbol
+        (when (and (seq? init) (= '.invk (first init))
+                   (symbol? (second init)))
+          (:raster.type/ret-tag (meta (second init))))
+        ;; Java static field/method return type (ClassName/name)
+        ;; Only for actual Java classes (not Clojure vars)
+        (when (and (seq? init) (symbol? (first init))
+                   (let [s (str (first init))]
+                     (and (.contains s "/") (not (.startsWith s "."))))
+                   ;; Skip if it resolves to a Clojure var
+                   (not (try (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) (first init))]
+                               (var? v))
+                             (catch Exception _ false))))
+          (try
+            (let [s (str (first init))
+                  slash (.indexOf ^String s "/")]
+              (when (pos? slash)
+                (let [cls-name (subs s 0 slash)
+                      meth-name (subs s (inc slash))
+                      src-ns (or (:source-ns ctx) *ns*)
+                      cls (or (try (Class/forName cls-name) (catch Exception _ nil))
+                              (when-let [r (ns-resolve src-ns (symbol cls-name))]
+                                (when (class? r) r)))
+                      n-args (dec (count init))]
+                  (when cls
+                    (or ;; Static field (0 args)
+                     (when (zero? n-args)
+                       (try (symbol (.getName (.getType (.getField cls meth-name))))
+                            (catch Exception _ nil)))
+                        ;; Static method
+                     (when-let [m (first (filter #(and (= (.getName ^java.lang.reflect.Method %) meth-name)
+                                                       (= n-args (.getParameterCount ^java.lang.reflect.Method %)))
+                                                 (.getMethods cls)))]
+                       (let [ret (.getReturnType ^java.lang.reflect.Method m)]
+                         (when-not (.isPrimitive ret)
+                           (symbol (.getName ret))))))))))
+            (catch Exception _ nil)))
+        ;; Instance method: (. obj method args...) or (.method obj args...)
+        ;; Infer return type from the method's declaring class
+        (when (and (seq? init) (symbol? (first init)))
+          (let [h (first init)]
+            (cond
+              ;; (.method obj args...)
+              (and (.startsWith (str h) ".") (not= "." (str h)))
+              (let [meth-str (subs (str h) 1)
+                    obj-form (second init)
+                    obj-tag (when (symbol? obj-form) (:hint (get locs obj-form)))
+                    src-ns (or (:source-ns ctx) *ns*)
+                    cls (when obj-tag
+                          (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
+                              (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
+                                (when (class? r) r))))]
+                (when cls
+                  ;; Find most specific return type among matching methods
+                  ;; Java bridge methods return the erased type; prefer
+                  ;; the non-bridge overload with the most specific return
+                  (let [matches (seq (filter #(= (.getName ^java.lang.reflect.Method %) meth-str)
+                                             (.getMethods cls)))
+                        best (or (first (remove #(.isBridge ^java.lang.reflect.Method %) matches))
+                                 (first matches))]
+                    (when best
+                      (let [ret (.getReturnType ^java.lang.reflect.Method best)]
+                        (when-not (.isPrimitive ret)
+                          (symbol (.getName ret))))))))
+              ;; (. obj method args...)
+              (= '. h)
+              (let [obj-form (second init)
+                    meth-sym (nth init 2 nil)
+                    obj-tag (when (symbol? obj-form) (:hint (get locs obj-form)))
+                    src-ns (or (:source-ns ctx) *ns*)
+                    cls (when obj-tag
+                          (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
+                              (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
+                                (when (class? r) r))))]
+                (when (and cls meth-sym)
+                  (let [matches (seq (filter #(= (.getName ^java.lang.reflect.Method %) (str meth-sym))
+                                             (.getMethods cls)))
+                        best (or (first (remove #(.isBridge ^java.lang.reflect.Method %) matches))
+                                 (first matches))]
+                    (when best
+                      (let [ret (.getReturnType ^java.lang.reflect.Method best)]
+                        (when-not (.isPrimitive ret)
+                          (symbol (.getName ret))))))))
+              :else nil)))
+        ;; (new ClassName ...) → ClassName
+        (when (and (seq? init) (= 'new (first init)))
+          (let [cls-sym (second init)]
+            (when cls-sym (symbol (str cls-sym)))))
+        ;; Fallback: use infer-arg-tag for if/do/loop/etc.
+        ;; This covers forms the bytecode handler's
+        ;; pattern matching doesn't handle.
+        (try
+          (let [local-env (into {} (keep (fn [[k v]]
+                                           (when-let [h (:hint v)]
+                                             [k h]))
+                                         locs))]
+            (inf/infer-arg-tag init local-env))
+          (catch Throwable _ nil))))
+
+(defn ^:no-doc binding-completion-plan
+  "Plan the emitter's existing lexical CHECKCAST and resulting local facts.
+   `actual` must be an established raw stack carrier, not a logical annotation.
+   Resolving a hint here does not establish the initializer's carrier or totality.
+   Slot allocation and execution remain the emitter's responsibility."
+  [tag actual ctx]
+  (let [tag (if (and (symbol? tag) (zero? (count (name tag)))) nil tag)
+        reference-class
+        (when (and tag (= actual :ref) (not (typed-interface? tag)))
+          (let [src-ns (or (:source-ns ctx) *ns*)
+                cls (cond
+                      (= tag 'objects) (Class/forName "[Ljava.lang.Object;")
+                      (= tag 'doubles) (Class/forName "[D")
+                      (= tag 'floats) (Class/forName "[F")
+                      (= tag 'ints) (Class/forName "[I")
+                      (= tag 'longs) (Class/forName "[J")
+                      (= tag 'bytes) (Class/forName "[B")
+                      (= tag 'shorts) (Class/forName "[S")
+                      :else
+                      (let [tag-str (str tag)]
+                        (when (pos? (count tag-str))
+                          (or (try (Class/forName tag-str) (catch Exception _ nil))
+                              (when-let [r (ns-resolve src-ns (symbol tag-str))]
+                                (when (class? r) r))))))]
+            (when (and cls (not= cls Object)) cls)))]
+    {:checkcast-class reference-class
+     :local-facts (cond-> {:type actual :hint tag
+                          :verified (boolean (and tag (not= tag 'Object)))}
+                    (= :ref actual) (assoc :reference-class (or reference-class Object)))}))
+
+(declare typed-invocation-plan plan-form-carrier plan-argument-carrier plan-flat-bindings primitive-tags)
+
+(defn ^:no-doc plan-argument-carrier
+  "Plan the raw operand carrier BEFORE a resolved typed input's adaptation.
+   Object consumption includes original boxing; other consumers do not change
+   the operand's raw carrier. The actual Method must own parameter-class."
+  [expression parameter-class locals ctx]
+  (when (class? parameter-class)
+    (if (= Object parameter-class)
+      (when (plan-form-carrier expression locals (object-input-context ctx)) :ref)
+      (plan-form-carrier expression locals ctx))))
+
+(defn ^:no-doc resolved-parameter-locals
+  "Seed a new physical program's locals from an already resolved Method.
+   No logical tags, source hints or overload selection supply carrier facts.
+   These describe the Method entry only, not nullness, bounds or ownership."
+  [resolved-method parameters]
+  (when (and (instance? java.lang.reflect.Method resolved-method)
+             (vector? parameters) (every? symbol? parameters)
+             (= (count parameters) (count (set parameters)))
+             (= (count parameters) (.getParameterCount ^java.lang.reflect.Method resolved-method)))
+    (let [classes (vec (.getParameterTypes ^java.lang.reflect.Method resolved-method))
+          carriers (mapv class-type->stack classes)]
+      (when (every? #{:ref :int :long :float :double :bool} carriers)
+        (into {} (map (fn [id carrier cls]
+                        [id (cond-> {:type carrier}
+                              (= :ref carrier) (assoc :reference-class cls))])
+                      parameters carriers classes))))))
+
+(defn ^:no-doc plan-resolved-invocation-inputs
+  "Construct inputs for a new physical program using an already resolved Method.
+   No overload/source dispatch or receiver expression is synthesized. The owner
+   must retain selection and source-import correspondence separately. Unsupported
+   operands/parameter conversions abstain; logical hints never supply raw facts.
+   Child argument context consumes the invocation's one-shot Object-result flag,
+   exactly as the real typed invocation emitter does."
+  [resolved-method arguments locals ctx]
+  (when (and (instance? java.lang.reflect.Method resolved-method)
+             (vector? arguments)
+             (= (count arguments) (.getParameterCount ^java.lang.reflect.Method resolved-method))
+             (not (.isVarArgs ^java.lang.reflect.Method resolved-method)))
+    (let [classes (vec (.getParameterTypes ^java.lang.reflect.Method resolved-method))
+          supported? (fn [^Class carrier]
+                       (or (not (.isPrimitive carrier))
+                           (contains? #{Float/TYPE Double/TYPE Integer/TYPE Long/TYPE} carrier)))
+          context (dissoc ctx :object-call-result?)]
+      (when (every? supported? classes)
+        (let [inputs (mapv (fn [operand carrier]
+                             (when-let [raw (plan-argument-carrier operand carrier locals context)]
+                               (when (and (contains? #{:ref :int :long :float :double :bool} raw)
+                                          (or (.isPrimitive ^Class carrier) (= :ref raw)))
+                                 {:operand operand :raw-carrier raw :parameter-class carrier
+                                  :adaptation (typed-input-adaptation raw carrier)
+                                  :contract (completion/planned-bytecode-input-contract
+                                             carrier (completion/bytecode-operand-context context) raw)})))
+                           arguments classes)]
+          (when (every? some? inputs) inputs))))))
+
+(defn ^:no-doc plan-flat-bindings
+  "Plan a closed lexical SSA binding spine without emitting or executing it.
+   Returns nil on unsupported/ambiguous facts. Local :type facts must originate
+   from a physical entry or this same mechanism, never logical hint inference.
+   This performs compiler-time resolution; it proves no totality or ownership."
+  [bindings locals ctx]
+  (when (and (vector? bindings) (even? (count bindings)))
+    (loop [remaining (seq (partition 2 bindings)) known locals entries []]
+      (if-not remaining
+        {:locals known :bindings entries}
+        (let [[id initializer] (first remaining)
+              raw (when (and (symbol? id) (not (contains? known id)))
+                    (plan-form-carrier initializer known (binding-initializer-context ctx)))]
+          (when (contains? #{:ref :int :long :float :double :bool} raw)
+            (let [hint (binding-hint id initializer known ctx)
+                  completion (binding-completion-plan hint raw ctx)
+                  facts (:local-facts completion)
+                  ;; A logical primitive hint on an Object result does not
+                  ;; request a reference CHECKCAST, nor change its raw carrier.
+                  unresolved? (and (= raw :ref) (:hint facts) (:verified facts)
+                                   (not (contains? primitive-tags (:hint facts)))
+                                   (= Object (:reference-class facts)))]
+              (when-not unresolved?
+                (recur (next remaining) (assoc known id facts)
+                       (conj entries {:binder id :initializer initializer :before known
+                                      :raw-type raw :completion completion :after facts}))))))))))
+
+(defn ^:no-doc plan-form-carrier
+  "Optional normal-completion stack carrier for a narrow closed source subset.
+   Unknown means abstain, not Object. This cannot prove successful evaluation,
+   purity, helper selection/return ownership, or permission to move an operand."
+  [expression locals ctx]
+  (cond
+    (symbol? expression)
+    (let [raw (:type (get locals expression))]
+      (when (contains? #{:ref :int :long :float :double :bool} raw) raw))
+    (number? expression)
+    (when (or (instance? Long expression) (instance? Integer expression)
+              (instance? Byte expression) (instance? Short expression)
+              (instance? Float expression) (instance? Double expression))
+      (numeric-literal-stack-type expression))
+    (instance? Boolean expression) :bool
+    (char? expression) :int
+    (or (nil? expression) (string? expression) (keyword? expression)) :ref
+    (seq? expression)
+    (let [head (first expression)]
+      (cond
+        (= completion/completion-symbol head)
+        (when-let [{:keys [contract operand]} (completion/canonical-parts expression)]
+          (case (:source-context contract)
+            :jvm-object-input
+            (when (plan-form-carrier operand locals (object-input-context ctx)) :ref)
+            :jvm-checkcast
+            (when (plan-form-carrier operand locals (object-input-context ctx)) :ref)
+            :jvm-bytecode-result-context
+            (let [raw (plan-form-carrier operand locals
+                                        (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
+                                               (:operand-context contract)))]
+              (when (= raw (:result-carrier contract)) raw))
+            :jvm-bytecode-boxed-parameter-input
+            (when (plan-form-carrier operand locals (object-input-context ctx))
+              (class-type->stack (:target-carrier contract)))
+            (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
+            (when-let [expected (:expected-input-carrier contract)]
+              (let [original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
+                                            (:operand-context contract))
+                    raw (plan-argument-carrier operand (:target-carrier contract) locals original-context)]
+                (when (= expected raw) (class-type->stack (:target-carrier contract)))))
+            ;; Input completions need retained expected-raw facts, not just
+            ;; target annotations.
+            nil))
+        (= 'let* head)
+        (when (and (= 3 (count expression)) (vector? (second expression)))
+          (when-let [plan (plan-flat-bindings (second expression) locals ctx)]
+            (plan-form-carrier (nth expression 2) (:locals plan) ctx)))
+        (= '.invk head)
+        (let [[_ receiver & arguments] expression
+              plan (typed-invocation-plan receiver (count arguments) locals ctx)]
+          (when (and (:global? plan)
+                     (every? some?
+                             (map (fn [argument carrier]
+                                    (plan-argument-carrier argument carrier locals
+                                                           (dissoc ctx :object-call-result?)))
+                                  arguments (:parameter-carriers plan))))
+            (let [raw (class-type->stack (or (:primitive-result-class plan)
+                                            (:interface-result-class plan)))]
+              (when (contains? #{:ref :int :long :float :double :bool} raw) raw))))
+        (and (symbol? head) (not (contains? locals head)) (is-clojure-core? head ctx)
+             (= 2 (count expression)) (primitive-core-cast-carrier (name head)))
+        (when (plan-form-carrier (second expression) locals (dissoc ctx :object-call-result?))
+          (primitive-core-cast-carrier (name head)))
+        :else nil))
+    :else nil))
+
 (defn- emit-let*-handler
   "Emit bytecode for (let* [bindings...] body...).
   Handles type inference for let bindings including:
@@ -3472,6 +4210,7 @@
   (let [[bindings & body] args
         pairs (partition 2 bindings)
         binding-idx (atom 0)
+        diverged? (volatile! false)
         new-locals (reduce
                     (fn [locs [sym init]]
                       (swap! binding-idx inc)
@@ -3484,169 +4223,32 @@
                              (catch Exception _)))
                       ;; Binding inits must always produce a value (for the local
                       ;; variable slot), so strip :void-context from ctx.
-                      (let [initializer-ctx (assoc (dissoc ctx :void-context :object-result?)
-                                                   :preserve-source-call-results? true)
+                      (let [initializer-ctx (binding-initializer-context ctx)
+                            planned (plan-form-carrier init locs initializer-ctx)
                             t (emit-form code init locs initializer-ctx)
+                            _ (when (and planned (not= planned t))
+                                (throw (ex-info "Lexical initializer differs from its shared carrier plan"
+                                                {:reason :bytecode-binding-plan-mismatch
+                                                 :binder sym :expected planned :actual t})))
                              ;; Handle type hints on let bindings
                              ;; ^objects → checkcast [Ljava/lang/Object;
                              ;; ^doubles → checkcast [D
                              ;; ^ClassName → checkcast to that class
-                            ;; Infer tag: explicit hint, CARRIED :raster.type/tag stamp
-                            ;; (AD emission / walker — emitters read stamps, never
-                            ;; re-infer), alias source, deftm return-tag, .invk
-                            ;; return-tag, or Java static field/method return type
-                            tag (or (:tag (meta sym))
-                                    (:raster.type/tag (meta sym))
-                                    ;; Alias: inherit from source
-                                    (when (symbol? init)
-                                      (:hint (get locs init)))
-                                    ;; Call to deftm: use return-tag from var metadata
-                                    (when (and (seq? init) (symbol? (first init)))
-                                      (try (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) (first init))]
-                                             (when (var? v)
-                                               (:raster.core/return-tag (meta v))))
-                                           (catch Exception _ nil)))
-                                    ;; .invk call: read return-tag from walker metadata on impl symbol
-                                    (when (and (seq? init) (= '.invk (first init))
-                                               (symbol? (second init)))
-                                      (:raster.type/ret-tag (meta (second init))))
-                                    ;; Java static field/method return type (ClassName/name)
-                                    ;; Only for actual Java classes (not Clojure vars)
-                                    (when (and (seq? init) (symbol? (first init))
-                                               (let [s (str (first init))]
-                                                 (and (.contains s "/") (not (.startsWith s "."))))
-                                               ;; Skip if it resolves to a Clojure var
-                                               (not (try (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) (first init))]
-                                                           (var? v))
-                                                         (catch Exception _ false))))
-                                      (try
-                                        (let [s (str (first init))
-                                              slash (.indexOf ^String s "/")]
-                                          (when (pos? slash)
-                                            (let [cls-name (subs s 0 slash)
-                                                  meth-name (subs s (inc slash))
-                                                  src-ns (or (:source-ns ctx) *ns*)
-                                                  cls (or (try (Class/forName cls-name) (catch Exception _ nil))
-                                                          (when-let [r (ns-resolve src-ns (symbol cls-name))]
-                                                            (when (class? r) r)))
-                                                  n-args (dec (count init))]
-                                              (when cls
-                                                (or ;; Static field (0 args)
-                                                 (when (zero? n-args)
-                                                   (try (symbol (.getName (.getType (.getField cls meth-name))))
-                                                        (catch Exception _ nil)))
-                                                    ;; Static method
-                                                 (when-let [m (first (filter #(and (= (.getName ^java.lang.reflect.Method %) meth-name)
-                                                                                   (= n-args (.getParameterCount ^java.lang.reflect.Method %)))
-                                                                             (.getMethods cls)))]
-                                                   (let [ret (.getReturnType ^java.lang.reflect.Method m)]
-                                                     (when-not (.isPrimitive ret)
-                                                       (symbol (.getName ret))))))))))
-                                        (catch Exception _ nil)))
-                                    ;; Instance method: (. obj method args...) or (.method obj args...)
-                                    ;; Infer return type from the method's declaring class
-                                    (when (and (seq? init) (symbol? (first init)))
-                                      (let [h (first init)]
-                                        (cond
-                                          ;; (.method obj args...)
-                                          (and (.startsWith (str h) ".") (not= "." (str h)))
-                                          (let [meth-str (subs (str h) 1)
-                                                obj-form (second init)
-                                                obj-tag (when (symbol? obj-form) (:hint (get locs obj-form)))
-                                                src-ns (or (:source-ns ctx) *ns*)
-                                                cls (when obj-tag
-                                                      (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
-                                                          (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
-                                                            (when (class? r) r))))]
-                                            (when cls
-                                              ;; Find most specific return type among matching methods
-                                              ;; Java bridge methods return the erased type; prefer
-                                              ;; the non-bridge overload with the most specific return
-                                              (let [matches (seq (filter #(= (.getName ^java.lang.reflect.Method %) meth-str)
-                                                                         (.getMethods cls)))
-                                                    best (or (first (remove #(.isBridge ^java.lang.reflect.Method %) matches))
-                                                             (first matches))]
-                                                (when best
-                                                  (let [ret (.getReturnType ^java.lang.reflect.Method best)]
-                                                    (when-not (.isPrimitive ret)
-                                                      (symbol (.getName ret))))))))
-                                          ;; (. obj method args...)
-                                          (= '. h)
-                                          (let [obj-form (second init)
-                                                meth-sym (nth init 2 nil)
-                                                obj-tag (when (symbol? obj-form) (:hint (get locs obj-form)))
-                                                src-ns (or (:source-ns ctx) *ns*)
-                                                cls (when obj-tag
-                                                      (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
-                                                          (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
-                                                            (when (class? r) r))))]
-                                            (when (and cls meth-sym)
-                                              (let [matches (seq (filter #(= (.getName ^java.lang.reflect.Method %) (str meth-sym))
-                                                                         (.getMethods cls)))
-                                                    best (or (first (remove #(.isBridge ^java.lang.reflect.Method %) matches))
-                                                             (first matches))]
-                                                (when best
-                                                  (let [ret (.getReturnType ^java.lang.reflect.Method best)]
-                                                    (when-not (.isPrimitive ret)
-                                                      (symbol (.getName ret))))))))
-                                          :else nil)))
-                                    ;; (new ClassName ...) → ClassName
-                                    (when (and (seq? init) (= 'new (first init)))
-                                      (let [cls-sym (second init)]
-                                        (when cls-sym (symbol (str cls-sym)))))
-                                    ;; Fallback: use infer-arg-tag for if/do/loop/etc.
-                                    ;; This covers forms the bytecode handler's
-                                    ;; pattern matching doesn't handle.
-                                    (try
-                                      (let [local-env (into {} (keep (fn [[k v]]
-                                                                       (when-let [h (:hint v)]
-                                                                         [k h]))
-                                                                     locs))]
-                                        (inf/infer-arg-tag init local-env))
-                                      (catch Throwable _ nil)))
+                            tag (binding-hint sym init locs ctx)
                             ;; A degenerate empty-symbol tag (infer-arg-tag's ctor arm
                             ;; misfires on host `(. obj meth …)` dot forms: (name '.)
                             ;; ends with ".") is POISON: it would mark the local
                             ;; :verified (≠ 'Object) while emitting no checkcast, so a
                             ;; downstream aget skips its checkcast too → VerifyError
                             ;; (aaload on Object). Treat it as absent.
-                            tag (if (and (symbol? tag) (zero? (count (name tag)))) nil tag)
                             ;; Checkcast for typed let bindings (arrays, records, etc.)
                             ;; These CHECKCASTs are redundant when getfield already returns
                             ;; the typed value, but C2 uses them as type proofs for downstream
                             ;; optimizations. Removing them causes 2x regression.
                             ;; Skip IFn__ types — handled by wrapper guard.
-                            reference-class (when (and tag (= t :ref)
-                                         (not (typed-interface? tag)))
-                                (let [src-ns (or (:source-ns ctx) *ns*)
-                                      cls (cond
-                                            (= tag 'objects)
-                                            (Class/forName "[Ljava.lang.Object;")
-                                            (= tag 'doubles)
-                                            (Class/forName "[D")
-                                            (= tag 'floats)
-                                            (Class/forName "[F")
-                                            (= tag 'ints)
-                                            (Class/forName "[I")
-                                            (= tag 'longs)
-                                            (Class/forName "[J")
-                                            (= tag 'bytes)
-                                            (Class/forName "[B")
-                                            (= tag 'shorts)
-                                            (Class/forName "[S")
-                                            :else
-                                            (let [tag-str (str tag)]
-                                              (when (pos? (count tag-str))
-                                                (or (try (Class/forName tag-str)
-                                                         (catch Exception _ nil))
-                                                    (when-let [r (ns-resolve src-ns (symbol tag-str))]
-                                                      (when (class? r) r))))))]
-                                  ;; Object is the existing verifier carrier, not a
-                                  ;; narrower type proof. Keep all real array/record
-                                  ;; casts, but do not emit this no-op instruction.
-                                  (when (and cls (not= cls Object))
-                                    (.checkcast code (class-desc-of cls))
-                                    cls)))
+                            completion-plan (binding-completion-plan tag t ctx)
+                            _ (when-let [cls (:checkcast-class completion-plan)]
+                                (.checkcast code (class-desc-of cls)))
                             ;; Skip store for void results (effectful calls like Arrays.fill)
                             slot (when-not (#{:void :diverge} t) (alloc-slot! ctx t))]
                         (when slot
@@ -3657,23 +4259,32 @@
                             :float  (.fstore code slot)
                             (.astore code slot)))
                         (if slot
-                          (let [new-locs (assoc locs sym (cond-> {:slot slot :type t :hint tag
-                                                          :verified (boolean (and tag (not= tag 'Object)))}
-                                                         (= :ref t) (assoc :reference-class (or reference-class Object))))]
-                            (retain-binding-context! ctx (count pairs) (dec @binding-idx) sym init locs (get new-locs sym))
-                            (retain-reduction-observation! ctx :bound-scope
-                                                           {:binder sym :initializer init :before locs
-                                                            :context (completion/bytecode-operand-context initializer-ctx)
-                                                            :after (get new-locs sym) :binding-count (count pairs)})
+                          (let [new-locs (assoc locs sym (assoc (:local-facts completion-plan) :slot slot))]
+                            (retain-binding-context! initializer-ctx (count pairs) (dec @binding-idx) sym init locs (get new-locs sym))
+                            (when (and me/*emission-inputs* (= :bound-scope (::reduction-role ctx)))
+                              (retain-reduction-observation!
+                               ctx :bound-scope
+                               {:binder sym :initializer init :before locs
+                                :context (completion/bytecode-operand-context initializer-ctx)
+                                :element-type (:element-type initializer-ctx)
+                                :unretained-sibling-calls? (method-local-callee-candidate? init initializer-ctx)
+                                :after (get new-locs sym) :binding-count (count pairs)}))
                             (when (and (System/getProperty "raster.debug.locals")
                                        (or (.startsWith (str sym) "K_")
                                            (.startsWith (str sym) "V_")
                                            (.startsWith (str sym) "Q_")))
                               (println (str "  [bind] " sym " → slot " slot " type " t)))
                             new-locs)
-                          locs)))
+                          (if (= :diverge t)
+                            (do (vreset! diverged? true) (reduced locs))
+                            locs))))
                     locals pairs)]
-    (emit-body code body new-locals ctx)))
+    (if @diverged?
+      :diverge
+      (let [result-type (emit-body code body new-locals ctx)]
+        (retain-terminal-context! ctx (count pairs) body new-locals result-type)
+        (retain-reduction-root-result! ctx body result-type)
+        result-type))))
 
 (defn- comparison-pred-parts
   "Return [op-name arg1 arg2] when `pred` is a 2-arg comparison the if-handler can
@@ -3725,6 +4336,8 @@
         ;; instead of materializing boolean. Critical for C2 counted loop
         ;; recognition which requires IF_ICMPxx at the loop back-edge.
         cmp-parts (comparison-pred-parts pred)
+        reduction-control (when (and me/*emission-inputs* (= :exit (::reduction-role ctx)))
+                            (atom nil))
         branch-folded?
         (when cmp-parts
           (let [pn (nth cmp-parts 0)
@@ -3735,7 +4348,16 @@
             (cond
                   ;; Both int → IF_ICMPxx (inverted for else branch)
               (and (= t1 :int) (= t2 :int))
-              (do (case pn "<" (.if_icmpge code else-label) "<=" (.if_icmpgt code else-label)
+              (do (case pn "<" (do
+                                  (.if_icmpge code else-label)
+                                  (when reduction-control
+                                    (reset! reduction-control
+                                            {:kind :int-less-than :predicate pred
+                                             :operands [a1 a2] :input-types [t1 t2]
+                                             :locals locals
+                                             :context (completion/bytecode-operand-context val-ctx)
+                                             :false-branch :if-icmpge})))
+                        "<=" (.if_icmpgt code else-label)
                         ">" (.if_icmple code else-label) ">=" (.if_icmplt code else-label)
                         "==" (.if_icmpne code else-label) "not=" (.if_icmpeq code else-label))
                   true)
@@ -3812,9 +4434,11 @@
               ;; Record the real carry load and merge conversion. A logical
               ;; Double carry alone does not prove a primitive loop result.
               (retain-reduction-observation!
-                ctx :exit {:value else :local (get locals else) :input-type else-type
-                           :result-type (if (primitive? else-type) :ref else-type)
-                           :context (completion/bytecode-operand-context ctx)})
+                ctx :exit (cond-> {:value else :local (get locals else) :input-type else-type
+                                   :result-type (if (primitive? else-type) :ref else-type)
+                                   :context (completion/bytecode-operand-context ctx)}
+                            (some? (some-> reduction-control deref))
+                            (assoc :control @reduction-control)))
               (.labelBinding code end-label)
               (if (primitive? else-type) :ref else-type)))
         ;; Normal case: both branches produce values.
@@ -3899,6 +4523,44 @@
                 (contains? #{:double :float :long :int :bool}
                            (:type (get locals arg))))))))
 
+(defn ^:no-doc typed-invocation-plan
+  "Resolve the emitter's existing typed invk mechanism before code generation.
+   The interface Method supplies actual parameter Classes. Neither its tags nor
+   this plan establish operand carriers, selected-definition ownership or purity.
+   :global? selects the emitter's args-first path, not an ordering proof. The
+   primitive result Class is an emission request, not return-bridge authority."
+  [obj arity locals ctx]
+  (when (symbol? obj)
+    (let [tag (or (:raster.type/tag (meta obj)) (:tag (meta obj)) (:hint (get locals obj)))]
+      (when (and tag (typed-interface? tag))
+        (let [src-ns (or (:source-ns ctx) *ns*)
+              cls (or (try (Class/forName (str tag)) (catch Exception _ nil))
+                      (when-let [r (ns-resolve src-ns (symbol (str tag)))]
+                        (when (class? r) r)))
+              _ (when-not cls
+                  (throw (ex-info (str "Cannot resolve IFn__ interface: " tag) {:obj obj :tag tag})))
+              method (first (filter #(and (= (.getName ^java.lang.reflect.Method %) "invk")
+                                          (= (.getParameterCount ^java.lang.reflect.Method %) arity))
+                                    (.getMethods cls)))
+              _ (when-not method
+                  (throw (ex-info (str "Cannot resolve invk method on " tag " with " arity " args")
+                                  {:obj obj :tag tag :arity arity})))
+              object-result? (or (:object-call-result? ctx) (:preserve-source-call-results? ctx))
+              primitive-result (when-not object-result?
+                                 (case (:raster.type/ret-tag (meta obj))
+                                   (double Double) Double/TYPE
+                                   (long Long) Long/TYPE
+                                   (int Integer) Integer/TYPE
+                                   (float Float) Float/TYPE
+                                   (boolean Boolean) Boolean/TYPE
+                                   (void Void) Void/TYPE
+                                   nil))]
+          {:interface cls :method method
+           :parameter-carriers (vec (.getParameterTypes ^java.lang.reflect.Method method))
+           :interface-result-class (.getReturnType ^java.lang.reflect.Method method)
+           :primitive-result-class primitive-result
+           :global? (and (namespace obj) (not (get locals obj)))})))))
+
 (defn- emit-dot-handler
   "Emit bytecode for (. obj method args...) — instance method or field access.
   Handles two paths:
@@ -3906,77 +4568,30 @@
   - Regular path: invokeinterface/invokevirtual with optional instanceof guard"
   [code args locals ctx]
   (let [[obj member & margs] args
-        object-call-result? (or (:object-call-result? ctx) (:preserve-source-call-results? ctx))
-        ctx (dissoc ctx :object-call-result?)
         [meth-name method-args] (if (seq? member)
                                   [(first member) (rest member)]
                                   [member margs])
-        meth-str (str meth-name)]
+        meth-str (str meth-name)
+        invocation (when (= meth-str "invk") (typed-invocation-plan obj (count method-args) locals ctx))
+        ctx (dissoc ctx :object-call-result?)]
     ;; invokedynamic path: .invk on a namespace-qualified -impl var
     ;; with an IFn__ interface tag. Emits invokedynamic instead of
     ;; RT.var().getRawRoot() + invokeinterface, giving C2 a
     ;; MutableCallSite target it can inline as a constant.
-    (if (and (= meth-str "invk")
-             (symbol? obj)
-             ;; Check for typed interface via metadata (set by walker's stamp-type-meta)
-             ;; or via the locals map hint (for function parameters).
-             ;; This is the single source of truth — no -impl suffix pattern matching.
-             (let [tag (or (:raster.type/tag (meta obj))
-                           (:tag (meta obj))
-                           (when-let [li (get locals obj)] (:hint li)))]
-               (and tag (typed-interface? tag))))
-      (let [src-ns (or (:source-ns ctx) *ns*)
-            tag (or (:raster.type/tag (meta obj)) (:tag (meta obj))
-                    (:hint (get locals obj)))
-            cls (or (try (Class/forName (str tag)) (catch Exception _ nil))
-                    (when-let [r (ns-resolve src-ns (symbol (str tag)))]
-                      (when (class? r) r)))
-            _ (when-not cls
-                (throw (ex-info (str "Cannot resolve IFn__ interface: " tag)
-                                {:obj obj :tag tag})))
-            method (first (filter #(and (= (.getName ^java.lang.reflect.Method %) "invk")
-                                        (= (.getParameterCount ^java.lang.reflect.Method %) (count method-args)))
-                                  (.getMethods cls)))
-            _ (when-not method
-                (throw (ex-info (str "Cannot resolve invk method on " tag " with " (count method-args) " args")
-                                {:obj obj :tag tag :arity (count method-args)})))
-            param-types (.getParameterTypes method)
-            ^Class ret-class (.getReturnType method)
-            ;; Primitive return type from walker (for invokedynamic zero-boxing).
-            ;; Only used for the var-reference path; local path keeps Object return.
-            ret-tag-meta (:raster.type/ret-tag (meta obj))
-            ^Class prim-ret-class (when-not object-call-result?
-                                   (case ret-tag-meta
-                                    (double Double)   Double/TYPE
-                                    (long Long)       Long/TYPE
-                                    (int Integer)     Integer/TYPE
-                                    (float Float)     Float/TYPE
-                                    ;; Comparison/boolean ops: bind compute_prim's
-                                    ;; primitive boolean return (zero-boxing) instead
-                                    ;; of falling back to the boxed invk → Object path.
-                                    (boolean Boolean) Boolean/TYPE
-                                    (void Void)       Void/TYPE
-                                    nil))
-            is-var? (and (namespace obj) (not (get locals obj)))
-            _ (retain-invocation-context!
-               method obj (vec method-args)
-               (cond is-var? :global-typed-indy
-                     (:verified (get locals obj)) :local-typed-interface
-                     :else :guarded-local-typed-interface)
-               (if is-var? (or prim-ret-class ret-class) ret-class) locals ctx)]
+    (if invocation
+      (let [{cls :interface method :method param-types :parameter-carriers
+             ^Class ret-class :interface-result-class ^Class prim-ret-class :primitive-result-class
+             is-var? :global?} invocation
+            completions (volatile! nil)]
         (if is-var?
           ;; Var reference (e.g. raster.numeric/_plus__m_double_double-impl)
           ;; → emit args first, then invokedynamic (static-like, no receiver).
           ;; Uses primitive return type when available → bootstrap targets compute_prim
           ;; for zero-boxing cross-function calls.
           (let [^Class indy-ret-class (or prim-ret-class ret-class)]
-            (doseq [[arg ^Class pt] (map vector method-args param-types)]
-              (let [t (emit-argument-value code arg pt locals ctx)
-                    target (class-type->stack pt)]
-                (if (not= t target)
-                  (emit-coerce code t target)
-                  (when (and (= t :ref) (not (.equals pt Object)))
-                    (.checkcast code (class-desc-of pt))))))
+            (vreset! completions
+                     (emit-typed-call-arguments code method-args param-types locals ctx
+                                                (boolean me/*emission-inputs*)))
             (ensure-bootstrap-class!)
             (let [call-mt (MethodTypeDesc/of (class-desc-of indy-ret-class)
                                              (into-array ClassDesc (mapv class-desc-of param-types)))
@@ -4003,13 +4618,9 @@
               ;; The method signature guarantees f is IFn__. C2 devirtualizes
               ;; via type profiling — zero instanceof overhead.
               (do (emit-form code obj locals ctx)
-                  (doseq [[arg ^Class pt] (map vector method-args param-types)]
-                    (let [t (emit-argument-value code arg pt locals ctx)
-                          target (class-type->stack pt)]
-                      (if (not= t target)
-                        (emit-coerce code t target)
-                        (when (and (= t :ref) (not (.equals pt Object)))
-                          (.checkcast code (class-desc-of pt))))))
+                  (vreset! completions
+                           (emit-typed-call-arguments code method-args param-types locals ctx
+                                                      (boolean me/*emission-inputs*)))
                   (.invokeinterface code iface-cd "invk" call-mt))
               ;; === UNVERIFIED: instanceof guard with boxed fallback ===
               (let [fast-label (.newLabel code)
@@ -4031,15 +4642,15 @@
                 ;; FAST PATH: typed .invk with primitives
                 (.labelBinding code fast-label)
                 (.checkcast code iface-cd)
-                (doseq [[arg ^Class pt] (map vector method-args param-types)]
-                  (let [t (emit-argument-value code arg pt locals ctx)
-                        target (class-type->stack pt)]
-                    (if (not= t target)
-                      (emit-coerce code t target)
-                      (when (and (= t :ref) (not (.equals pt Object)))
-                        (.checkcast code (class-desc-of pt))))))
+                (emit-typed-call-arguments code method-args param-types locals ctx false)
                 (.invokeinterface code iface-cd "invk" call-mt)
                 (.labelBinding code end-label)))))
+        (retain-invocation-context!
+         method obj (vec method-args)
+         (cond is-var? :global-typed-indy
+               (:verified (get locals obj)) :local-typed-interface
+               :else :guarded-local-typed-interface)
+         (if is-var? (or prim-ret-class ret-class) ret-class) @completions locals ctx)
         ;; Stack type: primitive for invokedynamic with compute_prim, :ref for local path
         (if (and is-var? prim-ret-class)
           (class-type->stack prim-ret-class)
@@ -4509,8 +5120,7 @@
         initializers (when (= :loop (::reduction-role ctx)) (atom []))
         loop-locals (reduce
                      (fn [locs [[sym init] rt]]
-                       (let [initializer-ctx (assoc (dissoc ctx :void-context :object-result?)
-                                                    :preserve-source-call-results? true)
+                       (let [initializer-ctx (binding-initializer-context ctx)
                              t (emit-form code init locs initializer-ctx)
                              emitted-type t
                              plan (source-arithmetic/loop-initializer-plan sym init t rt)
@@ -4606,13 +5216,23 @@
         (.goto_ code loop-label)
         :diverge)
       (let [vals (mapv (fn [arg loop-var]
-                         (let [t (emit-form code arg locals (dissoc ctx :object-result?))
-                               target (:type loop-var)]
+                         (let [operand-ctx (dissoc ctx :object-result?)
+                               t (emit-form code arg locals operand-ctx)
+                               target (:type loop-var)
+                               context (completion/bytecode-operand-context operand-ctx)]
                            (when (not= t target)
                              (emit-coerce code t target))
-                           {:type target :input-type t :operand arg
-                            :context (completion/bytecode-operand-context (dissoc ctx :object-result?))
-                            :locals locals}))
+                           (cond-> {:type target :input-type t :operand arg
+                                    :context context :locals locals}
+                             ;; Retain the recipe at the actual consumer, after the
+                             ;; operand and any required conversion were emitted. The slot
+                             ;; is not evidence that an Object update was a primitive call.
+                             ;; Reuse ValueCompletion's existing Number.xxxValue/JVM
+                             ;; conversion contract; no source-cast or new type inference.
+                             (contains? #{:float :double} target)
+                             (assoc :input-completion
+                                    (completion/bytecode-input-contract
+                                     (if (= :float target) Float/TYPE Double/TYPE) context)))))
                        args loop-vars)]
         (when (= :recur (::reduction-role ctx))
           (retain-reduction-observation! ctx :recur
@@ -5060,20 +5680,153 @@
                         {:reason :jvm-literal-owner-initialized})))
       (.set field nil (object-array values)))))
 
-(defn- emit-bytecode-primitive-completion
+(defn- emit-reference-check-completion
+  "Check the exact retained Class, not a descriptor resolved in another loader.
+   Bootstrap Classes have canonical VM identity and use CHECKCAST directly.
+   Otherwise the existing literal owner holds the exact Class, and Class.cast
+   preserves its identity across loaders. This returns only a :ref stack carrier,
+   not verified local Class facts; a later typed binder performs its own check.
+   Nil passes; the operand is consumed once at its original position."
+  [code {:keys [contract operand]} locals ctx & [observation]]
+  (let [^Class carrier (:target-carrier contract)
+        actual (emit-object-value code operand locals ctx)]
+    (when observation
+      (vreset! observation {:input-carrier actual
+                            :adaptation (if (= :diverge actual) :diverge :checkcast)
+                            :operand-context (completion/bytecode-operand-context
+                                              (object-input-context ctx))}))
+    (if (= :diverge actual) actual
+      (if (nil? (.getClassLoader carrier))
+        (do (.checkcast code (ClassDesc/ofDescriptor (.descriptorString carrier))) :ref)
+        (do
+            ;; Operand first: a recur/goto must not carry a Class receiver into
+            ;; an enclosing loop target with a different stack shape.
+            (emit-literal-reference code carrier ctx)
+            (.checkcast code (ClassDesc/of "java.lang.Class"))
+            (.swap code) ;; Both operand and Class are category-1 references.
+            (.invokevirtual code (ClassDesc/of "java.lang.Class") "cast"
+                            (MethodTypeDesc/of obj-cd (into-array ClassDesc [obj-cd])))
+            :ref)))))
+
+(defn- emit-bytecode-result-completion
+  "Replay the observed region context, without completing or coercing its value."
+  [code {:keys [contract operand]} locals ctx & [observation]]
+  (let [original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
+                                (:operand-context contract))
+        actual (emit-form code operand locals original-context)]
+    (when observation
+      (vreset! observation {:input-carrier actual
+                            :adaptation (if (= :diverge actual) :diverge :identity)
+                            :operand-context (completion/bytecode-operand-context original-context)}))
+    (when-not (or (= :diverge actual) (= (:result-carrier contract) actual))
+      (throw (ex-info "Bytecode result context produced a different physical carrier"
+                      {:reason :bytecode-result-context-carrier-mismatch
+                       :expected (:result-carrier contract) :actual actual})))
+    actual))
+
+(defn- emit-bytecode-input-completion
   "Use precisely the original bytecode invocation's argument/conversion path.
    Never reinterpret a Clojure source-policy contract as this context."
-  [code {:keys [contract operand]} locals ctx]
+  [code {:keys [contract operand]} locals ctx & [observation]]
   (let [carrier (:target-carrier contract)
         target (class-type->stack carrier)
-        original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
+        original-context (merge (apply dissoc ctx ::expected-completion-input-type
+                                      completion/bytecode-operand-context-keys)
                                 (:operand-context contract))
         actual (emit-argument-value code operand carrier locals original-context)]
+    (when observation
+      (vreset! observation {:input-carrier actual
+                            :adaptation (if (= :diverge actual) :diverge
+                                            (typed-input-adaptation actual carrier))
+                            :operand-context (completion/bytecode-operand-context original-context)}))
+    (when-let [expected (:expected-input-carrier contract)]
+      (when-not (or (= :diverge actual) (= expected actual))
+        (throw (ex-info "Planned input changed its physical carrier before conversion"
+                        {:reason :bytecode-input-result-carrier
+                         :expected expected :actual actual}))))
+    (when-let [expected (::expected-completion-input-type ctx)]
+      (when-not (= expected actual)
+        (throw (ex-info "Outlined operand changed its emitted carrier before conversion"
+                        {:reason :bytecode-input-result-carrier
+                         :expected expected :actual actual}))))
     (when (= :void actual)
-      (throw (ex-info "A void operand cannot complete a bytecode primitive input"
+      (throw (ex-info "A void operand cannot complete a bytecode invocation input"
                       {:reason :void-bytecode-input-completion :contract contract})))
     (if (= :diverge actual) actual
-      (do (when-not (= actual target) (emit-coerce code actual target)) target))))
+      (do (emit-typed-input-adaptation code actual carrier) target))))
+
+(declare emit-object-parameter)
+
+(defn- emit-boxed-parameter-completion
+  [code {:keys [contract operand]} locals ctx observation]
+  (let [carrier (:target-carrier contract)]
+    (if (and (not (.isPrimitive ^Class carrier)) (not= Object carrier))
+      ;; The original wrapper's descriptor resolves in its own loader. An
+      ;; imported module must retain that actual Class, not look up its name
+      ;; in the new loader. Reuse the existing exact CHECKCAST transport.
+      (emit-reference-check-completion
+       code {:contract (completion/reference-check-contract carrier) :operand operand}
+       locals ctx observation)
+      (let [actual (emit-object-value code operand locals ctx)]
+        (when observation
+          (vreset! observation {:input-carrier actual
+                                :adaptation (cond (= :diverge actual) :diverge
+                                                  (.isPrimitive ^Class carrier) :boxed-unbox
+                                                  :else :identity)
+                                :operand-context (completion/bytecode-operand-context
+                                                  (object-input-context ctx))}))
+        (if (= :diverge actual) actual
+            (do
+              ;; Same helper as both real IFn.invoke and the large-arity applyTo
+              ;; wrapper. In particular, int/long are Number conversions, not
+              ;; Clojure's checked casts, and Boolean/Character are not Numbers.
+              (emit-object-parameter code (class-desc-of-class carrier))
+              (class-type->stack carrier)))))))
+
+(defn- emit-canonical-completion
+  "One completion dispatcher for scalar and Object consumption. Observations
+   retain immutable emitter facts only, never an executable or CodeBuilder."
+  [code expression locals ctx object-parent?]
+  (let [{:keys [contract operand] :as parts} (completion/canonical-parts expression)
+        token (::completion-occurrence (meta expression))
+        observation (when (and token me/*emission-inputs*) (volatile! nil))
+        completed
+        (case (:source-context contract)
+          :jvm-object-input
+          (let [actual (emit-object-value code operand locals ctx)]
+            (when observation
+              (vreset! observation {:input-carrier actual
+                                    :adaptation (if (= :diverge actual) :diverge :identity)
+                                    :operand-context (completion/bytecode-operand-context
+                                                      (object-input-context ctx))}))
+            actual)
+          :jvm-checkcast (emit-reference-check-completion code parts locals ctx observation)
+          :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx observation)
+          :jvm-bytecode-boxed-parameter-input
+          (emit-boxed-parameter-completion code parts locals ctx observation)
+          (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
+          (emit-bytecode-input-completion code parts locals ctx observation)
+          (throw (ex-info "JVM completion consumer has no input-conversion authority"
+                          {:reason :unsupported-jvm-value-completion :contract contract})))
+        returned (if object-parent?
+                   (cond
+                     (= :diverge completed) :diverge
+                     (= :void completed) (do (.aconst_null code) :ref)
+                     (primitive? completed) (do (emit-box-to-ref code completed) :ref)
+                     :else completed)
+                   completed)]
+    (when observation
+      (let [record (merge @observation
+                          {:status :known :expression expression :contract contract :operand operand
+                           :site-context (completion/bytecode-operand-context ctx)
+                           :locals-before locals :object-parent? object-parent?
+                           :completion-carrier completed :returned-carrier returned
+                           :result-fact (completed-primitive-result-fact completed returned)})]
+        (swap! me/*emission-inputs* update :completion-contexts
+               (fn [contexts]
+                 (assoc contexts token (if (contains? contexts token)
+                                         {:status :ambiguous} record))))))
+    returned))
 
 (defn- emit-object-value
   "Consume the ORIGINAL operand in Object context. Result-position regions
@@ -5085,8 +5838,7 @@
         ;; throughout this region; logical scalar tags alone do not prove
         ;; those references unobservable. Primitive input conversions still
         ;; belong to their resolved consumers, not this result context.
-        ctx (assoc (dissoc ctx :object-result? :void-context :object-call-result?)
-                   :preserve-source-call-results? true)
+        ctx (object-input-context ctx)
         parts (completion/canonical-parts expression)
         head (when (seq? expression) (first expression))
         t (cond
@@ -5096,12 +5848,7 @@
               (emit-literal-reference code (second expression) ctx)
               (throw (ex-info "Object completion has an unsupported quoted literal"
                               {:reason :unsupported-jvm-object-literal})))
-            parts (case (get-in parts [:contract :source-context])
-                    :jvm-object-input (emit-object-value code (:operand parts) locals ctx)
-                    (:jvm-bytecode-floating-input :jvm-bytecode-integral-input)
-                    (emit-bytecode-primitive-completion code parts locals ctx)
-                    (throw (ex-info "JVM completion consumer has no input-conversion authority"
-                                    {:reason :unsupported-jvm-value-completion :contract (:contract parts)})))
+            parts (emit-canonical-completion code expression locals ctx true)
             (contains? #{'let 'let* 'letfn* 'loop* 'do 'if 'try 'case*} head)
             (emit-form code expression locals (assoc ctx :object-result? true))
             (seq? expression)
@@ -5165,11 +5912,7 @@
       ;; Reserved contexts are interpreted, never called as runtime functions.
       (and (seq? form) (= completion/completion-symbol (first form)))
       (if (completion/canonical-form? form)
-        (let [parts (completion/canonical-parts form)]
-          (if (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input}
-                         (get-in parts [:contract :source-context]))
-            (emit-bytecode-primitive-completion code parts locals ctx)
-            (emit-object-value code form locals ctx)))
+        (emit-canonical-completion code form locals ctx false)
         (throw (ex-info "Malformed reserved JVM value completion"
                         {:reason :invalid-value-completion :expression form})))
 
@@ -5200,17 +5943,7 @@
 
           ;; do
               do
-              (let [stmts (butlast args)
-                    last-form (last args)
-                    void-ctx (assoc (dissoc ctx :object-result?) :void-context true)]
-                (doseq [s stmts]
-                  (let [t (emit-form code s locals void-ctx)]
-                    (when-not (#{:void :diverge} t)
-                      (if (two-slot? t) (.pop2 code) (.pop code)))))
-                (if (seq args)
-                  (emit-result-form code last-form locals
-                             (if (:void-context ctx) ctx (dissoc ctx :void-context)))
-                  :void))
+              (emit-body code args locals ctx)
 
           ;; if — both branches must produce same stack type for verifier
               if
@@ -5521,7 +6254,7 @@
         ;; Build method type descriptors for fn-specs
         ;; Handle both symbol params and destructuring vectors
         ;; Detect ^double/^long hints to generate primitive param types
-        method-specs (mapv (fn [{:keys [name params return-tag]}]
+        method-specs (mapv (fn [{:keys [name params return-tag walked-body]}]
                              (let [method-name (clojure.lang.Compiler/munge (str name))
                                    ;; Each param is either a symbol or a vector (destructuring)
                                    ;; Both become a single method param
@@ -5540,6 +6273,7 @@
                                    mt (MethodTypeDesc/of ret-cd
                                                          (into-array ClassDesc param-descs))]
                                {:name name
+                                :body-token (::body-occurrence (meta walked-body))
                                 :method-name method-name
                                 :method-type mt
                                 :params method-params
@@ -5582,6 +6316,8 @@
                             deftm-refs)
         typed-sibling-methods (into {} (map (fn [ms] [(:method-name ms) ms])
                                             deftm-method-specs))
+        local-callee-names {:typed (set (keys typed-sibling-methods))
+                            :untyped (set (keys sibling-methods))}
         source-file (or (:source-file (first fn-specs))
                         (when-let [ns-obj (:source-ns (first fn-specs))]
                           (some-> ns-obj str
@@ -5604,7 +6340,9 @@
                                    {:keys [walked-body element-type source-ns]
                                     input-port-layout ::input-port-layout
                                     body-input-context ::body-input-context
-                                    expected-body-type ::expected-body-type}]
+                                    expected-body-type ::expected-body-type
+                                    expected-completion-input-type ::expected-completion-input-type
+                                    extracted-region ::extracted-region}]
                                   (map vector method-specs fn-specs)]
                             (.withMethodBody cb method-name method-type
                                              (int 0x0009)  ;; PUBLIC + STATIC
@@ -5705,9 +6443,19 @@
                                                             :element-type     element-type
                                                             :sibling-methods  sibling-methods
                                                             :typed-sibling-methods typed-sibling-methods
+                                                            :local-callee-names local-callee-names
                                                             :next-slot        next-slot
                                                             :source-ns        source-ns}
                                                        ctx (merge ctx body-input-context)
+                                                       ctx (cond-> ctx expected-completion-input-type
+                                                             (assoc ::expected-completion-input-type
+                                                                    expected-completion-input-type))
+                                                       ctx (assoc ctx
+                                                                  ::body-occurrence (::body-occurrence (meta walked-body))
+                                                                  ::body-scope-occurrence
+                                                                  (when (= 1 (count walked-body))
+                                                                    (::binding-scope-occurrence
+                                                                     (meta (first walked-body)))))
                                                        expanded-body (binding [*ns* source-ns]
                                                                        (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        _ (when-let [token (::body-occurrence (meta walked-body))]
@@ -5717,8 +6465,13 @@
                                                                       (if (contains? contexts token)
                                                                         (assoc contexts token {:status :ambiguous})
                                                                         (assoc contexts token {:status :known :body walked-body
+                                                                                              :extraction extracted-region
                                                                                               :locals locals
+                                                                                              :unretained-sibling-calls?
+                                                                                              (method-local-callee-candidate? expanded-body ctx)
                                                                                               :return-stack-type return-stack-type
+                                                                                              :return-descriptor (.descriptorString
+                                                                                                                  (.returnType ^MethodTypeDesc method-type))
                                                                                               :result-context (completion/bytecode-operand-context ctx)}))))))
                                                        ret-type (emit-body code expanded-body locals ctx)
                                                        _ (when-let [token (::body-occurrence (meta walked-body))]
@@ -5874,7 +6627,7 @@
                      (fn [record]
                        (if (and (= :known (:status record))
                                 (identical? body (:body record)))
-                         (assoc record :method method
+                         (assoc record :method method :method-owner cls
                                 :return-descriptor (.descriptorString
                                                     (.getReturnType ^java.lang.reflect.Method method)))
                          record)))))]
@@ -5996,8 +6749,117 @@
                    (guard)
                    value))}))
 
+(defn- completed-invocation-inputs?
+  "Check the actual emitter's complete positional conversions once, shared by
+   observation and outlining. Logical annotations never fill a missing slot."
+  [record]
+  (let [^java.lang.reflect.Method method (:method record)
+        carriers (when (instance? java.lang.reflect.Method method)
+                   (vec (.getParameterTypes method)))
+        inputs (:inputs record) completions (:input-completions record)]
+    (and carriers (vector? inputs) (vector? completions)
+         (= (count carriers) (count inputs) (count completions))
+         (every? true?
+                 (map (fn [original completed carrier]
+                        (let [actual (:emitted-type completed)]
+                          (and (identical? (:operand original) (:operand completed))
+                               (completion/bytecode-operand-context? (:context original))
+                               (identical? carrier (:parameter-carrier completed))
+                               (contains? #{:ref :long :int :float :double :bool} actual)
+                               (= (typed-input-adaptation actual carrier) (:adaptation completed)))))
+                      inputs completions carriers)))))
+
+(defn ^:no-doc retained-input-completed-invocation-context
+  "Observe all actual original-call argument completions without preparing or
+   executing any operand. Selection and constructed-operand correspondence remain
+   the consumer's obligations; reference checks do not prove non-nullness."
+  [emission input-body original]
+  (when-let [record (retained-input-invocation-context emission input-body original)]
+    (when (completed-invocation-inputs? record) record)))
+
+(defn ^:no-doc retained-input-extracted-reduction-binding
+  "Observe an extraction-owned reduction/helper/invocation/binding chain.
+   This conditional physical boundary grants no count/read, successful execution,
+   value correspondence, movement or GPU admission. Missing links abstain; no
+   helper is discovered by its spelling or a boxed payload's logical dtype.
+   The observed body carrier/Method return pair describes the actual return
+   adaptation; it proves neither that adaptation's identity nor nonthrowingness."
+  [emission input-body original-scope index]
+  (when (and (integer? index) (<= 0 index)
+             (seq? original-scope) (form-ir/binding-form? original-scope)
+             (vector? (second original-scope))
+             (even? (count (second original-scope)))
+             (< index (quot (count (second original-scope)) 2)))
+    (let [original (nth (second original-scope) (inc (* 2 index)) nil)
+          owned (input-origin emission input-body original :reduction)
+          observed (when owned (retained-reduction-emission emission owned))
+          bound (when observed
+                  (retained-input-binding-context emission input-body original-scope index))
+          candidates (when (and owned (map? (:body-contexts emission)))
+                       (filterv #(identical? owned (get-in (val %) [:extraction :source]))
+                                (:body-contexts emission)))]
+      (when (and bound (= 1 (count candidates)))
+        (let [[token body] (first candidates)
+              replacement (get-in body [:extraction :replacement])
+              invocation (retained-invocation-context emission replacement)
+              ^java.lang.reflect.Method method (:method body)
+              parameters (when (instance? java.lang.reflect.Method method)
+                           (vec (.getParameterTypes method)))
+              method-descriptor (when parameters
+                                  (.descriptorString
+                                   (java.lang.invoke.MethodType/methodType
+                                    (.getReturnType method) (.getParameterTypes method))))]
+          (when (and (= :known (:status body))
+                     (vector? (:body body))
+                     (identical? token (::body-occurrence (meta (:body body))))
+                     (= 1 (count (:body body))) (identical? owned (first (:body body)))
+                     (map? (:root-result observed))
+                     (= (:emitted-result-type body) (get-in observed [:root-result :result-type]))
+                     (= (:result-context body) (get-in observed [:root-result :context]))
+                     (instance? java.lang.reflect.Method method)
+                     (identical? (:method-owner body) (.getDeclaringClass method))
+                     (java.lang.reflect.Modifier/isStatic (.getModifiers method))
+                     (= :module-static (:invocation-mode invocation))
+                     (identical? token (:target-body invocation))
+                     (= (.getName method) (:target-name invocation))
+                     (= method-descriptor (:target-descriptor invocation))
+                     (instance? ClassDesc (:target-owner invocation))
+                     (= (.descriptorString ^ClassDesc (:target-owner invocation))
+                        (.descriptorString (.getDeclaringClass method)))
+                     (= (:return-descriptor body) (.descriptorString (.getReturnType method)))
+                     (= (:return-stack-type body) (class-type->stack (.getReturnType method))
+                        (get-in bound [:after :type]))
+                     (contains? #{:ref :float :double} (:emitted-result-type body))
+                     (contains? #{:float :double} (:return-stack-type body))
+                     (identical? (:initializer bound) (:expression invocation))
+                     (map? (:before bound))
+                     (vector? (:inputs invocation)) (every? map? (:inputs invocation))
+                     (vector? (:input-completions invocation))
+                     (every? map? (:input-completions invocation))
+                     (= (count parameters) (count (:inputs invocation))
+                        (count (:input-completions invocation)))
+                     (every? true?
+                             (map (fn [input completed ^Class carrier]
+                                    (and (completion/bytecode-operand-context? (:context input))
+                                         (symbol? (:operand input))
+                                         (map? (:ports input))
+                                         (= #{(:operand input)} (set (keys (:ports input))))
+                                         (= (:ports input)
+                                            (select-keys (:before bound) (keys (:ports input))))
+                                         (= (:emitted-type completed)
+                                            (get-in input [:ports (:operand input) :type]))
+                                         (= (:parameter-descriptor completed) (.descriptorString carrier))
+                                         (= (:target-stack-type completed) (class-type->stack carrier))
+                                         (contains? #{:ref :int :long :float :double :bool}
+                                                    (:emitted-type completed))))
+                                  (:inputs invocation) (:input-completions invocation) parameters)))
+            (me/assert-emission-inputs-current! emission)
+            {:source-input original :scope-input original-scope :ordinal index
+             :reduction observed :helper body :binding bound
+             :invocation (assoc invocation :method method)}))))))
+
 (defn ^:no-doc compile-invocation-input-region
-  "Outline one original completed FP or Int/Long input through its bytecode emitter.
+  "Outline one original FP, Int/Long or CHECKCAST input using its bytecode emitter.
    Physical ports and historical guards are preserved; this is not portable
    source, a derivative rule or permission to flatten the region."
   [emission original input-index]
@@ -6009,20 +6871,105 @@
       (throw (ex-info "Input outlining requires an original owned invocation occurrence"
                       {:reason :unowned-bytecode-input-region :input-index input-index})))
     (let [^java.lang.reflect.Method method (:method record)
-          carrier (nth (vec (.getParameterTypes method)) input-index)
-          contract (if (contains? #{Integer/TYPE Long/TYPE} carrier)
-                     (completion/bytecode-integral-input-contract carrier (:context input))
-                     (completion/bytecode-floating-input-contract carrier (:context input)))
+          carriers (when (instance? java.lang.reflect.Method method)
+                     (vec (.getParameterTypes method)))
+          completions (:input-completions record)
+          _ (when-not (completed-invocation-inputs? record)
+              (throw (ex-info "Input outlining requires its complete actual positional conversions"
+                              {:reason :unclosed-bytecode-input-completion :input-index input-index})))
+          carrier (nth carriers input-index)
+          completed (nth completions input-index)
+          contract (completion/bytecode-input-contract carrier (:context input))
           guard (fn []
                   (when-not (identical? record (retained-invocation-context emission original))
                     (throw (ex-info "Input region lost its owning invocation"
                                     {:reason :unowned-bytecode-input-region}))))]
       (assoc (compile-owned-input-region
               emission input carrier
-              {:return-tag (symbol (.getName ^Class carrier))
+              {:return-tag (if (.isPrimitive ^Class carrier) (symbol (.getName ^Class carrier)) carrier)
                :walked-body [(completion/complete-value contract (:operand input))]
+               ::expected-completion-input-type (:emitted-type completed)
                :element-type (:element-type record)} guard)
-             :input-contract contract))))
+             :input-contract contract :input-completion completed))))
+
+(defn ^:no-doc compile-input-invocation-region
+  "Outline one input of an exact frontend-origin call through its original emission.
+   This follows the existing opaque input-origin relation, not source equality.
+   The caller additionally retains frontend identity and ownership of execution order."
+  [emission input-body original input-index]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (assoc (compile-invocation-input-region emission owned input-index)
+           :source-input original :source-input-index input-index)))
+
+(defn ^:no-doc compile-input-binding-region
+  "Outline an exact original binding initializer, including its emitted result carrier.
+   Uses the same physical-port compiler as invocation inputs. This is execution
+   preparation only: the enclosing owner must establish occurrence correspondence,
+   dependency completion and placement. No enclosing initializers are evaluated."
+  [emission input-body original index]
+  (when-let [owned (input-origin emission input-body original :binding)]
+   (when-let [record (retained-binding-context emission owned index)]
+    (let [context (:input-context record)
+          input (when (completion/bytecode-operand-context? context)
+                  (physical-operand-input (:initializer record) (:before record)
+                                          (assoc context :local-callee-names (:local-callee-names record))))
+          result (:after record)
+          carrier (if (= :ref (:type result)) (:reference-class result)
+                      (primitive-carrier-class (:type result)))]
+      (when (and carrier input (contains? record :element-type)
+                 (map? (:local-callee-names record))
+                 (every? set? (map (:local-callee-names record) [:typed :untyped]))
+                 (identical? (:initializer record) (:operand input))
+                 (completion/bytecode-operand-context? (:context input))
+                 (= (:ports input) (select-keys (:before record) (keys (:ports input)))))
+        (let [guard (fn []
+                      (let [current (input-origin emission input-body original :binding)]
+                        (when-not (and (identical? owned current)
+                                       (identical? record (retained-binding-context emission owned index)))
+                          (throw (ex-info "Binding region lost its original emitted owner"
+                                          {:reason :unowned-bytecode-binding-region :binding-index index})))))]
+          (assoc (compile-owned-input-region
+                  emission input carrier
+                  {:return-tag carrier :walked-body [(:operand input)]
+                   :element-type (:element-type record)
+                   ::body-input-context (:context input)
+                   ::expected-body-type (:type result)} guard)
+                 :source-input original :source-binding-index index
+                 :binding-context record)))))))
+
+(defn ^:no-doc compile-terminal-result-region
+  "Outline the exact observed outer lexical tail, excluding its initializers.
+   Retain physical input ports, actual result context and the original method's
+   return adaptation. This does not authorize device exports, replay or admission
+   of the tail in a resident-only invocation."
+  [emission original-scope]
+  (let [record (retained-terminal-context emission original-scope)
+        ^java.lang.reflect.Method method (get-in record [:owner :method])]
+    (when-not (and record (instance? java.lang.reflect.Method method)
+                   (= (get-in record [:owner :return-descriptor])
+                      (.descriptorString (.getReturnType method))))
+      (throw (ex-info "Terminal outlining requires its original emitted return owner"
+                      {:reason :unowned-bytecode-terminal-region})))
+    (when (contains? #{:void :diverge} (:emitted-result-type record))
+      (throw (ex-info "Terminal outlining requires a value-producing result"
+                      {:reason :bytecode-terminal-result-carrier})))
+    (let [guard (fn []
+                  (let [current (retained-terminal-context emission original-scope)]
+                    (when-not (and current
+                                   (identical? (:terminal-context (:owner record))
+                                               (:terminal-context (:owner current)))
+                                   (identical? method (get-in current [:owner :method])))
+                      (throw (ex-info "Terminal region lost its original emitted owner"
+                                      {:reason :unowned-bytecode-terminal-region})))))
+          input (assoc (select-keys record [:ports :context :unretained-sibling-calls?])
+                       :operand (cons 'do (:body record)))
+          region (compile-owned-input-region
+                  emission input (.getReturnType method)
+                  {:return-tag (.getReturnType method) :walked-body (:body record)
+                   :element-type (:element-type record)
+                   ::body-input-context (:context record)
+                   ::expected-body-type (:emitted-result-type record)} guard)]
+      (assoc region :kind :owned-bytecode-terminal-region :terminal-context record))))
 
 (defn- compile-raw-int-input-region
   [emission input input-type element-type guard]
@@ -6065,6 +7012,36 @@
                                     {:reason :unowned-bytecode-array-count-region}))))]
       (compile-raw-int-input-region emission input (:input-type input) (:element-type record) guard))))
 
+(defn ^:no-doc compile-reduction-count-region
+  "Outline only an original reduction's actual bound initializer and context.
+   The WHOLE initializer includes the source checked Int conversion; outlining
+   the naked count via raw JVM narrowing would change overflow behavior.
+
+   This executes neither the accumulator initializer nor iterations. Count
+   effects remain effects: no purity, replay, source-position scheduling or
+   launch-domain permission is granted by outlining them."
+  [emission original]
+  (let [bound (:bound (retained-reduction-emission emission original))]
+    (when-not (and bound (contains? bound :element-type)
+                   (boolean? (:unretained-sibling-calls? bound)))
+      (throw (ex-info "Count outlining requires an original owned reduction bound"
+                      {:reason :unowned-bytecode-reduction-count-region})))
+    (let [input (assoc (physical-operand-input (:initializer bound) (:before bound) (:context bound))
+                       ;; The bound's original emitter owns this dependency
+                       ;; fact; its retained scalar context omits sibling maps.
+                       :unretained-sibling-calls? (:unretained-sibling-calls? bound))
+          guard (fn []
+                  (when-not (identical? bound (:bound (retained-reduction-emission emission original)))
+                    (throw (ex-info "Count region lost its owning reduction bound"
+                                    {:reason :unowned-bytecode-reduction-count-region}))))]
+      (assoc (compile-owned-input-region
+              emission input Integer/TYPE
+              {:return-tag 'int :walked-body [(:initializer bound)]
+               :element-type (:element-type bound)
+               ::body-input-context (:context bound) ::expected-body-type :int}
+              guard)
+             :kind :owned-bytecode-reduction-count-region :bound-context bound))))
+
 (def ^:dynamic *compiling-deftms*
   "Set of deftm var symbols currently being compiled, for cycle detection."
   #{})
@@ -6098,6 +7075,7 @@
                          {:source-snapshot source-snapshot
                           :body walked-body :params params :tags tags :return-tag return-tag
                           :dependency-snapshots (into dependency-snapshots (:values @emitted-inputs))
+                          :producer-inputs (:producer-inputs @emitted-inputs)
                           :static-inputs (:static @emitted-inputs)
                           :definition-revision definition-revision
                           :completed-definition-revision (dispatch/compiler-definition-revision)})
@@ -6210,6 +7188,9 @@
                                 helper-params (mapv (fn [p]
                                                       (vary-meta p assoc :tag (tag-for-sym p)))
                                                     ordered-free)
+                                helper-body (with-meta [form] {::body-occurrence (Object.)})
+                                replacement (with-meta (apply list helper-name ordered-free)
+                                              {::call-occurrence (Object.)})
                                 ;; Infer array tag from :cast field (float → floats, double → doubles)
                                 cast->arr-tag (fn [cast-sym]
                                                 (case cast-sym
@@ -6233,13 +7214,20 @@
                                                   (when (not= t 'Object) t)))
                                               (cast->arr-tag (:cast info))
                                               'doubles))]
+                            ;; Extraction owns this edge. The replacement is not an
+                            ;; original frontend call and gets no InputOrigins edge.
+                            (when me/*emission-inputs*
+                              (swap! me/*emission-inputs* assoc-in
+                                     [:invocation-catalog (::call-occurrence (meta replacement))]
+                                     replacement))
                             (swap! helpers conj
                                    {:name helper-name
                                     :params helper-params
                                     :return-tag ret-tag
-                                    :walked-body [form]
+                                    :walked-body helper-body
+                                    ::extracted-region {:source form :replacement replacement}
                                     :source-ns source-ns})
-                            (apply list helper-name ordered-free))
+                            replacement)
                           ;; Not a par form — keep as-is
                           form)))
         ;; Rewrite let-binding init expressions
@@ -6253,6 +7241,74 @@
     {:main-bindings rewritten-bindings
      :main-body rewritten-body
      :helpers @helpers}))
+
+(defn- partitioned-binding-scope
+  "Retain a root lexical occurrence across producer-owned method extraction.
+   Extraction may replace initializers, but must not alter the ordered binder
+   objects. Observations retain their ACTUAL emitted initializer and carrier;
+   this relation grants no source-initializer or whole-body equivalence."
+  [original bindings body]
+  (let [original-bindings (second original)]
+    (when-not (and (vector? original-bindings) (vector? bindings)
+                   (even? (count original-bindings))
+                   (= (count original-bindings) (count bindings))
+                   (every? true? (map identical?
+                                      (take-nth 2 original-bindings)
+                                      (take-nth 2 bindings))))
+      (throw (ex-info "Method extraction changed the original binding layout"
+                      {:reason :partitioned-binding-layout})))
+    (with-meta (list* (first original) bindings body) (meta original))))
+
+(defn ^:no-doc boxed-parameter-plan
+  "The shared wrapper recipe for a resolved compute parameter descriptor.
+   A recipe describes emission, not ownership of any caller or wrapper."
+  [^ClassDesc parameter]
+  (let [descriptor (.descriptorString parameter)
+        base {:parameter-descriptor parameter}]
+    (merge base
+           (case descriptor
+             "D" {:kind :unbox :result-carrier :double}
+             "J" {:kind :unbox :result-carrier :long}
+             "F" {:kind :unbox :result-carrier :float}
+             "Z" {:kind :unbox :result-carrier :bool}
+             "I" {:kind :unbox :result-carrier :int}
+             ("B" "S") {:kind :small-number :method (if (= "B" descriptor) "byteValue" "shortValue")
+                          :result-carrier :int}
+             "C" {:kind :character :result-carrier :int}
+             "Ljava/lang/Object;" {:kind :identity :result-carrier :ref}
+             "V" (throw (ex-info "void is not a boxed parameter" {:reason :invalid-boxed-parameter}))
+             {:kind :checkcast :result-carrier :ref}))))
+
+(defn- emit-object-parameter
+  "Complete one boxed IFn argument using the actual compute parameter descriptor."
+  [code ^ClassDesc parameter]
+  (let [{:keys [kind result-carrier method]} (boxed-parameter-plan parameter)]
+    (case kind
+      :unbox (emit-unbox-to-prim code result-carrier)
+      :small-number (do (.checkcast code number-cd)
+                        (.invokevirtual code number-cd method (MethodTypeDesc/of parameter no-cd)))
+      :character (let [character (ClassDesc/of "java.lang" "Character")]
+                   (.checkcast code character)
+                   (.invokevirtual code character "charValue" (MethodTypeDesc/of parameter no-cd)))
+      :identity nil
+      :checkcast (.checkcast code parameter))))
+
+(defn- emit-object-return
+  "Box the actual compute return descriptor for either IFn entry shape."
+  [code ^ClassDesc result]
+  (case (.descriptorString result)
+    "D" (emit-box-to-ref code :double)
+    "J" (emit-box-to-ref code :long)
+    "F" (emit-box-to-ref code :float)
+    "Z" (emit-box-to-ref code :bool)
+    "I" (emit-box-to-ref code :int)
+    ("B" "S" "C") (let [wrapper (ClassDesc/of "java.lang"
+                                                (case (.descriptorString result)
+                                                  "B" "Byte" "S" "Short" "C" "Character"))]
+                      (.invokestatic code wrapper "valueOf"
+                                     (MethodTypeDesc/of wrapper (into-array ClassDesc [result]))))
+    "V" (.aconst_null code)
+    nil))
 
 (defn compile-typed-impl!
   "Compile a deftm walked body into a class implementing the typed interface.
@@ -6270,8 +7326,8 @@
   ;; Note: clojure.lang.IFn caps positional invoke at 20 args, but the JVM
   ;; method limit is 255. For >20 typed params we still emit compute_static
   ;; and the typed `invk` method as usual; the `invoke(Object…)` overloads
-  ;; are skipped (existing guard) and the applyTo path uses a reflective
-  ;; fallback into compute_static (emitted below).
+  ;; are skipped and applyTo completes the same typed arguments before calling
+  ;; compute_static directly (emitted below).
   (let [;; Par-extraction splitting: extract par/map! and par/reduce forms into
         ;; separate static methods. Keeps scalar code in the main method.
         ;; Uses size estimate to avoid splitting small bodies unnecessarily.
@@ -6292,7 +7348,7 @@
                        {:keys [main-bindings main-body helpers]}
                        (split-body-into-helpers body binds params tags source-ns 2)
                        ;; Rebuild let with rewritten bindings (par forms replaced by helper calls)
-                       main-form (list* 'let main-bindings main-body)
+                       main-form (partitioned-binding-scope form main-bindings main-body)
                        ;; Tag main fn-spec params
                        tagged-params (mapv (fn [p t]
                                              (vary-meta p assoc :tag t))
@@ -6354,6 +7410,10 @@
                     ;; Implement both the typed interface AND IFn so the
                     ;; compiled impl can be used as a regular Clojure function.
                     ;; This enables deftm vars to hold the impl directly.
+                          ;; Inherit IFn's ordinary unsupported-arity methods;
+                          ;; implementing only the selected overload would leak
+                          ;; AbstractMethodError on a wrong-arity call.
+                          (.withSuperclass cb (ClassDesc/of "clojure.lang" "AFn"))
                           (.withInterfaceSymbols cb (into-array ClassDesc [iface-cd ifn-cd]))
                     ;; No-arg constructor
                           (.withMethodBody cb "<init>"
@@ -6362,7 +7422,7 @@
                                            (reify java.util.function.Consumer
                                              (accept [_ code]
                                                (.aload code 0)
-                                               (.invokespecial code obj-cd "<init>"
+                                               (.invokespecial code (ClassDesc/of "clojure.lang" "AFn") "<init>"
                                                                (MethodTypeDesc/of V-cd (into-array ClassDesc [])))
                                                (.return_ code))))
                     ;; Shared helper: load params, checkcast IFn__ types, call compute_static
@@ -6513,77 +7573,24 @@
                               ;; Unbox each Object arg to the compute_static param type
                                                    (loop [slot 1 i 0]
                                                      (when (< i (count compute-param-cds))
-                                                       (let [cpd (.descriptorString ^ClassDesc (nth compute-param-cds i))]
+                                                       (let [parameter (nth compute-param-cds i)]
                                                          (.aload code slot)
-                                                         (cond
-                                                           (= cpd "D")
-                                                           (let [num-lbl (.newLabel code)
-                                                                 end-lbl (.newLabel code)]
-                                        ;; instanceof Number guard — matches emit-coerce [:ref :double]
-                                                             (.dup code)
-                                                             (.instanceOf code number-cd)
-                                                             (.ifeq code num-lbl)
-                                                             (.checkcast code number-cd)
-                                                             (.invokevirtual code number-cd "doubleValue"
-                                                                             (MethodTypeDesc/of D-cd no-cd))
-                                                             (.goto_ code end-lbl)
-                                                             (.labelBinding code num-lbl)
-                                                             (.pop code)
-                                                             (.ldc code (double 0.0))
-                                                             (.labelBinding code end-lbl))
-                                                           (= cpd "J") (do (.checkcast code number-cd)
-                                                                           (.invokevirtual code number-cd "longValue"
-                                                                                           (MethodTypeDesc/of J-cd no-cd)))
-                                                           (= cpd "F") (do (.checkcast code number-cd)
-                                                                           (.invokevirtual code number-cd "floatValue"
-                                                                                           (MethodTypeDesc/of F-cd no-cd)))
-                                                           (= cpd "Z")
-                                                           (let [bool-cd (ClassDesc/of "java.lang" "Boolean")]
-                                                             (.checkcast code bool-cd)
-                                                             (.invokevirtual code bool-cd "booleanValue"
-                                                                             (MethodTypeDesc/of (ClassDesc/ofDescriptor "Z") no-cd)))
-                                                           (#{"I" "B" "S" "C"} cpd)
-                                                           (do (.checkcast code number-cd)
-                                                               (.invokevirtual code number-cd "intValue"
-                                                                               (MethodTypeDesc/of I-cd no-cd)))
-                                      ;; Ref types: checkcast if not Object
-                                                           :else (when (not= cpd "Ljava/lang/Object;")
-                                                                   (.checkcast code (nth compute-param-cds i))))
+                                                         (emit-object-parameter code parameter)
                                                          (recur (inc slot) (inc i)))))
                               ;; Call compute_static (invokestatic — cheapest call)
                                                    (.invokestatic code statics-cd "compute_static" compute-mt)
                               ;; Box primitive return to Object
-                                                   (let [crd (.descriptorString ^ClassDesc compute-ret-cd)]
-                                                     (cond
-                                                       (= crd "D") (.invokestatic code dbl-box-cd "valueOf"
-                                                                                  (MethodTypeDesc/of dbl-box-cd (into-array ClassDesc [D-cd])))
-                                                       (= crd "J") (.invokestatic code long-box-cd "valueOf"
-                                                                                  (MethodTypeDesc/of long-box-cd (into-array ClassDesc [J-cd])))
-                                                       (= crd "F") (.invokestatic code flt-box-cd "valueOf"
-                                                                                  (MethodTypeDesc/of flt-box-cd (into-array ClassDesc [F-cd])))
-                                                       (= crd "Z")
-                                                       (let [bool-box-cd (ClassDesc/of "java.lang" "Boolean")
-                                                             bool-cd (ClassDesc/ofDescriptor "Z")]
-                                                         (.invokestatic code bool-box-cd "valueOf"
-                                                                        (MethodTypeDesc/of bool-box-cd (into-array ClassDesc [bool-cd]))))
-                                                       (#{"I" "B" "S" "C"} crd)
-                                                       (.invokestatic code int-box-cd "valueOf"
-                                                                      (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
-                                                       (= crd "V") (.aconst_null code)
-                                                       :else nil))
+                                                   (emit-object-return code compute-ret-cd)
                                                    (.areturn code))))))
                       ;; applyTo for varargs.
                       ;; For ≤20 params: AFn.applyToHelper unpacks the seq and
                       ;; routes to one of the IFn.invoke(Object…) overloads.
                       ;; For >20 params: AFn.applyToHelper caps at 20, so we
-                      ;; emit a custom body that builds an Object[N] from the
-                      ;; seq and invokes compute_static reflectively.
+                      ;; check exact arity, then complete arguments in source
+                      ;; order and call compute_static without reflection.
                           (let [afn-cd (ClassDesc/of "clojure.lang" "AFn")
                                 iseq-cd (ClassDesc/of "clojure.lang" "ISeq")
-                                reflector-cd (ClassDesc/of "clojure.lang" "Reflector")
-                                obj-arr-cd (ClassDesc/ofDescriptor "[Ljava/lang/Object;")
                                 apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))
-                                reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [(ClassDesc/of "java.lang.Class") string-cd obj-arr-cd]))
                                 small? (<= (count param-cds) 20)
                                 load-int (fn [code n]
                                            (cond (<= -128 n 127) (.bipush code (int n))
@@ -6599,30 +7606,40 @@
                                                        (.aload code 1)
                                                        (.invokestatic code afn-cd "applyToHelper" apply-mt)
                                                        (.areturn code))
-                                                   (let [n (count param-cds)]
-                                                     (load-int code n)
-                                                     (.anewarray code obj-cd)
-                                                     (.astore code 2)
+                                                   (let [n (count param-cds)
+                                                         exact (.newLabel code)
+                                                         arity-cd (ClassDesc/of "clojure.lang" "ArityException")]
+                                                     ;; Match ordinary IFn entry behavior: reject arity
+                                                     ;; before any parameter conversion or body effect.
                                                      (.aload code 1)
-                                                     (.astore code 3)
+                                                     (load-int code (inc n))
+                                                     (.invokestatic code (ClassDesc/of "clojure.lang" "RT") "boundedLength"
+                                                                    (MethodTypeDesc/of I-cd (into-array ClassDesc [iseq-cd I-cd])))
+                                                     (.istore code 2)
+                                                     (.iload code 2)
+                                                     (load-int code n)
+                                                     (.if_icmpeq code exact)
+                                                     (.new_ code arity-cd)
+                                                     (.dup code)
+                                                     (.iload code 2)
+                                                     (.ldc code (str class-name))
+                                                     (.invokespecial code arity-cd "<init>"
+                                                                     (MethodTypeDesc/of (ClassDesc/ofDescriptor "V")
+                                                                                        (into-array ClassDesc [I-cd string-cd])))
+                                                     (.athrow code)
+                                                     (.labelBinding code exact)
                                                      (dotimes [i n]
-                                                       (.aload code 2)
-                                                       (load-int code i)
-                                                       (.aload code 3)
+                                                       (.aload code 1)
                                                        (.invokeinterface code iseq-cd "first"
                                                                          (MethodTypeDesc/of obj-cd no-cd))
-                                                       (.aastore code)
-                                                       (.aload code 3)
-                                                       (.invokeinterface code iseq-cd "next"
-                                                                         (MethodTypeDesc/of iseq-cd no-cd))
-                                                       (.astore code 3))
-                                                     ;; Use the actual emitted owner, including its unique
-                                                     ;; literal-capture suffix, in this wrapper's loader.
-                                                     ;; The requested source name is not a loadable class.
-                                                     (.ldc code statics-cd)
-                                                     (.ldc code "compute_static")
-                                                     (.aload code 2)
-                                                     (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
+                                                       (emit-object-parameter code (nth compute-param-cds i))
+                                                       (when (< i (dec n))
+                                                         (.aload code 1)
+                                                         (.invokeinterface code iseq-cd "next"
+                                                                           (MethodTypeDesc/of iseq-cd no-cd))
+                                                         (.astore code 1)))
+                                                     (.invokestatic code statics-cd "compute_static" compute-mt)
+                                                     (emit-object-return code compute-ret-cd)
                                                      (.areturn code))))))))))
         loader (compilation-loader)
         wrapper-class (.defineClass loader wrapper-name bytes nil)
@@ -6634,6 +7651,14 @@
                     :interface iface-class :invocation-method iface-invk
                     :compute-method compute-method
                     :parameter-carriers (vec iface-param-types)
+                    :boxed-entry
+                    {:parameter-carriers (vec compute-params)
+                     :plans (mapv boxed-parameter-plan compute-param-cds)
+                     :apply-to-method (.getDeclaredMethod wrapper-class "applyTo"
+                                                          (into-array Class [clojure.lang.ISeq]))
+                     :invoke-method (when (<= (count param-cds) 20)
+                                      (.getDeclaredMethod wrapper-class "invoke"
+                                                          (into-array Class (repeat (count param-cds) Object))))}
                     :compute-parameter-carriers (vec compute-params))))
     implementation))
 

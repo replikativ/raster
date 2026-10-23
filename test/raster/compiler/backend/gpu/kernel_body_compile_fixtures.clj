@@ -50,6 +50,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.passes.parallel.ordered-scalar-fold-fixture :as ordered-fold]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.ode.multilevel :as multilevel]
@@ -651,7 +652,9 @@
       (:kernels (compile-public-fixture
                  #'public-c-family-strided-scatter {:target device-id :dtype :float}))
       (:kernels (compile-public-fixture
-                 #'contract/contract-mm {:target device-id :dtype :float}))
+                 ;; This public function declares double storage. A fixture must
+                 ;; not silently reinterpret that declaration as float storage.
+                 #'contract/contract-mm {:target device-id :dtype :double}))
       (:kernels (compile-public-fixture
                  #'qk/qmatmul-q4k-dp4a-rows! {:target device-id :dtype :float}))
       (:kernels (compile-public-fixture
@@ -762,6 +765,12 @@
                             swizzled-pipelined)
            (write-artifact! directory suffix "workgroup-reduction"
                             (reduction-artifact dialect))
+           ;; Explicit native-schedule fixture, not public source admission evidence.
+           (write-artifact! directory suffix "ordered-seeded-scalar-fold"
+                            (segop-emit/generate-segred-kernel-body
+                             (ordered-fold/operation :double 2.0 'n '*) nil
+                             :dtype :double :array-types {'a :double} :scalar-types {'n :long}
+                             :target-dialect dialect :kernel-name-prefix "ordered_seeded_fold"))
            (write-artifact! directory suffix "portable-contraction"
                             (contraction-artifact dialect descriptor))
            (write-artifact! directory suffix "widened-contraction-result"
@@ -869,6 +878,11 @@
                           (body-emit/emit-scalar-kernel
                            "double_division_narrowing"
                            (body-fixtures/double-division-narrowing-body)
+                           {:target-dialect dialect}))
+           (write-source! directory suffix "checked-float-stage-qualification"
+                          (body-emit/emit-scalar-kernel
+                           "checked_float_stage_qualification"
+                           (body-fixtures/checked-float-stage-body 25)
                            {:target-dialect dialect}))
            (write-source! directory suffix "scalar-while"
                           (body-emit/emit-scalar-kernel

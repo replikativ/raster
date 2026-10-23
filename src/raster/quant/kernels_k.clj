@@ -543,7 +543,12 @@
                          ssum (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+
                                     (float 0.0) d0) m0) d1) m1) d2) m2) d3) m3)
                                     d4) m4) d5) m5) d6) m6) d7) m7)]
-                     (recur (inc sb) (+ a (* dact ssum))))
+                     ;; Preserve the compatibility consumer's physical checkpoints:
+                     ;; Float subblock sum, Double scale/add, then IEEE Float carry.
+                     ;; Do not let incidental Object boxing select the arithmetic.
+                     (recur (inc sb)
+                            (clojure.core/unchecked-float
+                             (+ (double a) (* (double dact) (double ssum))))))
                    a))]
        (ra/aset y ro acc)))))
 

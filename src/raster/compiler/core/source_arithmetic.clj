@@ -16,6 +16,11 @@
     (= [:float :float] [left right]) :float
     :else :double))
 
+(defn binary-operator?
+  "The core-inline arithmetic vocabulary owned by this source planner."
+  [operator]
+  (contains? #{"+" "-" "*" "/"} operator))
+
 (defn loop-carrier-join
   "The JVM loop-slot join over actual initializer and recurrence carriers.
    Unknown/reference carries do not become primitive from a declaration. This
@@ -48,6 +53,14 @@
      :slot-carrier (loop-carrier-join completed recurrence)
      :contextual-float-literal? (boolean contextual?)}))
 
+(defn numbers-method-name
+  "Numbers overload spelling for an already selected core arithmetic operation.
+   This does not select an overload, operand carrier or source definition."
+  [operator]
+  (case operator "+" "add" "-" "minus" "*" "multiply" "/" "divide"
+        (throw (ex-info "Unsupported source arithmetic invocation"
+                        {:reason :unsupported-source-arithmetic-invocation :operator operator}))))
+
 (defn binary-plan
   "Plan one step of the source inline left fold for +, -, *, or /.
    Inputs are actual stack carriers, never logical dtype annotations. Callers
@@ -55,7 +68,7 @@
    separately. A :numbers plan can still throw during numeric conversion, even
    when its selected overload uses IEEE division."
   [operator left right]
-  (when-not (and (contains? #{"+" "-" "*" "/"} operator)
+  (when-not (and (binary-operator? operator)
                  (every? #{:int :long :float :double :ref :bool} [left right]))
     (throw (ex-info "Unsupported source arithmetic invocation"
                     {:reason :unsupported-source-arithmetic-invocation
@@ -65,7 +78,7 @@
           inputs [(normalize left) (normalize right)]
           result (if (some #{:double} inputs) :double :ref)]
       {:kind :numbers :input-carriers inputs :result-carrier result
-       :method-name (case operator "+" "add" "-" "minus" "*" "multiply" "/" "divide")})
+       :method-name (numbers-method-name operator)})
     (let [target (if (= operator "/")
                    (if (= [:float :float] [left right]) :float :double)
                    (case left

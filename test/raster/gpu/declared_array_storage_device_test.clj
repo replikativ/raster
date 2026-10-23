@@ -1,17 +1,114 @@
 (ns raster.gpu.declared-array-storage-device-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.fixtures.mixed-storage :as storage]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
+            [raster.compiler.backend.jvm.frontend-reduction-correspondence-test :as reduction-fixture]
             [raster.compiler.compatibility-map-packet-test :as map-packet]
             [raster.compiler.backend.gpu.segmap-retirement-fixture :as retirement]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.kernel-call :as kernel-call]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.nn :as nn]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.gpu.runtime-backend :as backend]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.value :as value]))
+
+(defn- run-empty-fold-seed [target]
+  (let [runtime (backend/runtime-namespace target)
+        api #(requiring-resolve (symbol (str runtime) %))
+        arena ((api "make-kernel-arena!"))]
+    (try
+      (with-bindings {(api "*current-arena*") arena}
+        (doseq [dtype [:float :double] negative? [false true]]
+          (let [seed (if (= :float dtype) (float (if negative? -0.0 0.0))
+                         (if negative? -0.0 0.0))
+                form (with-meta
+                       (list 'raster.par/reduce 'acc seed 'i 0
+                             '(+ acc (clojure.core/aget a i)))
+                       {:raster.type/elem-type dtype})
+                operation (first (soac-lower/lower-reduce
+                                  (soac/par-form->soac 'result form 97 :dtype dtype)
+                                  nil :dtype dtype))
+                artifact (segop-opencl/generate-segred-kernel
+                          operation nil :dtype dtype :target-dialect :opencl-portable)
+                output ((api "buffer-of-array")
+                        (if (= :float dtype) (float-array [42.0]) (double-array [42.0])) dtype)
+                bits (if (= :float dtype) #(Float/floatToRawIntBits (float %))
+                         #(Double/doubleToRawLongBits (double %)))]
+            (try
+              (is (= '[result 0] (:arguments artifact)) "there is no element-input pointer to bind")
+              ((api "register-kernel!") (:kernel-name artifact) artifact)
+              ((api "launch-registered-bound!")
+               ((api "bind-kernel-call")
+                (kernel-call/make artifact [output {:type :int :value 0}])))
+              (is (= (bits seed) (bits (first ((api "buffer->array") output)))))
+              (finally ((api "free-buffer!") output))))))
+      (finally ((api "close-kernel-arena!") arena)))))
+
+(deftest native-empty-fold-stores-exact-seed-without-an-element-buffer
+  ;; This qualifies the native schedule only. Original source entry/count/initializer guards
+  ;; belong to the invocation owner and are deliberately not inferred from this device test.
+  (if @opencl/opencl-available?
+    (run-empty-fold-seed :ocl:0)
+    (opencl/opencl-skip! "exact empty scalar reduction seed on OpenCL"))
+  (if @gp/gpu-available?
+    (run-empty-fold-seed :ze:0)
+    (gp/gpu-skip! "exact empty scalar reduction seed on Level Zero")))
+
+(defn- run-owned-empty-source [target]
+  (doseq [float? [false true] negative? [false true]]
+    ((ns-resolve 'raster.compiler.backend.jvm.frontend-reduction-correspondence-test
+                 'with-fresh-reduction-binding)
+     float? false 0 (if float? (list 'float (if negative? -0.0 0.0)) (if negative? -0.0 0.0))
+     (fn [frontend]
+       (let [compilation (equation-first/compile (get-in frontend [:source-entry :source-var])
+                                                {:target target :dtype (if float? :float :double)})
+             array-of (if float? float-array double-array)
+             original (:implementation frontend)]
+         (doseq [input [nil (array-of 0) (array-of [2.0])]]
+           (let [artifact (link/instantiate-host-result! compilation [input])]
+             (try
+               (dotimes [replay 2]
+                 (when (and input (pos? (alength input)))
+                   (java.lang.reflect.Array/set input 0 (if float? (float (+ replay 3.0)) (+ replay 3.0))))
+                 (let [expected (original input)
+                       actual (link/run-host-result! artifact)
+                       ordered (:ordered @(:execution-state artifact))]
+                   (is (= (class expected) (class actual)))
+                   (is (= expected actual (if negative? Double/NEGATIVE_INFINITY Double/POSITIVE_INFINITY)))
+                   (is (empty? (:entry-refresh ordered)) "no unread argument is captured or uploaded")
+                   (is (= 1 (count (:roots ordered))) "only the scalar result owns native storage")))
+               (is (= 2 @(:completed-replays artifact)))
+               (finally (link/close! artifact)))
+             (is @(:closed? artifact))))
+         (when (and (not float?) (not negative?))
+           (let [artifact (link/instantiate-host-result! compilation [nil])
+                 failure (ex-info "injected terminal completion failure" {:reason :empty-terminal-failure})]
+             (try
+               (with-redefs [source-owner/invoke-terminal-result (fn [& _] (throw failure))]
+                 (is (identical? failure (try (link/run-host-result! artifact) nil
+                                             (catch clojure.lang.ExceptionInfo error error)))))
+               (is (zero? @(:completed-replays artifact)))
+               (is (false? @(:output-ready? artifact)))
+               (finally (link/close! artifact)))
+             (is @(:closed? artifact)))))))))
+
+(deftest source-owned-empty-fold-completes-null-entry-and-replay-without-an-input-buffer
+  (if @opencl/opencl-available?
+    (run-owned-empty-source :ocl:0)
+    (opencl/opencl-skip! "source-owned empty reduction on OpenCL"))
+  (if @gp/gpu-available?
+    (run-owned-empty-source :ze:0)
+    (gp/gpu-skip! "source-owned empty reduction on Level Zero")))
 
 (defn- run-generated-clone [target]
   (doseq [n [0 4]]
@@ -256,18 +353,14 @@
   (doseq [n [0 3 2049]]
     (let [x (double-array (take n (cycle [16777216.0 1.0 1.0])))
           expected (storage/double-reduction-float-result x)
-          artifact (compiled/compile
-                    #'storage/double-reduction-float-result [x]
-                    (merge storage/policy
-                           {:compiler :equation-first :target target :dtype :double}))]
-      (try
+          compilation (equation-first/compile
+                       #'storage/double-reduction-float-result
+                       (merge storage/policy {:target target :dtype :double}))]
+      (with-open [artifact (link/instantiate-host-result! compilation [x])]
         (dotimes [_ 2]
-          (let [outputs (artifact {})
-                result (value/->host (:result outputs))]
-            (is (= #{:result} (set (keys outputs))))
-            (is (= (class (float-array 0)) (class result)))
-            (is (= [expected] (vec result)))))
-        (finally (compiled/close! artifact))))))
+          (let [result (link/run-host-result! artifact)]
+            (is (= Float (class result)))
+            (is (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits result)))))))))
 
 (deftest completed-reduction-conversion-matches-jvm-on-both-backends
   (if @gp/gpu-available?
@@ -277,24 +370,119 @@
     (run-completed-conversion-case :ocl:0)
     (opencl/opencl-skip! "completed reduction conversion on OpenCL")))
 
+(defn- run-float-terminal-export-case [target]
+  (let [input (float-array [16777216.0 0.0 0.0 0.0])
+        _ (storage/float-reduction-double-quotient input)
+        compilation (equation-first/compile #'storage/float-reduction-double-quotient
+                                            {:target target :dtype :float})
+        contract (get-in compilation [:semantic :attributes :invocation-plan :attributes :terminal-host-result])]
+    (is (= [:float] (mapv :dtype (:parameters contract))))
+    (with-open [artifact (link/instantiate-host-result! compilation [input])]
+      ;; Exact sums under every legal reduction tree; widening happens only
+      ;; after the Float checkpoint. Cancellation/association is tested apart.
+      (doseq [values [[16777216.0 0.0 0.0 0.0] [4.0 -2.0 8.0 -4.0]]]
+        (doseq [i (range 4)] (aset-float input i (float (nth values i))))
+        (let [download gpu/download-range!
+              downloads (atom [])
+              actual (with-redefs [gpu/download-range!
+                                  (fn [session source destination options]
+                                    (swap! downloads conj [(class destination) (:elements options)])
+                                    (download session source destination options))]
+                       (link/run-host-result! artifact))]
+          (is (= [[(class (float-array 0)) 1]] @downloads))
+          (is (= Double (class actual)))
+          (is (= (Double/doubleToRawLongBits (storage/float-reduction-double-quotient input))
+                 (Double/doubleToRawLongBits actual))))))))
+
+(deftest float-terminal-exports-remain-float-on-both-backends
+  (if @opencl/opencl-available?
+    (run-float-terminal-export-case :ocl:0)
+    (opencl/opencl-skip! "Float terminal exports on OpenCL"))
+  (if @gp/gpu-available?
+    (run-float-terminal-export-case :ze:0)
+    (gp/gpu-skip! "Float terminal exports on Level Zero")))
+
+(defn- run-terminal-roundtrip-case [target]
+  (doseq [function [#'storage/double-reduction-float-roundtrip
+                    #'storage/scaled-reduction-float-roundtrip]
+          n [0 1]]
+    (let [scaled? (= function #'storage/scaled-reduction-float-roundtrip)
+          input (double-array (take n [16777217.0]))
+          ;; Settle the oracle's lazy JIT before compilation freezes its source
+          ;; owner; executing the reference must not mutate that owner mid-replay.
+          _ (function input)
+          compilation (equation-first/compile function
+                                              (merge storage/policy {:target target :dtype :double}))]
+      (with-open [artifact (link/instantiate-host-result! compilation [input])]
+        (doseq [value [16777217.0 16777219.0]]
+          (when (= 1 n) (aset-double input 0 value))
+          (let [actual (link/run-host-result! artifact)
+                expected (function input)]
+            (is (= Double (class actual)))
+            (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual)))
+            (when (and (= 1 n) (= 16777217.0 value))
+              (is (= (if scaled? 25165826.0 16777216.0) actual)
+                  "the completed Float checkpoint survives widening"))))
+        (when (= 1 n)
+          (aset-double input 0 Double/MAX_VALUE)
+          (is (thrown? IllegalArgumentException (link/run-host-result! artifact))))))))
+
+(defn- run-public-terminal-scalar-case [target]
+  (doseq [[f arguments] [[#'storage/public-scaled-reduction-float-roundtrip
+                          (fn [coefficient input] [coefficient input])]
+                         [#'storage/public-affine-reduction-float-roundtrip
+                          (fn [coefficient input] [7 input coefficient])]]]
+   (let [_ (apply f (arguments 1.5 (double-array [16777217.0])))
+        compilation (equation-first/compile f
+                                            (merge storage/policy {:target target :dtype :double}))]
+    (doseq [n [0 1] coefficient [1.5 -0.5]]
+      (let [input (double-array (take n [16777217.0]))]
+        (with-open [artifact (link/instantiate-host-result! compilation (arguments coefficient input))]
+          (doseq [value [16777217.0 16777219.0]]
+            (when (= n 1) (aset-double input 0 value))
+            (let [downloads (atom 0)
+                  download gpu/download-range!
+                  actual (with-redefs [gpu/download-range! (fn [& arguments]
+                                                             (swap! downloads inc)
+                                                             (apply download arguments))]
+                           (link/run-host-result! artifact))
+                  expected (apply f (arguments coefficient input))]
+              (is (= 1 @downloads) "only the numerical scalar is downloaded, never the public coefficient")
+              (is (= Double (class actual)))
+              (is (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual)))))
+          (when (= n 1)
+            (aset-double input 0 Double/MAX_VALUE)
+            (is (thrown? IllegalArgumentException (link/run-host-result! artifact))))))))))
+
+(deftest terminal-public-scalars-compose-with-completed-device-results
+  (if @opencl/opencl-available?
+    (run-public-terminal-scalar-case :ocl:0)
+    (opencl/opencl-skip! "public terminal scalars on OpenCL"))
+  (if @gp/gpu-available?
+    (run-public-terminal-scalar-case :ze:0)
+    (gp/gpu-skip! "public terminal scalars on Level Zero")))
+
+(deftest checked-terminal-roundtrips-preserve-rounding-and-overflow
+  (if @opencl/opencl-available?
+    (run-terminal-roundtrip-case :ocl:0)
+    (opencl/opencl-skip! "checked terminal roundtrips on OpenCL"))
+  (if @gp/gpu-available?
+    (run-terminal-roundtrip-case :ze:0)
+    (gp/gpu-skip! "checked terminal roundtrips on Level Zero")))
+
 (defn- run-scalar-gradient-case [target]
   (doseq [n [0 3 2049]]
     (let [x (double-array (take n (cycle [1.5 -2.0 0.25])))
           coefficient (float 2.0)
           expected (storage/mixed-scale-energy-gradient coefficient x)
-          artifact (compiled/compile
-                    #'storage/mixed-scale-energy-gradient [coefficient x]
-                    (merge storage/policy
-                           {:compiler :equation-first :target target :dtype :double}))]
-      (try
+          compilation (equation-first/compile
+                       #'storage/mixed-scale-energy-gradient
+                       (merge storage/policy {:target target :dtype :double}))]
+      (with-open [artifact (link/instantiate-host-result! compilation [coefficient x])]
         (dotimes [_ 2]
-          ;; Select by the public result's tangent representation, never generated ABI
-          ;; names. Other returned arrays are Double intermediates, not scalar gradients.
-          (let [results (map value/->host (vals (artifact {})))
-                gradients (filter #(instance? (class (float-array 0)) %) results)]
-            (is (= 1 (count gradients)))
-            (is (= [expected] (vec (first gradients))))))
-        (finally (compiled/close! artifact))))))
+          (let [result (link/run-host-result! artifact)]
+            (is (= Float (class result)))
+            (is (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits result)))))))))
 
 (deftest projected-scalar-gradient-matches-jvm-on-both-backends
   (if @gp/gpu-available?
@@ -303,6 +491,56 @@
   (if @opencl/opencl-available?
     (run-scalar-gradient-case :ocl:0)
     (opencl/opencl-skip! "projected scalar gradient on OpenCL")))
+
+(defn- host-result-failure-and-replay-controls [target]
+  ;; Evaluate the JVM oracle before compilation captures historical definitions.
+  (let [x (double-array [1.25])
+        expected (storage/double-reduction-float-result x)
+        compilation (equation-first/compile #'storage/double-reduction-float-result
+                                            (merge storage/policy {:target target :dtype :double}))
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (with-open [artifact (link/instantiate-host-result! compilation [x])]
+      (let [epoch (:value-epoch @(:execution-state artifact)) callback (atom 0)]
+        (is (= :explicit-host-result-required (reason #(link/run! artifact))))
+        (is (= :explicit-host-result-required
+               (reason #(link/run-ordered-with-inputs! artifact {} (fn [] (swap! callback inc))))))
+        (is (= 0 @callback))
+        (is (= epoch (:value-epoch @(:execution-state artifact)))))
+      (is (= expected (link/run-host-result! artifact)))
+      (is (= :explicit-host-result-required (reason #(link/outputs artifact))))
+      (aset-double x 0 2.5)
+      (is (= (float 2.5) (link/run-host-result! artifact)) "dynamic inputs refresh on replay")
+      (aset-double x 0 Double/MAX_VALUE)
+      (is (thrown? IllegalArgumentException (link/run-host-result! artifact)))
+      (is (= 2 @(:completed-replays artifact)) "overflow does not publish a successful replay")
+      (is (false? @(:output-ready? artifact)))
+      (is (= :link-execution-poisoned (reason #(link/output-lease! artifact)))))
+    (with-open [artifact (link/instantiate-host-result! compilation [x])]
+      ;; Simulate an internal execution path returning without its required
+      ;; terminal publication. This must fail inside the replay failure boundary.
+      (with-redefs-fn {#'link/run-ordered-invocation! (fn [_] nil)}
+        #(is (= :link-host-result-unavailable (reason (fn [] (link/run-host-result! artifact))))))
+      (is (zero? @(:completed-replays artifact)))
+      (is (false? @(:output-ready? artifact)))
+      (is (= :link-execution-poisoned (reason #(link/output-lease! artifact)))))
+    (aset-double x 0 1.25)
+    (with-open [artifact (link/instantiate-host-result! compilation [x])]
+      ;; A source helper is allowed to have effects, including reentrant owner
+      ;; activity. It cannot authorize publication from the old stage state.
+      (with-redefs [source-owner/invoke-terminal-result
+                    (fn [& _] (#'link/begin-mutation! artifact) (float 1.25))]
+        (is (= :link-terminal-result-reentrancy (reason #(link/run-host-result! artifact)))))
+      (is (zero? @(:completed-replays artifact)))
+      (is (false? @(:output-ready? artifact)))
+      (is (= :link-execution-poisoned (reason #(link/output-lease! artifact)))))))
+
+(deftest host-result-observation-is-explicit-and-failure-prevents-publication
+  (if @gp/gpu-available?
+    (host-result-failure-and-replay-controls :ze:0)
+    (gp/gpu-skip! "host-result failure and replay on Level Zero"))
+  (if @opencl/opencl-available?
+    (host-result-failure-and-replay-controls :ocl:0)
+    (opencl/opencl-skip! "host-result failure and replay on OpenCL")))
 
 (deftest level-zero-mixed-storage-public-compilers-match-jvm
   (if @gp/gpu-available?

@@ -31,6 +31,96 @@
                  (dialect/lambda-form '[x-element] [body])))]
     '[y])))
 
+(defn- required-scalar-program
+  ([] (required-scalar-program 0 0 'x 'unused []))
+  ([id position input result outputs]
+  (let [obligation {:source-binding-id position :flags #{:preserve-source-evaluation}
+                    :ordering :source}
+        value (av/tensor {:dtype :double :shape []})]
+    (dialect/make
+     (dialect/default-program-facts
+      {:values {input value result value} :inputs [input]
+       :equations {id (assoc-in (dialect/default-equation-facts {:source-binding-id position})
+                              [:attributes :required-evaluation] obligation)}
+       :attributes {:required-evaluations {id obligation}}})
+     [(list '= id [result]
+            (list 'scalar {:dtypes [:double]} [input]
+                  '(lambda [arg] (region [] [(clojure.core/+ arg 1.0)]))))]
+     outputs))))
+
+(deftest required-source-evaluation-catalog-is-conserved
+  (let [program (required-scalar-program)
+        facts (dialect/facts program)
+        equation (first (dialect/equations program))]
+    (is (= program (dialect/validate! program)))
+    (doseq [[changed-facts changed-equations]
+            [[(assoc facts :equations {} :inputs []) []]
+             [(update-in facts [:attributes] dissoc :required-evaluations) [equation]]
+             [(update-in facts [:equations 0 :attributes] dissoc :required-evaluation) [equation]]
+             [(assoc-in facts [:equations 0 :provenance :source-binding-id] 1) [equation]]
+             [(assoc-in facts [:equations 0 :attributes :fusion/constituents]
+                        {5 (get-in facts [:equations 0])}) [equation]]]]
+      (is (= :typed-soac-required-evaluation
+             (try (dialect/make changed-facts changed-equations []) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (let [stripped (dialect/make
+                    (-> facts (assoc :equations {} :inputs [])
+                        (update :attributes dissoc :required-evaluations)) [] [])]
+      (is (= :typed-soac-required-evaluation-refinement
+             (try (dialect/assert-required-evaluations-preserved! program stripped) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (let [remapped (dialect/remap-values program {'x 'input 'unused 'private-result})
+          projected (dialect/equation-subprogram program equation)]
+      (is (= (dialect/required-evaluation program 0)
+             (dialect/required-evaluation remapped 0)
+             (dialect/required-evaluation projected 0))))))
+
+(deftest required-source-evaluations-have-one-executor-and-conserve-order
+  (let [base (required-scalar-program)
+        facts (-> (dialect/facts base)
+                  (assoc-in [:values 'later] (av/tensor {:dtype :double :shape []}))
+                  (assoc-in [:equations 1] (dialect/default-equation-facts {:source-binding-id 1})))
+        first-equation (first (dialect/equations base))
+        second-equation '(= 1 [later] (scalar {:dtypes [:double]} [x]
+                                            (lambda [arg] (region [] [(clojure.core/* arg 2.0)]))))
+        program (dialect/make facts [first-equation second-equation] '[later])
+        reordered (list 'soac-program facts [second-equation first-equation] '[later])
+        duplicate (dialect/required-evaluation base 0)]
+    (is (= :typed-soac-required-evaluation-order
+           (try (dialect/validate! reordered) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :typed-soac-required-evaluation-refinement
+           (try (dialect/assert-required-evaluations-preserved! program reordered) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :typed-soac-required-evaluation
+           (try (dialect/make
+                 (-> facts (assoc-in [:equations 1 :provenance :source-binding-id] 0)
+                     (assoc-in [:equations 1 :attributes :required-evaluation] duplicate)
+                     (assoc-in [:attributes :required-evaluations 1] duplicate))
+                 [first-equation second-equation] '[later]) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (let [projected (dialect/equation-subprogram program second-equation)
+          rebased (dialect/rebase-source-bindings program {0 4, 1 5})]
+      (is (empty? (get-in (dialect/facts projected) [:attributes :required-evaluations])))
+      (is (= 4 (:source-binding-id (dialect/required-evaluation rebased 0))))
+      (is (= 4 (get-in (dialect/facts rebased)
+                       [:equations 0 :attributes :required-evaluation :source-binding-id]))))))
+
+(deftest required-source-evaluations-compose-only-with-explicit-distinct-occurrences
+  (let [producer (required-scalar-program 0 0 'x 'left '[left])
+        consumer (required-scalar-program 1 0 'input 'right '[right])
+        boundary {'input 'left}]
+    (is (= :typed-soac-required-evaluation
+           (try (dialect/append-pure-spines producer consumer boundary '[right]) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (let [consumer (dialect/rebase-source-bindings consumer {1 1})
+          composed (dialect/append-pure-spines producer consumer boundary '[right])]
+      (is (= #{0 1} (set (keys (get-in (dialect/facts composed)
+                                      [:attributes :required-evaluations])))))
+      (is (= composed (dialect/validate! composed)))
+      (is (= [0 1] (mapv #(-> (dialect/required-evaluation composed %) :source-binding-id)
+                         [0 1]))))))
+
 (deftest completed-full-reduction-transform-requires-one-result
   (let [left '(clojure.core/+ a element)
         right '(clojure.core/+ b element)

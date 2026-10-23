@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.device-scalar-substrate-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.segop :as segop]
@@ -19,13 +20,16 @@
 
 (defn- scalar-program
   ([] (scalar-program {}))
-  ([{:keys [result-value input-value bias-value operation-attributes equation-facts]
+  ([{:keys [result-value input-value bias-value operation-attributes equation-facts
+            input-expression program-attributes]
      :or {result-value (resident-scalar :double)
           input-value (av/tensor {:dtype :float :shape '[(extent out)]})
           bias-value (av/tensor {:dtype :double :shape []})
           operation-attributes {:dtypes [:double]}
-          equation-facts (dialect/default-equation-facts)}}]
-   (let [load (dialect/local-value 'loaded :float '(clojure.core/aget array-value 0))
+          equation-facts (dialect/default-equation-facts)
+          input-expression '(clojure.core/aget array-value 0)
+          program-attributes {}}}]
+   (let [load (dialect/local-value 'loaded :float input-expression)
          widen (dialect/local-value
                 'widened :double
                 (dialect/scalar-convert
@@ -46,8 +50,19 @@
                  'loss result-value}
         :inputs '[out bias]
         :equations {'terminal-scalar equation-facts}
+        :attributes program-attributes
         :effects (:effects equation-facts)})
       [equation] '[loss]))))
+
+(defn- required-resident-payload-program []
+  (let [obligation {:source-binding-id 0 :flags #{:preserve-source-evaluation}
+                    :ordering :source}]
+    (scalar-program
+     {:input-value (resident-scalar :float)
+      :input-expression 'array-value
+      :equation-facts (assoc-in (dialect/default-equation-facts {:source-binding-id 0})
+                               [:attributes :required-evaluation] obligation)
+      :program-attributes {:required-evaluations {'terminal-scalar obligation}}})))
 
 (defn- scheduled-program
   [algorithm operation]
@@ -67,6 +82,27 @@
     nil
     (catch clojure.lang.ExceptionInfo exception
       (:reason (ex-data exception)))))
+
+(deftest required-resident-payload-has-one-explicit-pointer-load
+  (let [algorithm (required-resident-payload-program)
+        operation (first (lower/lower-typed-scalar algorithm :test:0
+                                                  :target-descriptor target-descriptor))
+        reads (descriptor/aget-reads (:lambda operation))]
+    (is (= #{'out} (:inputs operation)))
+    (is (= #{'bias} (:scalars operation)))
+    (is (= [{:sym 'out :idx 0}] (mapv #(select-keys % [:sym :idx]) reads)))
+    (is (= (get-in (dialect/facts algorithm) [:equations 'terminal-scalar :attributes])
+           (:algorithm-equation-attributes operation)))
+    (is (= operation (lower/validate-typed-scalar-schedule! algorithm operation)))
+    (doseq [target-dialect [:opencl-portable :opencl-intel :cuda :hip]]
+      (let [emitted (target/emit-program (scheduled-program algorithm operation)
+                                        {:target-dialect target-dialect})]
+        (is (= algorithm (get-in emitted [:program :equations 0 :algorithm])))))
+    (doseq [forged [(assoc operation :inputs #{} :scalars #{'out 'bias})
+                    (assoc-in operation [:scalar-region :locals 0 :init]
+                              '(clojure.core/aget out 1))]]
+      (is (= :typed-soac-device-scalar-correspondence
+             (reason-of #(lower/validate-typed-scalar-schedule! algorithm forged)))))))
 
 (deftest the-same-scalar-schedule-emits-through-every-existing-target-dialect
   (let [algorithm (scalar-program)

@@ -216,15 +216,12 @@
 ;; ================================================================
 
 (deftest pure-par-unused-test
-  (testing "pure par/reduce binding is removed when unused"
-    ;; par/reduce is pure (no buffer mutation), so if its result is unused
-    ;; it should be eliminated.
-    (let [form '(let* [x (raster.par/reduce out init n (fn [acc i] (+ acc i)))
-                       y 42]
-                      y)
-          {:keys [stats]} (dce/eliminate-dead-bindings form)]
-      (is (= 1 (:bindings-removed stats))
-          "unused par/reduce is pure and should be removed"))))
+  (testing "external purity does not discharge reduction arithmetic"
+    (doseq [[reduction removed]
+            [['(raster.par/reduce acc 0 i 3 (+ acc i)) 0]
+             ['(raster.par/reduce acc 0 i 0 acc) 1]]]
+      (let [{:keys [stats]} (dce/eliminate-dead-bindings (list 'let* ['x reduction 'y 42] 'y))]
+        (is (= removed (:bindings-removed stats)))))))
 
 ;; ================================================================
 ;; Root-pred option
@@ -284,13 +281,40 @@
       (is (contains? kept 'dx_buf))
       (is (contains? kept '_1)))))
 
-(deftest verified-local-write-into-unread-buffer-is-eliminated
+(deftest unread-local-write-retains-arithmetic-completion
   (let [write '(clojure.core/aset dead 0 (+ (clojure.core/aget dy 0) (clojure.core/aget x 0)))
         source (list 'let* ['live '(clojure.core/double-array 1)
                            'write-live '(clojure.core/aset live 0 (clojure.core/aget dy 0))
                            'dead '(clojure.core/double-array 1) 'write-dead write] 'live)
         {lowered :form stats :stats} (dce/eliminate-dead-bindings source)
         kept (set (take-nth 2 (second lowered)))]
-    (is (= {:effect :local :flags #{}} (effects/descriptor write)))
-    (is (= '#{live write-live} kept))
-    (is (= 2 (:bindings-removed stats)))))
+    (is (= {:effect :local :flags #{:unclosed-source-arithmetic}} (effects/descriptor write)))
+    (is (= '#{live write-live dead write-dead} kept))
+    (is (zero? (:bindings-removed stats)))))
+
+(deftest verified-local-literal-write-into-unread-buffer-is-eliminated
+  (let [source '(let* [live (clojure.core/double-array 1)
+                      write-live (clojure.core/aset live 0 1.0)
+                      dead (clojure.core/double-array 1)
+                      write-dead (clojure.core/aset dead 0 2.0)] live)
+        {lowered :form stats :stats} (dce/eliminate-dead-bindings source)]
+    (is (= '#{live write-live} (set (take-nth 2 (second lowered)))))
+    (is (= 2 (:bindings-removed stats)))
+    (is (= [1.0] (vec (eval lowered))))))
+
+(deftest dead-arithmetic-retains-exception-and-source-order
+  (doseq [[expression bad-value] [['(clojure.core/* x 2) Long/MAX_VALUE]
+                                  ['(clojure.core// 1 x) 0]]]
+    (let [source (list 'let* ['before '(swap! events conj :before)
+                              'unused expression
+                              'after '(swap! events conj :after)] 7)
+          lowered (:form (dce/eliminate-dead-bindings source))
+          run (fn [body value]
+                (let [events (atom [])
+                      f (eval (list 'fn '[x events] body))
+                      outcome (try [:value (f value events)]
+                                   (catch ArithmeticException _ [:error ArithmeticException]))]
+                  [outcome @events]))]
+      (is (= [[:error ArithmeticException] [:before]] (run source bad-value)))
+      (is (= (run source bad-value) (run lowered bad-value)))
+      (is (= [[:value 7] [:before :after]] (run lowered 1))))))

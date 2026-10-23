@@ -119,6 +119,15 @@
       (fail! :ad-normalized-operation {:expression expression :operation operation}))
     (assoc call :template (if unary? forward-template template)
            :template-identity (if unary? forward-owner template-identity)
+           ;; Template arguments cross out of the typed program here. Retain
+           ;; their owning value declarations, not desired gradient-port tags.
+           :arguments (mapv (fn [argument]
+                              (if-let [dt (expression-dtype values argument)]
+                                (let [retained (:raster.type/tag (meta argument))]
+                                  (when (and retained (not= retained (tag dt)))
+                                    (fail! :ad-normalized-value-declaration
+                                           {:argument argument :declared (tag dt) :retained retained}))
+                                  (tagged argument dt)) argument)) arguments)
            :canonical (if unary? :nonlinear-unary canonical) :cast-tag cast-tag)))
 
 (defn- equation-expression [equation]
@@ -817,7 +826,12 @@
                       (fn [index equation-facts]
                         ;; With no intervening host activity, the first parallel equation
                         ;; ends the frontend's stageable scalar prefix for every later one.
-                        (and (= {:source-prefix? (zero? index)} (:attributes equation-facts))
+                        ;; These are distinct frontend phase facts in general. This
+                        ;; envelope admits only parallel equations without intervening
+                        ;; host activity, so both must change after the first equation.
+                        ;; Exact equality also rejects unknown or malformed obligations.
+                        (and (= {:source-prefix? (zero? index)
+                                 :before-parallel? (zero? index)} (:attributes equation-facts))
                              (= :analyzed-source (get-in equation-facts [:provenance :front-end]))
                              (= index (get-in equation-facts [:provenance :source-binding-id]))))
                       equation-facts))))))
@@ -2524,7 +2538,10 @@
         program-facts (soac/facts program)
         equation-facts (get-in program-facts [:equations (second equation)])
         values (:values program-facts)
-        matrix (contraction/dense-matrix-view facts)
+        ;; Phase correspondence proves geometry, not eligibility to replace the
+        ;; derivative's full scalar element by a hardware product. Retain its
+        ;; conversions/checkpoints; dense leaf admission remains independent.
+        matrix (contraction/dense-matrix-geometry facts)
         actual-maps (into {} (map (fn [operand]
                                    [(:sym operand) (contraction/operand-axis-map facts operand)]))
                           (:operands facts))

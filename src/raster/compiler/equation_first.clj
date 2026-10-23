@@ -13,10 +13,12 @@
             [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.source-prefix :as source-prefix]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -24,6 +26,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
             [raster.compiler.ir.kernel-executable :as kernel-executable]
@@ -35,9 +38,11 @@
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.prepared-module :as prepared-module]
             [raster.gpu.schedule :as gpu-schedule]
             [raster.core :as rcore]))
 
@@ -135,11 +140,13 @@
     (merge {:resident-reductions? true}
            options
            {:dtype effective-dtype
+            :terminal-host-results? true
             :segmented-plans? true
             :target-device target
             :active-params parameters
             :public-parameters parameters
             :source-ns source-ns
+            :source-policy (:source-policy frontend)
             :return-tag (:return-tag frontend)
             :array-types (:array-types parameter-types)
             :scalar-types (:scalar-types parameter-types)}
@@ -429,14 +436,20 @@
 
 (defn- compile-semantic
   "Schedule and emit one exact typed semantic program without source or ABI reconstruction."
-  [{:keys [id function-id target dtype source-ns options compiler-options]
+  [{:keys [id function-id target dtype source-ns source-var retained-frontend prefix-correspondence
+           reduction-correspondence
+           options compiler-options]
     :as context}
    semantic]
   (when-not (= :typed-parallel (:dialect semantic))
     (fail! :equation-first-coverage
            "program is outside the direct TypedSOAC/structured-control vertical"
            {:function function-id :dialect (:dialect semantic) :fallback :none}))
-  (let [{:keys [target-descriptor resolved-schedule
+  (let [terminal (get-in semantic [:attributes :invocation-plan :attributes :terminal-host-result])
+        terminal-owner (when terminal (source-owner/compile-terminal-result semantic terminal source-var
+                                                                           retained-frontend
+                                                                           reduction-correspondence))
+        {:keys [target-descriptor resolved-schedule
                 dispatch-reassociated? dispatch-contractions?]} context
         scheduled (structured-route/schedule-program semantic compiler-options)
         backend (device/select-runtime-backend target true nil)
@@ -469,12 +482,24 @@
            (assoc compiler-options :target-dialect target-dialect
                   :schedule resolved-schedule))
           emission)
-        invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)]
+        invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
+        ordered-owner (when (and source-var retained-frontend
+                                 (or reduction-correspondence
+                                     (source-owner/ordered-source-required? semantic (:program emission))))
+                        (source-owner/compile-ordered-source
+                         semantic (:program emission) source-var retained-frontend
+                         (boolean (or reduction-correspondence
+                                      (stage-result/requires-observation? (:program emission))))
+                         prefix-correspondence reduction-correspondence))
+        eager-owner (when (and source-var
+                              (source-owner/eager-evaluation-required? semantic (:program emission)))
+                      (source-owner/compile-eager-evaluation
+                       semantic (:program emission) source-var retained-frontend ordered-owner))]
     (when-not invocation-plan
       (fail! :equation-first-invocation
              "equation-first semantic program has no retained public invocation plan"
              {:function function-id}))
-    (->EquationFirstCompilation
+    (cond-> (->EquationFirstCompilation
      id function-id target dtype source-ns
      (cond-> (-> compiler-options
                  (assoc :schedule resolved-schedule)
@@ -488,7 +513,10 @@
       :schedule {:dialect (:dialect scheduled)
                  :equations (count (:equations scheduled))}
       :emission (:stats emission)
-      :fallback :none})))
+      :fallback :none})
+      terminal-owner (assoc :terminal-source-owner terminal-owner)
+      eager-owner (assoc :eager-source-owner eager-owner)
+      ordered-owner (assoc :ordered-source-owner ordered-owner))))
 
 (def ^:private typed-compilation-options
   #{:target :schedule :scalar-math :resident-outputs})
@@ -670,6 +698,8 @@
    it produces verified target source artifacts but does not require an installed runtime or a
    physical device. Unsupported target families and uncovered KernelBody graph families fail
    rather than borrowing the compatibility backend. `:dtype` defaults from retained deftm tags.
+   Source compilation requires its authenticated retained frontend; it does not
+   reconstruct an unowned source walk when that producer is unavailable.
 
    The three-argument form consumes an already captured target descriptor, allowing cache identity
    and compilation to share one immutable snapshot. Its device identity must match `:target`."
@@ -698,6 +728,9 @@
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
          function-id (function-symbol resolved-var)
+         _ (rcore/prepare-deftm-frontend! resolved-var)
+         _ (method-entry/observe-definition-input! resolved-var (:ns (meta resolved-var))
+                                                   (:name (meta resolved-var)))
          policy (compilation-policy function-id target options captured-target)
          {:keys [target-descriptor reference-schedule]} policy
          compiler-options (compiler-options resolved-var target dtype
@@ -705,27 +738,65 @@
                                                 (dissoc :target :gemm-precision)
                                                 (assoc :schedule reference-schedule
                                                        :target-descriptor target-descriptor)))
-         walked (pipeline/get-walked-body resolved-var (:dtype compiler-options))
-         source (if (= 1 (count walked)) (first walked) (list* 'do walked))
-         represented-source (pipeline/run-passes
-                             source pipeline/gpu-resident-pre-soa-passes compiler-options)
+         retained-frontend (pipeline/retained-frontend-source
+                            f-var resolved-var (:dtype compiler-options) compiler-options)
+         prefix-input (source-prefix/begin retained-frontend
+                                           (:raster.core/deftm-params (meta resolved-var)))
+         reduction-input (source-prefix/begin-reduction-interval
+                          retained-frontend (:raster.core/deftm-params (meta resolved-var)))
+         _ (source-prefix/prepare-prefix-entry! prefix-input rcore/ensure-current-owned-bytecode!)
+         _ (source-prefix/prepare-reduction-entry! reduction-input rcore/ensure-current-owned-bytecode!)
          representation (parameter-representation f-var (:dtype compiler-options))
          param-specs (:params representation)
-         represented (soa-lower/soa-lower represented-source param-specs (:soa-env representation))
          projection (:projection representation)
-         physical-parameters (mapv :sym (:params represented))
-         physical-types (when projection
-                          (opencl-pass/derive-param-types physical-parameters
-                                                         (mapv :tag (:params represented))
-                                                         (:dtype compiler-options) compiler-options))
-         compiler-options (cond-> compiler-options
-                            projection (assoc :active-params physical-parameters
-                                              :public-parameters physical-parameters
-                                              :array-types (:array-types physical-types)
-                                              :scalar-types (:scalar-types physical-types)))
-         semantic-candidate (pipeline/run-passes
-                             (:body represented) pipeline/gpu-semantic-post-soa-passes
-                             compiler-options :write-read-fused)
+         constructed
+         (prepared-module/construct-source
+          retained-frontend compiler-options
+          {:prepare-source #(pipeline/run-passes % pipeline/gpu-resident-pre-soa-passes compiler-options)
+           :prepare-authored-segment
+           (fn [source options]
+             (pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes options))
+           :canonicalize-ordinary-source pipeline/prepare-semantic-source
+           :represent-source
+           (fn [source options]
+             (let [represented (if projection
+                                 (soa-lower/soa-lower source param-specs (:soa-env representation))
+                                 {:body source :params param-specs})
+                   parameters (mapv :sym (:params represented))
+                   physical-types (when projection
+                                    (opencl-pass/derive-param-types
+                                     parameters (mapv :tag (:params represented)) (:dtype options) options))
+                   options (cond-> options
+                             projection (assoc :active-params parameters :public-parameters parameters
+                                               :array-types (:array-types physical-types)
+                                               :scalar-types (:scalar-types physical-types)))]
+               {:body (:body represented)
+                :options options :representation projection}))})
+         compiler-options (:frontend-options constructed)
+         source (:normalized-source constructed)
+         represented-source (:represented-source constructed)
+         phase (:prepared-phase constructed)
+         ;; Construction and storage analysis are not executable import closure.
+         ;; The finalizer must consume these exact components, not rerun ordinary
+         ;; source normalization/DCE and thereby detach their pending occurrences.
+         _ (when phase
+             (let [components (prepared-module/analyze-source-components
+                               phase (:frontend-source constructed))]
+               (fail! :unclosed-prepared-module-phase
+                      "prepared source requires complete InvocationPlan/source-owner finalization"
+                      {:function function-id :pending-inputs (count (:pending-inputs components))
+                       :allocations (count (:allocations components)) :fallback :none})))
+         ;; Keep the actual normalized admission refusal. Reanalyzing the
+         ;; original compatibility form can report already-normalized bindings
+         ;; as additional gaps and needlessly repeats source analysis.
+         semantic-attempt (pipeline/normalized-semantic-program-attempt
+                           (:frontend-source constructed) compiler-options
+                           (:physical-source constructed))
+         semantic-trace (if-let [program (:program semantic-attempt)]
+                          (pipeline/run-passes-diagnostic program [:materialize]
+                                                          compiler-options :soac-fused)
+                          {:form (:frontend-source constructed)})
+         semantic-candidate (:form semantic-trace)
          semantic (case (:dialect semantic-candidate)
                     :typed-parallel (if (get-in semantic-candidate [:attributes :invocation-plan])
                                       semantic-candidate
@@ -738,10 +809,26 @@
              (fail! :equation-first-coverage
                     "deftm is outside the direct TypedSOAC/structured-control vertical"
                     {:function (function-symbol f-var)
-                     :dialect (:dialect semantic) :fallback :none}))
+                     :dialect (:dialect semantic) :fallback :none
+                     :coverage (or (:declined semantic-attempt)
+                                   (typed-frontend/coverage-decline semantic compiler-options))}))
          semantic (cond-> semantic
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))
+         prefix-correspondence (source-prefix/close prefix-input (:normalization constructed)
+                                                    source represented-source semantic
+                                                    (:construction constructed))
+         reduction-correspondence
+         (source-prefix/close-reduction-terminal
+          reduction-input (:normalization constructed) source represented-source semantic
+          (:construction constructed))
+         ;; The conditional terminal join is not producer correspondence by itself. Only the
+         ;; closed empty producer can currently enter the connected source-owner vertical.
+         reduction-correspondence
+         (when (source-prefix/original-empty-reduction reduction-correspondence retained-frontend semantic)
+           reduction-correspondence)
+         _ (source-prefix/prepare-selected-calls! prefix-correspondence retained-frontend semantic
+                                                  rcore/ensure-current-owned-bytecode!)
          source-ns-symbol (source-namespace-symbol f-var)
          id (cond-> [::compilation (function-symbol f-var) target (:dtype compiler-options)]
               (:preserve-declared-array-storage? compiler-options)
@@ -750,6 +837,9 @@
       (merge policy
              {:id id :function-id (function-symbol f-var) :target target
               :dtype (:dtype compiler-options) :source-ns source-ns-symbol
+              :source-var resolved-var :retained-frontend retained-frontend
+              :prefix-correspondence prefix-correspondence
+              :reduction-correspondence reduction-correspondence
               :options options :compiler-options compiler-options})
       semantic))))))
 
@@ -757,37 +847,82 @@
   "Specialize a compiled equation-first program against ordered public arguments.
 
    Returns a validated, allocation-free LinkPlan. Public buffers retain their stable host source
-   identity until instantiation; scalar prefix and host-only equations execute through the same
-   typed JVM reference backend.
+   identity until instantiation. Flat source-owned scalar prefixes use their prepared original
+   executors; shared host equations reuse those results. The ownerless and aggregate reference
+   subsets retain their existing typed JVM evaluator and grant no ordered-source capability.
    Retained-validation is an internal capability path: it must be exact-owner
    static evidence. Invocation materialization and final LinkPlan validation remain fresh."
   [compilation arguments project retained-validation caller-options]
+  (stage-result/refuse-unobserved! compilation :lower-equation-compilation)
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))
   (let [started (System/nanoTime)
         source-ns (:source-ns compilation)
-        invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
+        invocation-plan (invocation/validate! (get-in compilation [:semantic :attributes :invocation-plan]))
+        _ (when (get-in invocation-plan [:attributes :terminal-host-result])
+            (fail! :explicit-host-result-required
+                   "terminal host observation requires the ordered host-result executor" {}))
+        ordered-host-actions (invocation/ordered-host-actions invocation-plan (:semantic compilation))
+        _ (when (seq ordered-host-actions)
+            (fail! :ordered-source-execution-required
+                   "host actions after numerical work require source-ordered execution, not eager materialization"
+                   {:actions (mapv #(select-keys % [:position :binding :invocation-step :equation])
+                                   ordered-host-actions)}))
+        _ (when (:ordered-source-owner compilation)
+          (source-owner/assert-ordered-compilation-source! compilation))
+        eager-context (source-owner/assert-eager-evaluation! compilation)
+        source-ns (or (:source-ns eager-context) source-ns)
+        owned-prefix
+        (when (= :owned-flat (:mode eager-context))
+          (let [initial (source-owner/begin-ordered-realization compilation arguments caller-options)]
+            ;; Qualify the whole executor set before any scalar source work.
+            ;; No missing executor may fall back after an earlier check ran.
+            (source-owner/assert-ordered-executor-coverage! compilation initial arguments)
+            initial))
         unsupported-host-evaluation
         (fn [& _]
           (fail! :equation-first-source-free-host-evaluation
                  "source-free compilation cannot evaluate a host invocation step or equation"
                  {:function (:function compilation)}))
-        evaluate-step (if source-ns
-                        (partial scalar/evaluate-invocation-step source-ns)
-                        unsupported-host-evaluation)
+        evaluate-step (cond
+                        owned-prefix (fn [step operands]
+                                       (source-owner/evaluate-ordered-invocation-step
+                                        compilation step operands (vec arguments)))
+                        source-ns (partial scalar/evaluate-invocation-step source-ns)
+                        :else unsupported-host-evaluation)
         materialized
-        (materialization/materialize
-         invocation-plan (vec arguments)
-         evaluate-step)
+        (if owned-prefix
+          (invocation-link/materialize-owned-source-prefix
+           owned-prefix evaluate-step
+           (fn [extent scalars]
+             (scalar/evaluate-array-size source-ns (update-vals scalars :value) extent))
+           caller-options)
+          (materialization/materialize invocation-plan (vec arguments) evaluate-step))
         materialization-ns (- (System/nanoTime) started)
         buffer-shapes (into {} (map (fn [[id buffer]] [id (:shape buffer)]))
                             (:program-buffers materialized))
-        evaluate-host (if source-ns
+        shared-host-steps (when owned-prefix
+                            (into {} (keep (fn [entry]
+                                            (when (and (:equation entry) (:invocation-step entry))
+                                              [(:equation entry) (:invocation-step entry)])))
+                                  (:source-order owned-prefix)))
+        evaluate-host (cond
+                        owned-prefix
+                        (fn [equation _]
+                          (source-owner/assert-ordered-compilation-source! compilation)
+                          (let [step (get shared-host-steps (:id equation))
+                                result (get-in materialized [:values step])]
+                            (when-not (and step (= 1 (count (:results equation))) result)
+                              (fail! :equation-first-owned-host-result
+                                     "owned host equation lacks its completed invocation result"
+                                     {:equation (:id equation)}))
+                            {(first (:results equation)) result}))
+                        source-ns
                         (fn [equation context]
                           (scalar/evaluate-host-equation
                            source-ns equation (assoc context :buffer-shapes buffer-shapes)))
-                        unsupported-host-evaluation)
+                        :else unsupported-host-evaluation)
         construction-started (System/nanoTime)
         projection-ns (volatile! 0)
         project (fn [plan]
@@ -802,6 +937,9 @@
                  (invocation-link/lower
                   materialized (:emitted compilation) (:target compilation)
                   evaluate-host project retained-validation caller-options))]
+    (when (:ordered-source-owner compilation)
+      (source-owner/assert-ordered-compilation-source! compilation))
+    (source-owner/assert-eager-evaluation! compilation)
     (when *lower-observer*
       (*lower-observer* {:materialization-ns materialization-ns
                          :link-plan-construction-ns

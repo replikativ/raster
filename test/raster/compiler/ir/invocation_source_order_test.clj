@@ -1,14 +1,20 @@
 (ns raster.compiler.ir.invocation-source-order-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.backend.jvm.source-owner :as owner]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.contractions :as contractions]
+            [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as auxiliary]
             [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
+            [raster.gpu.link :as gpu-link]
             [raster.par :as par]))
 
 (deftm write-before-shape
@@ -19,11 +25,33 @@
     (par/map! out i square double 1.0)
     out))
 
+(deftm shape-before-write
+  [x :- (Array double), n :- Long] :- (Array double)
+  (let [^long square (* (long n) (long n))
+        out (double-array square)]
+    (par/map! out i square double (+ (aget x i) 1.0))
+    out))
+
+(deftm write-before-checked-integral-shape
+  [x :- (Array double), first-output :- (Array double), rows :- Long, width :- Long] :- (Array double)
+  (let [written (par/map! first-output i 1 double (+ (aget x i) 1.0))
+        elements (int (* (long rows) (long width)))
+        count (int (* (long elements) (long width)))
+        out (double-array count)]
+    (par/map! out i count double (+ (aget first-output 0) 1.0))
+    out))
+
 (deftm helper-source-zero-observed
   [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
   (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
         out (arrays/zeros-like x n)
         result (par/map! out i n double (+ (aget out i) 1.0))]
+    result))
+
+(deftm write-then-functional-map
+  [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
+        result (par/map [i n] (aget x i))]
     result))
 
 (defn- compilation [v dtype]
@@ -32,6 +60,79 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest terminal-public-scalars-retain-public-provenance-not-numerical-exports
+  (let [[program plan] (compilation #'storage/public-scaled-reduction-float-roundtrip :double)
+        contract (get-in plan [:attributes :terminal-host-result])
+        context {:source-policy (:source-policy contract)
+                 :source-namespace (:source-namespace contract)
+                 :public-parameters (:parameters plan)}]
+    (is (= [{:symbol 'coefficient :dtype :double :parameter-position 0}]
+           (:public-scalar-parameters contract)))
+    (is (= (:outputs program) (:program-outputs plan) (mapv :value (:parameters contract))))
+    (is (= ['total 'coefficient] (mapv :symbol (invocation/terminal-parameters contract))))
+    (is (identical? plan (invocation/validate-against! plan program)))
+    (is (= [1.5] (owner/terminal-public-arguments contract [1.5 (double-array 0)])))
+    (doseq [arguments [[(float 1.5) (double-array 0)] [nil (double-array 0)]
+                       [1 (double-array 0)] [] (list 1.5 (double-array 0))]]
+      (is (= :terminal-source-public-arguments
+             (reason #(owner/terminal-public-arguments contract arguments)))))
+    (let [exports (atom 0)
+          executable {:execution-state
+                      (atom {:ordered {:compilation {:semantic program}
+                                       :result-mode :host-result
+                                       :arguments [(float 1.5) (double-array 0)]}})}]
+      ;; This mocks only the already-owned preflight, not an ownership proof.
+      ;; A malformed public carrier must refuse before even requesting exports.
+      (with-redefs [owner/assert-terminal-result-owner! (fn [& _] :owned)
+                    invocation-link/terminal-export-layout (fn [& _] (swap! exports inc))]
+        (is (= :terminal-source-public-arguments
+               (reason #(#'gpu-link/run-ordered-terminal! executable {}))))
+        (is (zero? @exports))))
+    (doseq [port [{:symbol 'coefficient :dtype :double :parameter-position 1}
+                 {:symbol 'coefficient :dtype :long :parameter-position 0}
+                 {:symbol 'values :dtype :double :parameter-position 1}]]
+      (is (= :invocation-terminal-correspondence
+             (reason #(invocation/validate-against!
+                       (assoc-in plan [:attributes :terminal-host-result :public-scalar-parameters] [port])
+                       program)))
+          "contract fields cannot certify their own public parameter origin"))
+    (doseq [parameters [(assoc-in (:parameters plan) [0 :value :shape] [1])
+                        (assoc-in (:parameters plan) [0 :value :dtype] :float)
+                        []]]
+      (is (contains? #{:invocation-terminal-public-carrier :invocation-terminal-free-values}
+                     (reason #(invocation/terminal-source-result program
+                                                                (assoc context :public-parameters parameters))))))
+    (is (= :invocation-terminal-public-carrier
+           (reason #(invocation/terminal-source-result
+                     (assoc program :source
+                            (let [[head bindings body] (:source program)]
+                              (list head (into bindings '[coefficient 1.5]) body))) context))))))
+
+(deftest terminal-public-port-order-preserves-original-ordinals-across-arrays
+  (let [[program plan] (compilation #'storage/public-affine-reduction-float-roundtrip :double)
+        contract (get-in plan [:attributes :terminal-host-result])]
+    (is (= [{:symbol 'offset :dtype :long :parameter-position 0}
+            {:symbol 'coefficient :dtype :double :parameter-position 2}]
+           (:public-scalar-parameters contract)))
+    (is (= [7 1.5] (owner/terminal-public-arguments contract [7 (double-array 0) 1.5])))
+    (is (= ['total 'offset 'coefficient] (mapv :symbol (invocation/terminal-parameters contract))))
+    (is (= :terminal-source-public-arguments
+           (reason #(owner/terminal-public-arguments contract [7.0 (double-array 0) 1.5]))))
+    (is (identical? plan (invocation/validate-against! plan program)))))
+
+(deftest prefix-source-ownership-is-distinct-from-late-routing
+  (let [[program plan] (compilation #'shape-before-write :double)
+        all (invocation/source-host-actions plan program)]
+    (is (some #(= 'square (:binding %)) all))
+    (is (empty? (invocation/ordered-host-actions plan program)))
+    (is (= all (invocation/source-host-actions
+                (assoc-in plan [:attributes :host-actions] []) program))
+        "caller-provided action lists cannot remove the reconstructed obligation")
+    (is (= :invocation-source-order-mismatch
+           (reason #(invocation/source-host-actions
+                     (assoc-in plan [:attributes :source-order]
+                               (vec (reverse (invocation/source-order plan program)))) program))))))
 
 (deftest helper-allocation-correspondence-is-retained-and-independently-rederived
   (let [[program plan] (compilation #'helper-source-zero-observed :double)
@@ -49,6 +150,20 @@
                                'unrelated/constructor)]]
       (is (= :invocation-source-step-mismatch (reason #(invocation/source-order changed program)))))))
 
+(deftest literal-helper-allocation-retains-an-independent-source-witness
+  (let [compiled (equation-first/compile #'storage/double-fold-float-storage
+                                        (merge storage/policy {:target :ocl:0 :dtype :double}))
+        program (:semantic compiled)
+        plan (get-in program [:attributes :invocation-plan])
+        allocation (first (get-in program [:attributes :allocations]))]
+    (is (= '(clojure.core/float-array 1) (get-in allocation [:source-projection :constructor])))
+    (is (vector? (invocation/source-order plan program)))
+    (doseq [changed [(assoc-in program [:attributes :allocations 0 :initialization] :unspecified)
+                     (update-in program [:attributes :allocations 0] dissoc :source-projection)
+                     (assoc-in program [:attributes :allocations 0 :source-projection :constructor]
+                               '(clojure.core/float-array 2))]]
+      (is (= :invocation-source-allocation (reason #(invocation/source-order plan changed)))))))
+
 (deftest source-position-is-not-the-dependency-pruned-prefix-ordinal
   (let [[program plan] (compilation #'write-before-shape :double)
         order (invocation/source-order plan program)
@@ -63,6 +178,97 @@
     (is (some? (:equation square)) "one host definition has two representations")
     (is (= (mapv :id (:equations program)) (into [] (keep :equation) order)))
     (is (= (count (:steps plan)) (count (keep :invocation-step order))))))
+
+(deftest eager-lowering-cannot-run-a-late-checked-source-action
+  (let [compilation (equation-first/compile #'write-before-shape {:target :ocl:0 :dtype :double})
+        program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        actions (invocation/ordered-host-actions plan program)
+        materializations (atom 0)
+        first-output (double-array [0.0])]
+    (is (some #(= 'square (:binding %)) actions))
+    (is (every? #(pos? (:position %)) actions))
+    (with-redefs [materialization/materialize
+                  (fn [& _] (swap! materializations inc)
+                    (throw (AssertionError. "late host calculation reached eager materialization")))]
+      (is (= :ordered-source-execution-required
+             (reason #(equation-first/lower compilation
+                                            [(double-array [1.0]) first-output Long/MAX_VALUE])))))
+    (is (zero? @materializations))
+    (is (= [0.0] (vec first-output)))
+    ;; Independent source oracle: the write happens BEFORE checked overflow.
+    ;; The eager path must neither execute the overflow early nor claim success.
+    (is (thrown? ArithmeticException
+                 (write-before-shape (double-array [1.0]) first-output Long/MAX_VALUE)))
+    (is (= [2.0] (vec first-output)))
+    (let [changed (assoc-in plan [:attributes :source-order]
+                            (vec (reverse (invocation/source-order plan program))))]
+      (is (= :invocation-source-order-mismatch
+             (reason #(invocation/ordered-host-actions changed program)))))))
+
+(deftest late-integral-checks-remain-owned-host-actions
+  (let [compiled (equation-first/compile #'write-before-checked-integral-shape {:target :ocl:0 :dtype :double})
+        program (:semantic compiled)
+        plan (get-in program [:attributes :invocation-plan])
+        actions (invocation/ordered-host-actions plan program)
+        host-bindings (set (map :binding actions))
+        output (double-array 1)
+        called (atom 0)]
+    (is (contains? host-bindings 'elements))
+    (is (contains? host-bindings 'count) "transitive host dependency remains at its own source site")
+    (is (not-any? #(some #{'elements} (:results %)) (:equations program))
+        "the newly retained checked computation is not numerical ScalarIR")
+    (is (every? #(true? (get-in % [:attributes :host-only]))
+                (filter #(some #{'count} (:results %)) (:equations program))))
+    (is (some? (:ordered-source-owner compiled)))
+    (with-redefs-fn {#'frontend/retain-host-input-scalars (fn [descriptions _ _] descriptions)}
+      (fn []
+        (is (= :equation-first-coverage
+               (reason #(equation-first/compile #'write-before-checked-integral-shape
+                                                {:target :ocl:0 :dtype :double}))))))
+    (is (identical? plan (invocation/validate-against! plan program)))
+    (with-redefs [materialization/materialize (fn [& _] (swap! called inc))]
+      (is (= :ordered-source-execution-required
+             (reason #(equation-first/lower compiled [(double-array [7.0]) output Long/MAX_VALUE 2])))))
+    (is (zero? @called))
+    (is (= [0.0] (vec output)))
+    (is (thrown? ArithmeticException
+                 (write-before-checked-integral-shape (double-array [7.0]) output Long/MAX_VALUE 2)))
+    (is (= [8.0] (vec output)))))
+
+(deftest late-source-allocation-still-requires-ordered-execution
+  (let [compilation (equation-first/compile #'helper-source-zero-observed
+                                           {:target :ocl:0 :dtype :double})
+        program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        allocations (filter :storage (invocation/ordered-host-actions plan program))
+        first-output (double-array [0.0])
+        materializations (atom 0)]
+    (is (some #(= 'out (:binding %)) allocations))
+    (with-redefs [materialization/materialize
+                  (fn [& _] (swap! materializations inc)
+                    (throw (AssertionError. "late source allocation reached eager materialization")))]
+      (is (= :ordered-source-execution-required
+             (reason #(equation-first/lower compilation
+                                            [(double-array [1.0]) first-output -1])))))
+    (is (zero? @materializations))
+    (is (= [0.0] (vec first-output)))
+    (is (thrown? NegativeArraySizeException
+                 (helper-source-zero-observed (double-array [1.0]) first-output -1)))
+    (is (= [2.0] (vec first-output)))))
+
+(deftest generated-result-allocation-without-a-host-step-is-an-ordering-obligation
+  (let [compilation (equation-first/compile #'write-then-functional-map
+                                           {:target :ocl:0 :dtype :double})
+        program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        actions (invocation/ordered-host-actions plan program)
+        generated (filter #(and (:realization %) (nil? (:invocation-step %))) actions)]
+    (is (seq generated))
+    (is (every? #(= :result-allocation (:kind (source/realization-action program %))) generated))
+    (is (= :ordered-source-execution-required
+           (reason #(equation-first/lower compilation
+                                          [(double-array [1.0]) (double-array 1) 1]))))))
 
 (deftest source-order-attests-typed-producers-not-just-local-names
   (let [[program plan] (compilation #'write-before-shape :double)

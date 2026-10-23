@@ -10,18 +10,22 @@
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.passes.parallel.staged-contraction-admission :as staged-admission]
             [raster.compiler.passes.parallel.staged-scalar-body :as scalar-stage-body]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.ir.index-algebra :as index-algebra]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -33,7 +37,8 @@
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
-            [raster.compiler.passes.scalar.effects :as effects]))
+            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]))
 
 (defn- fail!
   [reason message data]
@@ -227,6 +232,10 @@
       (when (symbol? expression) (some-> (get scalar-types expression) dtype/canon))
       (when (descriptor/aget-call? expression)
         (some-> (get array-types (descriptor/aget-array-sym expression)) dtype/canon))
+      ;; A canonical Fold declares its invariant accumulator dtype. Its own
+      ;; validator checks the recurrence; a consumer cannot retype that carry.
+      (when (dialect/scalar-fold-form? expression)
+        (some-> expression dialect/scalar-fold-parts :attributes :dtype dtype/canon))
       ;; A value conditional owns a result dtype exactly when both exits independently own the
       ;; same dtype.  TypedClojure commonly retains the branch facts without tagging the `if`
       ;; node itself, so preserve that join here rather than borrowing the surrounding map/store
@@ -314,10 +323,8 @@
           target-dtype (some-> target-dtype dtype/canon)
           source-op (descriptor/semantic-op (list cast expression))
           source-op (when source-op (symbol "clojure.core" (name source-op)))
-          narrowing (descriptor/cast-integral-narrowing source-op)
-          requested (case narrowing :reject :trap :wrap :wrap nil)
-          policy (when (and source-dtype target-dtype requested)
-                   (scalar-conversion/policy source-dtype target-dtype requested))]
+          policy (when (and source-dtype target-dtype)
+                   (scalar-conversion/source-policy source-dtype target-dtype source-op))]
       (when (and policy
                  (= target-dtype
                     (some-> source-op descriptor/cast-result-tag
@@ -3042,6 +3049,10 @@
           (set/difference (util/free-syms init) (:inputs io)
                           (set [symbol acc idx]) descriptor/aget-ops descriptor/aset-ops)]
       (merge {:kind :reduce :id id :sym symbol :results [symbol] :index idx :extent bound
+              ;; Diagnostic correspondence retains the constructor's own inputs,
+              ;; not an inferred physical return carrier or an admission witness.
+              :source-expression expression
+              :source-array-types (select-keys array-types (:inputs io))
               :product (reduction/scalar
                         ;; Explicit contextual narrowing wins; otherwise the accumulator's
                         ;; retained initializer/binder type owns its carrier, not kernel dtype.
@@ -3259,10 +3270,21 @@
        (or (= :pure (effects/analyze-effect expression))
            (symbol? (alength-array expression)))))
 
+(defn- requires-evaluation?
+  [expression]
+  (boolean (seq (:flags (effects/descriptor expression)))))
+
 (defn- requires-ordered-evaluation?
   [expression]
-  (boolean (some #{:checked-source-cast :source-reference-cast}
-                 (:flags (effects/descriptor expression)))))
+  (let [flags (:flags (effects/descriptor expression))]
+    (boolean
+     (or (seq (disj flags :preserve-source-evaluation))
+         (and (contains? flags :preserve-source-evaluation)
+              ;; Retain the evaluation itself, but a proved closed, pure,
+              ;; nonthrowing source constant has no ordering observation.
+              ;; Canonical IEEE constant evidence is NOT enough: source float
+              ;; narrowing can throw where an IEEE storage cast returns infinity.
+              (nil? (numeric-constant/source-value expression)))))))
 
 (defn- parallel-extent
   [expression]
@@ -3918,16 +3940,56 @@
                (meta expression)))))))
    expression))
 
-(defn- nested-scalar-reductions
-  "Return scalar reductions nested inside an expression, without entering a reduction body."
+(declare contains-parallel-form?)
+
+(def ^:dynamic ^:private *normalization-source-ns* nil)
+(def ^:dynamic ^:private *normalization-observer* nil)
+
+(defn- observe-normalization!
+  [stage original constructed & [details]]
+  (when *normalization-observer*
+    (*normalization-observer*
+     (merge details {:stage stage :original original :constructed constructed})))
+  constructed)
+
+(defn- original-inline-core-call?
   [expression]
-  (letfn [(sites [value]
-            (cond
-              (par/par-reduce-form? value) [value]
-              (seq? value) (mapcat sites value)
-              (vector? value) (mapcat sites value)
-              :else []))]
-    (vec (sites expression))))
+  (let [operation (first expression)]
+    (and (symbol? operation)
+         *normalization-source-ns*
+         (= "clojure.core" (namespace operation))
+         (descriptor/scalar-op? operation)
+         (not (contains? util/*shadowing-locals* operation))
+         (let [v (ns-resolve *normalization-source-ns* operation)]
+           (and (var? v) (:inline (meta v))
+                (try
+                  (intrinsic-source/assert-original!
+                   v operation :intrinsic-source-definition-mismatch)
+                  (when entry/*emission-inputs*
+                    (intrinsic-source/observe-original! *normalization-source-ns* operation))
+                  true
+                  (catch clojure.lang.ExceptionInfo _ false)))))))
+
+(defn- first-strict-scalar-reduction
+  "Find a reduction only along the first operand of original inline core calls.
+   This is an evaluation context, not a tree search: control/binding/quoted scopes,
+   collections, computed callees and later operands are not unconditional prefixes.
+   The replacement closure rebuilds precisely that occurrence, preserving metadata."
+  [expression]
+  (cond
+    (par/par-reduce-form? expression) {:reduction expression :replace identity}
+    (and (seq? expression)
+         (not (form/scope-info expression))
+         (not (:raster.op/lexical-callee (meta expression)))
+         (original-inline-core-call? expression))
+    (let [position 1]
+      (when (< position (count expression))
+        (when-let [{:keys [reduction replace]}
+                   (first-strict-scalar-reduction (nth expression position))]
+          {:reduction reduction
+           :replace #(util/remake-from expression
+                                       (assoc (vec expression) position (replace %)))})))
+    :else nil))
 
 (defn- lift-nested-scalar-reductions
   "Give a single nested scalar reduction its own SSA binding.
@@ -3935,35 +3997,53 @@
    TypedSOAC already fuses an adjacent pure scalar equation into a reduction result-transform,
    but analyzed Clojure can retain `(scalar-op (reduce ...))` as one initializer.  Lifting that
    value exposes the existing algebra without teaching the frontend about individual scalar
-   functions.  The surrounding expression must be removable after substitution, may not read
-   mutable array storage, and the reduction must carry its walker-provided result type."
+   functions. Extraction follows only an authenticated strict first-operand context: selected
+   helper calls need their own call-context proof and are deliberately not traversed. The
+   surrounding expression must be externally pure after substitution, may not read mutable
+   array storage, and the reduction must carry its walker-provided result type. This is not
+   erasure or fusion permission: metadata and exceptional completion obligations remain on
+   the rebuilt scalar binding for the ordinary admission and scheduling checks."
   [source]
   (if-not (and (seq? source) (contains? #{'let 'let*} (first source)))
     source
     (let [[head bindings & body] source
           pairs (partition 2 bindings)
-          lifted
-          (mapcat
-           (fn [[symbol expression]]
-             (let [sites (nested-scalar-reductions expression)]
-               (if (and (= 1 (count sites))
-                        (not (par/par-reduce-form? expression)))
-                 (let [reduction (first sites)
-                       reduction-tag (types/sym-type-tag reduction)
+          {:keys [lifted splits]}
+          (reduce
+           (fn [{:keys [lifted] :as state} [ordinal [symbol expression]]]
+             (let [{:keys [reduction replace]} (first-strict-scalar-reduction expression)]
+               (if (and reduction (not (par/par-reduce-form? expression)))
+                 (let [reduction-tag (types/sym-type-tag reduction)
                        value-id (with-meta (gensym "rstr_reduction_value_")
                                   (cond-> {}
                                     reduction-tag
                                     (assoc :tag reduction-tag :raster.type/tag reduction-tag)))
-                       outer (walk/postwalk #(if (= % reduction) value-id %) expression)]
+                       outer (replace value-id)]
                    (if (and reduction-tag
-                            (effects/removable-expr? outer)
+                            (= :pure (effects/analyze-effect outer))
                             (empty? (par/collect-aget-arrays outer))
-                            (empty? (nested-scalar-reductions outer)))
-                     [[value-id reduction] [symbol outer]]
-                     [[symbol expression]]))
-                 [[symbol expression]])))
-           pairs)]
-      (with-meta (list* head (vec (mapcat identity lifted)) body) (meta source)))))
+                            (not (contains-parallel-form? outer)))
+                     (let [bindings [[value-id reduction] [symbol outer]]]
+                       (cond-> (update state :lifted into bindings)
+                         *normalization-observer*
+                         (update :splits conj
+                                 {:scope source :binding-index ordinal :destination symbol
+                                  :original expression :constructed outer
+                                  :reduction reduction :result value-id :bindings bindings
+                                  :output-binding-index (count lifted)
+                                  :context :strict-first-operand :reduction-tag reduction-tag
+                                  :continuation-effect :pure
+                                  :continuation-flags (:flags (effects/descriptor outer))
+                                  :array-reads #{} :nested-parallel? false})))
+                     (update state :lifted conj [symbol expression])))
+                 (update state :lifted conj [symbol expression]))))
+           {:lifted [] :splits []}
+           (map-indexed vector pairs))
+          constructed (with-meta (list* head (vec (mapcat identity lifted)) body) (meta source))]
+      (doseq [event splits]
+        (observe-normalization! :reduction-split (:original event) (:constructed event)
+                                (assoc event :output-scope constructed)))
+      (observe-normalization! :lift-scalar-reductions source constructed))))
 
 (defn- erase-array-type-witnesses
   "Replace a pure array `oftype` witness with its declared element conversion.
@@ -3990,35 +4070,55 @@
                         :long 'clojure.core/long
                         :int 'clojure.core/int} element)]
          (if (and cast (= result element))
-           (with-meta (list cast value)
-             (-> (meta expression)
-                 (dissoc :raster.op/original)
-                 (assoc :tag (symbol (name element))
-                        :raster.type/tag (symbol (name element)))))
+           (observe-normalization!
+            :array-type-witness-rewrite expression
+            (with-meta (list cast value)
+              (-> (meta expression)
+                  (dissoc :raster.op/original)
+                  (assoc :tag (symbol (name element))
+                         :raster.type/tag (symbol (name element)))))
+            {:witness witness :value value :element-dtype element :result-dtype result
+             :cast cast :declared-array? true
+             :dtype-source (if (get array-types witness) :array-types :retained-tag)})
            expression))
        expression))
-   source))
+   source
+   (when *normalization-observer*
+     (fn [original constructed]
+       (observe-normalization! :array-type-witness original constructed)))))
 
-(defn- normalize-source*
-  [source array-types scalar-types]
+(defn- normalize-value-source*
+  [source array-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
-  (let [source (util/uniquify-rebindings (util/free-syms source) source)
+  (let [source (observe-normalization!
+                :uniquify-root source
+                (util/uniquify-rebindings
+                 (util/free-syms source) source
+                 (when *normalization-observer*
+                   (fn [original constructed renaming bound]
+                     (observe-normalization! :uniquify original constructed
+                                             {:renaming renaming :bound bound})))))
         ;; A locally bound scalar can reuse a public array's name. Only free array
         ;; parameters may borrow the entry type; local arrays need their own tag.
         public-array-types (select-keys array-types (util/free-syms source))
-        source (-> source
-                   (erase-array-type-witnesses public-array-types)
-                   lift-nested-scalar-reductions)]
+        source (observe-normalization! :array-type-witness-root source
+                                        (erase-array-type-witnesses source public-array-types))
+        source (lift-nested-scalar-reductions source)]
+    source))
+
+(defn- normalize-source*
+  [source array-types scalar-types]
+  (let [source (normalize-value-source* source array-types)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
             occupied-symbols (set (filter symbol? (tree-seq coll? seq source)))
-            {:keys [normalized]}
-            (reduce
+            origins (when *normalization-observer* (volatile! []))
+            step
              (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
                          local-scalar-types buffer-aliases]
                    :as state}
@@ -4261,10 +4361,42 @@
 
                    :else
                    (update state :normalized conj [symbol expression]))))
+            {:keys [normalized]}
+            (reduce
+             (if-not origins step
+               (fn [state [ordinal pair :as input]]
+                 (let [prefix (:normalized state)
+                       start (count prefix)
+                       next-state (step state input)
+                       output (:normalized next-state)]
+                   (when-not (<= start (count output))
+                     (fail! :raster/bug "normalization origin recorder lost its output prefix"
+                            {:input-index ordinal}))
+                   (vswap! origins conj
+                           {:input-index ordinal :input-binding pair
+                            :outputs (mapv (fn [index binding]
+                                             {:index index :binding binding
+                                              :origin (if (identical? (first pair) (first binding))
+                                                        :source-binding :derived-normalization-binding)})
+                                           (range start (count output)) (subvec output start))})
+                   next-state)))
              {:normalized [] :compound-extents {} :checked-extents {} :allocation-lengths {}
               :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
-             (map-indexed vector pairs))]
-        (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
+             (map-indexed vector pairs))
+            constructed (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source))]
+        (if origins
+          (let [recorded (into [] (mapcat :outputs) @origins)]
+            ;; Check the persistent pair objects once at the end, rather than
+            ;; rescanning every prefix at every binding (quadratic capture).
+            (when-not (and (= (count recorded) (count normalized))
+                           (every? true?
+                                   (map-indexed (fn [index output]
+                                                  (and (= index (:index output))
+                                                       (identical? (:binding output) (nth normalized index))))
+                                                recorded)))
+              (fail! :raster/bug "normalization origins do not cover the final binding spine" {}))
+            (observe-normalization! :normalize-binding-spine source constructed {:entries @origins}))
+          constructed))
       source)))
 
 (defn- alength-array
@@ -4287,7 +4419,8 @@
     (fn [{:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
                  before-parallel?] :as state}
          [id [symbol expression]]]
-      (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
+      (let [source-binding [symbol expression]
+            expression (retain-free-scalar-reference-types expression local-scalar-types)
             description
             (or (when (or segmented-plans? (not (swr-fuse/marker? expression)))
                   (binding [*scalar-definitions* scalar-definitions]
@@ -4297,6 +4430,11 @@
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
             description (assoc description
+                               ;; Preserve the actual normalized inputs before
+                               ;; metadata-only scalar-reference elaboration.
+                               ;; A later importer must not rediscover this
+                               ;; occurrence from equality or the new metadata.
+                               :source-binding source-binding
                                :source-prefix? stageable-prefix?
                                ;; Distinct from `source-prefix?`: a host allocation or other
                                ;; non-stageable host binding prevents scalar hoisting, but it does
@@ -4582,11 +4720,13 @@
            ;; parallel equation (for example a checked source cast after an
            ;; allocation) is a valid host boundary: retaining it at its source
            ;; position preserves exceptional control transfer. Once device work has
-           ;; occurred, the same scalar remains a decline until the graph represents
-           ;; the required device-to-host sequencing explicitly.
+           ;; occurred, device-dependent exceptional scalars remain a decline.
+           ;; The separate public-scalar dependency closure may retain a host-only
+           ;; integral computation, but never moves its original source position.
            (not (contains-parallel-form? (:expr description)))
            (or (not (requires-ordered-evaluation? (:expr description)))
-               (and (:before-parallel? description)
+               (and (or (:before-parallel? description)
+                        (:host-input-scalar? description))
                     ;; This value becomes a typed input of the following island. Its
                     ;; source declaration/metadata must therefore attest the ABI; the
                     ;; extent use is not permission to guess `long`.
@@ -4596,6 +4736,40 @@
   [descriptions]
   (let [physical-outputs (physical-output-symbols descriptions)]
     (every? #(admitted-description? physical-outputs %) descriptions)))
+
+(defn- retain-host-input-scalars
+  "Retain integral computations over declared public scalars as ordered HOST boundaries.
+   Dependency closure is not a completion/carrier proof or permission to hoist. A late
+   checked computation stays opaque to numerical ScalarIR and needs the existing source
+   owner/executor at its original position. Local type hints cannot seed this closure."
+  [descriptions scalar-types public-parameters]
+  (:descriptions
+   (reduce
+    (fn [{:keys [available host-types] :as state} {:keys [kind sym expr scalar-dtype] :as description}]
+      (let [host? (and (= :scalar kind)
+                       (contains? #{:int :long} scalar-dtype)
+                       ;; A stale public/local declaration on a shadowed binder
+                       ;; cannot turn a Double initializer into an integral port.
+                       (= scalar-dtype (some-> (retained-scalar-dtype expr host-types) dtype/canon))
+                       (ordered-scalar-expression? expr)
+                       (not (contains? (:flags (effects/descriptor expr)) :unclosed-source-obligations))
+                       (set/subset? (util/free-syms expr) available)
+                       (not-any? #(and (seq? %)
+                                       (or (par/par-form? %)
+                                           (descriptor/aget-op? (descriptor/semantic-op %))
+                                           (descriptor/alength-op? (descriptor/semantic-op %))))
+                                 (tree-seq coll? seq expr)))]
+        (-> state
+            (update :descriptions conj (cond-> description host? (assoc :host-input-scalar? true)))
+            ;; Every binder shadows the old identity, including parallel results
+            ;; and declarations that still carry an integral hint.
+            (assoc :available (cond-> (disj available sym) host? (conj sym))
+                   :host-types (cond-> (dissoc host-types sym) host? (assoc sym scalar-dtype))))))
+    {:descriptions []
+     :available (into #{} (filter #(contains? #{:int :long} (get scalar-types %)))
+                      public-parameters)
+     :host-types (select-keys scalar-types public-parameters)}
+    descriptions)))
 
 (defn- copy-allocation-source
   [expression]
@@ -4648,32 +4822,68 @@
         (meta source)))
     source))
 
+(defn- call-with-normalization-context
+  [source {:keys [array-types scalar-types source-ns]} observe! normalize]
+  ;; Keep runtime-safe and device projections under the same lexical/type
+  ;; environment. In particular, a local scalar may shadow a public array.
+  (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
+                  (filter symbol? (take-nth 2 (second source))))
+        tagged (fn [kind?]
+                 (set (filter #(kind? (types/sym-type-tag %)) binders)))]
+    (binding [*normalization-observer* observe!
+              util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
+              *normalization-source-ns* (cond
+                                         (instance? clojure.lang.Namespace source-ns) source-ns
+                                         (symbol? source-ns) (find-ns source-ns))
+              *region-local-counter* (atom -1)
+              *region-local-source-symbols* (source-symbols source)
+              *declared-kinds*
+              {:arrays (into (set (keys array-types))
+                             (tagged #(some? (dtype/dtype-for-array-tag %))))
+               :scalars (into (set (keys scalar-types))
+                              (tagged #(contains? #{:long :int}
+                                                  (some-> % dtype/dtype-for-scalar-tag
+                                                          dtype/canon))))}]
+      (normalize))))
+
+(defn normalize-value-source
+  "Canonical value-binding prefix shared by runtime program construction and TypedSOAC.
+
+   Performs lexical uniquification, proven array-type witness conversion and
+   strict scalar-reduction lifting only. Does not expose copies as device maps,
+   rewrite allocations, alias buffers or insert device extent bindings. This
+   constructs a NEW program before emission; it does not establish equivalence
+   to a previously emitted body or grant device admission. Completion wrappers
+   remain explicit. Options and constructor observations match normalize-source."
+  ([source] (normalize-value-source source {}))
+  ([source options] (normalize-value-source source options nil))
+  ([source options observe!]
+   (call-with-normalization-context
+    source options observe!
+    #(observe-normalization! :normalize-value-source source
+                             (normalize-value-source* source (:array-types options))))))
+
 (defn normalize-source
   "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
 
    TypedSOAC operations name extents; executable host expressions never leak into schedule fields.
    This normalization inserts an ordinary typed scalar binding immediately before its operation,
-   so the same expression remains visible to JVM materialization and runtime specialization."
+   so the same expression remains visible to JVM materialization and runtime specialization.
+   The optional third argument observes compiler-local constructors only. Notices
+   grant no ownership, semantic equivalence or admission. Seq/vector events are
+   ordered; map/set child traversal is not a source evaluation-order contract.
+   A caller must seal and validate complete correspondence under its own module
+   owner; changed untraced stages remain unclosed. Nested calls own their observer."
   ([source] (normalize-source source {}))
-  ([source {:keys [array-types scalar-types]}]
-   ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
-   ;; binder an array, exactly as the walker stamps them.
-   (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
-                   (filter symbol? (take-nth 2 (second source))))
-         tagged (fn [kind?]
-                  (set (filter #(kind? (types/sym-type-tag %)) binders)))]
-     (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
-               *region-local-counter* (atom -1)
-               *region-local-source-symbols* (source-symbols source)
-               *declared-kinds*
-               {:arrays (into (set (keys array-types))
-                              (tagged #(some? (dtype/dtype-for-array-tag %))))
-                :scalars (into (set (keys scalar-types))
-                               (tagged #(contains? #{:long :int}
-                                                   (some-> % dtype/dtype-for-scalar-tag
-                                                           dtype/canon))))}]
-       (normalize-source* (copy-allocations->maps source array-types)
-                          array-types scalar-types)))))
+  ([source options] (normalize-source source options nil))
+  ([source {:keys [array-types scalar-types] :as options} observe!]
+   (call-with-normalization-context
+    source options observe!
+    #(observe-normalization!
+      :normalize-source source
+      (normalize-source*
+       (observe-normalization! :copy-allocations source (copy-allocations->maps source array-types))
+       array-types scalar-types)))))
 
 (declare coverage-decline*)
 
@@ -4690,38 +4900,62 @@
     (coverage-decline* source options)))
 
 (defn- coverage-decline*
-  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage?]
+  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage? source-ns public-parameters]
            :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          descriptions (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
-                                          shape-equalities values)
+          descriptions (retain-host-input-scalars
+                        (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
+                                           shape-equalities values)
+                        scalar-types public-parameters)
           physical-outputs (physical-output-symbols descriptions)
           declined (remove #(admitted-description? physical-outputs %) descriptions)
           parallel? (some #(not= :scalar (:kind %)) descriptions)]
       (when (and parallel? (seq declined))
-        {:reason :typed-soac-source-coverage
-         :bindings
-         (mapv (fn [{:keys [id sym kind expr]}]
-                 {:id id
-                  :binding sym
-                  :kind kind
-                  :operation (when (seq? expr) (descriptor/semantic-op expr))
-                  :reason (case kind
-                            :unsupported :unsupported-parallel-operation
-                            :scalar :uncertified-host-scalar
-                            :map :unverified-map-effects
-                            :scatter :unverified-scatter-conflict
-                            :effect-map :unverified-ordered-effects
-                            :stencil :unverified-stencil-storage
-                            :segmented-reduce :unverified-segmented-reduction
-                            :product-reduce :unverified-product-reduction
-                            :segmented-fold-map :unverified-segmented-fold-map
-                            :scan :unverified-scan-storage
-                            :unverified-operation-contract)})
-               declined)}))))
+        ;; Only diagnose a refused source. These are normal-completion facts,
+        ;; not admission evidence, and no logical scalar tags seed the scope.
+        (let [completed (normal-return/completed-scalar-bindings
+                         (mapv (juxt :sym :expr) descriptions) {} source-ns)
+              correspondence
+              (into []
+                    (keep (fn [{:keys [id sym kind product source-expression source-array-types]}]
+                            (when (= :reduce kind)
+                              (when-let [proof (scalar-body/check-reduction-fp-correspondence
+                                                source-expression product
+                                                {:source-ns source-ns :array-types source-array-types})]
+                                {:id id :binding sym :value-correspondence proof}))))
+                    descriptions)]
+          (cond-> {:reason :typed-soac-source-coverage
+           :bindings
+           (mapv (fn [{:keys [id sym kind expr]}]
+                   (cond-> {:id id
+                            :binding sym
+                            :kind kind
+                            :operation (when (seq? expr) (descriptor/semantic-op expr))
+                            :reason (case kind
+                                      :unsupported :unsupported-parallel-operation
+                                      :scalar :uncertified-host-scalar
+                                      :map :unverified-map-effects
+                                      :scatter :unverified-scatter-conflict
+                                      :effect-map :unverified-ordered-effects
+                                      :stencil :unverified-stencil-storage
+                                      :segmented-reduce :unverified-segmented-reduction
+                                      :product-reduce :unverified-product-reduction
+                                      :segmented-fold-map :unverified-segmented-fold-map
+                                      :scan :unverified-scan-storage
+                                      :unverified-operation-contract)}
+                     (= :scalar kind)
+                     (assoc :source-evaluation-flags (:flags (effects/descriptor expr))
+                            :source (select-keys (meta expr) [:file :line :column])
+                            :normal-completion
+                            (when-let [fact (get completed sym)]
+                              (into {} (map (fn [[key value]]
+                                              [key (if (class? value) (.getName ^Class value) value)]))
+                                    fact)))))
+                 declined)}
+            (seq correspondence) (assoc :reduction-value-correspondences correspondence)))))))
 
 (defn- element-symbols [n] (mapv #(symbol (str "%element" %)) (range n)))
 (defn- capture-symbols [n] (mapv #(symbol (str "%capture" %)) (range n)))
@@ -4842,9 +5076,15 @@
              (not (contains? util/*shadowing-locals* (first expression))))
       (let [operand (second expression)
             source-dtype (retained-expression-dtype operand {} {})
-            canonical (canonicalize-scalar-folds operand (or source-dtype default-dtype))]
-        (if (= canonical operand) expression
-            (util/remake expression (first expression) canonical)))
+            canonical (canonicalize-scalar-folds operand (or source-dtype default-dtype))
+            target-dtype (some-> (first expression) descriptor/cast-result-tag
+                                dtype/dtype-for-scalar-tag dtype/canon)]
+        ;; Record the source conversion AFTER constructing the typed recurrence.
+        ;; The fold's dtype, never its storage consumer, owns the source side.
+        ;; Unknown source types retain the original cast and still fail closed.
+        (or (typed-source-conversion (first expression) canonical source-dtype target-dtype)
+            (if (= canonical operand) expression
+                (util/remake expression (first expression) canonical))))
       ;; `loop*` is a surface spelling, not part of canonical TypedSOAC. Translate only a complete
       ;; scalar initializer/result here: descending beneath an enclosing `let*` would detach the
       ;; Fold from those lexical binders. Unlike `raster.par/reduce`, a Clojure recurrence promises
@@ -5470,13 +5710,13 @@
         ;; The ordinary dependency closure below keeps this independent of allocation spelling.
         allocation-capacity-roots
         (allocation-capacity-scalars descriptions physical-outputs by-symbol)
-        ordered-evaluation-roots
+        retained-evaluation-roots
         (into #{} (keep (fn [[symbol description]]
-                          (when (requires-ordered-evaluation? (:expr description)) symbol)))
+                          (when (requires-evaluation? (:expr description)) symbol)))
               by-symbol)
         roots (set (concat outputs
                            allocation-capacity-roots
-                           ordered-evaluation-roots
+                           retained-evaluation-roots
                            semantic-scalar-roots
                            (mapcat (fn [equation]
                                      (into (dialect/operation-inputs equation)
@@ -5815,7 +6055,7 @@
    and derives the generated binding dtype only from that description. Unsupported returns remain
    unchanged so complete-source validation keeps its existing refusal boundary."
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
-                  preserve-declared-array-storage?]
+                  preserve-declared-array-storage? public-parameters]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source))
              (= 1 (count (drop 2 source))))
@@ -5832,7 +6072,7 @@
                   describe (fn [pairs]
                              (:descriptions
                               (source-storage-analysis pairs dtype array-types scalar-types
-                                                       segmented-plans? values shape-equalities)))
+                                                       segmented-plans? values shape-equalities public-parameters)))
                   descriptions (describe pairs)
                   physical-outputs (physical-output-symbols descriptions)
                   dependencies (set (util/free-syms expression))
@@ -5879,7 +6119,9 @@
   "Allocation leaves the equation spine as host scaffolding, but initialization is semantic.
    Supported constructor arity and positive scalar-kind evidence distinguish a length from a
    copy input; (float-array n 7), for example, must never become a zero-initialization fact."
-  [descriptions array-types scalar-types values shape-equalities]
+  ([descriptions array-types scalar-types values shape-equalities]
+   (allocation-contracts descriptions array-types scalar-types values shape-equalities {}))
+  ([descriptions array-types scalar-types values shape-equalities carrier-facts]
   (binding [*declared-kinds*
             {:arrays (set (keys array-types))
              :scalars (into (set (keys scalar-types))
@@ -5888,46 +6130,207 @@
     (into []
           (keep (fn [{:keys [kind id sym expr]}]
                   (when (= :scalar kind)
-                    (when-let [extent (allocation-length expr)]
-                      {:destination sym :source-binding-id id
-                       :source-expression expr
-                       :extent (canonical-extent shape-equalities values extent)
-                       :initialization (descriptor/allocation-initialization
-                                        (descriptor/semantic-op expr))
-                       :dtype (or (:dtype (get values sym))
-                                  (declared-type array-types sym))}))))
-          descriptions)))
+                    (let [projection (descriptor/direct-allocation-projection expr values carrier-facts)
+                          constructor (:constructor projection)
+                          helper-extent (when (:helper projection)
+                                          (descriptor/array-allocation-size constructor))
+                          core-extent (descriptor/array-allocation-size expr)
+                          ;; Only an authenticated core constructor (direct or
+                          ;; definition-projected) supplies this result type.
+                          constructor-dtype
+                          (some-> (or constructor (when core-extent expr)) first
+                                  descriptor/alloc-sym->array-tag dtype/dtype-for-array-tag)
+                          retained-dtype (or (:dtype (get values sym)) (declared-type array-types sym))
+                          _ (when (and constructor-dtype retained-dtype
+                                       (not= (dtype/canon constructor-dtype) (dtype/canon retained-dtype)))
+                              (fail! :source-value-conflict "allocation constructor and retained element type disagree"
+                                     {:id sym :constructor constructor-dtype :retained retained-dtype}))
+                          ;; aclone is an exact core copy primitive, not a size-only constructor
+                          ;; or a helper whose spelling can establish correspondence.
+                          core-copy? (and (some? (descriptor/core-array-copy-source expr))
+                                          (not (contains? util/*shadowing-locals* (first expr))))]
+                      (when-let [extent (or (when (and helper-extent (length-expression? helper-extent))
+                                             helper-extent)
+                                            (when (or core-extent core-copy?) (allocation-length expr)))]
+                        (cond-> {:destination sym :source-binding-id id
+                                 :source-expression expr
+                                 :extent (canonical-extent shape-equalities values extent)
+                                 :initialization (descriptor/allocation-initialization
+                                                  (descriptor/semantic-op (or constructor expr)))
+                                 :dtype (or retained-dtype constructor-dtype)}
+                          (:helper projection) (assoc :source-projection projection)))))))
+          descriptions))))
+
+(defn- staged-storage-input
+  "Check compiler-local correspondence data, not completion or admission.
+   Keep exact source inputs separate from the metadata-elaborated expression."
+  [description occurrence processed-bindings]
+  (let [[id expression :as binding] (:source-binding description)
+        parts (completion/canonical-parts expression)
+        target (get-in occurrence [:argument :completion :parameter-carrier])
+        port (when (= 1 (count (:ports occurrence))) (first (:ports occurrence)))
+        alias (when (dtype/dtype-for-jvm-array-class target) (first (:binding port)))]
+    (when-not (and (= (:id description) (get-in occurrence [:origin :index]))
+                   (= 2 (count binding) (count (:binding occurrence)))
+                   (every? true? (map identical? binding (:binding occurrence)))
+                   ;; Normalization reconstructs literal contract maps. Their
+                   ;; canonical data/Class identity is compared only AFTER the
+                   ;; exact source occurrence above has been established.
+                   parts (= (:contract parts) (get-in occurrence [:argument :contract]))
+                   (= target (get-in parts [:contract :target-carrier]))
+                   (class? target)
+                   (every? (fn [port]
+                             (let [actual (get processed-bindings (get-in port [:origin :index]))
+                                   binding (:binding port)
+                                   origin-binding (get-in port [:origin :binding])]
+                               (and (< (get-in port [:origin :index]) (:id description))
+                                    (= 2 (count actual) (count binding) (count origin-binding))
+                                    (every? true? (map identical? binding origin-binding))
+                                    (every? true? (map identical? binding actual)))))
+                           (:ports occurrence))
+                   (or (nil? (dtype/dtype-for-jvm-array-class target))
+                       (and alias
+                            (or (= alias (:operand parts))
+                                ;; The normalizer can propagate an exact prior
+                                ;; symbol alias. Do not expand computations or
+                                ;; fetch an AV from the substituted operand.
+                                (and (symbol? (second (:binding port)))
+                                     (= (second (:binding port)) (:operand parts)))))))
+      (fail! :source-input-correspondence
+             "staged input differs from its original normalized occurrence"
+             {:id (:id description) :binding id}))
+    {:occurrence occurrence :carrier target :alias alias}))
+
+(defn- source-storage-values
+  "Thread existing logical values through source bindings without inventing array capacity.
+   Alias facts preserve the complete value verbatim. They describe conditional logical storage,
+   not completion of a reference cast, a null check, or evaluation of a helper argument."
+  ([descriptions array-types scalar-types source-scalar-types values shape-equalities]
+   (source-storage-values descriptions array-types scalar-types source-scalar-types values shape-equalities {}))
+  ([descriptions array-types scalar-types source-scalar-types values shape-equalities staged-inputs]
+  (let [_ (when-not (every? (set (map :id descriptions)) (keys staged-inputs))
+            (fail! :source-input-correspondence "staged input has no source binding" {}))
+        local-ids (set (map :sym descriptions))
+        initial-values
+        (reduce-kv (fn [known id dt]
+                     (if (contains? local-ids id) known
+                         (merge-value known id (tensor-value dt []) shape-equalities)))
+                   values scalar-types)]
+    (reduce
+     (fn [{:keys [values carrier-facts processed-source-bindings] :as state} {:keys [kind sym expr] :as description}]
+       (let [staged (when (contains? staged-inputs (:id description))
+                      (staged-storage-input description (get staged-inputs (:id description)) processed-source-bindings))
+             alias-source (or (:alias staged) (when (symbol? expr) expr))
+             alias (when (and (= :scalar kind) alias-source) (get values alias-source))
+             array-dtype (declared-type array-types sym)
+             scalar-dtype (get source-scalar-types sym)
+             _ (when (and array-dtype scalar-dtype)
+                 (fail! :source-value-conflict
+                        "one source binding cannot be declared both array and scalar"
+                        {:id sym :array-dtype array-dtype :scalar-dtype scalar-dtype}))
+             alias? (and alias (or array-dtype scalar-dtype (= :tensor (:kind alias))))
+             _ (when alias?
+                 (when-not (and (= :tensor (:kind alias))
+                                (or (nil? (or array-dtype scalar-dtype))
+                                    (and (= (dtype/canon (or array-dtype scalar-dtype))
+                                            (dtype/canon (:dtype alias)))
+                                         (= (boolean array-dtype) (boolean (seq (:shape alias))))))
+                                (or (nil? (get values sym)) (= alias (get values sym))))
+                   (fail! :source-value-conflict
+                          "a source alias must preserve the complete existing AbstractValue"
+                          {:id sym :source alias-source :source-value alias :first (get values sym)})))
+             allocations
+             (into []
+                   (filter
+                    (fn [{:keys [extent]}]
+                      ;; A retained declaration describes a carrier, not a completed value.
+                      ;; Even a core allocator cannot publish a later local extent early.
+                      (every? #(contains? values %)
+                              (filter #(or (contains? local-ids %)
+                                           (contains? source-scalar-types %))
+                                      (util/free-syms extent)))))
+                   (allocation-contracts [description] array-types source-scalar-types
+                                         values shape-equalities carrier-facts))
+             values (cond
+                      alias? (assoc values sym alias)
+                      (and (= :scalar kind) scalar-dtype (nil? array-dtype))
+                      (merge-value values sym (tensor-value scalar-dtype []) shape-equalities)
+                      :else values)
+             values
+             (reduce (fn [known {:keys [destination extent dtype]}]
+                       (let [prior (get known destination)]
+                         (if (and dtype
+                                  (or (nil? prior)
+                                      (and (= {:kind :plain} (:representation prior))
+                                           (nil? (:logical-layout prior))
+                                           (= 1 (count (:shape prior))))))
+                           (merge-value known destination
+                                        (if prior (assoc prior :shape [extent])
+                                            (tensor-value dtype [extent]))
+                                        shape-equalities)
+                           known)))
+                     values allocations)]
+         (cond-> (-> state (assoc :values values) (update :allocations into allocations)
+                     (assoc-in [:processed-source-bindings (:id description)] (:source-binding description)))
+           staged (-> (assoc-in [:carrier-facts sym] {:carrier (:carrier staged)})
+                      (update :pending-inputs conj (:occurrence staged))))))
+     {:values initial-values :allocations [] :carrier-facts {} :pending-inputs []
+      :processed-source-bindings {}} descriptions))))
 
 (defn- source-storage-analysis
   "Establish allocation-owned extents before a consumer can infer element shapes.
    Allocation capacity is not permission to flatten a declared logical layout. Reuse the same
    allocation contracts for initialization later; no consumer extent may become its own producer."
-  [pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
-  (let [descriptions (normalize-extents
-                      (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
-                      shape-equalities values)
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities public-parameters]
+   (source-storage-analysis pairs dtype array-types scalar-types segmented-plans? values shape-equalities public-parameters {}))
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities public-parameters staged-inputs]
+  (let [descriptions (retain-host-input-scalars
+                      (normalize-extents
+                       (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
+                       shape-equalities values)
+                      scalar-types public-parameters)
         source-scalar-types
         (reduce (fn [types {:keys [kind sym scalar-dtype]}]
                   (if (and (= :scalar kind) scalar-dtype)
                     (assoc types sym scalar-dtype) types))
                 scalar-types descriptions)
-        allocations (allocation-contracts descriptions array-types source-scalar-types values
-                                          shape-equalities)
-        values (reduce (fn [known {:keys [destination extent dtype]}]
-                         (let [prior (get known destination)]
-                           (if (and dtype
-                                    (or (nil? prior)
-                                        (and (= {:kind :plain} (:representation prior))
-                                             (nil? (:logical-layout prior))
-                                             (= 1 (count (:shape prior))))))
-                             (merge-value known destination
-                                          (if prior (assoc prior :shape [extent])
-                                              (tensor-value dtype [extent]))
-                                          shape-equalities)
-                             known)))
-                       values allocations)]
+        {:keys [values allocations carrier-facts pending-inputs]}
+        (source-storage-values descriptions array-types
+                               (if (some? public-parameters)
+                                 (select-keys scalar-types public-parameters) scalar-types)
+                               source-scalar-types
+                               values shape-equalities staged-inputs)]
     {:descriptions (preserve-map-storage-inputs descriptions values)
-     :values values :allocations allocations}))
+     :values values :allocations allocations :carrier-facts carrier-facts :pending-inputs pending-inputs})))
+
+(defn terminal-host-source
+  "Retain a declined contiguous scalar suffix as one explicit terminal source region.
+   Uses the same source descriptions/admission rules as the numerical frontend. It neither
+   accepts an unsupported parallel leaf nor authorizes execution of the retained host region."
+  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
+                  preserve-declared-array-storage? public-parameters]
+           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types values)
+            *region-local-counter* (atom -1)
+            *region-local-source-symbols* (source-symbols source)]
+  (if-not (and (seq? source) (contains? #{'let 'let*} (first source)) (= 3 (count source)))
+    source
+    (let [[head bindings body] source
+          pairs (mapv vec (partition 2 bindings))
+          array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
+          descriptions (:descriptions (source-storage-analysis pairs dtype array-types scalar-types
+                                                               segmented-plans? values shape-equalities public-parameters))
+          suffix (vec (reverse (take-while #(= :scalar (:kind %)) (reverse descriptions))))
+          split (- (count pairs) (count suffix))
+          physical (physical-output-symbols descriptions)]
+      (if (and (seq suffix) (pos? split)
+               (= (mapv :sym suffix) (mapv first (subvec pairs split)))
+               (some semantic-description? (take split descriptions))
+               (some #(not (admitted-description? physical %)) suffix)
+               (not-any? #(contains-parallel-form? (:expr %)) suffix))
+        (with-meta (list head (vec (mapcat identity (subvec pairs 0 split)))
+                         (list 'let* (vec (mapcat identity (subvec pairs split))) body)) (meta source))
+        source)))))
 
 (defn canonicalize-fresh-full-write-maps
   "Project a closed single-write effect region to the existing functional map contract.
@@ -6049,7 +6452,10 @@
                          (some #(contains? (util/free-syms (second %)) destination) earlier)
                          :fresh-write-prior-use
                          (contains? (util/free-syms map-body) destination) :fresh-write-self-read
-                         (not (effects/removable-expr? map-body)) :fresh-write-unproved-purity
+                         ;; This is a representation change at the original
+                         ;; allocation/effect sites, not deletion or replay of
+                         ;; the body. Retained read/cast failures stay executable.
+                         (not= :pure (effects/analyze-effect map-body)) :fresh-write-unproved-purity
                          (contains? (util/free-syms suffix) statement) :fresh-write-observed-statement
                          :else nil))
                      description
@@ -6103,19 +6509,46 @@
                original-source)
        :rewrites (:rewrites rebuilt) :declines (:declines rebuilt)}))))
 
-(defn- form->program*
-  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
-                 preserve-declared-array-storage? host-scalars?]
-           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
+(defn- source-components*
+  ([source options] (source-components* source options {}))
+  ([source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
+                 preserve-declared-array-storage? host-scalars? public-parameters]
+           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}
+           :as options} staged-inputs]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [_ (validate-declared-array-values! array-types values)
           [_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          {descriptions :descriptions storage-values :values allocations :allocations}
+          {descriptions :descriptions storage-values :values allocations :allocations
+           :keys [carrier-facts pending-inputs]}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
-                                   values shape-equalities)]
-      (when (and (even? (count bindings))
+                                   values shape-equalities public-parameters staged-inputs)]
+      {:source source :options options :pairs pairs :array-types array-types
+       :descriptions descriptions :storage-values storage-values :allocations allocations
+       :carrier-facts carrier-facts :pending-inputs pending-inputs}))))
+
+(defn ^:no-doc analyze-source-components
+  "Internal analysis-only entry for an enclosing source producer. Pending input
+   correspondence is separate from options and grants no continuation or admission.
+   Ordinary compilation uses the same description/storage walk with no such data."
+  [source {:keys [array-types scalar-types values] :as options} staged-inputs]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types values)
+            *region-local-counter* (atom -1)
+            *region-local-source-symbols* (source-symbols source)]
+    (source-components* source options staged-inputs)))
+
+(defn- continue-source-components*
+  "Continue the single description/storage analysis through unchanged admission
+   and equation construction. Components are compiler-local data, not a proof or
+   permission to publish a source-derived program."
+  [{:keys [source options pairs array-types descriptions storage-values allocations pending-inputs]}]
+  (let [{:keys [dtype scalar-types values shape-equalities segmented-plans?
+                host-scalars? public-parameters]
+         :or {dtype :double scalar-types {} values {} shape-equalities {}}} options
+        [_ bindings & body] source]
+      (when (and (empty? pending-inputs)
+                 (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)
                      (and host-scalars? (every? #(= :scalar (:kind %)) descriptions)))
@@ -6321,25 +6754,38 @@
                                       (update :extent #(canonical-extent shape-equalities values %))
                                       (assoc :dtype (:dtype (get values (:destination allocation))))))
                                 allocations)
-              ;; An allocation-only public dimension need not appear in a numerical equation.
-              ;; Retain its declared type now; inserting the initializer later makes it an
-              ;; ordinary operation input. Do not infer a missing declaration from its name.
-              values (reduce (fn [values {:keys [extent]}]
-                               (if-let [declared (and (symbol? extent)
-                                                     (get source-scalar-types extent))]
-                                 (merge-value values extent (tensor-value declared []) shape-equalities)
-                                 values)) values allocations)
+              ;; Helper correspondence requires the completed retained argument
+              ;; environment, including allocation-only scalar parameters.
+              allocations (mapv (fn [allocation]
+                                  (let [projection (descriptor/direct-allocation-projection
+                                                    (:source-expression allocation) values)]
+                                    (cond-> allocation
+                                      (:helper projection)
+                                      (assoc :source-projection projection
+                                             :initialization (descriptor/allocation-initialization
+                                                              (descriptor/semantic-op (:constructor projection)))
+                                             :extent (canonical-extent
+                                                      shape-equalities values
+                                                      (descriptor/array-allocation-size (:constructor projection)))))))
+                                allocations)
               equation-facts
               (into {}
                     (map (fn [description]
-                           (let [storage (:result-storage description)]
+                           (let [storage (:result-storage description)
+                                 flags (when (= :scalar (:kind description))
+                                         (:flags (effects/descriptor (:expr description))))]
                              [(:id description)
                               (cond-> (dialect/default-equation-facts
                                        {:front-end :analyzed-source
                                         :source-binding-id (:id description)})
                                 true
                                 (update :attributes assoc
-                                        :source-prefix? (boolean (:source-prefix? description)))
+                                        :source-prefix? (boolean (:source-prefix? description))
+                                        :before-parallel? (boolean (:before-parallel? description)))
+                                (seq flags)
+                                (assoc-in [:attributes :required-evaluation]
+                                          {:source-binding-id (:id description)
+                                           :flags flags :ordering :source})
                                 (contains? graph-shape-scalar-ids (:sym description))
                                 (update :attributes assoc :graph-shape-definition true)
                                 storage
@@ -6356,6 +6802,10 @@
                                             {:result-storage storage
                                              :host-binding (:host-binding description)})))]))
                          equation-descriptions))
+              required-evaluations
+              (into {} (keep (fn [[id fact]]
+                               (when-let [obligation (get-in fact [:attributes :required-evaluation])]
+                                 [id obligation]))) equation-facts)
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
               ;; Protected markers stay in the reconstructed host form until their existing plan
               ;; becomes a scheduled equation. Keeping the source binding is provenance and
@@ -6373,7 +6823,7 @@
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects
                       :provenance {:front-end :analyzed-source}
-                      :attributes {:source-dialect :closed-clojure
+                      :attributes (cond-> {:source-dialect :closed-clojure
                                    :source-bindings (mapv first pairs)
                                    :host-binding-ids host-binding-ids
                                    :host-read-values host-read-values
@@ -6383,7 +6833,9 @@
                                             :values (set (filter #(contains? values %)
                                                                  (util/free-syms expr)))})
                                          host-control-descriptions)
-                                   :allocations allocations}})]
+                                   :allocations allocations}
+                                    (seq required-evaluations)
+                                    (assoc :required-evaluations required-evaluations))})]
           (let [segmented? (boolean (seq swr-descriptions))
                 ;; For a mixed projection this is an equation catalog used to build maximal
                 ;; ordinary SOAC chunks. Its broad outputs prevent validation from discarding a
@@ -6400,4 +6852,9 @@
              :outputs outputs
              :values values
              :facts facts
-             :source source}))))))
+             :source source})))))
+
+(defn- form->program*
+  [source options]
+  (when-let [components (source-components* source options)]
+    (continue-source-components* components)))

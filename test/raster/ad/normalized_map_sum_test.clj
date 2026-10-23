@@ -230,6 +230,23 @@
           bundle (build program 'xs)
           xs (array [-2.0 0.0 3.0]) weights (array [0.5 2.0 -1.0])]
       (is (= 2 (count (soac/equations program))))
+      (doseq [[index equation] (map-indexed vector (soac/equations program))]
+        (let [id (second equation)
+              facts (soac/facts program)]
+          (is (= {:source-prefix? (zero? index) :before-parallel? (zero? index)}
+                 (get-in facts [:equations id :attributes])))
+          ;; Mutate the actual producer envelope, not a hand-maintained fixture.
+          ;; Phase and provenance assertions must remain necessary for admission.
+          (doseq [[path value]
+                  [[[:equations id :attributes :source-prefix?] (not (zero? index))]
+                   [[:equations id :attributes :before-parallel?] (not (zero? index))]
+                   [[:equations id :provenance :source-binding-id] (inc index)]
+                   [[:equations id :provenance :front-end] :forged]
+                   [[:attributes :host-read-sites] '[unproved-read]]]]
+            (is (= :ad-normalized-sum-boundary
+                   (reason #(build (soac/make (assoc-in facts path value)
+                                             (soac/equations program) (soac/outputs program)) 'xs)))
+                (str "reject modified frontend evidence: " path)))))
       (is (identical? program (get-in bundle [:sum-programs :source])))
       (is (= -7.0 (v xs weights 3)))
       (is (zero? (v (array 0) (array 0) 0)))
@@ -275,7 +292,7 @@
         operation (apply list (assoc operation 4 (soac/lambda-form '[total element] [body])))
         tampered (apply list (assoc (vec source) 2
                                    (assoc equations 1 (apply list (assoc reduction 3 operation)))))]
-    (is (= :ad-normalized-sum-step (reason #(build tampered 'xs))))))
+    (is (= :ad-normalized-value-declaration (reason #(build tampered 'xs))))))
 
 (deftest recertification-cannot-break-source-or-snapshot-correspondence
   (let [bundle (build (source :double) 'xs)
@@ -316,7 +333,8 @@
                                      [(second equation)
                                       (assoc (soac/default-equation-facts
                                               {:front-end :analyzed-source :source-binding-id index})
-                                             :attributes {:source-prefix? (zero? index)})])
+                                             :attributes {:source-prefix? (zero? index)
+                                                          :before-parallel? (zero? index)})])
                                    (soac/equations source)))))
         frontend-source (soac/make facts (soac/equations source) (soac/outputs source))
         bundle (build frontend-source 'xs)]
@@ -327,6 +345,22 @@
     (is (= :ad-normalized-sum-boundary
            (reason #(build (soac/make (assoc-in facts [:attributes :host-binding-ids] '[effect])
                                      (soac/equations source) (soac/outputs source)) 'xs))))
+    (doseq [[equation-id attributes]
+            [['map-0 {:source-prefix? true :before-parallel? false}]
+             ['sum-1 {:source-prefix? false :before-parallel? true}]
+             ['map-0 {:source-prefix? true}]
+             ['map-0 {:source-prefix? true :before-parallel? :true}]
+             ['map-0 {:source-prefix? true :before-parallel? true :unknown true}]]]
+      (is (= :ad-normalized-sum-boundary
+             (reason #(build (soac/make (assoc-in facts [:equations equation-id :attributes]
+                                                 attributes)
+                                       (soac/equations source) (soac/outputs source)) 'xs)))
+          (str "reject altered phase/evaluation facts: " equation-id " " attributes)))
+    (is (= :typed-soac-required-evaluation
+           (reason #(build (soac/make
+                            (assoc-in facts [:equations 'map-0 :attributes :required-evaluation]
+                                      {:ordering :source})
+                            (soac/equations source) (soac/outputs source)) 'xs))))
     (is (= :typed-soac-equation-projection
            (reason #(soac/equation-subprogram source
                                               (list '= 'other '[mapped]

@@ -47,6 +47,9 @@
   (let [a (aget theta 0) k (aget theta 1)]
     (n/* 2.0 (response a k (double cnt)))))
 (deftm explicit-float [x :- Double] :- Float (float x))
+(deftm explicit-unchecked-float [x :- Double] :- Float (unchecked-float x))
+(deftm ignored-explicit-float [x :- Double] :- Double
+  (let [ignored (float x)] x))
 (deftm scalar-carry-region [x :- Double cnt :- Long] :- Double
   (par/reduce acc 1.0 i cnt (n/* acc x)))
 (deftm active-seed-region [x :- Double seed :- Double cnt :- Long] :- Double
@@ -314,6 +317,7 @@
                                 (vals (:invocation-catalog emission))))
         context (bytecode/retained-floating-conversion emission original)]
     (is (= :long (:input-type context)))
+    (is (= :jvm-coerce (:conversion-kind context)))
     (is (identical? Double/TYPE (:target-carrier context)))
     (is (nil? (bytecode/retained-floating-conversion
                emission (with-meta (apply list original) (meta original)))))
@@ -325,10 +329,43 @@
         (is (< (Math/abs (- (aget gradient 0) (/ (* 2.0 cnt) den))) 1e-12)))))
   (let [p (prepared #'explicit-float)
         f (#'reverse/compile-prepared-value+grad p)]
-    (doseq [x [0.1 -0.0 Double/MAX_VALUE Double/NaN]]
+    (doseq [x [0.1 -0.0 Double/NaN]]
       (let [[value gradient] (f x)]
         (is (instance? Float value))
         (is (= (Float/floatToRawIntBits (explicit-float x))
+               (Float/floatToRawIntBits value)))
+        (is (= 1.0 gradient))))
+    (doseq [x [Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+      (is (thrown? IllegalArgumentException (float x)) "independent Clojure source oracle")
+      (is (thrown? IllegalArgumentException (explicit-float x)))
+      (is (thrown? IllegalArgumentException (f x))
+          "whole-body AD must not replace an explicit checked cast with raw input completion")))
+  (let [f (#'reverse/compile-prepared-value+grad (prepared #'ignored-explicit-float))]
+    (is (= [2.5 1.0] (f 2.5)))
+    (doseq [x [Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+      (is (thrown? IllegalArgumentException (ignored-explicit-float x)))
+      (is (thrown? IllegalArgumentException (f x))
+          "an unused checked conversion retains its source failure"))))
+
+(deftest unknown-floating-conversion-lowering-is-not-raw-coercion-evidence
+  (let [observe bytecode/retained-floating-conversion]
+    (doseq [kind [nil :unknown]]
+      (with-redefs [bytecode/retained-floating-conversion
+                    (fn [emission original]
+                      (when-let [record (observe emission original)]
+                        (assoc record :conversion-kind kind)))]
+        (is (= :ad-unclosed-bytecode-body-region
+               (try (prepared #'explicit-float) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
+
+(deftest explicit-unchecked-float-keeps-ieee-narrowing-through-owned-ad
+  (let [f (#'reverse/compile-prepared-value+grad (prepared #'explicit-unchecked-float))]
+    (doseq [x [0.1 -0.0 Double/MAX_VALUE Double/POSITIVE_INFINITY
+               Double/NEGATIVE_INFINITY Double/NaN]]
+      (let [[value gradient] (f x)]
+        (is (= (Float/floatToRawIntBits (unchecked-float x))
+               (Float/floatToRawIntBits value)))
+        (is (= (Float/floatToRawIntBits (explicit-unchecked-float x))
                (Float/floatToRawIntBits value)))
         (is (= 1.0 gradient))))))
 
@@ -355,6 +392,8 @@
           (let [fresh (core/ensure-current-owned-bytecode! receiver)]
             (is (not (identical? old-emission fresh)))
             (is (not (identical? (:implementation old-emission) (:implementation fresh))))
+            (is (symbol? (:typed-interface fresh)))
+            (is (= (:typed-interface old-emission) (:typed-interface fresh)))
             (is (identical? (:implementation fresh) @receiver)))
           (is (thrown? clojure.lang.ExceptionInfo (f 3.0)))
           (let [p (prepared v)

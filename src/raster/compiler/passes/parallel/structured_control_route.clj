@@ -200,21 +200,60 @@
           (assoc equation :algorithm algorithm :operations [operation] :operands captures))))
     equation))
 
+(defn- required-source-evaluation?
+  "Recheck an evaluation obligation against its retained binding, not an advisory root list."
+  [parallel-program equation]
+  (let [obligation (get-in equation [:attributes :required-evaluation])
+        algorithm (:algorithm equation)
+        retained (when (soac/program-form? algorithm)
+                   (soac/required-evaluation algorithm
+                                             (second (first (soac/equations algorithm)))))
+        ;; The equation's scalar body retains the analyzed computation. Its materialized source
+        ;; may additionally contain a result conversion, which has a separate completion contract;
+        ;; do not reclassify that generated wrapper as an original evaluation obligation.
+        flags (some-> (invocation-source/scalar-equation-expression equation)
+                      effects/descriptor :flags)
+        ;; Generated algebra need not denote an invocation-level source evaluation. For an
+        ;; analyzed-source scalar, absence in both mutable catalogs is not evidence of totality.
+        source-required? (and (= :analyzed-source (get-in equation [:provenance :front-end]))
+                              (seq flags))]
+    (when (or obligation retained source-required?)
+      (let [[kind symbol] (:site equation)
+            source (some (fn [[binding expression]]
+                           (when (= symbol binding) expression))
+                         (partition 2 (second (:source parallel-program))))]
+        (when-not (and (= obligation retained)
+                      (= :binding kind)
+                      (= [symbol] (:results equation))
+                      (= equation (program/equation-for-binding parallel-program symbol source))
+                      (= #{:source-binding-id :flags :ordering} (set (keys obligation)))
+                      (= :source (:ordering obligation))
+                      (= (:source-binding-id obligation)
+                         (get-in equation [:provenance :source-binding-id]))
+                      (integer? (:source-binding-id obligation))
+                      (<= 0 (:source-binding-id obligation))
+                      (seq flags) (= flags (:flags obligation)))
+          (fail! :structured-control-required-evaluation
+                 "required invocation evaluation differs from its retained source obligation"
+                 {:equation (:id equation) :binding symbol :obligation obligation
+                  :source source :flags flags}))
+        true))))
+
 (defn- host-invocation-equation?
-  [available program-outputs required-shape-scalars source-prefix? equation]
+  [available program-outputs required-shape-scalars source-prefix? required? equation]
   (let [expression (invocation-source/scalar-equation-expression equation)]
     (and expression
          (not-any? (set (:results equation)) program-outputs)
          (set/subset? (set (:operands equation)) available)
          ;; Invocation-prefix construction is dependency-pruned and executes before all device
-         ;; equations. Even a shape projection may not cross that boundary when a checked cast
-         ;; still carries exceptional control. A checked scalar which really precedes device work
-         ;; may cross only when a retained shape requires its value before launch; the attested
-         ;; InvocationPlan region then becomes the exceptional computation's single owner.
+         ;; equations. Exceptional scalars may not cross device work or an uncovered host effect.
+         ;; An unused checked value still requires evaluation: its source obligation, not shape
+         ;; liveness, roots the one InvocationPlan executor.
          (or (effects/removable-expr? expression)
              (and source-prefix?
-                  (true? (get-in equation [:attributes :source-prefix?]))
-                  (some required-shape-scalars (:results equation)))))))
+                  (or (and (true? (get-in equation [:attributes :before-parallel?])) required?)
+                      (and (true? (get-in equation [:attributes :source-prefix?]))
+                           (some required-shape-scalars (:results equation)))))))))
 
 (defn- required-shape-scalars
   "Return scalar equation results in the transitive definition closure of retained shapes."
@@ -252,12 +291,13 @@
                         required-shape? (some shape-scalars (:results equation))
                         exceptional-shape? (and required-shape?
                                                 (not (effects/removable-expr? expression)))
+                        required? (required-source-evaluation? parallel-program original-equation)
                         host? (host-invocation-equation? available program-outputs
                                                            shape-scalars source-prefix?
-                                                           equation)
-                        ;; Required shape membership authorizes the exceptional one-shot branch;
-                        ;; only the frontend's explicit proof contract retains a removable scalar
-                        ;; as a host-only graph equation.
+                                                           required? equation)
+                        ;; Shape definitions retain their typed proof term.
+                        ;; Other required checks retain a host-only equation
+                        ;; without acquiring graph-shape proof status.
                         graph-shape? (true? (get-in equation
                                                     [:attributes :graph-shape-definition]))
                         ;; A preceding exceptional scalar which stays in the device equation
@@ -269,30 +309,32 @@
                                          (not (effects/removable-expr? expression))))
                                 (assoc :source-prefix? false))]
                     (cond
-                      (and host? exceptional-shape?)
-                      ;; The checked algebra moves, with its typed closed region, into the
-                      ;; InvocationPlan ScalarCompute. Removing this equation makes the value an
-                      ;; explicit program input and leaves the attested plan as its sole evaluator.
-                      (-> state
-                          (update :hoisted conj equation)
-                          (update :available into (:results equation)))
-
-                      (and host? (not graph-shape?))
-                      (-> state
-                          (update :hoisted conj equation)
-                          (update :available into (:results equation)))
-
-                      (and host? graph-shape?)
-                      ;; Allocation consumes this scalar on the host and target narrowing
-                      ;; consumes its exact typed equation as proof. Keep one explicit host-only
-                      ;; equation in program order; the invocation prefix materializes the same
-                      ;; pure definition before allocating storage.
+                      (and host? (or graph-shape? exceptional-shape?))
+                      ;; Keep the original typed shape algebra as a proof term.
+                      ;; The matching InvocationPlan ScalarCompute is still its
+                      ;; sole evaluator; slicing/scheduling must not lose the
+                      ;; checked product's successful-return equality witness.
                       (-> state
                           (update :retained conj
                                   (-> equation
                                       (assoc :operations [])
                                       (update :attributes assoc :host-only true
                                               :graph-shape-definition true)))
+                          (update :available into (:results equation)))
+
+                      (and host? required? (not (effects/removable-expr? expression)))
+                      ;; Keep the source-order obligation even when its value is unused. Empty
+                      ;; operations mean the matching ScalarCompute is its only evaluator.
+                      (-> state
+                          (update :retained conj
+                                  (-> equation
+                                      (assoc :operations [])
+                                      (update :attributes assoc :host-only true)))
+                          (update :available into (:results equation)))
+
+                      host?
+                      (-> state
+                          (update :hoisted conj equation)
                           (update :available into (:results equation)))
 
                       :else
@@ -349,12 +391,18 @@
                                                    [:attributes :graph-shape-definition])))
                           (mapcat :results))
                 (:equations parallel-program))
+          required-host-definitions
+          (into #{} (comp (filter #(and (true? (get-in % [:attributes :host-only]))
+                                        (required-source-evaluation? parallel-program %)))
+                          (mapcat :results))
+                (:equations parallel-program))
           candidates (filterv (fn [[symbol _]]
                                 ;; A graph-shape scalar remains an ordered TypedSOAC equation so
                                 ;; target narrowing can prove its exact algebra.  Host allocation
                                 ;; also needs the same pure value before numerical execution, so
                                 ;; materialize that one definition in the invocation prefix too.
-                                (or (contains? graph-shape-definitions symbol)
+                                (or (contains? required-host-definitions symbol)
+                                    (contains? graph-shape-definitions symbol)
                                     (not (contains? equation-sites symbol))))
                               source-pairs)
           shape-roots
@@ -362,7 +410,17 @@
                 (comp (mapcat (comp #(mapcat util/free-syms %) :shape val))
                       (filter #(scalar-value? (get prefix-values %))))
                 program-values)
-          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots)
+          host-shape-roots
+          (into #{}
+                (comp (filter #(and (true? (get-in % [:attributes :host-only]))
+                                     (true? (get-in % [:attributes :graph-shape-definition]))))
+                      (mapcat :results))
+                (:equations parallel-program))
+          ;; A reduction extent can be needed only by its launch/domain, not by
+          ;; any result-buffer shape. The retained host-only equation still needs
+          ;; its one canonical invocation executor; its proof term cannot run it.
+          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots
+                                          host-shape-roots required-host-definitions)
                                 (set public-parameters))
           required (required-prefix-symbols candidates roots)
           bindings (filterv (comp required first) candidates)
@@ -694,6 +752,59 @@
                 :else nil))]
       (project expression))))
 
+(defn- terminal-source-program
+  "Keep a contiguous scalar source suffix in the terminal host region.
+   Only already-certified scalar equations may leave the numerical spine; no
+   reduction/map/loop or earlier source action is moved. All suffix bindings,
+   including unused exceptional computations, remain in their original order."
+  [parallel-program]
+  (let [_ (when-not (= 3 (count (:source parallel-program)))
+            (fail! :structured-control-source-result
+                   "terminal observation requires exactly one retained return expression" {}))
+        [head bindings body] (:source parallel-program)
+        pairs (mapv vec (partition 2 bindings))
+        shape-dependencies (into (required-shape-scalars parallel-program)
+                                 (mapcat #(mapcat util/free-syms (:shape %)))
+                                 (vals (:values parallel-program)))
+        claimed (reduce (fn [claims equation]
+                          (if (= :binding (first (:site equation)))
+                            (let [symbol (second (:site equation))]
+                              (when (contains? claims symbol)
+                                (fail! :structured-control-terminal-source-site
+                                       "terminal extraction requires unambiguous source binding ownership"
+                                       {:binding symbol :site (:site equation)}))
+                              (assoc claims symbol equation))
+                            claims))
+                        {} (:equations parallel-program))
+        suffix (->> (rseq pairs)
+                    (take-while
+                     (fn [[symbol expression]]
+                       (and (not (contains? shape-dependencies symbol))
+                            (if-let [equation (get claimed symbol)]
+                              (and (= equation (program/equation-for-binding parallel-program symbol expression))
+                                   (some? (invocation-source/scalar-equation-expression equation)))
+                              (nil? (invocation-source/realization-equation parallel-program symbol expression))))))
+                    reverse vec)
+        removed (set (map first suffix))
+        equations (filterv #(not (and (= :binding (first (:site %)))
+                                      (contains? removed (second (:site %)))))
+                           (:equations parallel-program))
+        inputs (program/infer-inputs equations)]
+    (when (seq (set/intersection removed (set inputs)))
+      (fail! :structured-control-terminal-consumer
+             "a terminal source binding still has a numerical consumer" {}))
+    (if (empty? suffix)
+      parallel-program
+      (-> parallel-program
+          (assoc :source (with-meta
+                           (list head (vec (mapcat identity (subvec pairs 0 (- (count pairs) (count suffix)))))
+                                 (list 'let* (vec (mapcat identity suffix)) body))
+                           (meta (:source parallel-program)))
+                 :equations equations :inputs inputs
+                 :outputs (filterv #(not (contains? removed %)) (:outputs parallel-program))
+                 :effects (reduce set/union #{} (map :effects equations)))
+          (update :values #(apply dissoc % removed))))))
+
 (defn- validate-source-result!
   "Island live-outs are not evidence that the complete source return was lowered.
    Prove the return against logical results and the existing physical-storage relation
@@ -708,19 +819,41 @@
         body (drop 2 source)
         projection (when (= 1 (count body))
                      (source-result-projection parallel-program options (first body)))]
-    (when-not projection
-      (fail! :structured-control-source-result
-             "the complete source return is not represented by the typed program outputs"
-             {:source-result (last body) :source-body (vec body)
-              :program-outputs (:outputs parallel-program)
-              :site [:return] :source-meta (meta (last body))}))
     ;; Island outputs include host live-outs and conservative terminal values. Public
     ;; promotion changes only their escape boundary, never the equations/effects that
     ;; compute them. All returned leaves must have a typed producer or storage alias.
-    (assoc parallel-program :outputs
-           (if (= 'void return-tag)
-             []
-             (vec (distinct (:outputs projection)))))))
+    (if projection
+      (assoc parallel-program :outputs
+             (if (= 'void return-tag) [] (vec (distinct (:outputs projection)))))
+      ;; This describes the complete terminal computation, not its execution.
+      ;; The public compiler must construct its private source owner before
+      ;; publishing a compilation; only the explicit host-result executor may
+      ;; observe its physical exports. Resident entry points refuse it.
+      (let [_ (when (= 'void return-tag)
+                (fail! :structured-control-source-result
+                       "a Void source result needs its retained discard completion, not an Object terminal" {}))
+            parallel-program (terminal-source-program parallel-program)
+            contract
+            (try
+              (invocation/terminal-source-result
+               parallel-program {:source-policy (:source-policy options)
+                                 :source-namespace (some-> (:source-ns options) ns-name)
+                                 :public-parameters
+                                 (mapv (fn [symbol]
+                                         {:symbol symbol
+                                          :value (declared-parameter-value
+                                                  (:values parallel-program)
+                                                  (:array-types options) (:scalar-types options) symbol)})
+                                       (or (:public-parameters options) (:active-params options)))})
+              (catch clojure.lang.ExceptionInfo e
+                (throw (ex-info "the complete source return has no supported terminal boundary"
+                                {:reason :structured-control-source-result
+                                 :source-result (last body) :source-body (vec body)
+                                 :program-outputs (:outputs parallel-program)
+                                 :site [:return] :cause (ex-data e)} e))))]
+        (-> parallel-program
+            (assoc :outputs (mapv :value (:parameters contract)))
+            (assoc-in [:attributes :terminal-host-result] contract))))))
 
 (defn- validate-host-coverage!
   "Host-controlled bindings may remain in an island's retained source, but a complete
@@ -867,7 +1000,9 @@
                        values))
                    program-values binding-values)
         parallel-program (assoc parallel-program :values program-values)
-        promoted (assoc parallel-program :dialect :typed-parallel)
+        promoted (cond-> (assoc parallel-program :dialect :typed-parallel)
+                   (get-in parallel-program [:attributes :terminal-host-result])
+                   (update :effects conj :ordered-host-observation))
         public-set (set public-parameters)
         external-result-storage
         (->> (:equations parallel-program)
@@ -887,10 +1022,14 @@
                :program-inputs (:inputs parallel-program)
                :program-storage external-result-storage
                :program-outputs (:outputs parallel-program)
-               :attributes {:source-dialect :closed-clojure
+               :attributes (cond-> {:source-dialect :closed-clojure
                             :algorithm-dialect (:dialect parallel-program)
-                            :target-dialect :typed-invocation}})]
+                            :target-dialect :typed-invocation}
+                             (get-in parallel-program [:attributes :terminal-host-result])
+                             (assoc :terminal-host-result
+                                    (get-in parallel-program [:attributes :terminal-host-result])))})]
     (-> promoted
+        (update :attributes dissoc :terminal-host-result)
         (update :attributes assoc
                 :host-control :typed-invocation
                 :invocation-plan (invocation/validate-against! plan promoted))

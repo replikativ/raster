@@ -12,9 +12,12 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
@@ -27,6 +30,9 @@
 (defrecord BufferAllocation [id symbol operands initialization value])
 (defrecord BufferClone [id symbol operands source value])
 (defrecord ValueAlias [id symbol operands source value])
+;; An owner-local source action, not a portable cast or a storage alias. Its
+;; Class-bearing completion occurrence remains exact; an executor is still owed.
+(defrecord ReferenceCompletion [id symbol operands source completion value])
 (defrecord InvocationPlan
            [id parameters steps bindings storage-bindings
             program-inputs program-outputs values attributes])
@@ -47,6 +53,8 @@
   (record-kind? "raster.compiler.ir.invocation_plan.BufferClone" x))
 (defn value-alias? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.ValueAlias" x))
+(defn reference-completion? [x]
+  (record-kind? "raster.compiler.ir.invocation_plan.ReferenceCompletion" x))
 (defn invocation-plan? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.InvocationPlan" x))
 
@@ -238,7 +246,8 @@
 (defn invocation-step?
   [x]
   (or (shape-projection? x) (scalar-compute? x)
-      (buffer-allocation? x) (buffer-clone? x) (value-alias? x)))
+      (buffer-allocation? x) (buffer-clone? x) (value-alias? x)
+      (reference-completion? x)))
 
 (defn- fail!
   [reason message data]
@@ -255,6 +264,110 @@
 (defn- buffer-value?
   [value]
   (and (= :tensor (:kind value)) (seq (:shape value))))
+
+(defn terminal-parameters
+  "Ordered source arguments: numerical exports, then independently owned public scalars.
+   Public ports are never numerical exports or program outputs."
+  [contract]
+  (into (vec (:parameters contract)) (:public-scalar-parameters contract)))
+
+(defn terminal-source-result
+  "Describe the exact terminal source region and its logical producer ports.
+
+   This is correspondence data for the InvocationPlan attribute boundary, NOT
+   an executable, a physical scalar-export proof or permission to bypass source
+   coverage. Policy and namespace are supplied by the actual source producer.
+   A later owner must establish physical exports, compile under that retained
+   context, guard dependencies, await completion and explicitly observe results.
+
+   The boundary is one return expression over produced Float/Double/Long scalars,
+   optionally using declared public Double/Long scalars at their original
+   argument positions. Public-port declarations are not physical carrier proof.
+   Nested scopes and canonical completions remain intact; prefix
+   computations, array reads and private captures are not silently
+   acquired as terminal parameters. Portable encoding does not prove purity or
+   callee legality; logical producer IDs do not certify producer semantics.
+   Existing resident APIs remain unchanged."
+  [program {:keys [source-policy source-namespace public-parameters]}]
+  (parallel-program/validate! program)
+  (source-policy/unchecked-math source-policy)
+  (let [[head bindings & body] (:source program)]
+    (when-not (and (contains? form/let-heads head)
+                   (vector? bindings) (even? (count bindings)) (= 1 (count body))
+                   (symbol? source-namespace) (nil? (namespace source-namespace)))
+      (fail! :invocation-terminal-source
+             "terminal observation requires one return at a flat source boundary" {}))
+    (let [pairs (mapv vec (partition 2 bindings))
+          symbols (mapv first pairs)
+          _ (when-not (and (every? symbol? symbols) (distinct-vector? symbols))
+              (fail! :invocation-terminal-source
+                     "terminal observation requires distinct lexical source identities" {}))
+          expression (first body)
+          lexical (into (into (set symbols) (:inputs program)) (map :symbol public-parameters))
+          free (binding [util/*shadowing-locals* (into util/*shadowing-locals* lexical)]
+                 (util/free-syms expression))
+          producers (into {} (mapcat (fn [equation]
+                                      (map-indexed (fn [position result]
+                                                     [result [equation position]])
+                                                   (:results equation))))
+                          (:equations program))
+          parameters
+          (into []
+                (keep (fn [result]
+                        (when (contains? free result)
+                          (let [[equation position] (get producers result)
+                                value (get (:values program) result)]
+                            (when-not (and (scalar-value? value)
+                                           (contains? #{:float :double :long} (:dtype value)))
+                              (fail! :invocation-terminal-carrier
+                                     "terminal port requires a supported produced scalar"
+                                     {:value result :abstract value}))
+                            {:symbol result :value result :dtype (:dtype value)
+                             :producer-equation (:id equation) :result-position position}))))
+                (mapcat :results (:equations program)))
+          public-ports
+          (into []
+                (keep-indexed
+                 (fn [position {:keys [symbol value]}]
+                   (when (and (contains? free symbol) (not (contains? producers symbol)))
+                     (when-not (and (not (contains? (set symbols) symbol))
+                                    (scalar-value? value)
+                                    (contains? #{:double :long} (:dtype value)))
+                       (fail! :invocation-terminal-public-carrier
+                              "terminal public port requires an unshadowed declared scalar"
+                              {:symbol symbol :abstract value}))
+                     {:symbol symbol :dtype (:dtype value) :parameter-position position})))
+                public-parameters)
+          _ (when-not (= (count public-parameters) (count (distinct (map :symbol public-parameters))))
+              (fail! :invocation-terminal-public-parameters
+                     "terminal public parameter identities must be distinct" {}))
+          missing (set/difference free (set (concat (map :value parameters) (map :symbol public-ports))))]
+      (when (seq missing)
+        (fail! :invocation-terminal-free-values
+               "terminal source depends on values without retained numerical producers"
+               {:values missing}))
+      (when (empty? parameters)
+        (fail! :invocation-terminal-free-values
+               "terminal observation requires a numerical producer dependency" {}))
+      (let [contract (cond-> {:kind :terminal-host-result :site [:return]
+                             :effects #{:ordered-host-observation}
+                             :parameters parameters :body expression
+                             :source-policy source-policy :source-namespace source-namespace}
+                       (seq public-ports) (assoc :public-scalar-parameters public-ports))]
+        ;; No runtime object, private completion Class or executable may enter
+        ;; this portable semantic boundary. Such owners need a separate path.
+        (semantic/canonical-bytes contract)
+        contract))))
+
+(defn validate-terminal-source-result!
+  "Re-derive terminal correspondence from the actual program and source context.
+   Matching this data alone does not attest ownership, exports or execution."
+  [contract program context]
+  (let [actual (terminal-source-result program context)]
+    (when-not (semantic/equivalent? contract actual)
+      (fail! :invocation-terminal-correspondence
+             "terminal contract differs from its source or producer boundary" {}))
+    contract))
 
 (defn- operand-map
   [step]
@@ -274,6 +387,16 @@
        (= (:kind left) (:kind right))
        (= (:dtype left) (:dtype right))
        (av/storage-contract-compatible? left right)))
+
+(defn- reference-completion-parts
+  "Recognize a retained reference check, not permission to erase or execute it."
+  [expression]
+  (when-let [{:keys [contract operand] :as parts} (completion/canonical-parts expression)]
+    (when (and (contains? #{:jvm-checkcast :jvm-bytecode-reference-input}
+                          (:source-context contract))
+               (symbol? operand)
+               (dtype/dtype-for-jvm-array-class (:target-carrier contract)))
+      parts)))
 
 (defn- validate-step!
   [step values available]
@@ -362,6 +485,21 @@
                        (compatible-value? source-value value))
           (fail! :invocation-buffer-clone
                  "buffer clone requires one storage-compatible source"
+                 {:step id :source (:source step) :value value})))
+
+      (reference-completion? step)
+      (let [{:keys [contract operand]} (reference-completion-parts (:completion step))
+            source-value (get values (:source step))]
+        (when-not (and contract (buffer-value? value)
+                       (= 1 (count operands))
+                       (= (:source step) (get operands operand))
+                       ;; A reference check cannot change logical layout, leases,
+                       ;; presence or capacity, even when storage is compatible.
+                       (= source-value value)
+                       (= (dtype/canon (:dtype value))
+                          (dtype/dtype-for-jvm-array-class (:target-carrier contract))))
+          (fail! :invocation-reference-completion
+                 "reference completion requires one unchanged typed buffer and its retained check"
                  {:step id :source (:source step) :value value})))
 
       (value-alias? step)
@@ -600,6 +738,11 @@
                                   initialization value)
         (:helper projection) (assoc :source-projection projection))
 
+      (and (buffer-value? value) (reference-completion-parts expression))
+      (let [operand (:operand (reference-completion-parts expression))]
+        (->ReferenceCompletion id symbol (referenced-operands expression environment)
+                               (get environment operand) expression value))
+
       (symbol? expression)
       (->ValueAlias id symbol (referenced-operands expression environment)
                     (get environment expression) value)
@@ -703,7 +846,7 @@
   #{[:explicit-typed-algorithm :source-free-typed-invocation]
     [:explicit-typed-effect-algorithm :source-free-typed-effect-invocation]})
 
-(defn- source-free-program?
+(defn source-free-program?
   "Recognize the source-free boundary from the validated program, never from plan attributes."
   [program]
   (let [origin [(:front-end (:provenance program)) (:pass (:provenance program))]
@@ -793,6 +936,15 @@
               :expected-shape-projections expected-projections
               :external-dimensions declared-dimensions
               :expected-external-dimensions expected-dimensions}))
+    (when-let [contract (get-in plan [:attributes :terminal-host-result])]
+      (validate-terminal-source-result! contract parallel-program
+                                        (assoc (select-keys contract [:source-policy :source-namespace])
+                                               :public-parameters (:parameters plan)))
+      (when-not (contains? (:effects parallel-program) :ordered-host-observation)
+        (fail! :invocation-terminal-effects "terminal observation cannot be declared effect-free" {}))
+      (when-not (= (:program-outputs plan) (mapv :value (:parameters contract)))
+        (fail! :invocation-terminal-outputs
+               "terminal dependencies must be the exact numerical export boundary" {})))
     (when (contains? (:attributes plan) :source-order)
       (let [actual (derive-source-order plan parallel-program)]
         (when-not (semantic/equivalent? actual (get-in plan [:attributes :source-order]))
@@ -843,13 +995,32 @@
                         (fail! :invocation-source-projection
                                "source length conversions are not the retained exact projection"
                                {:binding symbol :source canonical}))
+                    _ (when (and (reference-completion? actual)
+                                 (not (identical? canonical (:completion actual))))
+                        (fail! :invocation-source-reference-completion
+                               "reference completion lost its exact source occurrence"
+                               {:binding symbol}))
                     step (prefix-step (:id plan) ordinal symbol canonical
                                       (:value (get steps-by-symbol symbol)) environment
                                       (into {} (map (fn [[symbol id]] [symbol (get-in plan [:values id])])) environment))]
                 {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
             {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
             (map-indexed vector step-pairs)))
-          _ (when-not (semantic/equivalent? expected-steps (:steps plan))
+          _ (when-not (and (= (count expected-steps) (count (:steps plan)))
+                           (every?
+                            true?
+                            (map (fn [expected actual]
+                                   (if (reference-completion? expected)
+                                     ;; Class-bearing source is owner-local, not
+                                     ;; serializable semantic fingerprint data.
+                                     ;; Compare its exact retained occurrence;
+                                     ;; fingerprint all remaining pure IR fields.
+                                     (and (reference-completion? actual)
+                                          (identical? (:completion expected) (:completion actual))
+                                          (semantic/equivalent? (dissoc expected :completion)
+                                                                (dissoc actual :completion)))
+                                     (semantic/equivalent? expected actual)))
+                                 expected-steps (:steps plan))))
               (fail! :invocation-source-step-mismatch
                      "invocation steps differ from their canonical source producers"
                      {:expected expected-steps :actual (:steps plan)}))
@@ -859,6 +1030,8 @@
               (fail! :invocation-source-allocation-claims
                      "allocation destinations require unique source producers" {}))
           allocations (into {} (map (juxt :destination :source-expression)) allocation-claims)
+          allocation-contracts (into {} (map (juxt :destination identity)) allocation-claims)
+          allocation-projections (into {} (map (juxt :destination :source-projection)) allocation-claims)
           binding-order
           (mapv
            (fn [position [symbol expression]]
@@ -871,14 +1044,19 @@
                  (fail! :invocation-source-order-ambiguous
                         "one source binding cannot be two different equation sites"
                         {:binding symbol}))
-               (when (and allocation?
-                          (not (invocation-source/allocation-corresponds?
-                                expression (get-in program [:values symbol])
-                                (descriptor/allocation-initialization
-                                 (descriptor/semantic-op expression)) (:values program))))
-                 (fail! :invocation-source-allocation
-                        "source storage allocation differs from its retained physical contract"
-                        {:binding symbol :source expression}))
+               (when allocation?
+                 (let [projection (invocation-source/allocation-source expression (:values program))]
+                   (when-not (and (invocation-source/allocation-corresponds?
+                                  expression (get-in program [:values symbol])
+                                  (:initialization projection) (:values program))
+                                 (= (:initialization projection)
+                                    (get-in allocation-contracts [symbol :initialization]))
+                                 (semantic/equivalent?
+                                  (when (:helper projection) (select-keys projection [:constructor :helper]))
+                                  (get allocation-projections symbol)))
+                     (fail! :invocation-source-allocation
+                            "source storage allocation differs from its retained physical contract"
+                            {:binding symbol :source expression}))))
                (when (and step equation)
                  (let [canonical (invocation-source/canonicalize-shape-projection
                                   (:values plan) public symbol expression)]
@@ -899,6 +1077,7 @@
                  realization (assoc :realization (:id realization))
                  allocation? (assoc :storage symbol))))
            (range) pairs)
+          terminal (get-in plan [:attributes :terminal-host-result])
           body-order
           (mapv
            (fn [index expression]
@@ -906,14 +1085,23 @@
                             #(and (or (= [:body index] (:site %))
                                       (and (= index (dec (count body))) (= [:return] (:site %))))
                                   (semantic/equivalent? expression (:source %)))
-                            (:equations program))]
+                            (:equations program))
+                   observation? (and terminal (= index (dec (count body)))
+                                     (semantic/equivalent? expression (:body terminal)))]
+               (when (and terminal (not observation?))
+                 (fail! :invocation-terminal-order
+                        "terminal observation must be the exact final source body" {}))
                (when (> (count matches) 1)
                  (fail! :invocation-source-order-ambiguous
                         "one body position cannot execute several equations" {:body-index index}))
-               (when-not (or (seq matches) (effects/removable-expr? expression))
+               (when (and observation? (seq matches))
+                 (fail! :invocation-terminal-order
+                        "a terminal observation cannot also execute a numerical equation" {}))
+               (when-not (or observation? (seq matches) (effects/removable-expr? expression))
                  (fail! :invocation-source-order-uncovered
                         "retained source body has no ordered equation producer" {:body-index index}))
                (cond-> {:position (+ (count pairs) index) :body-index index}
+                 observation? (assoc :terminal-result [:return])
                  (seq matches) (assoc :equation (:id (first matches))))))
            (range) body)
           order (into binding-order body-order)
@@ -938,3 +1126,48 @@
     (if (contains? (:attributes plan) :source-order)
       (get-in plan [:attributes :source-order])
       (derive-source-order plan program))))
+
+(defn- classify-source-host-actions
+  [plan program]
+  (if (source-free-program? program)
+    ;; Explicit source-free shape projections have no Clojure occurrence order;
+    ;; the existing closed source-free validator owns their prefix contract.
+    (do (validate-against! plan program) {:all [] :ordered []})
+    (let [order (source-order plan program)
+          equations (into {} (map (juxt :id identity)) (:equations program))
+          steps (into {} (map (juxt :id identity)) (:steps plan))]
+      (reduce
+        (fn [{:keys [numerical?] :as state} entry]
+          (let [equation (get equations (:equation entry))
+                host-equation? (true? (get-in equation [:attributes :host-only]))
+                step (get steps (:invocation-step entry))
+                realization (when (:realization entry)
+                              (invocation-source/realization-action program entry))
+                ;; Allocation occurrences may have been pruned from the host
+                ;; prefix. Their source checks still cannot move before writes.
+                ;; Exact lexical/storage aliases themselves evaluate nothing.
+                host-action? (or host-equation? (:storage entry)
+                                 (= :result-allocation (:kind realization))
+                                 (and step (not (value-alias? step))))]
+            (cond-> state
+              host-action? (update :all conj entry)
+              (and numerical? host-action?) (update :ordered conj entry)
+              (and equation (not host-equation?)) (assoc :numerical? true))))
+        {:numerical? false :all [] :ordered []} order))))
+
+(defn source-host-actions
+  "All executable host occurrences under exact validated source/plan correspondence.
+   Includes prefix computations and allocations, unlike the ordered-routing subset.
+   Source-free projections retain their separately validated prefix contract."
+  [plan program]
+  (:all (classify-source-host-actions plan program) []))
+
+(defn ordered-host-actions
+  "Derive host actions which cannot be eagerly materialized before numerical work.
+
+   Revalidates the exact source/plan correspondence; an attribute or a caller's
+   ordering hint is not authority. This is an execution obligation, not proof
+   that an action throws. Even an otherwise pure late scalar must stay ordered
+   until a separate motion proof establishes that moving it is unobservable."
+  [plan program]
+  (:ordered (classify-source-host-actions plan program) []))

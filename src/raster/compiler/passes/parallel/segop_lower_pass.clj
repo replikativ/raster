@@ -376,6 +376,7 @@
                    (list 'let* [result source] result)
                    (or (:dtype opts) :double) (:array-types opts)
                    (cond-> {:scalar-types (:scalar-types opts)
+                            :source-ns (:source-ns opts)
                             :values (:values opts)
                             :resident-reductions? (true? (:resident-reductions? opts))}
                      (= 'scalar kind) (assoc :host-scalars? true)))]
@@ -593,8 +594,10 @@
                                    (or (not= 1 (count contextual))
                                        (not (semantic/equivalent? algorithm
                                                                   (:algorithm (first contextual))))
-                                       (nil? (resident/validated-terminal-resident-output
-                                              context (first (:results equation)))))))
+                                       (not (or (resident/validated-terminal-resident-output
+                                                 context (first (:results equation)))
+                                                (resident/validated-required-resident-output
+                                                 context (first (:results equation))))))))
                         (throw (ex-info "resident scalar lacks its enclosing placement and storage proof"
                                         {:reason :typed-soac-device-scalar-activation
                                          :equation (:id equation)})))
@@ -888,6 +891,7 @@
         (typed-route/attempt
          host-source (or (:dtype opts) :double) (:array-types opts)
          {:scalar-types (:scalar-types opts)
+          :source-ns (:source-ns opts)
           :resident-reductions? (true? (:resident-reductions? opts))})
         {scheduled :form stats :stats}
         (segop-lower-pass (or (:program typed-result) host-source) opts)
@@ -939,6 +943,7 @@
         (typed-route/attempt
          source (or (:dtype opts) :double) (:array-types opts)
          {:resident-reductions? (true? (:resident-reductions? opts))
+          :source-ns (:source-ns opts)
           :scalar-types (:scalar-types opts)
           :values (:values opts)
           :abstract-machine (:abstract-machine opts)})

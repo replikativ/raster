@@ -112,9 +112,9 @@
 
     :symbolic-dense-contraction-gpu
     (let [compilation (equation-first/compile
-                       #'contract/contract-mm {:target target :dtype :float})
+                       #'contract/contract-mm {:target target :dtype :double})
           plan (equation-first/lower
-                compilation [(float-array 6) (float-array 6) 2 3 2])]
+                compilation [(double-array 6) (double-array 6) 2 3 2])]
       (equation-first-signature compilation plan))
 
     :q4k-dp4a-rows-gpu

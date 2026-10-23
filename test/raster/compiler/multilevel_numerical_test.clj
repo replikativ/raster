@@ -6,6 +6,8 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.ode.multilevel :as multilevel]
             [raster.ode.multilevel-compiler :as multilevel-compiler]
             [raster.compiler.equation-first :as equation]
@@ -70,6 +72,13 @@
           compiled (equation/compile operator {:target :ze:0 :dtype :double})
           plan (equation/lower compiled [destination source 3 5])]
       (is (seq (:outputs plan)))
+      (let [destination-node (some (fn [[id node]]
+                                     (when (identical? destination (:source node)) id))
+                                   (:nodes plan))]
+        (is (some? destination-node))
+        (is (contains? (:complete-writes (link-plan/initialization-contract plan))
+                       destination-node)
+            "the public optimized transfer retains complete destination coverage"))
       (if-not @gp/gpu-available?
         (gp/gpu-skip! "generated-coarse-fine-transfer")
         (with-open [executable (link/instantiate! plan)]
@@ -208,19 +217,55 @@
                            :hierarchy hierarchy :state state :distributed-plan (distributed/certify plan)
                            :coarse-fine scheduled}))))
 
+(defn- rectangular-effect-coverage-fixture
+  "Exercise the effect-region law directly, independently of whether the public
+   transfer frontend selects a functional map, scatter or ordered effect map."
+  []
+  (let [scalar (av/tensor {:dtype :long :shape []})
+        output (av/tensor {:dtype :double :shape '[rows columns]})
+        row-offset (with-meta '(clojure.core/* i width) {:tag 'long})
+        address (with-meta (list 'clojure.core/+ row-offset 'j) {:tag 'long})
+        store (list 'effect 'destination :unique address true 0.0)
+        loop (list 'effect-loop {:index 'j :lower 0} 'width
+                   (soac/effect-lambda-form '[j] [store]))
+        equation (list '= 0 '[written]
+                       (list 'effect-map
+                             {:index 'i :extent 'rows :dtypes [:double]
+                              :iteration-order :independent}
+                             [] '[columns] '[out]
+                             (soac/effect-lambda-form '[width destination] [loop])))
+        facts (assoc (soac/default-equation-facts)
+                     :effects #{:memory/write} :aliases {'written 'out}
+                     :attributes {:result-storage [{:destination 'out :access :write
+                                                    :host-return :effect}]})]
+    (soac/make
+     (soac/default-program-facts
+      {:values {'rows scalar 'columns scalar 'out output 'written output}
+       :inputs '[rows columns] :equations {0 facts} :effects #{:memory/write}})
+     [equation] '[written])))
+
 (deftest rectangular-coverage-retains-integer-and-control-semantics
-  (let [plan (equation/lower
-               (equation/compile #'multilevel/prolong-constant-2d! {:target :ze:0 :dtype :double})
-               [(double-array 60) (double-array 15) 3 5])
-        step (first (get-in plan [:instances 0 :call :steps]))
-        algorithm (get-in step [:equation :operations 0 :algorithm])
-        result (first (keys (:outputs step)))
-        scalars (merge (get-in plan [:instances 0 :call :scalar-values]) (:scalar-values step))
+  (let [algorithm (rectangular-effect-coverage-fixture)
+        result 'written
+        scalars {'rows {:type :long :value 6} 'columns {:type :long :value 10}}
         destination-parameter (-> algorithm soac/equations first soac/operation-parts
                                   :lambda soac/lambda-parts :parameters last)
         covers? #(boolean (coverage/rectangular-effect-covers? % result 60 scalars))
-        change-store (fn [f] (walk/postwalk (fn [x] (if (and (seq? x) (= 'effect (first x))) (f x) x)) algorithm))]
+        change-store (fn [f]
+                       (let [changed (atom 0)
+                             program (walk/postwalk
+                                      (fn [x]
+                                        (if (and (seq? x) (= 'effect (first x)))
+                                          (do (swap! changed inc) (f x)) x)) algorithm)]
+                         (is (= 1 @changed) "each negative oracle must modify the retained store")
+                         program))]
     (is (covers? algorithm))
+    (let [operation (first (soac-lower/lower-typed-effect-map algorithm :ze:0 :dtype :double))
+          execute (eval (list 'fn '[rows columns out] (segop-simd/compile-effect-segmap operation)))
+          output (double-array (repeat 60 9.0))]
+      (execute 6 10 output)
+      (is (= (vec (repeat 60 0.0)) (vec output))
+          "the certified rectangular fixture actually writes the complete domain"))
     (let [address-local
           (fn [type transform]
             (walk/postwalk

@@ -25,10 +25,12 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
+            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
@@ -71,8 +73,33 @@
                    :group-count (:num-blocks grid)
                    :shared-memory-bytes shared-memory-bytes}})))
 
+(defn scalar-empty-fold-schedule
+  "Canonical single-workitem schedule for an exact native empty scalar domain.
+   Source count conversion and initialization completion remain separate obligations."
+  [operator]
+  (let [operator (reduction/validate! operator)]
+    (reduction/schedule
+     {:strategy :scalar-empty-fold :workgroup-size 1
+      :stages [:identity :terminal-store] :tuning-space {}
+      :numerical-mode (select-keys (if (scan/associative-scan? (:algebra operator))
+                                    (:algebra operator)
+                                    (first (:components (:algebra operator))))
+                                  [:order :reassociation :overflow :nan-policy :signed-zero-policy])
+      :attributes {:phase :single :group-count 1 :shared-memory-bytes 0}})))
+
+(defn scalar-ordered-seeded-fold-schedule
+  "Canonical terminal left-fold schedule, without monoid or reassociation assumptions.
+   Selecting this schedule does not establish original source/read completion."
+  [operator]
+  (reduction/validate! operator)
+  (reduction/schedule
+   {:strategy :scalar-ordered-seeded-fold :workgroup-size 1
+    :stages [:seed :ordered-fold :terminal-store] :tuning-space {}
+    :numerical-mode {:order :source :reassociation :forbidden}
+    :attributes {:phase :single :group-count 1 :shared-memory-bytes 0}}))
+
 (defn- validate-scalar-segred!
-  "Validate the complete semantic/schedule subset implemented by the portable workgroup tree."
+  "Validate the scalar semantic subset and its exact tree, empty or ordered schedule."
   [segred out-sym array-types]
   (when-not (segop/seg-red? segred)
     (throw (ex-info "scalar reduction scheduling requires a SegRed"
@@ -100,6 +127,8 @@
                                "portable scalar SegRed requires an explicit reduction schedule"
                                {:operation (:id segred) :schedule (:schedule segred)
                                 :schedule-error (ex-data exception)})))
+        empty-fold? (= :scalar-empty-fold (:strategy schedule))
+        ordered-fold? (= :scalar-ordered-seeded-fold (:strategy schedule))
         result-region (get-in operator [:attributes :result-region])
         result-operands (vec (:operands result-region))
         result-operand-ids (set (map :sym result-operands))
@@ -180,11 +209,25 @@
       (decline! :workgroup-size
                 "portable scalar SegRed requires a positive power-of-two workgroup"
                 {:operation (:id segred) :workgroup-size workgroup-size}))
+    (when (and empty-fold?
+               (not (and (segop/empty-scalar-reduction? segred) (= 1 workgroup-size))))
+      (decline! :empty-scalar-domain
+                "empty scalar schedule requires an exact zero domain and one terminal workitem"
+                {:operation (:id segred) :space (:space segred) :phase phase :grid grid}))
+    (when (and ordered-fold?
+               (not (and (= :single phase) (= 1 workgroup-size num-blocks)
+                         (some? (:step operator)) (nil? (:combine operator)))))
+      (decline! :ordered-scalar-fold-domain
+                "ordered seeded fold requires one terminal workitem and an explicit scalar step"
+                {:operation (:id segred) :phase phase :grid grid}))
     (let [expected-level (if (= :block-local phase)
                            (segop/->SegLevel :block :virtual)
                            (segop/->SegLevel :block :none))
-          expected-shared-memory (* workgroup-size (dtype/bytes-of accumulator-dtype))
-          expected-schedule (scalar-workgroup-tree-schedule operator grid phase)]
+          expected-shared-memory (if (or empty-fold? ordered-fold?) 0
+                                    (* workgroup-size (dtype/bytes-of accumulator-dtype)))
+          expected-schedule (cond empty-fold? (scalar-empty-fold-schedule operator)
+                                  ordered-fold? (scalar-ordered-seeded-fold-schedule operator)
+                                  :else (scalar-workgroup-tree-schedule operator grid phase))]
       (when-not (= expected-level (:level segred))
         (decline! :phase-level
                   "scalar SegRed phase and execution level disagree"
@@ -499,19 +542,19 @@
                 {:expression expression :element-dtype (:type lowered)
                  :accumulator-dtype dtype}))
     {:operations (:operations lowered) :result (:result lowered)}))
-(defn lower
+(defn- lower-workgroup-tree
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
 
   `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
    accumulator remain uniform (int32/int64/FP32/FP64). A certified resident singleton used only
    by the terminal result region retains its own operand dtype. Integral combines retain their
    certified wrapping policy; integral scalar parameters may also participate in index expressions."
-  [segred out-sym & {:keys [dtype array-types array-shapes scalar-types coordinate-proof scalar-math]
+  [segred out-sym validated {:keys [dtype array-types array-shapes scalar-types coordinate-proof scalar-math]
                      :or {dtype :double array-types {} array-shapes {} scalar-types {}}}]
   (let [{validated-dtype :dtype output :output result-region :result-region
          result-operands :result-operands
          output-dtype :output-dtype}
-        (validate-scalar-segred! segred out-sym array-types)
+        validated
         dtype (or validated-dtype (:dtype segred) dtype)
         index (:name (segop/seg-space-reduced-dim (:space segred)))
         bound (:bound (segop/seg-space-reduced-dim (:space segred)))
@@ -770,6 +813,150 @@
      :group-count group-count
      :result-region result-region}))
 
+(defn- ordered-read-requirements [segred options]
+  (let [requirements (map-reads/fold-read-requirements segred options)]
+    (when-not (and (map? requirements)
+                   (= (set (keys requirements)) (set (segop/operation-inputs segred))))
+      (decline! :ordered-fold-read-footprint
+                "ordered fold requires independently proved capacities for every physical input"
+                {:operation (:id segred) :inputs (segop/operation-inputs segred)
+                 :requirements requirements}))
+    requirements))
+
+(defn- ordered-abi-minimum [segred input minimum options]
+  (let [bound (:bound (segop/seg-space-reduced-dim (:space segred)))
+        expanded-bound (launch/rebind-expression bound (:scalar-definitions options))
+        resident? (contains? (set (get-in segred [:reduction :attributes :resident-scalar-captures])) input)]
+    (cond
+      resident? minimum
+      (extent-expression/equivalent? minimum expanded-bound) '_n_bound
+      (and (symbol? bound) (not (contains? (set (:scalars segred)) bound)))
+      (launch/rebind-expression minimum {bound '_n_bound})
+      :else minimum)))
+
+(defn- scalar-leaf-interface
+  [segred {:keys [dtype output output-dtype result-region result-operands]}
+   {:keys [array-types array-shapes scalar-types] :as options}]
+  (let [arrays (vec (sort-by name (segop/operation-inputs segred)))
+        array-ids (set arrays)
+        ordered? (= :scalar-ordered-seeded-fold (get-in segred [:schedule :strategy]))
+        read-requirements (when ordered? (ordered-read-requirements segred options))
+        result-ids (set (map :sym result-operands))
+        captured-scalars (into (set (if (segop/empty-scalar-reduction? segred)
+                                      (segop/operation-scalars segred)
+                                      (:scalars segred)))
+                               (remove array-ids (drop 1 (:parameters result-region))))
+        pointer-parameters
+        (vec (concat
+              (map (fn [id]
+                     (let [storage-dtype (or (get array-types id)
+                                             (some #(when (= id (:sym %)) (:dtype %)) result-operands)
+                                             dtype)
+                           minimum (if ordered?
+                                     (ordered-abi-minimum segred id (get read-requirements id) options)
+                                     (if (contains? result-ids id) 1 '_n_bound))
+                           shape (or (get array-shapes id) [minimum])]
+                       (assoc (body/->KernelParameter id :input storage-dtype shape :global
+                                                      (layout/row-major shape storage-dtype) :operand)
+                              :minimum-elements minimum))) arrays)
+              [(body/->KernelParameter output :output output-dtype [1] :global
+                                       (layout/row-major [1] output-dtype) :result)]))
+        storage-types (scheduled-body/storage-scalar-closure pointer-parameters scalar-types #{'_n_bound})
+        scalars (vec (sort-by name (into captured-scalars (keys storage-types))))
+        parameters
+        (vec (concat pointer-parameters
+                     (map #(body/->KernelParameter % :scalar (or (get storage-types %) (get scalar-types %) dtype)
+                                                  [] nil nil :parameter) scalars)
+                     [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))]
+    {:arrays arrays :scalars scalars :parameters parameters}))
+
+(defn- ordered-step-lambda [operator]
+  (let [locals (mapv (fn [[id init]]
+                       (let [type (retained-expression-dtype id)]
+                         (when-not type
+                           (decline! :ordered-fold-local-dtype
+                                     "ordered fold locals require their retained binder dtype"
+                                     {:binding id :initializer init}))
+                         (dialect/local-value id type init)))
+                     (partition 2 (get-in operator [:step :bindings])))]
+    (dialect/lambda-form [(:accumulator (first (:components operator))) (:index operator)]
+                         locals (get-in operator [:step :results]))))
+
+(defn- lower-scalar-leaf
+  [segred {:keys [dtype output output-dtype result-region] :as validated}
+   {:keys [scalar-math] :as options} ordered?]
+  (let [{:keys [arrays scalars parameters]} (scalar-leaf-interface segred validated options)
+        reduction (:operator validated)
+        component (first (:components reduction))
+        seed (constant/literal-or-original (:neutral component))
+        bound (:bound (segop/seg-space-reduced-dim (:space segred)))
+        _ (when-not (number? seed)
+            (decline! :literal-seed "scalar leaf requires its actual numeric seed"
+                      {:operation (:id segred) :seed seed}))
+        empty-plan (when-not ordered? (scalar-plan segred))
+        parameter-types (into {} (map (juxt :id :dtype)) parameters)
+        scalar-environment (apply dissoc parameter-types (conj arrays output))
+        lowerer (when ordered?
+                  (scalar-expression/make-lowerer
+                   {:arrays (set arrays) :array-types (select-keys parameter-types arrays)
+                    :scalar-types scalar-environment
+                    :scalar-math scalar-math :require-source-types? true
+                    :lower-index (fn [expression scope]
+                                   (index-expression/lower-typed expression scope parameter-types :long decline!))
+                    :source-region (:step reduction) :id-prefix "ordered-scalar-fold" :decline! decline!}))
+        fold (when ordered?
+               (list 'fold {:identity seed :lower 0 :extent '_n_bound :dtype dtype :association :ordered}
+                     (ordered-step-lambda reduction)))
+        folded (when ordered? ((:lower lowerer) fold dtype scalar-environment))
+        final-value (if ordered? (:result folded) 'empty-fold-result)
+        transformed (when result-region
+                      (scalar-region-lower/lower
+                       result-region
+                       {:accumulator final-value :accumulator-dtype dtype :store-dtype output-dtype
+                        :scalar-math scalar-math
+                        :parameters (into {} (map (juxt :id clojure.core/identity)) parameters)
+                        :coordinate-lower (fn [operand-map]
+                                            (if (axis-map/singleton-broadcast? operand-map)
+                                              (axis-map/coordinate-exprs operand-map)
+                                              (decline! :full-reduction-result-operands
+                                                        "scalar leaf transform needs singleton operands"
+                                                        {:map operand-map})))
+                        :id-prefix "completed-scalar-leaf"}))
+        kernel-body
+        (body/make
+         {:id [:segred (:id segred) (if ordered? :ordered-seeded-fold :empty-fold)]
+          :parameters parameters :stable-reads (mapv body/stable-read arrays)
+          :allocations [] :indices [] :predicates []
+          :operations (vec (concat (if ordered? (:operations folded)
+                                      [(body/->ScalarCompute (body/value final-value dtype)
+                                                            (body/cast-expression
+                                                             (body/literal seed dtype)
+                                                             dtype :exact :exact))])
+                                   (:operations transformed)
+                                   [(body/->ScalarStore output [0]
+                                                       (or (:result transformed) final-value) nil)]))
+          :schedule (cond-> {:strategy (if ordered? :ordered-seeded-fold :empty-fold) :workgroup-size 1}
+                      (not ordered?) (assoc :reduction-operator (:operator empty-plan)))
+          :launch (launch/spec {:workgroup-size [1] :group-count [1] :shared-memory-bytes 0})
+          :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)
+                       :algorithm-dialect (:algorithm-dialect segred)}
+          :attributes (cond-> {:kind :scalar-reduction :seed seed}
+                        (not ordered?) (assoc :identity seed :operator (:operator empty-plan)
+                                             :numerical-policy (:numerical-policy empty-plan)))})]
+    {:kernel-body kernel-body :operator (:operator empty-plan) :identity seed
+     :numerical-policy (:numerical-policy empty-plan)
+     :arrays arrays :scalars scalars :output output :bound (if ordered? bound 0)
+     :group-count 1 :result-region result-region}))
+
+(defn lower
+  "Lower a validated scalar reduction through its explicit tree, empty or ordered schedule."
+  [segred out-sym & {:as options}]
+  (let [validated (validate-scalar-segred! segred out-sym (:array-types options))]
+    (case (get-in validated [:schedule :strategy])
+      :scalar-empty-fold (lower-scalar-leaf segred validated options false)
+      :scalar-ordered-seeded-fold (lower-scalar-leaf segred validated options true)
+      (lower-workgroup-tree segred out-sym validated options))))
+
 (defn- logical-bound-dtype
   [bound scalar-types]
   (let [scalar-dtype (fn [id]
@@ -799,6 +986,7 @@
                :dtype (:dtype options) :array-types (:array-types options)
                :array-shapes (:array-shapes options)
                :scalar-types scalar-types :coordinate-proof (:coordinate-proof options)
+               :scalar-definitions (:scalar-definitions options)
                :scalar-math (:scalar-math options))
         arguments (mapv (fn [parameter]
                           (if (= '_n_bound (:id parameter)) bound (:id parameter)))
@@ -816,12 +1004,14 @@
               (filterv (fn [[parameter _]] (= :scalar (:kind parameter)))
                        (map vector (:parameters kernel-body) arguments)))
         phase (:phase segred)
+        empty-fold? (segop/empty-scalar-reduction? segred)
+        ordered-fold? (= :scalar-ordered-seeded-fold (get-in segred [:schedule :strategy]))
         output-elements (launch/rebind-expression group-count {'_n_bound bound})
         integral? (dtype/integral? (:dtype segred))
         c-op ({:+ "+" :* "*" :min (if integral? "min" "fmin")
                :max (if integral? "max" "fmax")} operator)
         result-dtype (dtype/canon (or (:result-dtype result-region) (:dtype segred)))]
-    (when-not c-op
+    (when-not (or ordered-fold? c-op)
       (decline! :certified-monoid
                 "portable scalar reduction has no emitted combine spelling"
                 {:operation (:id segred) :operator operator}))
@@ -833,19 +1023,26 @@
       :effects {:kind :scalar-reduction-phase
                 :phase phase
                 :uses (scheduled-body/derive-uses kernel-body arguments)}
-      :legality {:kind :scalar-segred-workgroup-tree
+      :legality (cond-> {:kind (cond ordered-fold? :scalar-segred-ordered-seeded-fold
+                             empty-fold? :scalar-segred-empty-fold
+                             :else :scalar-segred-workgroup-tree)
                  :product-components 1
                  :segment-dimensions 0
                  :phase phase
                  :workgroup-size (get-in kernel-body [:schedule :workgroup-size])
                  :power-of-two-workgroup true
                  :terminal (contains? #{:single :cross-block} phase)
-                 :certified-monoid (get-in segred [:reduction :algebra])
-                 :identity identity
                  :uniform-dtype (dtype/canon (:dtype segred))}
-      :numerics (cond-> {:mode (if integral? :exact :reassociated)
-                         :policy :certified-workgroup-tree
-                         :rounding (if integral? :exact :implementation-defined)
+                  ordered-fold? (assoc :seed identity)
+                  (not ordered-fold?) (assoc :certified-monoid (get-in segred [:reduction :algebra])
+                                             :identity identity))
+      :numerics (cond-> {:mode (if (or integral? empty-fold? ordered-fold?) :exact :reassociated)
+                         :policy (cond ordered-fold? :source-ordered-seeded-fold
+                                       empty-fold? :exact-empty-fold
+                                       :else :certified-workgroup-tree)
+                         :rounding (cond ordered-fold? (if integral? :exact :nearest-even)
+                                        (or integral? empty-fold?) :exact
+                                        :else :implementation-defined)
                          :accumulator-dtype (dtype/canon (:dtype segred))}
                   (:overflow numerical-policy)
                   (assoc :overflow (:overflow numerical-policy))
@@ -862,18 +1059,18 @@
                           :result-dtype result-dtype}))
       :provenance {:dialect :kernel-body :source-dialect :segred
                    :segop-id (:id segred) :phase phase}
-      :attributes {:array-params arrays
+      :attributes (cond-> {:array-params arrays
                    :scalar-params scalars
-                   :strategy :scalar-workgroup-tree
+                   :strategy (get-in segred [:schedule :strategy])
                    :dtype (dtype/canon (:dtype segred))
                    :phase phase
                    :group-count output-elements
                    :output-elements output-elements
-                   :physical-result output
+                   :physical-result output}
+                    ordered-fold? (assoc :seed identity)
                    ;; Compatibility staging still combines partials on the host and consumes these
                    ;; values. They are projections of the proved monoid, not emitter inference.
-                   :identity-val identity
-                   :c-op c-op}}))))
+                    (not ordered-fold?) (assoc :identity-val identity :c-op c-op))}))))
 
 (defn validate-against-node!
   "Close scalar SegRed over its exact source, body, launch, and KernelGraph storage facts.
@@ -893,6 +1090,10 @@
                          identity)
         scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
         source (:source scheduled)
+        _ (when-not (semantic-fingerprint/equivalent? source (:operation node))
+            (decline! :schedule-source
+                      "scalar reduction source differs in retained types or numerical bits"
+                      {:source source :node-operation (:operation node)}))
         _ (when-not (segop/seg-red? source)
             (decline! :schedule-source
                       "scalar reduction storage closure requires an exact SegRed source"
@@ -925,6 +1126,14 @@
         group-count (get-in realized-launch [:group-count 0])
         workgroup-size (get-in source [:grid :block-size])
         shared-memory-bytes (get-in source [:grid :shared-mem-bytes])
+        ordered? (= :scalar-ordered-seeded-fold (get-in source [:schedule :strategy]))
+        read-requirements
+        (when ordered?
+          (ordered-read-requirements
+           source {:dtype (:dtype source)
+                   :array-types (into {} (map (juxt :id :dtype)) (vals buffers))
+                   :scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
+                   :scalar-definitions storage-scalars}))
         resident-scalar-captures
         (set (get-in source [:reduction :attributes :resident-scalar-captures]))]
     (doseq [[parameter argument] (map vector parameters arguments)
@@ -938,12 +1147,17 @@
                                 (apply launch/product realized-shape))
             source-elements (cond
                               (= :result (:role parameter)) output-elements
+                              ordered? (get read-requirements (:id parameter))
                               (contains? resident-scalar-captures (:id parameter)) 1
                               :else (:bound (segop/seg-space-reduced-dim (:space source))))
             input? (= :input (:kind parameter))
             minimum (:minimum-elements parameter)
             expected-minimum (when input?
-                               (if (contains? resident-scalar-captures (:id parameter)) 1 '_n_bound))]
+                               (if ordered?
+                                 (ordered-abi-minimum source (:id parameter)
+                                                      (get read-requirements (:id parameter))
+                                                      {:scalar-definitions storage-scalars})
+                                 (if (contains? resident-scalar-captures (:id parameter)) 1 '_n_bound)))]
         (when-not (and buffer
                        (= expected-minimum minimum)
                        (= 1 (count realized-shape))
@@ -952,6 +1166,10 @@
                           (project-extent (if input?
                                             (launch/rebind-expression minimum bindings)
                                             realized-elements)))
+                       (or (not (and ordered? input?))
+                           (map-reads/graph-capacity-covers?
+                            (project-extent (:elements buffer)) (project-extent source-elements)
+                            (:preconditions kernel-graph)))
                        (= (project-extent realized-elements)
                           (project-extent (:elements buffer))))
           (decline! :storage-extent
@@ -994,8 +1212,9 @@
                                      ;; aliases. They parameterize representation, not arithmetic.
                                      :array-shapes (into {} (map (juxt :id :shape))
                                                          (filter #(= :input (:kind %)) parameters))
+                                     :scalar-definitions storage-scalars
                                      :scalar-types scalar-types}))]
-      (when-not (= expected scheduled)
+      (when-not (semantic-fingerprint/equivalent? expected scheduled)
         (decline! :schedule-source
                   "scalar SegRed scheduled body is not the exact refinement of its source"
                   {:node (:id node) :source (:id source)

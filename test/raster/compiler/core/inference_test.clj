@@ -1,6 +1,125 @@
 (ns raster.compiler.core.inference-test
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.core.inference :as inf]))
+            [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.par]))
+
+(deftest late-inference-retains-boxed-entry-result-declarations
+  (doseq [[carrier tag] [[Float/TYPE 'float] [Double/TYPE 'double] [Long/TYPE 'long]
+                         [(class (double-array 0)) 'doubles] [(class (float-array 0)) 'floats]]]
+    (let [term (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier)
+                                          (with-meta 'input {:raster.type/tag 'wrong}))]
+      (is (= tag (inf/infer-arg-tag term {'input 'Object})))
+      (is (nil? (:tag (meta term))) "logical declaration is not a JVM storage hint"))))
+
+(deftest source-qualification-transports-only-a-completions-operand
+  (let [scope (create-ns (gensym "raster.qualified-completion."))
+        contract (completion/bytecode-result-context-contract
+                  (completion/bytecode-operand-context {}) :double)
+        expression (completion/complete-value contract '(inc value))
+        observed (atom [])]
+    (try
+      (binding [*ns* scope] (clojure.core/refer 'clojure.core))
+      (let [result (inf/qualify-body-symbols expression scope '#{value} #(swap! observed conj %))]
+        (is (identical? contract (second result)))
+        (is (= '(clojure.core/inc value) (nth result 2)))
+        (is (= (meta expression) (meta result)))
+        (is (= ['inc] (mapv :symbol @observed))))
+      (let [expression (completion/complete-value contract 'value)]
+        (is (identical? expression (inf/qualify-body-symbols expression scope '#{value}))))
+      (reset! observed [])
+      (is (= :invalid-value-completion
+             (try (inf/qualify-body-symbols
+                   (list completion/completion-symbol (assoc contract :unexpected true) '(inc value))
+                   scope '#{value} #(swap! observed conj %))
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (empty? @observed))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest source-qualification-keeps-literals-and-parallel-binders-lexical
+  (let [scope (create-ns (gensym "raster.qualified-scopes."))
+        source '(raster.par/reduce acc 0.0 i 2 (clojure.core/+ acc (double i)))
+        quoted (with-meta '(quote [acc i]) {:literal-marker :kept})]
+    (try
+      (doseq [name '[acc i]] (intern scope name 100))
+      (is (identical? quoted (inf/qualify-body-symbols quoted scope #{})))
+      (is (= source (inf/qualify-body-symbols source scope #{})))
+      (is (= 1.0 (eval (inf/qualify-body-symbols source scope #{}))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest source-qualification-construction-and-resolution-observers-are-independent
+  (let [scope (create-ns (gensym "raster.qualified-construction."))
+        call '(inc n) local '(f x) quoted '(quote [(inc n)])
+        source (list 'let* ['x call] (list 'fn* ['f] local) quoted)
+        constructors (atom []) resolutions (atom [])]
+    (try
+      (binding [*ns* scope] (clojure.core/refer 'clojure.core))
+      (let [projected (inf/qualify-body-symbols source scope '#{n} #(swap! resolutions conj %)
+                                               #(swap! constructors conj [%1 %2 %3]))
+            observed (fn [original] (first (filter #(identical? original (first %)) @constructors)))]
+        (is (= projected (inf/qualify-body-symbols source scope '#{n})))
+        (is (identical? projected (second (observed source))))
+        (is (= '(clojure.core/inc n) (second (observed call))))
+        (is (= local (second (observed local))))
+        (is (= '#{x f} (nth (observed local) 2)))
+        (is (identical? quoted (second (observed quoted))))
+        (is (nil? (observed (first (second quoted)))))
+        (is (some #(= #'clojure.core/inc (:result %)) @resolutions)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"construction observer failed"
+                           (inf/qualify-body-symbols call scope '#{n} nil
+                             (fn [& _] (throw (ex-info "construction observer failed" {}))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest source-qualification-threads-sequential-and-recursive-scopes
+  (let [scope (create-ns (gensym "raster.qualified-sequential."))]
+    (try
+      (doseq [[name value] [['x 100] ['y 7] ['self (Object.)] ['n (Object.)]]]
+        (intern scope name value))
+      (let [bindings (with-meta '[before x x 2 after x] {:binding-marker :kept})
+            source (list 'let* bindings (with-meta '[before after y] {:product-marker :kept}))
+            projected (inf/qualify-body-symbols source scope #{})]
+        (is (= [100 2 7] (eval projected)))
+        (is (= :kept (:binding-marker (meta (second projected)))))
+        (is (= :kept (:product-marker (meta (last projected))))))
+      (let [source '(fn* self [n]
+                      (if (clojure.core/zero? n) 0
+                        (clojure.core/inc (self (clojure.core/dec n)))))
+            projected (inf/qualify-body-symbols source scope #{})]
+        (is (= source projected))
+        (is (= 3 ((eval projected) 3))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest source-qualification-preserves-free-reference-metadata
+  (let [scope (create-ns (gensym "raster.qualified-reference."))
+        reference (with-meta 'external {:raster.type/tag 'double :reference-marker :kept})]
+    (try
+      (intern scope 'external 3.0)
+      (let [projected (inf/qualify-body-symbols reference scope #{})]
+        (is (= (symbol (str (ns-name scope)) "external") projected))
+        (is (= (meta reference) (meta projected))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest structural-classes-move-across-namespaces-without-changing-method-names
+  (let [scope (create-ns (gensym "raster.qualified-classes."))]
+    (try
+      (doseq [class [java.io.IOException java.util.ArrayList java.util.Collections java.util.function.IntUnaryOperator]]
+        (.importClass ^clojure.lang.Namespace scope class))
+      (doseq [name '[this x applyAsInt e]] (intern scope name (Object.)))
+      (let [project #(inf/qualify-body-symbols % scope #{})
+            caught (project '(try (throw (new IOException)) (catch IOException e 7)))
+            operator (project '(reify* [IntUnaryOperator]
+                                 (applyAsInt [this x] (int (clojure.core/+ x 3)))))
+            object (eval operator)]
+        (is (= 7 (eval caught)))
+        (is (= 'java.io.IOException (second (last caught))))
+        (is (= 'applyAsInt (first (nth operator 2))))
+        (is (= 7 (.applyAsInt ^java.util.function.IntUnaryOperator object 4)))
+        (is (instance? java.util.ArrayList (eval (project '(new ArrayList)))))
+        (is (instance? java.util.ArrayList
+                       ((eval (project '(fn* [ArrayList] (new ArrayList)))) :not-a-class)))
+        (is (= [] (eval (project '(Collections/emptyList))))))
+      (finally (remove-ns (ns-name scope))))))
 
 ;; Helper to build a minimal type-env for infer-binding-tag
 (defn- type-env

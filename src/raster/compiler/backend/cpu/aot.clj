@@ -35,6 +35,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.scalar.host-entry-contract :as host-entry]
+            [raster.compiler.passes.scalar.local-products :as local-products]
             [raster.compiler.passes.scalar.peephole :as peephole]))
 
 (def ^:dynamic *simd-preamble*
@@ -913,6 +914,22 @@
                             {:reason :unsupported-native-return :return-tag return-tag})))
         {:keys [form parallel-program params param-env]}
         (fused-scalar-form f-var dtype :simd? simd? :no-alias? no-alias?)
+        ;; Use the actual native scalar ABI, not the ambient element dtype, as
+        ;; the parameter payload authority. Arrays remain nullable references.
+        scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
+                             [p (elem->ctype (tag->elem (get param-env p)) "int")]))
+        parameter-facts (into (into {} (keep (fn [[p tag]]
+                                              (when (contains? types/primitive-array-info tag)
+                                                [p {:presence :unknown :array-tag tag}])) param-env))
+                             (keep (fn [[p c]]
+                                        (let [dt (ctype->ffm c nil)]
+                                          (when (#{:float :double} dt)
+                                            [p {:presence :present :scalar-type dt
+                                                :producer-scalar-type dt}])))) scalar-params)
+        form (local-products/project-storage-alias-snapshots
+              form parameter-facts
+              (when (#{:float :double} return-type)
+                (types/tag->java-class (dtype/scalar-tag-for-dtype return-type))))
         form (recover-rectangular-maps form)
         {nform :form length-syms :length-syms} (normalize-for-c form)
         ;; The lowering pipeline uses hygienic gensyms. Canonicalize the final
@@ -925,9 +942,6 @@
         ;; input array params as [sym ctype] (per-element type), scalars as [sym ctype]
         array-params  (vec (for [p params :when (contains? array-tags (get param-env p))]
                              [p (elem->ctype (tag->elem (get param-env p)) "double")]))
-        ;; scalar params typed from their tag (double eps, long n, ...), not all int.
-        scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
-                             [p (elem->ctype (tag->elem (get param-env p)) "int")]))
         ;; Retain access authority BEFORE discharging source assertions. Removing
         ;; an entry guard cannot turn an originally writable argument into const.
         written (written-pointer-syms unsimplified parallel-program

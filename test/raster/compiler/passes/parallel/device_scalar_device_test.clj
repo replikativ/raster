@@ -8,9 +8,10 @@
             [raster.gpu.device-probe :as opencl]
             [raster.dl.gpu-grad-parity :as ze]))
 
-(defn- check-device! [device dialect]
-  (let [algorithm (#'fixture/scalar-program)
-        operation (first (lower/lower-typed-scalar
+(defn- check-device!
+  ([device dialect] (check-device! device dialect (#'fixture/scalar-program)))
+  ([device dialect algorithm]
+  (let [operation (first (lower/lower-typed-scalar
                           algorithm device :target-descriptor @#'fixture/target-descriptor))
         emitted (target/emit-program (#'fixture/scheduled-program algorithm operation)
                                      {:target-dialect dialect})
@@ -32,7 +33,7 @@
                 (is (= (Double/doubleToRawLongBits expected)
                        (Double/doubleToRawLongBits (double actual)))
                     (str device " preserves the Float checkpoint before Double widening")))))
-          (finally (gpu/release-kernel-graph! session handle)))))))
+          (finally (gpu/release-kernel-graph! session handle))))))))
 
 (deftest resident-rank-zero-scalar-kernel-replays-changed-inputs-on-local-backends
   (if @opencl/opencl-fp64-available?
@@ -44,3 +45,15 @@
         (check-device! :ze:0 :opencl-intel)
         (ze/gpu-capability-skip! "typed scalar substrate" :fp64? caps)))
     (ze/gpu-skip! "typed scalar substrate")))
+
+(deftest required-scalar-payload-transport-executes-on-local-backends
+  (let [algorithm (#'fixture/required-resident-payload-program)]
+    (if @opencl/opencl-fp64-available?
+      (check-device! :ocl:0 :opencl-portable algorithm)
+      (opencl/opencl-skip! "required scalar payload" :fp64))
+    (if @ze/gpu-available?
+      (let [caps ((requiring-resolve 'raster.gpu.ze-runtime/module-capabilities))]
+        (if (:fp64? caps)
+          (check-device! :ze:0 :opencl-intel algorithm)
+          (ze/gpu-capability-skip! "required scalar payload" :fp64? caps)))
+      (ze/gpu-skip! "required scalar payload"))))

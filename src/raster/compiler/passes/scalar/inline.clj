@@ -12,8 +12,12 @@
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.par :as par]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.core :as rcore]
@@ -165,7 +169,7 @@
   [arg]
   (and (coll? arg) (nil? (constant/value arg))))
 
-(defn- check-inline-arity! [callee params args call]
+(defn ^:no-doc check-inline-arity! [callee params args call]
   (when (not= (count params) (count args))
     (throw (ex-info
             (str "Arity mismatch inlining `" callee "`: it takes "
@@ -176,7 +180,7 @@
 
 (defn- argument-substitution
   "Build a call-by-value substitution, emitting argument bindings in source order."
-  [params args tags source-env emit! & [force-bindings?]]
+  [params args tags source-env emit! & [force-bindings? observe-slot!]]
   (into {}
         (map-indexed
          (fn [i p]
@@ -194,9 +198,21 @@
                                        (cond-> (meta a)
                                          source-tag (assoc :raster.type/tag source-tag))))]
                  (emit! [id a])
+                 (when observe-slot! (observe-slot! {:ordinal i :formal p :argument a :binder id}))
                  [p id])
-               [p a])))
+               (do
+                 (when observe-slot! (observe-slot! {:ordinal i :formal p :argument a}))
+                 [p a]))))
          params)))
+
+(defn ^:no-doc prepare-call-arguments
+  "Use the shared call-by-value planner for an internal whole-call projection.
+   Result bindings retain actual source argument types, not formal coercions."
+  [callee params args source-env]
+  (check-inline-arity! callee params args {:callee callee :args args})
+  (let [bindings (atom [])
+        substitutions (argument-substitution params args nil source-env #(swap! bindings conj %))]
+    {:bindings @bindings :substitutions substitutions}))
 
 (defn- safe-to-inline?
   "Check if a resolved deftm body is safe to inline.
@@ -206,7 +222,7 @@
   [_deftm-info]
   true)
 
-(defn- try-resolve-walked-body
+(defn- resolve-walked-body-input
   "Try to extract walked body from a var. Returns {:params :walked-body :tags} or nil.
   Checks both var metadata (normal deftm) and the deref'd value's metadata
   (for value+grad/grad results stored in vars).
@@ -215,21 +231,44 @@
   (source-owner/assert-portable-source! (meta v))
   (when (var? v)
     (source-owner/assert-portable-source! (try (meta @v) (catch Exception _ nil))))
-  (let [;; Materialize the walked body FIRST: ensure-walked-body! lazily walks the
-        ;; deftm and stamps deftm-params/deftm-tags/return-tag/typed-body onto the
-        ;; var. Reading (meta v) before this returns stale meta with no params, so
-        ;; a cold (never-JIT'd) callee like valley.core/chunk-block would fail the
-        ;; guard below even though its body is perfectly inlinable.
-        _ (when (instance? clojure.lang.Var v)
+  (let [;; Freeze the original producer first. Walking the legacy cache before
+        ;; preparation would expand a cold helper's macros twice.
+        _ (when (and (var? v) (:raster.core/deftm (meta v)) method-entry/*emission-inputs*)
+            ;; Selection may already have observed several pending receivers.
+            ;; Freeze that known frontend frontier as one preparation batch,
+            ;; rather than consuming one whole-owner retry for each helper.
+            ;; The service checks the ORIGINAL history after the batch and
+            ;; forces the enclosing producer to restart on any publication.
+            (let [pending (into []
+                                (keep (fn [[receiver snapshot]]
+                                        (let [spec (get-in snapshot [:metadata :raster.core/jit-spec])]
+                                          (when (and (map? spec) (nil? (:frontend-source-owner spec)))
+                                            receiver))))
+                                (:definition-proofs @method-entry/*emission-inputs*))]
+              (when (seq pending)
+                (method-entry/prepare-pending-definition-inputs!
+                 rcore/prepare-implementation-frontend! pending))))
+        _ (when (var? v) (rcore/prepare-deftm-frontend! v))
+        retained-frontend (when (:raster.core/deftm (meta v))
+                            (method-entry/original-source-frontend v))
+        _ (when (and (var? v) (nil? retained-frontend))
             (try (rcore/ensure-walked-body! v) (catch Exception _ nil)))
-        metadata (meta v)
+        _ (when method-entry/*emission-inputs*
+            (method-entry/observe-definition-input! v (:ns (meta v)) (:name (meta v))))
+        snapshot (when method-entry/*emission-inputs*
+                   (get-in @method-entry/*emission-inputs* [:definition-proofs v]))
+        ;; Derive the imported body from the observation, not a metadata read
+        ;; made before it. A later policy/body mutation cannot bless old code.
+        metadata (if snapshot (:metadata snapshot) (meta v))
         ;; Also check the fn object's metadata (for value+grad results)
-        val-metadata (when (instance? clojure.lang.Var v)
-                       (try (meta @v) (catch Exception _ nil)))
+        observed-value (when (var? v) (if snapshot (:value snapshot) @v))
+        val-metadata (meta observed-value)
         _ (source-owner/assert-portable-source! metadata)
         _ (source-owner/assert-portable-source! val-metadata)
-        walked-body (or (:raster.core/deftm-walked-body-typed metadata)
-                        (:raster.core/deftm-walked-body metadata)
+        var-body (or (:body retained-frontend)
+                     (:raster.core/deftm-walked-body-typed metadata)
+                     (:raster.core/deftm-walked-body metadata))
+        walked-body (or var-body
                         (:raster.core/deftm-walked-body-typed val-metadata)
                         (:raster.core/deftm-walked-body val-metadata))
         params (or (:raster.core/deftm-params metadata)
@@ -237,11 +276,21 @@
         tags (or (:raster.core/deftm-tags metadata)
                  (:raster.core/deftm-tags val-metadata))
         return-tag (or (:raster.core/return-tag metadata)
-                       (:raster.core/return-tag val-metadata))]
-    (when (and walked-body params (not (:no-inline metadata)))
-      (let [effective-wb (if (> (count walked-body) 1)
-                           [(apply list 'do walked-body)]
-                           walked-body)]
+                       (:raster.core/return-tag val-metadata))
+        captured (when (contains? val-metadata :raster.ad.reverse/prepared-program)
+                   ((requiring-resolve 'raster.ad.reverse/captured-prepared-callable)
+                    observed-value val-metadata))
+        prepared (:prepared captured)
+        projection-mode (:mode captured)]
+    (if prepared
+      (when-not (or (:no-inline metadata) (:no-inline val-metadata))
+        ;; Never import its ordinary walked-body metadata as a helper frontend.
+        ;; Both generic expansion sites consume this through the shared projector.
+        {:params (:params prepared) :tags (:tags prepared)
+         :walked-body (:walked-body prepared)
+         :prepared-program prepared :projection-mode projection-mode})
+      (when (and walked-body params (not (:no-inline metadata)))
+      (let [effective-wb (source-transport/effective-body walked-body)]
         ;; Scalar-result helpers may read array inputs without owning array storage. Preserve
         ;; the declared return fact when distinguishing them from array-returning helpers.
         (when (binding [*inline-scalar-bodies?*
@@ -252,27 +301,15 @@
                              (let [callee (symbol (str (:ns metadata)) (str (:name metadata)))]
                                (not (canonical-callee callee))))]
                 (inlinable-body? (first effective-wb)))
-          (let [source-ns-sym (symbol (str (.name (.ns v))))
+          (let [_ (method-entry/observe-source-body-input! v (if var-body :var :value))
+                _ (when (and method-entry/*emission-inputs* (nil? retained-frontend))
+                    ;; A legacy walked cache or generated function value is
+                    ;; usable for existing non-owning compilation, but cannot
+                    ;; authenticate the live helper's original source body.
+                    (swap! method-entry/*emission-inputs* update :unclosed-source-imports
+                           (fnil conj #{}) [:unowned-helper-frontend v]))
+                source-ns-sym (symbol (str (.name (.ns v))))
                 source-ns (try (the-ns source-ns-sym) (catch Exception _ nil))
-                param-set (set (map #(if (symbol? %) % (symbol (name %))) params))
-                ;; Qualify non-primitive tags to fully-qualified class names.
-                ;; e.g. DP5Cache → raster.ode.core.DP5Cache so the bytecode
-                ;; backend can resolve them in any namespace context.
-                prim-tags #{'double 'long 'float 'int 'Double 'Long 'Float 'Integer
-                            'doubles 'floats 'longs 'ints 'objects}
-                qualified-tags
-                (when (and tags source-ns)
-                  (mapv (fn [t]
-                          (if (or (nil? t) (prim-tags t)
-                                  (.contains (str t) "."))
-                            t ;; already qualified or primitive
-                            (if-let [cls (try (ns-resolve source-ns (symbol (str t)))
-                                              (catch Exception _ nil))]
-                              (if (class? cls)
-                                (symbol (.getName ^Class cls))
-                                t)
-                              t)))
-                        tags))
             ;; Alpha-rename the callee body's INTERNAL binders (let/loop/par
             ;; induction vars, accumulators) to fresh names on EVERY resolve, so a
             ;; splice into a caller cannot capture — or be captured by — a same-named
@@ -282,14 +319,13 @@
             ;; → the index never advances → infinite hang. util/alpha-convert renames
             ;; only bound vars (params stay free for subst); fresh-like preserves the
             ;; name prefix + tags, so name-based heuristics and dtype tags survive.
-                hygienic-wb (mapv util/alpha-convert effective-wb)]
-            (if source-ns
-              {:params params
-               :tags (or qualified-tags tags)
-               :return-tag return-tag
-               :walked-body (mapv #(inf/qualify-body-symbols % source-ns param-set)
-                                  hygienic-wb)}
-              {:params params :tags tags :return-tag return-tag :walked-body hygienic-wb})))))))
+                imported (source-transport/prepare-inline-body retained-frontend walked-body params tags source-ns)]
+            (merge {:params params :return-tag return-tag}
+                   imported))))))))
+
+(defn- try-resolve-walked-body [v]
+  ;; Rejected inlining candidates do not become executable dependencies.
+  (method-entry/call-with-optional-definition-inputs #(resolve-walked-body-input v)))
 
 (defn- force-mangled-specialization!
   "Fresh-JVM determinism: a walked body may reference a mangled specialization
@@ -319,64 +355,54 @@
               (inf/try-parametric-specialize! parent-sym tags)
               (try (resolve base-sym) (catch Exception _ nil)))))))))
 
+(defn- selected-inline-var
+  "Select a generic call through the shared inference authority, never its body
+   cache or the number of currently registered methods. Unknown/missing tuples
+   abstain. Promotion still needs explicit call completion before inlining."
+  [sym table arg-tags]
+  (when (and (vector? arg-tags) (every? some? arg-tags))
+    (let [v (resolve sym)]
+      (when-not (and (var? v) (identical? table (:raster.core/dispatch-table (meta v))))
+        (throw (ex-info "Inline selection differs from its actual generic definition"
+                        {:reason :unclosed-inline-dispatch :callee sym})))
+      (method-entry/observe-definition-input! v *ns* sym))
+    (when (and (= 1 (count @table)) (not (contains? @table (count arg-tags))))
+      (let [expected (first (keys @table))]
+        (throw (ex-info (str "Arity mismatch inlining `" sym "`: it takes " expected
+                             " arg(s) but the call passes " (count arg-tags) ".")
+                        {:callee sym :expected-arity expected :actual-arity (count arg-tags)
+                         :arg-tags arg-tags}))))
+    (when-let [signature (inf/specialize-call-signature sym arg-tags)]
+      (when-not (some some? (:promotion-casts signature))
+        (try (resolve (:mangled-sym signature)) (catch Exception _ nil))))))
+
 (defn- try-resolve-deftm
   "Try to resolve a symbol to a deftm var with an inlinable walked body.
-   When arg-tags are provided, selects the matching overload from multi-method
-   dispatch tables. Without arg-tags, only inlines single-method dispatch."
+   Generic calls require a complete argument tuple and shared dispatch selection.
+   A single registered method is not evidence it accepts the actual arguments.
+   Already-selected implementation Vars remain a separate resolution boundary."
   ([sym] (try-resolve-deftm sym nil))
   ([sym arg-tags]
-   (when (qualified-symbol? sym)
-     (let [name-str (name sym)
-           base-sym (if (.endsWith ^String name-str "-impl")
-                      (symbol (namespace sym) (subs name-str 0 (- (count name-str) 5)))
-                      sym)
-           ;; Single source of truth for inline opacity (direct + `_m_` parent).
-           dispatch-no-inline? (dispatch/no-inline? base-sym)]
-       (when-not dispatch-no-inline?
-         (when-let [v (or (try (resolve base-sym) (catch Exception _ nil))
-                          ;; Cold-compile gate: the mangled specialization does not
-                          ;; exist yet in this JVM — force it deterministically so the
-                          ;; FIRST compile behaves like every later one.
-                          (force-mangled-specialization! base-sym))]
-           (when-not (:no-inline (meta v))
-             (let [parametric-sym (symbol (namespace base-sym) (name base-sym))
-                   has-parametric? (contains? @dispatch/parametric-registry parametric-sym)]
-               (or
-                ;; For parametric (All [T]) functions, skip the var's parametric
-                ;; template body — its literals are still T-generic. Force the
-                ;; dispatch-table path so try-parametric-specialize! generates
-                ;; (or finds) a concrete entry whose body has the literal-cast-fn
-                ;; applied (e.g. `0.0` → `(float 0.0)` for T=float).
-                (when-not has-parametric?
-                  (try-resolve-walked-body v))
-                (when-let [dispatch-table (:raster.core/dispatch-table (meta v))]
-                  (let [all-methods (mapcat identity (vals @dispatch-table))
-                      ;; Type-safe overload selection with parametric specialization.
-                      ;; Single-method fallback only when function is NOT parametric
-                      ;; (i.e., the one method IS the only possible overload).
-                        match (or (when (seq arg-tags)
-                                    (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
-                                      ;; No match — try parametric specialization
-                                        (when (inf/try-parametric-specialize!
-                                               parametric-sym arg-tags)
-                                          (let [new-methods (mapcat identity
-                                                                    (vals @(:raster.core/dispatch-table (meta v))))]
-                                            (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
-                                ;; Single method fallback: safe when no other overloads exist
-                                ;; AND function is not parametric. Parametric functions
-                                ;; may need a different specialization that hasn't been
-                                ;; generated yet — inlining the only existing overload
-                                ;; (e.g. doubles) into a float pipeline causes VerifyErrors.
-                                  (when (and (= 1 (count all-methods))
-                                             (not has-parametric?))
-                                    (first all-methods)))]
-                    (when match
-                      (let [backing-sym (symbol (namespace base-sym)
-                                                (str (types/mangle (name base-sym)
-                                                                   (:tags match))))
-                            backing-var (try (resolve backing-sym) (catch Exception _ nil))]
-                        (when backing-var
-                          (try-resolve-walked-body backing-var)))))))))))))))
+   (method-entry/call-with-optional-definition-inputs
+    (fn []
+      (when (qualified-symbol? sym)
+        (let [name-str (name sym)
+              base-sym (if (.endsWith ^String name-str "-impl")
+                         (symbol (namespace sym) (subs name-str 0 (- (count name-str) 5)))
+                         sym)
+              ;; Single source of truth for inline opacity (direct + `_m_` parent).
+              dispatch-no-inline? (dispatch/no-inline? base-sym)]
+          (when-not dispatch-no-inline?
+            (when-let [v (or (try (resolve base-sym) (catch Exception _ nil))
+                             ;; Cold-compile gate: the mangled specialization does not
+                             ;; exist yet in this JVM — force it deterministically so the
+                             ;; FIRST compile behaves like every later one.
+                             (force-mangled-specialization! base-sym))]
+              (when-not (:no-inline (meta v))
+                (if-let [table (:raster.core/dispatch-table (meta v))]
+                  (when-let [selected (selected-inline-var base-sym table arg-tags)]
+                    (try-resolve-walked-body selected))
+                  (try-resolve-walked-body v)))))))))))
 
 (def ^:private alloc-sym->array-tag op/alloc-sym->array-tag)
 
@@ -388,14 +414,9 @@
 (defn- subst-sym-leaf
   "Substitute a single symbol according to smap, preserving metadata."
   [smap expr]
-  (let [replacement (get smap expr expr)]
-    (if (and (not (identical? replacement expr))
-             (symbol? replacement)
-             (meta expr))
-      (vary-meta replacement merge (meta expr))
-      replacement)))
+  (util/subst-symbol-preserving-meta smap expr))
 
-(defn- subst-syms
+(defn ^:no-doc subst-syms
   "Capture-avoiding symbol substitution — delegates to the unified
    `util/subst-syms` (generic over form/scope-info, so it correctly handles
    EVERY closed-core binder incl. all par variants — map2!/map-void!/scan/
@@ -403,8 +424,8 @@
    all of which this pass's former hand-rolled version mis-handled or dropped
    into a capturing `:else`). `subst-sym-leaf` is passed as the leaf policy so
    use-site metadata is preserved onto the replacement (type-tag propagation)."
-  [smap expr]
-  (util/subst-syms smap expr subst-sym-leaf))
+  ([smap expr] (util/subst-syms smap expr subst-sym-leaf))
+  ([smap expr observe!] (util/subst-syms smap expr subst-sym-leaf observe!)))
 
 (defn- subst-syms-safe
   "Like subst-syms but also rewrites devirtualized core array ops to
@@ -413,6 +434,257 @@
   ;; Merge devirt->dispatch as base, smap overrides — then use
   ;; the scope-aware subst-syms which handles scoping correctly.
   (subst-syms (merge devirt->dispatch smap) expr))
+
+(defn- substitution-products-preserved? [expected actual]
+  ;; Substitution cannot rebuild a quoted reference-valued product. Fingerprints
+  ;; alone compare its contents, not this source identity obligation. General map
+  ;; and set reconstruction is deliberately outside this bounded source relation.
+  (cond
+    (identical? expected actual) true
+    (and (seq? expected) (#{'quote 'clojure.core/quote} (first expected))) false
+    (or (seq? expected) (vector? expected))
+    (and (if (seq? expected) (seq? actual) (vector? actual))
+         (= (count expected) (count actual))
+         (every? true? (map substitution-products-preserved? expected actual)))
+    (coll? expected) false
+    :else true))
+
+(defn ^:no-doc nested-expansion-substitution-view
+  "Independently check a nested shared-builder substitution against its exact import.
+   Slots are positional, including repeated and unused arguments. This checks only
+   the substitution law: no call selection, conversions, final placement or execution
+   permission follows. Flat placement and unsupported comparisons abstain."
+  [{:keys [source-import walked-body params tags]} arguments expansion]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+  (when (and (vector? arguments) (map? expansion) (vector? (:argument-slots expansion))
+             (every? #(and (map? %) (or (nil? (:binder %)) (symbol? (:binder %))))
+                     (:argument-slots expansion))
+             (vector? (:argument-bindings expansion))
+             (every? #(and (vector? %) (= 2 (count %))) (:argument-bindings expansion)))
+   (when-let [imported (source-transport/body-import-view source-import walked-body)]
+    (when (and (identical? params (:parameters imported)) (identical? tags (:tags imported)))
+    (let [parameters (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
+          slots (:argument-slots expansion)
+          bindings (:argument-bindings expansion)
+          body (first (source-transport/effective-body walked-body))
+          ;; No generated argument binder may capture any name in an initializer
+          ;; or imported body, even a bound name. This is stricter than free-vars.
+          names (into (set parameters)
+                      (filter symbol?)
+                      (tree-seq coll? seq (cons body arguments)))
+          lifted (filterv #(some? (:binder %)) slots)
+          binders (mapv :binder lifted)]
+      (when (and (contains? expansion :body) (not (contains? expansion :bindings))
+                 (= (count parameters) (count arguments) (count slots))
+                 (= (count bindings) (count lifted))
+                 (= (count binders) (count (set binders)))
+                 (every? #(and (symbol? %) (nil? (namespace %)) (not (contains? names %))) binders)
+                 (every? true?
+                         (map-indexed
+                          (fn [i {:keys [ordinal formal argument binder]}]
+                            (and (= ordinal i) (= formal (nth parameters i))
+                                 (identical? argument (nth arguments i))
+                                 (or (some? binder) (not (coll? argument))
+                                     (some? (constant/source-value argument))))) slots))
+                 (every? true?
+                         (map (fn [[id init] slot]
+                                (and (identical? id (:binder slot))
+                                     (identical? init (:argument slot)))) bindings lifted)))
+        (let [substitutions (into {} (map (fn [{:keys [formal argument binder]}]
+                                            [formal (or binder argument)]) slots))
+              calls (volatile! [])
+              expected (subst-syms substitutions body
+                                   (fn [original constructed _]
+                                     (when (form/call-form? original)
+                                       (vswap! calls conj {:original original :constructed constructed}))))
+              equivalent? (try (and (substitution-products-preserved? expected (:body expansion))
+                                    (fingerprint/equivalent? expected (:body expansion)))
+                               (catch clojure.lang.ExceptionInfo error
+                                 (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
+                                   false
+                                   (throw error))))]
+          (when equivalent?
+            {:callee-import imported :argument-slots slots
+             :argument-bindings bindings :substitutions substitutions
+             :body (:body expansion) :replayed-body expected :replayed-calls @calls}))))))))))
+
+(defn ^:no-doc nested-builder-substitution-view
+  "Check a recorded nested frame's local substitution without equating its caller
+   or rewritten arguments to root source. No conversion/placement/execution grant."
+  [construction expansion]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [source-import walked-body arguments callee-import] :as event}
+                (source-transport/builder-construction-view construction expansion)]
+       (when-let [law (nested-expansion-substitution-view
+                      {:source-import source-import :walked-body walked-body
+                       :params (:parameters callee-import) :tags (:tags callee-import)}
+                      arguments expansion)]
+         {:builder event :substitution law})))))
+
+(defn- aligned-call-occurrences [expected actual]
+  ;; Only used AFTER the complete substitution law and product checks pass.
+  ;; Locations, not names or equal-form searches, relate the replay to the
+  ;; exact recorded output. Opaque data is never traversed as code.
+  (let [calls (volatile! [])]
+    (letfn [(visit [left right]
+              (when (form/call-form? left)
+                (vswap! calls conj {:expected left :actual right}))
+              (when (and (or (seq? left) (vector? left))
+                         (not (and (seq? left) (#{'quote 'clojure.core/quote} (first left)))))
+                (doseq [[a b] (map vector left right)] (visit a b))))]
+      (visit expected actual)
+      @calls)))
+
+(defn ^:no-doc nested-substitution-call-origin
+  "Derive a child call's import-local origin from one checked recorded parent.
+   Replay edges are produced internally only; copies/repeated occurrences and
+   calls introduced by argument substitution acquire no imported-body origin.
+   The retained parent law remains a prerequisite, not execution permission."
+  [construction parent-expansion child]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [builder substitution] :as checked}
+                (nested-builder-substitution-view construction parent-expansion)]
+       (let [aligned (aligned-call-occurrences (:replayed-body substitution) (:body substitution))
+             matches (filterv #(identical? child (:actual %)) aligned)]
+         (when (= 1 (count matches))
+           (let [expected (:expected (first matches))
+                 edges (:replayed-calls substitution)
+                 replay (source-transport/unique-construction-edge edges expected)
+                 ;; Empty substitution preserves the original subtree by identity.
+                 qualified (or (:original replay)
+                               (when (and (empty? (:substitutions substitution))
+                                          (identical? expected child)) child))]
+             (when-let [origin (source-transport/body-import-occurrence
+                               (:source-import builder) (:walked-body builder) qualified)]
+               {:parent checked :origin origin :constructed child}))))))))
+
+(defn- completed-source-call-frame [checked original]
+  (let [call (:call-context original)
+        slots (mapv (fn [slot source input completed]
+                      (assoc slot :source-operand source :observed-input input
+                                  :input-completion completed
+                                  :constructed-correspondence :unclosed))
+                    (get-in checked [:substitution :argument-slots])
+                    (:source-arguments original) (:inputs call) (:input-completions call))]
+    (when (= (count slots) (count (get-in checked [:substitution :argument-slots])))
+      {:substitution (:substitution checked) :original-invocation original
+       :argument-slots slots :return-correspondence :unclosed :final-placement :unclosed})))
+
+(defn ^:no-doc nested-original-call-frame
+  "Join a checked nested substitution to original selected input completions.
+   Every slot exposes both source and constructed operands; their correspondence
+   is deliberately unresolved. No operand executes here, and no return conversion,
+   non-null array, resident producer or final interval is inferred from its ABI.
+   Imported calls require one unique checked parent and that parent's complete
+   selected ancestry. Search is identity-cycle checked and bounded by the actual
+   finite construction history; rejected attempts publish no observations."
+  [construction expansion]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [candidates (source-transport/recorded-builder-expansions construction)]
+       ;; At most one parent is followed per level, and each level examines the
+       ;; finite candidate list once. Count total attempts as well as path depth.
+       (let [remaining (volatile! (* (count candidates) (inc (count candidates))))]
+         (letfn [(frame [current ancestors]
+                   (method-entry/call-with-optional-definition-inputs
+                    (fn []
+                      (when (and (pos? @remaining)
+                                 (not-any? #(identical? current %) ancestors))
+                        (vswap! remaining dec)
+                        (when-let [checked (nested-builder-substitution-view construction current)]
+                          (let [caller (get-in checked [:builder :caller])]
+                            (if (source-transport/construction-occurrence construction caller)
+                              ;; A root call with a wrong selected target must not
+                              ;; acquire a different interpretation through imports.
+                              (when-let [original (source-transport/original-builder-invocation-view construction current)]
+                                (completed-source-call-frame checked original))
+                              (let [parents
+                                    (into []
+                                          (keep (fn [candidate]
+                                                  (when (pos? @remaining)
+                                                    (vswap! remaining dec)
+                                                    (nested-substitution-call-origin construction candidate caller))))
+                                          candidates)]
+                                (when (and (pos? @remaining) (= 1 (count parents)))
+                                  (let [derived (first parents)
+                                        parent (get-in derived [:parent :builder :expansion])]
+                                    (when-let [ancestry (frame parent (conj ancestors current))]
+                                      (when-let [original
+                                                 (source-transport/imported-builder-invocation-candidate
+                                                  construction current parent (get-in derived [:origin :constructed]))]
+                                        (when-let [result (completed-source-call-frame checked original)]
+                                          (assoc result :parent-frame ancestry :parent-substitution derived))))))))))))))]
+           (frame expansion [])))))))
+
+(defn- build-inline-expansion
+  "Construct argument bindings and the substituted callee in one place.
+   A result binder requests the binding inliner's existing flat placement;
+   otherwise retain the nested body's lexical scopes for recursive expansion.
+   This construction is NOT a completion, correspondence or execution proof."
+  [{:keys [params tags walked-body source-import prepared-program projection-mode] :as callee}
+   args source-env subst-fn result-sym caller & [reserved-symbols binding-site]]
+  (if prepared-program
+    (let [projection
+          ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
+           prepared-program args projection-mode source-env caller)
+          {:keys [bindings result-form]}
+          (source-transport/consume-prepared-program-projection
+           projection {:kind (if result-sym :binding :nested) :destination result-sym
+                       :binding-site binding-site
+                       :reserved-symbols (when reserved-symbols
+                                           (into reserved-symbols (keys source-env)))})]
+      (if result-sym
+        {:argument-bindings [] :bindings (conj bindings [result-sym result-form])}
+        {:argument-bindings [] :body (list 'let* (vec (mapcat identity bindings)) result-form)}))
+    (do
+  (when source-import
+    (let [imported (source-transport/body-import-view source-import walked-body)]
+      (when-not (and imported (= params (:parameters imported)) (= tags (:tags imported)))
+        (throw (ex-info "Inline expansion differs from its exact imported body or declarations"
+                        {:reason :unclosed-inline-body-import})))))
+  (let [body-form (first (source-transport/effective-body walked-body))
+        callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
+        arguments (atom [])
+        slots (when source-import (atom []))
+        substitutions (argument-substitution callee-params args tags source-env
+                                            #(swap! arguments conj %) false
+                                            (when slots #(swap! slots conj %)))
+        expansion
+    (if-not result-sym
+      (cond-> {:argument-bindings @arguments :body (subst-fn substitutions body-form)}
+        slots (assoc :argument-slots @slots))
+      (let [pairs (atom @arguments)
+            emit-tail! (fn [expressions]
+                         (doseq [effect (butlast expressions)]
+                           (swap! pairs conj
+                                  [(with-meta (gensym "effect_") {:raster.effect/effectful true}) effect]))
+                         (swap! pairs conj [result-sym (last expressions)]))]
+        (cond
+          (form/binding-form? body-form)
+          (let [[_ bindings & body] body-form
+                current (atom substitutions)]
+            (doseq [[id init] (partition 2 bindings)]
+              (let [fresh (gensym (str (name id) "_"))
+                    value (subst-fn @current init)
+                    renamed (if (and (seq? value) (symbol? (first value))
+                                     (op/alloc-op? (first value)))
+                              (with-meta fresh {:raster.buffer/hoistable true
+                                                :tag (get alloc-sym->array-tag (first value))})
+                              (if (meta id) (vary-meta fresh merge (meta id)) fresh))]
+                (swap! pairs conj [renamed value])
+                (swap! current assoc id renamed)))
+            (emit-tail! (mapv #(subst-fn @current %) body)))
+
+          (and (seq? body-form) (= 'do (first body-form)))
+          (emit-tail! (mapv #(subst-fn substitutions %) (rest body-form)))
+
+          :else (swap! pairs conj [result-sym (subst-fn substitutions body-form)]))
+        {:argument-bindings @arguments :bindings @pairs}))]
+    (source-transport/observe-builder-expansion! caller callee args source-env result-sym expansion)
+    expansion))))
 
 ;; ================================================================
 ;; value+grad / grad inlining
@@ -451,6 +723,7 @@
                      (= 'var (first var-form)))
             (let [var-sym (second var-form)]
               {:var-sym var-sym
+               :caller init
                :args args
                :options (ad-constructor-options (vec (drop 2 callee)))
                :mode (if (= op 'raster.ad.reverse/value+grad)
@@ -479,7 +752,8 @@
   (let [changed? (atom false)
         hoist-barrier? (fn [expression]
                          (and (seq? expression)
-                              (or (contains? '#{quote clojure.core/quote} (first expression))
+                              (or (completion/bytecode-context-form? expression)
+                                  (contains? '#{quote clojure.core/quote} (first expression))
                                   (form/introduces-scope? expression)
                                   (form/binding-form? expression))))
         rebuild util/remake-if-changed
@@ -611,6 +885,7 @@
                            :body (if (= 1 (count body)) (first body) (cons 'do body))})))))))
             (go [expression lexical known]
               (cond
+                (completion/bytecode-context-form? expression) expression
                 (and (seq? expression) (= 'quote (first expression))) expression
                 (seq? expression)
                 (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expression)]
@@ -859,6 +1134,9 @@
    lifted vg bindings that need to be prepended."
   [form]
   (cond
+    (completion/bytecode-context-form? form)
+    {:form form :bindings []}
+
     (not (seq? form))
     {:form form :bindings []}
 
@@ -905,34 +1183,28 @@
                            (catch Exception _ nil)))
                        (all-ns))))]
      (when v
-       (let [;; Try direct metadata, deref'd value metadata, then dispatch table
+       (let [;; A generic constructor must resolve before importing backing metadata.
              val-meta (when (var? v) (try (meta @v) (catch Exception _ nil)))
              _ (source-owner/assert-portable-source! (meta v))
              _ (source-owner/assert-portable-source! val-meta)
-             resolved (cond
-                        (:raster.core/deftm (meta v)) v
-                        (:raster.core/deftm val-meta) @v
-                        :else (when-let [dt (:raster.core/dispatch-table (meta v))]
-                                (let [all-methods (mapcat val @dt)
-                                      has-parametric? (contains? @dispatch/parametric-registry
-                                                                 (symbol (namespace var-sym) (name var-sym)))
-                                ;; Type-safe overload selection + parametric specialization
-                                      method (or (when (seq arg-tags)
-                                                   (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
-                                                       (when (inf/try-parametric-specialize!
-                                                              (symbol (namespace var-sym) (name var-sym)) arg-tags)
-                                                         (let [new-methods (mapcat val @dt)]
-                                                           (first (filter #(= (vec arg-tags) (vec (:tags %)))
-                                                                          new-methods))))))
-                                           ;; Non-parametric single method: safe (no other overloads possible)
-                                                 (when (and (= 1 (count all-methods)) (not has-parametric?))
-                                                   (first all-methods)))
-                                      ns-obj (:ns (meta v))
-                                      mangled (when method
-                                                (symbol (str (types/mangle (:name (meta v))
-                                                                           (:tags method)))))]
-                                  (when mangled
-                                    (try (ns-resolve ns-obj mangled) (catch Exception _ nil))))))]
+             resolved (if-let [table (:raster.core/dispatch-table (meta v))]
+                        ;; AD construction selects a declared function BEFORE
+                        ;; its returned gradient is invoked. A single-method
+                        ;; constructor uses the public AD policy, even when its
+                        ;; eventual arguments are expressions of another type.
+                        ;; This does not authorize inlining an ordinary generic
+                        ;; call. Multi-method AD applications still need shared
+                        ;; dispatch selection, with no fallback after a miss.
+                        (if (= 1 (reduce + 0 (map count (vals @table))))
+                          (do
+                            (method-entry/observe-definition-input! v (:ns (meta v)) (:name (meta v)))
+                            (rcore/resolve-deftm-var v {:deref-value? true}))
+                          (selected-inline-var
+                           (symbol (str (ns-name (:ns (meta v)))) (str (:name (meta v))))
+                           table arg-tags))
+                        (cond
+                          (:raster.core/deftm (meta v)) v
+                          (:raster.core/deftm val-meta) @v))]
          (when resolved
            (let [m (meta resolved)
                  _ (source-owner/assert-portable-source! m)
@@ -944,6 +1216,12 @@
                 :var resolved}))))))))
 
 (def ^:dynamic *param-env* nil)
+
+(def ^:dynamic *defer-prepared-ad-expansion?*
+  "Compiler cut control: leave prepared AD applications opaque during ordinary
+   source preparation. JVM-owned calls retain their existing portability checks;
+   this does not defer ordinary helper expansion or change AD preparation."
+  false)
 
 (defn inline-value+grad-call
   "Inline a ((value+grad #'f) args...) call into flat let* bindings.
@@ -959,17 +1237,22 @@
   [vg-info & {:keys [param-env]}]
   (let [{:keys [var-sym args mode options]} vg-info
         ;; Infer arg types from param-env to select the right overload
-        arg-tags (when (and param-env (every? symbol? args))
-                   (let [tags (mapv #(get param-env %) args)]
-                     (when (every? some? tags) tags)))
+        arg-tags (let [tags (mapv #(inf/infer-arg-tag % param-env) args)]
+                   (when (every? some? tags) tags))
         deftm-info (resolve-deftm-for-ad var-sym arg-tags)]
     (when deftm-info
       (let [;; One typed AD preparation owns activity, constant data, seed widths and padded
             ;; gradient slots for both runtime construction and compilation. The inliner only
             ;; qualifies, alpha-renames and substitutes this retained program; it does not
             ;; transform AD again or infer the gradient types from its consumers.
-            prepared-body ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
-                           (:var deftm-info) (:wrt (apply hash-map options)))
+            ;; Preparation may compile observed definitions on a cold frontier.
+            ;; Those nested JVM compilations do not belong to this caller's
+            ;; module-insertion scope. Only projection of the completed program
+            ;; below may consume the enclosing site's prepared-module cut.
+            prepared-body (binding [source-transport/*prepared-program-consumer* nil
+                                    *defer-prepared-ad-expansion?* false]
+                            ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
+                             (:var deftm-info) (:wrt (apply hash-map options))))
             owned? (contains? prepared-body :source-owner)]
         (if owned?
           (do
@@ -977,67 +1260,9 @@
                            (= :jvm-bytecode (get-in prepared-body [:source-owner :backend])))
               (source-owner/assert-portable-source! prepared-body))
             ((requiring-resolve 'raster.ad.reverse/project-owned-value+grad-call) prepared-body args mode))
-          (let [_ (source-owner/assert-portable-source! prepared-body)
-            params (:params prepared-body)
-            prepared-form (inf/qualify-body-symbols
-                           (first (:walked-body prepared-body))
-                           (:source-ns prepared-body) (set params))
-            prepared-elements (last prepared-form)]
-        (when prepared-body
-          (let [flat-result {:form prepared-form :result-sym (first prepared-elements)
-                             :param-adj-syms (vec (rest prepared-elements))}]
-            (when flat-result
-              (let [{:keys [form result-sym param-adj-syms]} flat-result
-                    ;; form is the retained flat let* with a padded [primal grads...] tail.
-                    ;; Extract bindings
-                    [_ bindings-vec] form
-                    pairs (partition 2 bindings-vec)
-                    ;; Substitute actual args for formal params
-                    param-names (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil)
-                                      params)
-                    _ (check-inline-arity! var-sym param-names args vg-info)
-                    argument-bindings (atom [])
-                    ;; AD consumes the same call-by-value boundary as ordinary inlining.
-                    ;; A prepared pullback may use an argument repeatedly or not at all;
-                    ;; neither permits duplicating or dropping its evaluation.
-                    param-subst (argument-substitution
-                                 param-names args nil param-env
-                                 #(swap! argument-bindings conj %))
-                    ;; Rename internal symbols to avoid conflicts, and substitute params
-                    renamed-pairs
-                    (let [subst (atom param-subst)]
-                      (mapv (fn [[sym expr]]
-                              (let [base (if (contains? (set param-names) sym)
-                                           sym ;; don't rename param bindings
-                                           (gensym (str (name sym) "_")))
-                                    ;; Preserve metadata (AD type tags etc.)
-                                    new-sym (if (and (not (identical? base sym)) (meta sym))
-                                              (with-meta base (meta sym))
-                                              base)
-                                    substed-expr (subst-syms @subst expr)]
-                                (when-not (= sym new-sym)
-                                  (swap! subst assoc sym new-sym))
-                                [new-sym substed-expr]))
-                            pairs))
-                    ;; The loss symbol after substitution
-                    final-subst (reduce (fn [m [old [new _]]]
-                                          (if (= old new) m (assoc m old new)))
-                                        param-subst
-                                        (map vector
-                                             (map first pairs)
-                                             renamed-pairs))
-                    loss-sym (get final-subst result-sym result-sym)
-                    grad-syms (mapv #(get final-subst % %) param-adj-syms)
-                    ;; Elements: loss + all gradient syms (DCE handles dead ones)
-                    elements (if (= mode :value+grad)
-                               (vec (cons loss-sym grad-syms))
-                               (vec grad-syms))]
-                {:bindings (into @argument-bindings renamed-pairs)
-                 :result-sym nil
-                 :loss-sym loss-sym
-                 :grad-syms grad-syms
-                 :scalar-result? (and (= :grad mode) (= 1 (count grad-syms)))
-                 :elements elements}))))))))))
+          (when-not *defer-prepared-ad-expansion?*
+            ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
+             prepared-body args mode param-env (:caller vg-info))))))))
 
 (defn- inline-one-pass
   "Single pass of deftm inlining over a let* form's bindings."
@@ -1047,6 +1272,9 @@
    (inline-one-pass form subst-fn skip-ad-rule-check? false))
   ([form subst-fn skip-ad-rule-check? ad-only?]
    (let [[_ bindings-vec0 & body-exprs-raw0] form
+         prepared-reservations
+         (when source-transport/*prepared-program-consumer*
+           (into (set (keys *param-env*)) (filter symbol?) (tree-seq coll? seq form)))
          ;; F1: hoist nested value+grad/grad applications out of any init/body
          ;; sub-position into their own preceding binding, so the binding-level AD
          ;; machinery (value+grad-call? + vg-elements + resolve-vg-nth) fires. A
@@ -1073,7 +1301,12 @@
                                 (assoc :raster.effect/effectful true)))]
              [[[result-sym (first body-exprs-raw)]] [result-sym]])
            [nil body-exprs-raw])
-         pairs (concat (partition 2 bindings-vec) extra-body-pairs)
+         pairs (vec (concat (partition 2 bindings-vec) extra-body-pairs))
+         prepared-scope
+         (when prepared-reservations
+           (with-meta (list* (first form) (vec (mapcat identity pairs)) body-exprs) (meta form)))
+         _ (when prepared-scope
+             (source-transport/observe-prepared-program-scope! form prepared-scope))
          result-pairs (atom [])
          any-inlined? (atom false)
          ;; Type env for dispatch resolution when inlining multi-overload calls
@@ -1096,10 +1329,15 @@
                                      (vector? f) (mapcat count-syms f)
                                      :else []))
                              all-forms)))]
-     (doseq [[sym init-raw] pairs]
+     (doseq [[source-index [sym init-raw]] (map-indexed vector pairs)]
        (let [;; D-value rewriting is deferred — D-call? and distribution run first.
              ;; Only rewrite D-as-value when D appears as an argument to non-pointwise ops.
              init init-raw
+             binding-site (when prepared-scope
+                            {:scope prepared-scope :index source-index :prefix @result-pairs
+                             :live-symbols (into (set (keys @type-env)) (map first @result-pairs))})
+             _ (when binding-site
+                 (source-transport/observe-prepared-program-binding-site! binding-site))
              ;; Detect (value+grad f) or (grad f) partial application
              vg-partial (when (and (seq? init) (<= 2 (count init)))
                           (let [op (first init)]
@@ -1121,6 +1359,7 @@
                                               (list 'var var-or-form)
                                               var-or-form)]
                                {:var-sym (second var-form)
+                                :caller init
                                 :args args
                                 :options options
                                 :mode mode})))
@@ -1143,7 +1382,13 @@
                  (reset! any-inlined? true))
              (if vg-info
            ;; value+grad call → inline AD transform
-               (if-let [vg-result (inline-value+grad-call vg-info :param-env @type-env)]
+               (if-let [vg-result
+                        (when-let [projection (inline-value+grad-call vg-info :param-env @type-env)]
+                          (source-transport/consume-prepared-program-projection
+                           projection {:kind :binding :destination sym
+                                       :binding-site binding-site
+                                       :reserved-symbols (when prepared-reservations
+                                                           (into prepared-reservations (keys @type-env)))}))]
                  (do
                    (doseq [[bsym bexpr] (:bindings vg-result)]
                      (swap! result-pairs conj [bsym bexpr]))
@@ -1198,7 +1443,7 @@
                              deftm-info (when (and (not ad-only?) head (not has-ad-rule?))
                                           (try-resolve-deftm head arg-tags))]
                          (if (and deftm-info (safe-to-inline? deftm-info))
-                           (let [{:keys [params walked-body tags]} deftm-info
+                           (let [{:keys [params]} deftm-info
                                  args (call-args init)
                  ;; ARITY GATE. The substitution below pairs callee params with call
                  ;; args POSITIONALLY — `(nth args i)` over the param index. A call
@@ -1212,52 +1457,9 @@
                  ;; reports "No AD template for <callee>".) A deftm call with the wrong
                  ;; number of args is always a bug — say so, at the call.
                                  _ (check-inline-arity! head params args init)
-                 ;; Handle multi-form bodies: wrap in (do ...) if more than one form
-                                 body-form (if (> (count walked-body) 1)
-                                             (list* 'do walked-body)
-                                             (first walked-body))
-                                 callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil)
-                                                     params)
-                 ;; ANF argument lifting + typed bindings for callee params.
-                 ;; Two cases require lifting an argument to a preceding let binding:
-                 ;; 1. Record/value-class params: preserves type info for bytecode backend
-                 ;; 2. Non-trivial call expressions: prevents duplication when the param
-                 ;;    appears multiple times in the callee body (e.g. inside par/pmap
-                 ;;    where CSE can't extract the duplicate afterward)
-                                 param-subst
-                                 (argument-substitution callee-params args tags @type-env
-                                                        #(swap! result-pairs conj %))]
-                             (if (form/binding-form? body-form)
-                               (let [[_ inner-bindings & inner-body] body-form
-                                     inner-pairs (partition 2 inner-bindings)
-                                     current-subst (atom param-subst)]
-                                 (doseq [[inner-sym inner-init] inner-pairs]
-                                   (let [base-renamed (gensym (str (name inner-sym) "_"))
-                                         substed (subst-fn @current-subst inner-init)
-                                         renamed (if (and (seq? substed)
-                                                          (symbol? (first substed))
-                                                          (op/alloc-op? (first substed)))
-                                                   (with-meta base-renamed
-                                                     {:raster.buffer/hoistable true
-                                                      :tag (get alloc-sym->array-tag (first substed))})
-                                                   (if (meta inner-sym)
-                                                     (vary-meta base-renamed merge (meta inner-sym))
-                                                     base-renamed))]
-                                     (swap! result-pairs conj [renamed substed])
-                                     (swap! current-subst assoc inner-sym renamed)))
-                                 (let [substed-body (mapv #(subst-fn @current-subst %) inner-body)]
-                                   (when (> (count substed-body) 1)
-                                     (doseq [effect (butlast substed-body)]
-                                       (swap! result-pairs conj [(with-meta (gensym "effect_") {:raster.effect/effectful true}) effect])))
-                                   (swap! result-pairs conj [sym (last substed-body)])))
-               ;; Handle do blocks: decompose into effect bindings + result
-                               (if (and (seq? body-form) (= 'do (first body-form)))
-                                 (let [do-exprs (rest body-form)
-                                       substed-exprs (mapv #(subst-fn param-subst %) do-exprs)]
-                                   (doseq [effect (butlast substed-exprs)]
-                                     (swap! result-pairs conj [(with-meta (gensym "effect_") {:raster.effect/effectful true}) effect]))
-                                   (swap! result-pairs conj [sym (last substed-exprs)]))
-                                 (swap! result-pairs conj [sym (subst-fn param-subst body-form)])))
+                                 expansion (build-inline-expansion deftm-info args @type-env subst-fn sym init
+                                                                   prepared-reservations binding-site)]
+                             (swap! result-pairs into (:bindings expansion))
                              (reset! any-inlined? true)
             ;; Record the inlined function's return type so subsequent
             ;; backward calls can infer arg-tags through the binding chain
@@ -1281,14 +1483,15 @@
      ;; Resolve (nth <vg-sym> N) in body expressions for >20 param cases
      (let [resolve-vg-nth (fn resolve-vg-nth [expr]
                             (cond
+                              (completion/bytecode-context-form? expr) expr
+
                               (and ad-only? (seq? expr)
                                    (or (= 'quote (first expr))
                                        (form/scope-info expr))) expr
                               (and (seq? expr) (= 'clojure.core/nth (first expr)) (= 3 (count expr)))
                               (or (known-vg-element @vg-elements (second expr) (nth expr 2)) expr)
-                              (seq? expr) (let [r (apply list (map resolve-vg-nth expr))]
-                                            (if-let [m (meta expr)] (with-meta r m) r))
-                              (vector? expr) (mapv resolve-vg-nth expr)
+                              (or (seq? expr) (vector? expr))
+                              (util/remake-if-changed expr (mapv resolve-vg-nth expr))
                               :else expr))
            ;; Resolve nth in BOTH binding values and body expressions
            resolved-pairs (if (seq @vg-elements)
@@ -1389,6 +1592,13 @@
   ([form] (inline-invk form {}))
   ([form {:keys [preserve-templates?] :as policy}]
    (cond
+     ;; Re-emitting these operands/bodies belongs to their retained producer.
+     ;; Ordinary helper expansion cannot erase saved argument/return semantics.
+     (completion/bytecode-context-form? form) form
+
+     ;; Quoted calls are data, not helper expansion opportunities.
+     (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
+
      (and (seq? form) (= '.invk (first form)) (>= (count form) 2))
      (let [impl-sym (second form)
            rkey (recursion-key impl-sym)
@@ -1409,7 +1619,7 @@
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info
                _ (check-inline-arity! impl-sym params (drop 2 form) form)
-               body-form (first walked-body)
+               body-form (first (source-transport/effective-body walked-body))
                safe? (safe-to-inline? deftm-info)
                ;; size policy: large straight-line callees become calls (wasm path);
                ;; fusable bodies (loop/par) always inline so fusion sees them.
@@ -1421,38 +1631,32 @@
              ;; recurse into arguments only.
              (let [args (drop 2 form)
                    new-args (map #(inline-invk % policy) args)]
-               (util/make-invk impl-sym new-args (meta form)))
+               (util/remake-invk-if-changed form impl-sym new-args))
              ;; Simple body -- safe to inline
              (let [args (mapv #(inline-invk % policy) (drop 2 form))
-                   {:keys [tags]} deftm-info
-                   callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
-                   ;; ANF lifting + typed bindings — same logic as inline-one-pass
-                   lifted-bindings (atom [])
-                   param-subst
-                   (argument-substitution callee-params args tags *param-env*
-                                          #(swap! lifted-bindings into %))
-                   inlined (subst-syms param-subst body-form)
+                   expansion (build-inline-expansion deftm-info args *param-env* subst-syms nil form)
+                   inlined (:body expansion)
                    ;; mark this callee as on the inline stack while re-processing its
                    ;; body, so a recursive self-call inside stays a call (terminates)
                    result (binding [*inlining* (conj *inlining* rkey)]
                             (inline-invk inlined policy))]
                ;; Wrap in let* with lifted bindings if any were emitted
-               (if (seq @lifted-bindings)
-                 (list 'let* (vec @lifted-bindings) result)
+               (if (seq (:argument-bindings expansion))
+                 (list 'let* (vec (mapcat identity (:argument-bindings expansion))) result)
                  result))))
          ;; Has template or can't resolve: keep call, recurse into arguments
          (let [args (drop 2 form)
                new-args (map #(inline-invk % policy) args)]
-           (util/make-invk impl-sym new-args (meta form)))))
+           (util/remake-invk-if-changed form impl-sym new-args))))
 
      ;; Binding forms -- recurse into bindings and body
      (and (seq? form) (form/binding-form? form))
      (let [[head bindings & body] form
            new-bindings (vec (mapcat (fn [[sym value]] [sym (inline-invk value policy)])
                                      (partition 2 bindings)))
-           new-body (map #(inline-invk % policy) body)
-           r (apply list head new-bindings new-body)]
-       (if-let [m (meta form)] (with-meta r m) r))
+           new-body (map #(inline-invk % policy) body)]
+       (util/remake-if-changed
+        form (list* head (util/remake-if-changed bindings new-bindings) new-body)))
 
      ;; Scope initializers and outer operands are values, but binder names and par
      ;; layout are structural. Reuse the shared decomposition without hoisting anything.
@@ -1465,15 +1669,13 @@
 
      ;; do block -- recurse into all expressions
      (and (seq? form) (= 'do (first form)))
-     (let [r (apply list 'do (map #(inline-invk % policy) (rest form)))]
-       (if-let [m (meta form)] (with-meta r m) r))
+     (util/remake-if-changed form (cons (first form) (map #(inline-invk % policy) (rest form))))
 
      ;; Any other seq -- recurse into all elements
      (seq? form)
-     (let [r (apply list (map #(inline-invk % policy) form))]
-       (if-let [m (meta form)] (with-meta r m) r))
+     (util/remake-if-changed form (mapv #(inline-invk % policy) form))
 
-     (vector? form) (mapv #(inline-invk % policy) form)
+     (vector? form) (util/remake-if-changed form (mapv #(inline-invk % policy) form))
      :else form)))
 
 (defn- anf-lift
@@ -1484,6 +1686,12 @@
    sibling effects, callee lookup and formal conversions cannot be reordered."
   [expr]
   (cond
+    ;; Distributing this obligation across a wrapper's children needs its own
+    ;; proof. Keep the wrapper intact rather than stripping a denial marker
+    ;; and allowing a later DCE to erase a throwing discarded initializer.
+    (true? (:raster.effect/preserve-evaluation (meta expr)))
+    [[] expr]
+
     ;; Binding form in expression position → lift bindings out with renaming
     (form/binding-form? expr)
     (let [[_ inner-bindings & inner-body] expr
@@ -1706,6 +1914,8 @@
    Also resolves constant var references (e.g. raster.numeric/neg-inf)."
   [expr env]
   (cond
+    (completion/bytecode-context-form? expr) expr
+
     ;; Resolve constant var references (plain values like neg-inf, pi)
     ;; Skip: functions, generic dispatch vars, deftm impl singletons
     (and (symbol? expr) (namespace expr) (not (contains? env expr)))

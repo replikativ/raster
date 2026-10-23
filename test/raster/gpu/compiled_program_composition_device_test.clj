@@ -9,6 +9,7 @@
             [raster.dl.nn :as nn]
             [raster.dl.loss :as loss]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.pipeline :as pipeline]
             [raster.hardware-fixture :as hardware-fixture]
             [raster.runtime.hardware :as hardware]
@@ -133,15 +134,20 @@
       (skip! "wide arithmetic followed by terminal float narrowing")
       (let [input (double-array [16777217.0])
             expected (narrow-after-wide-terminal-arithmetic input 1)
-            prepared (compiled/lower #'narrow-after-wide-terminal-arithmetic [input 1]
-                                     {:compiler :equation-first :target target :dtype :double})
-            artifact (compiled/instantiate! prepared)]
-        (try
-          (let [actual (first (value/->host (:result (artifact {}))))]
+            compilation (equation-first/compile #'narrow-after-wide-terminal-arithmetic
+                                               {:target target :dtype :double})]
+        (is (= :explicit-host-result-required
+               (try (equation-first/lower compilation [input 1]) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        (with-open [artifact (link/instantiate-host-result! compilation [input 1])]
+          (let [actual (link/run-host-result! artifact)]
             (is (= 16777218.0 (double expected)))
+            (is (= Float (class actual)))
             (is (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits actual))
                 "Double add precedes Float rounding; early narrowing would produce 16777216"))
-          (finally (compiled/close! artifact)))))))
+          (aset-double input 0 16777219.0)
+          (is (= (narrow-after-wide-terminal-arithmetic input 1)
+                 (link/run-host-result! artifact)) "arithmetic observes the changed reduction")))))))
 
 (defn- run-public-objective-case [target]
   (let [arguments [(float-array [0.25 -0.5])

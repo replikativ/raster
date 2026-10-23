@@ -49,10 +49,10 @@
                             :add-constant {:acc 'acc :expr '(clojure.core/+ acc 3.0)
                                            :operands [] :scalars [] :dtype :double}
                             :float-checkpoint {:acc 'acc
-                                               :expr '(clojure.core/double (clojure.core/float acc))
+                                               :expr '(clojure.core/double (clojure.core/unchecked-float acc))
                                                :operands [] :scalars [] :dtype :double}
                             :float-output {:acc 'acc
-                                           :expr '(clojure.core/float (clojure.core/+ acc 3.0))
+                                           :expr '(clojure.core/unchecked-float (clojure.core/+ acc 3.0))
                                            :operands [] :scalars [] :dtype :float}
                             nil)
                 form (cond-> (repeated-dense-map-form same-coordinate?)
@@ -82,7 +82,8 @@
             (doseq [values (map #(take required %)
                                 (if (contains? #{:float-checkpoint :float-output} transform-kind)
                                   [[16777217.0 0.0 -16777217.0 1.0 -1.0]
-                                   [-16777217.0 0.0 16777217.0 -1.0 1.0]]
+                                   [-16777217.0 0.0 16777217.0 -1.0 1.0]
+                                   [Double/MAX_VALUE 0.0 (- Double/MAX_VALUE) 1.0 -1.0]]
                                   [[1.25 -3.5 7.0 8.0 0.125]
                                    [-8.0 2.0 0.5 -1.0 16.0]]))]
               (let [input (double-array values)
@@ -93,15 +94,15 @@
                                                      (nth values (if same-coordinate? i j)))]
                                       (case transform-kind
                                         :add-constant (+ element 3.0)
-                                        :float-checkpoint (double (float element))
-                                        :float-output (float (+ element 3.0))
+                                        :float-checkpoint (double (unchecked-float element))
+                                        :float-output (unchecked-float (+ element 3.0))
                                         element))))]
                 ((runtime-var "invoke-registered-map-void-kernel")
                  (:kernel-name artifact) [input output] [] 10)
                 (is (= expected (vec output)))
                 (is (= (class (allocate-output 0)) (class output)))
                 (when (= :float-checkpoint transform-kind)
-                  (is (= (if (pos? (first values)) 16777216.0 -16777216.0)
+                  (is (= (double (unchecked-float (first values)))
                          (aget ^doubles output 1))
                       "the large completed result must pass through an observable Float checkpoint"))
                 (is (= before (vec input)))))

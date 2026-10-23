@@ -2,19 +2,26 @@
   "Lower a typed scalar S-expression region to target-neutral KernelBody SSA.
 
    This is shared by ordinary maps and ordered fold-maps. The caller supplies authoritative
-   storage/scalar dtypes, index lowering, participation, and its own structured decline function;
-   this pass performs no source-level type or function inference."
+   storage/scalar dtypes, index lowering, participation, and its own structured decline function.
+   The region lowerer does not infer source types or functions. Owner-facing bounded
+   correspondence queries separately validate original arithmetic against those facts;
+   a desired result dtype cannot supply the missing evidence."
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -37,6 +44,8 @@
     (assoc matched
            :inclusive? (= :inclusive (:bound-mode matched))
            :update-expr (:scoped-update-expr matched))))
+
+(declare canonical-selected-fp-operation)
 
 (defn make-lowerer
   "Build a scalar-expression lowerer.
@@ -362,7 +371,16 @@
                                (body/scalar-expression operator result-type arguments options))]
                  :result result :type result-type :range range}))
 
-            (cast-lowered [lowered target expression & [explicit-narrowing]]
+            (total-source-cast-literal? [lowered source-op]
+              ;; Consult the lowered operand, not a source spelling that could name
+              ;; a lexical value instead of the apparent Java numeric field.
+              (when (and (descriptor/cast-op? source-op)
+                         (instance? raster.compiler.ir.kernel_body.Literal (:result lowered)))
+                (some? (numeric-constant/source-value
+                        (list (symbol "clojure.core" (name source-op))
+                              (:value (:result lowered)))))))
+
+            (cast-lowered [lowered target expression & [explicit-source-op]]
               (let [target (dtype/canon target)]
                 (if (= target (:type lowered))
                   lowered
@@ -382,21 +400,28 @@
                           ;; An explicit source cast owns its checked-versus-unchecked narrowing
                           ;; contract. Implicit conversions continue to use the owner's policy, or
                           ;; the legacy map/fold wrap default when the owner supplies none.
-                          (or (case explicit-narrowing
-                                :wrap (scalar-conversion/policy source target :wrap)
-                                :reject (scalar-conversion/policy source target :trap)
-                                nil (if conversion-policy
-                                      (conversion-policy source target)
-                                      ;; The historical fallback wraps implicit integral
-                                      ;; narrowing only. Floating narrowing is source-cast
-                                      ;; semantics and must not leak into a result/local coercion.
-                                      (if (and (not (dtype/fp-dtype? source))
-                                               (not (dtype/fp-dtype? target)))
-                                        (scalar-conversion/policy source target :wrap)
-                                        (scalar-conversion/policy source target))))
+                          (or (if explicit-source-op
+                                (scalar-conversion/source-policy source target explicit-source-op)
+                                (if conversion-policy
+                                  (conversion-policy source target)
+                                  ;; The historical fallback wraps implicit integral narrowing
+                                  ;; only; it must not acquire checked source-cast semantics.
+                                  (if (and (not (dtype/fp-dtype? source))
+                                           (not (dtype/fp-dtype? target)))
+                                    (scalar-conversion/policy source target :wrap)
+                                    (scalar-conversion/policy source target))))
                               (decline! :cast-policy
                                         "scalar cast has no portable rounding and overflow policy"
                                         {:expression expression :source source :target target})))
+                        checked-floating? (and (dtype/fp-dtype? source) (= :trap overflow))
+                        total-floating? (and checked-floating?
+                                             (total-source-cast-literal? lowered explicit-source-op))
+                        _ (when (and checked-floating? (not total-floating?))
+                            (decline! :checked-floating-conversion
+                                      "checked floating source conversion requires an ordered host observation"
+                                      {:expression expression :source source :target target}))
+                        overflow (if total-floating?
+                                   (second (scalar-conversion/policy source target :trap)) overflow)
                         id (fresh "cast")]
                     (let [range (when (scalar-range/contained-in-dtype? (:range lowered) target)
                                   (:range lowered))]
@@ -678,8 +703,7 @@
                                            {:expression expression :operand operand
                                             :target target})))
                             lowered (lower operand source-expected env)]
-                        (cast-lowered lowered target expression
-                                      (descriptor/cast-integral-narrowing (first expression))))))
+                        (cast-lowered lowered target expression (first expression)))))
 
                   (dialect/scalar-convert-form? expression)
                   (let [{:keys [attributes operand]} (dialect/scalar-convert-parts expression)
@@ -691,6 +715,16 @@
                                       {:expression expression :expected expected
                                        :attributes attributes}))
                         lowered (lower operand (canon-type source-dtype) env)
+                        checked-floating? (and (dtype/fp-dtype? source-dtype) (= :trap overflow))
+                        total-floating? (and checked-floating?
+                                             (total-source-cast-literal? lowered (:source-op attributes)))
+                        _ (when (and checked-floating? (not total-floating?))
+                            (decline! :checked-floating-conversion
+                                      "checked floating source conversion requires an ordered host observation"
+                                      {:expression expression :source source-dtype :target target-dtype}))
+                        overflow (if total-floating?
+                                   (second (scalar-conversion/policy source-dtype target-dtype :trap))
+                                   overflow)
                         _ (when-not (= (canon-type source-dtype) (:type lowered))
                             (decline! :typed-scalar-convert-source
                                       "typed scalar conversion operand disagrees with its source dtype"
@@ -794,7 +828,10 @@
                                       {:expression expression :expected expected
                                        :dtype fold-type :parameters parameters
                                        :locals fold-locals :results body-results}))
-                        loop-index (fresh "fold-index")
+                        ;; The generated ForLoop binding below is explicitly long. Preserve that
+                        ;; constructor fact on lexical uses passed to typed index callbacks too;
+                        ;; the owner's outer ABI cannot know this newly generated SSA name.
+                        loop-index (with-meta (fresh "fold-index") {:raster.type/tag 'long})
                         carry (fresh "fold-carry")
                         result (fresh "fold-result")
                         initial (lower (:identity attributes) fold-type env)
@@ -1189,7 +1226,22 @@
                   (let [semantic-operation (descriptor/semantic-op expression)
                         operator (intrinsics/canonical semantic-operation)
                         intrinsic (intrinsics/descriptor operator)
-                        arguments (vec (descriptor/call-args expression))]
+                        arguments (vec (descriptor/call-args expression))
+                        ;; A selected implementation is not authenticated by
+                        ;; its nominal arithmetic name. Keep argument evaluation
+                        ;; and completion separate from this callee-only check.
+                        selected-operation? (and method-entry/*emission-inputs*
+                                     (= '.invk (first expression))
+                                     (= :infix (:kind intrinsic))
+                                     (source-arithmetic/binary-operator? (:c intrinsic))
+                                     (= 2 (count arguments))
+                                     (dtype/fp-dtype? expected))
+                        selected-operation (when selected-operation?
+                                             (canonical-selected-fp-operation expression))
+                        _ (when (and selected-operation? (nil? selected-operation))
+                            (decline! :selected-scalar-source-correspondence
+                                      "selected scalar body does not attest the emitted canonical operation"
+                                      {:expression expression :operator operator}))]
                     (when-not intrinsic
                       (decline! :scalar-expression
                                 "scalar expression has no canonical intrinsic"
@@ -1218,6 +1270,29 @@
                               source-result-type
                               (when-not comparison?
                                 (dtype/canon (source-type expression expected env)))
+                              ;; Correspondence includes widths, not just the operator.
+                              ;; Until entry conversions have their own source-completion
+                              ;; proof, accept only already matching primitive operands.
+                              ;; In particular a Double result stamp must not erase an
+                              ;; actual Float helper's rounding checkpoint.
+                              _ (when selected-operation
+                                  (let [carrier-dtype #(dtype/dtype-for-scalar-tag
+                                                       (symbol (.getName ^Class %)))
+                                        payload-type (carrier-dtype (:payload-carrier selected-operation))
+                                        formal-types (mapv carrier-dtype
+                                                           (:parameter-carriers selected-operation))
+                                        argument-types (mapv #(some-> (authoritative-source-type % env)
+                                                                      dtype/canon)
+                                                             arguments)]
+                                    (when-not (and (= payload-type source-result-type)
+                                                   (= formal-types argument-types)
+                                                   (every? #{payload-type} formal-types))
+                                      (decline! :selected-scalar-source-width
+                                                "selected scalar widths require source-owned entry and result conversions"
+                                                {:expression expression :payload-type payload-type
+                                                 :source-result-type source-result-type
+                                                 :formal-types formal-types
+                                                 :argument-types argument-types}))))
                               operand-type (if comparison?
                                              (let [types (mapv #(some-> (authoritative-source-type % env)
                                                                        dtype/canon)
@@ -1366,7 +1441,10 @@
    this is neither purity nor nonthrowing evidence. The caller must retain the
    original initializer, its position, and its conversions/traps. Selected
    invk calls use checked-selected-primitive-result instead: known operands do
-   not establish the selected implementation's result or definition freshness."
+   not establish the selected implementation's result or definition freshness.
+   The returned :type is the scalar grammar's dtype under the supplied inputs,
+   NOT proof of an ordinary source call's physical result or boxed payload.
+   Source presence consumers must use checked-scalar-normal-return instead."
   [expression present-types]
   (let [operation (descriptor/semantic-op expression)
         intrinsic (some-> operation intrinsics/canonical intrinsics/descriptor)
@@ -1379,6 +1457,51 @@
                intrinsic
                (every? known? arguments))
       (checked-scalar-result expression present-types))))
+
+(defn checked-scalar-normal-return
+  "Prove only nonnull-on-normal-return for a bounded closed numeric expression.
+   Payload dtypes validate the existing scalar grammar; they are NOT actual
+   argument carriers or source overload evidence. Consequently this API returns
+   no dtype, payload or storage information. Unknown calls and lexical callees
+   decline. The caller must keep the original producer, conversions and order."
+  [expression present-types]
+  (when (seq? expression)
+    (let [closed?
+          (loop [pending [[expression 0]] visits 0]
+            (cond
+              (empty? pending) true
+              (>= visits 10000) false
+              :else
+              (let [[node depth] (peek pending)
+                    remaining (pop pending)]
+                (cond
+                  (> depth 128) false
+                  (number? node) (recur remaining (inc visits))
+                  (symbol? node) (and (contains? present-types node)
+                                      (recur remaining (inc visits)))
+                  (seq? node)
+                  (let [arguments (descriptor/call-args node)
+                        argument-count (bounded-count (inc (- 10000 visits)) arguments)
+                        operation (descriptor/semantic-op node)
+                        cast (descriptor/cast-result-tag operation)]
+                    (and (= operation (first node))
+                         (not (contains? present-types operation))
+                         (not (:raster.op/lexical-callee (meta node)))
+                         (not= '.invk (first node))
+                         (<= (+ visits (count remaining) argument-count) 10000)
+                         (symbol? operation)
+                         (contains? #{"clojure.core" "Math" "java.lang.Math"}
+                                    (namespace operation))
+                         (or (and cast (= 1 argument-count))
+                             (and (or (descriptor/scalar-op? operation)
+                                      (descriptor/comparison-kind operation))
+                                  (some-> operation intrinsics/canonical intrinsics/descriptor)))
+                         (recur (into remaining (map #(vector % (inc depth))
+                                                     arguments))
+                                (inc visits))))
+                  :else false))))]
+      (when (and closed? (checked-scalar-program expression present-types))
+        {:presence :present}))))
 
 (defn- strict-core-expression?
   "Closed scalar producer grammar, not a purity test. A root symbol may be
@@ -1493,7 +1616,14 @@
                                   (if (= target Float/TYPE) :float :double))))
                      target))
 
-                 (intrinsics/primitive-fp-total? operation carriers)
+                 ;; Nonthrowing evidence is independent of the result-carrier
+                 ;; recipe. This summary owns only core comparisons and the
+                 ;; existing binary arithmetic planner, not library functions.
+                 (and (intrinsics/primitive-fp-total? operation carriers)
+                      (or (= :cmp (:kind intrinsic))
+                          (and (= :infix (:kind intrinsic))
+                               (= 2 (:arity intrinsic))
+                               (source-arithmetic/binary-operator? (:c intrinsic)))))
                  (if (= :cmp (:kind intrinsic))
                    Boolean/TYPE
                    (let [plan (source-arithmetic/binary-plan
@@ -1528,6 +1658,50 @@
                 (contains? #{Float Double} builtin-class)
                 (or (= target Double/TYPE) (= builtin-class Float))
                 (.isAssignableFrom ^Class carrier ^Class builtin-class)))))
+
+(defn checked-core-fp-evaluation
+  "Summarize one original core arithmetic/comparison call AFTER its operands complete.
+   Reuses the selected-body carrier planner and totality check, not inferred tags.
+   One actual primitive Double operand fixes the source's Double computation.
+   The other may be primitive FP or a proved present builtin FP payload behind
+   its actual reference carrier. Input carrier facts are never upgraded. Calls
+   without that Double anchor, integral arithmetic, casts and lexical calls abstain.
+   This grants neither operand completion nor permission to move/remove the call."
+  [expression argument-facts source-ns]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (let [{:keys [semantic-op arguments lexical-callee]} (descriptor/call-description expression)
+           intrinsic (intrinsics/descriptor semantic-op)
+           carriers (mapv :carrier argument-facts)]
+       (when (and method-entry/*emission-inputs* (instance? clojure.lang.Namespace source-ns)
+                  (seq? expression) (vector? argument-facts)
+                  (= semantic-op (first expression)) (not lexical-callee)
+                  (symbol? semantic-op) (= "clojure.core" (namespace semantic-op))
+                  (= 2 (count arguments) (count argument-facts))
+                  (some #{Double/TYPE} carriers)
+                  (every? #(completed-fp-argument? % Double/TYPE) argument-facts)
+                  (or (= :cmp (:kind intrinsic))
+                      (and (= :infix (:kind intrinsic))
+                           (source-arithmetic/binary-operator? (:c intrinsic)))))
+         (when (intrinsic-source/observe-original! source-ns semantic-op)
+           (let [parameters '[core-left core-right]
+                 body (apply list semantic-op parameters)
+                 source-carriers (mapv #(if (.isPrimitive ^Class %)
+                                          (keyword (.getName ^Class %)) :ref) carriers)
+                 source-result (if (= :cmp (:kind intrinsic)) Boolean/TYPE
+                                   (case (:result-carrier
+                                          (apply source-arithmetic/binary-plan
+                                                 (:c intrinsic) source-carriers))
+                                     :double Double/TYPE nil))
+                 ;; The original source overload still sees reference ports.
+                 ;; Present Float/Double payloads make its Double conversion exact;
+                 ;; only the arithmetic proof uses the resulting numeric carriers.
+                 arithmetic-carriers (mapv #(if (.isPrimitive ^Class %) % Double/TYPE) carriers)
+                 actual (completed-fp-body-carrier body (zipmap parameters arithmetic-carriers))]
+             (when (and source-result (= source-result actual))
+               {:result-carrier actual :scope :completed-fp-scalar :presence :present
+                :builtin-class (get types/primitive-info (symbol (.getName ^Class actual)))
+                :nonthrowing? true}))))))))
 
 (defn checked-selected-primitive-evaluation
   "Prove a bounded selected scalar call has no source arithmetic/conversion failure.
@@ -1603,3 +1777,391 @@
              {:scope :owned-fp-return-payload :result-carrier Object :payload-carrier actual
               :parameters parameters :parameter-carriers carriers :arguments (vec arguments)
               :computation program :bridge bridge})))))))
+
+(defn- instantiate-checked-fp-payload
+  "Replay the closed checked leaf's SSA through an owner's typed builder.
+   Formal substitution is positional and each definition is fresh: never walk/substitute
+   an operation tree or invent source syntax. This is computation composition only."
+  [payload arguments builder]
+  (let [{:keys [parameters parameter-carriers computation]} payload
+        types (mapv #(if (= Float/TYPE %) :float :double) parameter-carriers)]
+    (when (and (= :owned-fp-return-payload (:scope payload))
+               (vector? parameters) (every? symbol? parameters)
+               (= (count parameters) (count (set parameters))
+                  (count parameter-carriers) (count arguments))
+               (every? #{Float/TYPE Double/TYPE} parameter-carriers)
+               (= types (mapv :type arguments))
+               (every? #(vector? (:operations %)) arguments)
+               (vector? (:operations computation))
+               (<= (count (:operations computation)) 10000))
+      (let [resolve-value (fn [values value]
+                            (cond
+                              (instance? raster.compiler.ir.kernel_body.Literal value) value
+                              (symbol? value) (get values value)))
+            state
+            (reduce
+             (fn [{:keys [values operations types] :as state} operation]
+               (let [id (get-in operation [:result :id])
+                     type (get-in operation [:result :type])
+                     expression (:expression operation)
+                     operands (mapv #(resolve-value values %) (:arguments expression))]
+                 (if (and state
+                          (instance? raster.compiler.ir.kernel_body.ScalarCompute operation)
+                          (symbol? id) (not (contains? values id))
+                          (contains? #{:float :double :predicate} type)
+                          (= type (:result-type expression))
+                          (vector? (:arguments expression)) (every? some? operands))
+                   (let [computed ((:compute builder) (:op expression) type operands (:options expression))]
+                     {:values (assoc values id (:result computed))
+                      :types (assoc types id type)
+                      :operations (into operations (:operations computed))})
+                   (reduced nil))))
+             {:values (zipmap parameters (map :result arguments)) :types (zipmap parameters types)
+              :operations (vec (mapcat :operations arguments))}
+             (:operations computation))
+            original-result (:result computation)
+            result (when state (resolve-value (:values state) original-result))
+            result-type (if (instance? raster.compiler.ir.kernel_body.Literal original-result)
+                          (:type original-result) (get-in state [:types original-result]))]
+        (when (and state (some? result) (= result-type (:type computation)))
+          {:operations (:operations state) :result result :type (:type computation)})))))
+
+(defn check-completed-reduction-step
+  "Compare one original selected FP update/read with its constructed typed step.
+
+   Requires actual frontend-owned invocation, read, backedge and FP completion
+   observations. Only an invariant FP carry and a direct read at the loop index
+   are covered; selected arguments must already have identity FP completions.
+   The original Int read coordinate is CONDITIONALLY identified with the product
+   coordinate by exact widening. Count/control/domain and successful read evaluation
+   remain obligations for the enclosing source owner. No box, bounds or execution
+   permission follows from the returned arithmetic correspondence alone."
+  [frontend original product]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and method-entry/*emission-inputs* (seq? original)
+                (= 6 (bounded-count 7 original)) (= 'raster.par/reduce (first original)))
+       (reduction/validate! product)
+       (let [[_ accumulator _ index _ update] original
+             arguments (vec (descriptor/call-args update))
+             read-source (second arguments)
+             observed (method-entry/frontend-reduction-emission frontend original)
+             call (method-entry/frontend-completed-invocation-context frontend update)
+             read (when (descriptor/aget-call? read-source)
+                    (method-entry/frontend-array-read frontend read-source))
+             origin (when read (method-entry/frontend-invocation-input-source frontend update 1))
+             carry (second (get-in observed [:recur :values]))
+             carry-slot (get-in observed [:loop :locals accumulator])
+             type (:type carry-slot)
+             carrier (case type :float Float/TYPE :double Double/TYPE nil)
+             array (:array read)
+             component (first (:components product))
+             region (reduction/fold-region product)
+             physical-inputs (:input-completions call)
+             input-context (:context carry)]
+         (when (and carrier observed call read origin
+                    (= 2 (count arguments) (count (:inputs call)) (count physical-inputs))
+                    (= accumulator (first arguments))
+                    (= [index accumulator] (get-in observed [:loop :variables]))
+                    (= :global-typed-indy (:invocation-mode call))
+                    (= Object (:return-carrier call))
+                    (identical? (:expression call) (:operand carry))
+                    (= :ref (:input-type carry)) (= type (:type carry))
+                    (= carry-slot (get-in observed [:recur :targets 1]))
+                    (completion/bytecode-operand-context? input-context)
+                    (= (:input-completion carry)
+                       (completion/bytecode-input-contract carrier input-context))
+                    (= accumulator (get-in call [:inputs 0 :operand]))
+                    (= {accumulator carry-slot} (get-in call [:inputs 0 :ports]))
+                    (identical? (:expression read) (get-in call [:inputs 1 :operand]))
+                    (identical? read-source (:source-input origin))
+                    (identical? (:source read) (:source-original origin))
+                    (identical? (:expression read) (:operand origin))
+                    (symbol? array) (= type (:result-type read))
+                    (= index (get-in read [:input :operand]))
+                    (= :int (get-in read [:input :type]))
+                    (= (get-in observed [:loop :locals index])
+                       (get-in read [:input :ports index]))
+                    (true? (:primitive-index? read))
+                    (identical? (get types/primitive-array-info (dtype/array-tag-for-dtype type))
+                                (get-in read [:array-local :reference-class]))
+                    (= [type type] (mapv :emitted-type physical-inputs))
+                    (= [carrier carrier] (mapv :parameter-carrier physical-inputs))
+                    (every? #(= :identity (:adaptation %)) physical-inputs)
+                    (= 1 (count (:components product)) (count (:results region)))
+                    (= accumulator (:accumulator component)) (= index (:index product))
+                    (= type (:dtype component)) (empty? (:bindings region)))
+           (when-let [payload (checked-selected-fp-payload
+                               update [{:carrier carrier :presence :present}
+                                       {:carrier carrier :presence :present}])]
+             (when (and (= (:method call) (get-in payload [:bridge :invocation-method]))
+                        (= [carrier carrier] (:parameter-carriers payload))
+                        (= carrier (:payload-carrier payload)))
+               (let [decline! (fn [& _]
+                                (throw (ex-info "Outside completed reduction step correspondence"
+                                                {:reason ::completed-step-decline})))
+                     ;; The observed slot and product component independently establish
+                     ;; this binder's width. Normalize only that proved formal; the
+                     ;; product constructor elaborates its :tag, unlike the source use.
+                     carry-value (with-meta accumulator {:tag (dtype/scalar-tag-for-dtype type)
+                                                         :raster.type/tag (dtype/scalar-tag-for-dtype type)})
+                     actual-step (util/subst-syms {accumulator carry-value} (first (:results region)))
+                     ;; Compare coordinates only under the returned, still-unproved
+                     ;; Int -> Long relation. Do not erase the original index's width
+                     ;; metadata or pretend that its signed domain is a device extent.
+                     coordinate (body/->IndexCast index :long :exact)
+                     options {:array-types {array type} :arrays #{array}
+                              :scalar-types {accumulator type} :index-scope #{index}
+                              :source-region [original region (:computation payload)]
+                              :require-source-types? true :id-prefix "completed-step"
+                              :decline! decline!
+                              :lower-index (fn [expression _]
+                                             (if (= expression index) coordinate (decline!)))}]
+                 (try
+                   (let [source-builder (make-lowerer options)
+                         lowered-read ((:lower source-builder) read-source type {accumulator type})
+                         source (instantiate-checked-fp-payload
+                                 payload [{:operations [] :result carry-value :type type} lowered-read]
+                                 source-builder)
+                         actual ((:lower (make-lowerer options)) actual-step type {accumulator type})]
+                     (when (and source
+                                (fingerprint/equivalent?
+                                 source (select-keys actual [:operations :result :type])))
+                       {:scope :completed-selected-reduction-step :dtype type
+                        :checkpoints-preserved? true :array array
+                        :coordinate-obligation {:source :int :product :long :relation :exact-widening
+                                                :domain-correspondence :unproved}}))
+                   (catch clojure.lang.ExceptionInfo failure
+                     (when-not (= ::completed-step-decline (:reason (ex-data failure)))
+                       (throw failure)))))))))))))
+
+(defn canonical-selected-fp-operation
+  "Callee-only correspondence for a selected primitive FP arithmetic leaf.
+
+   The actual original body must be the same canonical core operation over its
+   ordered formals. Only identity result casts may surround it. This is NOT
+   operand completion, generic-call purity, Object erasure or permission to move
+   the source call. A wider body needs its actual owned computation recipe.
+   Existing source-entry and bootstrap definition guards own all assumptions."
+  [expression]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [entry body definition operation]}
+                (selected-strict-scalar-source expression)]
+       (let [parameters (:parameters definition)
+             carriers (:parameter-carriers entry)
+             intrinsic (intrinsics/descriptor operation)
+             scope (zipmap parameters carriers)
+             actual (completed-fp-body-carrier body scope true)
+             expected (some-> (:return-tag definition) types/tag->java-class)
+             ;; Do not erase Float checkpoints or even an exact widening:
+             ;; the computation width must stay the source operation's width.
+             primitive-body
+             (loop [source body]
+               (let [op (when (seq? source) (descriptor/semantic-op source))
+                     arguments (vec (descriptor/call-args source))
+                     operand (first arguments)]
+                 (if (and (seq? source) (= op (first source)) (= 1 (count arguments))
+                          (descriptor/cast-op? op)
+                          (= (completed-fp-body-carrier source scope true)
+                             (completed-fp-body-carrier operand scope true))
+                          (some? (completed-fp-body-carrier operand scope true)))
+                   (do
+                     (intrinsic-source/observe-original! (the-ns 'clojure.core) op)
+                     (recur operand))
+                   source)))
+             core-op (when (seq? primitive-body) (first primitive-body))]
+         (when (and (= :infix (:kind intrinsic))
+                    (source-arithmetic/binary-operator? (:c intrinsic))
+                    (= 2 (count parameters) (count carriers))
+                    (every? #{Float/TYPE Double/TYPE} carriers)
+                    (contains? #{Float/TYPE Double/TYPE} actual)
+                    (= expected actual)
+                    (symbol? core-op) (= "clojure.core" (namespace core-op))
+                    (= parameters (vec (rest primitive-body)))
+                    (= (intrinsics/canonical operation) (intrinsics/canonical core-op)))
+           (intrinsic-source/observe-original! (the-ns 'clojure.core) core-op)
+           {:scope :canonical-selected-fp-operation
+            :operation (intrinsics/canonical operation)
+            :parameter-carriers carriers :result-carrier (:result-carrier entry)
+            :payload-carrier actual}))))))
+
+(defn ^:no-doc check-reduction-fp-correspondence
+  "Conditional FP value/checkpoint correspondence at an owning reduction constructor.
+
+   `original` must be the owner's source occurrence; `product` is its actual
+   constructed ProductReduction. Storage and primitive scalar facts are supplied
+   by that owner, never inferred from desired result tags. Only one FP carry,
+   direct index reads, sequential let* and authenticated core FP arithmetic are covered.
+   Bare FP casts retain their source-namespace lookup, not a guessed core spelling.
+   Selected calls abstain: a boxed payload is not its parent's operand carrier.
+   This query does not establish source ownership, a physical JVM result carrier,
+   operand/count completion, bounds, purity or permission to reorder a reduction.
+   The enclosing extent is not part of ProductReduction. An opaque original bound
+   remains an obligation: its evaluation, checked Int conversion, ordering and
+   domain correspondence are NOT proved by operator/checkpoint correspondence.
+   Unknown correspondence abstains; definition-ownership failures still propagate."
+  [original product {:keys [source-ns array-types scalar-facts]}]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and method-entry/*emission-inputs*
+                (instance? clojure.lang.Namespace source-ns)
+                (seq? original) (= 6 (bounded-count 7 original))
+                (= 'raster.par/reduce (first original)))
+       (reduction/validate! product)
+       (let [abstain! (fn [& _]
+                        (throw (ex-info "Outside conditional FP reduction correspondence"
+                                        {:reason ::reduction-correspondence-decline})))
+             fp? #{:float :double}
+             retained-types (fn [x]
+                              (keep (fn [tag]
+                                      (or (when (and (keyword? tag) (dtype/known? tag)) (dtype/canon tag))
+                                          (dtype/dtype-for-scalar-tag tag)))
+                                    [(:raster.type/tag (meta x)) (:tag (meta x))]))
+             typed (fn [x type]
+                     (doseq [retained (retained-types x)]
+                       (when-not (= retained type) (abstain!)))
+                     (if (instance? clojure.lang.IObj x)
+                       (let [tag (dtype/scalar-tag-for-dtype type)]
+                         (with-meta x (assoc (meta x) :raster.type/tag tag :tag tag))) x))]
+         (try
+           ;; Bound analysis cost and recursion before either the correspondence
+           ;; traversal or the existing scalar lowerer visits an expression.
+           (loop [pending [[original 0] [(:results (:step product)) 0]] visits 0]
+             (when-let [[node depth] (peek pending)]
+               (when (or (>= visits 10000) (> depth 128)) (abstain!))
+               (let [remaining (pop pending)
+                     capacity (- 10000 visits (count remaining))]
+                 ;; Bound child realization BEFORE growing the work stack; a
+                 ;; wide or lazy collection must not evade the visit budget.
+                 (when (and (coll? node)
+                            (> (bounded-count (inc capacity) node) capacity)) (abstain!))
+                 (recur (if (coll? node)
+                          (into remaining (map #(vector % (inc depth)) node))
+                          remaining)
+                        (inc visits)))))
+           (let [{:keys [acc init idx body]} (par/extract-par-reduce-info original)
+                 component (first (:components product))
+                 region (reduction/fold-region product)
+                 target (:dtype component)
+                 scalar-types (into {}
+                                    (keep (fn [[id {:keys [carrier presence]}]]
+                                            (when (and (= :present presence)
+                                                       (contains? #{Float/TYPE Double/TYPE} carrier))
+                                              [id (if (= carrier Float/TYPE) :float :double)])))
+                                    scalar-facts)]
+             (when-not (and (= 1 (count (:components product))) (fp? target)
+                            (= acc (:accumulator component)) (= idx (:index product))
+                            (symbol? acc) (symbol? idx) (not= acc idx) (empty? (:bindings region))
+                            (= 1 (count (:results region)))
+                            ;; Initializers are retained by the actual constructor. Equal
+                            ;; numeric values must not substitute a different source width.
+                            (identical? init (:neutral component)))
+               (abstain!))
+             (letfn [(check [expression env]
+                       (let [[type normalized]
+                             (cond
+                               (instance? Float expression) [:float expression]
+                               (instance? Double expression) [:double expression]
+                               (symbol? expression)
+                               (when-let [type (get env expression)] [type expression])
+
+                               (and (seq? expression) (= 'let* (first expression)))
+                               (let [[_ bindings & bodies] expression]
+                                 (when-not (and (vector? bindings) (even? (count bindings))
+                                                (= 1 (count bodies))) (abstain!))
+                                 (let [[scope bindings]
+                                       (reduce (fn [[scope out] [id value]]
+                                                 (when-not (and (symbol? id) (not= idx id)) (abstain!))
+                                                 (let [[type value] (check value scope)]
+                                                   [(assoc scope id type)
+                                                    (conj out (typed id type) value)]))
+                                               [env []] (partition 2 bindings))
+                                       [type body] (check (first bodies) scope)]
+                                   [type (with-meta (list 'let* bindings body) (meta expression))]))
+
+                               (seq? expression)
+                               (let [{:keys [semantic-op arguments lexical-callee implementation-op]}
+                                     (descriptor/call-description expression)
+                                     core? (and (= semantic-op (first expression))
+                                                (= "clojure.core" (namespace semantic-op)))
+                                     bare-cast? (and (= semantic-op (first expression))
+                                                     (simple-symbol? semantic-op)
+                                                     (descriptor/cast-op? semantic-op))]
+                                 (when (or lexical-callee (contains? env implementation-op)
+                                           (contains? scalar-facts implementation-op)
+                                           (contains? array-types implementation-op)
+                                           (contains? util/*shadowing-locals* implementation-op))
+                                   (abstain!))
+                                 (cond
+                                   (and core? (= 'clojure.core/aget semantic-op)
+                                        (= 2 (count arguments)) (= idx (second arguments))
+                                        (symbol? (first arguments))
+                                        (not (contains? env (first arguments))))
+                                   (let [type (get array-types (first arguments))]
+                                     (when-not (fp? type) (abstain!))
+                                     (intrinsic-source/observe-original! source-ns semantic-op)
+                                     [type expression])
+
+                                   (and (or core? bare-cast?) (descriptor/cast-op? semantic-op)
+                                        (= 1 (count arguments)))
+                                   (let [[source operand] (check (first arguments) env)
+                                         canonical (if bare-cast?
+                                                     (symbol "clojure.core" (name semantic-op)) semantic-op)
+                                         canonical-source (with-meta (cons canonical arguments) (meta expression))
+                                         target (dtype/dtype-for-scalar-tag
+                                                 (descriptor/cast-result-tag semantic-op))]
+                                     (when-not (fp? target) (abstain!))
+                                     (intrinsic-source/observe-original! source-ns semantic-op canonical)
+                                     (when-not (or (= source target) (= target :double)
+                                                   (numeric-constant/source-value canonical-source))
+                                       (abstain!))
+                                     [target (with-meta (list canonical operand) (meta expression))])
+
+                                   :else
+                                   (let [_ (when-not core? (abstain!))
+                                         intrinsic (intrinsics/descriptor semantic-op)
+                                         checked (mapv #(check % env) arguments)
+                                         types (mapv first checked)]
+                                     (when-not (and (= 2 (count checked)) (= :infix (:kind intrinsic))
+                                                    (source-arithmetic/binary-operator? (:c intrinsic))
+                                                    (every? fp? types))
+                                       (abstain!))
+                                     (intrinsic-source/observe-original! source-ns semantic-op)
+                                     (let [plan (apply source-arithmetic/binary-plan (:c intrinsic) types)
+                                           type (:result-carrier plan)
+                                           op (symbol "clojure.core" (:c intrinsic))]
+                                       (when-not (= :primitive (:kind plan)) (abstain!))
+                                       [type (with-meta (apply list op (map second checked))
+                                                       (meta expression))]))))
+                               :else nil)]
+                         (when-not (fp? type) (abstain!))
+                         [type (typed normalized type)]))]
+               (let [[initial-type _] (check init scalar-types)
+                     env (assoc (dissoc scalar-types idx) acc target)
+                     [update-type source-step] (check body env)
+                     plan (source-arithmetic/loop-initializer-plan acc init initial-type update-type)
+                     [_ actual-step] (check (first (:results region)) env)]
+                 (when-not (= target update-type (:slot-carrier plan)) (abstain!))
+                 (let [options {:array-types array-types :arrays (set (keys array-types))
+                                :scalar-types env :index-scope #{idx}
+                                :source-region [source-step actual-step] :require-source-types? true
+                                :id-prefix "fp-correspondence" :decline! abstain!
+                                :lower-index (fn [coordinate _]
+                                               (if (= coordinate idx) idx (abstain!)))}
+                       lower (fn [expression]
+                               ((:lower (make-lowerer options)) expression target env))]
+                   ;; Algebra construction may place a let around the element
+                   ;; instead of the whole recurrence. Administrative syntax
+                   ;; need not match; its ordered loads/computations/checkpoints do.
+                   ;; Identities are already deterministic. Exact comparison must
+                   ;; retain literal FP bits: ordinary = conflates signed zeros.
+                   (when-not (fingerprint/equivalent? (lower source-step) (lower actual-step))
+                     (abstain!))
+                   {:scope :conditional-fp-reduction-correspondence :dtype target
+                    :checkpoints-preserved? true :zero-trip :initializer
+                    :source-count-obligation {:conversion :checked-int :evaluation :original-position
+                                              :domain-correspondence :unproved}}))))
+           (catch clojure.lang.ExceptionInfo error
+             (when-not (= ::reduction-correspondence-decline (:reason (ex-data error)))
+               (throw error)))))))))

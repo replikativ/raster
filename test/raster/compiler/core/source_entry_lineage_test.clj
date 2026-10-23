@@ -51,6 +51,45 @@
       (is (= Object (:result-carrier warm)))
       (is (= before @body-calls)))))
 
+(deftest frontend-physical-carriers-remain-bound-to-the-opaque-implementation
+  (let [{:keys [receiver source]} (fresh-entry)
+        before @body-calls]
+    (core/prepare-implementation-frontend! receiver)
+    (doseq [warm? [false true]]
+      (when warm? (core/ensure-bytecode-implementation! receiver))
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frontend (entry/original-source-frontend source)
+               physical (entry/frontend-body-entry-carriers frontend source)
+               foreign-implementation (Object.)
+               foreign-definition (assoc-in (:definition physical) [:entry :typed-impl]
+                                            foreign-implementation)
+               reason (fn [f]
+                        (try (f) nil
+                             (catch clojure.lang.ExceptionInfo failure
+                               (:reason (ex-data failure)))))]
+           (is (= ['values 'count 'scale 'reference] (:parameters physical)))
+           (is (= Double/TYPE (get-in physical [:parameter-facts 'scale :carrier])))
+           (is (= Long/TYPE (get-in physical [:parameter-facts 'count :carrier])))
+           (is (= Object (get-in physical [:parameter-facts 'reference :carrier])))
+           ;; Same source Var, formal order, nominal interface and carrier facts
+           ;; do not authorize borrowing another specialization's implementation.
+           (is (identical? source (:source-var foreign-definition)))
+           (is (= (:parameters (:definition frontend)) (:parameters foreign-definition)))
+           (is (= :retained-frontend-entry-mismatch
+                  (reason #(entry/frontend-body-entry-carriers
+                            (assoc frontend :definition foreign-definition) source))))
+           (with-redefs [entry/original-body-entry-carriers (fn [& _] nil)]
+             (is (nil? (entry/frontend-body-entry-carriers frontend source))
+                 "missing optional physical evidence is not permission to substitute another entry"))
+           ;; Also fence the physical projection independently: authenticating
+           ;; discovery is not permission to trust a later foreign entry result.
+           (with-redefs [entry/original-body-entry-carriers
+                         (fn [& _] (assoc physical :definition foreign-definition))]
+             (is (= :retained-frontend-entry-mismatch
+                    (reason #(entry/frontend-body-entry-carriers frontend source)))))
+           (is (= before @body-calls))))))))
+
 (deftest bytecode-publishes-source-walking-before-dependencies-are-sealed
   (let [{:keys [receiver source]} (fresh-entry)]
     (core/ensure-bytecode-implementation! receiver)
@@ -75,8 +114,39 @@
           (core/do-bytecode-upgrade! receiver (:source-name lineage) (:params lineage)
                                     (:tags lineage) (:return-tag lineage) nil
                                     (:source-ns lineage) (:typed-interface lineage)
-                                    :annotations (:annotations lineage) :source-body (:source-body lineage))
+                                    :annotations (:annotations lineage) :source-body (:source-body lineage)
+                                    :source-policy (:source-policy lineage))
           (is (identical? populated (:raster.core/deftm-walked-body (meta source)))))))))
+
+(deftest frozen-interface-spelling-is-nominal-not-a-new-physical-proof
+  (doseq [spelling [identity symbol]]
+    (let [{:keys [receiver source]} (fresh-entry)
+          lineage (:source-entry (core/prepare-implementation-frontend! receiver))
+          before @body-calls
+          implementation @receiver
+          pending (:raster.core/jit-spec (meta receiver))
+          options [:annotations (:annotations lineage) :source-body (:source-body lineage)
+                   :source-policy (:source-policy lineage)]
+          upgrade! (fn [name]
+                     (apply core/do-bytecode-upgrade! receiver (:source-name lineage)
+                            (:params lineage) (:tags lineage) (:return-tag lineage) nil
+                            (:source-ns lineage) name options))]
+      (is (string? (:typed-interface lineage)))
+      (is (= lineage (entry/capture-source-entry
+                       source (update lineage :typed-interface symbol))))
+      (is (= :frontend-emission-source-mismatch
+             (try (upgrade! "unrelated.Interface") nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (identical? implementation @receiver))
+      (is (identical? pending (:raster.core/jit-spec (meta receiver))))
+      (upgrade! (spelling (:typed-interface lineage)))
+      (let [emission (:raster.core/bytecode-emission (meta receiver))]
+        (is (symbol? (:typed-interface emission)))
+        (is (= (:typed-interface lineage) (str (:typed-interface emission))))
+        (is (= lineage (:source-entry emission)))
+        (is (nil? (:raster.core/jit-spec (meta receiver))))
+        (is (identical? emission (core/ensure-current-owned-bytecode! receiver))))
+      (is (= before @body-calls)))))
 
 (deftest missing-or-mismatched-entry-lineage-abstains
   (let [{:keys [receiver source operation implementation] :as selected} (fresh-entry)
@@ -88,6 +158,7 @@
       (doseq [[field value] [[:mangled-sym 'missing]
                               [:params '[wrong]] [:tags '[double]] [:annotations '[Object]]
                               [:source-body '(nil)] [:source-ns-name 'missing]
+                              [:source-policy {:unchecked-math true}]
                               [:typed-iface-name 'missing] [:return-tag 'Object]]]
         (reset-meta! receiver (assoc-in original [:raster.core/jit-spec field] value))
         (is (nil? (projection selected)) (pr-str field)))
@@ -101,6 +172,8 @@
                          (assoc-in warm [:raster.core/bytecode-emission :implementation] (Object.))
                          (assoc-in warm [:raster.core/bytecode-emission :typed-interface] 'missing)
                          (assoc-in warm [:raster.core/bytecode-emission :source-entry :source-var] #'body-calls)
+                         (assoc-in warm [:raster.core/bytecode-emission :source-entry :source-policy]
+                                   {:unchecked-math true})
                          (assoc-in warm [:raster.core/bytecode-emission :source-entry :source-body] '(nil))]]
           (reset-meta! receiver changed)
           (is (nil? (projection selected))))

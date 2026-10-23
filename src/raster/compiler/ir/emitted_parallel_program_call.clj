@@ -784,6 +784,19 @@
   ([call f] (map-buffers-for-request call f nil))
   ([call f caller-options] (map-buffers-for-request call f caller-options)))
 
+(defn ^:no-doc project-output-bindings
+  "Project declared outputs from already resolved buffers/scalars. This is data,
+   not program validation, completion or initialized-storage evidence."
+  [parallel-program buffers scalars]
+  (into {}
+        (map (fn [id]
+               [id (cond
+                     (contains? scalars id) (get scalars id)
+                     (contains? buffers id) (get buffers id)
+                     :else (fail! :emitted-program-output-binding
+                                  "program output has no runtime binding" {:value id}))]))
+        (:outputs parallel-program)))
+
 (defn- checked-stage-inputs
   "Check runtime bindings against the exact program without evaluating host equations."
   [parallel-program buffers scalar-values loop-scratch result-views retained-validation caller-options]
@@ -851,7 +864,7 @@
           (evaluate-host-equations program projections buffers scalars evaluate-host))]
     (assoc inputs :scalars scalars :host-steps host-steps)))
 
-(defn ^:no-doc make-equation-call
+(defn ^:no-doc make-equation-call-with-contracts
   "Bind one retained numerical equation using the ordinary checked ABI/dispatch path.
    No host equation is evaluated and no driver resource is acquired. This proves the selected
    call, not that preceding source work completed: the enclosing invocation cursor owns order,
@@ -866,7 +879,14 @@
       (fail! :emitted-program-ready-equation
              "one numerical equation call requires an existing non-loop numerical equation"
              {:equation equation-id}))
-    (prepare-equation-call equation (:values program) buffers scalars result-views projections)))
+    (assoc (prepare-equation-call equation (:values program) buffers scalars result-views projections)
+           :projection (emitted-program/operation-projection projections (first (:operations equation))))))
+
+(defn ^:no-doc make-equation-call
+  "Bind one numerical equation, retaining the ordinary checked ABI/dispatch path."
+  [parallel-program equation-id buffers scalar-values result-views caller-options]
+  (dissoc (make-equation-call-with-contracts parallel-program equation-id buffers scalar-values
+                                            result-views caller-options) :projection))
 
 (defn ^:no-doc make-host-equation-step
   "Evaluate only the selected retained host equation through the ordinary checked binding path.
@@ -919,14 +939,7 @@
          (:equations parallel-program))
         final-buffers (:buffers planned)
         outputs
-        (into {}
-              (map (fn [id]
-                     [id (cond
-                           (contains? scalars id) (get scalars id)
-                           (contains? final-buffers id) (get final-buffers id)
-                           :else (fail! :emitted-program-output-binding
-                                        "program output has no runtime binding" {:value id}))]))
-              (:outputs parallel-program))]
+        (project-output-bindings parallel-program final-buffers scalars)]
     (validate-call-against-program!
      (->EmittedParallelProgramCall
       parallel-program (:steps planned) buffers final-buffers scalars loop-scratch outputs

@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.ordered-invocation-realization-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
@@ -8,8 +9,10 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
+            [raster.gpu.link :as gpu-link]
             [raster.core :refer [deftm]]
             [raster.par :as par]))
 
@@ -28,6 +31,104 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftm scalar-total [x :- (Array double)] :- Double
+  (let [total (par/reduce sum 0.0 i (alength x) (+ sum (aget x i)))] total))
+
+(defn- advance-host-prefix [initial compilation]
+  (loop [state initial]
+    (let [entry (nth (:source-order state) (:source-cursor state) nil)
+          equation (some #(when (= (:equation entry) (:id %)) %) (get-in state [:program :equations]))]
+      (when-not entry (throw (ex-info "test fixture has no numerical entry" {})))
+      (if (or (:realization entry)
+              (and equation (not (true? (get-in equation [:attributes :host-only])))))
+        state
+        (recur (invocation-link/advance-host-source
+                state (partial scalar/evaluate-invocation-step (:source-ns compilation))
+                (partial scalar/evaluate-host-equation (:source-ns compilation)) nil))))))
+
+(deftest equation-graph-stage-retains-revalidated-reduction-write-coverage
+  (let [compilation (equation-first/compile #'scalar-total {:target :cuda:0 :dtype :double})
+        initial (invocation-link/begin-ordered-realization compilation [(double-array [1.0 2.0])] nil)
+        state (advance-host-prefix initial compilation)
+        entry (nth (:source-order state) (:source-cursor state))
+        ready (invocation-link/realize-ready-equation state (:equation entry) nil)
+        plan (:stage-plan ready)
+        output (first (:outputs plan))
+        changed (assoc-in plan [:instances 0 :attributes :emitted-equation-source :equation-id] :missing)]
+    (is (contains? (get-in ready [:entry-contract :full-produces]) output))
+    (is (not (contains? (get-in ready [:entry-contract :requires]) output)))
+    (is (= :emitted-program-ready-equation (reason #(link-plan/validate! changed))))))
+
+(deftest checked-source-ready-entry-retains-observation-without-crediting-completion
+  (let [compilation (equation-first/compile #'storage/mixed-scale
+                                           (merge storage/policy {:target :ocl:0 :dtype :double}))
+        initial (invocation-link/begin-ordered-realization compilation [2.0 (float-array [1.0 2.0])] nil)
+        allocation-state (advance-host-prefix initial compilation)
+        allocation (invocation-link/prepare-source-allocation
+                    allocation-state
+                    (fn [expression scalars]
+                      (scalar/evaluate-array-size (:source-ns compilation)
+                                                  (update-vals scalars :value) expression)) nil)
+        ;; IR-only post-allocation state, as in the acquired-root controls below.
+        ;; This supplies no device initialization/completion evidence.
+        state (advance-host-prefix
+               (-> (:state allocation) (dissoc :pending) (update :source-cursor inc)
+                   (update :acquired-storage conj (:storage allocation))) compilation)
+        position (:source-cursor state)
+        entry (nth (:source-order state) position)
+        ready (invocation-link/realize-ready-equation state (:equation entry) nil)
+        pending (:pending-observed-entry ready)
+        output (first (get-in ready [:stage-layout :outputs]))]
+    (is (some? pending))
+    (is (nil? (:stage-plan ready)))
+    (is (nil? (:effect-evidence ready)))
+    (is (= position (get-in ready [:state :source-cursor])))
+    (is (= #{} (get-in ready [:entry-contract :full-produces])))
+    (is (= #{output} (get-in ready [:entry-contract :success-produces])))
+    (is (seq (get-in ready [:entry-contract :observations])))
+    (is (= {:equation (:equation entry) :observations (get-in ready [:entry-contract :observations])}
+           (get (invocation-link/ordered-observation-occurrences state) position)))
+    (is (= (invocation-link/ordered-observation-occurrences state)
+           (invocation-link/ordered-observation-occurrences (assoc-in state [:program :outputs] [])))
+        "unused checked results still require their source observation")
+    (is (= :internal (get-in ready [:stage-layout :nodes output :role])))
+    (is (identical? pending (link-plan/validate-pending-observed-entry! pending)))
+    (is (= :checked-stage-observation-required
+           (reason #(link-plan/validate! (:stage-layout ready)))))
+    (let [acquisitions (atom 0)]
+      (with-redefs-fn {#'gpu-link/acquire-ordered-storage!
+                      (fn [& _] (swap! acquisitions inc) (throw (AssertionError. "unowned stage acquired storage")))}
+        (fn []
+          (doseq [executable [nil {} {:owns-session? true}
+                              (gpu-link/map->LinkedExecutable {:owns-session? true})
+                              (gpu-link/map->LinkedExecutable
+                               {:owns-session? :truthy :execution-state (atom {:ordered {:observe-checked? true}})})
+                              (gpu-link/map->LinkedExecutable
+                               {:owns-session? true :execution-state (atom {:ordered {:observe-checked? :truthy}})})]]
+            (is (= :link-checked-entry-owner-required
+                   (reason (fn [] (#'gpu-link/run-ordered-stage! executable ready))))))
+          (let [unowned (gpu-link/map->LinkedExecutable
+                         {:owns-session? true
+                          :execution-state (atom {:ordered {:observe-checked? true
+                                                            :compilation (dissoc compilation :ordered-source-owner)}})})]
+            (is (= :ordered-source-owner-mismatch
+                   (reason #(#'gpu-link/run-ordered-stage! unowned ready)))))))
+      (is (zero? @acquisitions)))
+    (is (= :invocation-ordered-pending
+           (reason #(invocation-link/realize-ready-equation (:state ready) (:equation entry) nil))))
+    (is (= :invocation-ordered-incomplete
+           (reason #(invocation-link/finish-ordered-storage-boundary (:state ready) nil))))
+    ;; Synthetic source state proves layout only: no device work or observation
+    ;; happened in this test and the returned value must grant neither.
+    (let [completed (-> (:state ready) (dissoc :pending)
+                        (assoc :source-cursor (count (:source-order state))))
+          boundary (invocation-link/finish-ordered-storage-boundary completed nil)]
+      (is (= [output] (:outputs boundary)))
+      (is (every? #(nil? (:source %)) (vals (:nodes boundary))))
+      (is (nil? (:instances boundary)))
+      (is (nil? (:effect-evidence boundary)))
+      (is (= :link-plan-type (reason #(link-plan/validate! boundary)))))))
 
 (deftest early-equation-binds-without-evaluating-the-late-checked-shape
   (let [compilation (equation-first/compile #'fixture/write-before-shape

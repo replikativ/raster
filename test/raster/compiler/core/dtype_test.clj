@@ -16,4 +16,8 @@
                [(double-array 0) (float-array 0) (short-array 0)
                 (int-array 0) (long-array 0) (byte-array 0)])))
   (is (nil? (dtype/dtype-for-jvm-array (object-array 0))))
-  (is (nil? (dtype/dtype-for-jvm-array nil))))
+  (is (nil? (dtype/dtype-for-jvm-array nil)))
+  (is (= [:double :float :half :int :long :byte]
+         (mapv #(dtype/dtype-for-jvm-array-class (Class/forName %))
+               ["[D" "[F" "[S" "[I" "[J" "[B"])))
+  (is (every? nil? (map dtype/dtype-for-jvm-array-class [nil Object Double/TYPE]))))

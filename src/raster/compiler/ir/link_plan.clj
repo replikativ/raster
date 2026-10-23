@@ -21,6 +21,7 @@
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
@@ -41,6 +42,8 @@
 (defrecord LinkPlan [id target nodes values instances outputs aliases attributes])
 (defrecord LinkEffectEvidence
            [source-dialect target-dialect plan-id target step-facts initialization])
+(defrecord PendingObservedEntry [layout equation entry-contract])
+(defrecord StorageBoundary [id target nodes values outputs aliases attributes])
 
 (def ^:dynamic ^:private *validated-program-instances* nil)
 (def ^:dynamic ^:private *retained-program-validations* nil)
@@ -129,7 +132,8 @@
    Unlike the ordinary whole-plan analyzer, this does not credit an internal value merely because
    another entry writes it somewhere in the spine. Reads and non-complete writes instead become
    explicit requirements. Only semantic complete-write evidence and certified produced views can
-   initialize fresh storage. Several complete child views may jointly cover a later parent view."
+   initialize fresh storage. Several complete child views may jointly cover a later parent view.
+   Checked observations retain separate success-produces; they never cover a following read."
   [nodes step-facts]
   (let [complete-ids (volatile! #{})
         complete-views (volatile! [])
@@ -137,6 +141,8 @@
         requirement-order (volatile! [])
         reads (volatile! #{})
         writes (volatile! #{})
+        observations (volatile! [])
+        success-produces (volatile! #{})
         covered? (fn [node-id]
                    (bview/covered-contiguous? (get-in nodes [node-id :view]) @complete-views))
         require! (fn [node-id]
@@ -149,8 +155,9 @@
         produce! (fn [node-id]
                    (vswap! complete-ids conj node-id)
                    (vswap! complete-views conj (get-in nodes [node-id :view])))]
-    (doseq [{:keys [facts produced-views complete-writes]} step-facts]
+    (doseq [{:keys [facts produced-views complete-writes conditional-complete-writes]} step-facts]
       (let [by-node (ordered-step-accesses facts)
+            conditional-nodes (into #{} (mapcat :writes) conditional-complete-writes)
             produced-views (set produced-views)
             certified-child?
             (fn [node-id]
@@ -170,15 +177,22 @@
               ;; child result is different: the child is produced below, while the untouched
               ;; parent remains uninitialized and must not become an artificial requirement for
               ;; a write-only pointer.
-              (when-not (and (= :write access) (certified-child? node-id))
+              (when-not (and (= :write access)
+                             (or (certified-child? node-id) (contains? conditional-nodes node-id)))
                 (require! node-id)))))
+        ;; These views are NOT available to another step in this entry. Only
+        ;; its enclosing ordered owner may credit them after exact observation.
+        (vswap! observations into (map :obligation conditional-complete-writes))
+        (vswap! success-produces into conditional-nodes)
         (doseq [node-id produced-views]
           (produce! node-id))))
-    {:requires @requirements
+    (cond-> {:requires @requirements
      :require-order @requirement-order
      :reads @reads
      :writes @writes
-     :full-produces @complete-ids}))
+     :full-produces @complete-ids}
+      (seq @observations) (assoc :observations @observations
+                                :success-produces @success-produces))))
 
 (defn ^:no-doc relative-entry-contracts!
   "Project strict conditional contracts for a complete ordered instance partition.
@@ -903,7 +917,28 @@
                        :nodes (set (keys nodes))}))))
   {:nodes nodes :values values})
 
-(defn- validate-plan-structure! [plan]
+(defn- validate-output-layout! [{:keys [nodes values outputs] :as boundary}]
+  (when-not (and (vector? outputs) (every? #(contains? nodes %) outputs))
+    (throw (ex-info "link outputs must name existing storage nodes"
+                    {:reason :link-outputs :outputs outputs :nodes (set (keys nodes))})))
+  (when-not (= (count outputs) (count (distinct outputs)))
+    (throw (ex-info "link output identities must be unique"
+                    {:reason :link-output-duplicates :outputs outputs})))
+  (let [positions (zipmap outputs (range))]
+    (doseq [[value-id link-value] values
+            :let [leaf-nodes (mapv :node (:leaves link-value))
+                  leaf-positions (vec (keep positions leaf-nodes))]
+            :when (seq leaf-positions)]
+      (when-not (and (= (count leaf-nodes) (count leaf-positions))
+                     (= leaf-positions
+                        (vec (range (first leaf-positions)
+                                    (+ (first leaf-positions) (count leaf-positions))))))
+        (throw (ex-info "public outputs must flatten whole logical values in field order"
+                        {:reason :link-output-value :value value-id :leaves leaf-nodes
+                         :positions leaf-positions :outputs outputs})))))
+  boundary)
+
+(defn- validate-plan-storage-and-instances! [plan]
   (when-not (link-plan? plan)
     (throw (ex-info "expected a LinkPlan value"
                     {:reason :link-plan-type :plan plan :actual (type plan)})))
@@ -926,24 +961,7 @@
     (when-not (= (count instances) (count (distinct (map :id instances))))
       (throw (ex-info "link instance identities must be unique"
                       {:reason :link-instance-ids :ids (mapv :id instances)})))
-    (when-not (and (vector? outputs) (every? #(contains? nodes %) outputs))
-      (throw (ex-info "link plan outputs must be an ordered vector of existing node identities"
-                      {:reason :link-outputs :outputs outputs :nodes (set (keys nodes))})))
-    (when-not (= (count outputs) (count (distinct outputs)))
-      (throw (ex-info "link plan output identities must be unique"
-                      {:reason :link-output-duplicates :outputs outputs})))
-    (let [positions (zipmap outputs (range))]
-      (doseq [[value-id link-value] values
-              :let [leaf-nodes (mapv :node (:leaves link-value))
-                    leaf-positions (vec (keep positions leaf-nodes))]
-              :when (seq leaf-positions)]
-        (when-not (and (= (count leaf-nodes) (count leaf-positions))
-                       (= leaf-positions
-                          (vec (range (first leaf-positions)
-                                      (+ (first leaf-positions) (count leaf-positions))))))
-          (throw (ex-info "public outputs must flatten whole logical values in field order"
-                          {:reason :link-output-value :value value-id :leaves leaf-nodes
-                           :positions leaf-positions :outputs outputs})))))
+    (validate-output-layout! plan)
     (when-not (and (set? aliases) (every? set? aliases))
       (throw (ex-info "link plan aliases must be a set of two-node sets"
                       {:reason :link-aliases :aliases aliases})))
@@ -951,6 +969,10 @@
       (throw (ex-info "link plan attributes must be a map"
                       {:reason :link-attributes :attributes attributes}))))
   plan)
+
+(defn- validate-plan-structure! [plan]
+  (stage-result/refuse-unobserved! plan :link-plan-validation)
+  (validate-plan-storage-and-instances! plan))
 
 (defn- validate-allocations-and-aliases! [{:keys [nodes aliases] :as plan}]
   (let [by-allocation (group-by #(get-in % [:view :allocation :id]) (vals nodes))]
@@ -1004,6 +1026,27 @@
                         {:reason :link-storage-node-identities :node id})))
       (validate-node-device! target id node true))
     (validate-allocations-and-aliases! {:nodes by-id :aliases (set aliases)})))
+
+(defn ^:no-doc make-storage-boundary
+  "Validate only a non-executable storage/output layout.
+   No instances, initialized-byte claim, completion evidence or binding permission
+   is represented. A live execution owner must independently establish all of
+   those obligations before exposing any view. Reuses LinkPlan storage rules."
+  [{:keys [id target nodes values outputs aliases attributes]
+    :or {outputs [] aliases #{} attributes {}} :as request}]
+  (when (or (nil? id)
+            (seq (set/difference (set (keys request))
+                                 #{:id :target :nodes :values :outputs :aliases :attributes}))
+            (not (map? attributes)))
+    (throw (ex-info "storage boundary cannot carry executable or effect evidence"
+                    {:reason :link-storage-boundary-contract})))
+  (let [nodes (:nodes (validate-storage-nodes! target nodes aliases))
+        values (normalize-values nodes values)
+        boundary (->StorageBoundary id target nodes values (vec outputs)
+                                    (into #{} (map canonical-alias-pair) aliases) attributes)]
+    (validate-storage-structure! target nodes values false)
+    (validate-output-layout! boundary)
+    boundary))
 
 (defn- validate-instance-bindings! [nodes values instance]
   (let [{:keys [id descriptor bindings roles]} instance
@@ -1231,7 +1274,9 @@
         (emitted-equation/validate-with-result-contracts
          (equation-dispatch/boundary-equation operation *caller-options*) *caller-options*)))))
 
-(defn- program-complete-writes [nodes values instance step call-scalars projection]
+(defn- program-complete-writes
+  "Semantic candidate coverage, partitioned by program-write-contract before admission."
+  [nodes values instance step call-scalars projection]
   (let [operation (:boundary projection)
         algorithm (:algorithm operation)
         scalars (merge (program-extent-values nodes values instance (:buffers step))
@@ -1265,6 +1310,30 @@
           ;; rederivation above, never a mere graph/ABI write permission.
           (when (soac/program-form? algorithm) (soac/equations algorithm)))))
 
+(defn- program-write-contract
+  "Partition the existing semantic coverage by independently rederived result conditions."
+  [nodes values instance step call-scalars projection]
+  (let [coverage (program-complete-writes nodes values instance step call-scalars projection)
+        conditional
+        (mapv (fn [obligation]
+                (let [physical (:output obligation)
+                      node (program-value-node! nodes values instance physical
+                                                (get (:buffers step) physical))
+                      candidates (into #{(:id node)}
+                                       (keep (fn [[logical storage]]
+                                               (when (and (= storage physical)
+                                                          (contains? (:outputs step) logical))
+                                                 (:id (program-value-node!
+                                                       nodes values instance logical
+                                                       (get (:outputs step) logical))))))
+                                       (:physical-results projection))]
+                  {:obligation obligation
+                   :writes (set/intersection coverage candidates)}))
+              (:stage-results projection))
+        conditional-nodes (into #{} (mapcat :writes) conditional)]
+    (cond-> {:complete-writes (set/difference coverage conditional-nodes)}
+      (seq conditional) (assoc :conditional-complete-writes conditional))))
+
 (defn- validate-program-instance-bindings!
   [nodes values instance]
   (let [{:keys [id call]} (validate-program-instance-for-current-request! instance)]
@@ -1276,8 +1345,8 @@
           (program-call/evaluated-host-equation? step) []
           (program-call/emitted-equation-call? step)
           (let [projection (program-operation-projection call step)
-                complete (program-complete-writes nodes values id step (:scalar-values call)
-                                                  projection)
+                write-contract (program-write-contract nodes values id step (:scalar-values call) projection)
+                complete (:complete-writes write-contract)
                 operation (:boundary projection)
                 algorithm (:algorithm operation)
                 equation (when (soac/program-form? algorithm)
@@ -1309,8 +1378,7 @@
                                     (assoc fact :access :read-write)
                                     fact))
                                 facts)))]
-           [(assoc graph-fact
-                  :complete-writes complete
+           [(assoc (merge graph-fact write-contract)
                   :produced-views
                   (set/intersection complete (set (map (fn [[result _]]
                               (:id (program-value-node! nodes values id result
@@ -1353,7 +1421,26 @@
                                 [compiler-value (:view node)])))
                        bindings)]
     (kgcall/validate-binding-aliases! graph physical bview/overlaps?)
-    [(program-graph-fact nodes values id 0 :graph graph bindings scalar-values {})]))
+    (let [fact (program-graph-fact nodes values id 0 :graph graph bindings scalar-values {})
+          retained (get-in instance [:attributes :emitted-equation-source])]
+      (if (contains? (:attributes instance) :emitted-equation-source)
+        (let [_ (when-not (and (map? retained) (= #{:program :equation-id} (set (keys retained))))
+                  (throw (ex-info "graph equation projection requires its complete enclosing program"
+                                  {:reason :graph-link-equation-source :instance id})))
+              {:keys [call projection]}
+              (program-call/make-equation-call-with-contracts
+               (:program retained) (:equation-id retained) bindings scalar-values {} *caller-options*)]
+          (when-not (= [graph bindings scalar-values] [(:graph call) (:buffers call) (:scalar-values call)])
+            (throw (ex-info "graph stage differs from its exact emitted equation call"
+                            {:reason :graph-link-equation-projection :instance id
+                             :graph-match? (= graph (:graph call))
+                             :bindings-match? (= bindings (:buffers call))
+                             :scalars scalar-values :expected-scalars (:scalar-values call)})))
+          ;; Reuse the program binder's semantic coverage. Keeping a numerical
+          ;; equation as one graph stage must not erase its complete-write
+          ;; proof or promote ABI write permission into such a proof.
+          [(merge fact (program-write-contract nodes values id call (:scalar-values call) projection))])
+        [fact]))))
 
 (defn- instance-access-facts [{:keys [nodes values instances]}]
   (mapcat #(cond
@@ -1366,6 +1453,9 @@
   ([plan] (analyze-effects! plan (vec (instance-access-facts plan))))
   ([{:keys [nodes outputs aliases]} step-facts]
    (let [step-facts (vec step-facts)
+        _ (when (some (comp seq :conditional-complete-writes) step-facts)
+            (throw (ex-info "ordinary link analysis cannot discharge checked result observations"
+                            {:reason :link-unobserved-result-condition})))
         ;; Preserve the plan's local node traversal for covering-view checks.  Rendering identities
         ;; is neither a semantic ordering nor an acceptable cost here; composed identities may
         ;; retain arbitrarily rich provenance. Canonical identity/order belongs to the enclosing
@@ -1755,6 +1845,66 @@
         values (normalize-values nodes values)
         aliases (into #{} (map canonical-alias-pair) aliases)]
     (->LinkPlan id target nodes values (vec instances) (vec outputs) aliases attributes)))
+
+(defn ^:no-doc make-pending-observed-entry
+  "Derive an ordered entry, NOT a validated executable LinkPlan.
+
+   Structure, aliases, exact equation bindings and semantic coverage are checked
+   independently. Checked output coverage remains explicitly conditional; no
+   whole-plan initialization proof, binding or publication permission is granted.
+   The enclosing owner must discharge observations before crediting success views."
+  ([equation request] (make-pending-observed-entry equation request nil))
+  ([equation request caller-options]
+   (with-independent-request
+    caller-options
+    (fn []
+      (let [projection (emitted-equation/validate-with-result-contracts equation caller-options)
+            obligations (:stage-results projection)
+            layout (normalize-plan request)
+            instance (first (:instances layout))]
+        (when-not (and (= 1 (count obligations))
+                       (= 1 (count (:instances layout)))
+                       (graph-link-instance? instance)
+                       (identical? (:graph equation) (:graph instance)))
+          (throw (ex-info "pending observed entry requires its exact single checked equation graph"
+                          {:reason :link-pending-observation-contract})))
+        (validate-plan-storage-and-instances! layout)
+        (validate-allocations-and-aliases! layout)
+        (let [facts (vec (instance-access-facts layout))
+              contract (relative-entry-contract (:nodes layout) facts)
+              success (:success-produces contract)]
+          (when-not (and (= obligations (:observations contract))
+                         (empty? (:full-produces contract))
+                         (= (set (:outputs layout)) success)
+                         (seq success)
+                         (every? (fn [node-id]
+                                   (let [node (get-in layout [:nodes node-id])]
+                                     (and (contains? #{:output :internal} (:role node))
+                                          (nil? (:source node))
+                                          (= :owned (get-in node [:view :allocation :ownership])))))
+                                 success))
+            (throw (ex-info "pending observation must retain fresh private success-conditioned outputs"
+                            {:reason :link-pending-observation-contract
+                             :observations-match? (= obligations (:observations contract))
+                             :unconditional (:full-produces contract)
+                             :outputs (:outputs layout) :success-produces success
+                             :output-contracts
+                             (mapv (fn [id]
+                                     (let [node (get-in layout [:nodes id])]
+                                       {:role (:role node) :host-source? (some? (:source node))
+                                        :ownership (get-in node [:view :allocation :ownership])}))
+                                   success)})))
+          (->PendingObservedEntry layout equation contract)))))))
+
+(defn ^:no-doc validate-pending-observed-entry!
+  "Reconstruct a pending entry; its mutable caller context cannot supply coverage facts."
+  ([entry] (validate-pending-observed-entry! entry nil))
+  ([entry caller-options]
+   (when-not (and (= "raster.compiler.ir.link_plan.PendingObservedEntry" (some-> entry class .getName))
+                  (= entry (make-pending-observed-entry (:equation entry) (:layout entry) caller-options)))
+     (throw (ex-info "pending entry differs from its independently derived conditional contract"
+                     {:reason :link-pending-observation-contract})))
+   entry))
 
 (defn ^:no-doc make-with-effect-evidence
   "Construct and validate a LinkPlan while retaining its derived effect witness."

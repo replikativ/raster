@@ -1,9 +1,16 @@
 # Raster compiler north star
 
-Status: architectural direction, reconciled with the implementation on 2026-09-01. Objective,
+Status: architectural direction, initially reconciled with the implementation on 2026-09-01. Objective,
 fidelity/time schedule axes, irregular primitives, composition, and the inference track were added
 on 2026-09-03 after the simulator survey (twenty rubric surveys of production simulators,
 training and inference systems; internal working note).
+
+Reading guide (2026-10-20): this document mixes the destination with receipts for bounded
+implementation slices. A typed/validated downstream artifact does not by itself prove original
+source correspondence, complete AD support, safe reuse or measured performance. The current
+[campaign checkpoint](compiler-unification-campaign.md#reviewed-next-vertical-source-correspondence-through-resident-training)
+records the next acceptance obligations; the [AD coverage matrix](normalized-ad.md#current-implementation-boundary)
+and [memory invariants](memory-planning-campaign.md#invariants) delimit their own capabilities.
 
 Raster should become a compiler in which a typed Clojure program, its parallel
 algorithm, its schedule, its device placement, and its executable artifact are
@@ -29,6 +36,50 @@ functional Clojure programming model, explicit AD rules, portable hardware
 model, and vendor-JIT backends. The reference systems supply specific missing
 ideas at specific layers.
 
+### Reading the hierarchy algebraically
+
+This is a hierarchy of related contracts, not one universal IR and not several independent
+compilers. Semantic equations describe what is computed; schedules refine how it is computed;
+physical views and runtime lifetimes determine where its representations can safely live.
+
+```text
+original typed source + source policy + consumed definition/rule history
+    │ source-to-semantic correspondence
+    ▼
+semantic TypedSOAC equations
+    values, shapes, effects, numerical permissions, required evaluations
+    │ scheduling and placement refinement
+    ▼
+scheduled ParallelProgram / KernelGraph / KernelBody
+    explicit operations, conversions, communication and synchronization
+    │ target realization and ordered ABI
+    ▼
+executable linked through LinkPlan physical views
+    │ initialization, invocation, output leases, residual retention and completion events
+    ▼
+runtime results
+```
+
+`ParallelProgram` can also carry unscheduled semantic equations; the diagram names its
+scheduled use, not a requirement that constructing the record performs scheduling. LinkPlan
+participates in preparation/binding as well as execution; it is not an afterthought added to
+already-bound code. Hardware facts constrain legal schedules; measured evidence informs cost
+and selection. Neither grants numerical, ownership or source-equivalence permission.
+
+Each arrow owes the observations it preserves: values under the declared numerical contract,
+exceptions and required evaluation order, alias-visible effects, interface/representation
+correspondence, and lifetime/completion requirements. Composition is valid only when the output
+contract of one arrow satisfies the input contract of the next. A successful target compiler,
+KernelBody validator or LinkPlan validator cannot fill a missing upstream correspondence.
+
+AD belongs alongside this hierarchy as a transformation capability. The intended semantic
+factorization is `linearize(f, x) = (f(x), residual, linear-program)`, with a forward action and
+a transpose of the linear program. This does not identify Bayesian inversion with transposition
+or make arbitrary effects differentiable. Current source/default AD, JVM-owned numerical AD and
+opt-in normalized host/device families share rules and some ownership machinery, but do not yet
+form one universally qualified import/execution path. The next campaign vertical closes one
+bounded prepared reverse-AD projection through this same hierarchy.
+
 ## 0. Objective: what the compiler is for
 
 Raster is the foundation for compiler-driven algebraic simulation and for inference through
@@ -36,8 +87,9 @@ simulators. The quantity to optimize is not kernel time. It is **grounding quali
 compute**: posterior or decision quality obtained from a simulation-backed model for a given
 budget of time, memory, energy and communication. Simulation-based inference that treats the
 simulator as a black box is the worst case the system must always support. The intended case is
-that inference uses the simulator's internals, through the same certified transformations the
-compiler already owns: automatic differentiation, local linearization, coarse-grained or
+that inference uses the simulator's internals through transformations whose supported
+source, semantic and scheduling boundaries are individually validated: automatic
+differentiation, local linearization, coarse-grained or
 marginalized variants, multi-level estimators, and emulators trained on internal state.
 
 This changes what a unit of value is. An AI agent can write a bespoke SPH or shallow-water code

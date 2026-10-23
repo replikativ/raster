@@ -2,6 +2,34 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
+(deftest source-float-narrowing-has-one-descriptor-owner
+  (is (= 'float (descriptor/cast-result-tag 'clojure.core/unchecked-float)))
+  (is (= :ieee (descriptor/cast-floating-narrowing 'clojure.core/unchecked-float)))
+  (is (= :checked (descriptor/cast-floating-narrowing 'clojure.core/float)))
+  (is (not (descriptor/cast-op? 'unchecked-float)))
+  (is (not (descriptor/cast-op? 'other/unchecked-float)))
+  (is (nil? (descriptor/cast-floating-narrowing 'clojure.core/double))))
+
+(deftest core-copy-identity-is-not-a-nominal-allocation-classification
+  (let [operand (with-meta 'x {:tag 'floats})]
+    (is (identical? operand (descriptor/core-array-copy-source
+                            (list 'clojure.core/aclone operand)))))
+  (doseq [expression ['(aclone x) '(other/aclone x)
+                      '(clojure.core/aclone x y)
+                      (with-meta '(.invk fake x) {:raster.op/original 'clojure.core/aclone})
+                      (with-meta '(clojure.core/aclone x) {:raster.op/lexical-callee true})]]
+    (is (nil? (descriptor/core-array-copy-source expression)))))
+
+(deftest allocation-argument-literals-must-have-exact-primitive-carriers
+  (is (= {:dtype :long :shape []} (descriptor/direct-allocation-argument-value 1 {})))
+  (is (= {:dtype :float :shape []} (descriptor/direct-allocation-argument-value (float 1) {})))
+  (is (= {:dtype :double :shape []} (descriptor/direct-allocation-argument-value 1.0 {})))
+  (doseq [value [1N (bigint (inc (bigint Long/MAX_VALUE))) (biginteger 1) 1M 1/2
+                 '(inc 1) 'Long/MAX_VALUE nil]]
+    (is (nil? (descriptor/direct-allocation-argument-value value {}))))
+  (is (= {:dtype :float :shape [3]}
+         (descriptor/direct-allocation-argument-value 'x {'x {:dtype :float :shape [3]}}))))
+
 (deftest reduction-identities-retain-exact-qualified-algebra
   (let [original descriptor/get-op-descriptor
         monoid {:associative? true :commutative? true :identity 42}

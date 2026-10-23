@@ -2,8 +2,11 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.invocation-plan :as invocation]
-            [raster.compiler.ir.invocation-source :as invocation-source]))
+            [raster.compiler.ir.invocation-source :as invocation-source]
+            [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.parallel-program :as program]))
 
 (defn- scalar [dtype]
   (av/tensor {:dtype dtype :shape []}))
@@ -19,6 +22,197 @@
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo exception
          (:reason (ex-data exception)))))
+
+(defn- terminal-program [body]
+  ;; Structural producer correspondence only, deliberately not an emitted
+  ;; reduction/export certificate or permission to execute this source.
+  (program/make
+   {:dialect :typed-parallel
+    :source (list 'let* '[total (sum x)] body)
+    :inputs '[x] :outputs '[total]
+    :values {'x (array-value :double 4) 'total (scalar :double)}
+    :equations [(program/map->ProgramEquation
+                 {:id :sum :site [:binding 'total] :source '(sum x)
+                  :operands '[x] :results '[total] :operations '[(reduce)]
+                  :effects #{} :provenance {} :attributes {}})]}))
+
+(defn- reference-fixture [expression input output]
+  (let [plan (invocation/from-prefix
+              {:id :retained-reference :parameters '[x] :parameter-values {'x input}
+               :bindings [['checked expression]] :binding-values {'checked output}
+               :program-values {'checked output 'total (scalar :double)}
+               :program-inputs '[checked] :program-outputs '[total]})
+        p (-> (terminal-program 'total)
+              (assoc :source (list 'let* ['checked expression 'total '(sum checked)] 'total)
+                     :inputs '[checked]
+                     :values {'checked output 'total (scalar :double)})
+              (assoc-in [:equations 0 :source] '(sum checked))
+              (assoc-in [:equations 0 :operands] '[checked]))]
+    [plan p]))
+
+(deftest reference-completion-is-an-ordered-check-not-an-alias
+  (let [value (array-value :double 4)
+        expression (completion/complete-value
+                    (completion/reference-check-contract (class (double-array 0))) 'x)
+        [plan p] (reference-fixture expression value value)
+        step (first (:steps plan))
+        evaluator-calls (atom 0)]
+    (is (invocation/reference-completion? step))
+    (is (not (invocation/value-alias? step)))
+    (is (identical? expression (:completion step)))
+    (is (identical? value (:value step)))
+    (is (= (:id step) (:invocation-step (first (invocation/source-order plan p)))))
+    (is (= (:id step) (:invocation-step (first (invocation/source-host-actions plan p)))))
+    (is (= :unclosed-invocation-reference-completion
+           (reason-of #(materialization/materialize
+                        plan [(double-array 4)]
+                        (fn [& _] (swap! evaluator-calls inc) {:type :double :value 0.0})))))
+    (is (zero? @evaluator-calls))
+    (let [with-earlier-scalar
+          (invocation/from-prefix
+           {:id :reference-preflight :parameters '[x] :parameter-values {'x value}
+            :bindings [['prior '(clojure.core/+ 1 2)] ['checked expression]]
+            :binding-values {'prior (scalar :long) 'checked value}
+            :program-values {'checked value}
+            :program-inputs '[checked] :program-outputs '[checked]})]
+      (is (= :unclosed-invocation-reference-completion
+             (reason-of #(materialization/materialize
+                          with-earlier-scalar [(double-array 4)]
+                          (fn [& _] (swap! evaluator-calls inc) {:type :long :value 3})))))
+      (is (zero? @evaluator-calls)))
+    (let [copy (with-meta (apply list expression) (meta expression))]
+      (is (= :invocation-source-reference-completion
+             (reason-of #(invocation/source-order
+                          (assoc-in plan [:steps 0 :completion] copy) p)))))
+    (doseq [changed [(array-value :float 4) (array-value :double 5)
+                     (assoc value :attributes {:presence :present})]]
+      (is (= :invocation-reference-completion
+             (reason-of #(reference-fixture expression value changed)))))))
+
+(deftest reference-completion-requires-the-canonical-array-check-and-earlier-operand
+  (let [value (array-value :double 4)]
+    (doseq [contract [(completion/reference-check-contract (class (float-array 0)))]]
+      (is (= :invocation-reference-completion
+             (reason-of #(reference-fixture (completion/complete-value contract 'x) value value)))))
+    (is (= :invocation-prefix-free-value
+           (reason-of #(reference-fixture
+                        (completion/complete-value
+                         (completion/reference-check-contract (class (double-array 0))) 'later)
+                        value value))))
+    (is (= :invocation-prefix-unsupported
+           (reason-of #(reference-fixture
+                        (completion/complete-value completion/object-input-contract 'x)
+                        value value))))))
+
+(deftest bytecode-reference-input-keeps-its-original-check-contract
+  (let [value (array-value :float 4)
+        contract (completion/planned-bytecode-input-contract
+                  (class (float-array 0))
+                  (completion/bytecode-operand-context {:preserve-source-call-results? true}) :ref)
+        expression (completion/complete-value contract 'x)
+        [plan p] (reference-fixture expression value value)]
+    (is (invocation/reference-completion? (first (:steps plan))))
+    (is (identical? expression (get-in plan [:steps 0 :completion])))
+    (is (= 1 (count (invocation/source-host-actions plan p))))))
+
+(def terminal-context
+  {:source-policy {:unchecked-math false}
+   :source-namespace 'raster.compiler.ir.invocation-plan-test})
+
+(def terminal-effects (atom 0))
+
+(deftest terminal-correspondence-is-not-execution-or-producer-certification
+  (let [body '(do (clojure.core/swap! raster.compiler.ir.invocation-plan-test/terminal-effects
+                                     clojure.core/inc)
+                  total)
+        p (terminal-program body)
+        before @terminal-effects
+        contract (invocation/terminal-source-result p terminal-context)
+        changed (assoc-in p [:equations 0 :source] '(different-computation x))]
+    (is (= body (:body contract)))
+    (is (= before @terminal-effects) "describing a region must not execute it")
+    (is (= contract (invocation/validate-terminal-source-result! contract changed terminal-context))
+        "producer slot correspondence alone does not attest what that producer computes")))
+
+(deftest terminal-ports-are-ordered-by-producers-not-the-result-tree
+  (let [p (-> (terminal-program '[other total])
+              (assoc-in [:values 'other] (scalar :long))
+              (update :equations conj
+                      (program/map->ProgramEquation
+                       {:id :count :site [:binding 'other] :source '(count x)
+                        :operands '[x] :results '[other] :operations '[(reduce)]
+                        :effects #{} :provenance {} :attributes {}}))
+              (assoc :source '(let* [total (sum x) other (count x)] [other total])))
+        contract (invocation/terminal-source-result p terminal-context)]
+    (is (= '[total other] (mapv :value (:parameters contract))))
+    (is (= '[other total] (:body contract)))
+    (is (= [[:sum 0] [:count 0]]
+           (mapv (juxt :producer-equation :result-position) (:parameters contract))))))
+
+(deftest terminal-correspondence-retains-conditional-completion-and-producer-ports
+  (let [body (list 'if '(clojure.core/nil? total) nil
+                   (list 'let* '[projected (clojure.core/float total)]
+                         (completion/complete-value completion/object-input-contract 'projected)))
+        p (terminal-program body)
+        contract (invocation/terminal-source-result p terminal-context)]
+    (is (= body (:body contract)))
+    (is (= [{:symbol 'total :value 'total :dtype :double
+             :producer-equation :sum :result-position 0}]
+           (:parameters contract)))
+    (is (= [:return] (:site contract)))
+    (is (= (:source-policy terminal-context) (:source-policy contract)))
+    (is (identical? contract
+                    (invocation/validate-terminal-source-result! contract p terminal-context)))
+    (doseq [changed [(assoc contract :body '(clojure.core/unchecked-float total))
+                     (assoc-in contract [:parameters 0 :producer-equation] :another)
+                     (assoc-in contract [:parameters 0 :result-position] 1)
+                     (assoc-in contract [:parameters 0 :dtype] :float)
+                     (assoc contract :source-policy {:unchecked-math true})
+                     (assoc contract :source-namespace 'another.namespace)]]
+      (is (= :invocation-terminal-correspondence
+             (reason-of #(invocation/validate-terminal-source-result! changed p terminal-context)))))))
+
+(deftest terminal-correspondence-uses-lexical-not-flat-free-variable-analysis
+  (doseq [body ['(let* [copy total total 1.0] [copy total])
+               '(let* [projected (clojure.core/float total)] projected)
+               '(if (clojure.core/nil? total) (quote not-a-port) total)]]
+    (is (= '[total]
+           (mapv :value (:parameters (invocation/terminal-source-result
+                                     (terminal-program body) terminal-context))))))
+  (let [p (-> (terminal-program '(clojure.core/float count))
+              (assoc :source '(let* [count (sum x)] (clojure.core/float count)))
+              (assoc :outputs '[count])
+              (update :values #(-> % (dissoc 'total) (assoc 'count (scalar :double))))
+              (assoc-in [:equations 0 :results] '[count])
+              (assoc-in [:equations 0 :site] [:binding 'count]))]
+    (is (= '[count] (mapv :value (:parameters (invocation/terminal-source-result p terminal-context)))))))
+
+(deftest terminal-correspondence-does-not-acquire-unrepresented-values-or-exports
+  (doseq [body ['(aget x 0) '(+ total private-capture) '(let* [total 1.0] total)]]
+    (is (= :invocation-terminal-free-values
+           (reason-of #(invocation/terminal-source-result (terminal-program body) terminal-context)))))
+  (doseq [value [(array-value :double 1) (scalar :int)]]
+    (is (= :invocation-terminal-carrier
+           (reason-of #(invocation/terminal-source-result
+                        (assoc-in (terminal-program 'total) [:values 'total] value)
+                        terminal-context)))))
+  (let [p (assoc-in (terminal-program 'total) [:values 'total] (scalar :float))
+        contract (invocation/terminal-source-result p terminal-context)]
+    (is (= [:float] (mapv :dtype (:parameters contract))))
+    (is (identical? contract (invocation/validate-terminal-source-result! contract p terminal-context)))
+    (is (= :invocation-terminal-correspondence
+           (reason-of #(invocation/validate-terminal-source-result!
+                        (assoc-in contract [:parameters 0 :dtype] :double) p terminal-context)))))
+  (is (= :unclosed-source-policy
+         (reason-of #(invocation/terminal-source-result (terminal-program 'total)
+                                                      (dissoc terminal-context :source-policy)))))
+  (is (= :invocation-terminal-source
+         (reason-of #(invocation/terminal-source-result
+                      (assoc (terminal-program 'total) :source '(do total)) terminal-context))))
+  (is (= :invocation-terminal-source
+         (reason-of #(invocation/terminal-source-result
+                      (assoc (terminal-program 'total) :source '(let* [total (sum x)] total nil))
+                      terminal-context)))))
 
 (deftest public-shadowing-is-explicit-ssa
   (let [public-array (array-value :double '(extent u0))

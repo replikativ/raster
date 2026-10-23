@@ -147,6 +147,17 @@
     (is (some? (segop-simd/compile-segred (operation 'float))))
     (is (nil? (segop-simd/compile-segred (operation 'double))))))
 
+(deftest reduction-admission-requires-an-implemented-vector-species
+  (doseq [dtype [:int :long]]
+    (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype dtype
+                     :inputs #{} :scalars '#{n}
+                     :reduction
+                     (reduction/scalar
+                      {:accumulator 'acc :neutral (if (= :int dtype) (int 0) (long 0))
+                       :dtype dtype :result 'out :index 'i :step-result '(+ acc i)})}]
+      (is (nil? (segop-simd/compile-segred operation))
+          "valid integral reductions are not Float/Double vector reductions"))))
+
 (deftest simd-able-simple-ops
   (testing "Simple arithmetic ops are SIMD-able"
     (is (segop-simd/simd-able? '(+ (aget a i) (aget b i)) 'i))
@@ -172,7 +183,8 @@
                      (dialect/scalar-convert
                       {:source-dtype source :target-dtype target
                        :rounding rounding :overflow overflow
-                       :source-op 'clojure.core/float}
+                       :source-op (if (= source target) 'clojure.core/float
+                                      'clojure.core/unchecked-float)}
                       operand))]
     (is (segop-simd/simd-able?
          (conversion :float :float :exact :exact '(+ (aget a i) (float 1.0))) 'i :float)

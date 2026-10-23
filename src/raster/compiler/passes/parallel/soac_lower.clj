@@ -436,17 +436,21 @@
        (= 1 (count (soac-dialect/equations program)))
        (= 'reduce (soac-dialect/operation-kind (first (soac-dialect/equations program))))))
 
-(defn lower-typed-reduce
-  "Lower one functional TypedSOAC reduction to SegRed without inspecting its source spelling.
+(defn project-typed-reduce
+  "Project one validated functional TypedSOAC reduction to its semantic reduction description.
 
    TypedSOAC keeps element values and captures as lexical lambda parameters. SegRed's temporary
    scalar-region adapter still spells element reads as `aget`; this conversion is a mechanical
-   projection from the validated parameter layout, not a second analysis of the host form."
-  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
+   projection from the validated parameter layout, not a second analysis of the host form.
+   This projection selects no schedule and grants no original-source correspondence."
+  [program & {:keys [dtype] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)]
     (when-not (typed-reduce-program? program)
       (throw (ex-info "typed SegRed lowering requires one reduce equation"
                       {:reason :typed-soac-reduce-subset :program program})))
+    (binding [util/*shadowing-locals*
+              (into util/*shadowing-locals*
+                    (filter symbol? (keys (:values (soac-dialect/facts program)))))]
     (let [equation (first (soac-dialect/equations program))
           [_ equation-id results operation] equation
           [_ attributes arrays captures lambda] operation
@@ -508,10 +512,16 @@
                        :outputs #{result}
                        :scalars scalar-captures
                        :elem-type accumulator-dtype}]
-      (mapv #(assoc % :algorithm-dialect :typed-soac
-                    :algorithm-equation equation-id)
-            (lower-reduce-description description device-id :dtype accumulator-dtype
-                                      :target-descriptor target-descriptor)))))
+      description))))
+
+(defn lower-typed-reduce
+  "Lower a functional TypedSOAC reduction through its shared semantic projection.
+   Schedule selection remains separate from projection and source correspondence."
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
+  (let [description (project-typed-reduce program :dtype dtype)]
+    (mapv #(assoc % :algorithm-dialect :typed-soac :algorithm-equation (:id description))
+          (lower-reduce-description description device-id :dtype (:elem-type description)
+                                    :target-descriptor target-descriptor))))
 
 (defn typed-segmented-reduce-program?
   "Whether a validated one-equation TypedSOAC program is a general segmented reduction."
@@ -1078,7 +1088,9 @@
                        grid-1 :product product-schedule dtype)]
       (case (:strategy execution)
         :single
-        (let [grid (single-block-grid grid-1)
+        (let [empty-scalar? (and (empty? (:segment-axes description))
+                                 (integer? bound) (zero? bound))
+              grid (if empty-scalar? (segop/->KernelGrid 1 1 0) (single-block-grid grid-1))
               reduction (assoc-in reduction [:attributes :physical-phase] :single)]
           [(segop/->SegRed (:id description)
                            space
@@ -1090,8 +1102,9 @@
                            (:scalars description)
                            grid
                            :single
-                           (segred-body/scalar-workgroup-tree-schedule
-                            reduction grid :single)
+                           (if empty-scalar?
+                             (segred-body/scalar-empty-fold-schedule reduction)
+                             (segred-body/scalar-workgroup-tree-schedule reduction grid :single))
                            dtype)])
 
         :two-phase

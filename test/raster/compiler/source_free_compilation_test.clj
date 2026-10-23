@@ -6,6 +6,7 @@
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-surface-map-test :as surface]
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-first :as equation-first]
@@ -630,6 +631,11 @@
     (is (equation-first/equation-first-compilation? compilation))
     (is (= :double (:dtype compilation)))
     (is (nil? (:source-ns compilation)))
+    (is (nil? (:eager-source-owner compilation)))
+    (is (nil? (source-owner/assert-eager-evaluation! compilation)))
+    (is (= :eager-source-owner-mismatch
+           (reason #(source-owner/assert-eager-evaluation!
+                     (assoc compilation :eager-source-owner (Object.))))))
     (is (= :typed-parallel (get-in compilation [:semantic :dialect])))
     (is (= :scheduled-parallel (get-in compilation [:scheduled :dialect])))
     (is (seq (:kernels compilation)))
@@ -1505,6 +1511,19 @@
           (finally
             (gpu-link/close! executable)
             (gpu-link/close! executable)))))))
+
+(deftest source-free-coverage-retains-its-closed-prefix-without-a-clojure-owner
+  (let [compilation (equation-first/compile-typed
+                     (pure-map :float) {:target :ocl:0 :schedule {:precision :f32-scalar}})
+        plan (get-in compilation [:semantic :attributes :invocation-plan])
+        arguments [(float-array [2.0 -3.0 0.5]) 3]
+        state {:materialization (materialization/begin-materialization plan arguments)
+               :source-order []}]
+    (is (nil? (:ordered-source-owner compilation)))
+    (is (identical? state (source-owner/assert-ordered-executor-coverage! compilation state arguments)))
+    (is (= :unclosed-ordered-source-executor
+           (reason #(source-owner/assert-ordered-executor-coverage!
+                     compilation (assoc state :source-order [{:position 0 :binding 'forged}]) arguments))))))
 
 (deftest source-free-compilation-replays-changed-inputs-on-opencl
   (if @opencl/opencl-available?

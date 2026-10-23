@@ -8,6 +8,3315 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
+### Original campaign obligations
+
+This is the completion checklist. Foundations below are recorded implementation
+history, not fresh qualification of their remaining end-to-end gates. Current work
+on original source-owned host computations and prepared AD composition advances
+items 3 and 5; it does not replace the other six obligations.
+
+| Item | Existing foundation | Remaining completion gate |
+|---|---|---|
+| 1. CI and coverage | Seven CI gates, vendor source compilation, targeted native/differential tests | Reconcile skipped tests and environment prerequisites; partition by affected compiler layer; retain cold-load, negative-admission and CPU/device controls. |
+| 2. Compatibility and debt ledger | Executable compatibility inventory and many bounded retirements | Re-audit reachable production paths and dependent packages; give every remaining adapter an owner and removal gate; remove covered dead code and duplicate tests without losing distinct oracles. |
+| 3. Direct TypedSOAC migration | Typed packets, ordered ABI, graph/body emission, retained dtype/effect/storage evidence | Close remaining source/semantic composition boundaries, bound compilation cost and remove migrated re-lowerings; demonstrate the same numerical intent through JVM/C and GPU routes with precise refusals. |
+| 4. Portable source compilation | OpenCL/Level Zero execution and CUDA/HIP compile gates | Keep actual public workload fixtures portable and distinguish source compilation from runtime/device evidence; coordinate the external CUDA runtime work against the common contracts. Cloud hardware is not a prerequisite for this local campaign. |
+| 5. Reusable training | AD rules, opt-in normalized bundles, artifacts, generated updates, GSDM staged execution | A resident forward/VJP/update composition, normalized AD migration gates, unchanged generated SFT and real-weight numerical acceptance, and measured steady execution. GSDM, Gemma and density/PDE derivatives are complementary controls. |
+| 6. Hardware-free distributed planning | Topology, physical service lanes, route evidence, root/scratch budgets, simulation/certificates | Fresh topology/dependency/capacity/collective/halo/drift counterexamples; independently check cost, numerical intent and ownership witnesses. Analytical forecasts must remain distinct from measured fabric performance. |
+| 7. Data parallelism and halos | Co-located update/collective and numerical halo demonstrations | Close public compiler-to-plan-to-runtime composition with device-scoped views, completion and cleanup; check nonuniform partitions and exact byte accounting. Do not claim multi-host transport or overlap from one laptop. |
+| 8. Durable and multilevel simulation | Manifests, mmap lease tests, checkpoint/restart and AMR provider slices | Fresh-owner restore/publication with producer geometry, time and lineage; numerical restart/branch and declared conservation/convergence/fidelity oracles; reject corrupt, incompatible or prematurely released state. |
+
+### October 21 operand-order repair and the next executable boundary
+
+October 23 reference-action checkpoint: `InvocationPlan` now distinguishes a
+retained `ReferenceCompletion` from a check-free `ValueAlias`. Both prefix
+construction and source-order rederivation use the same canonical reference
+contract over one preceding lexical buffer. The complete AV must remain
+unchanged; no non-null, capacity, initialization or successful-check fact is
+created. The original Class-bearing occurrence is compared by identity, not
+serialized or converted into a portable fingerprint; remaining pure IR fields
+retain semantic comparison.
+
+The new step is a source host action. Eager materialization rejects the whole
+unsupported capability set before earlier scalar evaluators; incremental
+materialization and ordered source preflight also refuse it. Review found that
+resident marker projection could otherwise prune a dead checked result. It now
+rejects these steps before graph-driven prefix pruning. A real emitted CUDA
+elementwise graph with a valid but unused reference-check prefix verifies that
+the check cannot disappear while numerical work stays live.
+
+Plan/materialization regressions pass 30 tests / 265 assertions; the real
+dead-check projection regression passes 1 test / 6 assertions. This represents
+an obligation, not its execution or whole-import closure. The actual training
+manifest still contains 75 obligations: five entry inputs, 64 body completions,
+and six allocator arguments. The six arguments comprise three reference checks
+and three checked Long size computations. A conditional candidate and the
+existing source owner's complete, transactional cover remain the next work;
+the ordinary pending-input continuation barrier is unchanged.
+
+The broader source-order/ordered-owner check reports 33 tests / 221 assertions,
+with one failure: `square` lacks the expected host-only equation in the
+source-position regression. Replacing only the planner functions with exact
+`2e5e2f79` versions in the same warm process reproduces that assertion failure;
+the new functions are restored afterwards. It remains an unresolved gate, not
+a skip or evidence that reference execution works.
+
+October 23 equation-first adoption checkpoint: the public compiler now uses the
+shared source constructor, including authored-segment preparation for discovered
+AD imports. Ordinary physical representation and storage-alias canonicalization
+precede its single final frontend normalization. Already-normalized semantic
+admission then shares the existing structured/TypedSOAC legality and materialization
+machinery; it does not replay representation or frontend normalization.
+Structured discovery receives the exact pre-normalization physical source, while
+TypedSOAC fallback receives the exact normalized source from that same constructor.
+An identity-spy regression checks both phase inputs and forbids normalization replay.
+
+Prepared imports still stop explicitly at `:unclosed-prepared-module-phase` after
+one source-component analysis. One/two actual generated-gradient imports retain
+three/six allocations, six/twelve pending input occurrences and their original
+open import markers. This is a production-entry integration test, not production
+training admission. No original marker is cleared and no source owner is minted.
+
+The focused adoption gate passes 11 tests / 186 assertions, including ordinary
+CUDA/HIP emission, capacity-versus-traversal, scalar extrema, checked-prefix order,
+record/tree parameter projection, portable stencils, and exact imported-module refusal. Cold owner
+transaction retries are preserved; the regression counts completed construction
+handoffs rather than treating aborted stale attempts as duplicate compilation.
+Whole-import completion/placement and source-owner finalization, unchanged model
+acceptance, and all seven exact-head CI gates remain required before merging.
+
+Independent review requested structured-loop and copy controls in addition to the
+passing ordinary controls. Both are still red, also with the exact pushed
+`46815fe3` compile function in the same process: RK4 reaches a conflicting scalar
+alias (`rstr_extent_0` versus `n`), and region copy reaches an unclosed ordered
+scalar executor. Neither test is skipped or reclassified as a passing gate.
+The module/pipeline gate passes 70 tests / 789 assertions; after the phase-view
+adjustment, pipeline/diagnostics pass 35 tests / 236 assertions. The diagnostics
+test now checks exact refusal transport at the actual shared admission seam;
+conditional FP/count proof assertions remain separately exercised. These are
+bounded integration receipts, not a claim of complete structured execution.
+
+October 23 source-history integration checkpoint: the shared constructor can now
+discover canonical prepared calls before authored preparation, then record the
+assembled result under a new actual source-construction edge. The old placement
+records remain unchanged. One insertion-site validator checks both their original
+prefix/member interval and the new source identity, prefix and shifted offset
+before composing with ordinary normalization origins. This removes repeated span
+validation rather than adding a parallel source-origin interpretation.
+
+Actual one/two-import constructor tests normalize once, retain three/six Float
+allocations and six/twelve pending input occurrences, and still refuse semantic
+continuation. Shifted cuts, damaged history/source/offset records and missing
+construction observations refuse. Ordinary modular no-import construction still
+prepares once. Imported representation remains identity-only.
+
+Authored preparation explicitly disables the prepared consumer and defers further
+AD expansion. A previously undiscovered application exposed through a helper is
+rejected by the unchanged GPU census; it cannot create an untracked legacy spine.
+Supporting further discovery requires another explicit cut/assembly composition,
+not a census exception. Failed construction publishes no pending marker to its
+parent. The test preserves existing whole-compilation retries for cold lazy
+definition changes rather than catching staleness as an expected domain refusal.
+
+Independent review approved the composition and the hidden-import hardening.
+The affected gate passes 127 tests / 1,404 assertions. Equation-first adoption,
+whole-source typing/import/InvocationPlan/source-owner finalization and resident
+model acceptance remain work; this constructor result does not authorize them.
+
+October 23 authored preparation/assembly checkpoint: a private constructor now
+runs the existing preparation pipeline only on authored segments, retaining all
+intermediate exports and splicing original imported binding members unchanged.
+Its assembly records distinguish original cut positions from new offsets/prefixes.
+Those records are construction data, not a new source owner or permission to
+reuse old normalized origins. Source-history composition is still required before
+the assembled source can enter the production constructor/finalizer.
+
+Lexical checks cover both original and prepared segments. Separate visible-scope
+and occupied-flat-binding sets prevent introduced locals from shadowing entry
+values, earlier temporaries or reserved later source/import names; duplicate
+bindings refuse. Only actual authored exports carry types to the next segment.
+Existing AVs are restricted to the original entry scope throughout: neither
+same-segment nor later-defined locals borrow future value/presence/capacity facts.
+Imported outputs retain their independently checked conditional declarations.
+
+One- and two-import fixtures pass full authored preparation while retaining
+markers, unchanged imported spans and source identity of the original phase.
+Export loss, unavailable values, name capture and future-fact leakage have
+negative controls. Independent review identified and verified fixes for the
+hygiene and AV-leakage gaps. The affected gate passes 123 tests / 1,363 assertions.
+This is not yet whole-source typing/owner closure, real resident training
+acceptance or resolution of the red public compile fixtures.
+
+October 23 authored-layout checkpoint: exact retained cut manifests now partition
+the original constructed source into authored segments and imported spans. No
+generated-name search is used; the original imported binding members are retained
+unchanged and every authored definition remains a cross-segment live-out. Outputs
+join original root ordinals to verified emitted binding contexts. Array declarations
+use the actual primitive-array Class, not a hint; boxed scalar payload declarations
+additionally require the guarded normal-return fact to match that physical carrier.
+Missing/misdirected records, unverified/wrong carriers, malformed cut intervals and
+changed result slots refuse. This query performs no preparation, assembly or admission.
+
+The real training consumer is now a regression for isolated authored preparation:
+using these conditional declarations, the unchanged GPU pre-SoA pipeline selects
+Float multiplication and its final census has zero non-exempt untagged bindings
+and zero undevirtualized calls. Imported bindings are never passed to that pipeline,
+and the original pending marker remains. A two-import REPL control also retains
+the intermediate value/gradient live-out tuple exactly. The affected gate passes
+90 tests / 1,119 assertions; independent review approved the implementation and
+its mutation controls. Source assembly/history composition and whole-source
+finalization still remain, as do the red public fixtures and all campaign gates.
+
+October 23 production sequencing finding: simply wiring the shared constructor
+to all pre-SoA passes is NOT sufficient. Deferred AD leaves the original
+value+grad/nth-dependent consumer unfinished at the GPU fixpoint census. The
+census correctly rejects it. Running whole-source fixpoint after inserting an
+import would instead rewrite its retained binding occurrences. Neither disabling
+the census nor inventing output tags is an acceptable repair.
+
+The reviewed next construction order is to discover the actual canonical
+prepared calls once, keep their real ports and original binding manifests, and
+prepare only the authored straight-line segments between those imports. Existing
+global value/gradient tuple projection resolves authored nth operations. Segment
+preparation must retain cross-segment live-outs and explicitly transport its
+construction history and shifted cut positions. Generated binding member objects
+must not pass through ordinary fixpoint, rewalk or DCE. Their emitted physical
+binding contexts supply nullable conditional result carriers; scalar-only
+normal-return facts must not be treated as array evidence. No consumer annotation
+or input exemplar extent supplies a missing result carrier.
+
+Typedness accounting must cover every assembled binding: ordinary authored
+census evidence or exact original imported physical evidence, followed by the
+existing complete pending conversion/source/order/storage/owner obligations.
+An imported-span exemption is not such evidence. Missing producers, duplicate
+cuts, reordered/mutated bindings, lost live-outs, stale original inputs and an
+actually untyped authored consumer must all refuse. This sequencing is still
+implementation work, not a completed training vertical.
+
+The ordinary semantic route now has one representation canonicalizer and one
+internal already-normalized entry sharing structured/functional selection and
+all existing admission/optimization behavior. The pipeline gate passes 31 tests /
+213 assertions, including a real RNG-map case that forbids repeated
+representation rewriting, ordinary routing or normalization. This seam alone
+does not grant prepared-import admission.
+
+October 23 original-input execution preparation: the prepared phase can now
+outline an exact scalar argument through its original bytecode emitter. The
+adapter joins the original ordered physical ports and checks the entire planned
+conversion, including the raw carrier against the actual emitted completion.
+Both phase history and original region guards fence execution. Reference inputs
+abstain before compilation; this cannot cast a resident buffer to a JVM array.
+No source expression is reinterpreted, no numerical fallback is added, and no
+import marker or pending-continuation barrier is removed. Placement and complete
+import closure remain the InvocationPlan/source-owner finalizer's obligations.
+
+Independent review approved correspondence, lifecycle guards and mutation tests.
+The affected five-namespace gate passes 87 tests / 1,065 assertions, including
+actual source replacement preventing invocation, mismatched ports/conversions,
+reference/copied/foreign-input abstention and region-guard failures. The latest
+pushed prerequisite head still fails public fixture generation (136/172 pass);
+all 36 failures remain campaign obligations. This is not production acceptance.
+
+October 23 staged-storage checkpoint: the prepared phase now feeds exact staged
+input correspondence into the frontend's existing single description/storage
+analysis. This is a private analysis entry, not an options callback, second walk,
+source owner or admission API. Original source binding objects and C expressions
+remain unchanged. Each port must join its exact already-processed predecessor;
+canonical contract maps compare as data only after source identity is established.
+One immutable symbol-alias step may explain normalization's reference substitution.
+
+The fold copies a genuinely existing tensor AV verbatim, including through an
+unannotated alias, while retaining declaration/destination conflict checks. If no
+reference AV exists it creates none. Conditional carrier facts publish separately
+after each staged binding; only earlier facts may select allocation helpers.
+Authenticated constructor leaves supply their actual result element types, with
+retained-type conflicts rejected. All three real training allocations now have
+Float contracts and extents from their own named size bindings without fabricating
+exemplar capacity. Six exact pending occurrences remain; two imports keep twelve.
+
+Continuation explicitly refuses nonempty pending input accounting, independently
+of whether a future scalar rule could recognize C. No marker is closed and no
+conditional carrier becomes an unconditional source-owner verifier fact. Whole
+InvocationPlan/source-order/backing-view and remaining numerical/reduction/import
+completion finalization still precedes resident execution.
+
+The affected five-namespace gate passes 85 tests / 1,022 assertions. A same-process
+comparison of all 151 existing frontend tests against committed functions has
+identical 18 failures and one error (953 assertions), including the latest alias
+change. A spy was updated to accept the extra internal carrier argument without
+changing its source-order assertions. Existing failures remain required work.
+Independent review approved the analysis/data boundary and alias/constructor laws.
+
+October 23 forwarding-composition checkpoint: selected allocation helpers now
+compose through a returned global typed call forwarding every formal exactly
+once, in source order. This is not allocator-name recognition or a recursive
+extension of the old general buffer-rewrite detector. The actual emitted call,
+selected invocation Method, outer physical entry and reference-return bridge
+must agree. Primitive input adaptations are identities; nullable array checks
+target the same exact Class; the direct leaf constructor must produce the outer
+compute method's actual array result Class. Any unproved edge refuses.
+
+Nested input/return adaptations are discharged by that narrow composition law,
+not silently left pending for consumers to ignore. Original definition/module
+histories stay in the existing collector. Delegation data contains only semantic
+constructor/interface descriptions, not Methods, executors or private owners.
+Cycles are rejected by source-Var/implementation identity. Computed, literal,
+dropped, duplicated and permuted forwarding arguments are outside this rule.
+
+All three unchanged generated `alloc-like` calls now project through `zeros-like`
+to their own completed size bindings without any exemplar AV or invented capacity.
+The prepared import still stays open and unadmitted. Five affected owner/helper/
+legality namespaces pass 81 tests / 976 assertions, including two-hop forwarding,
+physical-evidence mutations, full-chain stale-history controls, and JVM constructor
+result/exception comparisons. Independent review approved the complete diff.
+This closes the delegated-helper limitation noted in the checkpoint below, not
+whole source/InvocationPlan finalization or resident training acceptance.
+
+October 23 allocation-kind checkpoint: definition-derived direct helper projection
+can consume existing primitive/primitive-array carrier facts independently of a
+full AbstractValue. This proves only type/kind compatibility. An unused exemplar
+supplies no capacity; the constructor's completed size remains its extent producer.
+Explicit malformed or incompatible carriers cannot be masked by a logical value.
+Boxed classes, object arrays and unsupported primitive carriers refuse. Logical
+dtype aliases now canonicalize through the common dtype table. Core constructors
+and original selected-definition/frontend guards retain their existing behavior.
+Focused helper/descriptor checks pass 14 tests / 208 assertions. The wider allocation
+gate passes 34 tests / 369 assertions after replacing a stale constructor-cast AST
+assertion with the actual retained parameter contract and JVM result/size-failure
+parity. The same stale assertion failed against the committed descriptor in the
+same process. This leaf comparison grants no wrapper conversion or reference-check
+authority; invalid inputs remain source-owner obligations. Independent review
+approved the complete carrier/legality diff.
+
+The real module still declines: its `alloc-like` specialization forwards to
+`zeros-like`, while the helper detector currently certifies only direct core
+constructors. Carrier compatibility alone does not close this delegation. The
+next proof must compose the selected original definitions and their exact
+forwarded physical interfaces, retain nested completion obligations, and reject
+cycles/extra computations. Do not recursively broaden the older general buffer
+rewrite detector or grant allocation admission merely from an allocator name.
+
+October 23 input-correspondence checkpoint: the existing prepared phase can now
+query each exact staged allocator input without compiling or executing it. Physical
+formal/root ports join their actual bytecode local facts, original binding ordinal,
+call insertion coordinate and final normalization origin. All three source-order
+coordinates must agree. Split/derived origins, copied expressions, foreign imports,
+wrong physical facts and reordered/missing predecessors refuse. No symbol spelling,
+logical dtype or printed equality supplies occurrence authority.
+
+The real allocator sizes use prior completed roots, including an explicit literal
+local, rather than only generated public formals. All three original outlined size
+regions agree with their actual normalized JVM prefixes on changed training inputs.
+Array-input correspondence remains pending: no resident view is cast to a JVM array,
+and neither query nor test closes an import. The two affected construction/ownership
+namespaces pass 44 tests / 533 assertions in the capped REPL.
+
+Exact-head CI at f30c08d9 remains red: fixture emission refuses generated completion
+coverage; the unit shard reports two training-composition coverage errors; OpenCL
+reports 165 tests / 1,428 assertions, one failure and 19 errors. Its remaining families
+include checked floating conversions, scalar/AMR source arithmetic, successful-result
+observations and the two-step production canary. CUDA/HIP downstream gates did not
+run. These are required acceptance work, not environment skips or waived failures.
+
+October 22 ordered-argument construction checkpoint: the generated-call constructor
+now exposes the real allocator's positional completions as pending bindings. It
+retains the exemplar CHECKCAST, then original size evaluation plus Long coercion,
+then the same helper call on completed locals. Boxed public-entry arguments retain
+their different, existing all-operands-before-wrapper-conversions convention.
+Only exact flat global typed invocation roots with retained two-input observations
+and array/Long Method carriers are covered. Classifier metadata selects a candidate;
+it does not establish an allocation contract or successful completion.
+
+One checked layout joins every original root and derived input to its exact binding,
+original Method/receiver/mode/input vectors, physical entry and template occurrence.
+Body completions moved with an argument follow its template `:operand` path; outer
+completions stay on the root. Copied, missing, sibling-redirected and ambiguous
+occurrences refuse. The original bytecode input observer now handles an immediate
+canonical completion through its existing private catalog, not a new registry.
+
+Affected-layer checks pass 102 tests / 1,596 assertions. These include raw-bit
+whole-program JVM comparisons on changed training inputs and malformed/empty arrays,
+plus a nonvacuous nested-completion case distinguishing a bad exemplar's cast from
+division-by-zero in the following size. Review identified and corrected the semantic
+template-path convention before landing. The real pending capture has three allocator
+constructions, six new input obligations and 75 total obligations; it is unadmitted.
+
+The remaining production boundary is unchanged: join the original host shape input
+executor to InvocationPlan, validate the logical/backing relation before acquiring
+resident buffers, prove numerical continuations separately, and finalize all origins
+and completions before removing any exact import marker. No second JVM module is
+required to certify the helper that the allocation contract will replace. No kernel,
+model, performance, full-CI or resident-admission acceptance is claimed by these tests.
+
+October 22 root-coordinate checkpoint: generated-call roots now carry explicit
+root and call-binding indices. Import construction validates each index against
+the exact binder/expression pair before mapping any completion obligation through
+it. Four forged/missing/redirection cases refuse. Prepared-module controls pass
+15 tests / 164 assertions. This replaces positional root arithmetic without yet
+adding argument staging or granting admission.
+
+The next constructor change is owner-authenticated argument ANF: preserve each
+actual invocation input's completion in evaluation order, then consume the completed
+locals in the allocation contract. Real allocator observations have exemplar
+CHECKCAST followed by selected size evaluation and Object-to-Long coercion; treating
+either as identity from its logical type would be unsound. Reuse the retained
+invocation-input region for the host-only shape computation, not a new executor
+or resident integer arithmetic theorem. Numerical continuations remain resident.
+The rebuilt helper need not be JVM-emitted: original physical Method/mode/receiver
+and input-completion evidence plus exact constructor joins own the correspondence.
+Derived input/root indices will require one disjoint, complete topology check.
+
+October 22 ordered-storage checkpoint: source storage analysis now threads actual
+AbstractValues through bindings in source order. Public scalar declarations may
+supply scalar carriers, but later local declarations cannot authorize an earlier
+allocation. Exact aliases preserve the complete existing value, including shape,
+layout and ownership; conflicting kind/dtype or an altered destination value is
+rejected. Missing public array facts do not acquire a synthesized capacity.
+
+Non-core allocation helpers now require the selected definition's direct constructor
+projection. A recognizable allocator name or forged operation metadata is insufficient.
+Exact core size-only constructors and primitive `aclone` retain their contracts.
+The late allocation-dimension declaration fallback has been removed: an allocation
+consumer cannot manufacture its own missing scalar value. The former reversed-binding
+capacity test now requires refusal instead of retaining an unavailable future extent.
+Positive helper coverage uses an actual independently compiled `deftm` definition.
+
+Focused storage checks pass eight tests / 57 assertions; the real selected-helper
+namespace passes three tests / 19 assertions and the shared descriptor namespace
+passes ten tests / 157 assertions. Prepared-module controls pass 14 tests / 155
+assertions. The full frontend namespace reports 151 tests / 953 assertions with
+the same remaining 18 failures and one error.
+The actual generated training capture still has six declined bindings and no
+allocation contracts, and remains unadmitted. These are not waived gates.
+
+Compound helper-size extraction remains pending. Generic ANF naming is not yet safe:
+moving a size before a helper may move it ahead of the exemplar's reference adaptation.
+The phase must join the exact input/body completion spine to its ordered runtime
+preflight before such extraction can be admitted. Logical AV propagation alone does
+not prove null behavior, CHECKCAST completion, or argument conversion order.
+
+October 22 description-boundary checkpoint: the existing frontend now separates
+its one description/storage analysis from continuation through unchanged admission
+and equation construction. Both continuations remain private. Each description
+retains its exact normalized `[symbol expression]` inputs before free-scalar type
+metadata is elaborated. The phase can therefore match original element identities
+instead of rediscovering expressions by equality. This adds no admission predicate.
+
+The numerical-import plan is simpler than the earlier host-projection hypothesis:
+the four declined FP continuations already project through `scalar-equation`.
+Their remaining correspondence must use actual emitter operand carriers and the
+shared arithmetic plan, selected-operation ownership, and exact completion
+contracts. `terminal-source/trace-scalar` is not a numerical execution route for
+these equations. OrderedSourceOwner owns entry checks and source-order obligations;
+resident scalar equations own numerical results. Allocation helpers still need
+their compound sizes named at the original argument position and authenticated
+through the existing allocation projection, not a syntactic allocator fallback.
+
+The new source-identity control passes one test / seven assertions. The full
+affected frontend namespace reports 145 tests / 921 assertions, 18 failures and
+one error. A same-process committed-versus-refactored comparison of all 144
+pre-existing tests gives identical failure signatures. These remain campaign
+blockers; the factoring does not repair or waive them, close an import marker,
+or establish resident training.
+
+October 22 shared source-constructor checkpoint: ordinary and prepared sources
+now have one internal construct/represent/normalize implementation. The handoff
+keeps the original source normalization, pre-SoA construction, represented source,
+physical source and exact normalized frontend source distinct. No-import code
+creates no prepared phase and does not query AD entry carriers. Multi-form bodies
+retain every statement through the existing ordered `do` convention. The original
+`capture` entry is an adapter, not an independent miniature source pipeline.
+
+Until explicit representation correspondence exists, imported intervals require
+identical body and options and no representation descriptor. Copied bodies/options
+and forged representation descriptions refuse. Nested cold JVM preparation runs
+without an enclosing module-insertion consumer or temporary AD-deferral policy;
+only projection of its completed program may consume the actual outer cut. Two
+imports retain independent physical-entry, nonce, cut and obligation ownership.
+
+TypedSOAC routing now shares a private normalized-source continuation. Public
+`attempt` keeps its previous normalization and validation behavior. This factoring
+does not yet wire prepared imports into production equation-first admission or
+close any obligations. The final affected-layer gate passes 109 tests / 743
+assertions; normalized/public route controls additionally pass two tests / 17
+assertions. Constructor-only checks pass 14 tests / 159 assertions. A same-process
+comparison against 469d3e1f confirms identical 13 assertion failures and one error
+in the existing singleton-arithmetic and checked-conversion controls. Those remain
+explicit campaign blockers, not waived or rewritten expectations.
+
+October 22 late-cut construction checkpoint: the prepared-module phase can run
+ordinary pre-SoA preparation inside its existing source history, keeping prepared
+AD applications opaque until one final insertion pass. Ordinary helper expansion
+and JVM-owned calls keep their existing policies. The actual training fixture now
+crosses the complete pre-SoA sequence with one pending import and a complete
+normalized binding-origin spine. This is still construction, not training admission.
+
+The real-pass probe identified provenance loss in PE and rewalking. Their actual
+constructor returns now use the existing origin-only SourceConstruction relation;
+no equivalence, execution or numerical permission is inferred from those edges.
+PE and macroexpansion preserve unchanged seq/vector occurrences rather than
+copying them gratuitously. Changed child metadata still forces reconstruction.
+The late cut keeps exact caller identity checks, and ambiguous histories remain
+fatal. No new proof owner, registry, host numerical executor or fallback was added.
+
+The combined construction/macroexpansion/PE/source-transport/walker gate passes
+105 tests / 720 assertions in the capped REPL, including a duplicated AD-call
+history refusing without publishing a provisional import. Independent review
+found no blocker. Whole-import obligation discharge, equation-first production wiring and
+resident training remain open. Exact-head CI at d0b6f7aa passed setup/build but
+failed fixture emission, unit tests and OpenCL (165 tests, one failure and 19
+errors); CUDA/HIP gates did not run. These failures are not waived.
+
+October 22 canonical-module construction checkpoint: generated-body projection
+now inventories each actual emitted completion as a pending obligation. It
+requires the original physical entry, parameter carriers and flat SSA spine;
+copied or ambiguous occurrences, unknown numeric payloads and unsupported
+conversion policies refuse the whole proposal. Numeric conversions use the
+existing scalar-conversion contract, not a new type or operation registry.
+The proposal is explicitly non-admitted: removing completion syntax from a
+candidate does not discharge its checks, boxing or source-evaluation semantics.
+
+The early prepared-module cut can insert a complete canonical binding spine
+instead of only diagnostic ports. Its private pending import retains the exact
+projection event. Insertion preserves the source prefix and continuation,
+inactive output slots and result aliases. Fresh IDs cannot capture original
+locals; sequential initializer closure uses the registered site's live locals
+and earlier inserted IDs, never the broader reservation set containing later
+locals. The original unclosed import marker remains fatal. This mechanism
+does not yet install a production importer or admit resident training.
+
+Fresh-worker CI exposed a missing forward declaration for the boxed-entry
+descriptor helper which a warm REPL concealed. The declaration is fixed in
+0b9ea1a6; fresh CI qualification is still required. Existing red gates are not
+waived, and this checkpoint does not establish a performance improvement.
+The affected reused-REPL gate passes 104 tests / 970 assertions across source
+transport/construction, prepared imports, inlining, and generated boxed-entry
+and module proposals. Independent review approved this construction-only slice.
+
+The unchanged complete `local-gradient-sum` construction now also reaches the
+normalizer through its actual caller cut in a non-executing REPL prototype:
+one import, five input obligations, 64 body-completion obligations and 69 final
+bindings, with the one original import marker still open. The observer records
+the actual uniquification, array-type-witness and reduction-split edges. The
+same six scalar/allocation sites refuse; no permissive frontend switch was used.
+This exercise exposed a closure bug: broad collision reservations include
+operator spellings, so only actual lexical binder families may seed free-local
+recognition. A regression protects bare `float` cast syntax and retains the
+negative forward-reference controls.
+
+Fresh CI passes namespace loading after the declaration fix, then identifies
+missing logical declarations on the new boxed-entry completion results. These
+are now supplied at construction from exact builtin target Classes using the
+existing type tables. No operand hint, JVM hint, normal-return evidence or
+ownership permission follows. The unchanged typedness census and explicit
+completion barriers remain enforced.
+
+Reviewed integration seam: provisional frontend admission must be limited to
+exact owned-import binding obligations sealed against the normalization trace.
+The existing ordered-source traversal should consume the prepared producer's
+guarded physical context and compile scalar continuations in its one step map.
+Post-reduction division must depend on the produced reduction value, not outline
+and rerun the original whole initializer. Allocations must join existing storage
+contracts rather than become scalar callbacks. Only complete step, allocation,
+completion and result coverage may close the exact marker. This remains future
+production work, not a permission granted by the prototype.
+Qualification of the constructor/closure corrections passes 168 tests / 1,430
+assertions in the reused REPL, plus the focused unchanged-census test's four
+assertions. Independent review approved the complete correction diff. These
+receipts do not supersede full exact-head CI or establish runtime admission.
+
+The real-call construction is now factored into the existing generated-body
+module, rather than duplicated in the REPL importer. It stages every argument
+before conversion, retains the exact caller input requirements and wrapper
+contexts as pending obligations, and uses the same numeric-completion projection
+law as body projection. Contradictory builtin/physical dtype requirements refuse.
+Qualification, alpha-renaming and substitution retain their actual constructor
+events; complete flat-spine validation precedes the original/candidate/projected
+root join so it cannot silently truncate. No new producer API or registry is
+needed: existing prepared-entry queries and observation adoption suffice for a
+compiler-local guarded import context.
+
+An actual caller-cut regression now retains the unchanged training program's
+five input and 64 body obligations with the original marker open. Additional
+tests reject unknown/ambiguous numeric requirements, shortened or duplicated
+spines and detached source namespaces. This still does not install provisional
+frontend admission or close the scalar, allocation and runtime-view obligations.
+
+Fresh unit CI also exposed generated discarded-statement bindings without the
+existing effect-statement marker. The helper constructor now carries that marker
+at the authenticated original terminal-discard position. It adds no numerical
+type, conversion success or census exemption. Existing emitted value and failure
+domain comparisons, including the whole unchanged training helpers, remain the
+semantic oracle.
+The affected gate passes 178 tests / 1,568 assertions before removal of one
+redundant statement-shape assertion. The targeted hardware-free distributed
+training-composition test advances past the repaired census boundary but still
+errors at direct TypedSOAC coverage; it is not counted green or skipped. Complete
+owned-module admission and ordered scalar/allocation closure remain required.
+The final deduplicated statement namespace passes 6 tests / 88 assertions.
+Independent review approved the call constructor, conversion factoring, complete
+trace checks and producer statement-marker repair.
+
+October 22 prepared-module positioning checkpoint: the early AD module cut now
+retains the inliner's actual scope, binding ordinal and already-constructed prefix.
+Compilation-local identity registration authenticates both the scope and the exact
+immutable binding-site object; a structurally plausible replacement prefix is not
+accepted. Scope/cut records are deliberately excluded from ordinary source
+substitution edges. Output ports reserve both later binders and previous module
+ports, preserving inactive slots and result aliases without capturing locals.
+
+This is constructor-position evidence, not final equation placement or permission
+to execute a module. The next step remains importing the exact generated entry
+with its completion obligations, then splicing its canonical source spine and
+ParallelProgram together before deriving one InvocationPlan. Production admission
+must retain public argument checks and resident buffer contracts, and close the
+matching prepared import only after the entire composition validates. No fallback
+or marker waiver is authorized by this checkpoint.
+
+Focused reused-REPL qualification passes 90 tests / 747 assertions across the
+module cut, source transport/construction and ordinary inliner. Independent review
+found and closed the prefix-identity gap. Wider qualification also exposes an
+existing raw-projection test that sends reserved completion syntax to Clojure
+`eval`. A diagnostic bytecode emission with an Object-typed caller instead shows
+why that structural projection is not execution authority: it omits the generated
+entry's positional argument adaptation and changes the loss carrier for Float
+inputs. The importer must start at the actual Method/parameter contracts, not
+silently execute those substituted bindings. This remains an open qualification
+obligation; the raw-projection test is not skipped or counted green.
+The separate owned generated-entry/completion gate passes 133 tests / 1,705
+assertions in the same process. Neither receipt establishes broad CI acceptance.
+
+The follow-up now closes that specific generated-entry input gap, not general
+numerical admission. An authenticated boxed-entry bridge records actual public
+`applyTo`/`invoke` Methods, exact compute parameter Classes and the shared wrapper
+conversion recipes. Projection first stages every original operand in Object
+context, then applies parameter conversions in a second ordered block. This
+preserves all-argument evaluation before Number/Boolean/Character conversions,
+including exceptions. The new completion family reuses the wrapper's parameter
+emitter; imported reference targets reuse the existing exact-Class check rather
+than resolving a descriptor in a different loader. No type registry is added.
+
+Input plans require the same implementation, interface and parameter vector as
+the emission. Original-vs-catalogued bodies join through the existing private
+InputOrigins; copied bodies or parameters confer no authority. Fresh staged ports
+are metadata-free. Every staged completion remains queryable through the owning
+emission's existing occurrence API. The import marker stays open until complete
+typed source/equation composition and its runtime checks have been established.
+
+Bounded differential tests compare the actual wrappers with projected entry
+inputs for all primitive parameter families, arrays/nulls/wrong classes, signed
+zero/NaNs, custom Number conversion order and wide applyTo. The original Float
+loss-carrier regression passes through the real bytecode emitter, not eval of
+reserved IR. Same-name/different-loader reference tests also cover divergent
+operands. Review found and closed the exact-Class and physical-entry identity
+gaps. This is not a claim of resident training or portable numerical admission.
+The affected reused-REPL gate passes 181 tests / 2,238 assertions. The unchanged
+real training workload reaches the authenticated cut with five original operands,
+five explicit wrapper conversions and 55 unchanged body bindings (65 projected
+bindings total); its six result slots and four inactive gradients are preserved.
+This probe deliberately stops before partial numerical admission or execution.
+
+#### Reviewed continuation: close the producer, not individual optimizer copies
+
+October 22 boundary checkpoint (draft implementation, not released acceptance):
+selected helper emission capture is shared by AD
+and compiler normalization, with original definition observations retained across
+explicit owned preparation. Primitive-array helpers can expose their actual
+primitive return bridge without being admitted as scalar leaves. The JVM emitter
+can replay a saved Float/Double/Long body context before outer boxing and retains
+lexical reference checks, including exact Class-loader identity and operand-first
+failure/recur order. The real training MSE body agrees with its original owned
+invocation for changed inputs and failing reads. A shared generated-program
+canonicalizer now imports supported whole helper bodies before the one owned AD
+entry is frozen; runtime and compiler consume the same physical program. It
+retains actual entry Method identity, positional argument conversions, lexical
+reference checks, selected helper return contexts and original/new-namespace
+lookup dependencies. Unsupported expansion abstains transactionally. The affected
+reused-REPL gate passes 149 tests / 1,669 assertions. This does not establish
+resident gradient admission or broad CI acceptance.
+
+New generated ABI inputs use the resolved Method's positional Classes and the
+shared bytecode argument/adaptation mechanisms, not Clojure source-policy casts.
+Each recipe retains its established raw carrier, rechecked before conversion by
+final emission. Object consumption records the carrier after boxing. No receiver
+term, source-occurrence proof, or placement authority is synthesized. This matters
+at Float overflow: JVM d2f/Number.floatValue is not a checked core/float cast.
+
+Qualification remains incomplete. The Float reduction fixture now explicitly
+prepares its frontend before opening a read-only interval; the reused 75-test /
+1,200-assertion gate passes, but that is not fresh broad CI evidence. At draft
+head b2ee1b6f, public GPU fixture generation attempted 172 requests, passed 140,
+and reported 32 failures across source coverage, checked floating conversions,
+address certificates and a mismatched declared dtype. Head 373f0d74 corrects the
+double-declared contraction fixture and corresponding callers without silently
+retyping its source; separate FP32 fixtures remain covered. Its fixture CI now
+passes 142 of 172 requests, with 30 remaining failures; unit CI is also red.
+The unchanged resident forward/gradient/update/replay path, broad gates and
+subsequent measurements remain mandatory. The public softmax scalar quotient's
+unclosed source arithmetic is also still open.
+
+The next cut is an existing-IR module boundary, not more final-tree matching.
+An instrumented public training compilation creates its prepared projection
+inside `:fixpoint`. Before the next tagging call, its 25 projected bindings have
+already become 34 bindings with no exact projected binder/initializer pairs
+remaining. Final-tree `prepared-program-binding-occurrence` cannot certify this
+interval. Merely moving a query to `pass-lower` is also insufficient: direct
+equation-first compilation does not necessarily inline AD in that pass.
+
+The reviewed architecture now favors constructing one canonical generated body
+**before** freezing/emitting its first outer entry, rather than maintaining an
+additional correspondence owner between physical and normalized binding spines.
+Authenticated helper expansion already constructs a new program under the
+existing GeneratedPreparationOwner. Its runtime body, emitted entry and typed
+candidate should therefore share that program. This does not allow normalizing
+an already emitted body without its original completion evidence.
+
+The first factoring step introduces `normalize-value-source`: lexical
+uniquification, proven array-type witness conversion and strict scalar-reduction
+lifting share the existing frontend implementation and lexical environment.
+Device copy exposure, allocation/buffer alias rewrites and device extent
+insertion stay in `normalize-source`. The new prefix is not yet installed in
+generated preparation, and canonical completion wrappers remain extraction
+barriers. Traversing their operand requires preserving its original emitted
+context, not merely rebuilding a syntactically identical outer contract.
+
+Qualification of this factoring: 11 focused tests / 152 assertions pass in the
+existing capped REPL. Comparing 176 unchanged tests against the previous
+implementation in that same JVM gives identical outcomes (1,040 passing
+assertions, 18 failures, one error); those existing failures remain obligations,
+not accepted skips. No resident gradient admission is claimed by this step.
+
+Next, validate post-helper flattening and the safe prefix before first emission;
+preserve result ports/aliases, parameter completions and source order, check
+idempotence and the flat binding planner, and discharge completion facts only
+from the final actual entry. Do not move the full device normalizer into runtime
+preparation. The existing-IR module import still has these obligations:
+
+The generated-helper construction now exposes an authenticated binding spine
+before its sole outer emission. Each original initializer replays its retained
+physical context before its exact reference check; alpha-renaming maps the
+complete binding interval by ordinal. Multi-statement tails use the original
+terminal-context owner: each discarded statement becomes a binding around
+`(do statement nil)` under that saved context. The helper's final result/Object/
+reference wrappers remain on the final value. Generic ANF still treats these
+wrappers as barriers.
+
+Before publishing GeneratedPreparationOwner, actual emission must discharge all
+expected local type/hint/verified/reference-Class facts and every completion
+occurrence. Missing, ambiguous or altered facts refuse publication. A failed
+check can leave an unpublished generated class; this is a resource/performance
+obligation, not permission to publish a partially validated owner.
+
+The shared JVM body emitter now stops after divergence. The formerly duplicated
+`do` path delegates to it, so both use the same discard/pop/pop2 and void-context
+rules. Focused qualification: 125 tests / 1,658 assertions pass in the existing
+capped REPL, including negative context/local-fact cases and changed-input
+training oracles. A fresh unchanged training preparation has 55 bindings and 64
+completion nodes, all 64 observed in its actual generated entry. Unlike the old
+wrapper-free diagnostic skeleton, this count retains and validates conversions.
+This still does not establish TypedSOAC admission or resident training execution;
+the owned importer must lower those contexts and numerical regions together.
+
+1. Consume the exact prepared projection at its inliner construction boundary,
+   before raw bindings are appended. One compilation-local mechanism must cover
+   direct AD applications and authenticated captured prepared callables, including
+   applications exposed by later inlining. Keep opaque ownership out of AST
+   metadata, portable IR and semantic fingerprints.
+2. Account for every physical completion as an exact typed operation or an
+   ordered host invocation action. Public input checks precede acquisition;
+   internal reference checks need actual producer/alias facts. Never cast a
+   DeviceBuffer as a JVM array or infer raw carriers from logical type hints.
+3. Import the generated region and caller continuation into the existing
+   ParallelProgram/InvocationPlan composition. Preserve explicit output ports
+   and source order; do not build an alternate AD executor or expose a typed
+   object to generic S-expression passes. Initially refuse overlapping regions,
+   internal escapes and unproved cross-boundary fusion.
+4. Close only the exact prepared-import occurrence after its complete argument,
+   equation, storage and result boundary validates. Count overflow, allocation
+   failure, array bounds, aliases, lifetimes and publication remain independent
+   obligations; whole-region ownership grants none of them automatically.
+5. Qualify unchanged public local-gradient-sum, then forward/VJP/update, using
+   rows 1/3, changed inputs, JVM/OpenCL/Level Zero comparisons and repeated
+   resident execution. Negative controls must show failing preflight before
+   acquisition, and copied/stale owners or incomplete regions must refuse.
+
+The separate REPL-lifecycle addition `unregister!` is merged as #1563 after all
+seven exact-head gates passed. It clears a generic's methods, templates and
+specialization state while preserving its Var/table for redefinition. It is a
+sequential operation, not revocation of captured implementations or a concurrent
+reload fence. It does not replace any compiler migration acceptance gate.
+
+The first pre-rewrite import hook is now implemented on the draft branch for
+both direct AD applications and authenticated captured prepared callables. A
+compilation-local consumer receives the exact live projection before append,
+and returns fresh, metadata-free output ports with the original nil slots and
+alias partition. Copied, repeated, nested or colliding placements refuse before
+any import can be closed. With no consumer, ordinary expansion is unchanged.
+This is not yet a production ParallelProgram importer: no training admission
+or resident-memory permission follows from capturing the projection.
+
+Combined reused-REPL qualification of the import hook, source transport,
+prepared frontend and generated entry passes 58 tests / 407 assertions. That
+run exposed and then qualified a narrow lifecycle repair: owned bytecode may
+reconstruct its exact current original source after AD rules change. Old
+emissions and prepared executables remain stale; a captured dynamic gradient
+retains its own invocation guard even when a direct gradient constructor in
+the same caller is rebuilt. General emission retries do not gain this renewal
+permission. These focused results do not replace the draft's still-red unit,
+fixture-generation and OpenCL CI gates.
+
+Prepared completion classification now has an emitted occurrence boundary,
+reusing the bytecode owner's existing InputOrigins rather than a new AD type
+registry. Canonical completions have their own catalog, separate from calls;
+the shared scalar/Object dispatcher records raw, completed and parent-visible
+carriers, contexts and lexical locals. The original input, catalog-owned source
+and backend-rebuilt expression remain distinct. No `:ref` carrier implies an
+exact runtime Class or permission to erase a check. Divergence records no
+unexecuted adaptation, and a divergent let initializer now stops emission of
+unreachable later bindings and body.
+
+The unchanged training module exposes all 57 completion occurrences through
+this API. The existing changed-input CPU training oracle passes one test / 118
+assertions, including complete occurrence coverage. Completion, conversion,
+invocation and binding controls pass 84 tests / 1,368 assertions; prepared AD
+and source-transport controls still pass 58 / 407 in the reused REPL. This is
+evidence for the importer, not a completed typed-module lowering. At the prior
+head `2ef58c02`, CI fixture job 34060 still passes 142 of 172 public requests and
+fails private segmented reduction generation; unit job 34063 and OpenCL job
+34059 are also red. Those production obligations remain open.
+
+The next importer seam is an **owned generated module**, neither an original
+frontend prefix nor a source-free algorithm. Review confirmed this landing order:
+
+1. Authenticate the exact prepared physical entry and its generated Method.
+   Derive entry carriers from that Method and the emitted entry records, not
+   desired tags. Inventory completions under their original top-level physical
+   binding ordinals before producing any provisional numerical view.
+2. Feed actual completion-result facts to the existing normal-return analysis.
+   This is opt-in and conditional on normal return. Primitive results retain
+   their actual carrier; Object-parent boxing retains the exact builtin payload
+   class. References and divergence acquire no scalar-payload fact. Every use
+   stays an obligation to execute the exact binding or discharge a typed rule.
+3. Construct the existing TypedSOAC/ParallelProgram and InvocationPlan. Their
+   `:source-binding-id` facts index the NORMALIZED source, not the physical
+   prepared binding spine: retain and validate the normalization constructor
+   correspondence before joining equations, allocations and host steps back to
+   physical ordinals. A diagnostic-only wrapper-free view still has
+   four unclosed scalar bindings after existing normalization; it is never an
+   executable or evidence that their completion obligations may be removed.
+4. Where a host ScalarCompute corresponds to a complete physical initializer,
+   prepare it through `bytecode/compile-input-binding-region`, checking exact
+   ports and physical result against the invocation value. An extracted
+   reduction followed by a scalar continuation is NOT that case: outlining the
+   original initializer would execute the reduction again. It requires an
+   explicit retained continuation or typed scalar rule; refuse until proved.
+   Reuse the existing prepared-step runtime
+   and owner checks through a generated-entry adapter. Do not fabricate a source
+   Var or outline reductions/allocations as opaque host kernels.
+5. Remap and compose the imported module and caller through the existing typed
+   value/program APIs. Preserve argument call-by-value order, result nil/alias
+   slots, source order, and logical buffer-view checks before acquisition.
+   Initially decline nonidentity argument plans until their ordered bindings
+   are represented; do not lose them when cutting raw projection bindings.
+6. Close the exact prepared-import marker only when every completion, host
+   executor, typed producer/storage boundary and final owner guard validates.
+   An output tuple must not escape this projection boundary. Resident buffers
+   must never be passed through primitive-array JVM CHECKCASTs.
+
+The emitted result-fact resolver now composes through the shared normal-return
+analysis in an opt-in path; defaults remain unchanged. The unchanged training
+oracle passes 119 assertions, including the actual Object/Double loss result
+derived from the generated Method and owned completion records. The resolver
+does not itself admit native arithmetic or discharge source evaluation.
+Malformed non-nil resolver facts fail closed, and copied conversion occurrences
+cannot borrow another occurrence's result. The combined completion/normal-return/
+JVM conversion/binding gate passes 91 tests / 1,334 assertions in the capped
+REPL. At `c1c303ac`, test job 34066, fixture job 34067 and OpenCL job 34070 are
+red; the exact-head watcher has terminated red rather than claiming acceptance.
+
+The required constructor trace is now available as the optional third argument
+to `typed-soac-frontend/normalize-source`, separate from portable options. It
+records pre-lift SSA and array-witness reconstruction, exact witness rewrite
+details, and eager reduction-split notices containing both scopes, actual input
+and output ordinals, the reduction, fresh result binder and constructed pair
+identities. Root-stage notices connect exact stage inputs and outputs. Observer
+results never drive normalization, nested calls do not inherit the observer,
+and exceptions abort the candidate. Generic postwalk edges are lexical and
+quote-opaque; map/set traversal is not an evaluation-order proof.
+
+These are observations, not sealed module authority. Consumers must distinguish
+specific witness rewrites from generic reconstruction by stage before checking
+identity uniqueness, reject missing or ambiguous correspondence, retain the
+generated entry owner, and close the still-untraced post-lift transformations.
+The real diagnostic training view emits one strict-first-operand split and six
+array-witness rewrites; it remains unadmitted. New focused trace controls pass
+5 tests / 50 assertions. A same-REPL comparison of 175 existing tests found the
+same 18 failures and 14 errors under pre-change and changed implementations,
+with identical failing tests, assertions and error categories. Correcting two
+stale private-API test calls subsequently restores their 24 allocation
+assertions; the wider 179-test run now has 18 failures and one error, still open.
+No production gate is waived or declared green from that comparison.
+
+The earlier checkpoints below describe prerequisite evidence, not completion.
+
+Prerequisite qualification: scalar PE and simplification now preserve existing
+ValueCompletion terms as evaluation boundaries. The simplifier validates the
+reserved syntax before descent and simplifies only the operand, retaining the
+exact contract and wrapper metadata. Both quote forms are opaque; quoted invalid
+completion syntax is data, not an executable validation error. Independent review
+caught the initial rule-only barrier's premature descent and drove this repair.
+The final combined preparation/completion/PE, simplifier and typed arithmetic
+gate passes 73 tests / 885 assertions, including no-op collection identity. Unused
+checks still evaluate their operand once and fail before subsequent effects.
+This prerequisite does not enable helper expansion or grant resident admission;
+the shared pre-freeze canonicalizer and unchanged training acceptance remain open.
+
+The next shared physical-planning seam is factored from the existing JVM emitter,
+not reconstructed from logical tags: let and loop initializers use one context
+function; lexical hint selection and reference-check/local-fact planning each
+have one implementation consumed by actual let emission. The hint selector is
+the existing policy (including its conservative interop fallback), not authority
+for an initializer's raw carrier. The completion planner is likewise mechanism,
+not an authenticated witness: a future canonicalizer must establish raw facts
+from the actual parameter/operation boundary and reject unsupported carriers or
+unresolved reference hints before using its output. Final emission must recheck
+the resulting plan. No helper expansion or canonicalizer is enabled here.
+
+Qualification compares planner output with actual retained emitted binding facts,
+checks float[]/double[]/String casts, null passage and failure before later effects,
+and retains the empty-hint verifier guard. Entry/preparation checks pass 53 tests /
+787 assertions; existing binding ownership, loops, reference bridges and Object
+checks pass 74 tests / 1,243 assertions. These are separate affected scopes, not
+the broad CI or unchanged resident training gate.
+The combined seven-namespace gate also passes after a clean capped REPL restart:
+127 tests / 2,030 assertions. Bytecode's private InputOrigins class must not be
+reloaded while retaining old captures; those old diagnostic captures were
+discarded rather than interpreted as production evidence.
+
+The same emitter now provides narrow non-emitting physical carrier planning for
+SSA locals/literals, supported core casts, Object/result completions, lexical
+let spines and global typed invocations. Actual typed-call selection and cast
+result mechanisms are shared with emission. A known initializer plan is checked
+against actual emitted carrier; unsupported cases abstain without changing the
+general emitter. The planner performs compiler-time resolution, not numerical
+execution. It establishes no totality, purity, return payload, ownership or
+permission to move a source evaluation. Logical primitive hints on Object values
+remain Object facts. Dynamic/local receivers, unresolved reference hints,
+unsupported control flow and input recipes without original raw facts refuse.
+
+Independent review caught a planner/emitter mismatch for source CHECKCAST recipes;
+those now abstain because the direct bytecode completion path does not implement
+them. A forged raw plan is rejected by actual emission. The affected ten-namespace
+gate passes 178 tests / 2,568 assertions. A non-emitting full-spine check, seeded
+only by the existing physical entry's parameter facts, plans all 25 unchanged
+training-gradient bindings and matches their actual raw/completed emission facts.
+The unchanged CPU gradient remains within the independent explicit-FP32 oracle:
+weighted-gradient errors are 0 (rows 1) and 1.86e-9 (rows 3).
+No discarded module was emitted for analysis. Pre-freeze helper expansion,
+completion preservation and unchanged resident training acceptance remain open;
+neither broad CI nor a compile-time speedup is established by this receipt.
+
+The next production change should share target-neutral generated-program
+canonicalization before the owned AD entry is frozen. A REPL-only experiment
+using existing generic resolution, helper expansion and PE changes the training
+preparation from 25 to 34 to 22 bindings; rows 1/3 retain exact primal results
+and weighted-gradient errors 0 / 1.86e-9 against the independent oracle. This
+is numerical evidence only: bare expansion/PE is **not enabled** by this receipt.
+
+The current source pipeline expands helpers, propagates aliases/literals and
+later lifts reductions after preparation ownership has frozen. Reconstructing
+every such transformation afterwards would need optimizer-specific adapters.
+There is also an admission-order cycle: equation-first rejects uncertified
+scalars before its current final source-prefix correspondence is constructed.
+Do not solve either problem by clearing evaluation flags or permitting an
+isolated scalar query to discharge the whole generated import.
+
+The reviewed producer boundary must:
+
+- Preserve the original namespace, source policy, declared parameters, helper
+  selection/history, ordered argument conversions and return checks.
+- Express actual helper/binding completions with the existing ValueCompletion
+  algebra before PE; a logical annotation is not a CHECKCAST witness.
+- Share only neutral resolution/expansion/product/lexical/PE stages. Do not run
+  the GPU pre-SOA pipeline wholesale: its rewalk can remap dtype, and fusion,
+  placement and scheduling belong later.
+- Make canonicalization stable under the subsequent common scalar stages.
+  If a later stage still changes helper/alias/literal structure, factor that
+  neutral rewrite into the common producer rather than add a special verifier.
+- Qualify the actual unchanged gradient, including wrong/null helper results,
+  argument/exception order, stale helpers, negative/overflow row counts and
+  changed-input replay. Original reduction count/read and resident allocation
+  views still need their own validated correspondence; canonicalization is not
+  permission to replace JVM arrays with DeviceBuffers without that join.
+
+CI receipt for pushed 83c49343: setup/build pass; fixture job 33975 fails on
+softmax's uncertified inv-sum; unit job 33973 reports failed actions on all 16
+shards. Their executions stop at failing subshards, so neither one shard's count
+nor a sum is a complete-suite coverage claim. Failure families include source
+execution coverage, stale cold helper inputs, typed algorithm validation,
+dtype/ownership mismatches, and outdated expectations. Do not label all of them
+baseline or solved by the training work without reproducing each family.
+Origin/main 4e15484d has all seven required gates green; the draft stays held.
+
+The unit run also exposed a real operand-outlining regression: wrapping an
+original operand in its completion hid a forged pre-conversion carrier. The
+outliner now checks the actual emitted operand type before consumer conversion,
+scoped only to the outer completion. Nested-completion and existing mutation
+controls pass with the affected two namespaces: 43 tests / 767 assertions.
+Reference/integral recipe tests now assert their exact contracts rather than
+the obsolete expectation that no non-floating contract exists.
+
+October 22 shared-entry checkpoint (items 3/5): the generated AD runtime and
+compiler queries use one owned JVM bytecode entry, not independently evaluated
+source. Pending helpers are compiled without numerical execution; promotion
+rejects the old module and retries the entire producer. Generic IFn wrappers now
+share actual descriptor conversions across the 20/21-argument boundary, reject
+wrong arity, and invoke wide static methods directly rather than via reflection.
+Null Double arguments no longer silently become zero. Byte/Short/Character
+boxing follows the actual primitive descriptor.
+
+Captured value+grad/grad calls must retain and project that same preparation.
+Their callable identity is one-shot-bound inside the authenticated program;
+copying metadata cannot import an unrelated function as the prepared gradient.
+Higher-order AD retains the original producer, and grad runtime projects the
+guarded value+grad entry. Independently optimized :compile? runtimes do not lend
+the generated entry as their own source.
+
+This is not resident training acceptance. The unchanged GPU gradient still
+declines two scalar source operations and an unproved original reduction-count
+correspondence. Generated-source import closure, original argument/cast order,
+read/bounds placement and resident lifetime remain separate obligations. PR #1539
+stays draft; focused JVM/oracle qualification does not replace its seven CI gates.
+Qualification for this checkpoint: affected AD preparation, captured-call,
+source-construction, transport and inlining tests pass 98 tests / 851 assertions;
+the common bytecode completion namespace passes 26 tests / 565 assertions; the
+unchanged CPU training-gradient oracles pass 2 tests / 70 assertions. Independent
+review found and drove fixes for wide arity, captured-owner loss and independently
+optimized-runtime/source mismatch. These counts are separate scopes, not an
+aggregate full-suite or resident-device training result.
+
+October 22 generated-AD consolidation (items 3/5): canonicalize local products
+and sequential lexical wrappers once, before freezing GeneratedPreparationOwner.
+Prepared runtime execution and compiler projection now consume that same form.
+Reuse existing completed-result analysis only for opt-in presence refinement;
+retain initializer evaluation, exceptions, source policy and historical definition
+observations. No new AD rule, carrier inference or arithmetic reassociation is
+introduced. Active gradient slots require visible values; inactive slots remain
+nil. Unsupported canonical output shapes retain the original prepared program.
+
+The actual prepared training loss now has 25 top-level bindings instead of 14;
+its generated scale is no longer hidden in a presence-product branch. Existing
+SourceConstruction records the exact prepared projection and original caller,
+without treating generated bindings as original source or discharging its
+unclosed import marker. This is construction provenance, not execution permission.
+
+Focused preparation/local-product qualification: 54 tests / 339 assertions pass.
+The existing training-oracle tests, extended to reuse one prepared runtime across
+changed data, parameters and row counts, pass 2 tests / 70 assertions. Review
+identified the active-nil validation gap; it is corrected with a negative test.
+A stale-rule test now first obtains and verifies a current emission, separating
+its intended rule invalidation from an earlier legitimate helper promotion.
+Source construction, transport and inlining pass 70 tests / 618 assertions;
+direct-evaluation inliner tests now use the existing JVM projection for reserved
+completion terms, as the actual prepared runtime already does.
+
+This does NOT close resident training: the unchanged GPU gradient still refuses
+the forward reduction quotient and the generated scale as uncertified scalars.
+The prepared scale's recorded phase occurrence is authenticated, but later helper
+expansion reconstructs its expression without retaining that occurrence link.
+Observed equal syntax is diagnostic only, never a replacement for that relation.
+The next common boundary is prepared-binding/source-order correspondence and
+existing scalar execution, plus the separate original reduction/count/read join.
+Do not remove evaluation flags, infer physical carriers from storage dtype, or
+clear a whole prepared-import marker after checking only one scalar.
+PR #1539 remains draft; exact pushed head c5618c07 has setup/build green and
+fixture/OpenCL/test gates red. These focused checks do not supersede those gates.
+
+Following normalization commit fe7cf8e3, review located needless copying in
+gradient-result selection, retained helper calls and local-product traversal.
+These now reuse the existing identity-based reconstruction utility. Invocation
+reconstruction shares make-invk's single metadata constructor: missing operation
+metadata and retagged children still produce new nodes; an explicitly retained
+original operation is not reinterpreted from a mangled name. Quoted helper calls
+are opaque data. No equivalence certificate or source-order permission is added.
+Utility/inliner/product tests pass 109 tests / 714 assertions; source construction,
+transport and prepared AD pass 55 tests / 495 assertions. Actual gradient still
+has the same two scalar refusals; occurrence transport is not fully closed.
+Exact fe7cf8e3 CI has setup/build green, fixture/test red, OpenCL pending at the
+latest observation. Fixture33945 again refuses softmax's inv-sum scalar. Failed
+test shard output33948 reports 3 failures / 13 errors in 568 tests / 4118
+assertions, including source-ordered PDE/copy execution and attention algorithm
+validation; this is one failed shard, not a whole-suite summary. Keep the broad
+draft held and use these shared-boundary counterexamples in subsequent closure.
+The subsequent shared-walk cleanup removes unconditional seq/vector copies from
+metadata-preserving postwalk and the final void-contract annotation pass. Both
+quote spellings stay opaque, real metadata changes survive, and repeated effect
+annotation is idempotent. Utility/pipeline controls pass 67 tests / 424 assertions;
+source construction/transport/preparation pass 55 tests / 495 assertions. The
+generated scale's final origin is still open; do not mistake no-op reconstruction
+cleanup for complete source correspondence or a performance measurement.
+
+Whole-draft CI checkpoint, exact remote head `150fd933` (not main): public source
+job 33722 attempted 172 compilations, passed 142 and reported 30 refusals. Its 15
+refused workloads occur on both CUDA and HIP:
+
+| Shared missing boundary | Public workload set | Next acceptance obligation |
+|---|---|---|
+| Source-owned scalar completion | `softmax`, `softmax-cross-entropy`, `loss-fn`, `gqa-decode-attention-buf!` | Preserve original scalar and reduction/count semantics through the common frontend, not workload-specific waivers. |
+| Checked floating conversion | `batch-norm`, `rms-norm-reassociated!`, `rms-norm-chunked-backward-dx`, three row activation quantizers, `layer-norm-reassociated!`, `rope-prefill-strided!` | Complete generic checked conversion/stage composition or prove totality from independent evidence; do not replace checked conversion with unchecked conversion for a green fixture. |
+| Structural read provenance | `rms-norm-chunked` | Transport the actual read certificate through the common transformation, without minting one from equal syntax. |
+| Allocation extent initialization | `gqa-causal-mha`, `gqa-causal-mha-jvp` | Retain canonical integral extent and source-position/count completion. |
+
+The failed deterministic unit-job logs (33720) report 305 assertion failures and
+273 errors across their failed shard output; these are **not** 578 independent
+defects or a complete suite summary. They include canonical liveness/fusion,
+normalized AD captures, source ordering, artifact persistence, distributed training
+and AMR composition. OpenCL job 33721 also fails. Narrow ownership tests below do
+not supersede these results. This checkpoint must remain draft. Fix shared
+mechanisms, retain negative-admission tests, and requalify real unchanged workloads
+before claiming coverage regained. The independently landed #1558/#1559 each had
+all seven green gates; this debt must not be attributed to those main extractions.
+
+Landing update: PR #1558 squash-merged as `94017072` after all seven required
+contexts succeeded on reviewed head `e3f56e30`. The focused main-based checks were
+57 pipeline/inliner tests / 389 assertions, plus one permanent generated weight
+gradient device/JVM/independent-reference test / 12 assertions on OpenCL and Level
+Zero with changed inputs. These qualify that repair, not the whole training draft.
+The draft has merged this main checkpoint while retaining its additional snapshot
+evaluation-denial checks. Its broad CI and unchanged resident training acceptance
+remain open.
+Fresh post-merge qualification in the single restarted 900 MiB REPL passes 67
+construction/import/inliner tests / 555 assertions and 136 source/bytecode/AD
+ownership tests / 1,579 assertions. The groups overlap and are not additive;
+neither group closes the unimplemented nested-prefix execution relation.
+
+CI feedback extraction: PR #1559, reviewed head `8fd40930`, squash-merged as
+`85192b1a` after all seven CI contexts passed. It changes test
+infrastructure only. It attempts both CUDA/HIP public fixture groups, accumulates
+ordinary refusals and still fails the gate; cancellation/interruption/fatal errors
+abort. A same-REPL control against baseline `aa816699` preserved all 172 exact
+calls (86 per target), Var identities, options, optional captured descriptors and
+ordered artifacts. Eight reporting tests / 45 assertions pass; normal shard
+discovery includes the new namespace. These stubbed controls are not source
+compiler or device-performance evidence. The draft has merged the extraction,
+preserving main's original public Float contraction fixture. This replaces
+first-failure-only feedback without waiving any workload.
+
+Independent whole-draft triage separates three shared consumer obligations:
+producer-owned source evaluation through the existing activation path; checked
+conversion scheduling at its actual semantic position; and in-process execution
+ownership versus persistent-artifact eligibility. Keep `execution-identity`'s
+portable content-identity contract strict. Local observation, if added, needs an
+explicit authenticated process scope and must never populate portable program
+fingerprints or reach AMR/resident-state exporters by comparing absent hashes.
+
+Optimization-retention failures are distinct from coverage refusals. A fresh
+canonical-liveness probe succeeds with a validated typed program but removes zero
+bindings rather than two. Well-formed TypedSOAC alone does not prove successful
+original reads or permit erasing their failure obligations. A future removable-
+evaluation proof must separately close primitive numerical totality, count/index
+completion, original access domain and private/unobserved storage, or retain the
+original ordered checks independently of removed numerical work. The raw typed
+route fixture is not a valid standalone JVM source oracle; qualify this with an
+actual prepared `deftm` and short/null/alias/earlier-effect controls. Do not weaken
+effect flags or change expectations merely to make the failed tests green.
+
+Inspecting the actual placement seam uncovered a real pre-existing miscompile in
+default `anf-lift`: concatenating work lifted from every call/vector operand moves
+a later nested initializer before earlier operand evaluation. A two-element vector
+probe changed both its first value and the effect trace from `[:first :second]` to
+`[:second :first]`. Binding only earlier source values is insufficient: callee
+lookup and typed formal CHECKCAST/coercion can also have required earlier positions.
+
+The independently reviewed repair uses one sequential-wrapper normalizer. Calls
+and vectors remain opaque; whole `let`/`do` wrappers still flatten in source order.
+The unsafe default/safe-option split and redundant internal switches are removed.
+Restoring operand lifting requires an explicit completed-operand/callee contract,
+not purity or literal-looking source. This is a focused main-based extraction in
+PR #1558, head `d4a2a99e`; draft-side implementation is `91fef595`. No draft-only
+snapshot/ownership machinery is included in that PR.
+
+Evidence: exact extracted normalizer functions plus its on-disk tests pass 29
+tests / 189 assertions in the reused REPL (supplemental, not a fresh environment).
+Draft-side 67 construction/import/inliner tests / 555 assertions and 136 ownership
+tests / 1,579 assertions pass; groups overlap. Expanded normalized-AD controls
+report five `:ad-normalized-sum-boundary` errors in 20 tests / 121 assertions with
+BOTH the repair and exact pre-change `f1b3a2e2` functions in the same REPL. These
+remain separate debt, not green qualification. Unchanged `local-loss` still source
+compiles to two equations and two invocation steps. Full CI and device/training
+acceptance are separate obligations.
+
+The actual final training plan is scalar `rows * 1`, zero allocation, contraction,
+Float reduction and a terminal Double quotient. The original MSE count reads its
+prediction's length; its lowered use of the allocation extent is not by itself a
+source-placement or resident-result correspondence proof. Existing
+`project-scalar-metadata`, `owned-long-length-facts`, ShapeProjection and ordered
+ScalarCompute machinery can be reused, but must not fill that missing relation.
+
+Next implement a compositional frame-prefix verifier, consumed by SourceOwner:
+
+1. Start at the exact original root call and its checked selected frame. Instantiate
+   callee environments from indexed slots; retain every input evaluation/completion,
+   including unused inputs, and descend through checked selected ancestry.
+2. Derive the complete ordered host prefix up to the first numerical operation.
+   Verify sequential placement/alpha-renaming rather than matching generated names.
+3. Match that prefix to the final plan's exact source-order entries, ScalarCompute
+   objects and result-materialization conversions. The first useful consumer is
+   the real training `rows * 1` step, not another standalone trace query.
+4. Reuse the original argument outliner/existing scalar executor exactly once.
+   Missing/reordered/duplicated work must refuse before allocation. Do not let a
+   partial prefix witness grant an unproved later helper interval.
+5. Only then connect a completed numerical result to a formal's logical-view
+   length. Require the exact live view/producer, not equal shape or backing capacity;
+   initially plain contiguous rank-one, Java-array-compatible length. Execute the
+   original checked count conversion before seed initialization. Raw signed count
+   and nonnegative launch extent remain separate. No download, dummy array or
+   original numerical CPU evaluation may supply this evidence.
+
+Acceptance retains unchanged `local-loss`/`local-gradient-sum`, original-versus-
+lowered prefix overflow and first-failure/unused-input ordering; changed/zero
+lengths, sliced capacity mismatch, inconsistent/oversized views, replaced/stale
+results, producer failure and exact release/completion are negative controls.
+Native TypedSOAC operations retain their own semantic contracts: importing
+original Clojure semantics is not a blanket JVM-emission prerequisite.
+
+Independent consumer review refined the first executable subset. Extend the
+existing `source-prefix/begin`/`close` authority for original call roots, retaining
+the flat-let case. `original-step` may then identify an authenticated original
+argument slot; `source-owner/prepare-scalar-steps` uses the existing
+`prepare-frontend-invocation-input!` and stores its executor in the existing
+`:steps` table. `evaluate-ordered-invocation-step` remains the sole executor.
+Do not add a frame interpreter, a second tracing authority or a model-specific
+extent evaluator.
+
+For unchanged `local-loss`, source order is: MSE receiver; prediction's linear
+receiver and all five arguments (`x`, `theta`, `rows`, `width`, literal `1`);
+linear body entry; allocator receiver; allocator argument zero's reference
+CHECKCAST; argument one's checked multiplication and Long completion; only then
+the allocator body and allocation. MSE target/denominator arguments occur after
+the linear call returns and cannot be hoisted before it. Neither equal carrier
+classes nor selected ancestry alone closes constructed-slot correspondence.
+
+First support only unchanged public references whose observed CHECKCAST target
+matches the exact array class required by runtime preflight, and primitive Long
+public ports/the actual Long literals. Reference completion does not prove
+non-nullness; null arrays remain outside the existing exact-array preflight
+domain. Computed arrays and Object/Double-to-Long adaptations refuse until their
+own completion and placement are integrated. Reject wrong array classes before
+the product, changed receiver/callee history, intervening effects, and
+missing/reordered/duplicated final prefix entries. Whole-plan preflight must still
+refuse later unclosed MSE count/quotient work before any prefix effects run.
+
+The actual selected allocator argument can already be outlined with original
+physical ports `[batch out-f]`: zero/changed dimensions agree and checked
+`Long/MAX_VALUE * 2` throws. This is execution evidence for the existing owned
+argument region, not completed frame-environment or final-placement authority.
+The permanent regression extends the existing unchanged-training substitution
+case rather than adding a parallel fixture. Its focused case passes 1 test / 73
+assertions; the construction/import/inliner group now passes 67 / 561. Independent
+review confirmed that outlining remains explicit and grants no prefix replay.
+
+The second review found a missing right-endpoint obligation in the initial slice
+plan: the product's executable and final allocation metadata do not prove absence
+of intervening original helper work. The actual chain must also close `alloc-like`
+delegation to `zeros-like`, its receiver and all formal completions, the exact
+original array constructor/count, zero initialization and helper return
+completions. `direct-allocation-projection` can certify a selected helper whose
+entire original body is a direct constructor; it cannot retrospectively certify
+its enclosing delegation interval. `allocation-corresponds?` checks logical
+constructor/shape/initialization, while SourceOwner's extent-availability check
+does not establish the missing source interval.
+
+Likewise the pre-kernel prefix includes the post-allocation `oftype` arguments,
+which still lack their independent source-constant/substitution completion. Do
+not admit the product merely because today's `local-loss` later refuses a missing
+MSE executor: that incidental failure is not a safety authority. The default next
+vertical must finish the complete prefix before granting public execution. A
+smaller internal interval is useful only if an independently derived unresolved
+enclosing-frame obligation still prevents whole-plan admission. Add controls
+with effects/throws between product and constructor, after construction before
+helper return, and in a later GEMM argument; each unrepresented operation must
+prevent admission. This is a strengthened completion requirement, not a new
+function registry or permission to evaluate the numerical body on the CPU.
+
+### October 21 selected ancestry for imported helper calls
+
+Construction direction after independent review: preserve original completed
+call slots at the shared inline builder instead of repeatedly recovering erased
+input conversions downstream. An authenticated resolved-call plan must retain
+receiver/Method, original operand contexts and policy; every argument, including
+unused arguments, completes before body entry. Return carrier, boxed payload and
+actual return adaptation remain distinct. Unsupported return/completion recipes
+must retain/refuse the call. Existing SourcePrefix/SourceOwner consumers remain
+the placement/execution authorities; this does not solve resident child results
+or helper endpoints by itself.
+
+The first implemented prerequisite is explicit Int/Long bytecode input
+completion. It reuses `emit-argument-value`/`emit-coerce`, not Clojure source casts,
+logical dtype inference or a new evaluator. Existing FP completion shares that
+emitter; source projection refuses unsupported bytecode contexts. Structural AD
+explicitly refuses integral completion (including inactive operands) rather than
+falling through an unhandled dispatch. Five related namespaces pass 67 tests /
+664 assertions in the reused campaign REPL. A focused main-based extraction is
+PR #1560, head `d52d2906`: fresh main-based qualification passes 67 tests /
+658 assertions across six existing completion/bytecode/AD namespaces. The
+semantic discriminator is permanent: original bytecode D2I saturates a primitive
+Double overflow, whereas a checked Clojure source cast throws. The exact original
+path must be retained. All seven CI gates remain required; no inline expansion or
+GPU admission is widened yet.
+
+Imported call origins now feed the existing selected-call contract, rather than
+remaining disconnected tracing data. The shared Method/receiver/implementation
+checks serve both root and imported calls. An imported frame must derive its exact
+caller through one unique recorded parent's independently checked substitution,
+then retain that parent's selected ancestry. Identity-cycle detection and a total
+search budget derived from the finite recorded builder list bound the search.
+Root selection failure cannot fall back to an imported interpretation; stale
+ancestors propagate failure, and refused attempts publish no observations.
+
+The unchanged training `local-loss` now connects its actual `alloc-like` call to
+the selected `linear-nb` parent. The two imported `oftype` calls still refuse a
+frame because their bare cast constants lack an independent source-substitution
+proof. Original input conversions are retained; constructed-argument equivalence,
+resident result/count metadata, return completion and final execution placement
+remain explicitly unclosed. The transport-level imported selection candidate's
+`:parent-linkage :unclosed` is candidate-local, not a permission to execute.
+
+Targeted same-REPL evidence: 65 construction/import/inliner tests, 543 assertions;
+136 source/bytecode/AD ownership tests, 1,579 assertions; zero failures/errors.
+These groups overlap and are not additive. Controls cover competing parents,
+cycles, wrong root/ancestor selection, stale ancestor propagation, a wrong imported
+call, and transactional refusal. Source-fixture CI on preceding head `65e3250a`
+still fails, including softmax's uncertified `inv-sum`; these local checks do not
+qualify the broad draft for merge or establish resident training execution.
+
+### October 22 native empty-fold demand closure
+
+An exact integer-zero, unsegmented scalar SegRed now selects an explicit
+`:scalar-empty-fold` schedule: one workitem stores the actual component seed and
+executes any retained terminal transform. No fold element, shared tree, barrier,
+fold-only pointer or fold-only scalar is required. The seed is materialized with an
+exact same-dtype cast, not arithmetic or a reconstructed monoid zero; FP32/FP64
+positive and negative zero retain their raw bits. Ordinary positive/dynamic counts
+and product/segmented schedules keep their existing routes.
+
+The original operator and semantic `:inputs` remain retained. A shared narrow
+`segop/empty-scalar-reduction?` projection determines effective physical inputs;
+graph storage, read minima and emitter capacity checks use those physical inputs.
+Terminal singleton reads and scalar captures survive, including mixed operand and
+output storage. Checked narrowing still refuses without its original completion
+contract. SegRed/node and reconstructed schedule comparison use the existing
+semantic fingerprint equivalence so Clojure's signed-zero equality cannot admit
+forged seed bits or metadata.
+
+Qualification: 48 focused/adjacent tests, 593 assertions, zero failures/errors,
+including actual OpenCL and Level Zero seed stores without any element buffer.
+OpenCL/CUDA/HIP source emission and exact emitted-equation reconstruction pass;
+CUDA/HIP device execution is not claimed. Four broader affected namespaces have
+129 preexisting tests / 951 passing assertions / seven errors. Restoring their
+exact committed function definitions and rerunning in the same REPL reproduced
+the same counts, names and messages: checked-conversion, scalar-prefix and typed
+projection debt, not a green broad gate. PR1539 remains draft/unqualified.
+
+At that checkpoint this closed native physical demand, **not original source execution**. Source
+count conversion/initializer evaluation, nullable entry conversions, read-failure
+order and acquisition/publication guards remain obligations of the ordered
+invocation owner. Deferred materialization is still unwired. The next connected
+step must authorize exact deferred IDs and original argument-reference identities,
+prove the producer construction, and reconcile truly unread parameters at source
+completion without inventing empty buffers or weakening generic finish validation.
+
+### October 22 source-owned empty-fold execution
+
+The connected public compiler now prepares the original cold reduction entry through
+the existing owned-bytecode service, without calling the numerical function. Queries
+remain non-emitting; preparation is restricted to the actual direct reduction/terminal
+scope and changed observations trigger the existing whole-compilation retry. The
+selected floating terminal leaf is prepared before the caller, including when the
+caller is already warm but its callee remains pending. Signature observation selects
+preparation only; it does not grant numerical admission or primitive return storage.
+
+The existing `OrderedSourceOwner` authorizes unread arguments only after joining the
+original checked zero count, index/accumulator initialization and exact seed bits to
+the independently reconstructed native empty-fold body, ABI and output. It retains
+original primitive-array entry classes and performs their nullable casts before any
+storage acquisition. No new owner type, model-specific rule or dummy buffer is added.
+
+Ordered realization preserves authorized raw references and original argument ordinals
+without materializing them. Completion rechecks the exact emitted program, invocation
+plan identity, source order, pending IDs, ordinals and raw-reference identity, plus
+absence of realized input storage. The shared completed-storage projection uses only
+available bindings. Generic `finish-materialization` still refuses pending parameters;
+native completion, initialized output ranges, live roots and publication remain runtime
+obligations. Missing ownership defaults to eager validation, not permission to defer.
+
+Focused evidence after explicit preparation-order coverage: 104 tests / 1,728 assertions pass,
+including actual OpenCL and Level Zero null/empty/populated input cases, FP32/FP64
+positive/negative-zero seeds, changed-data replay and terminal-failure cleanup. The
+first fresh-JVM run exposed 19 order-dependent assertions that had borrowed a warm
+FP32 terminal callee. The explicit producer service and observation fixtures now prepare
+both actual entries without numerical warmup. A second fresh JVM confirms the FP32
+terminal is pending before the public cold test, which passes for FP32 and FP64
+(one test / ten assertions); the complete affected gate also passes in that fresh JVM
+(104 tests / 1,728 assertions, zero failures/errors). A broader
+ordered-realization group has three failures in two tests; restoring the exact committed
+functions in the same REPL reproduced all three. Those baseline failures and the broad
+CI failures remain outstanding; this is not merge qualification for draft PR1539.
+
+The producer law is deliberately zero-only. A singleton must evaluate its actual read
+and combine with the source seed, not substitute the element or a reconstructed neutral
+value. The next connected step is a strict seeded fold schedule using existing KernelBody
+operations, then original read/combine/backedge correspondence and source-ordered entry
+guards. Only an independently justified algebraic permission may select a reassociated
+tree. Positive/dynamic counts, null/short reads and earlier exceptions cannot borrow the
+empty-domain proof.
+
+The next read edge now reuses the existing emitter-local `InputOrigins` relation
+and guarded array-read observation, exposed through the same authenticated frontend
+observation service as calls and bindings. It retains actual primitive-array and index
+carriers, not inferred tags or equivalent source spelling. Equal copied forms abstain
+transactionally and queries cannot compile code. This closes an observation edge only:
+it proves neither a successful read nor bounds, and grants no nonempty fold execution.
+The affected source/ownership/device group passes 105 tests / 1,758 assertions; its
+new original-read check is one test / 30 assertions. Original catalog occurrence and
+actual emitter-expanded instruction are separate retained identity edges, not equal
+source substituted for either. Nonempty scheduling, original
+combine/backedge correspondence and source-ordered failure guards remain outstanding.
+
+Independent next-step review confirms a distinct ordered seeded-fold schedule is
+needed for the stronger source-exact law; adding an "exact" flag to the existing
+workgroup tree would be unsound. Reuse the canonical scalar `fold` term and its shared
+KernelBody lowerer, which already initializes the actual carry and emits an ordered
+`ForLoop`. Factor the reduce lambda/array-read projection and ABI construction rather
+than adding another interpreter. The strict route must bypass monoid-only `scalar-plan`
+and combine-spelling gates, retain terminal-only one-workitem/no-scratch execution, and
+independently reconstruct its body, seed, bound, storage and numerical contract.
+
+Before public nonempty activation, join the original read and combine occurrences to
+the actual carry/index backedge, argument order and completion conversions, and preserve
+null/short-array failure order before acquisition. Authenticate all combine/terminal
+receiver selections before a leaves-before-caller preparation batch. The review accepted
+the existing terminal-before-caller preparation and the new original-read observation
+wrappers. Certified parallel `par/reduce` schedules remain a separate, explicitly permitted
+realization; a source-exact schedule must not redefine their algebra or hide a performance
+regression behind stronger numerical claims.
+
+Exact-head CI at `bef35eaf`: setup/build passed; source-fixture job 33884 failed
+on the existing `raster.nn/softmax` `inv-sum` refusal (`:uncertified-host-scalar`,
+`:unclosed-source-arithmetic`, no normal-completion evidence). This confirms the
+connected empty-fold work does not yet repair the real nonempty softmax boundary.
+Unit/OpenCL jobs 33883/33882 were still pending at inspection; draft remains held.
+
+### October 22 ordered seeded-fold scheduling substrate
+
+A distinct `:scalar-ordered-seeded-fold` schedule now lowers a scalar SegRed through
+the existing canonical typed `fold` and shared scalar-expression KernelBody lowerer.
+One workitem initializes the actual seed, executes an ordered carried `ForLoop`, applies
+any retained result transform and stores once. There is no tree, neutral padding,
+partial-result buffer, barrier or scratch allocation. A singleton still computes the
+recurrence over the seed and element; it cannot replace the result with the element.
+No monoid certification/combine-spelling gate is borrowed. Strict metadata says `:seed`
+and `:source-ordered-seeded-fold`, not algebraic identity or reassociation permission.
+
+Empty and ordered leaf schedules share parameter/storage construction and terminal
+transform lowering. Flat `ReductionRegion` bindings are translated into canonical typed
+locals using retained binder dtypes; missing facts refuse rather than being inferred.
+The shared fold lowerer preserves the constructor-owned long index dtype on generated
+lexical references, so typed index callbacks see the actual SSA binding type. Original
+JVM int-index correspondence remains a separate, outstanding source obligation.
+
+Read footprints reuse `map-read-requirements/fold-read-requirements`, including lexical
+locals and resident singleton captures. Every physical input needs a proved requirement,
+even when a large backing shape is supplied. ABI minima, logical requirements and actual
+backing shapes are distinct: complete fold extents may project to private `_n_bound`,
+while graph capacity checks use logical requirements and independently checked graph
+guards. Larger backing storage is accepted, insufficient/unguarded capacity and altered
+minima are rejected. Shifted, strided and indirect addresses without a dense-span proof
+refuse; arbitrary addresses are not justified by an `n`-element pointer contract.
+
+Independent review found and closed the flat-binding/typed-local mismatch; self-review
+found the generic lowerer's address expressiveness exceeded the original pointwise ABI
+minimum. Reusing the existing footprint analysis closed that memory-contract gap without
+a new address grammar or owner type. Review then accepted the complete logical/ABI/
+capacity split and graph reconstruction controls.
+
+Qualification: 190 affected tests / 2,933 assertions pass, including strict source-region,
+existing empty/tree schedules, source-owner/materialization controls and actual OpenCL
+and Level Zero execution. Tiny native cases cover non-neutral multiplication, zero-trip
+seed preservation, negative zero and cancellation-sensitive ordered accumulation. The
+same generated symbolic-bound fixture compiled locally with Clang OpenCL, nvcc 12.4
+(`sm_80` PTX) and hipcc 5.7 (`gfx1100` code object), all exit zero, without CUDA/AMD
+hardware. The existing CI generator now includes that explicitly native-schedule fixture;
+it is not counted as public deftm qualification or a performance result.
+
+This is a scheduling substrate, not public nonempty source activation. The compiler's
+existing default parallel reduction routes are unchanged. Before selection by the public
+source-owner path, the actual read, seed, combine argument order/conversions and backedge
+must be joined, and null/short-array exception ordering preserved before acquisition.
+The next source gate begins with the literal singleton and then expands checked counts;
+it must not waive those obligations based on this native test receipt. The full draft's
+softmax/source-completion CI failure and unchanged resident training acceptance remain
+open; no merge or whole-campaign completion is established.
+
+### October 22 executable unchanged training loss
+
+The unchanged `distributed-training/local-loss` now executes through the public
+explicit host-result API on OpenCL and Level Zero. Two nonzero batch shapes match
+both the ordinary JVM function and an independent dense scalar oracle. Replaying
+each executable after changing weights and observations returns the changed loss.
+The test observes actual device graph execution; it is not a CPU fallback receipt.
+This qualifies the forward loss only, not a resident gradient/update, GSDM, Gemma,
+SFT, or broad model performance.
+
+The repair connects the original root call's exact argument-0 occurrence to its
+selected nested call and first allocator initializer. Existing checked construction
+frames relate the allocator's sole lifted argument to final scalar position 0 and
+its immediately adjacent allocation at position 1. Result materialization, shape
+and initialization are independently validated against the invocation plan. No
+model names, generated-name searches, second interpreter, or proof registry are
+used in production. Only exact candidate occurrences receive ancestry traversal.
+
+The existing ordered owner prepares original argument regions positionally: all
+parent arguments, including unused ones, complete left-to-right before allocator
+arguments. Actual method carriers are checked across both compositions. Global
+typed calls link after arguments; no synthetic receiver read is inserted and the
+outer loss dispatch boundary is not crossed early. Frozen history is checked at
+the nested boundaries. A fresh query owner reacquires dispatch/return evidence;
+execution never rereads a mutable compilation collector.
+
+Adversarial checks cover changed/reordered prefixes, duplicate occurrences, wrong
+root input edges, slot order/ancestry, altered return bridges, stale selections,
+wrong public carriers, and collector mutation after preparation. Null/wrong arrays
+and scalar carriers refuse before session acquisition for this admitted family.
+Short input buffers refuse before a numerical device launch and poison replay.
+Negative and `2^31` counts preserve `NegativeArraySizeException`; a source `2^32`
+count wrapping to zero refuses the incompatible native extent without acquiring
+GPU storage. General JVM exception equivalence for arbitrary array code remains
+outside this bounded qualification.
+
+Independent review accepted the bounded integration after immutable-history and
+fresh-owner fixes. The affected regression group passes 110 tests / 1,195 assertions;
+the device test passes 22 assertions across OpenCL and Level Zero. These receipts
+are not a full suite or performance benchmark. PR #1539 remains draft while broad
+source/OpenCL gates fail.
+
+The next unchanged `local-gradient-sum` probe first exposed cold definition-input
+invalidation. A later diagnostic reaches a stable coverage refusal: two uncertified
+host scalars, the forward loss quotient (`clojure.core//`) and MSE gradient scale
+(`raster.numeric//`). Retain the cold lifecycle failure as a separate qualification
+obligation; do not call warmed compilation a fix. Continue through these actual
+scalar completion boundaries with retained physical evidence, not exemptions by
+operation name. Gradient/update/replay and all eight completion gates remain open.
+
+### October 22 original binding executor consolidation
+
+Sequential source-owned binding initializers now use the same physical-port
+bytecode outliner and transactional frozen-history wrapper as original invocation
+arguments. The existing selected Long dimension consumer executes that exact
+initializer instead of compiling a reconstructed captured-Method call. Its
+prefix, physical-input and boxed-return correspondence checks remain unchanged.
+The now-unreachable `project-original-invocation` and its synthetic foreign-proxy
+test are removed; terminal reduction invocation projection remains separate and
+requires explicit carriers and payload class, without the retired Long defaults.
+
+Original initializer context, result carrier and reference CHECKCAST are retained.
+Free-port/callee traversal happens only for a requested region, not every binding.
+Binding records share compact immutable sibling-name sets, not transitive method
+specifications or mutable emitter state. Independent review checked dispatch
+ordering, physical ABI, frozen source/module history and the production consumer.
+
+Six affected namespaces pass 78 tests / 675 assertions in the reused capped REPL.
+The unchanged forward-loss device/JVM/independent-reference and changed-input
+replay check also passes again: one test / 22 assertions on OpenCL and Level Zero.
+The new binding controls cover exact effects, null/bounds exceptions, signed zero,
+exceptional FP values, reference identity/CHECKCAST, copied scopes and stale source.
+This consolidation is preparation for late gradient scalar execution; it does not
+admit the still-refused floating reduction epilogues or close training acceptance.
+
+### October 22 unchanged-training boundary preparation
+
+The unchanged public `local-loss` source compiles to portable numerical intent,
+but host-result execution still refuses before acquiring device storage:
+`:unclosed-ordered-source-executor`, first ScalarCompute, the imported allocation
+extent `rows * 1`. Ordinary resident `lower` separately and correctly requires
+the explicit host-result API for this scalar-returning function.
+
+The original body is a direct call, not a flat let prefix. `begin` now retains
+that exact root without claiming any inserted prefix correspondence. The public
+producer explicitly prepares its original caller before normalization when the
+first argument is itself a direct selected call. This uses the existing observed
+definition batch and whole-attempt retry; it executes no model code. Direct scalar
+roots and nested calls in later arguments cause no new preparation. The training
+construction regression no longer supplies a test-only caller warmup. Public
+compilation now supplies the original linear, allocator and MSE call frames.
+
+Affected namespace qualification passes 33 tests / 392 assertions in the capped
+REPL. An earlier run also exposed a cold numerical helper promotion invalidating
+the historical owner in `completed-training-helper-retains-the-whole-cpu-loss`
+(`oftype_m_floats_float-impl`); the subsequent warm run passes. This is not a
+fresh-process qualification or a reason to weaken lifecycle guards.
+
+A REPL experiment composes the actual five original linear argument regions,
+then both original allocator argument regions. It preserves the original array
+identity, actual primitive Long completion and checked multiplication overflow.
+This is not resident admission: original-to-final placement, selected-call
+completion and the allocated result's resident logical view remain unclosed.
+
+Review caught an important distinction: the actual global typed call emits
+arguments followed by `invokedynamic`, not a receiver read followed by arguments.
+The recorded `:receiver-input` is observational, not evidence that a receiver load
+executed. Do not add a synthetic receiver evaluation. Continue the bounded prefix
+closure through actual invocation-mode/linkage evidence and the existing prepared
+argument executors; do not introduce a second scalar interpreter or registry.
+
+All eight campaign completion obligations remain open. The broad draft stays held;
+the exact `63fd5efd` setup/build checks pass while source fixtures and OpenCL fail,
+and the test gate was still pending at the latest inspection.
+
+### October 22 completed source-step correspondence checkpoint
+
+`project-typed-reduce` now exposes the existing semantic reduction description
+without schedule selection; production lowering delegates to that same projection.
+It establishes its lexical shadowing context from the validated program, including
+when called outside production lowering. No parallel compatibility representation
+or second reduction parser was added.
+
+Original selected FP steps are compared through their actual checked return-payload
+SSA. Composition replays only sequential scalar-compute operations through the
+shared typed builder, with positional formals, fresh result identities and exact
+operation/type/options. Tests cover actual-argument/old-SSA name collisions, zero-op
+formal/literal results, independent numerical bit checks, and malformed/free/forward/
+duplicate/foreign-memory recipes. Both sides use independently fresh builders and
+the same reserved region. Exact semantic fingerprints remain strict.
+
+The original invocation/read/recur completion chain is independently authenticated.
+Its Int read coordinate is compared under an explicit, still-conditional exact
+widening relation, not by erasing index metadata. Only the carry formal is normalized
+using its independently proved JVM slot/Product component dtype. The existing opaque
+prefix correspondence joins literal-one count, original seed bits, signed control,
+initial index and complete backedge to discharge that singleton coordinate relation.
+Successful read evaluation remains explicitly unproved; this does not activate a new
+public execution route, change default schedules or qualify resident training.
+
+A provenance defect was found and fixed: `:producer-source :original` had held the
+represented-phase rebuilt occurrence. It now retains the exact original frontend
+occurrence, with `:represented` and `:constructed` separate. Reusing an equal copy is
+not authority. Current `par/reduce` still correctly rejects nonidentity seeds; native
+strict seeded-fold support and the existing ordered `segmented-fold-map!` semantics
+must not be used to waive a monoid identity gate.
+
+Reviewed focused qualification passes 161 tests / 2,510 assertions in eight affected
+namespaces, plus two existing typed lowering/mixed-storage integration tests / 18
+assertions. These are bounded receipts, not broad draft acceptance. The latest
+exact-head fixture failure at `060f0bd0` (33912) still reports the known softmax
+`inv-sum` source-arithmetic completion gap; PR #1539 remains draft. Immediate work
+returns to unchanged `local-loss`/`local-gradient-sum` executable acceptance, using its
+first actual failing boundary rather than extending proof APIs without a consumer.
+
+### October 22 original reduction carry completion checkpoint
+
+The JVM reduction observer now retains each actual floating recur consumer's existing
+`ValueCompletion` input contract after the operand and any required conversion are
+emitted. Its original operand identity, physical input carrier, actual target slot and
+operand context remain separate facts. In particular a selected arithmetic update still
+physically returns `Object`; its primitive payload does not retroactively change that
+call's carrier. This is physical observation, not a successful conversion, purity,
+read/bounds proof or source-to-device numerical admission. Consumers must join the
+whole authenticated observation with the selected return bridge and arithmetic proof.
+No conversion registry or ad hoc type inference was added.
+
+Explicit producer preparation selects the direct floating update and terminal leaves
+before any callback, then prepares update → terminal → caller through the existing
+definition-input service. A failed second selection cannot partially prepare the first.
+Queries remain nonemitting and original code is not numerically invoked to warm it.
+The update is also prepared for zero-count intervals: this is a compile-time dependency
+on that selected definition, not evidence that the dead recurrence executes.
+Source-owned singleton activation, index/control correspondence and the resident
+logical-view boundary remain open; this checkpoint must not be counted as training
+qualification or resolution of the held softmax source-ownership gate.
+
+Focused REPL qualification: 140 tests / 2,253 assertions pass across source/recur
+observations, bytecode input completion, prefix/terminal/checked ownership,
+materialization and ordered scalar folds, including tiny native OpenCL/Level Zero
+folds. Review found no checkpoint blocker. This is not full-suite or model validation;
+PR #1539 remains draft while its broader seven-gate obligations are unsatisfied.
+
+Follow-up control observation records the signed Int `<` test at the actual
+`IF_ICMPGE` emission, only for the owned reduction exit and actual Int/Int operands.
+Predicate/operand identities, original local slots and operand context are retained in
+that existing exit record. Negative/zero/singleton cases and tampered-record refusal are
+covered; no launch-domain or source-success claim follows. Future correspondence must
+join initial zero, exact backedge and source count, and prove nonnegative native domain
+`max(0,n)` plus index widening/no-overflow rather than treating signed `n` as an extent.
+Reviewed follow-up qualification: the same seven affected namespaces pass 141 tests /
+2,283 assertions, including native ordered folds; this supersedes, not adds to, the
+overlapping 140-test receipt. Public nonempty source activation is still unqualified.
+
+### October 21 DeepSeek inference reference integration
+
+The recovered full source review is retained locally in
+`.internal/deepseek-inference-requirements-20261021.md` (ignored, not a portable
+repository artifact). It records source-line evidence and the exact dirty-consumer
+boundary; the pinned requirements and acceptance gates below remain the tracked
+campaign record. Recovery rechecked pins without builds, model downloads or
+changes to pretrained-rstr.
+
+Read-only research verified the official [DeepInfer](https://github.com/deepseek-ai/DeepInfer)
+release and its exact dependency pins. Shallow sibling checkouts, without models,
+builds or submodule initialization, are available for reproducible source study:
+
+| Sibling directory | Inspected commit |
+|---|---|
+| `DeepInfer-raster-review` | `9bd9cf243fc53ef9afbf8f04d391d989117d6ab9` |
+| `DeepGEMM-raster-review` | `1fc9c66975ee322d628b3288534ca0e9ce12a64d` |
+| `FlashMLA-raster-review` | `2e5429fc5653bab6e081f09477126f731882a6a9` |
+| `DeepEP-raster-review` | `f6aa38fe06cd4a0489e7730365d4e0114970a2f3` |
+
+These observations are requirements evidence, not benchmark or execution results.
+The pretrained comparison used checkout `f4c2bb476884c36b5e12a8fa934eb2ddf4ca2ead`
+with existing decoder/local-server edits; neither it nor Raster's shared root was
+modified. It is not a qualification of current released pretrained behavior.
+
+| Requirement / evidence | Existing campaign integration and bounded acceptance |
+|---|---|
+| Encoded values **and auxiliary scales** have physical layouts, group axes and conversion semantics. DeepInfer `layers/tilelang_ops/cache_common.py::KVCacheFormat` and DeepGEMM `csrc/jit_kernels/heuristics/config.hpp::GemmDesc` keep these concerns explicit. | Items 2/3/4/8: generic byte-storage codecs and views, explicit decode/compute/accumulation and rounding contracts. First compare tiny encoded matvecs with decode→Float contraction, including tails and scale edge cases. Do not implement FP4 as merely a new fractional-byte scalar dtype or add model-specific emitters. |
+| Same-shaped inputs can invalidate inspected-content-dependent schedules. Pinned [FlashMLA's interface](https://github.com/deepseek-ai/FlashMLA/blob/2e5429fc5653bab6e081f09477126f731882a6a9/flash_mla/flash_mla_interface.py#L90) warns that changing valid-length values while reusing scheduler metadata silently retains stale split-KV scheduling. | Items 1/3/4/7/8, immediate correctness priority: distinguish replay inputs from specialized assumptions; retain content/version dependencies and completion-fenced metadata generations through existing owners/events. Test changed lengths with unchanged shapes, stale slots and failure/cancellation across two inflight iterations. Do not add a second attention-specific artifact cache. |
+| Sparse selection, ragged histories and expert routing compose several numerical operations. DeepInfer `attention_backend.py`, `models/v4_modules/mlp.py` and pinned grouped-GEMM paths provide concrete cases. | Items 2/3/4/5: qualify existing segmented gather/selection/weighted-reduction and histogram/scan/permute/grouped-contraction/combine composition. Start with empty and skewed groups, duplicate policies and masked invalid values against sequential oracles. Compression rollback remains a model-state contract, not automatic compiler algebra. |
+| Bulk matrix pipelines require phase/transaction and result-readiness contracts, beyond an async-copy spelling. DeepGEMM's SM100 implementation uses payload/scale streams, transaction barriers, rings and special storage. | Items 1/3/4/6/7: qualify existing `PipelinedFor`, async-copy/commit/wait, participation barriers, collectives and `MatrixMad` first; report native versus synchronous physical lowering. Later add only workload-backed bulk-copy, async-matrix, special-storage and cluster capabilities. An async-shaped IR or compiling instruction does not prove overlap or speed. |
+| Communication consumes compute and memory resources as well as link bandwidth. DeepEP routing handles/events and DeepInfer dispatch/combine SM budgets are concrete evidence. | Items 6/7: segmented exchange/all-to-all-v intent with counts, permutations, replication and combine arithmetic; shared compute/HBM/fabric capacity and completion ownership. Add hardware-free skew/contention/cleanup counterexamples now; real NVLink/RDMA and measured overlap belong to multi-device qualification. |
+| Regime-specific specialization includes scale layout, group skew, valid lengths and replay buckets, not merely dense matrix sizes. | Items 1/3/4/5: reuse existing finite schedules, numerical permissions and versioned measurement receipts. Bound search/compile/code-size/memory costs and measure cold preparation, host submission, GPU events and warm replay separately. No independent DeepSeek autotuner or keyword dispatch. |
+
+The release is useful inference implementation evidence, not a complete production
+cache/load-balancing/disaggregation stack. These requirements strengthen the same
+eight obligations; they do not add a ninth campaign or close source correspondence,
+real-weight training, durable publication or actual multi-host acceptance. The
+immediate continuation remains the local source/semantic ownership repair, then
+content-aware prepared replay and encoded/ragged composition qualification. No
+SM100, Ascend, model download or cloud dependency enters the hot development loop.
+
+October 22 refresh independently rechecked official remotes and reused the same sibling
+checkouts; the full delta report is locally retained as
+`.internal/deepseek-inference-refresh-20261022.md`. DeepInfer remains at the pin above.
+New companion objects were fetched without replacing the pinned source. In particular,
+[DeepGEMM 5081f851](https://github.com/deepseek-ai/DeepGEMM/commit/5081f8513af57e61696de4f4f04b0e707ffb503e)
+fixes split-barrier state surviving CUDA graph replay: a stable graph/grid identity was
+not a fresh execution generation. This is an upstream counterexample, **not an
+established Raster defect**. Items 1/3/4/6/7 must distinguish artifact identity, host
+value epochs and device-visible scratch/barrier generations. Before admitting persistent
+cross-workgroup scratch protocols, qualify at least three changed-input replays on the
+same graph/allocation, a modeled delayed producer that cannot consume prior-generation
+completion, distinct inflight slots or a proved retirement protocol, and failure/cancel
+reuse including finite-tag wrap/reinitialization rules. Include this source example in
+the CUDA-owner handoff; successful compilation alone cannot discharge it.
+
+The consumer review also confirms pretrained currently refuses descriptor mutation or
+a second submission while a paged-attention runner is pending and retains page leases.
+Keep that single-flight safety boundary until separately owned inflight metadata slots
+are qualified. Batch invariance is an explicit numerical capability, not deterministic
+sampling; bounded SWA replay is model-specific approximate reconstruction, not a generic
+equivalence-preserving compiler rewrite. These refinements do not change campaign order.
+
+Follow-up consumer review identified a small representation-identity regression target:
+`pretrained/openai/local.clj` independently defaults `:weights` and `:execution-variant`.
+The fingerprint receives the latter while quantization separately consumes the former;
+selecting Q8 weights without changing the default Q4 variant can retain a Q4 identity.
+Items 3/8 should require identity derived from, or validated against, the selected recipe,
+with a tiny changed-recipe collision test. This is a dirty-checkout source observation,
+not released-artifact qualification. No pretrained implementation was modified here.
+
+### October 21 integral call-completion prerequisite and next construction gate
+
+October 22 continuation: the opt-in completed `linear-nb` call is now tested as
+part of the **whole CPU training loss**, comparing original and completed JVM
+Methods bit-for-bit and against an independent squared-loss oracle for changed
+weights and row counts 1/3. Numerical calls run outside retryable compiler proof
+transactions; captured definition history is checked before and after execution.
+This is not resident training qualification or default producer enablement.
+
+CI also exposed a shared frontend/AD envelope drift: analyzed-source equations
+now carry both `:source-prefix?` and `:before-parallel?`, while normalized AD
+expected only the former. The common envelope checker now checks both exact
+booleans against its admitted no-host-activity equation sequence. It still refuses
+unknown attributes, host activity, allocation/evaluation obligations and invalid
+provenance. Real frontend Float/Double map-to-sum objectives, their JVP/VJP and
+finite-difference oracles, and tampered phase/provenance controls cover this
+boundary. An independent read-only review found no blocker. The adjacent resident
+scalar allowlist accepts only optional boolean phase facts; it does not use them
+as movement authority or weaken totality to admit unfinished source arithmetic.
+Targeted AD/whole-loss qualification passes 50 tests / 806 assertions. The new
+resident phase-fact test passes 22 assertions; the other 33 resident tests retain
+exactly the same failure signatures before/after the allowlist repair (27 failures,
+18 errors), including source-decline and unresolved arithmetic obligations. These
+are explicitly recorded baseline defects, not a green resident vertical.
+
+Draft #1539 remains unqualified: at head `e8cd519d`, setup/build passed but test,
+public fixture emission and OpenCL CPU gates failed. The 16 deterministic test
+shards reported 7,535 tests / 88,656 assertions / 317 failures / 274 errors;
+these are check totals, not independent defect counts. Public softmax and the
+training gradient still show source-arithmetic/evaluation correspondence gaps.
+No broad green or merge readiness is claimed by these targeted repairs.
+
+Next reviewed construction obligation: numerical producer → original binding →
+scalar consumer. `coverage-decline`'s normal-completion summaries are diagnostic
+only: its empty lexical environment can miss a preceding reduction result, and
+an Object/present/Double summary cannot establish execution correspondence.
+`source-prefix` currently stops before the first parallel form; its success
+must not be reused as a post-reduction placement certificate.
+
+Extend the existing SourceConstruction/correspondence/SourceOwner path with a
+bounded direct reduction-to-scalar interval. At the actual producer, retain the
+original scope and binding ordinals, exact equation/step identities and observed
+normalization/construction edges. Join existing reduction emission, binding and
+completed positional invocation observations with recurrence/checkpoint and FP
+consumer proofs. Keep actual stored carrier distinct from boxed payload. This
+relation needs a pre-admission producer seam; neither diagnostics nor a late
+prefix check can retroactively grant it. No new global facts, runtime or cache.
+
+First executable witness: an unchanged flat direct interval with checked literal
+count, literal initializer and independently certified reads, initially empty and
+singleton domains. This is a construction gate toward unchanged softmax/training,
+not replacement acceptance. Helper-expanded intervals and general dynamic counts
+stay held until their original-position/count/read contracts are connected.
+SourceOwner consumes the authenticated interval; resident reconstruction still
+checks the final use-closed placement. Required negative controls cover wrong or
+copied occurrences, stale history, changed carrier/coercions, intervening effects,
+extra uses, unchecked count substitution, insufficient/null storage, changed
+recurrence/association and missing read-domain evidence. The arithmetic flags
+remain until this complete join—not result typing alone—justifies their discharge.
+
+The next physical prerequisite is now observed across method extraction: the
+producer retains original reduction → exact helper body → resolved static
+Method/return boundary → actual static argument conversions → exact bound local.
+It reuses existing body/invocation catalogs and historical module guards;
+generated calls receive no frontend origins and use a distinct `:module-static`
+mode. Reduction root and helper body result carriers/contexts must agree. The
+body-carrier/Method-return pair describes an actual conversion, not its identity,
+nonthrowingness or numerical equivalence. Missing, ambiguous, edited, foreign or
+malformed links abstain. No scheduling/admission rule or numerical code changed.
+
+Independent review caught and verified fixes to root/result joining, malformed
+record guards and oversized indices. Affected qualification passes 96 tests /
+1,393 assertions across seven ownership/input/return/source-construction
+namespaces; the new forced-split/unsplit Float/Double boundary and negative controls
+account for 3 tests / 67 assertions within that total. Full interval/count/read
+correspondence and use-closed consumer placement still remain to be connected.
+
+The source-local observation now joins that producer to an immediately following
+selected FP consumer in an unchanged two-binding scope, reusing the existing
+private input representation under a distinct entry/query family. Unsplit Object
+storage and extracted primitive storage remain different; consumer argument
+coercions, receiver, actual return/storage and selected payload computation are
+retained separately. Primitive caller shortcuts abstain rather than inheriting
+an Object-interface proof. Whole-query history adoption is transactional; a
+refusal retains none of its individually successful subqueries. The old prefix
+family cannot consume the new capture. Independent review found no blocker for
+this conditional scope. Affected qualification: 98 tests / 1,485 assertions,
+zero failures/errors; new interval controls account for 2 tests / 92 assertions.
+This still supplies no count/read, equation placement or execution certificate.
+
+Next connected execution obligation has existing capacity authorities:
+`segred_body`'s input `:minimum-elements`, reconstructed fold-read requirements,
+`kernel_call/validate-retained-input-capacities!`, linked-view range validation
+and the ordered source cursor in `gpu/link`. These must be reused, not replaced
+by another bounds system. They are not yet source read completion: unknown native
+capacity remains a caller obligation and capacity failures are not original
+null/bounds failures. A general reduction-count outliner may capture arrays or
+effects; it cannot be represented by `ScalarCompute`, which requires pure
+rank-zero operands. The first closed literal count 0/1 family authenticates the
+original cast lookups and evaluates through the shared source constant evaluator,
+without inserting a synthetic source binding. General counts still require an
+authenticated original-position execution relation. Keep signed source count
+separate from nonnegative launch extent.
+At the reduction cursor, validate the original read domain against actual public
+array/live-view storage. Empty domains require no read or fabricated upload.
+Qualify null/empty inputs at counts 0/1, short views over larger roots, unknown
+capacity, changed replay, count-before-initializer failure and no launch/result
+publication after failed validation before consuming the numerical interval.
+
+The optional closed-count observation now retains the exact original checked
+initializer and bound context, original bootstrap cast identities, actual Integer
+0/1 value and independent pure/no-flags obligation. It is not a domain/read or
+execution certificate. Post-emission cast replacement invalidates the owning
+history. Explicit unchecked narrowing can produce 0/1 in the shared evaluator,
+but still abstains here while its independent source effect remains unclosed;
+value folding does not erase evaluation obligations. No admission rule changed.
+The affected seven-namespace gate passes 102 tests / 1,551 assertions. Current
+draft head `dbe75388` still fails test33827, fixture33828 and OpenCL33826; setup
+and build pass. CUDA/HIP gates have not established readiness. No merge is allowed.
+
+The original empty/singleton execution oracle adds 48 passing checks across
+Float/Double and forced split/unsplit emission: count0 does not read null/empty
+storage; count1 preserves NullPointerException/ArrayIndexOutOfBoundsException;
+changed values 2/4/-2 retain the expected consumer result. These execute original
+Methods outside proof transactions, not a device substitute.
+
+Further path review corrects the proposed integration seam: the exact two-binding
+fixture returns the scalar consumer, so existing terminal-host suffix construction
+already retains it without relaxing scalar admission. A real public equation-first
+compile reaches terminal ownership and currently refuses `.invk` with
+`:unclosed-terminal-source-projection` ("terminal symbol has no owned Var").
+Connect the authenticated original interval to the exact promoted reduction and
+existing terminal region; do not add a generic pre-admission bypass for this case.
+The generated terminal contract reads the reduction export and evaluates its
+nested scalar binding. This still requires original/constructed correspondence,
+actual operand/return completion and original read-domain execution contracts.
+
+Independent path review confirms two distinct remaining changes. First, the
+terminal projection must consume an authenticated exact interval/contract join
+and invoke the captured interface Method/receiver with the original ordered
+argument completions. Reuse the existing Long-only original-invocation projector
+machinery, but do not resolve `.invk` as a generic Var or rewrite typed Float
+division as core `/` (which changes arithmetic width). Second,
+`invocation_materialization/begin-materialization` currently validates every
+buffer eagerly through `runtime-buffer-shape`; it rejects nil even for count0,
+before any reduction cursor. Source-owned deferred array-reference materialization
+or verified dead-input projection must preserve public argument positions and
+original read ordering/failures. Existing raw arguments/ordered realization are
+the reuse point; no independent input cache or fabricated nil-as-empty buffer.
+Terminal projection may separately qualify valid-array execution, but must not
+be reported as completing zero/null/read semantics. Source-free compile entries
+and generic frontend admission remain unchanged. Final affected source gate now
+passes 103 tests / 1,599 assertions; this does not resolve the broad draft CI.
+
+The conditional terminal-consumer half is now implemented through the existing
+source-prefix correspondence representation and TerminalResultOwner, with no
+new runtime, cache or portable IR. The owner joins the original unchanged
+two-binding source through its actual normalization/construction phases to the
+exact final terminal contract and equation/export endpoint. It invokes the
+captured interface Method through shared ordered-call normalization. The actual
+Method result and observed consumer storage remain Object. An immediately
+returned, single Object alias is elided rather than emitted with an inferred
+primitive local hint; both source tags must match the independently observed
+boxed payload, and conflicting hints/param-tags refuse. Explicit mismatching
+owned-mode input refuses rather than falling back to ordinary projection.
+
+Crucially, the numerical frontend changes accumulator/index/input annotations.
+Those are NOT waived or accepted as numerical correspondence: the retained
+producer endpoints explicitly carry `:status :unproved`. Tests supply the
+original source's completed reduction value to the terminal owner and compare
+the resulting whole consumer against original execution. This is conditional
+consumer qualification, not GPU producer qualification. The default
+equation-first path is deliberately not wired to this capability until the
+independent producer/count/read execution proof is connected.
+
+An independent reviewer found no normal-path semantic blocker for this scope;
+its malformed-source hardening and explicit-mode refusal fixes are included.
+The affected nine-namespace REPL gate passes 141 tests / 2,187 assertions,
+including split/unsplit Float/Double, counts0/1, non-exact Float reciprocals,
+changed inputs, copied/foreign phase/program/contract boundaries, rollback,
+malformed source and conflicting-hint controls. Broad draft CI remains held.
+
+Next input execution work reuses InvocationMaterializationState and ordered raw
+arguments: owner-authorized existing buffer parameters may remain pending, never
+fabricated MaterializedBuffers, until the reduction cursor checks original entry
+CHECKCAST/null/bounds semantics and materializes actual demanded storage. Factor
+the existing parameter materializer instead of duplicating shape/alias rules.
+The zero case also needs validated empty-domain emission that removes unused
+pointer demand: current SegRed still carries its masked input pointer. A nullable
+entry CHECKCAST is not a nonnull read proof; deferral alone does not solve count0.
+
+The first materialization prerequisite factors buffer parameter construction into
+one private helper shared by eager initialization and retained-state validation.
+It preserves existing shape/dtype/storage checks and performs no deferral or new
+admission yet. The existing materialization namespace passes 13 tests / 123
+assertions after function-only reload; the capped REPL's record identities remain
+unchanged. Demand-time realization must reuse this same constructor.
+
+Explicit deferred construction now exists as a third materialization arity over
+a set of existing flat buffer parameter IDs. It retains raw references and exact
+original argument ordinals in the existing immutable state's extension data;
+pending IDs are absent from values/bindings, not nil or dummy buffers. State
+validation checks exact prefix membership and pending schemas. Demand-time
+realization follows declaration order, shares the ordinary constructor, and
+revalidates. Shape, clone and alias consumers refuse unavailable inputs; final
+publication refuses any pending input rather than silently dropping it.
+
+This is mechanical construction state, not a source authority: a structurally
+valid redirected raw reference can validate. The SourceOwner must independently
+check both its authorized ID set and each reference's identity against original
+arguments at its retained ordinal before execution. No ordered-runtime wiring or
+default admission is added yet. Aggregate/projected deferral remains refused;
+ordinary two-argument behavior stays eager. Independent review found no blocker.
+The materialization namespace passes 17 tests / 189 assertions; the final combined
+ten-namespace gate passes 158 tests / 2,376 assertions. Original source read guards,
+zero-domain pointer elimination and full numerical producer correspondence remain
+required before enabling the connected route.
+
+PR #1560 landed as `3bff894e` after all seven exact-head CI gates succeeded.
+Its shared bytecode completion emitter now represents actual Int/Long invocation
+parameter conversions without substituting Clojure checked casts. The distinction
+is observable: the original JVM Double-to-Int path saturates, whereas source
+`int` can throw. The campaign integration retains the separate reference-result
+context and its stricter AD refusal; merging this prerequisite changes no campaign
+execution admission by itself.
+
+PR #1561 landed as `a02ee86b` after all seven exact-head CI gates succeeded.
+It is the separately reviewed consumer: original input outlining selects
+the contract from the actual Method Class, while the AD producer explicitly
+requires a floating completion and matching floating Method return. Targeted
+qualification passed 97 tests / 1,221 assertions in the bounded existing REPL;
+this is not a fresh-process or whole-draft result. Campaign synchronization of
+the squash preserves the independently qualified integration source unchanged.
+
+The next construction change must replace retrospective argument matching with
+completed slots at the original-source producer boundaries. The shared inline
+builder consumes that construction; it cannot query a source-phase certificate
+that does not exist until after it returns. Its acceptance boundary is the whole
+selected call interval, not only a successfully evaluated allocation count:
+
+1. Authenticate the actual selected receiver, Method and each original operand
+   context. Logical scalar tags do not determine the physical completion recipe.
+2. Evaluate receiver, then **every** positional argument and completion once in
+   original order, including unused arguments, before entering the callee body.
+3. Substitute completed values, not uncompleted operands. Preserve original
+   return completion separately; an Object result and a primitive payload are
+   not interchangeable. Unrepresented return adaptation retains/refuses the call.
+4. Consume this construction through existing prefix/source-owner/scalar-compute
+   machinery. Do not introduce a call-frame interpreter or let a product/count
+   executor authorize an unclosed enclosing helper interval.
+5. Require complete coverage before executing any prefix effect. Controls must
+   cover a failing earlier conversion, unused throwing argument, wrong array
+   Class before an overflowing count, effects between count and constructor,
+   effects after allocation before helper return, later numerical arguments,
+   and omitted/reordered/duplicated/copied slot occurrences.
+
+First qualify original public primitive Long/literal inputs and already completed
+public arrays with independently checked runtime Class. CHECKCAST alone proves
+neither non-nullness nor safe access. Computed array arguments, helper delegation,
+return adaptation and resident producer/count correspondence remain explicit
+obligations until their complete intervals are represented. The existing two-
+equation training loss and softmax's scalar-after-reduction case are acceptance
+workloads, not reasons to bypass an unresolved interval.
+
+Fresh coherent campaign integration of the outlining consumer passed nine
+completion/bytecode/AD/construction namespaces: 121 tests / 1,570 assertions,
+zero failures or errors. The duplicated raw integral outliner branch is removed;
+the existing CHECKCAST path, positional completion validation, historical owner
+guards and terminal-region implementation remain. Independent integration review
+found no blocker. These targeted checks do not supersede the known broad-draft CI
+failures or qualify the draft for merging.
+
+A separate REPL construction probe confirms the next gap rather than merely
+inferring it from code: an actual typed helper with an unused Long formal throws
+on a nil argument; the existing expansion emits no argument bindings and returns
+`5`. Constructing three explicit original observed integral completions before
+the same scope-aware substitution restores both the nil failure and normal result.
+The original retained invocation nevertheless reports an **Object** return, even
+for this Long helper. Thus the prototype does not prove a return recipe or grant
+production expansion, and cannot justify dropping the return-boundary gate.
+The local reproduction is `.internal/probe-unused-formal-completion.clj`; it is
+diagnostic evidence, not a permanent passing regression or a shipped inliner fix.
+
+The return-path review also rejects `body :ref` plus invocation Object as a
+sufficient recipe. The original static body Method may insert a return CHECKCAST,
+and its wrapper is a separate edge. The first reference recipe therefore needs
+an actual emitted, unguarded reference pass-through bridge tied to that whole
+callee emission. It must replay the body under its saved result context, preserve
+the actual Method-return CHECKCAST when non-Object, and preserve wrapper reference
+identity. Extend the existing emitted return-bridge producer for that edge;
+do not reinterpret its primitive payload proof or add a caller-editable authority.
+Primitive boxed helpers retain their calls until their distinct recipe closes.
+
+### October 21 reference-return production and constructor insertion point
+
+PR #1562 landed as `4e15484d` after all seven exact-head CI gates succeeded.
+The existing wrapper producer records an actual unguarded reference-static-return
+edge, separate from primitive boxing. Shared validation now ties the saved whole
+body to its actual generated Method and return descriptor; a same-ABI foreign
+Method cannot supply a return CHECKCAST Class. The primitive observer retains its
+previous restrictions. Main-based qualification passed 110 tests / 1,396 assertions.
+
+The next campaign implementation constructs an owned whole original reference
+call, still **before enabling normalization or GPU admission**. It binds the stable
+receiver first, then every actual argument (including unused arguments), using the
+original typed-invocation emitter's shared conversion path. A canonical reference
+input context joins the existing integral/floating contexts; Object consumption
+retains its saved boxing/call-result behavior, while concrete reference consumers
+retain their actual CHECKCAST. These are not source casts, AD rules, non-nullness
+facts or portable native projection. The imported whole body runs under its saved
+result context and actual Method-return check. Historical source ownership and
+producer adoption remain shared, not an additional runtime interpreter/cache.
+
+Review identified two further obligations now represented here: substitution
+shares the inliner's use-site-metadata policy; actual bytecode body emission
+records the existing conservative method-local-callee denial. The constructor
+requires explicit closed dependency observations for the body and original
+receiver/argument operands. An authentic registered-source regression injects an
+owned same-class sibling through the existing producer path, verifies original
+execution does not call its colliding global, then checks construction refuses
+without publishing speculative dependencies. Other differentials cover null/
+array identity, unused argument effects and failure before the body, copied
+occurrences and stale ownership. Six whole-call tests pass with 58 assertions,
+including unchanged nested delegation, its effects and nullable results. The
+preceding affected 17-namespace gate passed 262 tests / 2,702 assertions before
+that final delegation test; independent review found no blocker in this unwired
+checkpoint. These reused-REPL results are not fresh-process or broad-CI receipts.
+The next step is construction-edge integration at both owned normalization
+producers, followed by complete helper-interval/result correspondence. No
+production normalization fallback is removed by the unwired constructor alone.
+
+The first normalization consumer now accepts the opaque completed-call value
+explicitly for its exact original root, not a compiler-option flag or caller map.
+The immutable frontend remains unchanged; the normalization edge joins the
+constructed root back to its original call and retained constructor. Imported
+callee nodes do not acquire caller-source origins. The constructor uses raw body
+import, separately from the public helper-import producer, to prevent accidental
+recursive construction during later integration. Default production normalization
+is unchanged pending full interval admission.
+
+Canonical bytecode input/result contexts are now shared rewrite barriers for
+legacy helper expansion, dispatch rewriting, AD application hoisting and D-call
+rewriting. This is shape-based protection, not inferred ownership or an AD rule;
+source Object completion is not relabelled bytecode-owned. Tests retain the
+delegated call and actual argument/return region through backend expansion.
+A fresh REPL first passed the constructor/transport gate (27 tests / 241
+assertions); the subsequent affected 17-namespace gate passed 265 tests / 2,774
+assertions. No whole-draft, numerical-GPU or performance acceptance follows.
+
+The opt-in phase now uses one same-position identity splice in both root
+normalization and helper import, rather than a root-only special case. Exactly one
+executable original occurrence is replaced; quotes stay opaque, equal-looking
+sibling calls are not rewritten, and ancestors retain source origins without
+inheriting completed-call authority. Import runs the splice before alpha-renaming
+and qualification; the constructor itself deliberately uses raw import.
+
+An actual failing argument-origin differential exposed an important emitter
+boundary: `(identity count)` need not emit an invocation observation, and its
+emitted operand is a reconstructed object. The constructor now joins the two
+existing producer records: exact frontend parent/argument through `InputOrigins`,
+then the owned positional argument through `retained-input-source-context` to the
+actual operand. Both identity checks are required; no equality/name matching or
+new semantic rule for identity is used. The capsule retains optional origin pairs
+under the original frontend/module history. Missing edges remain absent and this
+join grants no argument equivalence, placement or numerical admission.
+
+Independent review also caught a mixed-AD traversal: when another VG tuple was
+tracked, `resolve-vg-nth` could still enter a sealed completion region. It now uses
+the same barrier; a regression exercises folding outside while preserving the
+original region inside. Lexical-call expansion respects the barrier too. The
+latest affected 17-namespace gate passes 270 tests / 2,835 assertions. It covers
+source/normalized/imported differentials over branches, sequential rebinding,
+earlier failures and duplicate-looking calls; preserved argument origins;
+positional/copy/refusal query controls; and copied/foreign/stale import capsules.
+Default production normalization/import and numerical admission remain unchanged.
+Next is complete interval consumption in the actual training vertical, not a
+claim that constructor or origin coverage alone establishes resident execution.
+
+The campaign consumer uses the existing authenticated frontend/module-history
+observation boundary, not an editable return map. Cold queries do not compile;
+promotion requires a fresh owner, and the old cold history becomes stale. Missing,
+copied or foreign modules publish no observations. A real training compilation
+qualifies `[F` reference bridges for `linear-nb` and its nested `alloc-like`, while
+MSE correctly does not acquire one. These observations still do not close return
+substitution or final placement. Twelve integrated namespaces pass 158 tests /
+1,995 assertions, zero failures/errors; this is not whole-draft CI acceptance.
+
+Implementation review refined the next insertion point to the two existing owned
+source producers: `normalize-frontend-bindings` for the root and
+`prepare-inline-body` before callee hygiene/qualification. They have authentic
+frontends and exact original call occurrences, unlike the later shared builder.
+One shared constructor must authenticate selection, receiver, all original input
+contexts, imported callee and reference return bridge; emit every ordered completed
+slot; substitute only those values; and wrap the whole body in its saved result
+context plus actual Method-return CHECKCAST. Existing hygiene, qualification and
+sequential flattening then operate on this construction. Keep the frozen frontend
+identity unchanged. Do not manufacture a partial `SourceConstruction`, grow a
+retrospective resolver graph or interpret call frames at runtime.
+
+Initially support stable global typed receivers and the represented reference
+return recipe. Lexical/guarded receivers and unsupported primitive returns retain
+their original calls; later inlining must not erase their still-unclosed boundaries.
+Unavailable/cold evidence also retains the original call without silently warming
+JIT state. Explicit preparation and whole-owner retry remain producer lifecycle
+steps. Native TypedSOAC intrinsics keep their direct semantic contracts and do not
+acquire a blanket JVM compilation prerequisite. Acceptance must close one entire
+reference-returning helper interval, including unused inputs and delegation, not
+only execute its product/count operand.
+
+### October 21 typed reduction identity and rewalk qualification
+
+Focused PR #1554 (`0b839b48`, based on main `5baa8b30`) replaces the
+softmax maximum seed with the existing typed `neg-inf-val` helper. The former
+Float specialization retained checked `(float ##-Inf)`: ordinary Clojure rejects
+that conversion even if an unchecked bytecode conversion masks it. The new source
+does not read an element to select its identity, so empty inputs remain valid.
+Explicit checked Float narrowing is not weakened.
+
+Inlining this helper exposed an independent information-loss issue: the reduction
+walker inferred an accumulator type but retained it only on the form, not its
+binder. A subsequent walk after initializer lowering could no longer recover it.
+The fix uses the existing symbol metadata helper to retain that same logical type
+on the binder. It adds neither static-field inference nor a softmax special case;
+logical type retention still cannot stand in for physical-carrier evidence.
+
+Fresh capped clean-main JVM qualification: `raster.nn-test` and
+`raster.compiler.core.walker-test`, 53 tests / 356 assertions, zero failures/errors.
+The retained-source oracle uses ordinary Clojure evaluation independently of Raster
+bytecode coercions. Float/Double tests cover empty and shifted inputs, independent
+stable-reference values, primitive array classes, unchanged inputs and changed-data
+calls. The integrated broad-branch REPL passes 54 tests / 360 assertions, including
+its extra qualified-call reference-preservation regression. Independent review of
+the exact four-file patch found no blocker. All seven exact-head CI contexts then
+succeeded, and #1554 was squash-merged as `695c24ba` on October 21. The broader
+draft has reconciled that main ancestry without extra content changes. These
+source/compile gates are not backend-performance or full-draft acceptance claims.
+
+The unchanged-source GPU probe now gets past the reduction-initializer rewalk and
+still refuses `softmax/inv-sum` with `:uncertified-host-scalar` and
+`:unclosed-source-arithmetic`. The next completion obligation is transporting
+actual source-owned producer/checkpoint evidence into scalar FP consumers after
+reductions, preserving their original evaluation position. Conditional reduction
+value correspondence must not silently prove loop counts, read bounds, argument
+evaluation or safe box erasure. No arithmetic flag is waived by this source fix.
+
+### October 21 lexical observations survive method extraction
+
+The next source probe localized a concrete lost producer relation: softmax's
+original root scope existed in the bytecode binding catalog, but its binding
+observations were empty. `compile-typed-impl!` partitioned the function into
+static parallel helpers and rebuilt the main `let` without the root scope's
+metadata. The shared extractor now retains that root occurrence only after
+checking equal binding-vector size and identical ordered binder objects. It
+retains the original lexical head too. This is a producer-owned transformation,
+not a syntax search or a new type inference rule.
+
+The observation continues to expose the ACTUAL initializer and physical carrier.
+An extracted reduction reports a static helper initializer and may return primitive
+Float where the unsplit reduction returned an Object with a Float payload. The
+unchanged scalar initializer still identifies its original invocation context;
+the generated helper is not an original source invocation. Whole-body vector
+identity is deliberately not transferred. Both the original whole-body query and
+the production AD entry still refuse the split body without its separate proof.
+
+The regenerated softmax source now has all four binding observations (Float max,
+Float-array map output, Float sum, Object scalar-call result), while its GPU scalar
+continuation remains honestly unqualified. No count conversion, read-capacity,
+association or box-erasure permission follows merely from these observations.
+
+Independent review found no blocker; its requested production-AD negative was
+added and passes. Reused capped-REPL qualification covers frontend/reduction,
+binding and terminal ownership (42 tests / 386 assertions), plus loop carriers,
+whole-bytecode gradients and original source-prefix ownership (58 / 600), all
+passing. Copied scopes, equal-but-distinct binders, changed layouts, actual helper
+initializers and changed-data Float results are covered. This advances the producer
+transport prerequisite of items 3/5; full draft CI and the end-to-end training
+acceptance remain outstanding.
+
+### October 21 no-op source reconstruction through region-copy lowering
+
+Actual REPL phase instrumentation found that preserving only type-elaboration
+edges was insufficient: region-copy rebuilt every call even when it expanded no
+copy. A shared `util/remake-if-changed` now preserves seq/vector occurrences only
+when ordered child OBJECTS and count are unchanged. Equal symbols with different
+type metadata rebuild; original collection kind and metadata are retained. The
+AD application hoister reuses this helper instead of its duplicate implementation.
+Region-copy reuses actual control-head symbols and its original binding vector
+when unchanged, while rebuilding ancestors of real copy expansions.
+
+The traversal also now treats quote/core-quote as opaque in both value and
+statement contexts, and leaves empty `(do)` empty (nil) rather than constructing
+`(do do)`. These are source semantics corrections, not source-proof defaults.
+No permission for changed copy nodes, array aliases, bounds or metadata-only
+equivalence is added.
+
+Three affected namespaces pass 77 tests / 421 assertions; the ten ownership/AD
+namespaces separately retain 135 / 1,572, and existing copy complete-write
+coverage passes 1 / 8, all in the reused capped REPL. Independent review found
+no blocker. A diagnostic construction-edge map at actual type-tagging returns
+now reaches the real flat-binding helper builder with authenticated original
+caller, authenticated callee import and identical argument occurrences. Without
+the no-op region-copy repair the caller chain was missing. This diagnostic map
+grants no production admission. The next connected implementation must retain
+the actual type-elaboration edge and consume helper intervals in source-prefix
+validation and original source execution; it must not infer provenance by names.
+
+The focused main extraction is PR #1557 at `52a05e5d`, with exactly the shared
+helper, region-copy traversal, and the no-op/quote-safe AD hoister (main did not
+yet have the draft's earlier hoister repair). Independent review of its actual
+six-file diff found no blocker or broad-only API dependency. Its exact 67 on-disk
+test declarations pass 368 assertions in the reused development process; fresh
+all seven exact-head CI contexts then succeeded, and it squash-merged as
+`aa816699`. #1556's apparent status delay was verified
+through CircleCI's workflow API: setup/build succeeded and downstream jobs were
+queued, not absent from configuration. Both exact-head guarded monitors have
+completed their merges; these focused receipts do not qualify the broad draft.
+
+### October 21 shared operand outlining retains original method dependencies
+
+A real same-class sibling/global collision reproduced wrong execution in an
+owned invocation input outline: original operand `local-value(-2.0)` selected
+the original class's sibling and returned -1.0; the detached outline selected an
+unchanged same-named global, returned 100.0 and incremented its counter. Historical
+Var/module guards and hygienic NEW method names do not prove preservation of the
+ORIGINAL class's method environment.
+
+All operand families now capture dependency closure under the actual original
+emitter context. Invocation inputs, array indices, allocation counts and terminal
+tails share physical-operand-input for lexical ports, full scalar context and
+the conservative sibling-dependency facet; reduction counts forward their actual
+bound observation to the same outliner guard. Missing/nonboolean evidence refuses.
+Same-class sibling candidates refuse until their original executable dependencies
+can be transported; they are not re-resolved as globals. The scanner follows the
+actual typed (namespace-insensitive name) and ordinary (full spelling) emitter
+lookup keys, treats quoted data as opaque and checks nested executable bodies.
+It is denial evidence, not a new dispatch registry or proof of purity.
+
+Independent review caught the fifth shared caller, terminal-result outlining;
+the expanded affected gate also reported seven terminal errors before its
+producer/consumer path was covered. That path now captures its dependency facet
+under the original complete terminal emitter context, never defaults it from
+the reduced retained context, and keeps original return/Method/history guards.
+All five collision fixtures refuse without executing the unrelated global;
+positive ordinary-global and terminal controls retain original execution.
+No runtime submission or numerical performance improvement is claimed.
+
+The current on-disk affected gate spans ten namespaces, 133 tests / 1,557
+assertions, zero failures/errors in the reused capped REPL. The focused main
+extraction's exact four test declarations pass 28 assertions in that same
+process; this is not fresh isolated main qualification. The independent reviewer
+checked the actual extracted source/test diff and found no blocker. Fresh CI
+remains mandatory before landing.
+
+The focused main extraction omits terminal/reduction APIs not yet present there;
+it retains the same mandatory shared closure for every existing main caller.
+This closes a prerequisite for executing original helper argument outlines, not
+the ordered argument/result interval transport or full training acceptance.
+
+The focused fix is PR #1556, reconciled head `13e4da6f` after main's #1555
+landing. The reconciliation adds only the independently qualified naming fix
+and its fixtures; the reviewed dependency-closure diff remains two files. Its
+all seven exact-head CI contexts succeeded and it squash-merged as `a17af351`.
+#1555 passed all seven exact-head contexts at `3dc8ff4e`
+and squash-merged as `0513d222`; the broad draft has merged that main commit
+without dropping its separate ownership work. Neither receipt qualifies the
+broad draft or closes its still-red workload gates.
+
+After reconciling #1555's additional on-disk fixtures, the affected ten-namespace
+gate passes 135 tests / 1,572 assertions in the same capped REPL. This is a
+targeted reuse-process receipt, not the broad CI or a fresh-process benchmark.
+
+A subsequent actual-phase probe refines the interval implementation plan: for
+unchanged `unused-checked-helper-input`, normalization authenticates its root,
+but the first real binding inliner receives a different initializer occurrence.
+Equation-first does not default `:inline?` true; `:lower` first elaborates binding
+types and rebuilds the call, and the helper is expanded later in `:fixpoint`.
+Therefore the normalization-to-type-elaboration construction edge must be
+retained before authenticating the inliner interval. Do not assume the inliner
+sees an unchanged normalized call, weaken identity queries or infer origins from
+equal spellings. This evidence changes the next integration action; it does not
+grant completion/execution permission to the elaborated call.
+
+### October 21 ordered unused scalar prerequisite
+
+The actual unchanged helper probe exposed a missing executor before interval
+integration: an unused checked argument retained its TypedSOAC equation and
+required-evaluation obligation, but no InvocationPlan step. Shape liveness must
+not decide whether original checked work executes.
+
+Pre-device required scalars now retain a host-only equation with empty scheduled
+operations and exactly one existing ScalarCompute executor. They are not labeled
+graph-shape proofs. Prefix dependency pruning roots their existing obligations,
+rechecking the nested catalog, transported claim, provenance, exact source
+binding and computation flags; removing both catalogs does not prove totality.
+Flags come from the retained scalar computation, not a generated result ABI cast.
+The frontend's before-parallel relation remains distinct from stageable-prefix.
+
+Focused reused-REPL validation passes the seven invocation/shape/ordering tests
+(106 assertions, including the production public-parameter ordering control) and
+135 source/ownership tests (1,573 assertions). These are not full draft CI gates.
+The helper now has its ordered step but still refuses before allocation with
+`:unclosed-ordered-source-executor`: original argument/result interval ownership
+is deliberately not inferred from the existence of a scalar evaluator. That
+construction-edge integration remains next; no fallback or new interpreter was
+introduced. Review also confirmed that rebased source IDs are not globally equal
+to retained binding ordinals, so no such new coordinate assumption was added.
+
+### October 21 actual source-construction history
+
+The equation-first pre-SOA phase now scopes one owner-local SourceTransport
+collector around the actual pipeline. Type elaboration records its actual
+input/output and lexical environment, without rerunning inference. Both shared
+inliner entrypoints pass their actual caller before recursive argument rewriting;
+the observer records the builder's argument/substitution/result construction,
+not a fictitious final AST interval.
+
+An unchanged real helper probe now joins normalization to its caller's actual
+type edge and exact imported callee. Identity-only queries reject copied outputs,
+ambiguous/fan-in/fan-out/cyclic construction chains, repeated caller expansions,
+changed or missing positional arguments, and stale caller/callee source inputs.
+The actual recursive path has both an unchanged-argument positive control and a
+rewritten-argument negative control. Self identity edges are omitted, and chain
+traversal is bounded; queries currently scan retained events, not an indexed cache.
+
+The history is passed directly to the prefix verifier and is not added to compiler
+options, AST metadata, target modules or portable compilation artifacts. The
+existing bounded prefix/metadata/order verifier remains unchanged after that
+phase identity check. An observer trace is trusted producer provenance, NOT
+standalone transformation authorization: before expanded intervals can execute,
+the consumer still owes independent bounded transformation laws, exact final
+placement, formal completion, result adaptation and original source executors.
+Incompatible tag provenance deliberately grants no width/completion permission.
+The original checked-helper overflow case still refuses before device allocation.
+Independent read-only review found no blocker in this provenance-only scope.
+The reused capped REPL passes 55 transport/inliner/construction tests (364
+assertions) and 136 source/ownership tests (1,579 assertions); these are focused
+gates, not fresh-process, whole-draft or performance qualification.
+
+### October 21 original frontend argument execution
+
+Explicit `prepare-frontend-invocation-input!` now follows the authenticated
+frontend/input-origin relation into the existing bytecode input outliner. It
+preserves the original positional completion, physical ports and emitted method
+dependencies. This prepares an argument slot, not a whole helper or numerical
+argument; no source interpreter, new dtype inference or execution-order grant
+is introduced.
+
+The returned executable freezes both raw frontend identity and full transitive
+module history. A module guard alone accepts an equal-but-copied raw source body;
+the additional frontend guard correctly refuses it. Guards run before execution
+and before returning, with no fresh observations. A local collector prevents
+unrelated enclosing dependencies from becoming runtime costs, while historical
+adoption still fences the enclosing compilation. The existing input invocation
+checks its own region guard; the wrapper does not redundantly repeat that guard.
+
+Independent review found no blocker. Five new tests / 37 assertions cover the
+actual unused checked helper argument, overflow, out-of-owner invocation, copied
+and foreign inputs, source replacement before/after execution, transitive changes,
+no refreshed evidence and isolation from unrelated parent history. The existing
+136-test source/ownership gate also passes 1,579 assertions in the capped REPL.
+The complete source expansion and unchanged training gates remain unqualified.
+
+The next consumer must use general lexical call frames, not enlarge a root-only
+flat-prefix matcher or dispatch on the literal-count fixture. Actual `local-loss`
+contains only `mse-loss(linear-nb(...), y, rows)`; allocation products and reduction
+counts belong to imported callees. A frame must independently validate the
+bounded builder/substitution law, selected callee import, ordered completed formal
+slots (including unused arguments), callee-local substitutions, actual return
+completion and exact final invocation/equation interval. Construction traces only
+locate candidates. Existing ScalarCompute and ordered-source execution remain
+the executor model; prepared reverse-AD import closure is a separate obligation.
+
+Numerical arguments must NOT be executed by outlining their whole original CPU
+expression. A computed resident prediction needs proven physical-producer/formal
+correspondence. MSE's count uses prediction length, not target length or the loss
+denominator. Its current original count outliner takes a JVM array: the resident
+route requires an authenticated metadata/length projection through existing
+allocation/view/stage-completion facts, with null/bounds/domain/failure order
+preserved. Downloading or inventing a replacement array is not a valid shortcut.
+Acceptance must still rerun unchanged `local-loss` and `local-gradient-sum` with
+changed inputs and independent numerical/device oracles; successful scalar frames
+alone cannot close campaign items 3 or 5.
+
+The unchanged production `local-loss` probe now independently confirms that
+boundary: source compilation succeeds, with 12 actual type-elaboration edges and
+five builder observations. `linear-nb` has an authenticated root caller, unchanged
+argument occurrences and callee import. `mse-loss` has an authenticated root caller
+and callee import, but its numerical prediction argument was actually rewritten,
+so the unchanged-argument query correctly abstains. `alloc-like` and two `oftype`
+calls have authentic callee imports but no root-normalization origin. These are
+hierarchical import/frame and numerical-result correspondence gaps, not evidence
+for weakening a flag or adding a root-prefix special case. No device allocation,
+numerical execution or training/performance claim follows from this source probe.
+
+### October 21 original reduction count execution and outline hygiene
+
+The shared owned-input outliner now supports an original reduction's WHOLE
+observed count initializer, including its checked Int conversion. It reuses the
+existing physical-port compilation, context and historical guard machinery; it
+does not interpret source or add another numerical IR. Before the bound record
+can become executable, the common reduction query checks its sole binding's
+exact initializer/binder children and joins its before/after locals to the actual
+loop-entry environment. The count outline retains the full operand context and
+original element-type context, including an explicit nil. Legacy records missing
+those execution inputs refuse rather than acquire defaults.
+
+This count region runs neither accumulator initialization nor iterations. Negative
+counts remain negative; out-of-Int Long counts throw as the original checked
+conversion does instead of wrapping. Effects in a count run once, and a count
+failure precedes the original initializer's effects. Copied/foreign occurrences,
+detached initializers/locals, incomplete contexts and stale module history refuse.
+Original method-local helper dependencies are conservatively detected from the
+actual emitter's sibling tables (including namespace-insensitive typed lookup).
+They remain unsupported for this outline rather than silently resolve a same-named
+global. This is a denial check, not dispatch, purity or replay permission.
+
+The work also found a shared outliner naming hazard: a fixed generated method
+named `input` can capture a source global call of that name. Generated method
+names now avoid executable source symbol names, including qualified names and
+binders. The final spec and reflected Method use that exact chosen name. This
+independent fix is extracted onto main in reviewed PR #1555 (`1ee20648`); its
+exact 13 on-disk tests pass with 138 assertions in the reused REPL, and fresh CI
+is the required merge gate. It is not a fresh clean-main JVM measurement.
+
+The first fresh-CI run found an adjacent index-sibling fixture hard-coding the
+old generated name `input`, rather than consuming its returned method spec.
+PR #1555 head `3dc8ff4e` corrects the fixture while preserving direct primitive
+INVOKESTATIC, declaring-owner closure and no-reflection/no-boxing assertions.
+The corrected index namespace passes 3 tests / 23 assertions in the reused REPL;
+the clean-main hygiene declarations still pass 13 / 138. The replacement CI run
+is pending; this is not a green-main or merge receipt.
+
+An additional unchanged-stdlib MSE component test emits a fresh diagnostic module
+from the original body's exact retained input, rather than restamping an older
+REPL implementation. Its count outliner depends only on the actual `pred` array:
+lengths 0/1/17 and null behavior pass; neither target nor the mean denominator is
+invented as a count dependency. Cross-module source authentication still refuses.
+The ownership namespace passes 24 tests / 209 assertions. This is actual count
+execution over a public array, NOT full MSE scheduling, resident metadata
+projection, or enclosing `local-loss` source correspondence.
+
+The complete broad-branch targeted gate selects current on-disk declarations
+across eight ownership/input/AD namespaces, avoiding stale extra test Vars in the
+reused REPL: 124 tests / 1,483 assertions, zero failures/errors. Independent review
+covered the count/context joins, sibling refusal and shared naming repair.
+Memory pressure excluded an additional local JVM; no full-suite or performance
+claim follows.
+
+After the real MSE component and index fixture additions, the current on-disk
+gate spans nine namespaces: 128 tests / 1,514 assertions, zero failures/errors.
+The reused independent reviewer also checked both additions without a blocker;
+neither tests nor review establish full MSE scheduling or GPU admission.
+
+Executable count evaluation is NOT yet source-position scheduling or proof that
+the chosen launch domain agrees with the original count. The ordered invocation
+must execute it once at the original boundary and retain read-capacity,
+initialization, association, result-checkpoint and box-use obligations. Public
+draft CI at `61b84139` still fails emission job 33524 on the unchanged softmax
+`inv-sum` arithmetic-completion gap. This advances items 3/5 without closing that
+continuation or the full eight-item campaign.
+
+The reviewed continuation is to reuse InvocationPlan `ScalarCompute`, not add a
+count-specific runtime: construct the whole checked count binding before seed
+evaluation at the actual reduction transformation; transport the original
+occurrence to its count/reduction interval; prepare that exact step through the
+owned count executor before generic scalar projection. Keep the signed Int count
+distinct from the nonnegative launch extent and qualify read capacity separately.
+Do not loosen SourcePrefix's flat-prefix authority to admit later regions.
+For unchanged `local-loss`, original helper-call argument/result completion and
+substitution intervals must first connect its MSE helper to the final steps:
+the original caller contains no reduction. A literal/public-count surrogate or
+the component test above cannot close this obligation. Arithmetic denial flags,
+Float checkpoints and prepared-AD import checks remain in force.
+
+### October 21 arithmetic normal-completion conservation
+
+A real public helper reproduction exposed a silent source loss: an unused helper
+argument containing checked Long multiplication disappeared at `:dce-cleaned`.
+The original call throws on overflow, but the resulting program accepted that
+input. External purity is not a proof of successful evaluation. The shared
+effects descriptor now retains `:unclosed-source-arithmetic` for arithmetic
+identified by the existing canonical operation descriptors; DCE, CSE and the
+TypedSOAC required-evaluation boundary conserve the obligation. Logical type tags
+do not waive it, and quoted arithmetic remains data. This is conservative denial
+until a source-owned completion proof is available, not a second type registry.
+
+The repair also makes existing source-prefix correspondence distinguish a shared
+scalar ProgramEquation from an invocation-only ScalarCompute. The latter must
+retain the same source in both closed region and initializer, or the same central
+result materialization in both. Source-order validation independently rebuilds
+the entire step. Coherent source/plan mutation still cannot replace the original
+source occurrence. The executor uses the actual original Object-returning call
+and authenticated non-null Long boxing bridge; a syntactic result `long` wrapper
+is not a prerequisite or a replacement for that physical evidence. Exact owner,
+Method, implementation, operand, returned-wrapper and historical guards remain.
+
+The existing capped REPL passes six focused namespaces (77 tests / 871 assertions),
+the shared inliner namespace (31 / 192), two required-evaluation boundary tests
+(2 / 24), and source-owner/invocation-plan namespaces (18 / 83). Original selected-call overflow, changed-input and allocation-order
+oracles are retained. The unused-helper argument now survives before allocation
+and unsupported lowering refuses rather than silently dropping its exception.
+This does not yet provide that imported argument's executable source ownership.
+Implicit loop-count conversions, reads, allocations and other pure calls need
+their own completion accounting; no general totality or broad CI claim follows.
+Draft #1539 at `c41be4d4` still has failed test, OpenCL and public-source emission
+contexts, with CUDA/HIP compilation not established. It remains unqualified.
+
+### October 21 Float numerical checkpoint at the terminal host boundary
+
+An unchanged-training recheck after `78a6a4bd` found a missing boundary, not a
+reason to drop the new arithmetic obligation: `local-loss`'s retained quotient
+needs its numerical Float reduction export, while terminal ports previously
+accepted only Double/Long. The four-test diagnostic gate initially reported one
+error (`:invocation-terminal-carrier` on that Float result). Its source-emission
+oracle is kept unchanged.
+
+Produced terminal ports now additionally support Float. Existing emitted physical
+output correspondence, exact dtype/one-element ABI, initialized storage, ordered
+completion and source-owner/history checks remain. Download uses a one-element
+Float array; exact Float wrapper validation precedes value extraction through
+the existing static `RT.uncheckedFloatCast(Object)` adapter. That extraction
+does not add a checked narrowing point or permit a Double input. Ordinary core
+binary arithmetic over actual Float/Double operands widens Float at the source
+call to the existing Numbers Double overload; it never widens the reduction.
+Typed scalar Float arithmetic and public Float entry ports remain unsupported
+by this rule. Explicit checked source narrowing remains independently checked.
+
+The reused capped REPL passes source-owner, terminal-owner, invocation-plan and
+unchanged training diagnostics (47 tests / 476 assertions). These include Float
+identity and noncanonical NaN payload, signed zero/infinities, exact wrapper
+refusal, checked narrowing overflow, mixed core arithmetic, typed-context refusal
+and public Float refusal. Actual OpenCL and Level Zero changed-input replays pass
+14 assertions, including exactly one Float-element download and Double host
+result comparison with the JVM. The device sums are deliberately association-
+exact; they do not claim arbitrary tree/serial Float equivalence. `local-loss`
+again emits source; `local-gradient-sum` retains the two existing quotient
+completion/count obligations. Resident training and helper-expansion ownership
+remain open, and no full-draft green or performance claim follows.
+
+### October 21 generic inlining must preserve dispatch selection
+
+The next helper-origin investigation exposed another silent miscompile. A helper
+with only a Long method and a constant Long result correctly rejects a Double
+argument in the source program. Ordinary compilation nevertheless selected its
+sole body, erased the call, and accepted every tested Double input as an array
+program. Unknown arguments and a single registered overload are not evidence of
+method applicability.
+
+Ordinary generic inlining now branches on dispatch-table presence before reading
+backing metadata. Complete argument tuples use the same selection, priority and
+parametric specialization machinery as `try-resolve-call`; the new tag-tuple
+facade shares that implementation without fabricating source arguments. Misses,
+unknown/partial tuples and unpreserved promotion casts abstain, never fall back
+to whichever body exists. Actual selected mangled symbols come from the shared
+selector. The actual generic Var and lookup join the existing historical owner;
+normal overload publication and namespace-alias remapping invalidate old inputs
+even when the imported backing method has not changed. Rejected candidates do
+not publish their optional observations.
+
+The duplicated AD resolver is reduced separately. A single-method AD constructor
+uses the canonical public `value+grad` method-selection policy BEFORE the returned
+gradient receives arguments. That is not the ordinary runtime generic-call rule.
+Multi-method AD application selection uses the shared selector; general runtime
+parity of that specialization policy is not established here. Argument tags use
+the existing inference API rather than a symbol-only lookup. Runtime-versus-
+inlined constructor tests preserve actual Float/Double result classes and bits,
+argument failures and single evaluation.
+
+The reused capped REPL passes dispatch/inliner/inference tests (60 tests / 328
+assertions), canonical dispatch/parametric tests (17 / 130), and source-prefix,
+unchanged-training diagnostics and terminal-owner tests (45 / 544). The public
+incompatible caller is now explicitly rejected with its undevirtualized callee
+still identified; the compatible Long caller compiles and lowers to its expected
+seven-element output. This repairs method selection, not formal-completion
+proofs: even an applicable overload can require an implicit conversion, and the
+already-selected direct-call path still needs the planned expansion transaction.
+
+Exact-head CircleCI at `d86c72ac` remains red. The public emission job #33480
+specifically refuses `raster.nn/softmax`'s retained `inv-sum` (`raster.numeric//`,
+`:unclosed-source-arithmetic`, normal completion unavailable). That is a real
+remaining source-completion obligation exposed by conservation, not an
+infrastructure failure and not a reason to waive the flag. Unit and OpenCL gates
+also failed; neither CUDA nor HIP compilation is established by that run.
+
+### October 21 dynamic checked-map loop qualification
+
+The checked-map schedule now proves termination/nonoverflow for an actual validated
+exclusive Long loop with unit increment and integral leaf bounds. The proof is
+local to the exact KernelBody operation occurrence, not copied metadata, inferred
+parameter ranges or an arithmetic-expression rewrite. The previous literal-only
+proof remains independently available. Negative/reversed bounds are covered by
+the header theorem, not claimed as qualified source invocation/read domains; a
+finite loop is not necessarily short enough for a device watchdog.
+
+The real dynamic Float-storage/Double-accumulator fixture retains its independent
+source read-capacity certificate and conditional private-result initialization on
+OpenCL/CUDA/HIP source targets. Both local OpenCL and Level Zero execute zero/one/
+three-trip loops and changed-input replays against JVM oracles, including a
+cancellation case that distinguishes Double from Float accumulation. An
+overflowing final Float conversion prevents publication and poisons execution;
+an excessive dynamic count independently fails with `:program-link-graph-range`
+before graph submission. Session, graph and event ownership checks remain intact.
+The affected three namespaces pass 32 tests / 640 assertions; review found no
+blocker and its additional read-capacity control is included.
+
+Unchanged `rms-norm-chunked` now passes its dynamic-loop checked stage, but its
+final map remains refused at `:single-output-boundary`: the map domain retains a
+lifted scalar extent while output storage projects the checked product of rows
+and features. This requires the existing causal extent evidence, not weakened
+equality or a norm-specific exception. Internal checked conversions, complete
+training/source correspondence, and the broad draft's red CI remain open.
+
+### October 21 causal checked-map volume correspondence
+
+Checked-map emission and independent emitted-equation reconstruction now pass
+the retained dependency-closed scheduled body explicitly. When iteration extent
+and output elements differ syntactically, the planner reconstructs the complete
+source graph, requires its exact match and unique numerical algorithm, then uses
+the existing predecessor-only `extent-proof` environment to compare the iteration
+extent with the retained physical output shape. It does not manufacture source
+arithmetic from KernelLaunch products, trust read-certificate definitions or accept
+caller-option assertions. Original scalar evaluations and overflow checks remain.
+Callers without the causal body retain exact-equality-only admission.
+
+A product-shaped source map now compiles for OpenCL/CUDA/HIP and executes on both
+local backends, with zero-size output, changed-input replay, checked failure and
+ownership cleanup. Forged attached definitions, future or malformed predecessor
+bodies, changed effects/types and changed output storage remain refused. The
+shared extent-proof tests also cover narrowing, wrapping multiplication and
+guarded negative domains. The affected four namespaces pass 39 tests / 743
+assertions; independent review found no blocker.
+
+Unchanged `rms-norm-chunked` passes the former single-output-boundary refusal and
+now reaches a distinct map-body index-scope refusal (`rstr_local_7` undeclared).
+That is the next source/lowering investigation, not a qualified RMS execution
+claim. Internal checked conversions and the draft's broader red gates remain.
+
+### October 21 preserve the projected checked-map operand
+
+The subsequent index-scope refusal was a concrete cross-pass bug: read-address
+projection expanded and pruned certified quotient/remainder locals correctly,
+then checked-map planning restored the conversion operand captured before that
+projection. The producer now takes both locals and operand from the same
+projected region and explicitly requires unchanged outer conversion attributes.
+No scalar rule, numerical permission or source correspondence was invented.
+
+The product-shaped map fixture now reconstructs an input coordinate from explicit
+quotient/remainder locals. Before the fix it reproduced an undeclared-local
+refusal; afterward the existing changed-input/zero-domain/failure-publication
+tests execute it on both OpenCL and Level Zero. A mutation control rejects changed
+conversion semantics. The five affected address/extent/checked-stage/reporting/
+device namespaces pass 55 tests / 800 assertions; review found no blocker.
+
+Unchanged `rms-norm-chunked` now emits three CUDA source kernels. Actual Level Zero
+checked instantiation still refuses before device execution at
+`:unclosed-ordered-source-executor`, context `:scalar-compute`, for an allocation
+extent introduced through `alloc-like`; no original-source correspondence is
+available for that imported helper step. This is evidence for the already-open
+helper substitution/source-ownership transport, not permission to guess origins
+or use a fallback. Full RMS execution and vendor compilation remain unqualified.
+
+### October 21 preserve actual caller occurrences before helper import
+
+The helper-ownership review identified an earlier information loss:
+`hoist-nested-vg` reconstructed every ordinary call even when no AD application
+was hoisted. It now preserves a source node only when every child is the exact
+unchanged occurrence; changed paths retain their existing ordered construction
+and metadata. This is not an equality-based origin lookup or execution witness.
+The same review found and repaired an existing quote-boundary defect: syntactic
+AD applications inside quoted data must never be lifted or executed. Both quote
+spellings are opaque at the initializer and nested traversal boundaries.
+
+The inliner, source transport, source-prefix and actual JVM input-completion
+namespaces pass 75 tests / 639 assertions. Controls cover unchanged calls/vectors/
+scopes, genuine hoists with unchanged siblings, top-level applications and nested
+quoted data. Independent review found no blocker.
+
+Next, actual binding expansion must consume the exact caller occurrence, callee
+BodyImport and every positional input completion while constructing substitutions
+and binding-origin edges together. Existing argument substitution alone is not
+formal entry conversion. In particular Object-to-Long completion is not identity;
+unused arguments and normal-return completion remain separate obligations. This
+prerequisite does not by itself authorize the refused RMS allocation helper.
+
+### October 21 renewed bytecode nominal-interface publication
+
+The broader owned-AD gate exposed a genuine renewal failure: initial emission
+published the interface's registry Symbol, but renewal passed its frozen-source
+String through unchanged. The actual implementation, Method, parameter/return
+signature and namespace checks all passed; only nominal metadata representation
+differed. `emit-owned-bytecode!` now publishes a canonical interface Symbol while
+leaving source lineage, actual emitter arguments and every physical identity
+check unchanged. No AD string-comparison fallback or historical restamping is
+introduced. Both nominal input spellings and actual renewal are covered; old
+artifacts remain stale. Independent review found no blocker. This repair and the
+following operand slice pass the six-namespace affected gate: 72 tests / 1,034
+assertions, not a broader draft qualification.
+
+### October 21 retain actual integral call-input completion
+
+Actual RMS allocation-call observations show why an identity-only shortcut is
+insufficient: array inputs perform CHECKCAST, direct row counts arrive as Long,
+and product count operands return Object before Number-to-Long ABI coercion.
+Those are observed emitter operations, not declarations or generated source casts.
+The existing owned invocation-input outliner now also supports Int/Long inputs.
+It restores physical ports and the complete saved operand context, verifies the
+original emitted carrier, then uses the same emitter coercion on method return.
+The adaptation classifier is shared with actual typed-call emission. All
+positional completion records are checked, including unused other formals;
+missing, copied, guarded, malformed or stale evidence remains refused.
+
+Tests distinguish raw Long-to-Int wrapping from explicit checked `int`, retain
+Object-to-Long null/wrong-object failures, BigInt and nonfinite Number behavior,
+once-only custom Number unboxing and operand-effect order. The existing FP path
+is preserved, and its AD consumer now explicitly requires a floating contract:
+integral outlining cannot reach floating AD derivation. Review caught and closed
+the need to validate the full four-Boolean context rather than inherit outlining
+defaults. The six affected lineage/outlining/AD namespaces pass 72 tests / 1,034
+assertions; final independent review found no blocker.
+
+This is a JVM-owned operand capability, not authority to move arguments, omit
+checks, substitute helper bodies or admit resident execution. The next expansion
+transaction still must connect actual caller/callee inputs to its constructed
+bindings. Source-owner RMS instantiation remains refused until that closes.
+Broad CI at `2bfcda0e` reports 148/172 public fixtures passing and 24 failures
+(job 33424), versus the earlier 146/172. Vendor compilation and the other red
+unit/OpenCL gates remain unqualified; no failing fixture was skipped.
+
+### October 21 retain actual reference call-input completion
+
+The same owned input outliner now supports an actual recorded CHECKCAST. It
+restores the original operand context, verifies its emitted reference carrier,
+and uses the typed method return to perform the original reference check. The
+outlined method must resolve the identical target Class, not a matching name or
+declared dtype. Null and successful reference identity are preserved; wrong array
+and object classes fail after the original operand effects, even when the callee
+does not use that formal. Complete positional evidence and historical guards
+remain required. No floating AD contract is granted to the reference input.
+
+The six affected lineage/outlining/AD namespaces pass 73 tests / 1,055 assertions,
+including stale, copied and guarded-evidence controls. Independent review found
+no blocker. This closes another prerequisite for ordered helper arguments, not
+the helper expansion itself: callee bindings, allocation and return still need
+their own source correspondence. Broad draft CI at `e93adb6f` remains red in
+test, public source emission and OpenCL; no merge or RMS runtime qualification
+is claimed.
+
+### October 21 native replay refusal coverage alignment
+
+The replay-boundary regression now pins the earlier native refusal
+`:unclosed-c-family-value-completion`, replacing two stale expectations of the
+later unsupported string/throw refusal. It independently requires the retained
+completion, original alias-guard message and reason in the refused body, and
+checks that native compilation is never invoked. Runtime alias controls remain
+unchanged. The namespace passes 9 tests / 65 assertions; independent review found
+no blocker. This repairs CI accounting without admitting native replay guards or
+claiming a production AD fix. Remaining broad CI failures are still open.
+
+The distinct private-destination guard fixture has the same earlier refusal and
+now requires its completion plus original alias message/reason to survive too.
+Its existing successful private-write and opaque-alias runtime controls are
+unchanged. Both namespaces together pass 14 tests / 85 assertions; review found
+no blocker. These four corrected stale assertions are not evidence that the
+remaining draft failure clusters below have been resolved.
+
+### October 21 full draft CI failure baseline
+
+The complete test job **33431**, head **e93adb6f**, is substantially broader
+evidence than the earlier abbreviated shard inspection: its sixteen failed-shard
+summaries total **7,429 tests / 88,348 assertions, 117 FAIL headers and 172 ERROR
+headers**. These are that job's logged totals, not a fresh run of later heads.
+The reviewed replay-test updates above do not qualify the other failures.
+
+The principal shared boundaries are checked floating conversion in numerical
+maps, original source/ordered-host execution, prepared output/donation contracts,
+artifact serialization and contextual method ownership. Additional failures
+include AD structural completion, counted reductions and stale structural
+expectations. Failure locations are diagnostic clusters, not a proof that every
+member has the same cause: 43 ERROR headers originate at `segmap_body.clj`, 23 at
+`equation_first.clj`, 17 at `method_entry.clj`, 12 at `source_owner.clj`, 12 at
+`compiled.clj` and 9 at `equation_artifact.clj`. Keep public workloads and both
+positive and negative tests enabled while repairing these mechanisms.
+
+The immediate connected repair remains the actual inliner expansion transaction:
+one builder used by binding expansion and `.invk` expansion must consume the
+authenticated callee import while constructing argument bindings, substitutions,
+callee bindings and results. Retain construction edges there, not after the fact
+by generated names. Its caller occurrence and full positional ABI completion
+must be authenticated, and source-prefix correspondence must describe ordered
+call intervals rather than require an unchanged binding count. Argument-only
+evidence authorizes only the original call's ordered argument prefix; callee
+allocation/local evaluation and normal return require independent closure before
+RMS or training execution is admitted. No weaker fallback or restamped history
+is an acceptable route to a green campaign.
+
+### October 21 shared production inline construction
+
+Both binding expansion and recursive `.invk` expansion now use one builder for
+ordered argument lifting and callee substitution. The builder retains their
+existing flat versus nested placement conventions; sequential local renaming,
+allocator metadata and effect/result placement are unchanged. When a BodyImport
+is supplied, construction consumes its exact body and authenticated parameters
+and tags under its original history. Copied bodies, foreign declarations and
+stale inputs fail before substitution. Legacy/generated helpers without imports
+do not acquire ownership by passing through this builder.
+
+Review caught and closed two gaps: validating only the body was insufficient
+without its declarations, and the recursive path's size/fusability policy needed
+the same whole-body convention as construction. The latter also fixes a legacy
+multi-form path that previously substituted only the first form. Tests check
+both actual entrypoints, once-only ordered arguments, unused checked failure
+before later arguments/callee effects, all body effects/results and whole-body
+size limits. The five affected inliner/import/prefix/JVM-input namespaces pass
+94 tests / 856 assertions; three affected owned-AD namespaces separately pass
+33 tests / 524 assertions. Independent final review found no blocker. Unchanged
+`rms-norm-chunked` still emits three CUDA source kernels; no vendor compiler or
+RMS device execution is established by that source probe.
+
+This intentionally introduces no standalone provenance token. The next connected
+slice must retain actual caller/argument/callee construction edges through this
+builder, consume them in source-prefix call intervals, and prepare only closed
+original argument outlines. Missing callee/allocation/return obligations still
+refuse. The broad draft and the original eight completion gates remain open.
+
+### October 21 import-local and checked substitution occurrences
+
+Shared alpha conversion and source qualification now expose optional constructor
+observers, separate from resolution-history observation. BodyImport retains only
+actual call-node edges in two explicit phase-indexed vectors, using the same
+`form/call-form?` classification as bytecode InputOrigins. No lexical environments
+are retained. Identity edges remain meaningful within a phase. The guarded query
+joins exact qualified → hygienic → original occurrences; copies, repeated originals,
+ambiguous outputs and stale source/import history refuse without publishing partial
+parent dependencies. Quote opacity, sequential/recursive scope and auxiliary source
+bodies remain governed by the existing shared lexical walkers. Normalization uses
+the same identity-uniqueness check rather than retaining a duplicate implementation.
+
+The parent-expansion relation is derived, not another passive trace. During the
+independent full substitution-law check, the shared substituter internally records
+imported-call → replay-call edges. Only after the complete metadata/raw-bit/product
+check succeeds does structural-position alignment relate those calls to the exact
+recorded builder body. Unique child and replay origins then compose with BodyImport.
+Generated names/equal-form searches and caller-supplied edges supply no authority.
+Calls introduced solely through argument substitution, including one object used
+twice, cannot acquire imported-body origins. The checked parent law/history stays
+attached. Locally exhausted substitution environments may still conservatively
+abstain; the existing empty-map fast path is not expanded into a second traversal.
+
+The unchanged production `local-loss` now recovers original `alloc-like` and both
+`oftype` caller occurrences from the actual `linear-nb` expansion. This closes their
+previous missing import-local occurrence relation, not their selected/completed
+execution frame. Existing original selected Method/implementation checks, formal
+completion, resident prediction/length correspondence and final interval placement
+remain required. No host numerical recomputation, download or execution fallback
+is introduced.
+
+Independent review found no blocker after ambiguity/staleness controls. Replacing
+only the owned capped REPL for the changed private record layout exposed a former
+warm-test assumption: the training frontend needed explicit non-evaluating
+preparation before its original caller could be compiled. The regression now does
+that through the shared service. Reused-process gates after that fresh load pass:
+80 lexical/inference/import tests / 463 assertions; 64 transport/inliner/construction
+tests / 523 assertions; 136 source/bytecode/AD ownership tests / 1,579 assertions.
+The first two gates overlap; these are not additive unique-suite totals.
+
+JVM observations remain an import bridge for faithful existing Clojure semantics,
+not a permanent requirement for native TypedSOAC operations with direct semantic
+contracts. The next consumer must close and consume actual frames in execution,
+then retain compact checked obligations rather than proliferating whole histories.
+Preparation, validation and emitted-module costs require separate measurements.
+The broad draft CI and all eight campaign completion gates remain open.
+
+### October 21 original selected invocation frames
+
+The checked nested builder now joins an actual original selected call without
+executing or outlining any operand. The bytecode emitter's complete positional
+conversion validator is shared by the existing input outliner and a new read-only
+observer. MethodEntry retains the original whole-module history. SourceTransport
+checks actual interface Method, global receiver, registered source/receiver/entry,
+implementation identity and parameter Classes against the authenticated callee
+import. Matching descriptor spellings or a compatible ABI alone are insufficient.
+All composed queries retain optional-owner transaction isolation on refusal.
+
+Each frame slot carries the original source operand, observed evaluation context,
+actual emitted carrier/target Class/adaptation and constructed argument/binder.
+Constructed-operand correspondence, return adaptation and final placement remain
+explicitly unclosed. Array CHECKCAST does not prove a nonnull array or permit
+outlining a computed resident prediction. MSE's primitive invokedynamic result is
+not confused with its interface's Object result; return correspondence is not
+inferred from either carrier.
+
+The unchanged `local-loss` initially had no original invocation contexts because
+its CPU implementation was still cold. Explicit non-evaluating preparation of
+that original caller, followed by complete source recapture, exposes the actual
+`linear-nb`/MSE positional conversions. One loaded-process preparation probe took
+15 ms; this is not a cold compiler benchmark or automatic production admission.
+The production-source regression checks both frames and MSE's unresolved resident
+prediction, while another test forbids input outlining/preparation during queries.
+An authentic foreign callee with the same ABI is rejected. Missing/modified unused
+completion descriptors also refuse without publishing partial parent dependencies.
+
+Independent review found no blocker in this nonexecuting scope. Reused-REPL gates:
+61 transport/inliner/construction tests / 436 assertions; six frontend-input tests /
+48 assertions; 136 bytecode/source/AD ownership tests / 1,579 assertions. These
+receipts do not qualify the broad draft or complete training execution.
+
+Fresh CI at previous exact head `528d6686` confirms remaining failures rather than
+assuming the older baseline unchanged: source job **33648** passes **142/172**
+public CUDA/HIP fixtures and reports outstanding checked-floating conversions,
+map-address evidence, allocation extents and softmax host scalar closure. Unit job
+**33650**, inspected shard zero, has two real `local-gradient-sum` errors in five
+tests / 40 assertions, retaining the two known host quotients and original checked
+Int reduction-count obligation. This single shard is not an aggregate suite count.
+The draft remains non-mergeable; no tests, public fixtures or seven-context gates
+are disabled to obtain these targeted results.
+
+### October 21 checked nested helper substitution
+
+The shared builder now retains indexed formal/actual/binder slots for authenticated
+nested imports only; ordinary ownerless expansion does not allocate this evidence.
+The construction query is factored into exact recorded builder return + imported
+body, with the existing root-origin/unchanged-argument query retaining its stricter
+requirements. A separate inliner query independently validates each recorded nested
+frame's substitution law: exact positional argument identity (including repeats),
+ordered once-only lifted initializers, unique noncapturing binders, and replay of
+the shared scope-aware substitution over the exact imported body. Significant
+metadata and floating bits participate; quoted products retain identity. An arbitrary
+builder callback cannot validate itself. No function-name or model registry is added.
+
+Independent review found malformed false-valued binders could hide an unused failing
+argument, and wrong-shaped results could throw during comparison. Both now abstain
+under explicit shape checks, with regressions for unused checked overflow, repeated
+arguments, missing/reordered evaluation, capture, shadowing, quoted products, copied
+imports/outputs and faulty callbacks. Complete composed queries use optional-owner
+transactions, so a later refusal cannot publish partial imported dependencies.
+Identity assertions cover the unchanged parent history on refused root and nested
+relations. The three affected source-transport/inliner/construction namespaces pass
+60 tests / 413 assertions in the reused capped REPL.
+
+The unchanged production `local-loss` source supplies authentic nested `linear-nb`
+and MSE frames that pass this law, even though MSE's rewritten numerical argument
+does not satisfy the separate root-only caller relation. The two `oftype` frames
+still abstain: their unlifted `(float 1.0)` / `(float 0.0)` arguments use bare cast
+names, for which the shared SOURCE constant evaluator supplies no resolution proof.
+Canonical constant folding is not substituted for that missing source evidence.
+
+These are local substitution facts, not executable-call certificates. Original
+argument/formal completion, selected callee correspondence, resident prediction
+length projection, return adaptation, and exact final expanded interval remain
+separate obligations. Flat placement remains unqualified. No source execution or
+training admission is broadened; draft CI and all eight campaign gates remain open.
+
+### October 21 fresh unchanged training-source checkpoint
+
+Subsequent count-contract investigation found and repaired an actual source-cast
+miscompile rather than broadening admission: floating/reference `int` and `long`
+must use the Clojure source overload, not raw JVM saturation/ABI coercion. The
+independently reviewed clean-main fix is PR #1553 (`a93d6f91`), with 55 tests /
+2,056 assertions passing. Draft integration `19d59fe2` preserves the earlier
+Float-cast repair; its fresh 14-namespace source-owner, inference/inliner,
+native-alias and checked-cast gate passes 198 tests / 2,186 assertions. These
+receipts establish source behavior, not a reduction-domain or training proof.
+
+PR #1552 is squash-merged as `c389b458` after all seven contexts passed on exact
+head `050e635f`. The draft also adopts main's identical scoped unit APT setup and
+bounded OpenCL retries, keeping infrastructure failures separate from compiler
+failures. PR #1553 subsequently passed all seven contexts at exact head
+`a93d6f91` and squash-merged as `5baa8b30`; this focused source-cast landing
+does not qualify the broad draft.
+
+After `ab49dcb6`, a fresh capped REPL compiles the unchanged public `local-loss`
+fixture through equation-first to portable OpenCL source, with semantic/scheduled
+programs and emitted kernels. This supersedes the earlier first-Long-initializer
+refusal as the current next-action evidence. It is not a numerical, device or
+complete training acceptance receipt.
+
+The unchanged `local-gradient-sum` still refuses with exactly two retained host
+quotients: `clojure.core//` without normal-completion evidence and `raster.numeric//`
+with a present Object/known-Double completion. Both retain original source
+evaluation. Its Float reduction correspondence remains conditional on the checked
+Int source count at its original position, with domain correspondence unproved.
+The diagnostics test's stale count of four was observed failing before updating
+it to two plus the exact operation set; no production admission was relaxed.
+The complete diagnostic namespace, including the new primal source-emission
+control, passes four tests / 28 assertions.
+
+Review also identifies the earliest caller-identity seam: immediately after
+`retained-frontend-source`, `normalize-source-bindings` rebuilds call nodes, before
+`pass-lower`'s additional normalization and inlining. Callee BodyImport alone cannot
+authenticate these rewritten caller occurrences. Any subsequent expansion witness
+must be produced by those actual reconstruction steps and compose with retained
+argument/count/conversion obligations; matching equal forms afterward is not an
+alternative. Determine the remaining quotient's exact prerequisite before adding
+another transport layer.
+
+The follow-up review recommends closing the bounded reduction contract first,
+not starting general caller-occurrence transport merely because that seam exists:
+retain the original count conversion and its domain/failure position, the array
+read bounds/failure obligations, and the physical Float accumulator payload as
+distinct from the Double quotient context. Count evidence alone must not grant
+quotient completion. Prepared-AD semantic import closure is a separate obligation;
+the body-import witness does not discharge it. Keep both quotient refusals until
+their own evidence closes. Resume more general caller transport only where the
+current unchanged workload demonstrates that it is the missing prerequisite.
+
+That prerequisite is now explicit from review of the actual count machinery:
+InputOrigins relates original frontend input to JVM emission, BodyImport relates
+the callee's body transformation, and PrefixCorrespondence covers unchanged flat
+prefixes. None recovers the original count site after uniquification, helper
+substitution and nested-reduction lifting. The minimal next implementation chain
+therefore extends the existing owner-local source-transport machinery:
+
+1. Retain actual occurrence/lexical-scope reconstruction at `util/uniquify*`, for
+   both early source normalization and later TypedSOAC normalization.
+2. Connect BodyImport to actual helper substitution with all formal completions
+   checked independently; initially admit identity completions only.
+3. Retain the actual site-to-generated-binding relation in
+   `lift-nested-scalar-reductions`. It preserves the reduction node itself, so
+   requires no new interpretation or search for equal contents.
+4. Reuse ordered scalar-input normalization to bind checked raw count and separate
+   nonnegative extent to those exact source occurrences.
+5. Compose the retained count/read obligations with physical result context and
+   quotient evidence; prepared-AD semantic import closure stays independent.
+
+No global origin registry, generated-name search, post-hoc syntax equality or
+metadata safety flag can replace this chain. A diagnostic-only count certificate
+would not close the unchanged gradient. The checked-cast repair is complete at
+its own source boundary; these reconstruction/composition obligations remain.
+
+The first actual normalization edge is implemented in `bf0e5dae`: the original
+uniquifier retains exact constructed occurrences and lexical environments, and
+the prefix consumer uses that local witness instead of rematching the normalized
+root. Copied/ambiguous occurrences abstain; historical source identity is adopted
+by downstream owners. Its 16-namespace gate passed 240 tests / 2,408 assertions,
+with two additional artifact portability controls passing nine assertions. This
+does not yet connect helper substitution or later reduction lifting.
+
+The next prerequisite records actual typed invocation argument completions in
+the existing JVM emitter observation. Three identical emission loops share one
+implementation; each observed input retains its exact emitted operand, stack
+category, reflected parameter Class and identity/coercion/checkcast branch.
+Every formal is represented, including unused ones. Guarded IFn fallbacks supply
+no such evidence, and duplicate occurrences remain ambiguous. Identity means
+identity AFTER operand emission: explicit casts, effects and Object boxing inside
+that operand remain mandatory. This is not Clojure source input conversion and
+does not authorize substitution or return conversion. New nested, unused-formal,
+physical-port and ambiguity controls pass 12 tests / 109 assertions; the final
+six-namespace affected gate passes 62 tests / 481 assertions. The independent
+review found no factoring blocker.
+
+Fresh broad-draft CI at `bf0e5dae` is NOT green: emission job 33367 reports 145
+of 172 public fixtures passing and 27 failures, including definition-observation
+instability (`raster.math/log_m_float-impl`) and portable map/fold-map lowering
+refusals. This supersedes describing the draft's remaining vendor gate as a
+single known running-variance refusal. No fixture was skipped or permission
+relaxed; the full failure inventory and source preparation/lowering repairs
+remain required before broad landing.
+
+The preparation failure is now reproduced and repaired at the helper-import
+producer, without raising the retry limit. In a fresh capped JVM, three public
+softmax-cross-entropy compile attempts exhausted their internal retries across
+nine helper receivers. Every captured conflict preserved the executable root and
+changed only `:raster.core/jit-spec`: publishing the frozen frontend owner was
+invalidating prior observations one helper at a time. Typed-source import now
+batches only historically observed, still-unfrozen frontend receivers through
+the existing separate-ownership preparation service. Original history is checked
+after the entire batch; stale output is discarded and the WHOLE producer retries.
+No snapshots are refreshed, numerical bodies invoked, JVM implementations
+promoted, or already-frozen frontier callbacks repeated.
+
+The final filtered implementation passes the same cold public reproduction on
+its FIRST compile, emitting eight CUDA source kernels; two warm repetitions also
+emit eight. This is source-emission evidence, not nvcc or device qualification.
+Fresh six-helper fixtures exceed the fixed retry budget and pass in both
+observation orders with one rejected producer attempt, unchanged executable
+roots, zero numerical calls and bounded warm callback scope. The complete seven
+affected namespaces pass 114 tests / 638 assertions. Independent review found no
+blocker and required the final fresh-process check, which passed. Portable
+map/fold-map and checked-map refusals remain separate open failures.
+
+CI at `244dfb6b` independently confirms the preparation repair: public emission
+job 33383 passes 146 of 172 attempts, with 26 remaining refusals; private fixture
+generation also refuses a checked conversion. These are not vendor compiler or
+device results. Nested scalar-lowering diagnostics now retain only fixed keyword
+contract fields (never expressions/bodies), and the existing checked-map gate
+identifies its first unmet requirement without changing admission. Representative
+unchanged probes distinguish RMS chunked's `:private-result-storage` from the
+cooperative Q8 quantizer's `:single-output-boundary`; neither can be fixed by
+pretending every checked conversion is one private final store.
+
+Reviewed next conversion order: first a general invariant-scalar motion refinement
+exercised by RMSNorm's checked `eps` then `gain-offset` casts. Its guard must mean
+the final map actually runs (both rows AND features), with prior reads independently
+proved bounded/otherwise-total and conversion order retained. Reuse InvocationPlan
+ScalarCompute and the existing owned scalar projector's exact RT.floatCast and
+matching-carrier conditionals; do not add a floating launch-expression evaluator.
+The derived guard/host step needs its own independently reconstructed source-motion
+authority: successful projection alone cannot authorize synthesized work. Test
+empty domains with invalid scalars, each/both failures, aliasing, unchanged output
+on failure and resident replay. Cooperative lanes must still all reach barriers.
+Data-dependent internal casts and batch normalization's multiple running-state
+stores remain subsequent general lowering obligations, not exemptions or skips.
+
+One smaller correspondence gap is now closed: a single write-only checked map
+may retain the existing `:host-return :effect` representation as well as `:buffer`.
+TypedSOAC already validates both against the exact physical destination; the
+schedule still requires one closed descriptor, exact write alias, independent
+read domains and one final lane-owned store. Returning Void does not discharge
+output privacy or status observation. The new private-allocation/helper/return
+composition executes through the existing EXPLICIT checked executor on OpenCL
+and Level Zero: 94 assertions cover empty domains (including an otherwise invalid
+coefficient), changed-input replay, overflow poisoning, no failed publication and
+session closure. Ordinary compiled/lower remains deliberately refused. The three
+complete affected namespaces pass 29 tests / 534 assertions. This does not close
+RMS's subsequent loop/read obligations, multiple destinations, or internal casts.
+
+### October 21 ordered host-integral qualification
+
+Late checked integral computations may now remain opaque ordered host actions
+when their dependencies close over explicitly identified public integral scalar
+parameters and earlier such actions. Local type hints cannot seed that closure;
+every binder shadows the previous identity. Retained expression/result types must
+agree, and array reads, lengths, parallel results and unclosed source obligations
+do not acquire this admission. Classification is shared with diagnostics. This
+does not move checks earlier, establish normal completion, or insert them into
+device ScalarIR. The existing source owner and actual-carrier executor still have
+to close each action before session capture.
+
+The executor projects checked Int narrowing and integral widening only from
+actual primitive Integer/Long carriers. Wrapping `unchecked-int`, unknown Object
+ports and floating inputs refuse rather than borrowing checked semantics. Actual
+plain Clojure, typed-bytecode and projected oracles agree on supported values and
+overflow exception classes with the pinned dependency; no extra backend-origin
+parameter or type registry is needed.
+
+Three complete affected namespaces pass 39 tests / 445 assertions, plus the
+frontend closure test's 12 assertions. Actual OpenCL and Level Zero checks cover
+valid, empty, negative and overflowing dimensions, transitive Int results, prior
+resident writes before host failure, changed-input replay, no suffix allocation
+after failure, replay poisoning and event/buffer retirement. Public host arrays
+are not implicitly copied back. Negative controls cover absent public provenance,
+shadowing, forged carriers and missing owners before session/materialization.
+This is a bounded step-2 prerequisite, not qualification of the MSE quotient,
+selected helper payloads, prepared-AD imports or unchanged training workload.
+
+The subsequent emission triage reproduces one fixture-contract mismatch:
+`raster.linalg.contract/contract-mm` declares Double arrays but its vendor gate
+requested Float source specialization. That fixture now requests Double; existing
+generic Float contractions retain their separate gates. The production mismatch
+refusal is unchanged. A retained-frontend namespace gate passes 6 tests / 33
+assertions, including both hardware-free CUDA/HIP emissions, all three Double
+pointer slots and rejection of the Float request. Vendor compilation and runtime
+qualification remain separate; the other aggregate emission refusals remain open.
+
+The next execution repair reuses the original source executor for flat eager prefixes
+that already possess an ordered source owner. It checks the entire executor set
+before materialization, executes each invocation occurrence once and supplies
+shared host equations from those completed results instead of reinterpreting
+their source. Missing selected-helper executors refuse before any earlier source
+action; there is no typed-interpreter retry. Copied owners and stale histories
+also refuse before materialization. Three affected namespaces pass 41 tests /
+451 assertions; after adding the historical negative controls, the complete
+scalar-source namespace passes 14 tests / 101 assertions. Local device and the
+existing ownerless unchecked-prefix controls are included in the former gate.
+
+A wider compatibility gate caught the aggregate/physical-entry mismatch before
+landing. Projection tags cannot manufacture the original field-read/unboxing
+context. Evaluator-family selection is now explicit before evaluation: validated
+aggregate projections keep their existing reference path, with present-owner
+historical guards; flat owned plans use their prepared source executors. No failed
+executor can switch families. Six affected flat/record/tree namespaces then pass
+54 tests / 576 assertions, including CSR on both local GPU backends. Fabricated
+projection metadata must still fail exact owner identity before evaluation.
+The final complete scalar-source namespace passes 14 tests / 102 assertions after
+adding that exact owner-identity control with a structurally valid projection.
+
+That reuse repair alone did not seal eager evaluator selection: removal of an
+optional owner could not distinguish an intentionally ownerless reference program
+from an edited artifact. The subsequent producer-owned eager authority now seals
+both existing evaluator families. It binds exact semantic/emitted identities,
+the original ordered owner (including nil), original namespace and collected
+definition history. The lowerer uses the sealed mode and namespace, not mutable
+policy or namespace metadata. Missing frontend provenance refuses at the producer;
+no invocation-time reconstruction or interpreter retry supplies a missing seal.
+
+The requirement is independently derived from validated sourceful host-evaluation
+obligations. Removing the seal, ordered owner and namespace together cannot opt
+out. Genuine source-free programs keep their separate contract; numerical-only
+artifacts do not acquire a process-local owner. Archival explicitly refuses a
+supplied eager owner instead of serializing or silently stripping it. The existing
+aggregate/reference family remains producer-authorized; this seals selection and
+history, not the still-unproved aggregate physical-entry/coercion correspondence.
+
+A fresh bounded REPL passes six complete flat/record/tree/device namespaces (55
+tests / 587 assertions), plus three focused numerical-only archival/source-free
+controls (23 assertions). Final ownerless-reference, foreign-source-free-owner
+and archival controls pass 3 tests / 25 assertions. Tamper cases cover removed or
+copied seals, removed ordered owner, changed/nil/removed namespace and fabricated
+projection metadata, before materialization. Removing a defrecord basis field
+correctly fails the compilation-type guard first. Independent review found no
+blocker. The complete archival namespace remains red on process-owner reconstruction
+and dependent persistent-evidence expectations; it is not qualified by the focused
+controls. Selected dimension helper execution, MSE consumers, prepared AD imports
+and unchanged training acceptance remain separate open obligations.
+
+The next reviewed execution boundary is original call-result completion, not
+another arithmetic/type registry. A non-emitting REPL query confirms the selected
+Long product's actual interface is `Object invk(long,long)`. Exact primitive input
+ports therefore do not establish a primitive Long output. The existing invocation
+observer can authenticate Method/receiver/ordered input contexts, but the retained
+return-bridge proof is FP-only. Reuse exact original binding/input occurrence
+evidence and shared value-completion machinery for the result adaptation; do not
+insert `.longValue` from a Long annotation or turn an Object payload into its
+parent's source carrier. Keep cold queries non-emitting and abstaining when their
+original context is unavailable. Foreign receivers/methods, arity/carrier mismatch,
+nullable/Object results, checked overflow/order and stale histories are required
+negative controls. Do not rewrite helper bodies universally: AD/native consumers
+must not silently become warm-only or acquire unsupported reserved terms. This
+review identifies the next implementation boundary; it does not qualify execution.
+
+### October 21 shared frontend-to-emission origins
+
+One private input-origin owner now relates original calls, lexical binding scopes
+and reductions to their actual emitted occurrences. It seals the exact input and
+output bodies, keeps separate immutable identity pairs per family and refuses
+duplicate occurrences of the same original object. Equal-but-distinct forms stay
+distinct; quotes remain opaque. The reduction-only owner/key are retired, not
+retained as a second compatibility path. All three observers delegate to existing
+physical bytecode validators. The shared frontend boundary authenticates the
+original selection and whole historical emission; editable receiver/definition
+maps cannot supply another implementation's evidence. No query emits or executes
+code, reparses source, grants an unboxing or proves numerical admission.
+
+The origin gate passes 10 tests / 95 assertions in the bounded REPL, covering
+actual Object results despite Long hints, family isolation, exact body identity,
+clones, ambiguity, quotes, foreign selections, stale histories and cold queries.
+Independent implementation review found no blocker. A wider four-namespace run
+first reports one cold selected-host fixture error (`:unclosed-jvm-source-owner`);
+the isolated test and warm rerun pass, with the latter reporting 52 tests / 538
+assertions. That warm result does not qualify the initial cold failure, which
+remains under investigation. Original selected-call execution and unchanged
+training acceptance remain open; this is correspondence infrastructure only.
+
+The fresh diagnostic confirms the cold fixture's optional selected Method was
+absent while its source policy was valid. That host-execution test no longer
+borrows the global numeric operation's dispatch table: it authenticates its own
+registered fixture operation, retaining the deliberately misleading nominal
+metadata and all original receiver, failure-order and no-redispatch controls.
+The same gate order in a fresh 900 MiB REPL then passes the origin namespace
+(10 tests / 95 assertions) and all four physical-observation namespaces (52 tests /
+539 assertions). No production guard is weakened or extra warm-up lookup added.
+The existing ordered-source namespace separately passes 15 tests / 112 assertions.
+
+One producer-owned flat-prefix correspondence transaction is now implemented at
+`equation-first/compile`, spanning the authenticated frontend, source normalization,
+pre-SOA passes and constructed invocation steps. It validates the complete bounded
+evaluated prefix under explicit capture-avoiding renaming, including operand order,
+preceding initializers, literal bits and metadata obligations, then binds exact
+original scope/ordinal/call and exact constructed `ScalarCompute` objects. Normalized
+binding IDs or matching printed expressions alone cannot authenticate an original
+bytecode context. Transformed/helper-expanded prefixes, nested scopes, originally
+shadowed parameters and aggregate projections abstain. Retained declarations may
+elaborate lexical-reference tags; only the existing canonical core allocator table
+owns added allocation-result tags. Neither is primitive carrier evidence.
+
+The correspondence stays process-local inside the existing ordered source owner;
+it is not another cache, registry, interpreter or portable IR annotation. The first
+consumer enriches a missing-executor refusal with its authenticated original source.
+Execution remains refused: ownership of the original occurrence does not prove its
+Method, operand completion, Object payload, result adaptation or numerical legality.
+Existing source-free paths remain independent and no fallback gains admission.
+
+Independent review found a capture counterexample where an earlier initializer
+reads a global whose name is a later binder. The verifier now collects free names
+sequentially, not by subtracting all binders up front. Exact future-binding and
+self-initializer counterexamples, capture/shadowing controls and unchanged-name
+positives exercise that repair. Re-review found no remaining blocker. A fresh
+900 MiB REPL passes the prefix, ordered-source and original-frontend namespaces
+(31 tests / 262 assertions), plus existing checked-source-owner/native-alias gates
+(33 tests / 210 assertions) and two focused source-free controls (20 assertions).
+The broad draft remains red in CI, including checked floating conversion emission;
+these bounded receipts do not qualify it or the unchanged training workload.
+
+The actual small selected-product probe demonstrates two distinct obligations:
+the original initializer is an Object-returning `invk`; the normalized scalar
+region additionally carries `invocation-source/scalar-equation-source`'s explicit
+Long result-materialization conversion. `scalar-result` and all pre-SOA passes
+retain the original product computation in this probe; do not blame them for
+inventing a widening or collapse the result ABI conversion into original source.
+An unchanged training recheck still refuses forward `local-loss` at the missing
+ordered executor and `local-gradient-sum` at direct semantic coverage. Neither
+workload is qualified by the ownership and physical-observation gates above.
+
 ### October 21 checked integral source conversions
 
 Tracing reduction count obligations exposed a JVM source-cast miscompile: an
@@ -55,6 +3364,299 @@ requested order, duplicate collapse, warm reuse, no numerical execution, unchang
 unrequested pending inputs, empty selection, pre-callback refusal, nested ownership
 and whole-producer retry after promotion.
 
+### October 21 retained physical-observation dependencies
+
+Successful original-frontend call, binding and reduction observations now retain
+the exact authenticated emission's historical guard in their enclosing producer.
+The existing emission guard owns recursive static dependencies and nested producer
+guards; it is not reconstructed from the returned physical observation. The shared
+query boundary commits authentication, observation and retention atomically through
+the existing optional-proof transaction. Refused queries leave the original parent
+collector unchanged. Repeated queries deduplicate by exact emission identity inside
+that owner, without a global registry or shape/source-equality cache.
+
+This closes a freshness gap, not a semantic import-closure or execution gap.
+Emission maps do not currently publish preparation's source-body/unclosed-import
+obligations. Those still require their original preparation owner; a physical
+observation does not grant selected scalar execution, primitive unboxing, helper
+purity or prepared-AD closure. The training acceptance threshold is unchanged.
+
+Independent review found no blocker. Loaded-code checks in the reused capped REPL
+pass 30 tests / 178 assertions for frontend correspondence and definition
+preparation, plus 51 tests / 348 assertions for prefix/source owners and native
+aliasing. The transitive-history regression mutates a real emitted helper absent
+from the parent definition snapshot index and confirms rejection after the query
+returns. Existing copied/foreign/cold occurrence controls remain passing. These
+are affected loaded-code receipts, not fresh-JVM or full-CI qualification.
+
+### October 21 explicit owned-definition renewal
+
+The existing preparation algorithm now serves two explicit entry points:
+pending-only preparation retains its default/all-pending and warm-skip behavior;
+owned-definition preparation requires an explicit ordered vector and asks the
+existing bytecode owner to validate or renew each selected receiver, including
+warm ones. Both validate the entire selection against original observations
+before callbacks, compile under separate ownership and check the original owner
+afterward. A changed batch requires a fresh whole-producer attempt. Neither API
+refreshes observations or acquires physical selection/execution authority.
+
+Actual emitter evidence refines the lifecycle: promoting a callee does not always
+invalidate an inlined caller. Current caller emissions remain identical. When a
+real retained helper-source dependency changes, the owner emits a new caller
+implementation from frozen source and the old emission guard rejects. Preparation
+must precede importing occurrence guards; an already-stale enclosing owner is
+rejected, not healed. Source-prefix execution remains a subsequent obligation.
+
+The reused capped REPL passes the complete affected 34 tests / 233 assertions,
+plus ordered/prefix/checked-source gates (30 tests / 208 assertions). The actual
+emitter lifecycle regression uses isolated fresh declarations and also passes two
+consecutive reruns without namespace reload (60 assertions), with no numerical
+body execution. These are loaded-code receipts, not full-CI qualification. The
+selective-preparation prerequisite PR's unit job 33178 failed during apt repository
+installation (git-core PPA HTTP 503), before tests; this is an infrastructure
+failure and does not qualify the PR for merge.
+
+### October 21 source-prefix producer preparation
+
+Equation-first compilation now explicitly prepares eligible original prefix calls
+after correspondence closes and before importing physical occurrence guards.
+The existing frontend-selection validator authenticates the caller; signature-only
+queries establish primitive Long public ports and exactly registered callees.
+This first subset accepts direct original `invk` initializers with those unchanged
+public symbols or Long literals. Nested expressions, local/renamed operands,
+reference formals, recursive receiver selection and unowned prefixes abstain.
+All eligible selections close before the first callback. Preparation runs callees
+in original occurrence order, then their actual caller, through the shared owned
+renewal service. Changed snapshots escape to the whole-compilation retry.
+
+Correspondence, call and binding queries still perform no preparation. The new
+phase grants no selected-call execution, result unboxing or purity: the selected
+product fixture still refuses lowering at its missing original-source executor.
+Independent review found no blocker. The reused REPL passes 8 prefix tests / 71
+assertions and 74 ordered/source-owner/preparation tests / 456 assertions. An
+actual nested-argument control retains valid prefix correspondence but produces
+zero callbacks and no retained speculative selections. The isolated emitter
+lifecycle tests above supply the separate cold/renewal evidence; accepting a warm
+or cold preparation count alone does not prove a cold path ran. Fresh-JVM/full-CI
+qualification and unchanged real training acceptance remain outstanding.
+
+### October 21 original implementation return observation
+
+Original-frontend return bridges now use the same authenticated whole-emission
+observation transaction as calls, bindings and reductions. A successful bridge
+query retains the module's full historical dependency guard; a cold, copied,
+edited or ownerless query abstains without compilation or speculative retention.
+The interface result remains Object, separately from the conditional primitive
+payload observed at its actual boxing edge. No unboxing, purity, totality or
+selected-call execution is granted.
+
+Independent review found no blocker. A single freshly started 900 MiB REPL passes
+the accumulated prefix, preparation, frontend correspondence, ordered/scalar
+source-owner and native-alias gates (103 tests / 720 assertions). A subsequent
+focused test strengthens the bridge-first/empty-owner control (1 test / 10
+assertions). This is fresh local affected-code evidence, not a whole-suite/vendor
+CI or real-training acceptance claim.
+
+The reviewed next executor must consume the original direct initializer, its
+actual invocation result carrier and matching binding completion, the callee's
+owned return bridge and the independently validated Long materialization. An
+Object-returning interface alone is insufficient: actual invokedynamic may return
+a primitive, and a source binding may unbox. Preserve the actual receiver/Method,
+original argument order and returned reference, plus truthful Object/payload facts
+and caller/callee historical guards. Unknown inputs or missing correspondence
+continue to refuse; prepared-AD import closure remains a separate obligation.
+
+### October 21 original selected-call execution and constructor order
+
+The source owner now consumes that observation for the bounded direct-global
+Long-input/boxed-Long-result subset. It validates the original caller invocation
+and binding completion against the independently selected callee and its owned
+return bridge. Execution calls the captured actual interface Method, preserving
+argument order and the returned Object reference; the conditional Long payload
+does not relabel the physical result as primitive. Missing, stale or inconsistent
+observations, nested operands and unsupported carriers still refuse before any
+source computation. No new function/type registry or `compute_static` shortcut is
+introduced. This closes a real prefix executor, not the helper-expanded MSE or
+prepared-AD import obligations.
+
+Qualification exposed a distinct eager-lowering defect: a source array constructor
+can have no invocation-plan step, so iterating steps alone skipped its constructor
+count check. Pure specialization now walks retained source order and reuses the
+ordered runtime's count/shape validation. Negative counts fail before later scalar
+work. Wrapping constructor counts that cannot match retained mathematical extents
+refuse rather than producing an incorrect native shape. This creates no storage,
+acquisition acknowledgement, initialization or completion evidence. Used host or
+realized state is rejected, and terminal materialization cannot execute unconsumed
+scalar/shape computations after bypassing their source positions.
+
+Independent review found no remaining blocker in the executor or count repair.
+The reused-REPL prefix/shared ordered-runtime/materialization/source-order gate
+passes 53 tests / 490 assertions. A freshly started capped REPL then passes all
+eleven affected prefix, preparation, source-owner, native-alias and shared ordered
+runtime/materialization/source-order namespaces: 148 tests / 1,142 assertions.
+Both real local devices are available. The new OpenCL and Level Zero tests pass
+2 tests / 36 assertions: changed input sizes 0/1/3, two replays each, independent
+JVM outputs, zero source calls while binding, exactly one per replay and closed
+sessions. No device test was skipped. These bounded receipts do not qualify the
+broad draft's unrelated CI or unchanged-training refusals.
+
+The complete affected ordered-root namespace subsequently passes 4 tests / 462
+assertions on these real devices, covering existing source allocation, failure
+ordering and replay controls as well as the new selected-prefix tests.
+
+An unchanged training recheck confirms that `local-loss` still refuses its first
+helper-expanded scalar occurrence: `rows * 1` imported from `linear-nb`. The final
+ScalarCompute contains a logical Long conversion around the selected call, but
+has no original-root prefix correspondence. `local-gradient-sum` separately
+refuses two retained source evaluations (core division and numeric division),
+while retaining its conditional Float reduction correspondence and unproved
+source-count-domain obligation. These are failures, not qualified training results.
+
+### October 21 source qualification history prerequisite
+
+The existing body qualifier now accepts an optional observer for its actual
+symbol, namespace and alias resolution decisions. Inliner body qualification and
+its adjacent nonprimitive formal-tag qualification both retain these decisions
+in the existing compiler owner. Resolved Vars reuse definition snapshots at the
+original lookup namespace/symbol. Classes, misses and namespace/alias identities
+use private immutable producer guards, including detached/replaced namespace
+targets. Optional refused queries discard these observations; no second symbol
+scan, whole-namespace snapshot or executable registry is introduced.
+
+Review exposed a real qualification defect: an alias can have the same spelling
+as an already loaded global namespace. Qualification must resolve in the original
+source namespace first. It now preserves that alias target, including a missing
+member: the latter must remain unresolved instead of becoming a successful call
+in the unrelated global namespace. Independent source-versus-consumer eval tests
+cover both cases. Observer failures propagate outside lookup exception handling.
+
+Independent review finds no blocker. Focused controls include Class/static method
+owners, structural `new`/`catch`, namespace recreation, changed aliases/imports,
+lexical/quoted opacity and actual inliner formal-tag import invalidation. The
+completed affected qualifier/inliner, preparation, prefix, retained-frontend,
+source-owner and native-alias gate passes 167 tests / 1,060 assertions in the
+capped REPL with freshly loaded production classes. This retains lookup history;
+it grants no formal argument completion, helper-expansion correspondence or source
+execution. Compile-overhead and full exact-head CI remain separate qualification.
+
+PR #1550 is squash-merged as `63a5a97c` after all seven exact-head CircleCI gates
+passed. PR #1552, the independent observation-checked explicit preparation API,
+now targets main at `1ee2fb0b` and requires its own new seven-gate run. The broad
+draft's emission job `33256` still refuses the known checked Double→Float
+running-variance update conversion; it remains unqualified and must not merge.
+
+### October 21 retained helper-body import
+
+The inliner now uses one shared source-transport transformation for its existing
+multi-form wrapping, alpha-renaming and qualification. An authentic helper frontend
+and active compilation owner retain the exact input/output body objects, ordered
+metadata-preserving binder renamings and import-local dependency history. Legacy
+ownerless transformations remain ownerless; a copied body cannot reconstruct a
+witness. An unrelated enclosing dependency does not contaminate an independently
+adopted helper import.
+
+The imported history includes a lightweight authenticated source-entry identity
+guard, not the intermediate ASTs. This catches equal-but-copied raw body metadata
+even when ordinary metadata equality and direct Var snapshots still agree. The
+downstream publication test checks that refusal without querying the import again.
+Queries never rerun qualification or refresh historical observations.
+
+Independent review finds no blocker. A fresh capped REPL passes the focused
+namespace: 12 tests / 47 assertions. Restarting the previous REPL was necessary
+because reloaded protocol and implementation classes had different interface
+identities; production guards were not relaxed. The complete 12-namespace affected
+gate passes 179 tests / 1,107 assertions in that same fresh REPL, covering source
+qualification, inference/inlining, preparation, ordered source owners and native
+alias execution. Full draft CI and end-to-end training remain separate gates.
+
+This is body-import evidence only. It supplies no formal argument completion,
+call substitution, final-step correspondence or permission to execute an imported
+body. Unchanged training and the draft's checked floating-conversion refusal
+remain open. The next transport below must consume this relation at actual call
+expansion rather than reconstructing it later.
+
+PR #1552's previous head passed six CI gates but its unit gate failed before tests
+on two shards after Git PPA HTTP 503 retries. Commit `050e635f` scopes unit APT
+prerequisites to the image's main source list and makes update failures fatal.
+All seven contexts must pass anew on that exact head before merging.
+
+### October 21 actual scoped normalization reconstruction
+
+The shared scope uniquifier now optionally observes its actual reconstruction:
+original node, constructed node, visible lexical renaming and bound names. The
+callback cannot replace the result; independent invocations do not inherit it,
+and both quoted-data spellings remain opaque. Existing normalization arities keep
+their output contract and allocate no observation events when tracing is disabled.
+
+Source transport reuses one guarded binder allocator and local-history transaction
+for helper import and authenticated frontend normalization. Its owner-local
+normalization witness requires unique original/constructed identities. Copied,
+ambiguous, ownerless or malformed queries supply no authority. Queries adopt the
+original lightweight source identity/history; they do not rerun normalization or
+refresh dependencies. This records a transformation, not type inference or
+permission to execute, differentiate, move or erase source work.
+
+Equation-first keeps the witness local and the prefix verifier consumes it instead
+of re-matching the normalized root structurally. Existing independent represented
+source/final-step checks remain. The internal `source-prefix/close` now requires
+this witness; there is no old matching fallback. Public `deftm` semantics are
+unchanged. Prefix queries into a fresh publication owner also retain exact source
+identity. No opaque token is added to options, IR metadata or portable artifacts.
+
+Independent review finds no blocker. The reused capped REPL's complete affected
+16-namespace gate passes 240 tests / 2,408 assertions, including unchanged training
+diagnostics. Two additional artifact controls pass 9 assertions: numerical-only
+compilation still seals/encodes/decodes/opens and lowers equivalently, while
+process-local source owners remain explicitly refused. Ambiguity controls exercise
+both duplicate output and one original paired with distinct outputs.
+
+This closes the first reconstruction seam only. Helper argument completion and
+substitution, later normalization/lifting, original count-to-extent correspondence,
+read obligations, quotient execution and prepared-AD closure still require the
+remaining chain above. Neither this receipt nor green focused tests qualifies the
+broad draft for merge. PR #1553 is now squash-merged as `5baa8b30` after all seven
+exact-head contexts passed; the checked source-cast prerequisite is on main.
+
+### Next producer-owned helper-expansion transport
+
+Independent review of the actual inliner locates the missing relation:
+`resolve-walked-body-input` owns the callee's authentic frontend transiently, then
+returns a hygienic/qualified body without retaining its owner or renaming recipe.
+`inline-invk` and the binding inliner apply call-by-value substitution, but that
+mechanism preserves actual argument types, not formal argument completion.
+Primitive/array symbols may be directly substituted, including unused formals.
+Neither generated binder names nor structural expression equality recover the
+original call's semantics after this boundary.
+
+The next slice must retain an owner-local expansion transaction at construction:
+
+1. Keep the exact original caller occurrence, selected callee frontend and actual
+   hygienic renaming/substitution recipe. Compose nested witnesses through their
+   immediate parent rather than globally searching for matching expressions.
+2. Reuse shared scope utilities, argument-substitution mechanics and ordered-call
+   contracts, while checking argument order, single evaluation and **all** formal
+   completions independently. Initially admit identity-completion cases only;
+   conversions and unsupported/effectful arguments remain explicit obligations.
+3. Validate the constructed expansion before connecting exact final invocation
+   steps to original callee occurrences through the existing prefix authority.
+   Carry caller/callee historical guards in the existing observation collector;
+   do not add an executable registry, mutable public form certificate or hash
+   match that can authorize copied source.
+4. First qualify diagnostic-only transport with unused failing conversion,
+   reordered/duplicated arguments, shadowed locals, copied expansion and stale
+   callee counterexamples. Then use the existing source executor/count path for
+   execution and rerun unchanged `local-loss` and training composition oracles.
+
+This is one staged relation for ordinary helper composition, not a special
+`linear-nb`/MSE rewrite, a permission to simplify checked multiplication by one,
+or a relaxation of prepared-AD import closure. Real training acceptance remains
+the gate; diagnostic provenance alone does not close campaign items 3 or 5.
+
+PR #1551 (bounded apt acquisition retries, without softening failed prerequisites)
+is squash-merged as `4bb40cb1` after all seven exact-head CircleCI contexts passed.
+PR #1550 now includes that prerequisite at head `0c0af56f`; its new CI run must be
+qualified independently of the old head's six successes and pre-test HTTP failure.
+
 ### October 21 explicit owned-definition preparation
 
 The preparation service now shares one observation-checked batch implementation
@@ -74,6 +3676,7 @@ selection, ordering, empty/warm behavior, ownership and retry; they do not prove
 actual bytecode renewal, source correspondence or execution admission. Fresh
 clean-branch qualification also passes 12 tests / 61 assertions in a 256 MiB JVM.
 Exact-head CI qualification remains a separate gate.
+
 ### October 21 primitive boxing-edge correspondence
 
 The existing emitter-owned return bridge now records audited primitive Long
@@ -101,6 +3704,11 @@ because the git-core Ubuntu PPA returned HTTP 503. That is infrastructure eviden
 not an OpenCL pass or a compiler regression. A new exact-head qualification is
 required before merge; successful contexts on the earlier head are not reused.
 
+The retry at `fbdcf5e1` passed all seven exact-head CircleCI contexts. PR #1549
+was squash-merged as `70e643be` and integrated into the campaign branch. The
+unrelated larger ownership draft remains held; the foundation's greens are not
+its qualification.
+
 ### October 21 primitive math completion
 
 Eight audited primitive FP math rows (sqrt, floor, sin, cos, tan, exp, log and
@@ -117,6 +3725,11 @@ scalar-region lowering and KernelBody validation. These are local correctness
 receipts, not vendor runtime, performance or broader draft qualification. The
 separate draft's checked-map device cases additionally exercise final Float
 overflow and publication; that machinery is not part of this independent slice.
+
+The independent math slice landed as PR #1548 (`ba675571`) after all seven
+CircleCI contexts passed its reviewed head. Fusion robustness landed as PR #1547
+(`97ea226b`) under the same exact-head gate. Neither green slice qualifies the
+broader source-ownership draft.
 
 ### October 21 independent fusion robustness
 
@@ -135,11 +3748,1813 @@ propagation. This is proof-failure robustness, not new IEEE conversion admission
 or a kernel-performance result. The separate source-ownership draft's concrete
 IEEE conversion case and its wider qualification remain outside this landing.
 
-### October 19 active continuation
+### October 20 active continuation
 
 The original eight obligations below remain open. Execute bounded, reviewed
 verticals and land exact-head green PRs without waiting for another approval;
 keep one memory-bounded REPL and delegate full suites/vendor compilation to CI.
+
+#### October 21 qualification-first adjustment
+
+The eight obligations remain unchanged. Broader inspection of draft CI found
+multiple shared failure categories, not just the four training-scalar refusals:
+checked floating conversion realization, late source actions, process-local owner
+archival, normalized AD invocation contexts and source/JIT lifecycle. The review
+does not establish that every CI failure belongs to those categories. Freeze new
+admission families and repair these production boundaries before extending the
+helper-payload projection further.
+
+The fixed-head `fe439ca4` unit report across sixteen failed shards totals 7,306
+tests / 87,115 assertions, with 124 failures and 156 errors. Group by the first
+structured refusal and its producer, not the generic validator stack line or
+workload name. Some old positive fusion fixtures expect IEEE behavior from a
+checked source `float`; they require explicit numerical intent, not relaxed
+fusion validation. Other categories still require production repairs.
+
+The public ordered route (`90f13070`) now selects the existing owned executor only
+for reconstructed late host actions. Prefix-only programs remain concrete; source
+owners, executor coverage, role/layout/alias gates and unobserved checked-stage
+refusals remain mandatory. Deferred artifacts do not expose a single static
+LinkPlan/certificate or become generally composable after execution. Local receipt:
+24 tests / 211 assertions, including actual OpenCL and Level Zero replay, changed /
+omitted inputs, state/constant capture, output lifetimes and late checked overflow.
+An initial test incorrectly expected ordered behavior from a prefix-only fixture;
+the corrected fixture has a genuinely late allocation. This is not a performance
+or multi-device receipt.
+
+Do not extract that route alone onto main: the attempted cherry-pick exposed
+missing original-frontend/source-owner and checked-stage prerequisites. It was
+aborted without dropping guards or opening a PR. A safe independent source-ownership
+slice is medium-sized and needs its own clean-main workload qualification. Until
+then, keep activation pending on the draft; first repair broad qualification,
+then checked-result realization, archival reconstruction and helper/AD import
+closure, without replacing checked casts by IEEE conversions.
+
+The next reproduced lifecycle repair distinguishes nominal interface spelling
+from physical receiver evidence. Frozen source identity canonicalizes a Symbol /
+String name, while emitted interface representation remains unchanged for AD
+registry consumers. Direct successful bytecode publication also clears the
+pending JIT spec with its old stub owner in the same metadata update. Rejection
+retains that exact pending spec; neither operation refreshes old observations or
+claims transactional concurrent dispatch publication.
+The interface-registry review caught and rejected a broader emission-field
+normalization: existing AD consumers intentionally retain that representation.
+The final fix changes only nominal lineage/comparison and successful pending-spec
+retirement. Fresh lifecycle plus paired/owned helper tests pass 51 tests / 503
+assertions; the final pure metadata-update form passes the focused lifecycle gate
+again (17 / 175). This repairs reproduced failures, not the remaining AD import,
+checked-conversion or full-draft qualification categories.
+
+The next reproduced ordered-realization failure was preflight ordering, not a
+missing observation capability: `run-ordered-stage!` dereferenced a nil executor
+before delegating the checked entry's owner guard. Checked entries now validate
+record/state shape and literal-true ownership/observation flags first; actual
+historical source ownership still precedes storage acquisition. Ordinary entries
+retain their source guard before acquisition. Negative tests forbid acquisition
+for malformed executors and for a structurally plausible record missing its source
+owner. The affected realization/checked-execution gate passes 12 tests / 271
+assertions, including real OpenCL and Level Zero success, failure-order and private
+generation checks. This is guard repair, not a new checked-conversion family.
+
+Two raw-result-cast tests still expected the retired raw cast spelling despite
+the canonical scalar-conversion term. They now assert its exact source/target
+width, source operation, rounding and overflow policy while retaining inner and
+nested fold precision checks. Checked Double-to-Float still traps; Float-to-Double
+is exact; unchecked-IEEE and lexical-shadowing controls remain unchanged. Review
+confirmed no removed precision coverage; the focused gate passes 4 tests / 19
+assertions. This test-only correction is not checked-cast execution support.
+Two normalized-AD negative tests also expected later refusal sites. Tampered
+operation metadata now fails operation validation before certificate comparison;
+a wrong-width use-site declaration fails declaration validation before sum-step
+validation. Their exact reasons were updated without accepting alternatives or
+removing malformed cases. Review confirmed the earlier refusals; both full test
+namespaces pass 23 tests / 182 assertions. Production validation is unchanged.
+
+Fresh qualification at `fe439ca4` still fails unit, OpenCL and fixture emission;
+setup/build success does not qualify the draft. The public clone fixture exposes
+an independent generated-storage mismatch: clone normalization invented a generic
+`alloc-like` call with no selected implementation. Generated copy scaffolding now
+uses the existing dtype authority's concrete primitive constructor, retaining the
+source length evaluation, fresh allocation and identity map. The allocation
+validator is unchanged. The affected frontend, public compile/link and actual
+OpenCL/Level Zero clone gates pass 140 tests / 876 assertions, including primitive
+widths, empty/changed inputs and null failure ordering. Packed-half scalar copying
+remains refused. This closes that allocation mismatch, not the checked-exponential
+overflow-boundary proof or the remaining broad qualification failures.
+The clone repair was independently extracted and fresh-main qualified (133 tests /
+819 assertions), then squash-merged as #1546 at `b0cef3df` after all seven exact-head
+CI checks passed.
+
+The repeated-dense-map device failure was a contract mismatch in its checkpoint
+fixtures. IEEE checkpoint cases now explicitly use `unchecked-float`, with finite
+rounding and overflow-to-infinity controls. Separate checked `float` epilogues,
+including Double-to-Float-to-Double, refuse before invoking the legacy SegMap
+emitter and retain the original portable decline. The existing final epilogue
+guard already refused these cases; no returned-artifact miscompile was established.
+Independent review found no blocker, and the affected contraction/body plus actual
+OpenCL/Level Zero gate passes 29 tests / 451 assertions. Other legacy fallback
+decline classes remain outside this bounded guarantee.
+
+Shared positive map/map and horizontal fusion fixtures now use the existing inner
+`unchecked-float` pattern, retaining the outer Float storage cast. Executed raw-bit
+source/fused comparisons include overflow; checked-cast no-fusion and failure-before-
+write controls remain unchanged. The focused gate passes five tests / 27 assertions.
+The full fusion namespace remains unqualified: its preceding run had 24 failures
+and nine errors, including separate terminal-frontend refusals. Do not replace a
+nil frontend program with an invented SOAC value or waive source completion.
+The internal `pmap` macro's bare-cast allocator and materializer cast tables also
+need later reconciliation with the shared descriptor/dtype authorities: putting
+`unchecked-float` directly in that cast slot currently disagrees with runtime
+storage. The existing inner-expression pattern avoids extending that inconsistent
+surface while qualification is red.
+
+Fresh terminal-roundtrip qualification exposed a missing execution root, not a
+reason to weaken owner coverage. A removable scalar reduction extent was retained
+as a host-only graph-shape proof equation, but no buffer shape used it and prefix
+pruning omitted its evaluator. Prefix construction now roots only results whose
+equations already have literal-true `:host-only` and `:graph-shape-definition`.
+Canonical source correspondence, dependency pruning and executor checks remain
+unchanged. The fresh-process gate passes eight tests / 135 assertions, including
+actual OpenCL/Level Zero direct and scaled Double-to-Float-to-Double checkpoints,
+zero rows, changed replay, overflow/publication and existing checked-prefix controls.
+The complete affected invocation/source-order/terminal-owner namespaces also pass
+46 tests / 310 assertions; neither receipt qualifies the whole draft.
+The source oracle is JIT-settled before its owner is captured; an earlier warm REPL
+also retained an obsolete fixture signature, so only the fresh receipt qualifies.
+
+The next bounded terminal extension now distinguishes numerical-result exports
+from public scalar argument ports. Existing `:parameters` remain exactly the
+numerical export/output vector; optional `:public-scalar-parameters` carry the
+original argument ordinal and declared Double/Long dtype. Semantic revalidation
+derives those ports from the actual InvocationPlan parameters, never the contract's
+own assertions. At least one numerical dependency remains required; arrays,
+unsupported carriers, arbitrary captures and shadowed public captures refuse.
+
+Owner compilation authenticates the retained frontend's exact implementation,
+full parameter order and actual primitive body-entry carriers. Independent review
+caught an initial reliance on editable frontend `:definition`; the shared
+`frontend-body-entry-carriers` helper now binds physical facts back to the opaque
+owned implementation and independently selected entry. Same-source/order foreign
+entries and a real Object-ABI input with a claimed logical Double type refuse.
+No new type registry or runtime carrier inference was introduced.
+
+Projection and invocation share numerical-then-public argument order. Runtime
+checks all public carriers before requesting numerical exports, then downloads
+only numerical results. Ordered host/numerical calls now share the static path's
+declared-program scalar projection: public source-only arguments remain in the
+invocation environment, not the emitted ABI. Undeclared-port checks remain intact.
+
+The fresh-process focused gate passes five tests / 186 assertions, including
+OpenCL and Level Zero mixed Long/Double arguments across an array slot, zero rows,
+changed-input replay, checked overflow and exactly one numerical download per run.
+Four complete affected ownership/lineage/invocation namespaces pass 58 tests /
+451 assertions, including malformed ordinal/type/symbol and pre-export rejection.
+The Object-ABI negative was added in that same fresh process without changing any
+existing fixture signature. These receipts do not qualify the full draft or
+establish resident training composition; the explicit host-result API and all
+ownership/publication guards remain required. Draft CI is still red in broader
+unit/emission qualification; do not merge it based on these local receipts.
+
+The existing ordered-prefix scalar preparation now uses that same authenticated
+entry projection instead of independently consulting editable frontend definition
+fields. Missing physical evidence still abstains after ownership/history checks;
+a nonnil foreign entry still throws. This preserves optional capability behavior
+without treating stale or contradictory evidence as absence. Required executor
+coverage remains the runtime gate; an owner with no prepared scalar executor is
+not permission to execute an unsupported source action. Independent review
+confirmed the shared boundary and caught the needed absence/contradiction split.
+The bounded REPL's four affected lineage/checked-owner/terminal-owner/source-order
+namespaces pass 57 tests / 440 assertions, including both required and optional
+foreign-selection refusal and missing optional physical evidence.
+
+Fusion qualification now separates nine checked terminal source shapes from the
+pure scalar algebra. The checked shapes retain exact ordered source and explicit
+declines; Double-only controls retain nonidentity transforms, host boundaries,
+aliasing and shared-use obligations. IEEE map fixtures declare that intent in
+their body, preserving the outer storage cast. Alias and intervening-write
+negatives have matching fusible counterfactuals rather than passing vacuously
+because a conversion independently blocks motion. No source cast was globally
+reclassified as pure.
+
+This exposed an actual optional-optimization failure: a legal typed IEEE map
+feeding a reduction/scan projected its canonical conversion back to source during
+algebra recertification, where generic effect analysis could not prove the element.
+Fusion now abstains only for that exact local missing-element-effect request and
+retains the complete materialized boundary; invalid algebra, malformed conversion,
+source/history failures and unrelated exceptions still propagate. Later legal
+candidates are attempted and only successful rewrites affect the counters.
+Independent review found no blocker. Primitive operand correspondence through
+canonical conversion algebra remains a performance capability gap: valid policy
+attributes alone are not proof of the operand's physical carrier. Do not solve
+that gap by erasing Object/reference completion or relaxing source purity.
+
+A fresh single 900 MiB REPL passes six complete affected namespaces (125 tests /
+860 assertions) and four actual OpenCL/Level Zero scalar-observation regression
+cases (4 tests / 206 assertions). The complete fusion namespace's preceding
+focused run passes 58 tests / 366 assertions. These receipts supersede its earlier
+local failures, not the broader draft's red CI. The independent fusion-abstention
+repair is being qualified separately on clean main so it need not wait for the
+source-ownership draft. Remaining production failures include training scalar
+ownership, checked conversion maps and normalized AD/source lifecycle; none is
+declared complete by fixture consolidation.
+
+The independent optional-fusion repair landed as #1547 (`97ea226b`) after all
+seven exact-head CircleCI contexts passed. Its clean-main tests inject missing
+element evidence into otherwise supported Double programs; they do not establish
+clean-main IEEE conversion admission. The draft retains its separate concrete
+IEEE map/reduction/scan regressions.
+
+The next checked-map repair explicitly marks eight audited primitive FP math
+operations (sqrt, floor, sin, cos, tan, exp, log and pow) as nonthrowing only after
+operand completion. It does not mark a descriptor factory, infer source carriers,
+permit Object unboxing, alter target-library accuracy or discharge final checked
+Float storage. KernelBody verifies operand types, exact arity and math realization
+independently; the arity check now precedes analyses requiring nonempty operands,
+so malformed zero-argument intrinsics produce a structured refusal. Independent
+review found no blocker in either boundary.
+
+A fresh 900 MiB REPL passes three complete affected namespaces (28 tests / 459
+assertions), including existing physical-return-payload negatives, plus two actual
+OpenCL/Level Zero checked-equation cases (2 tests / 102 assertions). The latter
+exercise exp with finite values, NaN and overflow, preserve observation before
+publication, and check graph/event retirement. Overflow is checked against the
+actual target result; implementation-defined library accuracy is not a promise
+of identical JVM/device decisions arbitrarily near a conversion threshold. These
+bounded receipts do not close the draft's other conversion, training, persistence
+or AD failures.
+
+#### Reviewed next vertical: source correspondence through resident training
+
+This is the October 20 planning checkpoint, not a new implementation or qualification
+receipt. A read-only independent review studied the actual scalar, AD import, resident
+scheduling and training-fixture machinery. It corrected the earlier sequence: closing
+the four scalar diagnostics is necessary but insufficient. Prepared reverse AD still
+records an unclosed semantic import, which ordered source compilation must reject.
+
+The next vertical must keep these obligations separate:
+
+| Boundary | Required evidence | Evidence that is insufficient |
+|---|---|---|
+| Source ownership | Original lookup, definition/rule history, parameter plan and source policy | Equal syntax, current tags or a refreshed snapshot |
+| Source to typed computation | Corresponding operations, actual input/storage facts and all conversion/checkpoint positions | A successful typed lowerer alone |
+| Conditional result | Value domain after original evaluation completes | Proof that reads, unboxing or conversions cannot fail |
+| Scheduling | Required-evaluation occurrence/order, legal numerical association and dependency graph | Unused result, read permission or logical dtype |
+| Physical realization | Actual JVM carrier or explicit resident payload representation | A logical Float/Double result annotation |
+| Lifetime | Exact views, initialized storage, ownership and completion/lease evidence | Allocation existence or nonblocking completion observation |
+
+Implementation/landing sequence:
+
+0. **Establish the gate and baseline.** At the planning checkpoint, exact PR #1539
+   head `11852323` had setup/build success and failing unit, emission and OpenCL checks.
+   The evolving branch remains draft and unqualified; each later head needs its own
+   qualification, and absent vendor successes cannot be assumed. Classify those
+   failures and repair affected gates before enabling new admission. Strengthen the
+   existing training oracle's paired `map` comparison: unequal lengths must fail,
+   and this finite fixture must explicitly reject nonfinite expected/actual values.
+   Preserve independent analytic and rounded FP32 oracles and existing tolerances.
+
+1. **Bounded reduction correspondence, without new admission.** Use original owned
+   expressions and authoritative primitive array/parameter facts to validate the
+   element, sequential lexical locals, initializer, recurrence and exit. Reuse
+   `core/source-arithmetic`'s binary/loop plans and the ordinary scalar lowerer;
+   do not add a parallel inference engine or carry original bytecode occurrences
+   through every AD alpha conversion. Keep `completed-fp-body-carrier`'s existing
+   restricted completion contract: array loads must not acquire a nonthrowing proof.
+   Retained-type validation checks consistency, not original-source authentication.
+   Preserve bound evaluation/conversion, including the surface reduction's Int count,
+   and zero-trip initialization. Only already-certified parallel reductions can
+   regroup/interleave; per-element arithmetic/checkpoints and ordered folds retain
+   their separate contracts. A permuting tree requires commutativity as well as
+   associativity. Checkpoint tests are not bitwise equivalence claims for FP trees.
+
+   The follow-up implementation review fixes the query boundary as
+   `(owned original reduction, actual operand/storage facts, constructed reduction
+   region) -> conditional value/checkpoint correspondence`. It must not invent a
+   primitive JVM exit carrier: a Float value can still leave the JVM reduction
+   boxed as Object. Physical exit facts remain with the separate actual-emission
+   observer. Start with one FP carry, sequential lexical locals, declared primitive
+   array reads and authenticated core FP arithmetic/conversions. Compare against
+   the actual `ProductReduction` component and lower its region through the existing
+   `make-lowerer`; retain source Int-count conversion and zero-trip initialization.
+   Unknown storage, nullable scalar inputs, user calls, forged retained widths,
+   mismatched narrowing checkpoints, integral/multi-carry/data-dependent loops and
+   unsupported count domains abstain initially. Expose successful correspondence
+   separately in diagnostics, not as a `:normal-completion :carrier`, nonthrowing
+   fact or new admission permission. Reuse maps and the existing dependency owner;
+   no new rule/type registry, bytecode materialization or origin propagation is needed.
+
+2. **Scalar consumers through existing representations.** Realize the Float MSE
+   result followed by its Double quotient without narrowing Double intermediates.
+   Use existing required-evaluation catalogs and singleton resident scalar scheduling;
+   do not put device reduction results into host-only scalar preparation. Selected
+   Object/Double loss-scale results need the existing owned computation recipe plus
+   use-closed payload projection; their physical source carrier stays Object.
+   Checked Long dimension products must execute at their original ordered host sites
+   when their operands originate there. Late device-dependent exceptional work stays
+   unsupported without an explicit completion/transport contract. These may be
+   separate focused PRs, but must share the same evidence boundaries.
+
+3. **Close the bounded prepared-AD semantic import.** Reuse its existing generated
+   owner and definition collector. Freshness and hygiene alone cannot clear
+   `:prepared-reverse-ad`. Validate argument evaluation and entry conversions in their
+   original order; the sealed active/inactive parameter plan and padded result slots;
+   all input/result conversions, narrowing checkpoints and observable Object uses;
+   required evaluations; supported operation correspondence; and retained definition,
+   source-policy and AD-rule dependencies. Clear only the exact import whose complete
+   bounded projection is checked. Unknown operations and transitive unclosed imports
+   remain refusals. The opt-in normalized device subset is not an already-complete
+   replacement for this generic prepared path. Do not add another AD rule registry.
+
+4. **Qualify the unchanged public training fixture.** Run source/runtime AD controls,
+   hardware-free assembly, then OpenCL and Level Zero forward/gradient/collective/SGD
+   execution for unequal batches, changed arrays/parameters and multiple updates.
+   Check initialized views, allocation budgets, source fences, lease/cleanup behavior
+   and stale preparation rejection. Respect the existing finite unrolled plan's
+   single-run boundary; changed-input tests must not assume unsupported replay.
+   Co-located execution is not multi-device fabric or overlap evidence.
+
+5. **Consolidate before expanding.** Review the final authority/consumer graph,
+   remove only actually superseded implementations/tests, and publish a compact
+   supported/refused boundary matrix. Do not weaken numerical tolerances, restore
+   source-shaped fallbacks, or count more helper tests as workload closure. Land only
+   exact-head green changes; compile-only vendor checks and runtime/performance
+   receipts remain distinct. A read-only planning review does not qualify code.
+
+Every implementation boundary needs positive and refusal tests. The cross-boundary
+negative set includes forged dtype tags, lexical/namespace shadowing and remapping,
+stale AD rules/definitions, nullable or escaping Object results, explicit narrowing,
+wider recurrences, checked overflow, empty/negative/count-overflow domains, Float
+cancellation checkpoints, and missing/duplicated/reordered required evaluations.
+Storage/range safety and operand evaluation remain separately checked even when a
+conditional value correspondence succeeds.
+
+Compile latency is an explicit acceptance axis of this vertical, not deferred until
+more backends land. Retain one bounded marketing density and the unchanged training
+fixture. Separate fresh-process startup/loading, frontend/dispatch, AD preparation,
+SOAC/fusion/effect analysis, emission/materialization, executable preparation and JVM
+warm-up; record phase counts, allocations and cache hits/misses as well as elapsed
+time. Compare fresh, loaded-first, same-signature repeated preparation, changed data
+with fixed shape, changed shape and changed-definition/rule cases. These distinguish
+unnecessary recompilation from intrinsically excessive analysis and startup cost.
+Optimize repeated work before adding cache layers. Reuse immutable owned analysis
+results only under their actual source/rule/policy/target dependencies; do not suppress
+freshness guards, persist process-local owners or assume a bounded cache bounds
+generated-class/native-memory lifetime. Cross-process artifact reuse needs its own
+portable identity/validation boundary. Set numerical budgets from measured baselines;
+do not report whole-worker or sampling time as pure compiler time. Requalify cold/warm
+costs after the vertical closes, independently of execution throughput.
+
+The first execution increment hardens the finite training oracle (3 focused tests /
+38 assertions) and diagnoses an actual artifact boundary regression. A real ordinary
+map compilation carries an `OrderedSourceOwner`; archival fingerprinting refuses that
+process-local object. Sealing now explicitly refuses attached or independently required
+ordered owners before serialization, and bounded store diagnostics retain the keyword
+reason through the outer exact-evidence error. Dropping an owner cannot manufacture
+portability. Focused refusal/diagnostic checks pass 2 tests / 10 assertions; adjacent
+source-owner/fingerprint checks pass 13 / 45. This does NOT restore portable evidence
+or PDE capture: a producer-owned portable payload plus authenticated source-executor
+reconstruction remains required, including exact decoded semantic/emitted identities,
+historical dependencies and executor coverage. No opaque-owner fingerprint exemption
+or process-local identity fallback is allowed for durable restore.
+
+A warm REPL diagnostic on a tiny synthetic-target map compiled once and recorded
+three process-cache hits: loaded-first preparation 348.6 ms; identical, changed-data
+and changed-dynamic-size preparations 19.8, 18.1 and 17.0 ms. Hit-path equation lowering
+accounted for 18.2, 16.7 and 15.5 ms. This is one loaded-machine probe, not a marketing
+profile, cold-start benchmark, stable speedup or device execution receipt. Artifact
+publication remained explicitly refused. Keep cache misses and work repeated on hits
+as separate profiling targets.
+
+After the source-discovery lifecycle correction, the unchanged local training
+gradient diagnostic still refuses at the same four scalar boundaries (Double
+loss quotient, Object/Double scale and two checked dimension products). One loaded
+REPL observation took 1.019 seconds, with inclusive transform times around 502 ms
+in fixpoint, 209 ms in late cleanup, 180 ms in SOAC fusion and 117 ms in DCE. This is
+a single coverage-refused analysis under background load, not a successful training
+compile, isolated CPU profile or marketing performance measurement. It confirms
+that source discovery no longer masks those refusals with an unrelated stale-AD
+module error; it does not demonstrate cache sufficiency or remove those refusals.
+
+Use one focused independent reviewer for the authority/admission changes and another
+review pass over the integrated workload/deletion diff; reuse reviewers rather than
+launching recurring broad surveys. Ask each review to identify duplicated authorities,
+unvalidated consumers and counterexamples, not merely approve the written design.
+Keep focused REPL feedback local, full suites in CI, and cold-load/lifecycle tests
+where they specifically matter. Each PR records its invariant, affected consumers,
+negative gate, workload evidence and explicit nonclaims.
+
+The shared pass executor and opt-in phase observer landed as PR #1543 after all
+seven exact-head CI contexts succeeded. Production and diagnostic pipelines now
+share transform/result extraction/validation; timing separates transform and
+validation without clock reads on the unobserved path. This supplies measurement
+infrastructure, not evidence that marketing preparation is fast enough.
+
+The independent finite-oracle hardening landed as PR #1544 after all seven
+corrected-head contexts succeeded. Its first unit run correctly caught the
+exact-membership shard guard still expecting eight training cases; that guard
+now explicitly includes the ninth oracle regression and still checks uniqueness.
+No tolerance, workload case or required CI context was removed.
+
+The next independently reviewed lifecycle correction separates authenticated
+original-frontend discovery from freshness of a previously generated module.
+Original source can seed a new preparation after an AD-rule revision; the old
+preparation and actual emitted-code consumers still reject stale rules. The
+opaque source owner is checked against the actual selected implementation,
+including rejection of a same-signature foreign owner. Cold lookup neither runs
+the source nor upgrades its bytecode. Focused source/lifecycle tests pass 25 tests /
+123 assertions in the existing REPL; the combined affected gate previously passed
+36 / 201. This does not establish stale-module renewal, portable owner persistence,
+new effect admission, or the complete marketing fresh-worker lifecycle.
+
+Step 1 now has a bounded diagnostic-only first subset in shared scalar machinery:
+`check-reduction-fp-correspondence` checks the actual constructor source/product
+pair, owned primitive storage facts, one FP carry, sequential locals and qualified
+bootstrap-authenticated core FP arithmetic. It reuses the source arithmetic and
+initializer plans, then compares two deterministic invocations of the existing
+scalar lowerer. Original initializer identity and conversion/checkpoint agreement
+are separate checks. Node/depth and child-enumeration limits bound analysis, even
+for a lazy unbounded input. Required count conversion remains explicitly named
+`:source-count-obligation`, not a proof of successful conversion or bounds.
+
+Independent review caught and removed an attempted boxed-payload/primitive-operand
+conflation. The first subset now abstains on all selected calls; supporting a known
+Float payload behind Object still needs the planned physical-context projection.
+The real selected Object/Float and Object/Double cases have refusal regressions.
+Coverage reporting exposes successful results under
+`:reduction-value-correspondences`, never as `:normal-completion` or admission
+evidence. A synthetic preserved post-reduction quotient remains refused with its
+evaluation obligation. This is not closure of the AD-generated training reduction:
+its selected calls and other non-core shapes may still abstain. The fresh bounded
+REPL's affected scalar-region, physical-return and equation-first diagnostic suites
+pass 79 tests / 851 assertions. Full draft qualification remains open.
+
+The next physical-context review confirms that the first real training quotient
+still lacks an authenticated result-context relation for its imported/generated
+reduction. Audit whether that source occurrence is still directly owned and
+observable through `frontend-reduction-emission`; use its actual result fact only
+when the exact occurrence relation holds. An AD-generated or alpha-renamed source
+needs a relation established by its prepared producer, not syntax equality or a
+global guessed reduction-return rule. Preserve Object/Float at the quotient's
+source operand and the denominator's actual Double conversion. Only then may
+`checked-core-fp-evaluation` justify the enclosing Double arithmetic and existing
+singleton resident scheduling realize it. Object payload elimination additionally
+needs all uses/aliases closed. Original count/init/read/evaluation obligations and
+the larger prepared-AD semantic-import gate remain independent.
+
+The root-context follow-up now records the actual generated reduction root's
+result flags and emitted carrier after its body is emitted. It does not substitute
+the nested exit's context: a real Float-reduction/core-quotient regression has
+`preserve-source-call-results?` false at the root and true at the exit. The query
+exposes this observation only alongside the owned expansion and exact single loop
+child, matching physical carrier and complete boolean context. Missing root data,
+copied regions and malformed contexts abstain; no payload, normal-completion,
+source/native projection or new admission follows from this observation alone.
+The independently reviewed result-context completion now represents exactly the
+saved four flags plus a reference result carrier. Its JVM consumer evaluates once
+under that context, requires the actual reference carrier and returns that same
+reference without adding conversion or boxing. Primitive metadata cannot change
+its physical carrier. Source/native projection and structural AD explicitly
+refuse it; scalar analysis gains no presence/payload fact. A joined producer /
+consumer regression compares actual observed reduction results, count failures,
+bad reads and initializer effect order with the original. This is the mechanism,
+not yet the authority bridge: helper projection must still establish exact
+pre-hygiene occurrence and historical source ownership before using the contract.
+The combined affected gate passes 86 tests / 725 assertions in the bounded REPL;
+the independent review found no blocking issue. Draft #1539 at `5b5ece57` still
+fails CI: the inspected distributed-training shard reports the same four
+preserve-evaluation scalar refusals plus the new conditional Float correspondence.
+This checkpoint neither fixes those refusals nor qualifies resident AD training.
+
+The next reviewed implementation boundary is one local helper projection
+transaction, not unconditional insertion in `resolve-walked-body-input`. That
+resolver also serves pre-AD, source-JVM and native C; the JVM-only completion would
+break those consumers and could make an ordinary import fail only after warming.
+Before hygiene, use the exact original frontend reduction/quotient and actual
+emission history to jointly check root context, conditional FP recurrence,
+Object/Float payload, Double denominator conversion, enclosing core arithmetic,
+closed numerical uses and required evaluation. Reuse optional definition-input
+transactions so abstention does not leak dependencies. Activate only with a
+target-neutral recipe that accounts for the wrapper's physical behavior, followed
+by existing whole-form hygiene and call-by-value substitution. Do not publish an
+unused sidecar, silently force JIT from a query, or infer physical helper ABI from
+its declared return tag. Missing evidence preserves ordinary expansion and the
+strict coverage refusal. Target precision/capabilities remain checked: a Double
+quotient cannot silently become Float arithmetic merely because its eventual
+storage is Float. Count/read/initialization and prepared-AD import checks remain
+separate from this transaction.
+
+The count audit found that the original MSE bound is an array-length helper call,
+whereas the normalized training form already has a bound symbol. ProductReduction
+does not store either iteration extent. The diagnostic operator/checkpoint query
+therefore now permits an opaque original bound within its existing traversal
+budget, and explicitly reports `:domain-correspondence :unproved` alongside checked
+Int conversion and original-position obligations. This does not execute or infer
+the bound, prove a valid count, transport a hoist, or change admission. Even an
+out-of-range literal can have matching operator arithmetic without a successful
+source count conversion. The local transaction must separately retain original
+bound evaluation exactly once before initialization and match the converted
+target extent, including nonpositive domains. Reuse authenticated array-length /
+shape projection rather than a new helper-name rule.
+Independent review found no admission widening; its test-quality suggestion was
+applied using a resolvable count probe with an observable counter. A fresh single
+900 MiB REPL passes the nine affected namespaces: 159 tests / 1,510 assertions.
+This also joins the real MSE helper's original root observation, Float operator,
+Double denominator and Double quotient without asserting source-to-target closure.
+
+Two warm, coverage-refused training observations after this slice took 1.361 and
+1.214 seconds (11 observed phases, SOAC transforms 268 and 209 ms). Both retained
+the same four scalar refusals and produced no conditional reduction summaries:
+the actual selected-call shape is deliberately still outside the first subset.
+These loaded-process samples establish neither speedup nor a successful training
+compile, and are not marketing cold-worker measurements.
+
+The shared loop-plan/JVM-consumer deduplication was also extracted onto clean main
+as PR #1545 for independent qualification. Review found unchanged slot joins and
+initializer coercions; arithmetic and unchanged loop-carrier suites pass 27 tests /
+634 assertions in the campaign REPL. CI remains the clean-process authority.
+PR #1545 subsequently squash-merged as `acfa349d` after all seven exact-head
+CircleCI contexts passed.
+
+The next concrete audit refines the diagnosis above. The owned `local-loss` AD
+preparation contains a selected MSE helper call, not a generated reduction. That
+helper's frozen original frontend still has an exactly observed reduction with
+Object/present-Float result. Ordinary helper inlining subsequently renames and
+substitutes it. This case therefore needs a local helper-boundary/context
+projection, not global reduction-origin tracing through every AD transformation.
+Do not attach the original observation to a copied expression by equality.
+
+The actual inlined step was core FP arithmetic with bare `float` casts. Conditional
+correspondence now authenticates those casts through their original namespace
+lookups, retaining lexical shadowing, remapping and bootstrap inline guards. Its
+constructor also moves a `let*` from around the recurrence into its element;
+ordered deterministic SSA comparison accepts that administrative difference
+without accepting reordered/duplicated/dropped reads. Exact semantic comparison
+retains raw FP bits rather than Clojure numeric equality (including signed zero
+and NaN payloads). Both retained dtype hints are independently checked before
+canonicalization. The unchanged training diagnostic now has one conditional Float
+correspondence and still exactly four required-evaluation refusals. The affected
+gate passes 82 tests / 871 assertions; no execution admission changed.
+
+One important context observation prevents a shortcut in the next implementation:
+the MSE reduction's emitted exit returns a reference, but its original
+`:object-result?` and `:object-call-result?` are false. Its reference result comes
+from the actual branch/exit boxing path. An Object result fact alone therefore
+does not justify relabeling the original evaluation with `object-input-contract`.
+Preserve the emitter-owned evaluation/result context, any actual primitive return
+conversion, and public helper boxing separately. If existing completion terms do
+not express that exact result context, extend the shared completion algebra or
+refuse; do not borrow a different input contract merely because both end in Object.
+
+This vertical advances original items 3 and 5 and validates parts of 6 and 7. It does
+not replace items 1, 2, 4 or 8, finish general AD migration/lifetimes, establish SOTA
+performance, or qualify real multi-host execution. All eight obligations below stay
+open until their own acceptance gates close.
+
+CI timing artifacts now also distinguish a completed runner invocation (which may
+have failing assertions) from an aborted load/report invocation. The existing
+`:outcomes` assertion/skip counters remain complete; each test retains at most
+eight small failure diagnostics with source location, exception class and
+keyword-only compiler reason/rule fields. Runtime compiler objects, inputs and
+formatted expected/actual values are not serialized. These additive fields keep
+the timing schema and planner inputs unchanged. Reporter tests cover unchanged
+events/counters, a real failing assertion, bounded samples, aborted loads and
+output/reporter failures. The process exit/native-crash gate remains authoritative:
+a completed diagnostic artifact alone is not a passing CI or coverage receipt.
+Exact-head b1d94dc5 still has failing unit and emission jobs; their failures remain
+open compiler/fixture obligations, not a new accepted baseline.
+
+The loop-carrier join and contextual Float-literal initializer plan now live in
+the shared source-arithmetic authority; JVM loop emission consumes that same plan.
+This extracts the existing implementation without changing slot selection or
+conversion placement. Unknown/reference initializers remain nonprimitive, explicit
+Double expressions are not narrowed from tags, and wider recurrences still widen
+the slot. The focused arithmetic/actual JVM loop gate passes 27 tests / 617
+assertions after reconnecting to the bounded REPL. This is representation planning,
+not a normal-return proof, reassociation permission or new SOAC admission. The next
+training obligation is to validate structural reduction arithmetic and checkpoint
+correspondence before deriving a conditional numeric value domain for its consumers;
+physical carriers and required source evaluations must remain separate facts.
+
+Required invocation-level scalar evaluations now have an explicit TypedSOAC contract:
+a program catalog and an exact executor claim per source occurrence. Validation
+rejects missing/duplicate claims, missing executors, hidden claims in fusion
+constituents and placement across a required evaluation. Whole-program fusion
+also compares the retained producer, so deleting both claim and catalog cannot
+silently erase the requirement. Source projection/rebasing uses shared dialect
+helpers, including fused constituent coordinates; sequential spine composition
+requires distinct explicit source occurrences. These constraints do not turn
+per-element checked conversions into global host effects.
+
+This is conservation/ordering evidence, not original-source authentication,
+totality, initialized storage, or observed runtime completion. Original source
+ownership and scheduled-stage completion remain independently required. The explicit
+TypedSOAC path now retains unused required scalar roots, projects audited singleton
+payload reads, and revalidates the earlier writer and closed uses at scheduling.
+Flattened graphs containing required evaluations have an explicit source-order
+dependency chain; pure graphs retain their hazard-only DAG. The reviewed affected
+gate passes 23 tests / 204 assertions, including OpenCL/Level Zero payload replay,
+checked integer/narrowing refusals and real OpenCL invocation failure fencing.
+Late *source* admission remains closed until source-to-ScalarIR correspondence is
+proved; resident storage and logical dtype alone do not prove an original JVM carrier.
+
+Completion analysis now requires the actual producer namespace for core operations,
+including casts. Authenticating the canonical `clojure.core` Var in another namespace
+was insufficient: a producer can mask that qualifier. Missing lookup context abstains;
+changed definitions and masked qualifiers refuse. The shared Double-anchored arithmetic
+summary reuses existing carrier/totality authorities and grants no removability,
+argument completion or source motion. Its focused and adjacent gates pass 69 tests /
+684 assertions, including independent Clojure IEEE edge cases and AD-generated scope
+contexts. A primitive Double operand can also anchor the exact source overload when
+the other operand is a proved present Float/Double reference payload; the source
+planner still sees that reference, and the producer's physical facts stay unchanged.
+Float-only and reference-only calls remain outside this proof. Independent Clojure
+Object/Double overload oracles cover both operand orders and IEEE edge cases.
+No device performance, complete training vertical or broad CI acceptance
+follows from these checks.
+
+The production route now forwards that same producer namespace beyond source
+normalization into frontend analysis. It previously dropped this context from the
+frontend option map, making otherwise available normal-completion diagnostics
+abstain. A before/after regression checks missing versus actual namespace, rejects
+a masked `clojure.core` qualifier, and keeps the late required scalar refused in
+both ordinary cases. The affected source-completion, scalar-activation and scan
+gate passes 28 tests / 839 assertions. This repairs evidence transport; it does not
+close reduction checkpoint correspondence or grant operand completion/admission.
+
+Bare core casts now use that same bootstrap authority while retaining their
+actual namespace lookup spelling. Successful normal return can establish the
+cast's primitive result carrier; missing context, lexical shadowing and replaced
+namespace mappings do not borrow a canonical core definition. Historical guards
+retain the bare lookup edge, so replacing it invalidates earlier evidence. The
+affected completion/payload/activation gate passes 56 tests / 616 assertions.
+The unchanged training probe still refuses four late scalar bindings, but now
+correctly reports the selected MSE-scale call as an Object with a present Double
+payload. This is not primitive storage, totality, box-erasure or admission evidence.
+
+The actual specialized MSE source has also been checked separately from raw Clojure
+macro fallback: precision-sensitive inputs retain a Float accumulation checkpoint
+before the Double quotient; an empty domain reaches IEEE zero division. This is a
+producer regression, not permission to infer that checkpoint from a result tag.
+The unchanged hardware-free topology/cost/compute/storage/math-request gate freshly
+passes 84 tests / 660 assertions. It does not establish device transport or measured
+fabric performance, and items 6–8 retain their remaining integration obligations.
+
+The original bytecode reduction observer now supplies a shared normal-return
+`:result-fact` from its authenticated carry-load/exit conversion. Float/Double
+carries remain an **Object** result with an exact present builtin payload at the
+divergent-if boxing boundary; neither the carry tag nor its slot is a primitive
+region-return proof. Owned AD uses this same fact instead of duplicating that
+boxing-path test. Initializer/count/recurrence/read/replay obligations are unchanged.
+The affected source-owner and runtime/AOT AD gates pass 43 tests / 559 assertions,
+including actual Float MSE, empty domains, malformed/copied observations and stale
+definitions. This is original-region completion evidence, not permission to copy
+it onto alpha-renamed/generated training source or erase a box with arbitrary uses.
+
+An owner-private producer relation now links exact unchanged emitter-input reduction
+occurrences to their freshly owned emitted occurrences. The frozen frontend query
+requires its existing opaque source owner AND exact emission-map identity in the
+already-retained receiver definition observation. An edited emission map cannot
+borrow genuine body/occurrence identities to manufacture different completion facts.
+Equal-but-distinct reductions stay distinct; one input object reused at multiple
+occurrences abstains. Copied bodies, missing legacy evidence and AD/SIMD-replaced
+emitter inputs also abstain. Cold queries never force bytecode materialization,
+and reduction-free bodies retain no extra input-body owner. The affected source,
+completion and frontend/import gates pass 52 tests / 306 assertions, including a
+concrete edited-observation attack. This closes the unchanged frontend→emission
+edge only: hygienic inlining/substitution, AD forward preservation and strict loss
+extraction still owe their own correspondence before training admission can widen.
+
+Review refined the training route: do **not** make bytecode-occurrence tracing
+through every alpha-renaming pass the primary AD→TypedSOAC architecture. The shared
+AD producer still assembles transformed source forms, and the inliner explicitly
+records its prepared reverse-AD import as unclosed. Close that producer once using
+authenticated SourceFrontend inputs and its actually consumed historical definitions,
+then validate its structural ParIR reductions. Original-bytecode occurrence links
+remain useful for original source observations, not a substitute typed AD pipeline.
+
+The first producer correction makes shared reverse preparation consume the frozen
+frontend rather than replaceable walked-body caches, under the existing definition
+collector transaction. Missing root lineage stays explicitly unclosed. This does
+not yet seal generated-program fields, source policy or template revisions for later
+reuse; the inliner's unclosed import marker remains. The next owner must bind the
+exact generated body, params/tags, namespace, result/gradient slots and normalized
+active-parameter selection, plus immutable historical observations and original
+source policy. Historical adoption must not refresh snapshots. Retain any unclosed
+transitive imports, and distinguish template invalidation from harmless later cache
+materialization. Structural-domain and accumulation/checkpoint proofs follow; the
+unchanged Float MSE training workload remains the end-to-end acceptance case.
+The root-input change passes a fresh-REPL affected gate of 33 tests / 199 assertions
+(preparation, source/loop projection, owned array AD, frontend imports and unchanged
+training-refusal diagnostics). It rejects poisoned derived walk-cache input and
+detects a source change during preparation without materializing a cold numeric
+implementation. An earlier warm run hit anonymous-class collisions after backend
+reload; restarting only the owned bounded REPL removed those errors. This is not
+a whole-suite qualification or a fix for generated-program lifecycle ownership.
+
+The next preparation-only owner now seals the exact generated fields, normalized
+parameter plan, original frontend, immutable consumed-definition observations and
+AD template epoch. Generation and legacy compilation use the definition's source
+policy rather than the caller's policy. Altered fields (including symbol metadata),
+stale rules and rules changed during generation refuse. The affected gate passes
+39 tests / 220 assertions, including inactive checked conversions and selected
+parameter gradient slots. This owner is checked at preparation/compilation/import,
+not on every invocation. It does not close transitive imports or authenticate the
+legacy `alength` source rewrite as an execution projection. Historical adoption,
+benign JIT renewal semantics, structural domains and Float checkpoints remain
+separate obligations; the inliner still records prepared reverse AD as unclosed.
+At `903c6061`, setup/build passed but unit, emission and OpenCL gates failed.
+The preparation gate does not supersede those failures.
+
+Prepared reverse AD now adopts its authenticated indexed definition history into
+an enclosing compilation, using the same first-observation merge as ordinary
+definition discovery. Adoption never resnapshots, preserves unrelated serialized
+inputs, unions lookup/source-import edges and commits once or rejects a competing
+collector update. Legacy compilation and inlining both use this handoff. The
+reviewed affected gate passes 70 tests / 354 assertions, including stale parent
+and child histories, alias removal after handoff and unchanged training refusal.
+This is not adoption of static-artifact history or template-epoch authority;
+those producer guards and the actual semantic projection must still reach the
+consumer before the prepared import can be closed. No fallback was restored.
+
+The existing historical-input validator now also retains process-local producer
+dependencies separately from Var snapshots and portable values. Prepared AD's
+own frontend/template guard survives adoption, optional transactions and frozen
+ordered-source observations. JVM root/static emission payloads and their prepared
+reuse guards retain the same dependency. A review found that root AD expansion
+previously happened before the emitter's fresh collector; lazy-JIT transformation
+and emission now share one historical transaction before publication. Emission
+inherits those original observations rather than resnapshotting around transformed
+code. An actual first-JIT gradient root, not only injected emitter fixtures, proves
+the retained epoch guard. The reviewed affected gate passes 87 tests / 484 assertions.
+This connects freshness checks, not general per-call dispatch instrumentation or
+the inliner's semantic projection. The prepared import remains unclosed; actual
+Float reduction realization, selected loss scaling and checked dimension products
+still block unchanged resident training. CI at `39dd672e` has setup/build success
+and fixture-emission failure; the other gates were still pending when checked.
+
+CI then exposed an ownership-scope regression: independent root materialization
+inherited a caller's unrelated, already-stale analysis collector. Root AD/SIMD
+transformation and emission now run in their own historical transaction; outer
+observations are neither overwritten nor refreshed and still reject promotion.
+The focused real-emission/normal-return gate passes 36 tests / 237 assertions,
+including the CI throwing-producer case and an explicitly stale unrelated owner.
+This fixes isolation, not a waiver for stale executable reuse.
+
+Whole-call AD projection now lives beside its preparation producer. It checks
+the flat program/padded slots against the sealed parameter plan, uses the existing
+call-by-value argument planner, then applies shared whole-form alpha conversion
+and capture-avoiding substitution. The inliner's independent top-level renaming
+map is removed. Rejected shapes/arities do not adopt dependencies; the projection
+operation itself records its still-unclosed import. Focused preparation/inliner
+checks pass 40 tests / 203 assertions before the extra failure-atomicity controls;
+the final preparation namespace passes 16 / 63. The broader 119-test / 771-assertion
+gate has zero failures and one resident-reduction error. An A/B run with the
+committed versus working inliner gives the same
+`:scalar-reduction-requires-typed-graph` refusal; this is not a passing resident
+training gate. No projection receipt or public map is granted ownership authority.
+
+Shared scope consolidation follows two reproduced defects: qualification rewrote
+quoted symbols and mistook `par/reduce` binders for same-named namespace Vars.
+Qualification now uses `form/scope-info` for sequential/recursive/parallel scopes,
+leaves quoted data opaque and preserves metadata. Named lambda self-binding is
+one enclosing scope across anonymous arities, shared by free-variable analysis,
+alpha conversion and substitution. Imported catch/reify/constructor classes use
+a separate class-only structural projection; method names stay unchanged. The
+reviewed scope/qualification/AD gate passes 164 tests / 973 assertions, including
+cross-namespace class execution, recursive capture and existing AD scope controls.
+These are closed-core fixes, not arbitrary unexpanded-macro coverage or new
+authentication of type-hint metadata. They do not close numerical realization,
+entry/return conversions or the prepared import's portable admission obligation.
+
+The JVM scheduled effect-map boundary now uses the existing canonical-conversion
+source projection before desugaring calls. Previously a retained conversion term
+could execute as its IR constructor, returning a list where a number was needed.
+All four reproduced continuation failures are fixed; the reviewed JVM carry/region/
+branch gate passes 28 tests / 551 assertions. An overflow control confirms earlier
+writes survive and the later store is absent when checked Float narrowing fails.
+The wider six-namespace check remains red (65 tests / 886 assertions: one failure,
+five errors) on GPU checked narrowing, carried integer-width admission, a bound
+diagnostic expectation and source-ordered multilevel composition. Those are retained
+debts, not waived by the passing JVM projection gate.
+
+Current integration hold: PR #1539 is draft, not qualified for merge.
+At `add22852`, setup/build passed; emission, unit and OpenCL gates failed.
+Emission still refuses target-library `exp` inside a checked Float narrowing stage;
+exception stability near the overflow boundary remains unproved. That refusal must
+not be repaired with a totality flag or numerical tolerance waiver. At `577ca631`,
+setup/build passed and emission, unit and OpenCL failed again. These
+are not acceptance evidence for CUDA/HIP. This is not a green compiler baseline.
+Dependent CUDA/HIP jobs are not acceptance evidence. The following table takes precedence over
+historical receipts below; do not infer broad qualification from focused gates.
+
+Public vendor-fixture emission now collects independent compiler refusals across
+CUDA and HIP instead of stopping at the first public workload. Each diagnostic
+identifies function, target, dtype and requested schedule; empty compiler artifact
+lists are failures, not omissions. Any refusal still fails the whole gate. Progress
+goes to stderr while successful stdout remains the emitted-file list. Cancellation
+and VM failures, including wrapped causes, abort immediately. Five reporting controls
+pass 30 assertions; a real six-compilation smoke emits four successful workloads,
+reports the checked-exponential refusal on both targets and reaches the later
+Long-state workload on each. This improves feedback, not vendor qualification;
+private body-fixture generation and actual vendor compilation retain their own gates.
+The first aggregate CI run (`e8ef4837`, emission 32706) exposed a phase-order gap:
+a private segmented-reduction conversion refusal escaped after CUDA's public group,
+hiding its accumulated failures and preventing HIP's public group from running.
+Both public groups are now realized before private generation. If private generation
+then fails, the public aggregate remains primary and retains the independent private
+failure as suppressed evidence; cancellation/VM failures still abort immediately.
+Seven reporting controls pass 41 assertions. Holding both artifact vectors is an
+explicit CI-memory tradeoff, not permission to omit workloads. At `e8ef4837`, setup
+and build passed; emission 32706, unit 32709 and OpenCL 32710 all failed. All eight
+campaign obligations and the unchanged training/source-admission work remain open.
+The `4203ffcc` emission run (32714) now confirms both public groups were attempted:
+172 attempts, 140 passed, 32 refused, plus the separately preserved private
+segmented-reduction conversion failure. Repeated target pairs expose missing
+target graph lowering (norms, quantizers, RoPE and attention), checked map-stage
+conversions, a dense-backward allocation proof and a contraction specialization
+owner/dtype mismatch. These are an actionable debt inventory, not successful
+vendor-toolchain execution. Unit 32713 also failed; OpenCL 32717 was still running
+when this checkpoint was written.
+
+The latest normalization correction replaces recursive reduction discovery and
+equality substitution with an occurrence-specific strict evaluation context.
+Extraction follows only the first operand of bootstrap-authenticated inline core
+calls resolved in the actual producer namespace. It never crosses conditional,
+binding, quoted, collection, selected-helper or later-operand contexts. Missing
+producer context withholds extraction. This deliberately narrows speculative
+helper extraction until its call-context proof exists; no legacy fallback returns.
+The focused gate passes 134 tests / 744 assertions. The adjacent route namespace
+remains red, with the same failure-event inventory under the committed extractor
+and corrected extractor; that comparison is not a passing integration gate.
+
+The follow-up separates normalization from removability. A strict first-operand
+reduction can be exposed while its externally pure surrounding scalar retains
+all source metadata, checked-completion obligations and preserve-evaluation flags.
+The training-shaped unused forward-loss quotient remains an explicit binding;
+coverage and the actual route still refuse it after parallel work. The focused
+gate passes 135 tests / 754 assertions; the unchanged training diagnostic passes
+1 test / 5 assertions. Review confirms fail-closed admission today, but metadata
+alone is not a general fusion barrier. Before broadening admission, represent and
+enforce the scalar's completion/ordering obligation through TypedSOAC fusion and
+the ordered executable boundary. Do not turn preserved evaluations into dead
+values or claim that normalization alone activates training.
+
+The next reviewed slice admits checked Double-to-Float after a finite literal-bound
+ordered fold, including an exact write-only destination with runtime-proven private
+ownership. It preserves the Double accumulator and source failure selection. Helper
+allocation correspondence uses the actual prepared original frontend, not an older
+walked-body cache; rejected speculative helpers retain no dependency observations.
+The affected gate passes 186 tests / 1,852 assertions, including local OpenCL/Level
+Zero execution, changed inputs, precision-sensitive folds and failure cleanup.
+This is not broad integration acceptance. Source-only public CUDA/HIP fixture probes
+progress to `double-exponential-float-storage`, where `exp` lacks descriptor-owned
+nonthrowing evidence. Preserve its declared target-library accuracy separately from
+exception totality; do not erase checks or claim vendor execution/performance.
+
+Review identified a second requirement before admitting that target-math operand:
+nonthrowing `exp` does not prove the downstream checked cast has the same outcome.
+An implementation-defined approximation can cross `Float/MAX_VALUE`. The warm
+JVM probe around `log(Float/MAX_VALUE)` confirms adjacent Double inputs switch
+from successful narrowing to `IllegalArgumentException`. Keep the case rejected
+until a range-stability certificate or source-compatible observation policy
+justifies exception behavior; simply adding a totality flag is insufficient.
+Also separate primitive result-carrier proof from intrinsic nonthrowing evidence:
+the current completed-FP helper summary assumes binary arithmetic after that
+query and must not accidentally accept unary library operations.
+
+The next compiler-quality slice separates that carrier recipe explicitly from
+nonthrowing intrinsic evidence; library functions remain unadmitted. It also
+retains the actual semantic-pass decline in equation-first diagnostics instead
+of reanalyzing the original compatibility form. Manual normalization already
+lifts the nested training loss reduction, but the complete route retains further
+evaluation obligations; neither that observation nor better reporting proves
+training admission. The unchanged workload still refuses. The focused combined
+gate passes 44 tests / 636 assertions (carrier proofs, normalized diagnostics,
+checked schedules, source order and actual local device execution). No source
+evaluation flag, numerical check or compiler legality rule was relaxed.
+
+Source completion now has an opt-in compositional query alongside the unchanged
+presence/array `result-fact`. It threads actual normal-return producer carriers
+through expanded sequential bindings and existing selected-method proofs. An
+Object result containing Double remains Object; explicit casts retain bootstrap
+callee ownership and may still throw while evaluating their operands. Unknown
+producers shadow old facts. Bare casts, unexpanded lexical macros, primitive-input
+contexts without result-carrier authority and opaque source remain unknown.
+In particular, the source primitive-input projection calls `RT.box(T)`: the
+conversion's input target does not establish a primitive result carrier.
+
+These facts currently enrich refused-source diagnostics only (source position,
+evaluation flags, normal-return carrier/payload); they do not admit kernels,
+remove evaluations or supply payload recipes. Selected-call proofs and rejected
+dependency transactions are reused rather than duplicating dispatch/type rules.
+The six-namespace affected gate passes 175 tests / 988 assertions, plus the
+changed nested-compatibility regression (1 / 2). Review found and corrected the
+input-context/result-carrier confusion and unauthenticated core-cast assumptions.
+Next: connect owned payload computations and closed numerical uses to ordered
+scalar stages, with independent source-order coverage and the unchanged training
+composition oracle. Cold recipe availability and bare source lookup remain
+explicit obligations; a carrier fact alone is not sufficient.
+
+The next tightening authenticates the selected arithmetic implementation's actual
+original body, not just its nominal operation name. A canonical FP leaf must use
+the same core operation over ordered formals; extra arithmetic, permuted operands
+and intermediate rounding refuse. Lowering additionally requires matching actual
+formal, operand and payload widths. A conflicting Double result stamp cannot erase
+a Float helper's rounding checkpoint. Valid but unproved entry conversions still
+refuse; matching lowering widths is not proof of original argument completion.
+This does not activate training admission or remove preservation flags. Independent
+review found no further concrete blocker in this restricted tightening. The affected
+six-namespace gate passes 41 tests / 496 assertions, including checked device execution;
+the final payload namespace adds positive Float lowering coverage (10 / 89).
+
+The training investigation also found a producer hygiene defect: built-in AD
+generators constructed bare `long`, `double` and `long-array` calls. The MSE,
+min/max, convolution-dimension and pool-allocation generators now name their
+intended Clojure builtins explicitly, leaving supplied argument forms unchanged.
+Hostile-caller execution tests preserve value and exception oracles (including
+null/out-of-range casts and negative allocation sizes). The affected three namespaces
+pass 42 tests / 346 assertions; the actual JVM training gradient additionally matches
+an independent exact-binary oracle on two changed target arrays. Review found no
+further concrete issue. Actual training refusal now reports the MSE scale's normal
+completion as Object containing Double. It still refuses retained evaluation:
+neither qualification nor completion grants motion, erasure or GPU admission.
+
+The next admission prerequisite closes an eager-execution ordering hole. Invocation
+materialization used to evaluate all host steps before numerical execution, even
+when their source positions follow an earlier kernel. The eager compiler entry now
+rederives source order and refuses late host computations/allocations before any
+materialization. This includes explicit storage and generated result allocations
+whose host steps were pruned; exact aliases remain exempt. Validated source-free
+programs retain their separate explicit prefix contract. The ordered executor is
+the intended continuation, not permission to hoist or delete these operations.
+Automatic Compiled activation and remaining generic entry-path audits stay open.
+
+The affected seven-namespace gate passes 93 tests / 1,106 assertions, including
+source-free compilation and actual local OpenCL/Level Zero ordered execution.
+Independent JVM oracles write before late overflow/negative-size exceptions;
+the eager refusal invokes no materialization callback and changes no output.
+Review caught the missing allocation-action family before commit. One initial test
+mistakenly assumed an explicit helper allocation had no host step; the actual
+missing-step case is now a separate functional-map allocation test. A renamed old
+test Var was explicitly removed from the warm REPL before the final passing gate.
+
+The host scalar reference backend also had a selected-call correspondence defect:
+it could discard an actual `.invk` receiver and invoke the nominal generic operator.
+An explicit retained-receiver fixture independently returns division while the
+nominal operator multiplies. This is an internal host-evaluation counterexample,
+not evidence that ordinary public dispatch selected the wrong implementation.
+Selected calls now refuse without their original source execution context. An
+optional execution seam receives the whole expression and raw environment, rather
+than already-evaluated arguments; its producer must prepare the executable under
+the existing source owner and freeze historical guards. Existing source compilation
+preserves the receiver, source policy and original argument completion order.
+
+The focused gate passes 19 tests / 165 assertions: changed-input receiver oracles,
+null completion before a later arithmetic failure, nested/lexical refusals, and
+explicit region Float rounding/overflow checkpoints without suffix execution or
+retry. Independent review found no further required correction. This is not
+automatic routing: logical-dtype local/result coercions still require independent
+source correspondence, and buffer-shape stand-ins cannot be passed to original
+array-taking code without an audited shape projection. The callback itself grants
+no ownership authority. Do not catch a partial interpreter refusal and retry it.
+
+Historical source fencing now uses one `OrderedSourceOwner` for both ordinary
+and checked ordered execution; the checked-only type/API/field is removed. One
+validated occurrence classifier supplies all host actions for ownership and only
+their late subset for routing. Prefix actions therefore cannot bypass ownership.
+Missing/cross-program owners fail before preparation, device creation or captured
+uploads, with the obligation independently rederived when the owner is absent.
+Live/source/epoch fences cover each source action, completed stages before
+initialization credit, allocation before acquisition, input handoff and publication.
+Checked observation and private-generation retirement remain distinct obligations.
+
+The existing strict source-policy/import restriction is not broadened into an
+ordinary eager-compilation refusal. Unobserved compilation may explicitly abstain
+from acquiring an unsupported ordered capability; frontend/bootstrap/history
+failures still throw, and speculative observations roll back. Ordered entry then
+independently refuses the absent owner. An unchecked prefix-allocation fixture
+still compiles and lowers to a validated eager LinkPlan without touching a device.
+No automatic routing or new unchecked source execution is enabled.
+
+Cold frontend tests now create fresh definitions per test instead of assuming a
+fresh JVM; two consecutive runs pass in the same REPL. A neighboring call-count
+probe also exposed public multi-arity self-delegation being intercepted twice;
+both invocation-step arities now share a private implementation. This changes
+neither the scalar expression nor its evaluation count. Nested prepared-graph
+mutation tests fence the completed outer source action, not each internal graph.
+The final affected eleven-namespace gate passes 104 tests / 1,566 assertions,
+including actual OpenCL and Level Zero execution and source-free compilation.
+Review found no remaining concrete blocker in this bounded consolidation. Earlier
+combined rerun failed only the eight cold-state assertions before their fixtures
+were made fresh; the final gate retains those assertions unchanged. Independent
+ordinary stage/host-action source-mutation probes poison the owner, grant no replay
+credit and expose no resident result boundary. This is not broad CI acceptance or
+training admission; all eight campaign obligations remain open.
+
+The shared source projection now prepares optional owner-local ScalarCompute
+executables using actual selected-entry carrier facts and invocation IDs. This
+reuses the terminal projector's walker and existing source compiler, not another
+interpreter, function registry or expression-string cache. Source policy, exact
+Methods and dependency history are guarded; history freezes after compilation.
+Execution requires the exact source step, exact boxed ports/results, and an
+independent physical-result/ABI comparison. It performs no typed-region coercions
+and no lookup, recompilation or retry. Unknown capabilities remain absent.
+
+This first slice covers checked Long add/subtract/multiply, identity Long casts
+and existing compatible Double/cast fragments, including explicit Float checkpoints.
+It deliberately refuses selected calls, Long division, unproved casts/joins and
+shape-derived carrier assumptions. Ordinary Clojure Long division returns Ratio
+where an actual typed entry can return Double; a Method signature or logical dtype
+cannot erase this execution-context distinction. Physical Boolean-to-Double also
+needs its original context. Warm bytecode outlining already has owned input-region
+APIs; cold source lowering must not manufacture those emitter contexts.
+
+The affected fourteen-namespace gate passes 140 tests / 1,874 assertions, including
+actual local device/source-free gates. Final focused controls additionally verify
+the original typed entry versus ordinary Clojure separately, shadowed invocation
+IDs, stale source, nullable Object conversion before later overflow, signed zero,
+NaN and Float rounding/overflow (new namespace: 5 / 40). The terminal adapters remain
+on the same projector. The final four-namespace gate, rerun after the interruption,
+passes 45 tests / 351 assertions in the existing 900 MiB REPL.
+Runtime activation is still gated: require complete executor
+coverage before any earlier source/device mutation; do not discover missing host
+capabilities halfway through an accepted route. No training or performance claim.
+
+The following activation has local qualification, not broad acceptance: ordered
+invocation now preflights every source occurrence before session creation/capture,
+replay retirement and input handoff. ScalarCompute uses its prepared source
+executable directly, including shared host-equation producers; no interpreter
+fallback runs after earlier work. Standalone host equations and compound allocation
+extents still refuse upfront. Allocations retain their original count conversion,
+failure order and existing storage/initialization checks.
+
+Shape carriers need independent source correspondence. A checked Long cast around
+an array-length projection is admitted only for a bootstrap core leaf or an actual
+selected helper whose authenticated original body computes that projection. A
+nominal alength descriptor, interface result or logical shape dtype is insufficient.
+Bytecode emission now records qualified core-intrinsic lookups as well as bare
+ones; missing historical lookup edges in an old helper remain unsupported, not
+recreated by consumers. Plain Clojure body-entry signatures use the owned generated
+target class; Object-array hints remain conditional runtime class requirements.
+Explicit source-free TypedSOAC projections retain their separately revalidated
+closed contract, without inventing a Clojure source owner. Pure numerical routes
+with no host source actions do not acquire irrelevant body-entry obligations.
+The adjacent twelve-namespace gate passes 120 tests / 1,737 assertions; the final
+preparation-fence gate adds 16 tests / 188 assertions after reloading Compiled.
+Both local device probes report true. These receipts do not close the integration
+hold, training admission, cross-vendor execution or any of the eight obligations.
+
+Training admission will keep two execution modes under the same source-order
+owner: host-only checked dimensions as original ordered host actions, and
+device-dependent total FP values as resident evaluate-once scalar stages. Required
+unused forward loss remains an execution root. Entry carrier evidence must come
+from original retained source ownership and the actual selected interface, not
+logical dtype options. Scalar use closure, publication and eager/generic binding
+gates must be proved before broader frontend admission; none is waived here.
+
+| Boundary | Current evidence | Next acceptance requirement |
+|---|---|---|
+| Terminal scalar host result | Integrated in `db3b4789`; ownership/invocation 58 tests / 406 assertions, full structured-control route 63 / 614, targeted local OpenCL/Level Zero scalar replay and failure controls pass | Broad integration green; retain explicit host-result API, source-history preflight and poison-before-publication. Array/composite terminal returns and portable persistence still refuse. |
+| Checked numerical map result | Source-derived `mixed-scale` compiles across OpenCL/CUDA/HIP. The explicit internal ordered checked executor observes actual local OpenCL/Level Zero results, guards historical source ownership, tracks success-conditioned coverage, and rotates private output generations on replay. Finite literal-bound ordered folds retain Double accumulation and a runtime private-output obligation. Ordinary invocation/composition/persistence still refuse. | Qualify broader integration and automatic Compiled admission; establish descriptor-owned nonthrowing target-math evidence without changing accuracy policy. Preserve checked source diagnostics; never relabel checked casts IEEE to pass. |
+| Training scalar source coverage | Actual normalized pass diagnostics now report `local-gradient-sum`'s retained scalar obligations. A second analysis of unnormalized source was misleading about the nested reduction; the complete route still refuses retained divide/multiply evaluations. | Close source-order/carrier evidence without dropping preservation flags or duplicating evaluation; retain the actual distributed-training composition oracle. |
+| Existing AD/native/fusion integration | Exact-head unit logs still contain native refusals, closed-product AD gaps and fusion/terminal-conversion failures | Classify actual semantic gaps versus obsolete structural expectations; preserve numerical/failure oracles. Updating tests must not substitute for implementation. |
+| Distributed and durable workload acceptance | Original obligations remain below; training composition currently blocked by the scalar row above | Complete their unchanged workload gates after shared compiler fixes. Local co-location/simulation is not multi-host performance evidence. |
+
+The checked-map refinement is deliberately limited to a single-result one-dimensional
+map, one outer checked Double-to-Float conversion, independently proved reads and an
+otherwise-total primitive operand region. Exact write-only destinations require actual
+private-generation ownership; finite literal-bound unit-step folds keep ordered carries.
+Dynamic loops and arbitrary mutable maps remain unsupported. Status is overwritten on every active lane;
+failed lanes retain their original Double diagnostic and do not store a public result.
+Neither those stores nor schedule metadata grant unconditional initialization. The emitted
+validator reconstructs from the semantic source even if a witness label is mutated.
+Review caught and closed both a label-dispatch bypass and an overbroad conversion trigger.
+Structural graph/ABI tests now use Double storage rather than claiming that an arbitrary
+fixture-only schedule implements checked narrowing; the real checked-source tests remain.
+Compiler reconstruction alone is not production checked-map execution or campaign completion.
+
+The next observation component independently reconstructs the emitted obligation and
+interprets completed status snapshots in bounded chunks. It selects the first failing
+source lane and reads only that lane's initialized original-Double diagnostic; it reruns
+the immutable checked conversion rather than the operand computation. Empty stages do
+no reads; malformed protocols refuse. This component returns no initialization proof
+and cannot independently enable execution. The confined binder reuses the existing graph
+binder privately, retains the actual bound graph generation/temporary cleanup owner through
+completion and observation, and releases everything on success and failure. Only exact
+artifact KernelCall validation is admitted in an expiring owning-thread scope; ordinary
+public graph binding, composition and persistence still refuse. Scope tests cover escaped
+bound functions and future inheritance. Actual local device tests cover source result bits,
+failure before a consumer, changed inputs, empty extents, checked exceptions and injected
+observation-failure cleanup. The remaining integration is historical source ownership,
+private output nonescape, ordered cursor advance and success-conditional write coverage.
+Review explicitly does not treat the confined seam as ordinary invocation activation.
+The five-namespace affected gate passes 76 tests / 563 assertions, including actual
+OpenCL and Level Zero execution. The original hardware-free C-family compilation
+receipts remain separate; no CUDA/HIP execution or performance claim is implied.
+
+Ordered entry planning now preserves that observation condition explicitly. The existing
+semantic write-coverage analysis partitions unconditional writes from checked writes;
+ordinary whole-plan analysis refuses unresolved checked conditions. A separate
+`PendingObservedEntry` retains a validated storage layout and a rederived entry contract,
+not an executable LinkPlan or effect witness. Its `full-produces` excludes checked outputs;
+`observations` and `success-produces` remain conditional and cannot satisfy a later read.
+The source-ready path returns this pending variant rather than ordinary plan/evidence.
+A preceding exact source result-allocation may identify private layout provenance, but
+its acquisition or zeroing does not prove map completion or runtime nonescape. The runtime
+still refuses this pending entry before acquisition until historical source ownership and
+live allocation-ledger checks are integrated. The six affected namespaces pass 86 tests /
+697 assertions, including adversarial bindings, condition mutations, ordinary-consumer
+refusal, source-ready realization and the existing confined local-device qualification.
+
+Historical source ownership now freezes the original producer's definition inputs,
+exact semantic/emitted identities, and policies of actually imported helper bodies.
+The inliner consumes snapshot metadata rather than pairing an old body with a later
+definition observation. Refused optional imports leave no dependency. Unknown or
+unchecked imported policies refuse this checked-source capability; prepared reverse-AD
+imports without transitive lineage explicitly refuse it too. Ordinary AD is unchanged.
+The eight-namespace focused gate passes 113 tests / 905 assertions, including local
+OpenCL/Level Zero checks. This does not enable ordered checked-result execution or
+qualify the red integration baseline.
+
+Before activation, close an independently reproduced source-correspondence gap:
+a materialized `deftm` keeps its original user-macro behavior, but fresh raw-source
+walking can expand a redefined macro differently while the source Var guard still
+passes. A REPL oracle returned `3.0` before and after macro replacement; compiler
+walking changed from `x + 2.0` to `x + 7.0`. A fresh macro snapshot cannot authenticate
+the original expansion. The smaller first route retains the actual typed frontend
+body in an opaque producer owner, before backend AD/SIMD, bound to the selected
+implementation and original source-entry lineage. Eager/plain producers retain
+their actual Clojure frontend too; the context distinguishes parameter precision
+from the original literal-walking mode. Consume that typed body without retyping
+it, and normalize scopes with the same helper used by fresh source compilation.
+Requested precision must correspond to the selected specialization, not silently
+retype it. Root lookup uses existing flat-var and mangled-operation authority;
+helper imports must use the same original frontend rather than stale walk caches.
+Cold/legacy layouts without that evidence receive no checked-execution owner.
+The pending JIT and GPU paths now share one frontend-materialization producer
+under the existing implementation lock, without numerical invocation or JVM
+emission. The immutable semantic frontend is separate from its pending/published
+implementation correspondence. Promotion reuses that body but invalidates older
+implementation observations; recompilation must obtain fresh correspondence,
+not refresh an old execution owner's guards. Cold helper import prepares this
+producer before considering legacy caches, avoiding a second frontend walk.
+Focused tests cover concurrent requests, macro stability, and specification
+changes during preparation. Ordered runtime activation remains separate work.
+Acceptance includes changed-macro source oracles, distinct genuine Float/Double
+specializations, backed/wrapped source handles, edited metadata refusals and a
+prewalk-A/materialize-B helper import. Aliases and parametric cases remain required.
+Live allocation-ledger checks, success-conditional initialization and a non-executable
+final storage boundary remain required after this source-provenance work.
+
+The non-executable storage projection is now represented separately as
+`StorageBoundary`: it shares the existing physical/logical storage, alias and
+whole-value output-order validators, but cannot carry instances, effect evidence
+or initialization fields. `finish-ordered-storage-boundary` projects completed
+source-state storage without rebuilding an executable whole-program call or
+replaying initializers. Its construction proves layout only; even a fabricated
+completed cursor grants no device completion. Ordinary LinkPlan validation and
+instantiation reject its distinct type. Focused storage/LinkPlan/ordered-realization
+gate passes 34 tests / 255 assertions. Runtime activation must independently establish exact
+source-occurrence/replay-epoch observation accounting, live private-root ownership,
+initialized-range checks and failure poisoning before this boundary can publish.
+
+The explicit internal `instantiate-checked-invocation!` vertical now connects
+these owners: exact historical source guards precede session creation, source
+actions and publication; pending stages reconstruct their contracts and validate
+actual private roots against the acquisition ledger and live cleanup owners.
+Only successful device completion plus source observation commits initialized
+ranges, the source cursor and that replay's occurrence entry together. Final
+publication requires all emitted source observation occurrences, including unused
+results, for the current epoch, plus live acquired roots and initialized outputs.
+Checked replay retires private roots before any source zeroing and acquires them
+under fresh physical keys; captured inputs retain their original acquisition
+scope. Output leases prohibit that transition. Reallocating under an old key is
+not sufficient because old raw resident views could otherwise resolve new bytes.
+Focused checked/ordinary ordered execution passes 22 tests / 750 assertions with
+both local OpenCL and Level Zero exercised. Review found no further concrete
+blocker in this slice. This does not admit checked programs to ordinary binding,
+composition or persistence, cover mutable checked folds, prove generated-AD
+source lineage, qualify the red integration baseline, or close the eight-item
+campaign. Automatic Compiled admission remains separate acceptance work.
+
+The original-frontend slice passes the nine-namespace focused gate: 119 tests /
+928 assertions, including actual confined local-device checks. The new source
+oracles cover both original eager/plain frontend code and successful JIT frontend
+code, original implementation/owner identity, backed lookup, precision mismatch,
+and transitive helper-cache drift. Under explicit declared-storage preservation,
+source typing remains fixed while the target carrier can differ; Float buffer /
+Double scalar ABI checks pass. These receipts do not close cold frontend sharing,
+generated-AD provenance, ordered checked execution or the red broad CI baseline.
+
+### Historical integration receipts (not the current acceptance status)
+
+Earlier integration hold at `e3046c82` identified these groups:
+
+- Source memory evaluation: unused owned allocations lose negative-size failures
+  in invoked JVM AOT; independent probes also lose unused read bounds failures
+  and read-before-allocation exception order. Repair at attested original memory
+  producers, not by disabling DCE or marking all generated AD reads effectful.
+  The current repair marks both the owned-bytecode producer and the portable
+  source-preparation frontier, including imported source helpers before generated
+  tape/map storage. Its cold compatibility gate ran 34 tests: 455 assertions
+  passed, with 2 failures and 10 errors in the already-identified product/native/
+  contraction groups; none was in the allocation/read-order regression namespace.
+  The shared evaluation/storage/native-alias gate passes 163 tests, 940 assertions.
+  These are bounded repair receipts, not a green PR or campaign completion.
+- AD products/completion: conditional product schemas, higher-order completion
+  transposes, and native residual Object completions need closure; source guards
+  and strict precision refusals must remain observable.
+  An adversarial native probe rejected the proposed *general* literal-nil
+  completion erasure: source numeric consumption throws NPE, whereas exposed
+  native nil could become zero. Keep used/escaping nil behind its completion
+  boundary; only a provably unused, flag-free literal-nil Object snapshot may
+  be discarded by its lexical binding owner. Passing ordinary callers alone
+  was insufficient safety evidence for that broader rewrite.
+  The restricted dead-binding repair passes the cold shared gate (165 tests,
+  969 assertions) and native AD caller gate (6 tests, 32 assertions), including
+  the new source-NPE/native-refusal regression. Alias-chain cleanup remains
+  conservative; these receipts do not close higher-order/compositional AD.
+- TypedSOAC composition: contraction scalar-contract projection, resident
+  training coverage, RMSNorm effect loops, and checked terminal scalar results
+  remain integration failures, not permission to restore retired fallbacks.
+  Contraction projection now reuses the existing recurrence certificate with
+  accumulator-first orientation and lexical/evaluation checks. AD phase geometry
+  is checked separately from body-replacing dense-leaf eligibility: full scalar
+  elements and conversions remain; hardware replacement still requires the
+  original bare-product guard. Cold affected gates pass 76 tests / 1,181
+  assertions, including all normalized segmented AD checks. This includes host
+  oracles and compile-only scheduled phases, not new device/performance evidence.
+- Numerical/control evidence: Q4_K exact Float-bit comparisons differ by an ULP
+  on multiple outputs; integer-bound/control regressions also remain. Do not
+  relax exact contracts or update expectations without establishing semantics.
+  The Q4_K mismatch has now been attributed independently: the compatibility
+  consumer's boxed Float subblock result selects Double scale/add followed by
+  a Float carry checkpoint; the product consumer accidentally selected Float
+  scale/add. Explicit Double scale/add and `clojure.core/unchecked-float` at
+  every superblock restore all 33 original outputs exactly in a REPL source
+  intervention. Expanded host parity checks cover one, two and three
+  superblocks, single/multiple rows and changed data (two selected tests,
+  156 assertions pass). General unchecked-float support uses the shared cast
+  descriptor, source constant policy and JVM RT overloads; it is not a
+  quantization-specific emitter rule. Checked core float remains distinct.
+  The cold five-namespace gate passes 103 tests / 1,351 assertions (numeric
+  constants, descriptors, JVM input completion, scalar-region lowering and
+  the full K-quant kernel namespace). Backend acceptance remains required. This is not
+  a device-equivalence or performance receipt. Explicit source FP64 operations
+  must not be hidden merely because public storage is Float; the existing
+  widened-math capability gate is not a general source-dtype capability proof.
+
+CI on `d3d2d824` also exposed three regressions absent from the prior job: fresh
+map/gather AD rejects source reads carrying mandatory-evaluation flags. Two
+derivation/canonicalization gates currently conflate external purity with
+removability. Keep the flags and source evaluations; repair the gate distinction
+under the existing private-output/replay contracts, with primal failure controls.
+The reviewed gate correction passes 33 tests / 314 assertions across functional
+fresh-write admission, scoped AD effects, owned allocations and the independent
+tangent-storage law. Original bounds/negative-size failures remain, while aliases
+and unsupported active effects still refuse. This repairs those three regressions;
+it does not establish general replay safety or permit DCE to discard reads.
+The subsequent actual `e3046c82` jobs (unit 32377, emission 32378, OpenCL CPU
+32381) are terminal failures; the three fresh-map/gather errors are absent
+from the inspected unit logs. The remaining groups above are still open.
+The integer JVM reduction crash was independently isolated to SIMD eligibility:
+`compile-segred` attempted Float/Double vector construction for a valid Long
+reduction. Eligibility now consults the existing implemented-species table
+before constructing vector forms; the caller keeps the original scalar
+reduction when no species exists. Direct Int/Long admission controls and source
+versus invoked AOT sums cover empty/small inputs and a result larger than Int.
+The two affected JVM namespaces pass 63 tests / 180 assertions in the bounded
+REPL. This is target eligibility, not a restored GPU source fallback or a claim
+of integer vectorization; Object-parameter completeness warnings remain visible.
+Product-boundary test consumers now use the existing JVM source projection
+instead of evaluating canonical completion terms as runtime namespace calls.
+The oracle also checks that a failing, unselected field is still evaluated in
+source order. Both AD modes reach the common preparation-time scan precision
+guard; checks retain its original inexact-storage witness and independently
+contrast the source result (0.25) with a wrongly storage-rounded carry (0.0).
+These three reviewed checks pass 13 assertions. The full namespace remains
+red (8 tests / 27 assertions, one error): reentrant transformation of an
+untyped compound completion still lacks a closed scalar transpose declaration.
+That production admission issue is not waived by the test-consumer migration.
+The HVP/Hessian failures had a separate concrete consumer defect: the HVP
+constructor passed canonical completion IR directly to Clojure `eval`, causing
+`ClassNotFoundException` for the reserved IR namespace. It now uses the same
+JVM source projection as the other runtime AD consumers. No derivative rule,
+compilation policy, reference-Class binding or ownership guard is invented.
+Cold qualification passes the full reverse-AD namespace (46 tests / 121
+assertions) and the O4 composition law (1 test / 12 assertions), including
+analytic Hessians, directional finite differences and definition replacement
+guards. Two private, unreferenced pullback prototypes were removed during the
+consumer audit; active reification/HVP/Hessian paths remain. This repairs the
+observed HVP consumer failure, not all higher-order AD or the marketing lifecycle.
+
+Next normalized product-closure work must preserve **presence, tangent declaration
+and physical completion as independent facts**. REPL attribution of the third
+derivative shows an actual inactive residual `[nil [nil]]` joining a Double
+residual, not permission to treat every untyped leaf as numeric. A prototype
+presence-aware schema join progressed to a second refusal: generated `grad-acc`
+results whose `present_gradient` operands already lack tangent declarations.
+That prototype was reverted, not landed as a partial repair or a guard waiver.
+
+The follow-up order is: shared normal-return facts for canonical completions;
+producer-time freezing of lexical facts; retained logical declarations through
+rule instantiation, absence lifting, snapshots and projections; existing shared
+typing for generated derivative programs before reentrant AD; then checked
+nullable-scalar product joins. `BindCtx/genlet` and absence-lifted slots are
+specific declaration-transport seams to audit, not grounds for a new AD function
+inference registry. Explicit absence may join a declared scalar; unknown Object
+must still refuse. Optional arrays stay held until zero construction and ownership
+are checked. Original producers, singular pullbacks, source guards and rounding
+checkpoints must remain observable. Controls include both branch orientations,
+alias shadowing, nested projections, unknown inactive values, differing tangent
+declarations, malformed schemas, and absent versus present-zero cotangents.
+The shared completion-presence foundation is separately reviewed and qualified:
+Object/reference-check contexts forward only already-owned operand facts;
+primitive contexts prove presence only on successful normal return, without
+payload-width or policy authorization. An original-versus-DCE oracle retains
+the failing reference check and its exception order. The cold presence,
+local-product, DCE and effects gate passes 83 tests / 482 assertions. No nullable
+product or tangent-tag producer changes are included in that foundation.
+The next bounded normalization change transports existing `:raster.type/tag`
+declarations through lexical references, aliases and the final result. It uses
+the shared capture-avoiding scope traversal, publishes bindings only after their
+initializers and removes shadowed declarations. It does not infer operation
+types, copy physical JVM hints, prove non-nullness or relax product schemas.
+Conflicting reference declarations refuse pending an owning refinement proof.
+An independent review found qualified-quote traversal; shared substitution and
+alpha-renaming now preserve both quote spellings, with direct and nested data
+identity controls. Executed source and bytecode controls preserve nil, String
+and arbitrary Object identity despite logical numeric declarations. The cold
+six-namespace normalization, shared-scope, conditional, initializer and reverse-AD
+gate passes 112 tests / 544 assertions. This is not nullable-product closure or
+a fix for marketing's separate runtime/AOT lifecycle invalidation.
+
+The subsequent product-closure investigation found two concrete declaration
+losses rather than a need for AD-local arithmetic inference: canonical Object
+snapshots retained physical `Object` but lost the operand's logical declaration;
+and derivative-region normalization started empty even when the actual formal
+owner and visible outer value both retained Double declarations. The follow-up
+imports those declarations through the same lexical scope engine, never through
+private child catalogs. Exact Object completion supplies only a logical value
+declaration, with conflict refusals and source/bytecode identity controls.
+Presence is frozen at each initializer before rebinding; only the current
+record may publish the new result's facts. A recursively checked product join
+admits explicit absence with an already-declared scalar tangent, not unknown
+leaves, mixed widths, arrays, malformed schemas or active absent ports. The
+joined declaration proves neither presence nor a primitive carrier.
+The approved optional-cotangent sum's nil identity is projected only for lexical
+operands/literal nil, retaining the selected input's Object completion. Compound
+operands, changed helper definitions, lexical callees and call-level denial
+flags retain the original call. The first-through-third cubic derivative probe
+now returns its analytic values in a fresh JVM. The cold ten-namespace gate
+passes 182 tests / 981 assertions; the existing first-through-third derivative
+tests separately pass 3 tests / 9 assertions. Full CI remains required.
+Object-helper completeness warnings remain visible, so
+this is not a claim of optimized higher-order AD or complete AD coverage.
+Inspection of completed unit job 32391 (`bb27191d`) confirms the Q4_K exact-bit,
+Long/SIMD, raw-evaluation test-consumer and outdated scan-reason failures are
+gone. Its remaining failures include HVP consumers (repaired in the subsequent
+`5c745536`), schema/tag closure, training, native guards and integer/control
+proofs. This is a measured delta, not broad green CI or merge acceptance.
+
+Marketing's downloaded 0.2.1690 passes its inline/lagged workflow qualification
+(49 tests, 757 assertions plus both fresh workers). Helper migration separately
+fails runtime-gradient reuse after AOT with `:ad-normalized-stale-rules`: template
+revision remains 238, compiler revision advances 1560 to 1564. Attribute the
+definition changes before changing invalidation; a passing warmed small control
+does not reproduce or close this lifecycle bug. Cold time/RSS are not improved
+by this functional qualification.
+
+The preserved helper fixture now reproduces on campaign source as well: runtime
+and AOT both evaluate to `2.0620095064443418`, then retained runtime reuse refuses
+with compiler revision 1699 to 1703 (template revision 239 unchanged). Tracing the
+four actual changes identifies two generated `deftm` definitions evaluated in
+the marketing namespace: each publishes a result descriptor and registers its
+method. This is deliberate source publication by the bridge, not a numerical
+failure or a mysteriously mutating AOT cache. Raster's own
+`compiled-value+grad-fn` has the analogous named-wrapper pattern.
+
+Reviewed continuation: extract one anonymous retained-entry compiler from the
+existing JVM AOT path after definition resolution. The Var API remains an
+adapter; both use the same source preparation, forward passes, loader and
+hoisting/emission. Anonymous entries return diagnostics instead of mutating a
+Var and retain actual source namespace/policy, annotations, return contexts,
+captures and definition observations. Share typed-body AD preparation rather
+than fabricating a Var or introducing another differentiation path. Existing
+`ftm` and source-owner helpers are precedents, not substitutes for the complete
+AOT owner contract. Keep epoch and changed-definition guards intact: finer
+invalidation would require historical selection and negative-lookup dependencies.
+Acceptance is an already-retained MMM gradient surviving subsequent anonymous
+compilation without namespace/GF publication, with unchanged template/callee/
+overload mutation refusals. The local implementation now reuses the existing
+metadata-carrier resolver and full JVM AOT path rather than adding another IR
+or compiler. It retains actual namespace identity, checked source policy,
+annotations and the physical Object return contract. Captured closures,
+unchecked arithmetic and anonymous native/GPU targets remain explicitly held.
+The generated gradient wrapper uses `ftm`, without interning a definition;
+diagnostics attach to the returned anonymous callable. Warm anonymous-entry
+qualification passes 10 tests / 55 assertions, including retained-gradient reuse,
+unchanged definition revision and Var-held source-context routing. Static review
+found no remaining bounded defect. This is not yet released, and the downstream
+bridge still needs migration and its actual MMM lifecycle qualification.
+
+The compatibility gate also independently reproduced a silent source-product
+regression: lexical substitution/alpha conversion rebuilt vectors without their
+runtime metadata, changing the primal branch and derivative. Both vector walkers
+now preserve original metadata unchanged; the existing source-product oracle
+passes without changing its expectations. A nested-vector control covers both
+walkers. A separate product join now forgets absence for an exact unknown leaf
+only at a path inactive in both validated arms; it never derives a tangent dtype
+or creates a tangent edge there. Nested, reversed, repeated-join and active-unknown
+denial controls accompany this repair. Both changes received static review.
+The fresh-JVM combined gate passes 69 tests / 423 assertions across anonymous
+AOT, lexical utilities, product ports, conditional ports and source products.
+This is bounded source/JVM evidence, not a green integration PR or device result.
+The additional four-namespace owner/lifecycle/replay/function-algebra gate is not
+green: 41 tests / 187 assertions report two failures and one error. The native
+replay refusal stops at unclosed value completion before the expected guard
+diagnostic, and `D-pipeline-rewrite` still errors. Do not treat these as covered
+by the narrower passing product gate; both remain in the integration backlog.
+
+Residual follow-up: the actual failing `D4-compiled` conditional paired a
+two-field result with every forward local as its residual. The two forward
+arms computed different numbers of locals, although neither reverse arm used
+those locals. The producer now retains an ordered free-variable projection of
+the reverse bindings and returned parameter adjoints; both saving and restoration
+consume that exact projection. All forward expressions and their evaluation
+order remain unchanged. No padding, product-schema relaxation or inactive tape
+claim is introduced. Truly incompatible live residuals remain unsupported until
+the branch owner supplies an explicit heterogeneous residual interface.
+
+This exposes the ordinary empty-vector product in forward-over-reverse. The
+existing dynamic tangent-zero fallback now recurses pointwise over vectors,
+including the empty product, as the vector JVP rule already does. Unsupported
+Object leaves/maps/lists still refuse, and array leaf zeros are freshly allocated.
+The warm conditional/replay gate passes 24 tests / 250 assertions, including
+selected unused-read failures/effects on runtime and invoked AOT paths. The
+existing full `D-pipeline-rewrite` numerical assertions now pass. Four separate
+Float cotangent-class law failures remain: template emission currently stamps
+the desired input tangent dtype onto produced expressions without materializing
+the conversion. Retained lexical declarations expose that producer-contract gap;
+do not remove declarations, change expected classes, or weaken precision checks.
+Fresh-JVM qualification passes five conditional/product namespaces (46 tests /
+436 assertions) plus the dedicated product-zero and existing first-through-fourth
+derivative pipeline checks (2 tests / 19 assertions). A subsequent strengthened
+forward-failure control explicitly asserts invoked AOT status and passes 1 test /
+13 assertions. Integration CI remains outstanding for this follow-up.
+
+Reviewed next repair: close every scalar template output at the shared
+`instantiate-template-ctx` boundary, for static and handwritten rules alike.
+Keep actual RHS dtype evidence separate from the desired input tangent-space
+declaration. The former `stamp-emitted-bindings` created circular evidence by stamping
+the desired LHS tag onto the RHS and publishing `(or desired inferred)` as its
+actual dtype. Preserve independently established intermediate/array declarations,
+but do not feed an unfulfilled scalar output declaration into its own inference.
+Evaluate each original RHS once as a flat raw binding, apply the existing
+nil-safe `tangent/project-expr` at each returned scalar port, and publish the
+target declaration only after that projection. No `:materialized? true` without
+independent presence evidence. Ports returning an existing symbol, nil, or one
+shared source with conflicting Float/Double targets need separate projections,
+not mutation of that shared source's metadata. Keep kernel/SOAC RHSs flat.
+Acceptance includes the four existing Float laws, checked overflow/rounding,
+nil preservation, shared mixed-target outputs, static/custom rules and nested AD.
+This is a producer-contract repair, not per-operation dispatch or a change to
+AD algebra. The local implementation replaces that stamping path with
+`close-template-output-ports`, sharing the existing scalar projection's retained
+value-evidence helper. Dispatch inference may widen conditional branches; it
+therefore remains distinct from exact dtype evidence used to elide conversion.
+The normalized scalar owner also transports its existing argument declarations
+into template calls, with a conflict refusal rather than silent metadata override.
+Contradictory shared scalar/array or distinct-array-dtype ports refuse; mixed
+Float/Double scalar ports receive independent projections. No global tags or
+existing array/intermediate declarations are erased.
+
+Warm qualification passes nine affected namespaces (131 tests / 900 assertions)
+and five existing Float/HVP/derivative-pipeline tests (83 assertions). Added
+declaration-conflict and incompatible-interface controls pass in a subsequent
+four-namespace gate (46 tests / 410 assertions). These are source/JVM results,
+not device/performance evidence. Final fresh-JVM qualification passes nine affected
+namespaces (133 tests / 906 assertions) and five Float/HVP/derivative-pipeline
+tests (83 assertions): 138 tests / 989 assertions total. Static review found no
+confirmed remaining bounded defect. Integration CI qualification remains required;
+the draft PR is not ready to merge. No source arithmetic contract was relaxed.
+
+### Residency consolidation: ordered host observation
+
+October 19 implementation checkpoint: the generated terminal region now has a
+private JVM executable owner, compiled under the numerical producer's previously
+observed definition, namespace and arithmetic policy. It freezes historical
+dependencies, rejects mismatched program/contract identity and argument carriers
+before source effects, and fences successful publication with definition guards.
+This owner grants neither physical scalar exports nor completion evidence.
+
+Terminal source projection uses resolved Methods and actual captured IFns rather
+than unrestricted macro/inline expansion. Float conversions retain their actual
+operand overload and checked/unchecked policy. Unknown helper primitive ABIs,
+mixed primitive joins and unaccounted JVM hints refuse. The supported Clojure
+1.12 control forms derive carriers from children rather than form tags; those
+tags are preserved without becoming evidence. Exact Object hints are admitted
+only on already Object-valued locals. Other hint contexts remain unsupported.
+Independent source-oracle tests cover these distinctions.
+
+Review exposed a shared source-resolution defect: a namespace alias can redirect
+a qualified Class/method spelling to a Var even when the retained Method is
+correct. The existing ordered-call verifier now rejects namespace/alias masking
+of the declaring Class qualifier. Its regression first demonstrates actual
+Clojure compiler redirection, then checks refusal. These are sequential fences,
+not a concurrent Namespace mutation/ABA guarantee. Intrinsic projection assumes
+standard Clojure definitions at backend bootstrap and guards later replacement.
+
+The warm affected gate passes seven namespaces, 70 tests / 479 assertions. A real
+frontend capture of mixed-scale-energy-gradient successfully compiles its owned
+terminal expression and returns Float values with matching signed-zero and NaN
+bits; Double/MAX_VALUE throws as required. This is a terminal-owner probe, NOT
+end-to-end equation-first execution: ordinary compilation still refuses the
+unintegrated return boundary. The earlier cold 78-test gate predates the final
+hint adjustment and is not fresh-load qualification of that adjustment.
+
+Next acceptance remains the public compile/execute/replay path, not another
+standalone helper: attach portable correspondence to InvocationPlan, retain its
+private executable with the compilation owner, account for the final source-order
+observation, validate actual physical exports, and observe only after producer
+completion. Preserve resident-only refusal and complete return coverage until
+that entire transition is supported. Audit graph-liveness prefix pruning before
+omitting any pure-but-throwing scalar computation. Current exact-head CI remains
+red and PR #1539 remains draft; all eight campaign obligations remain open.
+
+Definition-policy prerequisite (October 19): named `deftm`, parametric templates
+and their concrete specializations now retain the actual producer's
+`*unchecked-math*` context, sharing the existing anonymous-function policy schema.
+Frontend facts and equation-first options transport it separately from dtype.
+Lazy JIT uses the pending specification's policy; renewal uses the original
+lineage; specialization uses its template. Source metadata must correspond before
+walking, and a policy-bearing plan must capture a genuine source entry rather
+than silently downgrade to unowned emission. Missing, changed and removed policy
+metadata are rejection controls; a deterministic mutation during capture checks
+that the pending implementation and JIT spec remain untouched on failure.
+
+The affected warm REPL gate passes seven namespaces, 50 tests / 426 assertions
+(source policy, source-entry lineage, required JIT walking, parametric dispatch,
+specialization returns, anonymous AOT and JVM source-owner compilation). This is
+bounded ownership/transport evidence, not device execution or a green integration
+gate. The separate Object-array `specialize.clj` path, mixed-policy helper
+inlining, general policy-aware target lowering and terminal host observation are
+not established by this receipt. Policy-less legacy walking retains its prior
+behavior without acquiring source ownership; old pending JIT specs with missing
+policy fail closed. Sequential source guards do not claim general concurrent
+metadata mutation/ABA protection. All eight campaign obligations remain open.
+
+Terminal correspondence groundwork (October 19): the existing InvocationPlan
+namespace now derives and independently rechecks a portable terminal-result
+description. It preserves the entire final expression, scoped locals, lazy
+branches and canonical completion terms, with deterministic logical Double/Long
+ports identified by producer equation/result position. It refuses unrepresented
+free values, unsupported carriers, missing policy and nonterminal source shapes.
+The actual mixed-gradient candidate yields its one Double dependency without
+rewriting its conditional checked Float/Object return. The focused warm plan and
+materialization gate passes 23 tests / 177 assertions. Review requested explicit
+authority-limit controls: descriptive analysis does not execute an effectful
+terminal call, and unchanged producer IDs do not certify changed computations.
+Both controls pass. Portable encoding is not purity/callee legality evidence.
+This helper is not yet activated in promotion, source-order admission or runtime:
+existing refusals remain until actual source ownership, physical scalar exports,
+completion and an explicit observation API form the complete vertical.
+
+The independent residency review distinguishes established physical contracts
+from an incomplete source-level phase boundary. AbstractValue/LinkValue separate
+logical values from physical leaves; LinkPlan checks overlapping writes and
+composed initialization/alias contracts; execution events, output leases and
+pending-transfer retention express completion and lifetime obligations. These
+foundations must be reused, not replaced by another residency runtime.
+
+The current public mixed-storage gradient exposes the missing composition:
+a device-produced Double scalar is followed by a conditional checked Float
+conversion and Object completion. Rank zero does not mean host availability.
+An IEEE device cast does not implement the host conversion's overflow exception,
+and a host preparation expression cannot depend on unfinished device work.
+Current refusal is correct, but does not satisfy the public compile vertical.
+Exact-head `962b054a` emission CI confirms this terminal source-result failure;
+unit and OpenCL gates also remain red. No merge qualification follows from the
+138-test bounded AD gate.
+
+Implement one typed terminal host-result continuation at the existing invocation
+boundary. Its contract must identify the actual producer values, their physical
+scalar exports and completion dependencies, the retained closed host computation,
+and the complete source result structure. Preserve checked conversions, lazy
+branches, Object completion, definition/source-policy ownership and evaluation
+order. Execute the host computation once after the required producers complete.
+Replace the restricted source-result proof with a proof of this continuation;
+do not waive result coverage or reinterpret a destination type as value evidence.
+
+The initial admissible region is terminal: no later device consumer or observable
+source operation may be moved across it. Resident-only entry points must refuse
+when they cannot return the promised resident result without host observation.
+Do not silently download resident chains. General intermediate host/device
+crossings require explicit ordered scheduling; deferred device error flags are
+not equivalent if later effects can occur before the host notices failure.
+
+Keep logical numerical encoding, physical realization/ABI, placement,
+initialization, ownership/escape and completion as separate proof obligations.
+The current `:resident-scalar-buffer` representation and pristine-value admission
+predicates are consolidation targets: document and remove their coupling only
+with replacement proof coverage, not by broadening whitelists. Centralize the
+transition contract (prepare, acquire, submit, complete, observe) and state which
+semantic/physical/effect/alias/completion changes invalidate each certificate.
+This is an execution-layer completion beneath TypedSOAC, not a replacement IR.
+
+Acceptance requires source-versus-execution tests for Float rounding, overflow,
+NaNs/infinities/signed zero, selected and unselected nil conversions, failure
+ordering around effects, Object boxing, multiple result leaves and repeated
+invocations. Add mismatched physical ABI, changed/shadowed source definition and
+downstream-device-consumer refusals. Hardware-free contract/emission evidence,
+actual OpenCL/Level Zero execution and performance measurements remain separate.
+The broader distributed placement/planning obligations below remain open.
+
+Implementation seams confirmed by follow-up review: retain the validated
+continuation at InvocationPlan's existing attribute boundary, not its prefix
+`:steps`. Construct it during frontend terminal-source analysis and whole-source
+promotion; both host coverage and result coverage must consume the same owned
+contract. The existing ordered invocation executor already acknowledges numerical
+stages after synchronous completion. Extend that owner and its final realization
+validation to perform explicit terminal observation. Keep exact producer/export
+relations in the contract; rank-zero dtype alone is not export evidence.
+
+`gpu.compiled/invoke-compiled` is a resident API today. Its output tree, resident
+view projection and leases must not silently change to return host objects.
+Provide a distinct, explicit source-result observation boundary; reject unsupported
+resident requests before mutation/replay. The JVM typed-scalar interpreter's
+numeric result coercion and restricted expression grammar are not already an
+Object/nil completion evaluator. Reuse the existing retained source/bytecode
+completion owner when closing the result computation, rather than evaluating
+arbitrary source or inventing runtime implementations of canonical IR terms.
+
+The first implementation prerequisite now observes the actual outer lexical tail
+at JVM emission. Its final free ports come from emitted local slots/classes,
+including shadowing, and its actual result context remains distinct from the
+outer method context (Object regions strengthen call-result preservation).
+The owned whole-body record also retains the reflected method's actual return
+descriptor/carrier. `compile-terminal-result-region` reuses the existing physical
+port outliner and JVM emitter, excluding prefix initializers while preserving
+checked casts, lazy branches, Object/nil results and reference return checks.
+Original occurrence/definition guards remain; copied, stale, ambiguous, altered
+or actually split owners refuse. This is compiler-local ownership evidence,
+not an authenticated portable certificate or a device scheduling permission.
+
+An initial fresh-JVM owner gate passed 47 tests / 445 assertions, but stronger
+independent plain-Clojure oracles then exposed an existing explicit `float` bug:
+the JVM emitter used raw narrowing and accepted Double overflow/infinities instead
+of throwing. Explicit `float` now shares the existing RT cast-emission path with
+`unchecked-float`, choosing `RT.floatCast` rather than raw descriptor coercion.
+Implicit argument conversions remain unchanged. Review found the whole-bytecode
+AD consumer also rebuilt every cast as raw argument completion; retained cast
+evidence now identifies the actual checked source operation, and that consumer
+preserves its operation and mandatory evaluation even when its result is unused.
+This is a source-semantics repair, not new reassociation or fast-math permission.
+
+The new outliner namespace is discovered by the ordinary CI shard planner.
+Independent plain-Clojure oracles cover primitive/Object cast overloads, terminal
+conversion, reference return checks and array reads. Retained cast observations
+require an explicit lowering kind; missing or unknown provenance refuses rather
+than becoming raw conversion evidence. Checked and unchecked overflow paths have
+separate actual whole-bytecode AD regressions. Final fresh-JVM qualification of
+the combined repair passes six namespaces, 69 tests / 850 assertions. Full
+integration CI remains required. The result
+continuation's semantic port/export correspondence,
+explicit device completion/readback, host-facing invocation entry and resident
+preflight refusals are NOT implemented by this prerequisite.
+
+PDE CI triage found an obsolete representation assumption in the rectangular
+coverage mutation test: its first step is now a host equation, and the actual
+numerical step is a functional map rather than the former effect map. Merely
+selecting the numerical step is insufficient: effect mutation then edits nothing.
+Retain the public functional-map acceptance and exercise rectangular effect
+coverage with an explicit effect-map fixture; do not drop the negative guard,
+overflow, narrowing or injectivity checks. The reviewed repair now uses a validated
+6-by-10 effect-map fixture with explicit Long address evidence, asserts that each
+store mutation actually changes one store, and executes the positive fixture
+against sentinel-filled storage. Public prolongation/restriction separately retain
+complete-destination initialization assertions and device-versus-JVM checks.
+The full affected namespace passes 10 tests / 115 assertions, including local
+Level Zero execution. Independent static review found no coverage weakening.
+This closes the stale test assumption, not the remaining integration failures.
+
+### Source conversion contracts beneath residency
+
+A subsequent independent REPL check found a second interpretation mismatch:
+canonical Double-to-Float conversion accepted `:overflow :ieee` together with
+`clojure.core/float`, although projecting that term to source throws on
+`Double/MAX_VALUE` while an IEEE narrowing returns infinity. The shared
+`scalar-conversion/source-policy` now separates descriptor-owned source casts
+from implicit numerical/storage conversion. Checked Double-to-Float retains
+`:nearest-even/:trap`; unchecked narrowing retains `:nearest-even/:ieee`.
+Canonical validation and frontend construction consume this same policy.
+
+Raw checked Float calls also retain the existing checked-source-cast evaluation
+obligation before canonicalization. Totality uses checked source constant evidence
+or retained source dtypes, never IEEE constant folding or a destination hint.
+The scalar KernelBody lowerer admits a checked narrowing only when its actual
+lowered literal proves it cannot throw; other cases refuse rather than silently
+emitting IEEE conversion. Existing trapping-conversion fusion barriers therefore
+also cover checked Float producers. This does not implement a device exception
+protocol or the missing terminal host continuation.
+
+Independent review found no further confirmed soundness blocker in this bounded
+repair. The focused conversion/body/effect gate passes 77 tests / 829 assertions;
+two further fusion/order controls pass nine assertions. These include overflow,
+infinities, NaN, signed zero, lexical callees, nested unchecked Float infinity and
+failure before later output writes. Intentionally IEEE test terms now name the
+unchecked source operation; checked-source refusal controls remain separate.
+
+Broader qualification is still red: the initial seven-namespace affected gate
+reported 35 failures and 11 errors. A subsequent concise inventory, after the
+masked-reduction fixture repair, still shows fusion expectation failures,
+unclosed terminal scalar programs, the public layer-norm backward checked cast
+and missing native vector emission. That inventory suppressed standard assertion
+reporting and is diagnostic only, not a passing gate. Do not change source casts,
+drop acceptance assertions or relax exceptions to make these green. Finish the
+ordered observation/realization boundary and distinguish actual source conversion
+from compiler-owned storage conversion using retained producer evidence.
+
+The adjacent source-cast matrix found the same distinction for Float/Double to
+Int/Long: ordinary checked casts throw on overflow, whereas unchecked conversion
+saturates. `source-policy` now records `:toward-zero/:trap` for those checked
+casts, independently of the existing saturating numerical conversion policy.
+The shared scalar lowerer applies the same refusal/closed-literal proof boundary.
+
+Review also identified an overload-sensitive proof issue: a boxed Number cast can
+truncate before checking an integral bound, unlike the original primitive FP
+cast. `numeric-constant/source-value` now selects actual Float/Double primitive
+overloads for literal source casts; the separate numerical/IEEE `value` path is
+unchanged. Tests compare the proof itself with independently typed source
+oracles at fractional Byte/Int boundaries, neighboring Long boundaries,
+infinities and NaN, and assert the literal's actual carrier Class. The focused
+four-namespace gate passes 88 tests / 1,178 assertions in the reused REPL.
+Hardware-free tests also require all three C-family emitters to refuse an
+unsupported trapping FP-to-integral KernelBody cast. Independent final static
+review found no remaining confirmed blocker in this bounded delta. This is not
+a cold integration gate or qualification of the broader currently failing suite.
+
+The real mixed-storage energy-gradient REPL probe still reaches
+`:structured-control-source-result`, retaining its conditional Float/Object
+completion and one free Double-result port. An explicitly experimental host-only
+projection through the existing `source-owner/compile-function` agrees with
+ordinary Clojure on Float carrier, rounding, signed zero, NaN and checked
+overflow/infinities. This experiment deliberately chose a generated-source
+policy and provided no runtime guard; it is NOT production ownership evidence.
+The named public deftm metadata inspected here does not retain that policy.
+The semantic producer must therefore supply the actual generated source context
+and dependency guard, rather than infer them from a return hint, ambient REPL
+bindings or an unrelated original bytecode tail.
+
+The existing source-owner seam now has permanent conditional Object/nil-result
+and unprojectable bytecode-completion controls (eight tests / 29 assertions).
+Next retain the semantic terminal region/context at its producer, derive exact
+physical scalar exports, and execute its guarded observation through the existing
+ordered executor and an explicit host-result API. None of those integration
+steps is established by this host-only experiment.
+
+Exact-head `9ca37eb6` emission CI (32484) additionally reaches a checked
+Double-to-Float conversion inside the functional mixed-scale map. Independent
+CPU invocation of `par/scale Double/MAX_VALUE` over a Float array throws too;
+this is not permission to relabel its conversion IEEE. Terminal result
+observation alone will not close that map's execution contract.
+
+After the terminal complete/observe/publish boundary, reuse that transition for
+a typed checked-stage result obligation. The first status-buffer realization
+may cover only checked Double-to-Float with fresh private non-escaping output,
+no aliases/donation, one conversion kind, and otherwise total independent
+element computations. Purity alone is insufficient. Preserve the checked
+semantic operation; explicit KernelBody predicates/branches and existing
+AtomicRMW may realize its validation, with private status storage accounted for
+by LinkPlan. Reset before every replay, await actual kernel completion and
+observe success BEFORE initialization credit, cursor advancement, consumers or
+output publication. Failure must not yield a ready output or output lease.
+Do not make status-buffer representation the semantic model or silently add
+downloads to resident-only APIs. General effectful/otherwise-throwing maps,
+multiple error classes and checked FP-to-integral device realization remain
+held until their source-order and carrier-specific contracts are proved.
+Independent design review confirmed this bounded seam and requires replay-reset,
+failure-before-consumer, alias/donation refusal and extra-throwing-operation
+negative controls. No checked-stage runtime implementation is claimed here.
+
+The next physical realization was first exercised as a test-only KernelBody
+fixture, not a production schedule: compare the original Double to exact
+`+/-Float/MAX_VALUE`, convert/write only valid lanes, and overwrite each lane's
+status on both success and failure. NaN remains source-valid; infinities and the
+immediate Double neighbours outside the finite Float interval fail. Checking
+whether the narrowed Float is infinite would be incorrect at those neighbours.
+The experiment runs failure -> mixed -> success -> mixed to detect stale status.
+Local generated CUDA source compiled to PTX with nvcc 12.4, and HIP source to a
+gfx1100 code object with the installed HIP/Clang toolchain, both without hardware.
+These are physical feasibility checks, not public checked-map support, general
+initialization evidence, CUDA/HIP execution or performance qualification.
+
+A bit-only status cannot reproduce value-dependent source diagnostics. Preserve
+the offending original Double in private stage diagnostics, and prove the selected
+failure lane's correspondence to source traversal before reconstructing the source
+exception. Diagnostic storage is only readable for a failure-selected lane whose
+write completed; successful output initialization remains conditional on status
+observation. Zero-length success must require neither launch nor status read.
 
 The immediate JVM helper/ordered-reduction slice now has source qualification
 on the unchanged marketing formulation: runtime and invoked AOT gradients agree
@@ -468,18 +5883,85 @@ Multi-GPU execution additionally needs device-scoped roots, peer route admission
 The existing topology/cost and empirical route contracts should consume those facts; synthetic
 links, NVLink branding or a forecast never grant ownership, numerical permission or measured overlap.
 
-### Original campaign obligations
+### Loop import and vectorization consolidation (October 19 REPL exploration)
 
-| Item | Landed foundation | Remaining completion gate |
+Explicit `par/` combinators remain the primary parallel-intent API. Ordinary Clojure loops
+remain a best-effort import into the same typed operations and ordered control regions, not
+a second scheduler or a promise to infer arbitrary parallel algorithms. Recognition, legality,
+target representability and profitability must be reported separately.
+
+The bounded source REPL exploration found:
+
+| Surface case | Observed boundary | Remaining obligation |
 |---|---|---|
-| 1. CI and coverage | Seven CI gates, vendor source compilation, targeted native/differential tests | Reconcile skipped tests and environment prerequisites; partition by affected compiler layer; retain cold-load, negative-admission and CPU/device controls. |
-| 2. Compatibility and debt ledger | Executable compatibility inventory and many bounded retirements | Re-audit reachable production paths and dependent packages; give every remaining adapter an owner and removal gate; remove covered dead code and duplicate tests without losing distinct oracles. |
-| 3. Direct TypedSOAC migration | Typed packets, ordered ABI, graph/body emission, retained dtype/effect/storage evidence | Close remaining source/semantic composition boundaries, bound compilation cost and remove migrated re-lowerings; demonstrate the same numerical intent through JVM/C and GPU routes with precise refusals. |
-| 4. Portable source compilation | OpenCL/Level Zero execution and CUDA/HIP compile gates | Keep actual public workload fixtures portable and distinguish source compilation from runtime/device evidence; coordinate the external CUDA runtime work against the common contracts. Cloud hardware is not a prerequisite for this local campaign. |
-| 5. Reusable training | AD rules, opt-in normalized bundles, artifacts, generated updates, GSDM staged execution | A resident forward/VJP/update composition, normalized AD migration gates, unchanged generated SFT and real-weight numerical acceptance, and measured steady execution. GSDM, Gemma and density/PDE derivatives are complementary controls. |
-| 6. Hardware-free distributed planning | Topology, physical service lanes, route evidence, root/scratch budgets, simulation/certificates | Fresh topology/dependency/capacity/collective/halo/drift counterexamples; independently check cost, numerical intent and ownership witnesses. Analytical forecasts must remain distinct from measured fabric performance. |
-| 7. Data parallelism and halos | Co-located update/collective and numerical halo demonstrations | Close public compiler-to-plan-to-runtime composition with device-scoped views, completion and cleanup; check nonuniform partitions and exact byte accounting. Do not claim multi-host transport or overlap from one laptop. |
-| 8. Durable and multilevel simulation | Manifests, mmap lease tests, checkpoint/restart and AMR provider slices | Fresh-owner restore/publication with producer geometry, time and lineage; numerical restart/branch and declared conservation/convergence/fidelity oracles; reject corrupt, incompatible or prematurely released state. |
+| Explicit map / dense `dotimes` map | Both reach TypedSOAC; raw map reports one recovery | Numerical/device controls and declared alias contracts remain separate. |
+| Explicit reduction / recovered sum loop | Explicit form imports; recovered form is recognized but its unbound terminal operation does not import | A flat terminal-result binding admits it in the REPL prototype; close this canonicalization handoff without changing evaluation context/order. |
+| Explicit contraction | One generated kernel through public equation-first compilation | Compare schedules/performance under matched numerical permissions. |
+| Outer `par/map-void!` with ordered inner reduction | One generated kernel | Do not confuse outer parallelism with cooperative reduction-axis scheduling. |
+| Raw nested row loop | Imports after the flat terminal-binding prototype | Keep the recovered inner fold ordered unless separately authorized. |
+| Data-dependent search inside a map | Semantic import succeeds; KernelBody lowering refuses | Import success is not end-to-end language coverage. |
+| Dependent stores | Terminal-binding prototype imports an effect-map with `:iteration-order :sequential` | Never upgrade it solely because the surrounding source is counted. |
+
+These observations used a synthetic target and small JVM numerical controls; they are not GPU
+execution, bounds-completeness or performance receipts. Shared array snapshot discharge now
+composes inline literal projection through the existing saved-product owner, followed by
+sequential-only let normalization; it does not introduce another product lowerer or enable
+broad copy propagation. A cold-loaded focused gate passes 161 tests / 924 assertions, and the
+new public array-product integration check passes two assertions. Controls include eager sibling
+evaluation/failure, reference identity, nullable arrays, contradictory carriers and preservation
+of evaluation obligations across nested wrappers. Mixed-precision reduction completion and
+actual device qualification remain separate obligations.
+
+Independent read-only review found no confirmed defect in this shared-storage change; it
+explicitly did not qualify emitted-device execution. The retained mixed-scale scalar-gradient
+initially refused with `:equation-first-coverage` at a preserved constant seed after parallel
+work. The next source-completion increment separates retention from ordering: marked successful
+literal conversions remain executable roots, but their source-proved totality permits staging.
+Canonical IEEE constant evidence is distinct from checked Clojure source evidence; Float
+overflow cannot acquire infinity-on-overflow semantics through this proof. Both constant proofs
+abstain at a bounded cast depth. Optional purity abstention retains the original independent
+source obligations; incomplete obligation discovery produces a non-waivable unknown-obligation
+denial. Review caught the initially conflated retention/order predicate and abstention interaction
+before landing; both now have controls.
+
+Focused gates pass 12 tests / 118 assertions for numeric/source staging and 163 tests / 940
+assertions for evaluation/native behavior; array admission passes 1 test / 2 assertions. The full
+affected frontend/storage namespaces report 145 tests / 794 passing assertions / one error. The
+remaining mixed-gradient control now reaches the complete-source-return check and refuses
+`:structured-control-source-result`, rather than declining the constant seed. Its conditional
+Object-carried scalar completion and checked Float projection remain open. Do not substitute
+payload metadata for source conversion or evaluation-sequencing proof. No check was waived,
+no source precision contract changed, and no device-performance claim follows.
+
+Downstream qualification of the downloaded 0.2.1690 jar now reports 49 tests / 757 assertions
+and both fresh inline/packed-lagged marketing workers passing, including changed-data AOT and
+MM allocation finite differences. This is workflow correctness evidence, not throughput evidence.
+The separate preserved helper lifecycle still fails when a retained runtime gradient is reused
+after AOT preparation: template revision stays 238 while compiler revision advances 1560→1564.
+Keep that runtime→AOT→runtime sequence as a compatibility-debt acceptance case. Identify the
+actual semantic/derived definition changes before changing invalidation granularity; never
+reset or bypass the freshness guard to make the acceptance pass.
+
+The read-only reference audit used local LLVM `585e2a01` and Valhalla JDK `775bcc5bdf2`.
+LLVM LoopVectorize separates CFG/instruction/memory legality, runtime alias checks, VPlan and
+costing; SLP is a separate packing optimization. C2 SuperWord likewise has dependency analysis,
+speculative alias checks and profitability filtering. LLVM and C2 distinguish strict ordered
+FP reductions from authorized reassociation; MLIR VectorToLLVM defaults reassociation off.
+Do not rank these systems from unmatched numerical contracts or source inspection alone.
+
+Priority within items 1–5: (1) close canonicalization/import handoffs with shared scope/context
+machinery; (2) separate region numerical permissions from operator-level monoid facts;
+(3) connect access/range, physical-view alias, ownership and completion evidence; (4) add narrow
+guarded/costed vector plans only after differential legality controls. Existing raw-loop recovery
+consults a global FP monoid permission; qualify and reconcile this with explicit-permission
+semantics before widening it. The tested native scalar/requested-SIMD cancellation probe agreed,
+so no changed numerical result was established by this exploration.
+
+External acceptance may include a small synthesis/GA workload from Jack Rusher and, later,
+Timestral-5M forecasting in pretrained-rstr. Timestral adds tests for mixed F32/F64 statistics,
+masking/scans and robust existing math, not a new time-series compiler dialect. Its public
+inference does not require AD; training qualification is separate. Existing naive `asinh`
+cancellation is numerical-stdlib debt. These additions do not replace the original eight gates.
 
 ### Execution order
 
@@ -4932,6 +10414,141 @@ and uncast Double promotion are distinct oracles, not interchangeable tolerances
 The wider conditional-index proof, artifact quotienting, resident-scalar composition
 and unchanged real-model acceptance obligations remain open.
 
+### Explicit terminal host observation over the ordered invocation owner
+
+A checked scalar return is an observable source computation, not permission to
+expose its numerical dependency as the function result. Equation-first compilation
+now retains the complete ordered terminal scalar suffix in InvocationPlan and
+compiles it under the producer's historical source ownership. Double/Long ports
+come from revalidated equation/result correspondence, not output-name or dtype
+search. A later numerical consumer cannot be hidden in the host suffix.
+
+`raster.gpu.link/instantiate-host-result!` and `run-host-result!` explicitly opt into
+the host observation. They reuse the ordered executable's storage, lifetime lock,
+initialization proof and failure boundary; numerical stages remain resident until
+the declared scalar observation. Resident output/lease APIs refuse to expose these
+private dependencies. Source ownership is checked before replay mutation. Terminal
+exceptions or missing publication poison execution before replay credit/readiness.
+This is a deliberate API distinction, not an implicit download in resident replay.
+
+Projection into a GraphLinkInstance retains exact emitted-equation provenance as
+revalidation input; ordinary graph/ABI/alias checks precede reuse of existing
+complete-write analysis. It does not accept caller-authored coverage claims.
+Terminal-owner persistence remains refused pending a reconstruction contract.
+Equivalent lazy source-JIT definition transitions can still conservatively stale
+an owner; general lifecycle/cache convergence is not established by this slice.
+
+Bounded local qualification includes real OpenCL and Level Zero checked scalar
+returns, changed-input replay, overflow, explicit mode refusal and injected missing
+publication. No full campaign, device-performance or broad source-completeness
+claim follows from these tests. Checked conversions inside numerical map stages
+remain a separate open completion-before-publication obligation.
+
+Follow-up terminal coverage includes binary core arithmetic over actual primitive
+Double operands. The owner uses the shared source-arithmetic plan and method-name
+translation to resolve exact Numbers overloads, retaining Double operations before
+checked Float narrowing. Logical result tags do not select carriers. Other arities
+and carriers still refuse. Core arithmetic Var/inline definitions join the existing
+bootstrap ownership guard, not a new inference registry. A fresh-process affected
+gate passes 27 tests / 1,067 assertions, including source arithmetic plans, terminal
+ownership controls and the guarded Float hardware experiment; the original public
+wide-add/narrow test passes ten assertions on OpenCL/Level Zero with changed replay
+and explicit resident-API refusal. This is host-result qualification, not resident
+composition or a broad green CI receipt.
+
+### Prepared-module normalization correspondence (in progress)
+
+The generated-AD import path now observes the final normalization binding spine
+at its constructor, including extent bindings inserted immediately before their
+owning operation. Each post-lift input position retains its exact input pair and
+the ordered output pair objects it produced. A final linear identity check rejects
+missing, rebuilt or reordered pairs; the ordinary no-observer path has no origin
+capture or scan. These notices are correspondence inputs, not admission evidence.
+
+The focused recorder gate passes 2 tests / 52 assertions in the reused REPL.
+The complete frontend namespace still reports 18 failures / 1 error; rerunning
+the 142 unaffected tests with the committed normalizer reproduces all of them.
+Those ownership, loop and mixed-radix coverage failures remain debt, not waived
+tests. The exact-head CI for 8cb5408c also remains red: distributed training and
+fixture emission decline unclosed generated completions; OpenCL additionally
+exposes unchecked scalar/stage-observation and resident-step-count obligations.
+
+The private `prepared-module` phase now owns that early consumer: it obtains the
+actual generated physical entry, adopts the existing AD producer, constructs the
+pending call itself, and checks a bijection between minted calls and actual cuts.
+It seals the actual normalization once under the retained source history, rechecks
+physical entry and namespace identity, and maps each call binding and completion
+obligation through its exact cut insertion interval to final normalized positions.
+Reduction and continuation remain two positions belonging to one original module
+binding. Input obligations retain both Object staging and conversion positions.
+The assumed staged-input/conversion/body layout is independently checked before
+using positional arithmetic; a generator layout change cannot silently reassign
+an obligation. Supplied and generated normalization declarations use conflict-
+checked canonical unions, including scalar/array kind conflicts.
+
+This is construction only, not a second executor or a production frontend
+permission. `view` requires the private phase and its exact normalized object;
+copied context maps have no standalone authority. No phase object enters portable
+IR. The first vertical supports direct public-parameter arguments, unchanged copy
+allocation spines, and completion contexts under root binding initializers. Other
+shapes explicitly refuse until their construction correspondence is represented.
+Neither observer data nor logical dtype declarations close the prepared-import
+marker. The real training fixture still has six scalar/storage coverage refusals.
+
+The reviewed phase/dtype/generated-body gate passes 26 tests / 293 assertions in
+the reused capped REPL. Negative controls cover changed physical entry identity,
+missing/corrupt histories, conflicting declarations, count-preserving source
+reordering, and a generator staging-layout change. Canonical primitive-array
+Class lookup is shared with the existing dtype facets rather than duplicated.
+
+Next is integration with the existing equation-first frontend and OrderedSourceOwner:
+carry the private phase outside the AST, attach all required obligation identities
+to the complete equation/InvocationPlan spine, and prepare scalar continuations at
+their existing source-order positions. A numerical reduction must execute once;
+outlining its original whole initializer on the host is forbidden. Publication
+still requires complete ordered execution, completion, storage, runtime-view and
+output accounting. No global scalar admission waiver or fallback is acceptable.
+
+Execution integration review clarified two additional constraints. The ordinary
+typed route normalizes and can reproject/DCE source again; an owned normalized
+entry must instead consume the exact sealed object and preserve its positional
+map. The full production pre-SoA pipeline cannot be run destructively after the
+cut and then excused by equal names/counts. The first generated-module producer
+must retain a complete canonical source transaction and explicitly refuse SoA
+interface changes until their correspondence exists.
+
+Most importantly, a post-reduction continuation is not automatically a host
+scalar action. Cross-equation reductions must stay resident. Its exact typed
+scalar region should use the existing reduction result-transform fusion and
+resident materialization, with emitted physical representation independently
+rechecked. The ordered source owner retains actual input/count/exception checks
+and true host-prefix actions; it must not download a reduction to rerun a quotient
+on the host. Allocation obligations join the existing allocation contract,
+BufferAllocation step and source-ordered initialization, not a scalar thunk.
+Future finalization must partition every import binding and obligation across
+those existing mechanisms before consuming its exact original marker. Device
+buffer views still need a logical-to-resident correspondence; they cannot be
+cast to JVM arrays as a substitute.
+
+The existing JVM scalar projector now has an optional constructor trace for that
+join. It records exact occurrence and parent/child identities, actual resolved
+Methods and ordered input contracts, their constructed projections and physical
+result carriers. Parameter adaptation is explicitly separate from source-body
+operations. Enter/value notices describe static construction, not dynamic branch
+execution; two shared expression objects in different branches retain distinct
+occurrence tokens. The trace owns no new inference or arithmetic registry.
+
+`trace-scalar` requires a live source namespace and enclosing definition collector,
+and fences both namespace identity and dependency history after projection. It
+explicitly distinguishes the existing typed-scalar restrictions from ordinary
+Clojure source Float-to-Double widening. The consumer must prove which context
+matches the actual emitted body; choosing a label or seeing a result dtype is not
+that proof. Traces stay non-admitting, helper/reference effects remain obligations,
+and the existing `project-scalar` restrictions are unchanged. Untraced calls avoid
+occurrence/frame allocation and tracing try/finally. The affected terminal/ordered
+source-owner gate passes 47 tests / 486 assertions, including raw-bit FP oracles,
+method/child-position checks, helper nonexecution and namespace replacement.
+
 ### Observable scalar checkpoints alongside resident state
 
 A returned loss can precede VJP and optimizer effects, while the typed envelope
@@ -4960,3 +10577,72 @@ this is not a controlled compile-time benchmark. Full 2-layer/32-dimensional
 GSDM statistical training, Adam/EMA coverage, real-weight Gemma adapter gates,
 and normalized AD general composition/default migration remain separate open
 acceptance obligations.
+
+### Pre-emission generated numerical templates (2026-10-22)
+
+`generated-body/normalize-program` now constructs the numerical template and its
+complete pending completion manifest before the first outer generated entry is
+emitted. The unchanged completion-bearing program remains the CPU runtime body.
+After existing local/context validation, publication retains the identical
+template under the existing GeneratedPreparationOwner; there is no new registry
+or execution convention. Unsupported template construction or an unavailable
+complete occurrence inventory leaves CPU execution available without authorizing
+a numerical import. Stale owners and mismatched owned contracts still fail.
+
+Each completion traversal occurrence has its own manifest token and, where
+needed, fresh conversion hole. Shared source objects do not share holes. The
+emitter supplies an exact ordered occurrence inventory, not inferred syntax
+equivalence or dynamic branch order. Queries validate the dependency lineage
+once for the complete inventory. Copies, missing/extra/ambiguous records and
+unemitted unreachable occurrences cannot close it; quoted data stays opaque.
+
+`propose-value-source` now requires this retained template. It refines only
+numeric boundary holes using actual raw operands or independent normal-return
+facts, never the same conversion's result as its source type. Explicit primitive
+input recipes use the existing scalar-conversion policy at construction time and
+are checked against actual emission. The former post-emission numerical AST
+reconstruction is removed. Wrapper/check obligations remain pending, and source
+imports remain open until the existing normalization/TypedSOAC/InvocationPlan
+closure is complete. This change is not production training admission.
+
+The actual distributed-training body joins all 64 manifest entries to their
+emitted occurrences; only two conversions require deferred numeric refinement.
+Focused tests cover shared/nested occurrences, stale and copied owners, CPU
+divergence preservation, publication identity, and Float checkpoint raw-bit
+agreement through Double conversion (signed zero, subnormals, overflow, infinity
+and NaN). The broader seven-gate PR requirement is unchanged. Exact-head `aadb9c33`
+CI remained red: unit training composition has two equation-first coverage
+errors; OpenCL reports one failure and twenty errors across training, PDE/AMR,
+effect/control and checked-stage boundaries. These are unresolved campaign
+obligations, not accepted skips or permission to merge.
+
+### Keep checked shape algebra through scheduling (2026-10-22)
+
+The indexed-attention CI failure exposed a lost proof boundary: promotion moved
+a checked allocation-size computation into `InvocationPlan` and removed its typed
+equation. Logical footprint validation and later equation slicing could no longer
+prove the same size. Promotion now retains that original algorithm/source/value
+evidence as an empty-operation, host-only graph-shape equation, using the existing
+representation for shape proofs. Its shared source-order entry still has exactly
+one `ScalarCompute` evaluator. Overflow and earlier source failures remain ordered
+before allocation; no evaluation is duplicated. The pure and checked shape cases
+share one retention branch. Experimental extra invocation-proof queries were
+removed rather than introducing a second proof route or synthetic equations.
+
+The resulting public indexed compilation proceeds to the existing ordered host
+executor. Its Long head-dimension quotient now has an exact typed-only projection
+through `Numbers.quotient(long,long)` and the original core intrinsic snapshot.
+Primitive Long operands are required; Int, mixed, floating, Object, wrong-arity
+and ordinary-source contexts remain refused. This is not GPU division admission.
+Core, actual typed bytecode and projected JVM checks cover sign/truncation,
+MIN/-1, zero divisors, Method identity and intrinsic replacement. Adding this
+bootstrap assumption requires a fresh compiler process, not a snapshot refresh.
+The complete generated-training import and all seven CI gates remain obligations.
+
+Qualification: the fresh single capped REPL passes the Long quotient parity
+probe; the complete terminal-source ownership namespace passes 31 tests / 441
+assertions, and four focused shape-order/overflow tests pass 78 assertions.
+The public indexed reference roundtrip passes 27 assertions on Intel Arc OpenCL
+and 27 on Level Zero, including repeated execution at edge counts 4, 1 and 0
+against the independent segmented-reduction reference. No performance claim or
+broader training/PDE coverage is inferred from these checks.

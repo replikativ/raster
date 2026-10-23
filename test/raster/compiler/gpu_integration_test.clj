@@ -288,10 +288,10 @@
           (finally (gpu-link/close! executable)))))))
 
 (deftest symbolic-dense-contraction-uses-one-correct-kernel-body-test
-  (let [left (float-array [1 2 3 4 5 6])
-        right (float-array [7 8 9 10 11 12])
+  (let [left (double-array [1 2 3 4 5 6])
+        right (double-array [7 8 9 10 11 12])
         compilation (equation-first/compile
-                     #'contract/contract-mm {:target :ze:0 :dtype :float})
+                     #'contract/contract-mm {:target :ze:0 :dtype :double})
         plan (equation-first/lower compilation [left right 2 3 2])
         artifact (first (:kernels compilation))
         body (get-in artifact [:attributes :kernel-body])]

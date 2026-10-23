@@ -6,6 +6,7 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.stage-result :as stage-result]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
@@ -13,6 +14,7 @@
             [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
+            [raster.compiler.passes.parallel.checked-map-stage :as checked-stage]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
@@ -79,11 +81,22 @@
         policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         expected (expected-graph algorithm body caller-options)
         mixed? (= :mixed-precision-contraction (get-in refinement [:schedule :kind]))
+        checked? (or (checked-stage/candidate? algorithm expected)
+                     (= checked-stage/kind (get-in refinement [:schedule :kind]))
+                     (stage-result/requires-observation? refinement)
+                     (stage-result/requires-observation? graph))
+        _ (when (and checked?
+                     (not= checked-stage/kind (get-in refinement [:schedule :kind])))
+            (fail! :checked-map-stage-refinement
+                   "checked source requires its source-derived checked stage refinement" {}))
+        checked (when checked?
+                  (checked-stage/validate-reconstruction! algorithm expected refinement caller-options body))
         mixed (when mixed?
                 (mixed-validation/validate-reconstruction! algorithm expected refinement caller-options))
         refinement (when refinement
-                     (if mixed? refinement (refinement/validate-against! refinement expected)))
-        scheduled (or (:graph mixed)
+                     (if (or mixed? checked?) refinement
+                         (refinement/validate-against! refinement expected)))
+        scheduled (or (:graph checked) (:graph mixed)
                       (if refinement (refinement/scheduled-graph refinement) expected))
         ;; Executable validation already validates this exact graph before checking its ABI,
         ;; scalar dependencies and artifacts. Do not immediately repeat the graph proof.
@@ -133,8 +146,9 @@
                                      (when (and generated-body
                                                 (not (semantic-fingerprint/equivalent?
                                                       generated-body certificate)))
-                                       (fail! :emitted-mixed-matrix-artifact-refinement
-                                              "mixed matrix artifact changed its exact generated stage body" {}))
+                                       (fail! (if checked? :emitted-checked-map-artifact-refinement
+                                                  :emitted-mixed-matrix-artifact-refinement)
+                                              "artifact changed its exact source-derived stage body" {}))
                                      (when (and (swr/plan? algorithm)
                                                 (not (semantic-fingerprint/equivalent?
                                                       certificate
@@ -145,11 +159,12 @@
                                       certificate (:operation emitted-node))
                                      true)
                                  (if generated-body
-                                   (fail! :emitted-mixed-matrix-artifact-refinement
-                                          "mixed matrix artifact requires its generated scheduled-body certificate" {})
+                                   (fail! (if checked? :emitted-checked-map-artifact-refinement
+                                              :emitted-mixed-matrix-artifact-refinement)
+                                          "artifact requires its generated scheduled-body certificate" {})
                                    (= (:operation scheduled-node) certificate)))))
                            (:nodes scheduled) (:nodes emitted)
-                           (or (:stage-bodies mixed) (repeat nil))))
+                           (or (:stage-bodies checked) (:stage-bodies mixed) (repeat nil))))
       (fail! :emitted-parallel-equation-operation
              "target emission changed a scheduled equation operation certificate" {}))
     (doseq [[field value] [[:provenance provenance] [:attributes attributes]]]
@@ -157,7 +172,8 @@
         (fail! :emitted-parallel-equation-description
                "emitted equation descriptions must be maps"
                {:field field :value value})))
-    {:boundary emitted-equation :source-graph expected :mixed-reconstruction mixed}))
+    {:boundary emitted-equation :source-graph expected :mixed-reconstruction mixed
+     :checked-stage-reconstruction checked}))
 
 (defn validate!
   ([emitted-equation] (validate! emitted-equation {}))
@@ -221,22 +237,26 @@
 
 (declare validate-with-result-contracts)
 
+(defn- physical-result-report [report]
+  (cond-> (select-keys report [:boundary :physical-results :complete-write-domains])
+    (seq (:stage-results report)) (assoc :stage-results (:stage-results report))))
+
 (defn ^:no-doc validate-with-physical-results
   "Validate an equation and return its exact boundary with the derived storage projection.
    This report is data, not authority to accept a later call without checking its bindings."
   ([emitted]
-   (select-keys (validate-with-result-contracts emitted)
-                [:boundary :physical-results :complete-write-domains]))
+   (physical-result-report (validate-with-result-contracts emitted)))
   ([emitted caller-options]
-   (select-keys (validate-with-result-contracts emitted caller-options)
-                [:boundary :physical-results :complete-write-domains])))
+   (physical-result-report (validate-with-result-contracts emitted caller-options))))
 
 (defn- result-contract-report
   [emitted caller-options]
-  (let [{:keys [boundary source-graph mixed-reconstruction]} (validation-report emitted caller-options)
+  (let [{:keys [boundary source-graph mixed-reconstruction checked-stage-reconstruction]}
+        (validation-report emitted caller-options)
         algorithm (:algorithm boundary)]
     {:boundary boundary
      :physical-results (physical-results-for-validated-boundary boundary)
+     :stage-results (:stage-results checked-stage-reconstruction)
      :numerical-model (:numerical-model mixed-reconstruction)
      :complete-write-domains
      (if (swr/plan? algorithm)

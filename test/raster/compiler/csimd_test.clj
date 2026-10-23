@@ -113,7 +113,7 @@
                         (dialect/scalar-convert
                          {:source-dtype :double :target-dtype :float
                           :rounding :nearest-even :overflow :ieee
-                          :source-op 'clojure.core/float}
+                          :source-op 'clojure.core/unchecked-float}
                          '(+ (aget a i) gain)))
                  :avx2 '#{a out}))
           "conversion source precision is checked before source projection"))
@@ -277,13 +277,14 @@
         operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float :out-sym 'out}
         attributes {:source-dtype :double :target-dtype :float
                     :rounding :nearest-even :overflow :ieee
-                    :source-op 'clojure.core/float}]
+                    :source-op 'clojure.core/unchecked-float}]
     (binding [cs/*array-types* '{a :float out :float}]
       (is (some? (cs/compile-segmap-c
                   (assoc operation :lambda (dialect/scalar-convert attributes body))
                   :avx2 '#{a out})))
       (doseq [policy [(assoc attributes :rounding :toward-zero)
                       (assoc attributes :overflow :saturate)
+                      (assoc attributes :source-op 'clojure.core/float)
                       (assoc attributes :unknown-policy true)
                       (assoc attributes :source-op 'clojure.core/double)]]
         (is (= :invalid-canonical-scalar-conversion
