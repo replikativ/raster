@@ -4418,7 +4418,8 @@
     (fn [{:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
                  before-parallel?] :as state}
          [id [symbol expression]]]
-      (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
+      (let [source-binding [symbol expression]
+            expression (retain-free-scalar-reference-types expression local-scalar-types)
             description
             (or (when (or segmented-plans? (not (swr-fuse/marker? expression)))
                   (binding [*scalar-definitions* scalar-definitions]
@@ -4428,6 +4429,11 @@
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
             description (assoc description
+                               ;; Preserve the actual normalized inputs before
+                               ;; metadata-only scalar-reference elaboration.
+                               ;; A later importer must not rediscover this
+                               ;; occurrence from equality or the new metadata.
+                               :source-binding source-binding
                                :source-prefix? stageable-prefix?
                                ;; Distinct from `source-prefix?`: a host allocation or other
                                ;; non-stageable host binding prevents scalar hoisting, but it does
@@ -6377,10 +6383,11 @@
                original-source)
        :rewrites (:rewrites rebuilt) :declines (:declines rebuilt)}))))
 
-(defn- form->program*
+(defn- source-components*
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
                  preserve-declared-array-storage? host-scalars? public-parameters]
-           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
+           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}
+           :as options}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [_ (validate-declared-array-values! array-types values)
           [_ bindings & body] source
@@ -6389,6 +6396,18 @@
           {descriptions :descriptions storage-values :values allocations :allocations}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
                                    values shape-equalities public-parameters)]
+      {:source source :options options :pairs pairs :array-types array-types
+       :descriptions descriptions :storage-values storage-values :allocations allocations})))
+
+(defn- continue-source-components*
+  "Continue the single description/storage analysis through unchanged admission
+   and equation construction. Components are compiler-local data, not a proof or
+   permission to publish a source-derived program."
+  [{:keys [source options pairs array-types descriptions storage-values allocations]}]
+  (let [{:keys [dtype scalar-types values shape-equalities segmented-plans?
+                host-scalars? public-parameters]
+         :or {dtype :double scalar-types {} values {} shape-equalities {}}} options
+        [_ bindings & body] source]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)
@@ -6701,4 +6720,9 @@
              :outputs outputs
              :values values
              :facts facts
-             :source source}))))))
+             :source source})))))
+
+(defn- form->program*
+  [source options]
+  (when-let [components (source-components* source options)]
+    (continue-source-components* components)))

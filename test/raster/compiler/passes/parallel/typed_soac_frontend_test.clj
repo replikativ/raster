@@ -21,6 +21,32 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
+(deftest source-components-retain-the-original-binding-before-reference-elaboration
+  (let [source '(let* [offset (clojure.core/+ n 1)
+                      result (raster.par/pmap i n long (clojure.core/+ offset i))]
+                 result)
+        options {:dtype :long :scalar-types {'n :long} :public-parameters '[n]}
+        normalize (frontend/normalize-source source options)
+        analyze @#'frontend/source-storage-analysis
+        continue @#'frontend/continue-source-components*
+        calls (atom 0)
+        captured (atom nil)]
+    (with-redefs-fn
+      {#'frontend/source-storage-analysis
+       (fn [& args] (swap! calls inc) (apply analyze args))
+       #'frontend/continue-source-components*
+       (fn [components] (reset! captured components) (continue components))}
+      #(frontend/form->program normalize options))
+    (let [description (first (:descriptions @captured))
+          [id expression] (:source-binding description)]
+      (is (= 1 @calls))
+      (is (identical? normalize (:source @captured)))
+      (is (identical? id (first (second normalize))))
+      (is (identical? expression (second (second normalize))))
+      (is (not (identical? expression (:expr description))))
+      (is (nil? (:raster.type/tag (meta (second expression)))))
+      (is (= 'long (:raster.type/tag (meta (second (:expr description)))))))))
+
 (deftest late-host-integral-boundaries-require-public-scalar-dependency-closure
   (let [checked (with-meta 'checked {:raster.type/tag 'int})
         input (with-meta 'n {:raster.type/tag 'long})

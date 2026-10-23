@@ -28,6 +28,30 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 description-boundary checkpoint: the existing frontend now separates
+its one description/storage analysis from continuation through unchanged admission
+and equation construction. Both continuations remain private. Each description
+retains its exact normalized `[symbol expression]` inputs before free-scalar type
+metadata is elaborated. The phase can therefore match original element identities
+instead of rediscovering expressions by equality. This adds no admission predicate.
+
+The numerical-import plan is simpler than the earlier host-projection hypothesis:
+the four declined FP continuations already project through `scalar-equation`.
+Their remaining correspondence must use actual emitter operand carriers and the
+shared arithmetic plan, selected-operation ownership, and exact completion
+contracts. `terminal-source/trace-scalar` is not a numerical execution route for
+these equations. OrderedSourceOwner owns entry checks and source-order obligations;
+resident scalar equations own numerical results. Allocation helpers still need
+their compound sizes named at the original argument position and authenticated
+through the existing allocation projection, not a syntactic allocator fallback.
+
+The new source-identity control passes one test / seven assertions. The full
+affected frontend namespace reports 145 tests / 921 assertions, 18 failures and
+one error. A same-process committed-versus-refactored comparison of all 144
+pre-existing tests gives identical failure signatures. These remain campaign
+blockers; the factoring does not repair or waive them, close an import marker,
+or establish resident training.
+
 October 22 shared source-constructor checkpoint: ordinary and prepared sources
 now have one internal construct/represent/normalize implementation. The handoff
 keeps the original source normalization, pre-SoA construction, represented source,
