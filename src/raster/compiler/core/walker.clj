@@ -15,6 +15,7 @@
   (:require [raster.compiler.core.callee-identity :as callee-identity]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [clojure.string :as str]
@@ -435,7 +436,9 @@
   Preserves metadata and auto-hints field access on typed receivers.
   Resolves namespace-aliased symbols to fully qualified names."
   [form ctx]
-  (let [;; An explicitly unknown local masks type evidence from an earlier scope.
+  (let [original form
+        constructed
+        (let [;; An explicitly unknown local masks type evidence from an earlier scope.
         form (inf/mask-unknown-local form (:type-env ctx))
         ;; Resolve namespace-aliased symbols to fully qualified names
         form (if (and (symbol? form) (namespace form) (not (ctx-get-tag ctx form)))
@@ -670,7 +673,9 @@
               (vary-meta result assoc :raster.type/tag rt)
               result)
             :else result))
-        result))))
+        result)))]
+    (source-transport/observe-construction! original constructed (:type-env ctx))
+    constructed))
 
 (defn walk-forms
   "Walk multiple forms with the same context. Returns a vector of walked forms."

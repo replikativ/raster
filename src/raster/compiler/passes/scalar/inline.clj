@@ -1217,6 +1217,12 @@
 
 (def ^:dynamic *param-env* nil)
 
+(def ^:dynamic *defer-prepared-ad-expansion?*
+  "Compiler cut control: leave prepared AD applications opaque during ordinary
+   source preparation. JVM-owned calls retain their existing portability checks;
+   this does not defer ordinary helper expansion or change AD preparation."
+  false)
+
 (defn inline-value+grad-call
   "Inline a ((value+grad #'f) args...) call into flat let* bindings.
 
@@ -1248,8 +1254,9 @@
                            (= :jvm-bytecode (get-in prepared-body [:source-owner :backend])))
               (source-owner/assert-portable-source! prepared-body))
             ((requiring-resolve 'raster.ad.reverse/project-owned-value+grad-call) prepared-body args mode))
-          ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
-           prepared-body args mode param-env (:caller vg-info)))))))
+          (when-not *defer-prepared-ad-expansion?*
+            ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
+             prepared-body args mode param-env (:caller vg-info))))))))
 
 (defn- inline-one-pass
   "Single pass of deftm inlining over a let* form's bindings."

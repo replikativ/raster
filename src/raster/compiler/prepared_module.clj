@@ -208,12 +208,16 @@
     true))
 
 (defn capture
-  "Expand one exact frontend using the owned early consumer, then normalize once.
+  "Prepare one exact frontend, expand AD at its final cut, then normalize once.
    Requires an active definition collector. Only direct public-parameter inputs
    currently have caller-carrier evidence; other expressions explicitly refuse.
+   The optional compiler preparation runs under the same construction history,
+   BEFORE installing the owned AD consumer. It must leave AD applications opaque;
+   the final expansion alone inserts the canonical generated binding spine.
    Returned phase seals construction only. It grants no provisional admission
    and does not remove the original unclosed prepared-import marker."
-  [source-frontend options]
+  ([source-frontend options] (capture source-frontend options identity))
+  ([source-frontend options prepare-source]
   (when-not entry/*emission-inputs*
     (refuse! "prepared module construction requires a definition owner" {}))
   (let [source-var (get-in source-frontend [:source-entry :source-var])
@@ -225,7 +229,17 @@
         environment (zipmap parameters (get-in source-frontend [:source-entry :tags]))
         minted (volatile! [])
         expanded
-        (binding [transport/*prepared-program-consumer*
+        (transport/with-source-construction-history
+         (:source-normalization normalization)
+         #(let [prepared-source
+                ;; Do not expose the insertion consumer to earlier passes. A
+                ;; generated spine inserted here would be rewritten again by
+                ;; preparation, invalidating its occurrence-owned obligations.
+                (binding [transport/*prepared-program-consumer* nil
+                          inline/*defer-prepared-ad-expansion?* true]
+                  (prepare-source (first (:walked-body normalization))))]
+            (binding [inline/*defer-prepared-ad-expansion?* false
+                      transport/*prepared-program-consumer*
                   (fn [event placement]
                     (let [prepared (:prepared event)
                           physical (reverse/prepared-bytecode-entry prepared)
@@ -242,9 +256,7 @@
                       (vswap! minted conj {:event event :placement placement :prepared prepared
                                            :physical physical :call call :import import :nonce nonce})
                       {:ports ports :bindings (:bindings call) :import import}))]
-          (transport/with-source-construction-history
-           (:source-normalization normalization)
-           #(inline/inline-ad-applications (first (:walked-body normalization)) environment)))
+              (inline/inline-ad-applications prepared-source environment))))
         construction (transport/source-construction-view (:source-construction expanded)
                                                          (:source-normalization normalization) (:form expanded))
         cuts (:prepared-program-cuts construction)]
@@ -287,7 +299,7 @@
           observations @entry/*emission-inputs*
           phase (PreparedModulePhase. context observations)]
       (entry/assert-producer-current! phase)
-      phase)))
+      phase))))
 
 (defn view
   "Query only this phase's exact normalized object under its original history.

@@ -8,22 +8,22 @@
    would strip metadata (the :raster.type/tag, :raster.op/original the backends
    rely on), so we re-implement it preserving meta."
   (:refer-clojure :exclude [])
-  (:require [raster.compiler.core.value-completion :as completion]))
+  (:require [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.util :as util]))
 
 (defn walk-preserving-meta
   "Like clojure.walk/walk but preserves metadata on forms."
   [inner outer form]
   (let [m (meta form)
         result (cond
-                 (list? form)   (outer (apply list (map inner form)))
-                 (seq? form)    (outer (doall (map inner form)))
-                 (vector? form) (outer (mapv inner form))
+                 (or (seq? form) (vector? form))
+                 (outer (util/remake-if-changed form (mapv inner form)))
                  (record? form) (outer (reduce-kv (fn [r k v] (assoc r k (inner v))) form form))
                  (map? form)    (outer (into (empty form)
                                              (map (fn [[k v]] [(inner k) (inner v)]) form)))
                  (set? form)    (outer (into (empty form) (map inner form)))
                  :else          (outer form))]
-    (if (and m (instance? clojure.lang.IObj result))
+    (if (and (not (identical? form result)) m (instance? clojure.lang.IObj result))
       (with-meta result (merge (meta result) m))
       result)))
 
@@ -85,7 +85,7 @@
            m (meta form)
            result (walk-preserving-meta #(macroexpand-all-preserving % skip-head?)
                                         carry-let-init-type-meta expanded)]
-       (if (and m (instance? clojure.lang.IObj result))
+       (if (and (not (identical? form result)) m (instance? clojure.lang.IObj result))
          (with-meta result (merge (meta result) m))
          result)))))
 

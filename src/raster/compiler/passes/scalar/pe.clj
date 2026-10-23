@@ -17,6 +17,7 @@
   beyond the transformations above — preserves metadata, qualified symbols, etc."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.simplify :as simp]
             [raster.core :as rcore]))
@@ -251,11 +252,13 @@
   ordinary forms. Typed `.invk` nodes retain their boundary and metadata rather
   than recovering operator semantics from impl spelling. Type tags are preserved."
   [form result changed?]
-  (if-let [m (meta form)]
-    (if (instance? clojure.lang.IMeta result)
-      (with-meta result (if changed? (dissoc m :raster.op/original) m))
-      result)
-    result))
+  (if (identical? form result)
+    form
+    (if-let [m (meta form)]
+      (if (instance? clojure.lang.IMeta result)
+        (with-meta result (if changed? (dissoc m :raster.op/original) m))
+        result)
+      result)))
 
 (defn pe-pass
   "Single pass of partial evaluation.
@@ -424,14 +427,16 @@
         ;; General call — PE args, then try constant folding
         :else
         (let [pe-children (map #(pe-pass % const-env) form)
-              called (apply list pe-children)
-              r (simp/simplify-1 called)]
+              called (util/remake-if-changed form pe-children)
+              r (simp/simplify-1 called)
+              result (reattach-meta form r (not= r called))]
           ;; drop stale :raster.op/original iff simplify changed the head (task #78)
-          (reattach-meta form r (not= r called)))))
+          (source-transport/observe-construction! form result const-env)
+          result)))
 
     ;; Vector
     (vector? form)
-    (mapv #(pe-pass % const-env) form)
+    (util/remake-if-changed form (mapv #(pe-pass % const-env) form))
 
     ;; Map
     (map? form)

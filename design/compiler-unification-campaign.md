@@ -28,6 +28,29 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 late-cut construction checkpoint: the prepared-module phase can run
+ordinary pre-SoA preparation inside its existing source history, keeping prepared
+AD applications opaque until one final insertion pass. Ordinary helper expansion
+and JVM-owned calls keep their existing policies. The actual training fixture now
+crosses the complete pre-SoA sequence with one pending import and a complete
+normalized binding-origin spine. This is still construction, not training admission.
+
+The real-pass probe identified provenance loss in PE and rewalking. Their actual
+constructor returns now use the existing origin-only SourceConstruction relation;
+no equivalence, execution or numerical permission is inferred from those edges.
+PE and macroexpansion preserve unchanged seq/vector occurrences rather than
+copying them gratuitously. Changed child metadata still forces reconstruction.
+The late cut keeps exact caller identity checks, and ambiguous histories remain
+fatal. No new proof owner, registry, host numerical executor or fallback was added.
+
+The combined construction/macroexpansion/PE/source-transport/walker gate passes
+105 tests / 720 assertions in the capped REPL, including a duplicated AD-call
+history refusing without publishing a provisional import. Independent review
+found no blocker. Whole-import obligation discharge, equation-first production wiring and
+resident training remain open. Exact-head CI at d0b6f7aa passed setup/build but
+failed fixture emission, unit tests and OpenCL (165 tests, one failure and 19
+errors); CUDA/HIP gates did not run. These failures are not waived.
+
 October 22 canonical-module construction checkpoint: generated-body projection
 now inventories each actual emitted completion as a pending obligation. It
 requires the original physical entry, parameter carriers and flat SSA spine;

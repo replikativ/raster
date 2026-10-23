@@ -7,6 +7,7 @@
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.fixtures.distributed-training :as training]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.prepared-module :as module]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]))
 
@@ -105,6 +106,96 @@
 
 (deftest construction-refuses-without-a-definition-owner
   (is (= :unclosed-prepared-module-phase (reason #(module/capture {} {})))))
+
+(deftest preparation-cannot-insert-the-generated-spine-before-the-final-cut
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [source (source-frontend)
+           parameters (get-in source [:source-entry :params])
+           environment (zipmap parameters (get-in source [:source-entry :tags]))
+           project reverse/project-prepared-value+grad-call
+           projections (atom 0)
+           preparations (atom 0)
+           phase
+           (with-redefs [reverse/project-prepared-value+grad-call
+                         (fn [& args]
+                           (swap! projections inc)
+                           (apply project args))]
+             (module/capture
+              source {:dtype :float}
+              (fn [form]
+                (swap! preparations inc)
+                (is (nil? transport/*prepared-program-consumer*))
+                (is inline/*defer-prepared-ad-expansion?*)
+                ;; Exercise the real AD recognizer in the earlier phase. It
+                ;; must retain the application, not mint an untracked import.
+                (let [result (inline/inline-ad-applications form environment)]
+                  (is (zero? @projections))
+                  result))))
+           normalized (module/normalized-source phase)
+           view (module/view phase normalized)]
+       (is (= 1 @preparations))
+       (is (= 1 @projections))
+       (is (= 1 (count (:imports view))))
+       (is (= 1 (count (:prepared-program-cuts
+                        (transport/source-construction-view
+                         (:source-construction view) (:normalization view) (:source view))))))
+       (is (false? (:admitted? view)))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
+(deftest real-pre-soa-preparation-retains-the-original-ad-call-occurrence
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [frontend (source-frontend)
+           options {:dtype :float :target :opencl
+                    :source-ns (get-in frontend [:source-entry :source-ns])
+                    :param-env (zipmap (get-in frontend [:source-entry :params])
+                                       (get-in frontend [:source-entry :tags]))}
+           phase (module/capture
+                  frontend options
+                  #(pipeline/run-passes % pipeline/gpu-resident-pre-soa-passes options))
+           normalized (module/normalized-source phase)
+           view (module/view phase normalized)
+           construction (transport/source-construction-view
+                         (:source-construction view) (:normalization view) (:source view))
+           cut (first (:prepared-program-cuts construction))
+           origin (get-in cut [:event :caller-origin])]
+       (is (= 1 (count (:imports view))))
+       (is (= 1 (count (:prepared-program-cuts construction))))
+       (is (identical? frontend (:frontend origin)))
+       (is (identical? (get-in cut [:event :caller]) (:constructed origin)))
+       (is (seq (:construction-edges origin))
+           "actual reconstruction edges, not a structural search, join the late call")
+       (is (= (count (:origins view)) (quot (count (second normalized)) 2)))
+       (is (false? (:admitted? view)))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
+(deftest ambiguous-rewalk-origins-cannot-mint-a-late-import
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [frontend (source-frontend)
+           options {:dtype :float :target :opencl
+                    :source-ns (get-in frontend [:source-entry :source-ns])
+                    :param-env (zipmap (get-in frontend [:source-entry :params])
+                                       (get-in frontend [:source-entry :tags]))}
+           observe transport/observe-construction!
+           duplicated (atom 0)]
+       (with-redefs [transport/observe-construction!
+                     (fn [original constructed environment]
+                       (observe original constructed environment)
+                       (when (and (not (identical? original constructed))
+                                  (seq? original) (seq? (first original))
+                                  (= 'raster.ad.reverse/value+grad (ffirst original)))
+                         (swap! duplicated inc)
+                         (observe original constructed environment)))]
+         (is (= :unclosed-prepared-program-placement
+                (reason #(module/capture
+                          frontend options
+                          (fn [form]
+                            (pipeline/run-passes form pipeline/gpu-resident-pre-soa-passes options)))))))
+       (is (pos? @duplicated))
+       (is (empty? (:unclosed-source-imports @entry/*emission-inputs*))
+           "failed local construction does not publish a pending import to its parent")))))
 
 (deftest construction-retains-compatible-declarations-and-refuses-conflicting-options
   (entry/call-with-definition-inputs

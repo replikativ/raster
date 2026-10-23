@@ -11,6 +11,18 @@
       (is (= 'if (first out)))                       ; when → if
       (is (= 'double (:raster.type/tag (meta out)))))))
 
+(deftest nonmacro-noops-preserve-occurrence-identity
+  (let [child (with-meta '[x y] {:source :arguments})
+        form (with-meta (list 'f child) {:line 17})]
+    (is (identical? form (mex/macroexpand-all-preserving form)))
+    (is (identical? child (second (mex/macroexpand-all-preserving form))))
+    (let [replacement (with-meta 'x {:tag 'long})
+          changed (mex/walk-preserving-meta
+                   #(if (identical? % (first child)) replacement %) identity child)]
+      (is (not (identical? child changed)))
+      (is (identical? replacement (first changed)))
+      (is (= (meta child) (meta changed))))))
+
 (deftest skip-head-keeps-form
   (testing "skip-head? leaves a matching form unexpanded but recurses into children"
     (let [form '(dotimes [i n] (when c (bar)))

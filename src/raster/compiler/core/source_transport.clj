@@ -369,13 +369,18 @@
                :grad-syms (if (= :value+grad mode) (vec (rest ports)) ports)
                :result-form (if (and (= :grad mode) scalar?) (first ports) ports))))))
 
-(defn observe-type-elaboration!
+(defn observe-construction!
   "Observe an actual constructor return, only inside the owner-local source phase.
    This retains origins, not equivalence, types, completion or execution evidence."
   [original constructed environment]
   (when (and *source-construction-observer* (not (identical? original constructed)))
     (*source-construction-observer*
      :type-elaboration {:original original :constructed constructed :environment environment})))
+
+(defn observe-type-elaboration!
+  "Type elaboration uses the same origin-only constructor relation as rewalking."
+  [original constructed environment]
+  (observe-construction! original constructed environment))
 
 (defn observe-prepared-program-scope!
   "Register the inliner's actual pre-loop binding snapshot, not a type rewrite.
