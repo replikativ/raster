@@ -5,6 +5,7 @@
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.generated-body :as generated]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.fixtures.distributed-training :as training]
@@ -56,6 +57,9 @@
        (is (= (count obligations) (count (set (map :id obligations)))))
        (is (= (count (:origins view)) (count (set (map :index (:origins view))))))
        (is (= 2 (count (:unclosed-source-imports @entry/*emission-inputs*))))
+       (let [inputs (keep #(module/input-occurrence phase (:normalized view) (:binding %)) (:origins view))]
+         (is (= 12 (count inputs)))
+         (is (= #{(:import (first imports)) (:import (second imports))} (set (map :import inputs)))))
        (is (false? (:admitted? view)))))))
 
 (deftest ordinary-multiform-source-keeps-every-statement-in-order
@@ -213,6 +217,160 @@
 
 (deftest construction-refuses-without-a-definition-owner
   (is (= :unclosed-prepared-module-phase (reason #(module/capture {} {})))))
+
+(deftest staged-input-query-follows-physical-roots-without-preparing-code
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           view (module/view phase source)
+           joined (first (:import-origins view))
+           pending (filterv #(= :argument (second (:id %))) (:obligation-origins joined))
+           inputs
+           (with-redefs [frontend/normalize-source
+                         (fn [& _] (throw (AssertionError. "query normalized source")))
+                         bytecode/compile-input-invocation-region
+                         (fn [& _] (throw (AssertionError. "query prepared an executor")))]
+             (mapv #(module/input-occurrence phase source
+                                             (get-in % [:binding-origins 0 :origins 0 :binding])) pending))]
+       (is (= 6 (count inputs)))
+       (is (every? some? inputs))
+       (is (= [0 1 0 1 0 1] (mapv #(get-in % [:argument :input-index]) inputs)))
+       (doseq [[expected actual] (map vector pending inputs)]
+         (is (identical? expected (:obligation actual)))
+         (is (identical? phase (:phase actual)))
+         (is (identical? (:import joined) (:import actual)))
+         (is (identical? (get-in view [:imports 0 :physical]) (:physical actual)))
+         (is (identical? (:obligation expected) (:argument actual)))
+         (is (= (count (get-in actual [:argument :input :ports])) (count (:ports actual))))
+         (doseq [{:keys [kind parameter physical-port root binding-origin origin binding]} (:ports actual)]
+           (is (= :root kind) "actual size inputs include completed locals, not merely formals")
+           (is (= parameter (:original-id root)))
+           (is (= (:call-binding-index root) (:call-index binding-origin)))
+           (is (identical? physical-port (get-in actual [:argument :input :ports parameter])))
+           (is (identical? origin (first (:origins binding-origin))))
+           (is (identical? binding (:binding origin)))
+           (is (< (:index origin) (get-in actual [:origin :index])))))
+       (is (every? #(= :long (get-in % [:physical-port :type]))
+                   (mapcat :ports (filter #(= 1 (get-in % [:argument :input-index])) inputs))))
+       (is (false? (:admitted? (module/view phase source))))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
+(deftest staged-input-query-refuses-copied-and-unrelated-occurrences
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           view (module/view phase source)
+           pending (first (filter #(= :argument (second (:id %)))
+                                  (get-in view [:import-origins 0 :obligation-origins])))
+           [id expression :as binding] (get-in pending [:binding-origins 0 :origins 0 :binding])
+           other-phase (capture)
+           copied-source (with-meta (apply list source) (meta source))
+           copied-expression (with-meta (apply list expression) (meta expression))]
+       (is (some? (module/input-occurrence phase source binding)))
+       ;; Pair containers are recreated by source-descriptions; their members
+       ;; must be the exact retained binder and initializer objects.
+       (is (some? (module/input-occurrence phase source [id expression])))
+       (is (nil? (module/input-occurrence phase source [id copied-expression])))
+       (is (nil? (module/input-occurrence phase copied-source binding)))
+       (is (nil? (module/input-occurrence other-phase source binding)))
+       (is (nil? (module/input-occurrence other-phase (module/normalized-source other-phase) binding)))
+       (is (nil? (module/input-occurrence phase source (get-in view [:origins 0 :binding]))))
+       (is (nil? (module/input-occurrence {} source binding)))))))
+
+(deftest staged-port-origin-requires-each-order-coordinate-and-physical-local-fact
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           view (module/view phase source)
+           joined (first (:import-origins view))
+           pending (first (filter #(and (= :argument (second (:id %))) (= 1 (last (:id %))))
+                                  (:obligation-origins joined)))
+           current (get-in pending [:binding-origins 0])
+           final (get-in current [:origins 0])
+           occurrence (module/input-occurrence phase source (:binding final))
+           port (first (:ports occurrence))
+           parameter (:parameter port)
+           physical-port (:physical-port port)
+           map-port (fn [joined current final]
+                      (#'module/input-port-origin joined current final parameter physical-port))
+           root-index (get-in port [:root :root-index])
+           call-index (get-in port [:binding-origin :call-index])]
+       (is (some? (map-port joined current final)))
+       (is (nil? (map-port joined (assoc current :call-index call-index) final)))
+       (is (nil? (map-port joined (assoc current :source-index (get-in port [:binding-origin :source-index])) final)))
+       (is (nil? (map-port joined current (assoc final :index (get-in port [:origin :index])))))
+       (is (nil? (map-port (assoc-in joined [:binding-origins call-index :source-index] (:source-index current))
+                           current final)))
+       (doseq [change [(fn [record] (assoc record :binder 'foreign))
+                       (fn [record] (update-in record [:after :slot] inc))
+                       (fn [record] (update record :source-input #(with-meta (apply list %) (meta %))))]]
+         (let [query bytecode/retained-input-binding-context]
+           (with-redefs [bytecode/retained-input-binding-context
+                         (fn [& arguments] (change (apply query arguments)))]
+             (is (nil? (map-port joined current final))))))
+       (is (nil? (map-port (update-in joined [:call :root-bindings root-index :root-index] inc) current final)))
+       (is (nil? (map-port (update-in joined [:call :root-bindings root-index :original-expression]
+                                     #(with-meta (apply list %) (meta %))) current final)))
+       ;; The same mapping also supports genuine formal verifier locals, but
+       ;; only through their actual completed wrapper slot and body-entry fact.
+       (let [slot (nth (get-in joined [:call :argument-plan :slots]) 3)
+             {:keys [emission input-body]} (:physical occurrence)
+             body (bytecode/retained-input-body-context emission input-body)
+             formal (:formal slot)
+             physical (get-in body [:locals formal])
+             mapped (#'module/input-port-origin joined current final formal physical)]
+         (is (= :formal (:kind mapped)))
+         (is (identical? slot (:slot mapped)))
+         (is (nil? (#'module/input-port-origin joined current final formal (update physical :slot inc))))
+         (let [query bytecode/retained-input-body-context]
+           (with-redefs [bytecode/retained-input-body-context
+                         (fn [& arguments] (update-in (apply query arguments) [:locals formal :slot] inc))]
+             (is (nil? (#'module/input-port-origin joined current final formal physical))))))))))
+
+(deftest staged-input-ports-execute-the-original-size-region
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           view (module/view phase source)
+           pending (filter #(and (= :argument (second (:id %))) (= 1 (last (:id %))))
+                           (get-in view [:import-origins 0 :obligation-origins]))
+           parameters (get-in view [:imports 0 :event :arguments])
+           source-ns (get-in view [:imports 0 :physical :emission :source-ns])]
+       (is (= 3 (count pending)))
+       (doseq [obligation pending]
+         (let [occurrence (module/input-occurrence phase source
+                                                   (get-in obligation [:binding-origins 0 :origins 0 :binding]))
+               {:keys [physical construction ports origin]} occurrence
+               region (bytecode/compile-input-invocation-region
+                       (:emission physical) (:input-body physical) (:source-call construction) 1)
+               positions (zipmap (map :parameter ports) (range))
+               indices (mapv positions (:parameters region))
+               ;; Evaluate the real normalized prefix with JVM semantics, then
+               ;; route its completed host values by origin, not operand names.
+               prefix (subvec (second source) 0 (* 2 (inc (:index origin))))
+               tags (get-in view [:imports 0 :prepared :tags])
+               interface (types/ensure-fn-interface! tags)
+               read-values
+               (:implementation
+                (core/emit-owned-bytecode!
+                 bytecode/compile-typed-impl! "raster.compiled.ModuleInputPrefixTest"
+                 parameters tags 'Object
+                 [(list 'let* prefix [(mapv (comp first :binding) ports)
+                                      (first (:binding occurrence))])]
+                 source-ns (:iface-name interface) 'module-input-prefix-test))]
+           (is (every? some? indices))
+           (is (every? #(= Long/TYPE %) (vec (.getParameterTypes ^java.lang.reflect.Method (:method region)))))
+           (is (= Long/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+           (doseq [rows [1 3]]
+             (let [[inputs expected] (read-values (float-array [0.2 0.4])
+                                                  (float-array (repeat (* rows 2) 0.5))
+                                                  (float-array (repeat rows 0.1)) rows 2)]
+               (is (= expected (apply (:invoke region) (mapv inputs indices))))))))
+       (is (false? (:admitted? (module/view phase source))))))))
 
 (deftest preparation-cannot-insert-the-generated-spine-before-the-final-cut
   (entry/call-with-definition-inputs

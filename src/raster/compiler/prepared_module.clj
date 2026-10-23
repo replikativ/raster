@@ -4,6 +4,7 @@
    Conversion, source arithmetic, storage, runtime views and publication remain
    obligations of the existing ordered source owner. No object enters portable IR."
   (:require [raster.ad.reverse :as reverse]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.generated-body :as generated]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.method-entry :as entry]
@@ -372,3 +373,96 @@
   (when (and entry/*emission-inputs* (instance? PreparedModulePhase phase))
     (entry/assert-producer-current! phase)
     (:normalized (.-context ^PreparedModulePhase phase))))
+
+(defn- final-binding-origin [binding-origin]
+  ;; No reconstruction of a split reduction or derived normalization temporary.
+  ;; These require their own correspondence, not a guess at its last result.
+  (let [origins (:origins binding-origin)]
+    (when (and (= 1 (count origins))
+               (= :source-binding (:lift-role (first origins)))
+               (= :source-binding (:normalization-role (first origins))))
+      (first origins))))
+
+(defn- input-port-origin [joined current-binding-origin current-final parameter physical-port]
+  (let [call (:call joined)
+        physical (get-in call [:proposal :physical])
+        {:keys [emission input-body]} physical
+        slots (get-in call [:argument-plan :slots])
+        formals (filterv #(= parameter (:formal %)) slots)
+        roots (filterv #(= parameter (:original-id %)) (:root-bindings call))
+        ;; A physical port is either a generated formal or a prior original
+        ;; root. The latter is common even for sizes: explicit completed inputs
+        ;; such as rows and the literal 1 have their own verifier local slots.
+        correspondence
+        (cond
+          (and (= 1 (count formals)) (empty? roots))
+          (let [slot (first formals)
+                index (+ (count slots) (:ordinal slot))
+                body (bytecode/retained-input-body-context emission input-body)]
+            (when (= physical-port (get-in body [:locals parameter]))
+              {:kind :formal :slot slot :call-index index :physical-context body}))
+
+          (and (empty? formals) (= 1 (count roots)))
+          (let [root (first roots)
+                scope (get-in call [:proposal :original])
+                index (:root-index root)
+                record (bytecode/retained-input-binding-context emission input-body scope index)]
+            ;; This is the input-origin join to the emitted binding, which may
+            ;; retag/expand its initializer. Never compare the expanded syntax
+            ;; to the original initializer, or treat an equal symbol as proof.
+            (when (and record (identical? scope (:source-input record))
+                       (= parameter (:binder record))
+                       (identical? (:original-expression root)
+                                   (nth (second scope) (inc (* 2 index)) nil))
+                       (= physical-port (:after record)))
+              {:kind :root :root root :call-index (:call-binding-index root)
+               :physical-context record})))
+        binding-origin (when correspondence
+                         (nth (:binding-origins joined) (:call-index correspondence) nil))
+        final (final-binding-origin binding-origin)]
+    (when (and final
+               (< (:call-index binding-origin) (:call-index current-binding-origin))
+               (< (:source-index binding-origin) (:source-index current-binding-origin))
+               (< (:index final) (:index current-final)))
+      (assoc correspondence :parameter parameter :physical-port physical-port
+                            :binding-origin binding-origin :origin final
+                            :binding (:binding final)))))
+
+(defn ^:no-doc input-occurrence
+  "Compiler-private correspondence for one exact staged invocation input.
+   The pair must be the actual normalized binding (its two objects, not printed
+   or structural equality). Ports follow original generated formal/root slots
+   through the retained normalization history. No code is compiled or executed.
+   This query grants neither completion nor admission; every obligation stays
+   pending until the whole source owner has validated its InvocationPlan."
+  [phase normalized binding]
+  (when-let [context (view phase normalized)]
+    (let [matches
+          (into []
+                (mapcat
+                 (fn [joined]
+                   (when (generated/value-source-binding-layout (:call joined))
+                     (keep
+                      (fn [{:keys [id obligation binding-origins] :as pending}]
+                        (when (and (= :argument (second id)) (= 1 (count binding-origins)))
+                          (let [binding-origin (first binding-origins)
+                                final (final-binding-origin binding-origin)
+                                root (nth (get-in joined [:call :root-bindings]) (nth id 2) nil)
+                                construction (:argument-construction root)
+                                argument (nth (:arguments construction) (:input-index obligation) nil)]
+                            (when (and final (same-pair? binding (:binding final))
+                                       (identical? argument obligation)
+                                       (= (:call-binding-index argument) (:call-index binding-origin)))
+                              (let [ports (mapv (fn [[parameter port]]
+                                                  (input-port-origin joined binding-origin final parameter port))
+                                                (sort-by (comp :slot val) (get-in argument [:input :ports])))]
+                                (when (every? some? ports)
+                                  {:kind :prepared-module-invocation-input
+                                   :phase phase :import (:import joined)
+                                   :physical (get-in joined [:call :proposal :physical])
+                                   :root root :construction construction
+                                   :obligation pending :argument argument
+                                   :origin final :binding (:binding final) :ports ports}))))))
+                      (:obligation-origins joined)))))
+                (:import-origins context))]
+      (when (= 1 (count matches)) (first matches)))))

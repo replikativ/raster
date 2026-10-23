@@ -28,6 +28,28 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 input-correspondence checkpoint: the existing prepared phase can now
+query each exact staged allocator input without compiling or executing it. Physical
+formal/root ports join their actual bytecode local facts, original binding ordinal,
+call insertion coordinate and final normalization origin. All three source-order
+coordinates must agree. Split/derived origins, copied expressions, foreign imports,
+wrong physical facts and reordered/missing predecessors refuse. No symbol spelling,
+logical dtype or printed equality supplies occurrence authority.
+
+The real allocator sizes use prior completed roots, including an explicit literal
+local, rather than only generated public formals. All three original outlined size
+regions agree with their actual normalized JVM prefixes on changed training inputs.
+Array-input correspondence remains pending: no resident view is cast to a JVM array,
+and neither query nor test closes an import. The two affected construction/ownership
+namespaces pass 44 tests / 533 assertions in the capped REPL.
+
+Exact-head CI at f30c08d9 remains red: fixture emission refuses generated completion
+coverage; the unit shard reports two training-composition coverage errors; OpenCL
+reports 165 tests / 1,428 assertions, one failure and 19 errors. Its remaining families
+include checked floating conversions, scalar/AMR source arithmetic, successful-result
+observations and the two-step production canary. CUDA/HIP downstream gates did not
+run. These are required acceptance work, not environment skips or waived failures.
+
 October 22 ordered-argument construction checkpoint: the generated-call constructor
 now exposes the real allocator's positional completions as pending bindings. It
 retains the exemplar CHECKCAST, then original size evaluation plus Long coercion,
