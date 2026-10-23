@@ -19,7 +19,6 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.source-prefix :as source-prefix]
-            [raster.compiler.core.source-transport :as source-transport]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -43,6 +42,7 @@
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.prepared-module :as prepared-module]
             [raster.gpu.schedule :as gpu-schedule]
             [raster.core :as rcore]))
 
@@ -698,6 +698,8 @@
    it produces verified target source artifacts but does not require an installed runtime or a
    physical device. Unsupported target families and uncovered KernelBody graph families fail
    rather than borrowing the compatibility backend. `:dtype` defaults from retained deftm tags.
+   Source compilation requires its authenticated retained frontend; it does not
+   reconstruct an unowned source walk when that producer is unavailable.
 
    The three-argument form consumes an already captured target descriptor, allowing cache identity
    and compilation to share one immutable snapshot. Its device identity must match `:target`."
@@ -744,37 +746,56 @@
                           retained-frontend (:raster.core/deftm-params (meta resolved-var)))
          _ (source-prefix/prepare-prefix-entry! prefix-input rcore/ensure-current-owned-bytecode!)
          _ (source-prefix/prepare-reduction-entry! reduction-input rcore/ensure-current-owned-bytecode!)
-         normalized-input (when retained-frontend
-                            (source-transport/normalize-frontend-bindings
-                             retained-frontend (:raster.core/deftm-params (meta resolved-var))))
-         walked (or (:walked-body normalized-input)
-                    (pipeline/get-walked-body resolved-var (:dtype compiler-options)))
-         source (if (= 1 (count walked)) (first walked) (list* 'do walked))
-         source-construction
-         (source-transport/with-source-construction-history
-          (:source-normalization normalized-input)
-          #(pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes compiler-options))
-         represented-source (:form source-construction)
          representation (parameter-representation f-var (:dtype compiler-options))
          param-specs (:params representation)
-         represented (soa-lower/soa-lower represented-source param-specs (:soa-env representation))
          projection (:projection representation)
-         physical-parameters (mapv :sym (:params represented))
-         physical-types (when projection
-                          (opencl-pass/derive-param-types physical-parameters
-                                                         (mapv :tag (:params represented))
-                                                         (:dtype compiler-options) compiler-options))
-         compiler-options (cond-> compiler-options
-                            projection (assoc :active-params physical-parameters
-                                              :public-parameters physical-parameters
-                                              :array-types (:array-types physical-types)
-                                              :scalar-types (:scalar-types physical-types)))
+         constructed
+         (prepared-module/construct-source
+          retained-frontend compiler-options
+          {:prepare-source #(pipeline/run-passes % pipeline/gpu-resident-pre-soa-passes compiler-options)
+           :prepare-authored-segment
+           (fn [source options]
+             (pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes options))
+           :canonicalize-ordinary-source pipeline/prepare-semantic-source
+           :represent-source
+           (fn [source options]
+             (let [represented (if projection
+                                 (soa-lower/soa-lower source param-specs (:soa-env representation))
+                                 {:body source :params param-specs})
+                   parameters (mapv :sym (:params represented))
+                   physical-types (when projection
+                                    (opencl-pass/derive-param-types
+                                     parameters (mapv :tag (:params represented)) (:dtype options) options))
+                   options (cond-> options
+                             projection (assoc :active-params parameters :public-parameters parameters
+                                               :array-types (:array-types physical-types)
+                                               :scalar-types (:scalar-types physical-types)))]
+               {:body (:body represented)
+                :options options :representation projection}))})
+         compiler-options (:frontend-options constructed)
+         source (:normalized-source constructed)
+         represented-source (:represented-source constructed)
+         phase (:prepared-phase constructed)
+         ;; Construction and storage analysis are not executable import closure.
+         ;; The finalizer must consume these exact components, not rerun ordinary
+         ;; source normalization/DCE and thereby detach their pending occurrences.
+         _ (when phase
+             (let [components (prepared-module/analyze-source-components
+                               phase (:frontend-source constructed))]
+               (fail! :unclosed-prepared-module-phase
+                      "prepared source requires complete InvocationPlan/source-owner finalization"
+                      {:function function-id :pending-inputs (count (:pending-inputs components))
+                       :allocations (count (:allocations components)) :fallback :none})))
          ;; Keep the actual normalized admission refusal. Reanalyzing the
          ;; original compatibility form can report already-normalized bindings
          ;; as additional gaps and needlessly repeats source analysis.
-         semantic-trace (pipeline/run-passes-diagnostic
-                         (:body represented) pipeline/gpu-semantic-post-soa-passes
-                         compiler-options :write-read-fused)
+         semantic-attempt (pipeline/normalized-semantic-program-attempt
+                           (:frontend-source constructed) compiler-options
+                           (:physical-source constructed))
+         semantic-trace (if-let [program (:program semantic-attempt)]
+                          (pipeline/run-passes-diagnostic program [:materialize]
+                                                          compiler-options :soac-fused)
+                          {:form (:frontend-source constructed)})
          semantic-candidate (:form semantic-trace)
          semantic (case (:dialect semantic-candidate)
                     :typed-parallel (if (get-in semantic-candidate [:attributes :invocation-plan])
@@ -789,18 +810,18 @@
                     "deftm is outside the direct TypedSOAC/structured-control vertical"
                     {:function (function-symbol f-var)
                      :dialect (:dialect semantic) :fallback :none
-                     :coverage (or (get-in semantic-trace [:stats :soac-fused :typed-soac-declined])
+                     :coverage (or (:declined semantic-attempt)
                                    (typed-frontend/coverage-decline semantic compiler-options))}))
          semantic (cond-> semantic
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))
-         prefix-correspondence (source-prefix/close prefix-input (:source-normalization normalized-input)
+         prefix-correspondence (source-prefix/close prefix-input (:normalization constructed)
                                                     source represented-source semantic
-                                                    (:source-construction source-construction))
+                                                    (:construction constructed))
          reduction-correspondence
          (source-prefix/close-reduction-terminal
-          reduction-input (:source-normalization normalized-input) source represented-source semantic
-          (:source-construction source-construction))
+          reduction-input (:normalization constructed) source represented-source semantic
+          (:construction constructed))
          ;; The conditional terminal join is not producer correspondence by itself. Only the
          ;; closed empty producer can currently enter the connected source-owner vertical.
          reduction-correspondence

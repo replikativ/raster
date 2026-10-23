@@ -270,16 +270,23 @@
                  :array-types {'seeds :long} :scalar-types {'n :int 'base-seed :long}}
         normalized (typed-frontend/normalize-source source options)
         seen (atom [])
+        structured-seen (atom [])
+        discover structured-route/attempt
         project @#'typed-route/source-projection
         result
         (with-redefs-fn
           {#'pipeline/prepare-semantic-source (fn [& _] (throw (AssertionError. "representation replay")))
            #'typed-frontend/normalize-source (fn [& _] (throw (AssertionError. "normalization replay")))
            #'typed-route/attempt (fn [& _] (throw (AssertionError. "ordinary route replay")))
+           #'structured-route/attempt (fn [form options]
+                                       (swap! structured-seen conj form)
+                                       (discover form options))
            #'typed-route/source-projection (fn [form options]
                                              (swap! seen conj form)
                                              (project form options))}
-          #(pipeline/normalized-semantic-program-attempt normalized options))]
+          #(pipeline/normalized-semantic-program-attempt normalized options source))]
+    (is (= 1 (count @structured-seen)))
+    (is (identical? source (first @structured-seen)))
     (is (identical? normalized (first @seen)))
     (is (some? (:program result)))
     (is (true? (get-in result [:stats :typed-validated])))

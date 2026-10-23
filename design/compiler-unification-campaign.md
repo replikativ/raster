@@ -28,6 +28,41 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 equation-first adoption checkpoint: the public compiler now uses the
+shared source constructor, including authored-segment preparation for discovered
+AD imports. Ordinary physical representation and storage-alias canonicalization
+precede its single final frontend normalization. Already-normalized semantic
+admission then shares the existing structured/TypedSOAC legality and materialization
+machinery; it does not replay representation or frontend normalization.
+Structured discovery receives the exact pre-normalization physical source, while
+TypedSOAC fallback receives the exact normalized source from that same constructor.
+An identity-spy regression checks both phase inputs and forbids normalization replay.
+
+Prepared imports still stop explicitly at `:unclosed-prepared-module-phase` after
+one source-component analysis. One/two actual generated-gradient imports retain
+three/six allocations, six/twelve pending input occurrences and their original
+open import markers. This is a production-entry integration test, not production
+training admission. No original marker is cleared and no source owner is minted.
+
+The focused adoption gate passes 11 tests / 186 assertions, including ordinary
+CUDA/HIP emission, capacity-versus-traversal, scalar extrema, checked-prefix order,
+record/tree parameter projection, portable stencils, and exact imported-module refusal. Cold owner
+transaction retries are preserved; the regression counts completed construction
+handoffs rather than treating aborted stale attempts as duplicate compilation.
+Whole-import completion/placement and source-owner finalization, unchanged model
+acceptance, and all seven exact-head CI gates remain required before merging.
+
+Independent review requested structured-loop and copy controls in addition to the
+passing ordinary controls. Both are still red, also with the exact pushed
+`46815fe3` compile function in the same process: RK4 reaches a conflicting scalar
+alias (`rstr_extent_0` versus `n`), and region copy reaches an unclosed ordered
+scalar executor. Neither test is skipped or reclassified as a passing gate.
+The module/pipeline gate passes 70 tests / 789 assertions; after the phase-view
+adjustment, pipeline/diagnostics pass 35 tests / 236 assertions. The diagnostics
+test now checks exact refusal transport at the actual shared admission seam;
+conditional FP/count proof assertions remain separately exercised. These are
+bounded integration receipts, not a claim of complete structured execution.
+
 October 23 source-history integration checkpoint: the shared constructor can now
 discover canonical prepared calls before authored preparation, then record the
 assembled result under a new actual source-construction edge. The old placement

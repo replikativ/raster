@@ -924,7 +924,9 @@
   "Share structured/functional admission and its diagnostics. The two internal
    callers select ordinary versus already-normalized syntax, not different
    legality rules or permission to admit a prepared import."
-  [source opts abstract-machine typed-attempt]
+  ([source opts abstract-machine typed-attempt]
+   (semantic-program-attempt* source opts abstract-machine typed-attempt source))
+  ([source opts abstract-machine typed-attempt structured-source]
   (let [;; A public array's backing capacity is independent of each traversal.
         ;; Semantic owners must prove their logical access footprint separately.
         values (merge (when (device/gpu-target? (:target-device opts))
@@ -941,7 +943,7 @@
                 :public-parameters (or (:public-parameters opts) (:active-params opts))
                 :abstract-machine abstract-machine}
         structured (when (device/gpu-target? (:target-device opts))
-                     (structured-route/attempt source common))]
+                     (structured-route/attempt structured-source common))]
     (if (:program structured)
       structured
       (let [typed (typed-attempt
@@ -968,7 +970,7 @@
                     typed)]
         (cond-> (or typed {})
           (:declined structured)
-          (assoc :structured-control-declined (:declined structured)))))))
+          (assoc :structured-control-declined (:declined structured))))))))
 
 (defn- semantic-program-attempt
   "Try structured control and ordinary TypedSOAC with shared representation preparation."
@@ -979,11 +981,14 @@
 (defn ^:no-doc normalized-semantic-program-attempt
   "Consume a producer's already-normalized source without representation rewrites
    or another normalization. Ordinary whole-source validation and optimization
-   remain unchanged. Pending prepared components must not enter this route."
-  [source opts]
-  (semantic-program-attempt* source opts
-                             (abstract-machine-for-target (:target-device opts) (:target-descriptor opts))
-                             typed-soac-route/attempt-normalized))
+   remain unchanged. Structured discovery may consume the same producer's physical
+   source before frontend normalization, preserving its existing loop boundary.
+   Pending prepared components must not enter this route."
+  ([source opts] (normalized-semantic-program-attempt source opts source))
+  ([source opts structured-source]
+   (semantic-program-attempt* source opts
+                              (abstract-machine-for-target (:target-device opts) (:target-descriptor opts))
+                              typed-soac-route/attempt-normalized structured-source)))
 
 (defn- unfused-compatibility
   "Keep unsupported source byte-for-byte while exposing why no certified fusion ran."

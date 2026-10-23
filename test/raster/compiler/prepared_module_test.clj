@@ -11,6 +11,7 @@
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.fixtures.distributed-training :as training]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.prepared-module :as module]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]))
@@ -58,6 +59,41 @@
         first-gradient (clojure.core/nth vg 1)
         second-gradient (hidden-gradient theta x y rows width)]
     (raster.dl.nn/residual-add first-gradient second-gradient width)))
+
+(deftest public-compilation-reaches-the-owned-import-boundary
+  (doseq [[f imports] [[#'training/local-gradient-sum 1] [#'two-gradient-imports 2]]]
+    (let [construct module/construct-source
+          analyze module/analyze-source-components
+          calls (atom {:construction 0 :analysis 0})
+          failure
+          (with-redefs [module/construct-source
+                        (fn [& args]
+                          (let [result (apply construct args)]
+                            ;; Cold definition loading may retry the complete
+                            ;; owner transaction. Count only completed handoffs.
+                            (swap! calls update :construction inc)
+                            result))
+                        module/analyze-source-components
+                        (fn [& args]
+                          (swap! calls update :analysis inc)
+                          (swap! calls assoc :markers
+                                 (count (:unclosed-source-imports @entry/*emission-inputs*)))
+                          (apply analyze args))
+                        pipeline/normalized-semantic-program-attempt
+                        (fn [& _]
+                          (throw (ex-info "pending imports entered ordinary admission" {})))]
+            (try
+              (equation-first/compile
+               f {:dtype :float :target :ocl:prepared-production-boundary
+                  :schedule {:precision :f32-scalar}}
+               {:device-id :ocl:prepared-production-boundary :device-type :gpu :backend :ocl
+                :subgroup-dialect :opencl-portable :max-workgroup-size 256})
+              nil
+              (catch clojure.lang.ExceptionInfo error (ex-data error))))]
+      (is (= {:reason :unclosed-prepared-module-phase :compiler :equation-first
+              :pending-inputs (* 6 imports) :allocations (* 3 imports) :fallback :none}
+             (select-keys failure [:reason :compiler :pending-inputs :allocations :fallback])))
+      (is (= {:construction 1 :analysis 1 :markers imports} @calls)))))
 
 (deftest two-late-imports-retain-distinct-occurrence-and-obligation-identities
   (entry/call-with-definition-inputs
@@ -260,6 +296,8 @@
                       (module/construct-source
                        frontend {:dtype :float :target-device :ocl:assembled-source :segmented-plans? true}
                        {:prepare-source (fn [_] (throw (AssertionError. "unresolved source entered whole preparation")))
+                        :canonicalize-ordinary-source
+                        (fn [& _] (throw (AssertionError. "unclosed import entered ordinary canonicalization")))
                         :prepare-authored-segment
                         (fn [source options]
                           (pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes options))}))
@@ -391,12 +429,14 @@
              (module/construct-source
               frontend {:dtype :double}
               {:prepare-source (fn [source] (swap! events conj [:prepare source]) source)
+               :canonicalize-ordinary-source
+               (fn [source _] (swap! events conj [:canonicalize source]) source)
                :represent-source
                (fn [source options]
                  (swap! events conj [:represent source])
                  ;; A real representation step may rebuild an ordinary source.
                  {:body (with-meta (apply list source) (meta source)) :options options})}))]
-       (is (= [:prepare :represent :normalize] (mapv first @events)))
+       (is (= [:prepare :represent :canonicalize :normalize] (mapv first @events)))
        (is (nil? (:prepared-phase result)))
        (is (not (identical? (:represented-source result) (:physical-source result))))
        (is (identical? (:physical-source result) (second (last @events))))

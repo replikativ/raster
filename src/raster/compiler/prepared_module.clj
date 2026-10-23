@@ -255,14 +255,18 @@
    preparation still runs on whole no-import source. Representation runs once after
    closing that pre-SoA source construction; imported spines currently require an
    identity representation. Ordinary no-import sources use the same construction
-   and normalization path without manufacturing a PreparedModulePhase.
+   and normalization path without manufacturing a PreparedModulePhase. Their
+   optional representation canonicalizer runs once before final normalization;
+   imported source never enters that ordinary-only rewrite.
    The returned handoff map is NOT authority: its retained objects own provenance.
    A prepared phase seals construction only, never admission or marker closure."
   ([source-frontend options] (construct-source source-frontend options {}))
-  ([source-frontend options {:keys [prepare-source represent-source prepare-authored-segment]
+  ([source-frontend options {:keys [prepare-source represent-source prepare-authored-segment
+                                  canonicalize-ordinary-source]
                              :or {prepare-source identity
                                   represent-source (fn [source options]
-                                                     {:body source :options options})}}]
+                                                     {:body source :options options})
+                                  canonicalize-ordinary-source (fn [source _] source)}}]
   (when-not entry/*emission-inputs*
     (refuse! "prepared module construction requires a definition owner" {}))
   (let [source-var (get-in source-frontend [:source-entry :source-var])
@@ -370,16 +374,20 @@
           _ (when-not (and (map? represented) (contains? represented :body)
                            (seq? (:body represented)))
               (refuse! "source representation did not return its actual body" {}))
-          physical-source (:body represented)
+          represented-body (:body represented)
           physical-options (get represented :options options)
           _ (when-not (map? physical-options)
               (refuse! "source representation did not return compiler options" {}))
           _ (when (and (seq @minted)
-                       (not (and (identical? physical-source (:form expanded))
+                       (not (and (identical? represented-body (:form expanded))
                                  (identical? options physical-options)
                                  (nil? (:representation represented)))))
               (refuse! "prepared module representation changed its unclosed interval"
                        {:representation :unclosed}))
+          ;; Ordinary-only canonicalization precedes final normalization. An
+          ;; imported spine cannot undergo such rewriting without new origins.
+          physical-source (if (seq @minted) represented-body
+                              (canonicalize-ordinary-source represented-body physical-options))
           events (volatile! [])
           normalized (frontend/normalize-source physical-source physical-options #(vswap! events conj %))
           origins (when (seq @minted)
