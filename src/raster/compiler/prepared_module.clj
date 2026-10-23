@@ -207,25 +207,29 @@
     (doseq [import (:imports context)] (assert-import-current! import))
     true))
 
-(defn capture
-  "Prepare one exact frontend, expand AD at its final cut, then normalize once.
+(defn construct-source
+  "Construct, represent and normalize one exact frontend under its source history.
    Requires an active definition collector. Only direct public-parameter inputs
-   currently have caller-carrier evidence; other expressions explicitly refuse.
-   The optional compiler preparation runs under the same construction history,
-   BEFORE installing the owned AD consumer. It must leave AD applications opaque;
-   the final expansion alone inserts the canonical generated binding spine.
-   Returned phase seals construction only. It grants no provisional admission
-   and does not remove the original unclosed prepared-import marker."
-  ([source-frontend options] (capture source-frontend options identity))
-  ([source-frontend options prepare-source]
+   currently have prepared-call carrier evidence; other imported expressions refuse.
+   Compiler preparation precedes the final AD cut. Representation runs once after
+   closing that pre-SoA source construction; imported spines currently require an
+   identity representation. Ordinary no-import sources use the same construction
+   and normalization path without manufacturing a PreparedModulePhase.
+   The returned handoff map is NOT authority: its retained objects own provenance.
+   A prepared phase seals construction only, never admission or marker closure."
+  ([source-frontend options] (construct-source source-frontend options {}))
+  ([source-frontend options {:keys [prepare-source represent-source]
+                             :or {prepare-source identity
+                                  represent-source (fn [source options]
+                                                     {:body source :options options})}}]
   (when-not entry/*emission-inputs*
     (refuse! "prepared module construction requires a definition owner" {}))
   (let [source-var (get-in source-frontend [:source-entry :source-var])
         _ (entry/assert-frontend-source! source-frontend source-var)
-        caller (entry/frontend-body-entry-carriers source-frontend source-var)
-        _ (when-not caller (refuse! "prepared module has no actual caller entry carriers" {}))
+        caller (delay (entry/frontend-body-entry-carriers source-frontend source-var))
         parameters (get-in source-frontend [:source-entry :params])
         normalization (transport/normalize-frontend-bindings source-frontend parameters)
+        normalized-source (first (transport/effective-body (:walked-body normalization)))
         environment (zipmap parameters (get-in source-frontend [:source-entry :tags]))
         minted (volatile! [])
         expanded
@@ -237,14 +241,17 @@
                 ;; preparation, invalidating its occurrence-owned obligations.
                 (binding [transport/*prepared-program-consumer* nil
                           inline/*defer-prepared-ad-expansion?* true]
-                  (prepare-source (first (:walked-body normalization))))]
+                  (prepare-source normalized-source))]
             (binding [inline/*defer-prepared-ad-expansion?* false
                       transport/*prepared-program-consumer*
                   (fn [event placement]
-                    (let [prepared (:prepared event)
+                    (let [caller @caller
+                          prepared (:prepared event)
                           physical (reverse/prepared-bytecode-entry prepared)
                           _ (when-not (and physical (reverse/adopt-prepared-program-inputs! prepared))
                               (refuse! "prepared module producer could not join its enclosing owner" {}))
+                          _ (when-not caller
+                              (refuse! "prepared module has no actual caller entry carriers" {}))
                           facts (mapv (:parameter-facts caller) (:arguments event))
                           _ (when-not (every? some? facts)
                               (refuse! "prepared module call requires exact public parameter arguments" {}))
@@ -260,7 +267,7 @@
         construction (transport/source-construction-view (:source-construction expanded)
                                                          (:source-normalization normalization) (:form expanded))
         cuts (:prepared-program-cuts construction)]
-    (when-not (and construction (seq @minted) (= (count cuts) (count @minted))
+    (when-not (and construction (= (count cuts) (count @minted))
                    (every? true?
                            (map (fn [cut {:keys [event placement call import nonce]}]
                                   (and (identical? event (:event cut))
@@ -271,7 +278,8 @@
                                        (identical? (:bindings call) (:canonical-bindings cut)))) cuts @minted)))
       (refuse! "prepared module calls and inserted cuts are not a bijection" {}))
     (doseq [import @minted] (assert-import-current! import))
-    (let [actual-options
+    (let [caller (when (seq @minted) @caller)
+          actual-options
           {:array-types (into {} (keep (fn [[id fact]] (when-let [dt (dtype/dtype-for-jvm-array-class (:carrier fact))] [id dt])))
                               (:parameter-facts caller))
            :scalar-types (into {} (keep (fn [[id fact]]
@@ -288,18 +296,49 @@
                           (checked-type-union options actual-options) @minted)
           options (assoc options :source-ns source-ns
                                  :public-parameters parameters)
+          represented (represent-source (:form expanded) options)
+          _ (when-not (and (map? represented) (contains? represented :body)
+                           (seq? (:body represented)))
+              (refuse! "source representation did not return its actual body" {}))
+          physical-source (:body represented)
+          physical-options (get represented :options options)
+          _ (when-not (map? physical-options)
+              (refuse! "source representation did not return compiler options" {}))
+          _ (when (and (seq @minted)
+                       (not (and (identical? physical-source (:form expanded))
+                                 (identical? options physical-options)
+                                 (nil? (:representation represented)))))
+              (refuse! "prepared module representation changed its unclosed interval"
+                       {:representation :unclosed}))
           events (volatile! [])
-          normalized (frontend/normalize-source (:form expanded) options #(vswap! events conj %))
-          origins (normalization-origins (:form expanded) normalized @events)
-          import-origins (import-origins (:form expanded) @events origins @minted)
+          normalized (frontend/normalize-source physical-source physical-options #(vswap! events conj %))
+          origins (when (seq @minted)
+                    (normalization-origins physical-source normalized @events))
+          import-origins (when (seq @minted)
+                           (import-origins physical-source @events origins @minted))
           context {:source-construction (:source-construction expanded)
                    :normalization (:source-normalization normalization)
-                   :source (:form expanded) :normalized normalized :options options
+                   :source (:form expanded) :physical-source physical-source
+                   :normalized normalized :options physical-options
+                   :representation (:representation represented)
                    :imports @minted :events @events :origins origins :import-origins import-origins :admitted? false}
           observations @entry/*emission-inputs*
-          phase (PreparedModulePhase. context observations)]
-      (entry/assert-producer-current! phase)
-      phase))))
+          phase (when (seq @minted) (PreparedModulePhase. context observations))]
+      (when phase (entry/assert-producer-current! phase))
+      {:normalization (:source-normalization normalization)
+       :normalized-source normalized-source
+       :construction (:source-construction expanded)
+       :represented-source (:form expanded) :physical-source physical-source
+       :frontend-source normalized :frontend-options physical-options
+       :representation (:representation represented) :prepared-phase phase}))))
+
+(defn capture
+  "Test/diagnostic adapter over the shared source constructor, requiring an import.
+   No provisional admission or original prepared-import marker is discharged."
+  ([source-frontend options] (capture source-frontend options identity))
+  ([source-frontend options prepare-source]
+   (or (:prepared-phase (construct-source source-frontend options {:prepare-source prepare-source}))
+       (refuse! "prepared module construction did not contain an import" {}))))
 
 (defn view
   "Query only this phase's exact normalized object under its original history.

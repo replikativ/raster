@@ -21,6 +21,102 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(core/deftm ordinary-source [n :- Long] :- Long (clojure.core/+ n 1))
+
+(core/deftm ordinary-multiform-source [out :- (Array long) n :- Long] :- Long
+  (clojure.core/aset out 0 n)
+  (clojure.core/aset out 1 (clojure.core/inc (clojure.core/aget out 0)))
+  (clojure.core/+ (clojure.core/aget out 1) 1))
+
+(core/deftm two-gradient-imports
+  [theta :- (Array float) x :- (Array float) y :- (Array float)
+   rows :- Long width :- Long] :- (Array float)
+  (let [first-vg ((reverse/value+grad (var raster.compiler.fixtures.distributed-training/local-loss)
+                                   :wrt [0]) theta x y rows width)
+        first-gradient (clojure.core/nth first-vg 1)
+        second-vg ((reverse/value+grad (var raster.compiler.fixtures.distributed-training/local-loss)
+                                    :wrt [0]) theta x y rows width)
+        second-gradient (clojure.core/nth second-vg 1)]
+    (raster.dl.nn/residual-add first-gradient second-gradient width)))
+
+(deftest two-late-imports-retain-distinct-occurrence-and-obligation-identities
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [root (core/resolve-deftm-var #'two-gradient-imports)
+           _ (core/prepare-deftm-frontend! root)
+           phase (module/capture (entry/original-source-frontend root) {:dtype :float})
+           view (module/view phase (module/normalized-source phase))
+           imports (:imports view)
+           obligations (mapcat :obligation-origins (:import-origins view))]
+       (is (= 2 (count imports)))
+       (is (true? (every? #(identical? (:physical %)
+                                      (reverse/prepared-bytecode-entry (:prepared %))) imports)))
+       (is (not (identical? (:nonce (first imports)) (:nonce (second imports)))))
+       (is (= (count obligations) (count (set (map :id obligations)))))
+       (is (= (count (:origins view)) (count (set (map :index (:origins view))))))
+       (is (= 2 (count (:unclosed-source-imports @entry/*emission-inputs*))))
+       (is (false? (:admitted? view)))))))
+
+(deftest ordinary-multiform-source-keeps-every-statement-in-order
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [root (core/resolve-deftm-var #'ordinary-multiform-source)
+           _ (core/prepare-deftm-frontend! root)
+           frontend (entry/original-source-frontend root)
+           result (module/construct-source frontend {:dtype :double})
+           params (get-in frontend [:source-entry :params])
+           compiled (binding [*ns* (get-in frontend [:source-entry :source-ns])]
+                      (eval (list 'fn params (:frontend-source result))))
+           expected (long-array 2)
+           actual (long-array 2)]
+       (is (nil? (:prepared-phase result)))
+       (is (= (ordinary-multiform-source expected 11) (compiled actual 11)))
+       (is (= [11 12] (vec actual)))
+       (is (= (vec expected) (vec actual)))))))
+
+(deftest ordinary-source-shares-construction-without-an-import-owner
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [root (core/resolve-deftm-var #'ordinary-source)
+           _ (core/prepare-deftm-frontend! root)
+           frontend (entry/original-source-frontend root)
+           events (atom [])
+           normalize frontend/normalize-source
+           result
+           (with-redefs [entry/frontend-body-entry-carriers
+                         (fn [& _] (throw (AssertionError. "ordinary source queried AD entry carriers")))
+                         frontend/normalize-source
+                         (fn [source options observer]
+                           (swap! events conj [:normalize source])
+                           (normalize source options observer))]
+             (module/construct-source
+              frontend {:dtype :double}
+              {:prepare-source (fn [source] (swap! events conj [:prepare source]) source)
+               :represent-source
+               (fn [source options]
+                 (swap! events conj [:represent source])
+                 ;; A real representation step may rebuild an ordinary source.
+                 {:body (with-meta (apply list source) (meta source)) :options options})}))]
+       (is (= [:prepare :represent :normalize] (mapv first @events)))
+       (is (nil? (:prepared-phase result)))
+       (is (not (identical? (:represented-source result) (:physical-source result))))
+       (is (identical? (:physical-source result) (second (last @events))))
+       (is (some? (transport/source-construction-view
+                   (:construction result) (:normalization result) (:represented-source result))))
+       (is (empty? (:unclosed-source-imports @entry/*emission-inputs*)))))))
+
+(deftest unclosed-import-cannot-borrow-a-different-representation
+  (doseq [represent [(fn [source options]
+                      {:body (with-meta (apply list source) (meta source)) :options options})
+                    (fn [source options] {:body source :options (assoc options :dtype :double)})
+                    (fn [source options] {:body source :options (into {} options)})
+                    (fn [source options] {:body source :options options :representation {:forged true}})]]
+    (entry/call-with-definition-inputs
+     (fn []
+       (is (= :unclosed-prepared-module-phase
+              (reason #(module/construct-source (source-frontend) {:dtype :float}
+                                                {:represent-source represent}))))))))
+
 (deftest actual-training-module-retains-complete-pending-construction
   (entry/call-with-definition-inputs
    (fn []
@@ -114,10 +210,18 @@
            parameters (get-in source [:source-entry :params])
            environment (zipmap parameters (get-in source [:source-entry :tags]))
            project reverse/project-prepared-value+grad-call
+           prepare reverse/prepare-value+grad
+           preparation-policies (atom [])
            projections (atom 0)
            preparations (atom 0)
            phase
-           (with-redefs [reverse/project-prepared-value+grad-call
+           (with-redefs [reverse/prepare-value+grad
+                         (fn [& args]
+                           (swap! preparation-policies conj
+                                  [(nil? transport/*prepared-program-consumer*)
+                                   (false? inline/*defer-prepared-ad-expansion?*)])
+                           (apply prepare args))
+                         reverse/project-prepared-value+grad-call
                          (fn [& args]
                            (swap! projections inc)
                            (apply project args))]
@@ -136,6 +240,9 @@
            view (module/view phase normalized)]
        (is (= 1 @preparations))
        (is (= 1 @projections))
+       (is (seq @preparation-policies))
+       (is (every? #(= [true true] %) @preparation-policies)
+           "nested preparation cannot inherit either outer insertion or deferral policy")
        (is (= 1 (count (:imports view))))
        (is (= 1 (count (:prepared-program-cuts
                         (transport/source-construction-view

@@ -140,6 +140,27 @@
                                      (+ acc (clojure.core/aget shared k)))]
          [mapped reduced]))
 
+(deftest normalized-route-shares-validation-without-normalizing-again
+  (let [source '(let* [result (raster.par/rng-fill! seeds n base-seed)] result)
+        arrays {'seeds :long}
+        options {:scalar-types {'n :int 'base-seed :long}}
+        normalized (frontend/normalize-source source (assoc options :array-types arrays))
+        project @#'route/source-projection
+        first-source (atom nil)
+        result
+        (with-redefs-fn
+          {#'frontend/normalize-source
+           (fn [& _] (throw (AssertionError. "normalized route replayed normalization")))
+           #'route/source-projection
+           (fn [form options]
+             (compare-and-set! first-source nil form)
+             (project form options))}
+          #(#'route/attempt-normalized normalized :long arrays options))]
+    (is (identical? normalized @first-source))
+    (is (some? (:program result)))
+    (is (true? (get-in result [:stats :typed-validated])))
+    (is (= :analyzed-source (get-in result [:stats :front-end])))))
+
 (deftest rng-fill-is-an-ordinary-typed-map
   (let [source '(let* [result (raster.par/rng-fill! seeds n base-seed)] result)
         {:keys [program stats]}

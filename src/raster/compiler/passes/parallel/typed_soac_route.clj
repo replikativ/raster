@@ -1728,25 +1728,17 @@
               (assoc admitted :terminal-scalars-materialized 0)))))
       (assoc admitted :terminal-scalars-materialized 0))))
 
-(defn attempt
-  "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
-   no parallel binding is in this closed subset. Internal :host-scalars? admits host-only packets
-   through the same frontend; their caller must independently certify purity and storage algebra.
-   It does not authorize a device schedule or alter default scalar-only admission."
-  ([form dtype]
-   (attempt form dtype {}))
-  ([form dtype array-types]
-   (attempt form dtype array-types {}))
-  ([form dtype array-types {:keys [resident-reductions? resident-initialization?
+(defn- attempt-normalized
+  "Consume one exact normalized source. Normalization is owned by the caller;
+   all existing whole-source validation, liveness and scheduling remain shared.
+   This private continuation grants no prepared-import or source-owner admission."
+  [form dtype array-types {:keys [resident-reductions? resident-initialization?
                                    resident-uniform-input-loads?
                                    scalar-types values abstract-machine segmented-plans? source-ns
                                    preserve-declared-array-storage? host-scalars? terminal-host-results?
                                    public-parameters]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
-     (let [form (frontend/normalize-source form {:array-types array-types
-                                                 :source-ns source-ns
-                                                 :scalar-types scalar-types})]
        (try
          (let [frontend-options {:dtype dtype :array-types array-types
                                  :source-ns source-ns
@@ -1809,4 +1801,19 @@
              {:declined {:reason (:reason (ex-data exception))
                          :message (.getMessage exception)
                          :details (ex-data exception)}}
-             (throw exception))))))))
+             (throw exception))))))
+
+(defn attempt
+  "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
+   no parallel binding is in this closed subset. Internal :host-scalars? admits host-only packets
+   through the same frontend; their caller must independently certify purity and storage algebra.
+   It does not authorize a device schedule or alter default scalar-only admission."
+  ([form dtype] (attempt form dtype {}))
+  ([form dtype array-types] (attempt form dtype array-types {}))
+  ([form dtype array-types options]
+   (when (and (seq? form) (contains? #{'let 'let*} (first form)))
+     (attempt-normalized
+      (frontend/normalize-source form {:array-types array-types
+                                       :source-ns (:source-ns options)
+                                       :scalar-types (:scalar-types options)})
+      dtype array-types options))))

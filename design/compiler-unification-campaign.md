@@ -28,6 +28,31 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 shared source-constructor checkpoint: ordinary and prepared sources
+now have one internal construct/represent/normalize implementation. The handoff
+keeps the original source normalization, pre-SoA construction, represented source,
+physical source and exact normalized frontend source distinct. No-import code
+creates no prepared phase and does not query AD entry carriers. Multi-form bodies
+retain every statement through the existing ordered `do` convention. The original
+`capture` entry is an adapter, not an independent miniature source pipeline.
+
+Until explicit representation correspondence exists, imported intervals require
+identical body and options and no representation descriptor. Copied bodies/options
+and forged representation descriptions refuse. Nested cold JVM preparation runs
+without an enclosing module-insertion consumer or temporary AD-deferral policy;
+only projection of its completed program may consume the actual outer cut. Two
+imports retain independent physical-entry, nonce, cut and obligation ownership.
+
+TypedSOAC routing now shares a private normalized-source continuation. Public
+`attempt` keeps its previous normalization and validation behavior. This factoring
+does not yet wire prepared imports into production equation-first admission or
+close any obligations. The final affected-layer gate passes 109 tests / 743
+assertions; normalized/public route controls additionally pass two tests / 17
+assertions. Constructor-only checks pass 14 tests / 159 assertions. A same-process
+comparison against 469d3e1f confirms identical 13 assertion failures and one error
+in the existing singleton-arithmetic and checked-conversion controls. Those remain
+explicit campaign blockers, not waived or rewritten expectations.
+
 October 22 late-cut construction checkpoint: the prepared-module phase can run
 ordinary pre-SoA preparation inside its existing source history, keeping prepared
 AD applications opaque until one final insertion pass. Ordinary helper expansion

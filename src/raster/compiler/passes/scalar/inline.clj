@@ -1245,8 +1245,14 @@
             ;; gradient slots for both runtime construction and compilation. The inliner only
             ;; qualifies, alpha-renames and substitutes this retained program; it does not
             ;; transform AD again or infer the gradient types from its consumers.
-            prepared-body ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
-                           (:var deftm-info) (:wrt (apply hash-map options)))
+            ;; Preparation may compile observed definitions on a cold frontier.
+            ;; Those nested JVM compilations do not belong to this caller's
+            ;; module-insertion scope. Only projection of the completed program
+            ;; below may consume the enclosing site's prepared-module cut.
+            prepared-body (binding [source-transport/*prepared-program-consumer* nil
+                                    *defer-prepared-ad-expansion?* false]
+                            ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
+                             (:var deftm-info) (:wrt (apply hash-map options))))
             owned? (contains? prepared-body :source-owner)]
         (if owned?
           (do
