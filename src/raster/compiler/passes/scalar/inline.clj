@@ -169,7 +169,7 @@
   [arg]
   (and (coll? arg) (nil? (constant/value arg))))
 
-(defn- check-inline-arity! [callee params args call]
+(defn ^:no-doc check-inline-arity! [callee params args call]
   (when (not= (count params) (count args))
     (throw (ex-info
             (str "Arity mismatch inlining `" callee "`: it takes "

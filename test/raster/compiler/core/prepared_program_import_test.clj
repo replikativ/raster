@@ -63,6 +63,11 @@
         projected-binders (set (map first (get-in event [:projection :bindings])))
         actual-symbols (set (filter symbol? (tree-seq coll? seq source)))]
     (is (some? (reverse/assert-prepared-program-source! (:prepared event))))
+    (is (= 2 (count (get-in event [:argument-plan :object-bindings]))))
+    (is (= 2 (count (get-in event [:argument-plan :input-bindings]))))
+    (is (= [Double/TYPE Double/TYPE]
+           (mapv :parameter-class (get-in event [:argument-plan :slots]))))
+    (is (some? (get-in event [:argument-plan :boxed-entry-bridge])))
     (is (= :binding (:kind placement)))
     (let [{:keys [scope index prefix]} (:binding-site placement)
           cut (first (:prepared-program-cuts (construction-view imported)))]

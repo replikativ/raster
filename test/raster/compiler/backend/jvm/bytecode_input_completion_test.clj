@@ -708,19 +708,20 @@
         first-class (.defineClass (clojure.lang.DynamicClassLoader.) binary-name bytes nil)
         second-class (.defineClass (clojure.lang.DynamicClassLoader.) binary-name bytes nil)
         first-array (java.lang.reflect.Array/newInstance first-class (int 0))
-        second-array (java.lang.reflect.Array/newInstance second-class (int 0))
-        contract (completion/reference-check-contract (class first-array))
-        term (completion/complete-value contract 'input)
-        run (compiled ['input] term)
-        recur-term (completion/complete-value contract '(recur (clojure.core/+ i 1)))
-        run-loop (compiled [] (list 'loop* '[i (long 0)]
-                                   (list 'if '(clojure.core/< i 1) recur-term nil)))]
+        second-array (java.lang.reflect.Array/newInstance second-class (int 0))]
     (is (= (.getName (class first-array)) (.getName (class second-array))))
     (is (not (identical? (class first-array) (class second-array))))
-    (is (identical? first-array (run first-array)))
-    (is (nil? (run nil)))
-    (is (nil? (run-loop)) "A divergent operand must not push the Class before recur")
-    (is (= ClassCastException (:error (outcome run second-array))))))
+    (doseq [contract [(completion/reference-check-contract (class first-array))
+                      (completion/bytecode-boxed-parameter-contract (class first-array))]]
+      (let [term (completion/complete-value contract 'input)
+            run (compiled ['input] term)
+            recur-term (completion/complete-value contract '(recur (clojure.core/+ i 1)))
+            run-loop (compiled [] (list 'loop* '[i (long 0)]
+                                       (list 'if '(clojure.core/< i 1) recur-term nil)))]
+        (is (identical? first-array (run first-array)))
+        (is (nil? (run nil)))
+        (is (nil? (run-loop)) "A divergent operand must not push the Class before recur")
+        (is (= ClassCastException (:error (outcome run second-array))))))))
 
 (deftest integral-outlining-composes-an-original-call-with-its-input-completion
   (doseq [[caller carrier] [[#'integral-long-caller Long/TYPE]

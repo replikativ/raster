@@ -122,6 +122,18 @@
     (bytecode-integral-input-contract carrier operand-context)
     :else (bytecode-floating-input-contract carrier operand-context)))
 
+(defn bytecode-boxed-parameter-contract
+  "Retain one generated IFn entry's Object-to-compute-parameter completion.
+   Unlike typed invocation adaptation, this uses the wrapper's Number.xxxValue,
+   Boolean/Character unboxing or exact reference CHECKCAST. The producer owns
+   the actual wrapper/compute Method correspondence and argument evaluation order."
+  [parameter-class]
+  (when-not (and (class? parameter-class) (not= Void/TYPE parameter-class))
+    (throw (ex-info "boxed parameter completion requires a non-void resolved Class"
+                    {:reason :unsupported-value-completion :carrier parameter-class})))
+  {:source-context :jvm-bytecode-boxed-parameter-input :target-carrier parameter-class
+   :policy :preserve-bytecode-boxed-entry})
+
 (defn bytecode-result-context-contract
   "Retain the actual bytecode region-entry context and normal result carrier.
    This is not Object-input conversion: the consumer must return the original
@@ -158,6 +170,11 @@
 (defn canonical-contract? [contract]
   (and (map? contract)
        (or (= object-input-contract contract)
+           (and (= #{:source-context :target-carrier :policy} (set (keys contract)))
+                (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
+                (= :preserve-bytecode-boxed-entry (:policy contract))
+                (class? (:target-carrier contract))
+                (not= Void/TYPE (:target-carrier contract)))
            (and (= #{:source-context :operand-context :result-carrier} (set (keys contract)))
                 (= :jvm-bytecode-result-context (:source-context contract))
                 (contains? #{:ref :double :float :long :int :bool} (:result-carrier contract))
@@ -218,7 +235,8 @@
   "A canonical region whose reconstruction needs original bytecode authority.
    Shape recognition is a rewrite barrier, not proof of ownership or execution."
   [expression]
-  (contains? #{:jvm-bytecode-reference-input :jvm-bytecode-integral-input
+  (contains? #{:jvm-bytecode-boxed-parameter-input
+               :jvm-bytecode-reference-input :jvm-bytecode-integral-input
                :jvm-bytecode-floating-input :jvm-bytecode-result-context}
              (get-in (canonical-parts expression) [:contract :source-context])))
 
@@ -311,7 +329,8 @@
      (if (and (seq? form) (= completion-symbol (first form)))
        (if-let [{:keys [contract operand]} (canonical-parts form)]
          (with-meta (case (:source-context contract)
-                      (:jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                      (:jvm-bytecode-boxed-parameter-input
+                       :jvm-bytecode-floating-input :jvm-bytecode-integral-input
                        :jvm-bytecode-reference-input :jvm-bytecode-result-context)
                       (throw (ex-info "Bytecode-owned completion requires its bytecode consumer"
                                       {:reason :unsupported-value-completion-source-context

@@ -14,6 +14,47 @@
 (defn- decline! [message data]
   (throw (ex-info message (assoc data :reason :generated-body-unsupported))))
 
+(defn instantiate-boxed-entry-inputs
+  "Construct the input boundary of an authenticated generated public entry.
+   All original operands complete in Object context before any wrapper conversion,
+   just as applyTo/invoke does. The caller must retain the physical owner/guard;
+   these bindings alone grant no numerical realization or portable import."
+  [{:keys [emission input-body implementation interface-class]} parameters arguments]
+  (let [bridge (bytecode/retained-boxed-entry-bridge emission)
+        carriers (get-in bridge [:boxed-entry :parameter-carriers])]
+    (when-not (and bridge (vector? parameters) (vector? arguments)
+                   (bytecode/retained-input-body-context emission input-body)
+                   (identical? parameters (:params emission))
+                   (identical? implementation (:implementation emission))
+                   (identical? interface-class (:interface bridge))
+                   (= (count parameters) (count arguments) (count carriers))
+                   (= (count parameters) (count (set parameters))))
+      (throw (ex-info "Generated call has no exact boxed entry input boundary"
+                      {:reason :generated-body-boxed-entry-inputs})))
+    (let [used (volatile! (into (set parameters) (filter symbol?)
+                                (tree-seq coll? seq [input-body arguments])))
+          fresh! (fn [prefix]
+                   (loop []
+                     (let [id (gensym prefix)]
+                       (if (contains? @used id) (recur)
+                           (do (vswap! used conj id) id)))))
+          slots (mapv (fn [ordinal formal argument carrier]
+                        {:ordinal ordinal :formal formal :original-argument argument
+                         :object-binder (fresh! "entry_object__")
+                         :input-binder (fresh! "entry_input__")
+                         :parameter-class carrier
+                         :contract (completion/bytecode-boxed-parameter-contract carrier)})
+                      (range) parameters arguments carriers)
+          objects (mapv (fn [{:keys [object-binder original-argument]}]
+                          [object-binder (completion/complete-value completion/object-input-contract
+                                                                    original-argument)]) slots)
+          inputs (mapv (fn [{:keys [input-binder object-binder contract]}]
+                         [input-binder (completion/complete-value contract object-binder)]) slots)]
+      {:slots slots :object-bindings objects :input-bindings inputs
+       :bindings (into objects inputs)
+       :substitutions (into {} (map (juxt :formal :input-binder)) slots)
+       :boxed-entry-bridge bridge})))
+
 (defn- reference-check [carrier value]
   (if (or (nil? carrier) (= Object carrier)) value
       (completion/complete-value (completion/reference-check-contract carrier) value)))

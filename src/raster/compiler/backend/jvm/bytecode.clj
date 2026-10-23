@@ -290,7 +290,8 @@
             (get-in (completion/canonical-parts form) [:contract :source-context])))
     (get-in (completion/canonical-parts form) [:contract :result-carrier])
     (and (seq? form)
-         (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input
+         (contains? #{:jvm-bytecode-boxed-parameter-input
+                      :jvm-bytecode-floating-input :jvm-bytecode-integral-input
                       :jvm-bytecode-reference-input}
                     (get-in (completion/canonical-parts form) [:contract :source-context])))
     ;; The completed carrier is an explicit physical result of this validated
@@ -910,6 +911,18 @@
       (me/assert-emission-inputs-current! emission)
       record)))
 
+(defn ^:no-doc retained-input-body-context
+  "Authenticate the complete original input body against this actual emission.
+   Original and catalogued bodies need not be identical. Their private input
+   origins retain that join; a copied equal vector does not acquire it."
+  [emission input-body]
+  (let [origins (:input-origins emission)]
+    (when (or (identical? input-body (:body emission))
+              (and (instance? InputOrigins origins)
+                   (identical? input-body (.-input-body ^InputOrigins origins))
+                   (identical? (:body emission) (.-emitted-body ^InputOrigins origins))))
+      (retained-body-context emission))))
+
 (declare physical-operand-input)
 
 (defn- retain-terminal-context!
@@ -1055,6 +1068,36 @@
                (identical? body-return-carrier (.getReturnType ^java.lang.reflect.Method compute-method))
                (= :ref (:return-stack-type body-context) (:emitted-result-type body-context)))
       bridge)))
+
+(declare boxed-parameter-plan)
+
+(defn ^:no-doc retained-boxed-entry-bridge
+  "Authenticate the actual generated public applyTo/invoke parameter boundary.
+   The shared emitted recipes and compute Classes describe conversions only;
+   caller evaluation order and numerical/placement admission remain separate."
+  [emission]
+  (when-let [{:keys [boxed-entry compute-parameter-carriers] :as bridge}
+             (retained-return-bridge emission)]
+    (let [{:keys [parameter-carriers plans apply-to-method invoke-method]} boxed-entry
+          implementation (:implementation emission)
+          owner (class implementation)
+          arity (count compute-parameter-carriers)
+          method? (fn [method name parameters]
+                    (and (instance? java.lang.reflect.Method method)
+                         (identical? owner (.getDeclaringClass ^java.lang.reflect.Method method))
+                         (= name (.getName ^java.lang.reflect.Method method))
+                         (not (java.lang.reflect.Modifier/isStatic (.getModifiers ^java.lang.reflect.Method method)))
+                         (java.lang.reflect.Modifier/isPublic (.getModifiers ^java.lang.reflect.Method method))
+                         (identical? Object (.getReturnType ^java.lang.reflect.Method method))
+                         (= parameters (vec (.getParameterTypes ^java.lang.reflect.Method method)))))]
+      (when (and (vector? parameter-carriers)
+                 (= parameter-carriers compute-parameter-carriers)
+                 (= plans (mapv #(boxed-parameter-plan (class-desc-of-class %)) parameter-carriers))
+                 (method? apply-to-method "applyTo" [clojure.lang.ISeq])
+                 (if (<= arity 20)
+                   (method? invoke-method "invoke" (vec (repeat arity Object)))
+                   (nil? invoke-method)))
+        (assoc bridge :boxed-entry boxed-entry)))))
 
 (defn- retain-call-observation!
   "Retain one actual emitter observation per original call occurrence.
@@ -4082,6 +4125,9 @@
                                         (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
                                                (:operand-context contract)))]
               (when (= raw (:result-carrier contract)) raw))
+            :jvm-bytecode-boxed-parameter-input
+            (when (plan-form-carrier operand locals (object-input-context ctx))
+              (class-type->stack (:target-carrier contract)))
             (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
             (when-let [expected (:expected-input-carrier contract)]
               (let [original-context (merge (apply dissoc ctx completion/bytecode-operand-context-keys)
@@ -5670,6 +5716,34 @@
     (if (= :diverge actual) actual
       (do (emit-typed-input-adaptation code actual carrier) target))))
 
+(declare emit-object-parameter)
+
+(defn- emit-boxed-parameter-completion
+  [code {:keys [contract operand]} locals ctx observation]
+  (let [carrier (:target-carrier contract)]
+    (if (and (not (.isPrimitive ^Class carrier)) (not= Object carrier))
+      ;; The original wrapper's descriptor resolves in its own loader. An
+      ;; imported module must retain that actual Class, not look up its name
+      ;; in the new loader. Reuse the existing exact CHECKCAST transport.
+      (emit-reference-check-completion
+       code {:contract (completion/reference-check-contract carrier) :operand operand}
+       locals ctx observation)
+      (let [actual (emit-object-value code operand locals ctx)]
+        (when observation
+          (vreset! observation {:input-carrier actual
+                                :adaptation (cond (= :diverge actual) :diverge
+                                                  (.isPrimitive ^Class carrier) :boxed-unbox
+                                                  :else :identity)
+                                :operand-context (completion/bytecode-operand-context
+                                                  (object-input-context ctx))}))
+        (if (= :diverge actual) actual
+            (do
+              ;; Same helper as both real IFn.invoke and the large-arity applyTo
+              ;; wrapper. In particular, int/long are Number conversions, not
+              ;; Clojure's checked casts, and Boolean/Character are not Numbers.
+              (emit-object-parameter code (class-desc-of-class carrier))
+              (class-type->stack carrier)))))))
+
 (defn- emit-canonical-completion
   "One completion dispatcher for scalar and Object consumption. Observations
    retain immutable emitter facts only, never an executable or CodeBuilder."
@@ -5689,6 +5763,8 @@
             actual)
           :jvm-checkcast (emit-reference-check-completion code parts locals ctx observation)
           :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx observation)
+          :jvm-bytecode-boxed-parameter-input
+          (emit-boxed-parameter-completion code parts locals ctx observation)
           (:jvm-bytecode-floating-input :jvm-bytecode-integral-input :jvm-bytecode-reference-input)
           (emit-bytecode-input-completion code parts locals ctx observation)
           (throw (ex-info "JVM completion consumer has no input-conversion authority"
@@ -7144,24 +7220,39 @@
                       {:reason :partitioned-binding-layout})))
     (with-meta (list* (first original) bindings body) (meta original))))
 
+(defn ^:no-doc boxed-parameter-plan
+  "The shared wrapper recipe for a resolved compute parameter descriptor.
+   A recipe describes emission, not ownership of any caller or wrapper."
+  [^ClassDesc parameter]
+  (let [descriptor (.descriptorString parameter)
+        base {:parameter-descriptor parameter}]
+    (merge base
+           (case descriptor
+             "D" {:kind :unbox :result-carrier :double}
+             "J" {:kind :unbox :result-carrier :long}
+             "F" {:kind :unbox :result-carrier :float}
+             "Z" {:kind :unbox :result-carrier :bool}
+             "I" {:kind :unbox :result-carrier :int}
+             ("B" "S") {:kind :small-number :method (if (= "B" descriptor) "byteValue" "shortValue")
+                          :result-carrier :int}
+             "C" {:kind :character :result-carrier :int}
+             "Ljava/lang/Object;" {:kind :identity :result-carrier :ref}
+             "V" (throw (ex-info "void is not a boxed parameter" {:reason :invalid-boxed-parameter}))
+             {:kind :checkcast :result-carrier :ref}))))
+
 (defn- emit-object-parameter
   "Complete one boxed IFn argument using the actual compute parameter descriptor."
   [code ^ClassDesc parameter]
-  (case (.descriptorString parameter)
-    "D" (emit-unbox-to-prim code :double)
-    "J" (emit-unbox-to-prim code :long)
-    "F" (emit-unbox-to-prim code :float)
-    "Z" (emit-unbox-to-prim code :bool)
-    "I" (emit-unbox-to-prim code :int)
-    ("B" "S") (do (.checkcast code number-cd)
-                    (.invokevirtual code number-cd
-                                    (if (= "B" (.descriptorString parameter)) "byteValue" "shortValue")
-                                    (MethodTypeDesc/of parameter no-cd)))
-    "C" (let [character (ClassDesc/of "java.lang" "Character")]
-          (.checkcast code character)
-          (.invokevirtual code character "charValue" (MethodTypeDesc/of parameter no-cd)))
-    "Ljava/lang/Object;" nil
-    (.checkcast code parameter)))
+  (let [{:keys [kind result-carrier method]} (boxed-parameter-plan parameter)]
+    (case kind
+      :unbox (emit-unbox-to-prim code result-carrier)
+      :small-number (do (.checkcast code number-cd)
+                        (.invokevirtual code number-cd method (MethodTypeDesc/of parameter no-cd)))
+      :character (let [character (ClassDesc/of "java.lang" "Character")]
+                   (.checkcast code character)
+                   (.invokevirtual code character "charValue" (MethodTypeDesc/of parameter no-cd)))
+      :identity nil
+      :checkcast (.checkcast code parameter))))
 
 (defn- emit-object-return
   "Box the actual compute return descriptor for either IFn entry shape."
@@ -7521,6 +7612,14 @@
                     :interface iface-class :invocation-method iface-invk
                     :compute-method compute-method
                     :parameter-carriers (vec iface-param-types)
+                    :boxed-entry
+                    {:parameter-carriers (vec compute-params)
+                     :plans (mapv boxed-parameter-plan compute-param-cds)
+                     :apply-to-method (.getDeclaredMethod wrapper-class "applyTo"
+                                                          (into-array Class [clojure.lang.ISeq]))
+                     :invoke-method (when (<= (count param-cds) 20)
+                                      (.getDeclaredMethod wrapper-class "invoke"
+                                                          (into-array Class (repeat (count param-cds) Object))))}
                     :compute-parameter-carriers (vec compute-params))))
     implementation))
 

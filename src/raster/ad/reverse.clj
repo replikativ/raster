@@ -5979,8 +5979,10 @@
 (defn ^:no-doc project-prepared-value+grad-call
   "Instantiate the shared flat preparation at one compiler call site.
    Validate the producer's padded result boundary before whole-form hygiene and
-   the ordinary call-by-value substitution. No operation is rewritten here.
-   This structural projection does not close JVM conversions or device semantics."
+   call-by-value substitution. An owned generated entry stages every Object
+   argument before its actual wrapper parameter conversion. Numerical body
+   operations are not rewritten. This structural projection does not close
+   caller construction, numerical realization, placement or device semantics."
   ([prepared arguments mode param-env]
    (project-prepared-value+grad-call prepared arguments mode param-env nil))
   ([{:keys [walked-body params source-ns] :as prepared} arguments mode param-env caller]
@@ -6007,10 +6009,15 @@
                        (= results (into [(:result-sym prepared)] (map slots params))))
           (throw (ex-info "prepared AD results differ from their normalized parameter plan"
                           {:reason :ad-prepared-call-results})))))
-    (let [argument-plan (inline/prepare-call-arguments
-           (if owner (get-in (.-frontend ^GeneratedPreparationOwner owner) [:source-entry :source-var])
-               :prepared-reverse-ad)
-           params arguments param-env)
+    (let [_ (inline/check-inline-arity!
+             (if owner (get-in (.-frontend ^GeneratedPreparationOwner owner) [:source-entry :source-var])
+                 :prepared-reverse-ad)
+             params arguments (or caller {:args arguments}))
+          argument-plan
+          (if owner
+            ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/instantiate-boxed-entry-inputs)
+             (prepared-bytecode-entry prepared) params (vec arguments))
+            (inline/prepare-call-arguments :prepared-reverse-ad params arguments param-env))
           {argument-bindings :bindings :keys [substitutions]} argument-plan
           qualified (inf/qualify-body-symbols source source-ns (set params))
           hygienic (util/alpha-convert qualified)

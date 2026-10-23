@@ -5,6 +5,21 @@
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
 
+(deftest boxed-entry-contract-is-a-distinct-bytecode-only-boundary
+  (doseq [carrier [Double/TYPE Float/TYPE Long/TYPE Integer/TYPE Boolean/TYPE
+                   Byte/TYPE Short/TYPE Character/TYPE Object String (class (float-array 0))]]
+    (let [contract (completion/bytecode-boxed-parameter-contract carrier)
+          term (completion/complete-value contract 'input)]
+      (is (completion/canonical-contract? contract))
+      (is (completion/bytecode-context-form? term))
+      (is (= :unsupported-value-completion-source-context
+             (try (completion/project-to-jvm-source term) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (not (completion/canonical-contract? (assoc contract :payload :double))))))
+  (doseq [carrier [Void/TYPE nil 'double]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (completion/bytecode-boxed-parameter-contract carrier)))))
+
 (deftest bytecode-result-context-is-not-an-object-input-or-numeric-proof
   (let [context (completion/bytecode-operand-context {})
         contract (completion/bytecode-result-context-contract context :ref)

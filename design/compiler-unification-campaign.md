@@ -57,6 +57,36 @@ obligation; the raw-projection test is not skipped or counted green.
 The separate owned generated-entry/completion gate passes 133 tests / 1,705
 assertions in the same process. Neither receipt establishes broad CI acceptance.
 
+The follow-up now closes that specific generated-entry input gap, not general
+numerical admission. An authenticated boxed-entry bridge records actual public
+`applyTo`/`invoke` Methods, exact compute parameter Classes and the shared wrapper
+conversion recipes. Projection first stages every original operand in Object
+context, then applies parameter conversions in a second ordered block. This
+preserves all-argument evaluation before Number/Boolean/Character conversions,
+including exceptions. The new completion family reuses the wrapper's parameter
+emitter; imported reference targets reuse the existing exact-Class check rather
+than resolving a descriptor in a different loader. No type registry is added.
+
+Input plans require the same implementation, interface and parameter vector as
+the emission. Original-vs-catalogued bodies join through the existing private
+InputOrigins; copied bodies or parameters confer no authority. Fresh staged ports
+are metadata-free. Every staged completion remains queryable through the owning
+emission's existing occurrence API. The import marker stays open until complete
+typed source/equation composition and its runtime checks have been established.
+
+Bounded differential tests compare the actual wrappers with projected entry
+inputs for all primitive parameter families, arrays/nulls/wrong classes, signed
+zero/NaNs, custom Number conversion order and wide applyTo. The original Float
+loss-carrier regression passes through the real bytecode emitter, not eval of
+reserved IR. Same-name/different-loader reference tests also cover divergent
+operands. Review found and closed the exact-Class and physical-entry identity
+gaps. This is not a claim of resident training or portable numerical admission.
+The affected reused-REPL gate passes 181 tests / 2,238 assertions. The unchanged
+real training workload reaches the authenticated cut with five original operands,
+five explicit wrapper conversions and 55 unchanged body bindings (65 projected
+bindings total); its six result slots and four inactive gradients are preserved.
+This probe deliberately stops before partial numerical admission or execution.
+
 #### Reviewed continuation: close the producer, not individual optimizer copies
 
 October 22 boundary checkpoint (draft implementation, not released acceptance):

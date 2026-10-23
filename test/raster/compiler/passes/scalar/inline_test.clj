@@ -19,22 +19,32 @@
   dispatch: it is always a bug, and the inliner must say so AT THE CALL — naming the
   callee and both arities."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.par]
             [raster.numeric]
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.util :as util]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
 
-(defn- eval-compiler-source [expression]
-  ;; Generated preparation is compiler IR, including explicit Object completion.
-  ;; Use the same projection as prepared runtime execution before JVM eval.
-  (eval (completion/project-to-jvm-source expression)))
+(defn- compile-projected-entry [[head parameters & body]]
+  ;; Generated preparation includes bytecode-owned completion syntax. Exercise
+  ;; its actual consumer, never eval a source approximation of that syntax.
+  (assert (and (= 'fn head) (vector? parameters)))
+  (let [tags (vec (repeat (count parameters) 'Object))
+        interface (types/ensure-fn-interface! tags)]
+    (:implementation
+     (core/emit-owned-bytecode!
+      bytecode/compile-typed-impl! "raster.compiled.InlineProjectionTest"
+      parameters tags 'Object (vec body)
+      (the-ns 'raster.compiler.passes.scalar.inline-test)
+      (:iface-name interface) 'inline-projection-test))))
 
 (deftest helper-expansion-keeps-opaque-occurrences-and-quoted-data
   (let [call (util/make-invk 'example/opaque_m_double-impl ['x])]
@@ -354,14 +364,14 @@
       (is (identical? initializer (get final-bindings id)))
       (is (= (meta initializer) (meta (get final-bindings id)))))
     (is (= (second (:elements @captured)) (get final-bindings (last expanded))))
-    (is (= 7.0 ((eval-compiler-source (list 'fn '[x y] expanded)) 2.0 3.0)))))
+    (is (= 7.0 ((compile-projected-entry (list 'fn '[x y] expanded)) 2.0 3.0)))))
 
 (deftest ad-arguments-evaluate-once-in-source-order-even-when-unused
   (doseq [mode [:value+grad :grad]]
     (let [expanded (inline/inline-value+grad-call
                     {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
                      :args '[(draw :first) (draw :unused)] :mode mode})
-          f (eval-compiler-source (list 'fn '[draw]
+          f (compile-projected-entry (list 'fn '[draw]
                         (list 'let* (vec (mapcat identity (:bindings expanded)))
                               (:elements expanded))))
           trace (atom [])
@@ -393,10 +403,13 @@
   (let [expanded (inline/inline-value+grad-call
                   {:var-sym 'raster.compiler.passes.scalar.inline-test/option-one-loss
                    :args '[(clojure.core/float (draw))] :mode :value+grad})
-        [argument expression] (first (:bindings expanded))]
-    (is (= '(clojure.core/float (draw)) expression))
-    (is (= 'float (:raster.type/tag (meta argument)))
-        "the Double formal must not widen the lifted Float producer")))
+        [argument expression] (first (:bindings expanded))
+        [_ converted] (second (:bindings expanded))]
+    (is (= completion/object-input-contract (:contract (completion/canonical-parts expression))))
+    (is (= '(clojure.core/float (draw)) (:operand (completion/canonical-parts expression)))
+        "the original Float producer completes before the Double parameter conversion")
+    (is (nil? (meta argument)) "the Object staging port is not stamped with a formal dtype")
+    (is (identical? Double/TYPE (:target-carrier (:contract (completion/canonical-parts converted)))))))
 
 (deftm option-overloaded-loss [x :- Float n :- Long] :- Float
   (raster.numeric/* x x))
@@ -411,7 +424,7 @@
           result (inline/inline-value+grad-call
                   {:var-sym callee :args '[x n] :mode :value+grad}
                   :param-env {'x tag 'n 'long})
-          f (eval-compiler-source (list 'fn '[x n]
+          f (compile-projected-entry (list 'fn '[x n]
                         (list 'let* (vec (mapcat identity (:bindings result)))
                               (:elements result))))
           actual (f argument (long 3))]
@@ -443,14 +456,14 @@
                              :mode :reverse :wrt [0])
                    vg (gradient x y)] vg)]]
     (let [expanded (inline/inline-deftm-calls source)
-          f (eval-compiler-source (list 'fn '[x y] expanded))]
+          f (compile-projected-entry (list 'fn '[x y] expanded))]
       (is (= [10.0 7.0 nil] (f 2.0 3.0)))
       (is (= ((rev/value+grad #'option-loss :wrt [0]) 2.0 3.0) (f 2.0 3.0)))))
   (let [source '(let* [gradient ((raster.ad.reverse/grad
                                   (var raster.compiler.passes.scalar.inline-test/option-loss)
                                   :wrt [0]) x y)] gradient)
         expanded (inline/inline-deftm-calls source)
-        f (eval-compiler-source (list 'fn '[x y] expanded))]
+        f (compile-projected-entry (list 'fn '[x y] expanded))]
     (is (= [7.0 nil] (f 2.0 3.0))))
   (doseq [source ['(let* [g ((raster.ad.reverse/grad
                              (var raster.compiler.passes.scalar.inline-test/option-one-loss)
@@ -460,14 +473,14 @@
                                     :wrt [0])
                           g (gradient x)] g)]]
     (let [expanded (inline/inline-deftm-calls source)
-          f (eval-compiler-source (list 'fn '[x] expanded))]
+          f (compile-projected-entry (list 'fn '[x] expanded))]
       (is (= ((rev/grad #'option-one-loss :wrt [0]) 2.0) (f 2.0)))
       (is (= 4.0 (f 2.0)))))
   (let [source '(let* [vg ((raster.ad.reverse/value+grad
                             (var raster.compiler.passes.scalar.inline-test/option-loss)
                             :wrt []) x y)] vg)
         expanded (inline/inline-deftm-calls source)
-        f (eval-compiler-source (list 'fn '[x y] expanded))]
+        f (compile-projected-entry (list 'fn '[x y] expanded))]
     (is (= [10.0 nil nil] (f 2.0 3.0))))
   (doseq [wrt [[-1] [2] [0 0]]]
     (is (thrown? clojure.lang.ExceptionInfo

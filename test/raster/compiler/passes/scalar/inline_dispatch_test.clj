@@ -1,10 +1,12 @@
 (ns raster.compiler.passes.scalar.inline-dispatch-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.par :as par]
             [raster.ad.reverse :as reverse]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.gpu.core :as gpu]))
@@ -82,9 +84,17 @@
         expanded (inline/inline-value+grad-call
                   {:var-sym 'raster.compiler.passes.scalar.inline-dispatch-test/promoted
                    :args '[(draw)] :mode :value+grad})
-        compiled (eval (list 'fn '[draw]
-                             (list 'let* (vec (mapcat identity (:bindings expanded)))
-                                   (:elements expanded))))
+        ;; Reserved completion syntax belongs to its real bytecode consumer,
+        ;; not Clojure eval. Object draw results must pass the entry's actual
+        ;; parameter conversion before the projected numerical body.
+        interface (types/ensure-fn-interface! '[Object])
+        compiled (:implementation
+                  (core/emit-owned-bytecode!
+                   bytecode/compile-typed-impl! "raster.compiled.InlineADConstruction"
+                   '[draw] '[Object] 'Object
+                   [(list 'let* (vec (mapcat identity (:bindings expanded))) (:elements expanded))]
+                   (the-ns 'raster.compiler.passes.scalar.inline-dispatch-test)
+                   (:iface-name interface) 'inline-ad-construction))
         describe (fn [run]
                    (try [:value (mapv (fn [value]
                                        [(class value)

@@ -145,6 +145,10 @@
         ;; Retaining a physical evaluation context says nothing about value
         ;; presence or a target-neutral producer. Await a separate projection.
         :jvm-bytecode-result-context unknown
+        :jvm-bytecode-boxed-parameter-input
+        (if (.isPrimitive ^Class (:target-carrier contract))
+          {:presence (if (= :no-return (:presence fact)) :no-return :present)}
+          fact)
         ;; These contexts preserve the actual reference, including nil. A
         ;; desired CHECKCAST class does not establish a producer array carrier.
         (:jvm-object-input :jvm-checkcast :jvm-bytecode-reference-input) fact
