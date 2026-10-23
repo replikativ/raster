@@ -28,6 +28,23 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 original-input execution preparation: the prepared phase can now
+outline an exact scalar argument through its original bytecode emitter. The
+adapter joins the original ordered physical ports and checks the entire planned
+conversion, including the raw carrier against the actual emitted completion.
+Both phase history and original region guards fence execution. Reference inputs
+abstain before compilation; this cannot cast a resident buffer to a JVM array.
+No source expression is reinterpreted, no numerical fallback is added, and no
+import marker or pending-continuation barrier is removed. Placement and complete
+import closure remain the InvocationPlan/source-owner finalizer's obligations.
+
+Independent review approved correspondence, lifecycle guards and mutation tests.
+The affected five-namespace gate passes 87 tests / 1,065 assertions, including
+actual source replacement preventing invocation, mismatched ports/conversions,
+reference/copied/foreign-input abstention and region-guard failures. The latest
+pushed prerequisite head still fails public fixture generation (136/172 pass);
+all 36 failures remain campaign obligations. This is not production acceptance.
+
 October 23 staged-storage checkpoint: the prepared phase now feeds exact staged
 input correspondence into the frontend's existing single description/storage
 analysis. This is a private analysis entry, not an options callback, second walk,

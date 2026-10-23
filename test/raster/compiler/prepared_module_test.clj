@@ -411,6 +411,87 @@
          (is (nil? (#'frontend/continue-source-components* (assoc ready :pending-inputs pending)))))
        (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
 
+(deftest prepared-scalar-input-regions-retain-original-ports-and-pending-obligations
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           components (module/analyze-source-components phase source)
+           inputs (:pending-inputs components)
+           scalars (filter #(= 1 (get-in % [:argument :input-index])) inputs)
+           references (filter #(= 0 (get-in % [:argument :input-index])) inputs)
+           observations @entry/*emission-inputs*]
+       (is (= 3 (count scalars) (count references)))
+       (doseq [input scalars]
+         (let [region (module/prepare-scalar-input-region phase source (:binding input))
+               ports (:ports input)]
+           (is (some? region))
+           (is (identical? (:argument input) (get-in region [:occurrence :argument])))
+           (is (= (mapv :parameter ports) (:parameters region)))
+           (is (= [Long/TYPE Long/TYPE]
+                  (vec (.getParameterTypes ^java.lang.reflect.Method (:method region)))))
+           (is (= (:contract (:argument input))
+                  (assoc (:input-contract region) :expected-input-carrier
+                         (get-in region [:input-completion :emitted-type]))))
+           (doseq [[a b] [[2 17] [0 17] [-1 17]]]
+             (is (= (* a b) (apply (:invoke region) [a b]))))))
+       (doseq [input references]
+         (is (nil? (module/prepare-scalar-input-region phase source (:binding input)))))
+       (is (nil? (module/prepare-scalar-input-region
+                  phase (apply list source) (:binding (first scalars)))))
+       (is (= (:unclosed-source-imports observations)
+              (:unclosed-source-imports @entry/*emission-inputs*)))
+       (is (nil? (#'frontend/continue-source-components* components)))))))
+
+(deftest scalar-input-region-mismatches-and-stale-guards-cannot-execute
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           inputs (:pending-inputs (module/analyze-source-components phase source))
+           scalar (first (filter #(= 1 (get-in % [:argument :input-index])) inputs))
+           reference (first (filter #(= 0 (get-in % [:argument :input-index])) inputs))
+           original (module/prepare-scalar-input-region phase source (:binding scalar))
+           parameter (first (:parameters original))
+           calls (atom 0)]
+       (doseq [change [(constantly nil)
+                       #(update % :parameters (comp vec reverse))
+                       #(update-in % [:physical-ports parameter :slot] inc)
+                       #(assoc-in % [:input-contract :target-carrier] Double/TYPE)
+                       #(assoc-in % [:input-completion :adaptation] :identity)
+                       #(assoc-in % [:input-completion :emitted-type] :long)]]
+         (with-redefs [bytecode/compile-input-invocation-region (fn [& _] (change original))]
+           (is (= :unclosed-prepared-module-phase
+                  (reason #(module/prepare-scalar-input-region phase source (:binding scalar)))))))
+       (with-redefs [bytecode/compile-input-invocation-region
+                     (fn [& _] (swap! calls inc) (throw (ex-info "must abstain" {})))]
+         (is (nil? (module/prepare-scalar-input-region phase source (:binding reference))))
+         (is (nil? (module/prepare-scalar-input-region phase (apply list source) (:binding scalar))))
+         (is (nil? (module/prepare-scalar-input-region phase source ['foreign 1])))
+         (is (zero? @calls)))
+       (let [prepared (with-redefs [bytecode/compile-input-invocation-region
+                                   (fn [& _] (assoc original :invoke (fn [& _] (swap! calls inc))))]
+                        (module/prepare-scalar-input-region phase source (:binding scalar)))
+             source-var (core/resolve-deftm-var #'training/local-gradient-sum)]
+         (apply (:invoke prepared) [2 17])
+         (is (= 1 @calls))
+         (reset! calls 0)
+         (with-redefs-fn {source-var (fn [& _] (throw (AssertionError. "must not execute replacement")))}
+           #(is (thrown? clojure.lang.ExceptionInfo (apply (:invoke prepared) [2 17]))))
+         (is (zero? @calls)))
+       (let [broken? (atom false)
+             prepared (with-redefs [bytecode/compile-input-invocation-region
+                                   (fn [& _]
+                                     (assoc original
+                                            :guard #(when @broken?
+                                                      (throw (ex-info "stale region" {:reason :test-stale-region})))
+                                            :invoke (fn [& _] (swap! calls inc))))]
+                        (module/prepare-scalar-input-region phase source (:binding scalar)))]
+         (reset! broken? true)
+         (is (= :test-stale-region (reason #(apply (:invoke prepared) [2 17]))))
+         (is (zero? @calls)))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
 (deftest staged-storage-analysis-rejects-detached-or-reordered-source-data
   (entry/call-with-definition-inputs
    (fn []

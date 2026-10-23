@@ -467,6 +467,48 @@
                 (:import-origins context))]
       (when (= 1 (count matches)) (first matches)))))
 
+(defn ^:no-doc prepare-scalar-input-region
+  "Prepare one exact staged scalar input using its original bytecode emitter.
+   Arguments remain the original physical ports in slot order, not reconstructed
+   source expressions. This prepares execution only: the enclosing source owner
+   still owes plan placement, dependency completion and whole-import closure.
+   Reference inputs deliberately abstain; a resident buffer is not a JVM array."
+  [phase normalized binding]
+  (when-let [occurrence (input-occurrence phase normalized binding)]
+    (let [{:keys [physical construction argument ports]} occurrence
+          carrier (get-in argument [:contract :target-carrier])]
+      (when (and (class? carrier) (.isPrimitive ^Class carrier)
+                 (not (identical? Void/TYPE carrier)))
+        (let [region (bytecode/compile-input-invocation-region
+                      (:emission physical) (:input-body physical)
+                      (:source-call construction) (:input-index argument))
+              expected-parameters (mapv :parameter ports)]
+          (when-not (and region
+                         (= expected-parameters (:parameters region))
+                         (= (into {} (map (juxt :parameter :physical-port)) ports)
+                            (:physical-ports region))
+                         ;; The generated recipe additionally pins the raw
+                         ;; operand carrier. Outlining reports that carrier in
+                         ;; its actual completion, not in the input contract.
+                         (= (:contract argument)
+                            (assoc (:input-contract region) :expected-input-carrier
+                                   (get-in region [:input-completion :emitted-type])))
+                         (= (:completion argument) (:input-completion region)))
+            (refuse! "prepared scalar input differs from its original physical region"
+                     {:id (get-in occurrence [:obligation :id])}))
+          (let [invoke (:invoke region)
+                region-guard (:guard region)
+                guard (fn []
+                        (entry/assert-producer-current! phase)
+                        (region-guard))]
+            (guard)
+            (assoc region :occurrence occurrence :guard guard
+                   :invoke (fn [& arguments]
+                             (guard)
+                             (let [result (apply invoke arguments)]
+                               (guard)
+                               result)))))))))
+
 (defn ^:no-doc analyze-source-components
   "Analyze this exact phase once, retaining pending input identities separately
    from the conditional logical/carrier facts. This neither continues semantic
