@@ -205,6 +205,28 @@
     (is (empty? (:allocations (analyze (subvec (vec descriptions) 2) {'x x 'alias x})))
         "a future or missing scalar binding cannot be supplied by helper shape inference")))
 
+(deftest constructor-result-types-and-alias-values-have-producer-evidence
+  (let [n (av/tensor {:dtype :long :shape []})
+        core-description {:kind :scalar :id 0 :sym 'out :expr '(clojure.core/float-array n)}
+        helper (compiled-helper #'storage-helper '[x n])
+        helper-description (assoc core-description :expr (:call helper))
+        facts {'x {:carrier (class (float-array 0))} 'n {:carrier Long/TYPE}}
+        contracts (fn [description arrays carriers]
+                    (#'frontend/allocation-contracts [description] arrays {'n :long} {'n n} {} carriers))]
+    (doseq [[description carriers] [[core-description {}] [helper-description facts]]]
+      (let [allocation (first (contracts description {} carriers))]
+        (is (= :float (:dtype allocation)))
+        (is (= 'n (:extent allocation))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"constructor and retained element type disagree"
+                            (contracts description {'out :double} carriers))))
+    (is (empty? (contracts (assoc core-description :expr '(unregistered/float-array n)) {} {}))))
+  (let [x (av/tensor {:dtype :float :shape [2 3] :ownership :borrowed :logical-layout {:kind :dense}})
+        result (#'frontend/source-storage-values [{:kind :scalar :id 0 :sym 'alias :expr 'x}]
+                                                {} {} {} {'x x} {})]
+    (is (identical? x (get-in result [:values 'alias])))
+    (is (empty? (:carrier-facts result)))
+    (is (empty? (:pending-inputs result)))))
+
 (deftest refused-helper-analysis-does-not-become-a-source-import
   (let [v (core/resolve-deftm-var #'scalar-helper {:dtype :double})
         _ (core/prepare-deftm-frontend! v)

@@ -28,6 +28,36 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 staged-storage checkpoint: the prepared phase now feeds exact staged
+input correspondence into the frontend's existing single description/storage
+analysis. This is a private analysis entry, not an options callback, second walk,
+source owner or admission API. Original source binding objects and C expressions
+remain unchanged. Each port must join its exact already-processed predecessor;
+canonical contract maps compare as data only after source identity is established.
+One immutable symbol-alias step may explain normalization's reference substitution.
+
+The fold copies a genuinely existing tensor AV verbatim, including through an
+unannotated alias, while retaining declaration/destination conflict checks. If no
+reference AV exists it creates none. Conditional carrier facts publish separately
+after each staged binding; only earlier facts may select allocation helpers.
+Authenticated constructor leaves supply their actual result element types, with
+retained-type conflicts rejected. All three real training allocations now have
+Float contracts and extents from their own named size bindings without fabricating
+exemplar capacity. Six exact pending occurrences remain; two imports keep twelve.
+
+Continuation explicitly refuses nonempty pending input accounting, independently
+of whether a future scalar rule could recognize C. No marker is closed and no
+conditional carrier becomes an unconditional source-owner verifier fact. Whole
+InvocationPlan/source-order/backing-view and remaining numerical/reduction/import
+completion finalization still precedes resident execution.
+
+The affected five-namespace gate passes 85 tests / 1,022 assertions. A same-process
+comparison of all 151 existing frontend tests against committed functions has
+identical 18 failures and one error (953 assertions), including the latest alias
+change. A spy was updated to accept the extra internal carrier argument without
+changing its source-order assertions. Existing failures remain required work.
+Independent review approved the analysis/data boundary and alias/constructor laws.
+
 October 23 forwarding-composition checkpoint: selected allocation helpers now
 compose through a returned global typed call forwarding every formal exactly
 once, in source order. This is not allocator-name recognition or a recursive

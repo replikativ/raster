@@ -7,6 +7,7 @@
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.core.source-transport :as transport]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.fixtures.distributed-training :as training]
@@ -61,6 +62,11 @@
        (let [inputs (keep #(module/input-occurrence phase (:normalized view) (:binding %)) (:origins view))]
          (is (= 12 (count inputs)))
          (is (= #{(:import (first imports)) (:import (second imports))} (set (map :import inputs)))))
+       (let [components (module/analyze-source-components phase (:normalized view))
+             pending (:pending-inputs components)]
+         (is (= 6 (count (:allocations components))))
+         (is (= 12 (count pending) (count (set (map #(get-in % [:obligation :id]) pending)))))
+         (is (nil? (#'frontend/continue-source-components* components))))
        (is (false? (:admitted? view)))))))
 
 (deftest ordinary-multiform-source-keeps-every-statement-in-order
@@ -357,6 +363,101 @@
            (is (= 'raster.arrays/zeros-like
                   (get-in projection [:helper :definition :delegation :operation])))))
        (is (false? (:admitted? (module/view phase source))))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
+(deftest staged-storage-analysis-retains-source-objects-and-pending-obligations
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           view (module/view phase source)
+           analyze @#'frontend/source-storage-analysis
+           describe @#'frontend/source-descriptions
+           analyses (atom 0)
+           descriptions (atom 0)
+           components
+           (with-redefs-fn
+             {#'frontend/source-storage-analysis (fn [& args] (swap! analyses inc) (apply analyze args))
+              #'frontend/source-descriptions (fn [& args] (swap! descriptions inc) (apply describe args))}
+             #(module/analyze-source-components phase source))
+           pending (:pending-inputs components)
+           originals (filter #(= :argument (second (:id %)))
+                             (get-in view [:import-origins 0 :obligation-origins]))]
+       (is (= 1 @analyses @descriptions))
+       (is (identical? source (:source components)))
+       (is (= 3 (count (:allocations components))))
+       (is (= #{:float} (set (map :dtype (:allocations components)))))
+       (is (every? #(= [(:extent %)] (get-in components [:storage-values (:destination %) :shape]))
+                   (:allocations components)))
+       (is (= 6 (count pending) (count (:carrier-facts components))))
+       (is (every? true? (map identical? originals (map :obligation pending))))
+       (is (every? #(identical? phase (:phase %)) pending))
+       (is (every? (fn [input]
+                     (let [[id expression] (:binding input)
+                           description (nth (:descriptions components) (get-in input [:origin :index]))]
+                       (and (identical? id (first (:source-binding description)))
+                            (identical? expression (second (:source-binding description)))
+                            (not (contains? (:storage-values components) id)))))
+                   (filter #(= 0 (get-in % [:argument :input-index])) pending))
+           "no reference AbstractValue or capacity is fabricated from a carrier")
+       (is (nil? (#'frontend/continue-source-components* components)))
+       ;; Pin the barrier independently of today's unsupported C expressions.
+       (let [options {:dtype :double :segmented-plans? true :scalar-types {'n :long}
+                      :array-types {'x :double} :public-parameters '[x n]}
+             simple (frontend/normalize-source
+                     '(let* [out (raster.par/pmap i n double (clojure.core/aget x i))] out) options)
+             ready (frontend/analyze-source-components simple options {})]
+         (is (some? (#'frontend/continue-source-components* ready)))
+         (is (nil? (#'frontend/continue-source-components* (assoc ready :pending-inputs pending)))))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
+(deftest staged-storage-analysis-rejects-detached-or-reordered-source-data
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           source (module/normalized-source phase)
+           options (:options (module/view phase source))
+           components (module/analyze-source-components phase source)
+           inputs (into {} (map (juxt #(get-in % [:origin :index]) identity)) (:pending-inputs components))
+           index (apply min (keys inputs))
+           input (get inputs index)
+           copy (fn [form] (with-meta (apply list form) (meta form)))]
+       (is (nil? (module/analyze-source-components phase (copy source))))
+       (doseq [change [(fn [o] (update-in o [:binding 1] copy))
+                       (fn [o] (update-in o [:origin :index] inc))
+                       (fn [o] (assoc-in o [:argument :contract :target-carrier] Object))
+                       (fn [o] (assoc-in o [:argument :completion :parameter-carrier] Object))
+                       (fn [o] (assoc-in o [:ports 0 :origin :index] index))
+                       (fn [o] (update-in o [:ports 0 :binding 0]
+                                         #(with-meta % (assoc (meta %) :detached true))))]]
+         (is (= :source-input-correspondence
+                (reason #(frontend/analyze-source-components source options (update inputs index change))))))
+       (is (= :source-input-correspondence
+              (reason #(frontend/analyze-source-components source options (assoc inputs 9999 input)))))
+       (doseq [subset [{} (dissoc inputs index) {index input}]]
+         (let [partial (frontend/analyze-source-components source options subset)]
+           (is (= (count subset) (count (:pending-inputs partial))))
+           (is (nil? (#'frontend/continue-source-components* partial)))))
+       ;; Accounting IDs are not authority even when changed in internal data.
+       (let [forged (frontend/analyze-source-components
+                     source options (assoc-in inputs [index :obligation :id] [:forged]))]
+         (is (nil? (#'frontend/continue-source-components* forged))))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
+(deftest staged-reference-aliases-preserve-the-entire-prior-value
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [x (av/tensor {:dtype :float :shape ['rows 'width]
+                         :logical-layout {:kind :dense} :ownership :borrowed})
+           phase (module/capture (source-frontend) {:dtype :float :segmented-plans? true :values {'x x}})
+           source (module/normalized-source phase)
+           components (module/analyze-source-components phase source)
+           input (first (filter #(= 0 (get-in % [:argument :input-index])) (:pending-inputs components)))
+           prior (get-in input [:ports 0 :binding 0])
+           result (first (:binding input))]
+       (is (identical? x (get-in components [:storage-values prior])))
+       (is (identical? x (get-in components [:storage-values result])))
+       (is (nil? (#'frontend/continue-source-components* components)))
        (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
 
 (deftest staged-input-ports-execute-the-original-size-region

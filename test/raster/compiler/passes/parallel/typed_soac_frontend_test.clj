@@ -93,7 +93,7 @@
         x (av/tensor {:dtype :float :shape ['m 'n]})
         result
         (with-redefs [descriptor/direct-allocation-projection
-                      (fn [expression values]
+                      (fn [expression values & _]
                         (when (= 'raster.arrays/alloc-like (first expression))
                           (swap! seen conj values)
                           (when (and (get values 'x) (get values 'size))

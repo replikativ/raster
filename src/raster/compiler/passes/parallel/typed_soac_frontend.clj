@@ -18,6 +18,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
@@ -6118,7 +6119,9 @@
   "Allocation leaves the equation spine as host scaffolding, but initialization is semantic.
    Supported constructor arity and positive scalar-kind evidence distinguish a length from a
    copy input; (float-array n 7), for example, must never become a zero-initialization fact."
-  [descriptions array-types scalar-types values shape-equalities]
+  ([descriptions array-types scalar-types values shape-equalities]
+   (allocation-contracts descriptions array-types scalar-types values shape-equalities {}))
+  ([descriptions array-types scalar-types values shape-equalities carrier-facts]
   (binding [*declared-kinds*
             {:arrays (set (keys array-types))
              :scalars (into (set (keys scalar-types))
@@ -6127,11 +6130,21 @@
     (into []
           (keep (fn [{:keys [kind id sym expr]}]
                   (when (= :scalar kind)
-                    (let [projection (descriptor/direct-allocation-projection expr values)
+                    (let [projection (descriptor/direct-allocation-projection expr values carrier-facts)
                           constructor (:constructor projection)
                           helper-extent (when (:helper projection)
                                           (descriptor/array-allocation-size constructor))
                           core-extent (descriptor/array-allocation-size expr)
+                          ;; Only an authenticated core constructor (direct or
+                          ;; definition-projected) supplies this result type.
+                          constructor-dtype
+                          (some-> (or constructor (when core-extent expr)) first
+                                  descriptor/alloc-sym->array-tag dtype/dtype-for-array-tag)
+                          retained-dtype (or (:dtype (get values sym)) (declared-type array-types sym))
+                          _ (when (and constructor-dtype retained-dtype
+                                       (not= (dtype/canon constructor-dtype) (dtype/canon retained-dtype)))
+                              (fail! :source-value-conflict "allocation constructor and retained element type disagree"
+                                     {:id sym :constructor constructor-dtype :retained retained-dtype}))
                           ;; aclone is an exact core copy primitive, not a size-only constructor
                           ;; or a helper whose spelling can establish correspondence.
                           core-copy? (and (some? (descriptor/core-array-copy-source expr))
@@ -6144,41 +6157,88 @@
                                  :extent (canonical-extent shape-equalities values extent)
                                  :initialization (descriptor/allocation-initialization
                                                   (descriptor/semantic-op (or constructor expr)))
-                                 :dtype (or (:dtype (get values sym))
-                                            (declared-type array-types sym))}
+                                 :dtype (or retained-dtype constructor-dtype)}
                           (:helper projection) (assoc :source-projection projection)))))))
-          descriptions)))
+          descriptions))))
+
+(defn- staged-storage-input
+  "Check compiler-local correspondence data, not completion or admission.
+   Keep exact source inputs separate from the metadata-elaborated expression."
+  [description occurrence processed-bindings]
+  (let [[id expression :as binding] (:source-binding description)
+        parts (completion/canonical-parts expression)
+        target (get-in occurrence [:argument :completion :parameter-carrier])
+        port (when (= 1 (count (:ports occurrence))) (first (:ports occurrence)))
+        alias (when (dtype/dtype-for-jvm-array-class target) (first (:binding port)))]
+    (when-not (and (= (:id description) (get-in occurrence [:origin :index]))
+                   (= 2 (count binding) (count (:binding occurrence)))
+                   (every? true? (map identical? binding (:binding occurrence)))
+                   ;; Normalization reconstructs literal contract maps. Their
+                   ;; canonical data/Class identity is compared only AFTER the
+                   ;; exact source occurrence above has been established.
+                   parts (= (:contract parts) (get-in occurrence [:argument :contract]))
+                   (= target (get-in parts [:contract :target-carrier]))
+                   (class? target)
+                   (every? (fn [port]
+                             (let [actual (get processed-bindings (get-in port [:origin :index]))
+                                   binding (:binding port)
+                                   origin-binding (get-in port [:origin :binding])]
+                               (and (< (get-in port [:origin :index]) (:id description))
+                                    (= 2 (count actual) (count binding) (count origin-binding))
+                                    (every? true? (map identical? binding origin-binding))
+                                    (every? true? (map identical? binding actual)))))
+                           (:ports occurrence))
+                   (or (nil? (dtype/dtype-for-jvm-array-class target))
+                       (and alias
+                            (or (= alias (:operand parts))
+                                ;; The normalizer can propagate an exact prior
+                                ;; symbol alias. Do not expand computations or
+                                ;; fetch an AV from the substituted operand.
+                                (and (symbol? (second (:binding port)))
+                                     (= (second (:binding port)) (:operand parts)))))))
+      (fail! :source-input-correspondence
+             "staged input differs from its original normalized occurrence"
+             {:id (:id description) :binding id}))
+    {:occurrence occurrence :carrier target :alias alias}))
 
 (defn- source-storage-values
   "Thread existing logical values through source bindings without inventing array capacity.
    Alias facts preserve the complete value verbatim. They describe conditional logical storage,
    not completion of a reference cast, a null check, or evaluation of a helper argument."
-  [descriptions array-types scalar-types source-scalar-types values shape-equalities]
-  (let [local-ids (set (map :sym descriptions))
+  ([descriptions array-types scalar-types source-scalar-types values shape-equalities]
+   (source-storage-values descriptions array-types scalar-types source-scalar-types values shape-equalities {}))
+  ([descriptions array-types scalar-types source-scalar-types values shape-equalities staged-inputs]
+  (let [_ (when-not (every? (set (map :id descriptions)) (keys staged-inputs))
+            (fail! :source-input-correspondence "staged input has no source binding" {}))
+        local-ids (set (map :sym descriptions))
         initial-values
         (reduce-kv (fn [known id dt]
                      (if (contains? local-ids id) known
                          (merge-value known id (tensor-value dt []) shape-equalities)))
                    values scalar-types)]
     (reduce
-     (fn [{:keys [values] :as state} {:keys [kind sym expr] :as description}]
-       (let [alias (when (and (= :scalar kind) (symbol? expr)) (get values expr))
+     (fn [{:keys [values carrier-facts processed-source-bindings] :as state} {:keys [kind sym expr] :as description}]
+       (let [staged (when (contains? staged-inputs (:id description))
+                      (staged-storage-input description (get staged-inputs (:id description)) processed-source-bindings))
+             alias-source (or (:alias staged) (when (symbol? expr) expr))
+             alias (when (and (= :scalar kind) alias-source) (get values alias-source))
              array-dtype (declared-type array-types sym)
              scalar-dtype (get source-scalar-types sym)
              _ (when (and array-dtype scalar-dtype)
                  (fail! :source-value-conflict
                         "one source binding cannot be declared both array and scalar"
                         {:id sym :array-dtype array-dtype :scalar-dtype scalar-dtype}))
-             alias? (and alias (or array-dtype scalar-dtype))
+             alias? (and alias (or array-dtype scalar-dtype (= :tensor (:kind alias))))
              _ (when alias?
                  (when-not (and (= :tensor (:kind alias))
-                                (= (dtype/canon (or array-dtype scalar-dtype))
-                                   (dtype/canon (:dtype alias)))
-                                (= (boolean array-dtype) (boolean (seq (:shape alias))))
+                                (or (nil? (or array-dtype scalar-dtype))
+                                    (and (= (dtype/canon (or array-dtype scalar-dtype))
+                                            (dtype/canon (:dtype alias)))
+                                         (= (boolean array-dtype) (boolean (seq (:shape alias))))))
                                 (or (nil? (get values sym)) (= alias (get values sym))))
                    (fail! :source-value-conflict
                           "a source alias must preserve the complete existing AbstractValue"
-                          {:id sym :source expr :source-value alias :first (get values sym)})))
+                          {:id sym :source alias-source :source-value alias :first (get values sym)})))
              allocations
              (into []
                    (filter
@@ -6190,7 +6250,7 @@
                                            (contains? source-scalar-types %))
                                       (util/free-syms extent)))))
                    (allocation-contracts [description] array-types source-scalar-types
-                                         values shape-equalities))
+                                         values shape-equalities carrier-facts))
              values (cond
                       alias? (assoc values sym alias)
                       (and (= :scalar kind) scalar-dtype (nil? array-dtype))
@@ -6210,14 +6270,20 @@
                                         shape-equalities)
                            known)))
                      values allocations)]
-         (-> state (assoc :values values) (update :allocations into allocations))))
-     {:values initial-values :allocations []} descriptions)))
+         (cond-> (-> state (assoc :values values) (update :allocations into allocations)
+                     (assoc-in [:processed-source-bindings (:id description)] (:source-binding description)))
+           staged (-> (assoc-in [:carrier-facts sym] {:carrier (:carrier staged)})
+                      (update :pending-inputs conj (:occurrence staged))))))
+     {:values initial-values :allocations [] :carrier-facts {} :pending-inputs []
+      :processed-source-bindings {}} descriptions))))
 
 (defn- source-storage-analysis
   "Establish allocation-owned extents before a consumer can infer element shapes.
    Allocation capacity is not permission to flatten a declared logical layout. Reuse the same
    allocation contracts for initialization later; no consumer extent may become its own producer."
-  [pairs dtype array-types scalar-types segmented-plans? values shape-equalities public-parameters]
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities public-parameters]
+   (source-storage-analysis pairs dtype array-types scalar-types segmented-plans? values shape-equalities public-parameters {}))
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities public-parameters staged-inputs]
   (let [descriptions (retain-host-input-scalars
                       (normalize-extents
                        (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
@@ -6228,14 +6294,14 @@
                   (if (and (= :scalar kind) scalar-dtype)
                     (assoc types sym scalar-dtype) types))
                 scalar-types descriptions)
-        {:keys [values allocations]}
+        {:keys [values allocations carrier-facts pending-inputs]}
         (source-storage-values descriptions array-types
                                (if (some? public-parameters)
                                  (select-keys scalar-types public-parameters) scalar-types)
                                source-scalar-types
-                               values shape-equalities)]
+                               values shape-equalities staged-inputs)]
     {:descriptions (preserve-map-storage-inputs descriptions values)
-     :values values :allocations allocations}))
+     :values values :allocations allocations :carrier-facts carrier-facts :pending-inputs pending-inputs})))
 
 (defn terminal-host-source
   "Retain a declined contiguous scalar suffix as one explicit terminal source region.
@@ -6444,31 +6510,45 @@
        :rewrites (:rewrites rebuilt) :declines (:declines rebuilt)}))))
 
 (defn- source-components*
-  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
+  ([source options] (source-components* source options {}))
+  ([source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
                  preserve-declared-array-storage? host-scalars? public-parameters]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}
-           :as options}]
+           :as options} staged-inputs]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [_ (validate-declared-array-values! array-types values)
           [_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          {descriptions :descriptions storage-values :values allocations :allocations}
+          {descriptions :descriptions storage-values :values allocations :allocations
+           :keys [carrier-facts pending-inputs]}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
-                                   values shape-equalities public-parameters)]
+                                   values shape-equalities public-parameters staged-inputs)]
       {:source source :options options :pairs pairs :array-types array-types
-       :descriptions descriptions :storage-values storage-values :allocations allocations})))
+       :descriptions descriptions :storage-values storage-values :allocations allocations
+       :carrier-facts carrier-facts :pending-inputs pending-inputs}))))
+
+(defn ^:no-doc analyze-source-components
+  "Internal analysis-only entry for an enclosing source producer. Pending input
+   correspondence is separate from options and grants no continuation or admission.
+   Ordinary compilation uses the same description/storage walk with no such data."
+  [source {:keys [array-types scalar-types values] :as options} staged-inputs]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types values)
+            *region-local-counter* (atom -1)
+            *region-local-source-symbols* (source-symbols source)]
+    (source-components* source options staged-inputs)))
 
 (defn- continue-source-components*
   "Continue the single description/storage analysis through unchanged admission
    and equation construction. Components are compiler-local data, not a proof or
    permission to publish a source-derived program."
-  [{:keys [source options pairs array-types descriptions storage-values allocations]}]
+  [{:keys [source options pairs array-types descriptions storage-values allocations pending-inputs]}]
   (let [{:keys [dtype scalar-types values shape-equalities segmented-plans?
                 host-scalars? public-parameters]
          :or {dtype :double scalar-types {} values {} shape-equalities {}}} options
         [_ bindings & body] source]
-      (when (and (even? (count bindings))
+      (when (and (empty? pending-inputs)
+                 (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)
                      (and host-scalars? (every? #(= :scalar (:kind %)) descriptions)))

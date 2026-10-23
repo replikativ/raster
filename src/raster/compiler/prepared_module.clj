@@ -466,3 +466,29 @@
                       (:obligation-origins joined)))))
                 (:import-origins context))]
       (when (= 1 (count matches)) (first matches)))))
+
+(defn ^:no-doc analyze-source-components
+  "Analyze this exact phase once, retaining pending input identities separately
+   from the conditional logical/carrier facts. This neither continues semantic
+   admission nor constructs a source owner or executable InvocationPlan."
+  [phase normalized]
+  (when-let [context (view phase normalized)]
+    (let [inputs
+          (into []
+                (mapcat
+                 (fn [joined]
+                   (keep (fn [{:keys [id binding-origins]}]
+                           (when (= :argument (second id))
+                             (let [final (when (= 1 (count binding-origins))
+                                           (final-binding-origin (first binding-origins)))
+                                   occurrence (when final (input-occurrence phase normalized (:binding final)))]
+                               (when-not occurrence
+                                 (refuse! "prepared input lost its exact analysis occurrence" {:id id}))
+                               [(:index final) occurrence])))
+                         (:obligation-origins joined))))
+                (:import-origins context))
+          _ (when-not (= (count inputs) (count (set (map first inputs))))
+              (refuse! "prepared inputs do not have distinct source producers" {}))
+          components (frontend/analyze-source-components normalized (:options context) (into {} inputs))]
+      (entry/assert-producer-current! phase)
+      components)))
