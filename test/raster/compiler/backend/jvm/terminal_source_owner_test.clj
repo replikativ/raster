@@ -21,6 +21,123 @@
 (defn- reason [thunk]
   (try (thunk) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
+(defn- traced-scalar [expression ports context]
+  (entry/call-with-definition-inputs
+   #(terminal/trace-scalar expression ports
+                           (the-ns 'raster.compiler.backend.jvm.terminal-source-owner-test)
+                           {:unchecked-math false} context)))
+
+(defn- compile-traced [projection]
+  (owner/compile-function (:params projection) (:source projection)
+                          (fn [params body] (list 'fn* params body))
+                          (merge projection {:source-policy {:unchecked-math false}
+                                             :source-ns (the-ns 'raster.compiler.backend.jvm.terminal-source-owner-test)})))
+
+(deftest scalar-trace-retains-exact-occurrences-and-selected-method-plans
+  (let [expression '(clojure.core/+ left (clojure.core/* right 2.0))
+        ports [{:symbol 'left :carrier Double/TYPE} {:symbol 'right :carrier Double/TYPE}]
+        projection (traced-scalar expression ports :typed-scalar)
+        correspondence (:correspondence projection)
+        events (:events correspondence)
+        entered (filterv #(= :enter (:kind %)) events)
+        values (filterv #(= :value (:kind %)) events)
+        methods (filterv #(and (= :resolved-call (:kind %)) (:occurrence %)) events)
+        execute (compile-traced projection)]
+    (is (identical? expression (:expression correspondence)))
+    (is (identical? ports (:parameters correspondence)))
+    (is (false? (:admitted? correspondence)))
+    (is (= Double/TYPE (get-in projection [:result-facts :carrier])))
+    (is (= ["multiply" "add"] (mapv #(-> % :plan :method .getName) methods)))
+    (is (every? #(= [Double/TYPE Double/TYPE] (vec (.getParameterTypes ^java.lang.reflect.Method (get-in % [:plan :method])))) methods))
+    (is (= (count entered) (count values)))
+    (is (= 1 (count (filter #(nil? (:parent %)) entered))))
+    (is (= 1 (count (filter #(identical? expression (:expression %)) values))))
+    (is (every? #(= (if (:occurrence %) :body :parameter-boundary) (:phase %))
+                (filter #(= :resolved-call (:kind %)) events)))
+    (doseq [[_ children] (group-by :parent (filter :parent entered))]
+      (is (= (vec (range (count children))) (mapv :child-index children))))
+    (doseq [event methods]
+      (is (= 1 (count (filter #(and (identical? (:occurrence event) (:occurrence %))
+                                    (identical? (:projection event) (:projection %))) values)))))
+    (doseq [event entered]
+      (let [completed (filterv #(identical? (:occurrence event) (:occurrence %)) values)]
+        (is (= 1 (count completed)))
+        (is (identical? (:expression event) (:expression (first completed))))
+      (when-let [parent (:parent event)]
+        (is (= 1 (count (filter #(identical? parent (:occurrence %)) entered)))))))
+    (doseq [[left right] [[0.0 -0.0] [1.25 2.0] [Double/MAX_VALUE Double/MAX_VALUE]
+                         [Double/NaN 1.0] [Double/NEGATIVE_INFINITY Double/POSITIVE_INFINITY]]]
+      (is (= (Double/doubleToRawLongBits (+ left (* right 2.0)))
+             (Double/doubleToRawLongBits (execute [left right])))))))
+
+(deftest ordinary-float-source-trace-is-not-typed-float-admission
+  (let [expression '(clojure.core/+ left right)
+        ports [{:symbol 'left :carrier Float/TYPE} {:symbol 'right :carrier Float/TYPE}]
+        projection (traced-scalar expression ports :clojure-source)
+        methods (filterv #(and (= :resolved-call (:kind %)) (:occurrence %))
+                         (get-in projection [:correspondence :events]))
+        execute (compile-traced projection)]
+    (is (= Double/TYPE (get-in projection [:result-facts :carrier])))
+    (is (= ["doubleCast" "doubleCast" "add"] (mapv #(-> % :plan :method .getName) methods)))
+    (is (= [[Float/TYPE] [Float/TYPE] [Double/TYPE Double/TYPE]]
+           (mapv #(vec (.getParameterTypes ^java.lang.reflect.Method (get-in % [:plan :method]))) methods)))
+    (is (= :unclosed-terminal-source-projection (reason #(traced-scalar expression ports :typed-scalar))))
+    (doseq [[left right] [[Float/MAX_VALUE Float/MAX_VALUE] [(float -0.0) (float -0.0)]
+                         [Float/POSITIVE_INFINITY Float/NEGATIVE_INFINITY] [(float 0.1) (float 0.2)]]]
+      (is (= (Double/doubleToRawLongBits (+ left right))
+             (Double/doubleToRawLongBits (execute [left right])))))))
+
+(deftest tracing-does-not-execute-or-certify-reference-conversions-and-helpers
+  (let [before @source-effects
+        projection (traced-scalar
+                    '(raster.compiler.backend.jvm.terminal-source-owner-test/observed-helper value)
+                    [{:symbol 'value :carrier Double/TYPE}] :clojure-source)
+        methods (filterv #(and (= :resolved-call (:kind %)) (:occurrence %))
+                         (get-in projection [:correspondence :events]))]
+    (is (= before @source-effects))
+    (is (seq (:captures projection)))
+    (is (= [Object] (mapv :result-carrier methods)))
+    (is (false? (get-in projection [:correspondence :admitted?]))))
+  (is (= :unclosed-terminal-source-projection
+         (reason #(terminal/trace-scalar 'x [{:symbol 'x :carrier Double/TYPE}]
+                                         *ns* {:unchecked-math false} :typed-scalar))))
+  (is (= :unclosed-terminal-source-projection
+         (reason #(traced-scalar 'x [{:symbol 'x :carrier Double/TYPE}] :unknown-context)))))
+
+(deftest conditional-trace-keeps-branch-positions-even-for-identical-child-objects
+  (let [branch '(raster.compiler.backend.jvm.terminal-source-owner-test/observed-helper value)
+        expression (list 'if '(clojure.core/nil? missing) branch branch)
+        before @source-effects
+        projection (traced-scalar expression [{:symbol 'missing :carrier Object}
+                                              {:symbol 'value :carrier Double/TYPE}] :clojure-source)
+        entered (filterv #(= :enter (:kind %)) (get-in projection [:correspondence :events]))
+        root (first entered)
+        children (filterv #(identical? (:occurrence root) (:parent %)) entered)
+        [then else] (rest children)]
+    (is (= before @source-effects))
+    (is (= [0 1 2] (mapv :child-index children)))
+    (is (identical? branch (:expression then)))
+    (is (identical? branch (:expression else)))
+    (is (not (identical? (:occurrence then) (:occurrence else))))))
+
+(deftest scalar-trace-fences-a-namespace-change-after-the-final-projection
+  (let [source-ns (the-ns 'raster.compiler.backend.jvm.terminal-source-owner-test)
+        replacement (create-ns (gensym "raster.test.projection-namespace."))
+        project @#'terminal/project*
+        find-original find-ns
+        changed (atom false)]
+    (try
+      (is (= :unclosed-terminal-source-projection
+             (reason #(entry/call-with-definition-inputs
+                       (fn []
+                         (with-redefs-fn
+                           {#'terminal/project* (fn [& args] (let [result (apply project args)] (reset! changed true) result))
+                            #'clojure.core/find-ns (fn [symbol] (if (and @changed (= symbol (ns-name source-ns)))
+                                                                 replacement (find-original symbol)))}
+                           (fn [] (terminal/trace-scalar 'value [{:symbol 'value :carrier Double/TYPE}]
+                                                         source-ns {:unchecked-math false} :typed-scalar))))))))
+      (finally (remove-ns (ns-name replacement))))))
+
 (defn- boundary [body]
   ;; A structural region fixture. This alone cannot certify source-to-program
   ;; correspondence, physical exports or completed numerical execution.

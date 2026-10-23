@@ -10070,6 +10070,46 @@ outlining its original whole initializer on the host is forbidden. Publication
 still requires complete ordered execution, completion, storage, runtime-view and
 output accounting. No global scalar admission waiver or fallback is acceptable.
 
+Execution integration review clarified two additional constraints. The ordinary
+typed route normalizes and can reproject/DCE source again; an owned normalized
+entry must instead consume the exact sealed object and preserve its positional
+map. The full production pre-SoA pipeline cannot be run destructively after the
+cut and then excused by equal names/counts. The first generated-module producer
+must retain a complete canonical source transaction and explicitly refuse SoA
+interface changes until their correspondence exists.
+
+Most importantly, a post-reduction continuation is not automatically a host
+scalar action. Cross-equation reductions must stay resident. Its exact typed
+scalar region should use the existing reduction result-transform fusion and
+resident materialization, with emitted physical representation independently
+rechecked. The ordered source owner retains actual input/count/exception checks
+and true host-prefix actions; it must not download a reduction to rerun a quotient
+on the host. Allocation obligations join the existing allocation contract,
+BufferAllocation step and source-ordered initialization, not a scalar thunk.
+Future finalization must partition every import binding and obligation across
+those existing mechanisms before consuming its exact original marker. Device
+buffer views still need a logical-to-resident correspondence; they cannot be
+cast to JVM arrays as a substitute.
+
+The existing JVM scalar projector now has an optional constructor trace for that
+join. It records exact occurrence and parent/child identities, actual resolved
+Methods and ordered input contracts, their constructed projections and physical
+result carriers. Parameter adaptation is explicitly separate from source-body
+operations. Enter/value notices describe static construction, not dynamic branch
+execution; two shared expression objects in different branches retain distinct
+occurrence tokens. The trace owns no new inference or arithmetic registry.
+
+`trace-scalar` requires a live source namespace and enclosing definition collector,
+and fences both namespace identity and dependency history after projection. It
+explicitly distinguishes the existing typed-scalar restrictions from ordinary
+Clojure source Float-to-Double widening. The consumer must prove which context
+matches the actual emitted body; choosing a label or seeing a result dtype is not
+that proof. Traces stay non-admitting, helper/reference effects remain obligations,
+and the existing `project-scalar` restrictions are unchanged. Untraced calls avoid
+occurrence/frame allocation and tracing try/finally. The affected terminal/ordered
+source-owner gate passes 47 tests / 486 assertions, including raw-bit FP oracles,
+method/child-position checks, helper nonexecution and namespace replacement.
+
 ### Observable scalar checkpoints alongside resident state
 
 A returned loss can precede VJP and optimizer effects, while the typed envelope

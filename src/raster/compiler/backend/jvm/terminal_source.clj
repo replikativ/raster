@@ -44,8 +44,14 @@
              {:expression expression :source-metadata metadata}))))
 
 (defn- project*
-  [contract source-ns typed-context?]
+  ([contract source-ns typed-context?]
+   (project* contract source-ns typed-context? nil))
+  ([contract source-ns typed-context? observe!]
   (let [policy (:source-policy contract)
+        ;; Projection order is not runtime execution order (both conditional
+        ;; arms are visited). Tokens retain occurrence/scoping without guessing
+        ;; correspondence from equal expressions or generated symbol names.
+        active (when observe! (volatile! []))
         used (volatile! #{})
         _ (util/postwalk-preserving-meta
            (fn [x] (when (symbol? x) (vswap! used conj x)) x) (:body contract))
@@ -60,22 +66,31 @@
         resolve-var (fn [symbol]
                       (let [v (try (ns-resolve source-ns symbol) (catch IllegalArgumentException _ nil))]
                         (when-not (var? v) (fail! "terminal symbol has no owned Var" {:symbol symbol}))
-                        (entry/observe-definition-input! v source-ns symbol) v))]
+                        (entry/observe-definition-input! v source-ns symbol)
+                        (when observe!
+                          (observe! {:kind :resolution :occurrence (:occurrence (peek @active))
+                                     :symbol symbol :var v}))
+                        v))]
     (letfn [(resolved [^Method method receiver args]
-              (let [normalized (ordered/normalize-resolved-call
-                                (ordered/plan-resolved-call method receiver args policy)
-                                fresh @used)]
+              (let [plan (ordered/plan-resolved-call method receiver args policy)
+                    normalized (ordered/normalize-resolved-call plan fresh @used)
+                    carrier (.getReturnType method)
+                    result (cond-> {:source (list 'let* (:bindings normalized) (:invocation normalized))
+                                    :carrier carrier}
+                             (.isPrimitive carrier)
+                             (assoc :boxed-carrier (get types/primitive-info
+                                                        (symbol (.getName carrier))) :non-null? true))]
+                (when observe!
+                  (observe! {:kind :resolved-call :occurrence (:occurrence (peek @active))
+                             :phase (if (seq @active) :body :parameter-boundary)
+                             :plan plan :normalization normalized
+                             :projection (:source result) :result-carrier carrier}))
                 (vswap! methods conj method)
                 (doseq [{:keys [class port]} (:class-ports normalized)]
                   (when-not (contains? @references class)
                     (vswap! captures conj {:port port :value class})
                     (vswap! references assoc class port)))
-                (let [carrier (.getReturnType method)]
-                  (cond-> {:source (list 'let* (:bindings normalized) (:invocation normalized))
-                           :carrier carrier}
-                    (.isPrimitive carrier)
-                    (assoc :boxed-carrier (get types/primitive-info
-                                               (symbol (.getName carrier))) :non-null? true)))))
+                result))
             (static-call [class method carriers args]
               (resolved (.getMethod ^Class class method (into-array Class carriers)) nil args))
             (go* [expression env]
@@ -248,7 +263,7 @@
                           (resolved (.getMethod clojure.lang.IFn "invoke" (into-array Class (repeat arity Object)))
                                     (capture! @v) (mapv :source arguments)))))))
                 :else (fail! "terminal literal has no owned source projection" {:class (class expression)})))
-            (go [expression env]
+            (checked-go [expression env]
               (let [result (go* expression env)]
                 ;; Validate hints against the actual projected Method/local
                 ;; carrier, never use the hint to select that carrier.
@@ -266,7 +281,27 @@
                       (fail! "terminal invocation hint differs from its observed payload" {}))
                     (source-hints! (vary-meta expression dissoc :tag) (:carrier result) source-ns))
                   (source-hints! expression (:carrier result) source-ns))
-                result))]
+                result))
+            (go [expression env]
+              (if-not observe!
+                ;; Existing projections do not allocate occurrence frames or
+                ;; enter a tracing try/finally at every scalar node.
+                (checked-go expression env)
+                (let [token (Object.)
+                      parent (peek @active)
+                      child-index (when parent
+                                    (let [counter (:children parent) index @counter]
+                                      (vswap! counter inc) index))]
+                  (observe! {:kind :enter :occurrence token :parent (:occurrence parent)
+                             :child-index child-index :expression expression})
+                  (vswap! active conj {:occurrence token :children (volatile! 0)})
+                  (try
+                    (let [result (checked-go expression env)]
+                      (observe! {:kind :value :occurrence token :expression expression
+                                 :projection (:source result)
+                                 :result-facts (select-keys result [:carrier :boxed-carrier :non-null?])})
+                      result)
+                    (finally (vswap! active pop))))))]
       (let [input (fresh "terminal_inputs__")
             projected
             (mapv (fn [index {:keys [symbol carrier]}]
@@ -293,7 +328,7 @@
          :source (list 'let* (vec (mapcat (fn [[id value]] [(with-meta id nil) (:source value)]) projected))
                        (:source result))
          :result-facts (select-keys result [:carrier :boxed-carrier :non-null?])
-         :captures @captures :methods @methods :reference-bindings @references}))))
+         :captures @captures :methods @methods :reference-bindings @references})))))
 
 (defn project
   "Project the audited terminal export contract under its original source owner.
@@ -378,3 +413,36 @@
    projection, not proof that the surrounding typed region's coercions agree."
   [expression parameters source-ns source-policy]
   (project* (scalar-contract expression parameters source-policy) source-ns true))
+
+(defn trace-scalar
+  "Construct the existing scalar projection plus its exact constructor trace.
+   :typed-scalar uses project-scalar's unchanged restrictions; :clojure-source
+   uses the existing ordinary-source Float checkpoint/Numbers widening model.
+   The caller must authenticate WHICH context matches its actual emitted body.
+   Parameters remain actual carrier requirements supplied by that caller, not
+   inferred from dtype tags. No numerical body or resolved Method is invoked.
+
+   This is pending correspondence data, NOT an equivalence/totality/effect proof,
+   frontend admission or portable IR. Method input contracts, private captures,
+   reference checks and all runtime obligations remain. Enter events are preorder,
+   value events postorder, calls/resolution interior, under explicit parent/child
+   positions. Parameter-boundary calls are not body operations. This is not
+   dynamic execution order. The owner must retain this exact result and its
+   enclosing producer history."
+  [expression parameters source-ns source-policy context]
+  (when-not (and entry/*emission-inputs*
+                 (contains? #{:typed-scalar :clojure-source} context)
+                 (instance? clojure.lang.Namespace source-ns)
+                 (identical? source-ns (find-ns (ns-name source-ns))))
+    (fail! "scalar correspondence needs its actual owner, namespace and source context" {}))
+  (let [events (volatile! [])
+        projection (project* (scalar-contract expression parameters source-policy)
+                             source-ns (= context :typed-scalar) #(vswap! events conj %))
+        observations @entry/*emission-inputs*]
+    (entry/assert-definition-inputs-current! observations)
+    (when-not (identical? source-ns (find-ns (ns-name source-ns)))
+      (fail! "scalar correspondence namespace changed during projection" {}))
+    (assoc projection :correspondence
+           {:context context :expression expression :parameters parameters
+            :source-ns source-ns :source-policy source-policy
+            :events @events :observations observations :admitted? false})))
