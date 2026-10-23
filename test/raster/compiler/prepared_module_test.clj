@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core]
             [raster.ad.reverse :as reverse]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.generated-body :as generated]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-transport :as transport]
@@ -147,7 +148,10 @@
                          (:root-bindings call))))
        (is (identical? (:import (first imports)) (:import joined)))
        (is (= (count (:bindings call)) (count (:binding-origins joined))))
-       (is (= (+ (count (:input-obligations call)) (count (get-in call [:proposal :completion-obligations])))
+       (is (= (+ (count (:input-obligations call))
+                 (count (get-in call [:proposal :completion-obligations]))
+                 (reduce + 0 (map #(count (get-in % [:argument-construction :arguments]))
+                                  (:root-bindings call))))
               (count (:obligation-origins joined))))
        (is (every? true? (map identical?
                               (concat (:input-obligations call) (get-in call [:proposal :completion-obligations]))
@@ -362,3 +366,70 @@
          (with-redefs [generated/instantiate-value-source
                        (fn [& args] (alter (apply construct args)))]
            (is (= :unclosed-prepared-module-phase (reason capture)))))))))
+
+(deftest allocation-inputs-retain-actual-completion-order-and-pending-obligations
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [phase (capture)
+           view (module/view phase (module/normalized-source phase))
+           call (get-in view [:imports 0 :call])
+           roots (filter :argument-construction (:root-bindings call))
+           obligations (get-in view [:import-origins 0 :obligation-origins])]
+       (is (= 3 (count roots)))
+       (is (= 6 (count (filter #(= :argument (second (:id %))) obligations))))
+       (doseq [root roots
+               :let [{:keys [arguments observed]} (:argument-construction root)
+                     [reference size] arguments]]
+         (is (= [:checkcast :coerce] (mapv #(get-in % [:completion :adaptation]) arguments)))
+         (is (= [:ref :ref] (mapv #(get-in % [:completion :emitted-type]) arguments)))
+         (is (= [:jvm-bytecode-reference-input :jvm-bytecode-integral-input]
+                (mapv #(get-in % [:contract :source-context]) arguments)))
+         (is (= [(- (:call-binding-index root) 2) (dec (:call-binding-index root))]
+                (mapv :call-binding-index arguments)))
+         (is (every? #(= :pending (:status %)) arguments))
+         (is (every? true?
+                      (map (fn [argument]
+                             (every? true? (map identical? (:binding argument)
+                                                (nth (:bindings call) (:call-binding-index argument)))))
+                           arguments)))
+         (is (identical? (:operand size)
+                         (:operand (raster.compiler.core.value-completion/canonical-parts
+                                    (second (:binding size))))))
+         (is (identical? Long/TYPE (get-in size [:completion :parameter-carrier])))
+         (is (= :global-typed-indy (:invocation-mode observed))))
+       (is (false? (:admitted? view)))
+       (is (= 1 (count (:unclosed-source-imports @entry/*emission-inputs*))))))))
+
+(deftest malformed-argument-manifests-cannot-redirect-completions
+  (let [construct generated/instantiate-value-source]
+    (doseq [change [(fn [argument] (assoc argument :call-binding-index 0))
+                    (fn [argument] (assoc argument :input-index 1))
+                    (fn [argument] (assoc argument :template-source-path [1 1]))
+                    (fn [argument] (assoc argument :status :complete))
+                    (fn [argument] (assoc-in argument [:contract :expected-input-carrier] :long))]]
+      (entry/call-with-definition-inputs
+       (fn []
+         (with-redefs [generated/instantiate-value-source
+                       (fn [& args]
+                         (let [call (apply construct args)
+                               root-index (first (keep-indexed
+                                                  #(when (:argument-construction %2) %1)
+                                                  (:root-bindings call)))]
+                           (update-in call [:root-bindings root-index :argument-construction :arguments 0]
+                                      change)))]
+           (is (= :unclosed-prepared-module-phase (reason capture)))))))))
+
+(deftest allocation-staging-requires-the-original-invocation-observation
+  (entry/call-with-definition-inputs
+   (fn []
+     (with-redefs [bytecode/retained-input-completed-invocation-context (fn [& _] nil)]
+       (is (= :generated-body-unsupported (reason capture)))))))
+
+(deftest allocation-proposal-cannot-replace-the-prepared-physical-entry
+  (let [construct generated/instantiate-value-source]
+    (entry/call-with-definition-inputs
+     (fn []
+       (with-redefs [generated/instantiate-value-source
+                     (fn [& args]
+                       (update-in (apply construct args) [:proposal :physical] #(into {} %)))]
+         (is (= :unclosed-prepared-module-phase (reason capture))))))))

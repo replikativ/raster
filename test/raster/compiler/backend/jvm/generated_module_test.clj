@@ -350,6 +350,153 @@
        (is (every? #(= :pending (:status %)) obligations))
        (is (identical? prepared (reverse/assert-prepared-program-source! prepared)))))))
 
+(deftest nested-completion-origins-follow-the-staged-argument-not-the-root
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [parameters '[ref n divisor]
+           context (completion/bytecode-operand-context {:preserve-source-call-results? true})
+           contract (completion/planned-bytecode-input-contract Long/TYPE context :long)
+           size (completion/complete-value contract '(clojure.core/quot n divisor))
+           interface (types/ensure-fn-interface! '[floats long])
+           receiver (with-meta 'raster.arrays/alloc-like_m_floats_long-impl
+                      {:tag (:iface-name interface) :raster.type/tag (:iface-name interface)})
+           allocation (with-meta (list '.invk receiver 'ref size)
+                        {:raster.op/original 'raster.arrays/alloc-like})
+           root (completion/complete-value
+                 (completion/bytecode-result-context-contract context :ref) allocation)
+           physical (emit parameters '[Object long long] [(list 'let* ['out root] '[out])])
+           call (generated/instantiate-value-source
+                 physical parameters parameters
+                 [{:carrier Object :presence :unknown}
+                  {:carrier Long/TYPE :presence :present}
+                  {:carrier Long/TYPE :presence :present}])
+           layout (generated/value-source-binding-layout call)
+           root (first (:root-bindings call))
+           [reference argument] (get-in root [:argument-construction :arguments])
+           source-call (get-in root [:argument-construction :source-call])
+           indices (:body-obligation-indices layout)
+           obligations (get-in call [:proposal :completion-obligations])
+           by-source (fn [source]
+                       (keep-indexed #(when (identical? source (:source %2)) %1) obligations))
+           staged (emit parameters '[Object long long]
+                        [(list 'let* (vec (mapcat identity (:bindings call))) (:outputs call))])
+           observe (fn [physical arguments]
+                     (try {:lengths (mapv alength (apply (:implementation physical) arguments))}
+                          (catch Throwable e {:error (class e)})))]
+       (is (some? layout))
+       (is (= 1 (count (by-source size))))
+       (is (= (:call-binding-index argument) (nth indices (first (by-source size)))))
+       (is (= :operand (nth (:template-source-path argument) 2)))
+       (is (identical? size
+                       (:source-input (bytecode/retained-input-invocation-input-source
+                                       (:emission physical) (:input-body physical) source-call 1))))
+       (is (nil? (bytecode/retained-input-invocation-input-source
+                  (assoc (:emission physical) :completion-catalog {})
+                  (:input-body physical) source-call 1)))
+       (is (nil? (bytecode/retained-input-invocation-input-source
+                  (update (:emission physical) :completion-contexts
+                          #(into {} (map (fn [[id record]] [id (assoc record :status :ambiguous)])) %))
+                  (:input-body physical) source-call 1)))
+       (is (nil? (bytecode/retained-input-completion-context
+                  (:emission physical) (:input-body physical)
+                  (with-meta (apply list size) (meta size)))))
+       (is (< (:call-binding-index reference) (:call-binding-index argument) (:call-binding-index root)))
+       (doseq [actual [[(float-array 0) 6 2] [nil 6 2]
+                       ["not an array" 6 0] [nil 6 0] [(float-array 0) -6 2]]]
+         (is (= (observe physical actual) (observe staged actual))))
+       (is (= {:error ClassCastException} (observe staged ["not an array" 6 0])))
+       (is (= {:error ArithmeticException} (observe staged [nil 6 0])))
+       (is (nil? (generated/value-source-binding-layout
+                  (assoc-in call [:proposal :completion-obligations (first (by-source size)) :path]
+                            [1 1]))))
+       (is (nil? (generated/value-source-binding-layout
+                  (assoc-in call [:root-bindings 0 :argument-construction :arguments 1 :template-source-path]
+                            (:template-source-path reference)))))))))
+
+(deftest allocation-layout-rejects-detached-source-and-observation-joins
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [prepared (reverse/prepare-value+grad #'training/local-loss [0])
+           _ (reverse/adopt-prepared-program-inputs! prepared)
+           physical (reverse/prepared-bytecode-entry prepared)
+           call (generated/instantiate-value-source
+                 physical (:params prepared) '[theta x y rows width]
+                 [{:carrier Object :presence :unknown} {:carrier Object :presence :unknown}
+                  {:carrier Object :presence :unknown} {:carrier Long/TYPE :presence :present}
+                  {:carrier Long/TYPE :presence :present}])
+           root-index (first (keep-indexed #(when (:argument-construction %2) %1) (:root-bindings call)))
+           path [:root-bindings root-index :argument-construction]
+           copy-form (fn [form] (with-meta (apply list form) (meta form)))
+           changes [(fn [c] (assoc-in c [:observed :method] nil))
+                    (fn [c] (update-in c [:observed :inputs] #(mapv identity %)))
+                    (fn [c] (update-in c [:observed :input-completions] #(mapv identity %)))
+                    (fn [c] (assoc-in c [:observed :invocation-mode] :local-typed))
+                    (fn [c] (update-in c [:observed :receiver] #(with-meta % {:tag 'Object})))
+                    (fn [c] (update-in c [:observed :source-input] copy-form))
+                    (fn [c] (update c :source-call copy-form))
+                    (fn [c] (update c :candidate-call copy-form))
+                    (fn [c] (update-in c [:arguments 0 :original-operand] #(with-meta % {:tag 'Object})))
+                    (fn [c] (update-in c [:arguments 1 :operand] copy-form))
+                    (fn [c] (update-in c [:arguments 1 :completion] #(assoc % :adaptation :identity)))
+                    (fn [c] (assoc-in c [:arguments 1 :input-index] 0))
+                    (fn [c] (update-in c [:arguments 1 :binding 1] copy-form))
+                    (fn [c] (update c :constructed-call
+                                    #(util/remake-from % (assoc (vec %) 1 'other/implementation))))]]
+       (is (some? (generated/value-source-binding-layout call)))
+       (doseq [change changes]
+         (is (nil? (generated/value-source-binding-layout (update-in call path change)))))
+       (doseq [change [(fn [o] (assoc o :token (Object.)))
+                       (fn [o] (update o :source copy-form))
+                       (fn [o] (update o :contract #(into {} %)))
+                       (fn [o] (update o :path conj :detached))]]
+         (is (nil? (generated/value-source-binding-layout
+                    (update-in call [:proposal :completion-obligations 0] change)))))))))
+
+(deftest ordered-allocation-inputs-preserve-the-generated-jvm-program
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [prepared (reverse/prepare-value+grad #'training/local-loss [0])
+           _ (reverse/adopt-prepared-program-inputs! prepared)
+           physical (reverse/prepared-bytecode-entry prepared)
+           arguments '[theta x y rows width]
+           facts [{:carrier Object :presence :unknown}
+                  {:carrier Object :presence :unknown}
+                  {:carrier Object :presence :unknown}
+                  {:carrier Long/TYPE :presence :present}
+                  {:carrier Long/TYPE :presence :present}]
+           call (generated/instantiate-value-source physical (:params prepared) arguments facts)
+           body [(list 'let* (vec (mapcat identity (:bindings call))) (:outputs call))]
+           staged (emit arguments (:tags prepared) body)
+           number-value (fn [value]
+                          [(class value)
+                           (cond (instance? Double value) (Double/doubleToRawLongBits (double value))
+                                 (instance? Float value) (Float/floatToRawIntBits (float value))
+                                 :else value)])
+           observe (fn [physical arguments]
+                     (try
+                       {:values
+                        (mapv (fn [value]
+                                (cond
+                                  (instance? Number value) (number-value value)
+                                  (and value (.isArray (class value))) [(class value) (mapv number-value value)]
+                                  :else value))
+                              (apply (:implementation physical) arguments))}
+                       (catch Throwable e {:error (class e)})))]
+       (is (some? (generated/value-source-binding-layout call)))
+       (doseq [rows [1 3] change [0 1]
+               :let [{:keys [x y]} (first (training/batches [rows]))
+                     theta (float-array (map #(+ (double %) (* change 0.125)) (training/initial-theta)))
+                     x (float-array (map #(+ (double %) (* change 0.0625)) x))
+                     actual [theta x y rows 17]]]
+         (is (= (observe physical actual) (observe staged actual))))
+       (doseq [actual [[nil (float-array 17) (float-array 1) 1 17]
+                       [(float-array 17) nil (float-array 1) 1 17]
+                       [(float-array 17) (float-array 17) nil 1 17]
+                       [(float-array 17) (float-array 1) (float-array 1) 1 17]
+                       [(float-array 17) (float-array 17) (float-array 0) 1 17]
+                       [(float-array 17) (float-array 0) (float-array 0) 0 17]]]
+         (is (= (observe physical actual) (observe staged actual))))))))
+
 (deftest the-real-training-caller-inserts-the-whole-pending-call-at-its-owned-cut
   (entry/call-with-definition-inputs
    (fn []
@@ -388,7 +535,13 @@
        (is (every? #(= :pending (:status %)) (:input-obligations call)))
        (is (every? #(= :pending (:status %)) (get-in call [:proposal :completion-obligations])))
        (is (false? (:admitted? call)))
-       (is (not (completion/contains-completion? (:form expanded))))
+       (let [expected (mapcat #(map (comp second :binding)
+                                   (get-in % [:argument-construction :arguments]))
+                              (:root-bindings call))
+             actual (filter completion/canonical-form? (tree-seq coll? seq (:form expanded)))]
+         (is (= 6 (count expected) (count actual)))
+         (is (every? (fn [node] (some #(identical? node %) expected)) actual)
+             "only the exact new pending argument completions remain in the constructed source"))
        (is (some #(and (= :prepared-reverse-ad (first %))
                        (identical? (:occurrence event) (nth % 2 nil)))
                  (:unclosed-source-imports @entry/*emission-inputs*))

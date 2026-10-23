@@ -302,6 +302,74 @@
       (decline! "Generated call construction did not preserve the complete flat spine" {})))
   source)
 
+(defn- completion-leaf
+  "Follow only canonical completion wrappers, retaining the original source coordinate."
+  [expression]
+  (loop [expression expression path []]
+    (if (completion/canonical-form? expression)
+      (recur (:operand (completion/canonical-parts expression)) (conj path :operand))
+      {:expression expression :path path})))
+
+(defn- replace-completion-leaf [expression replacement]
+  (if (completion/canonical-form? expression)
+    (util/remake-from expression
+                      [(first expression) (second expression)
+                       (replace-completion-leaf (nth expression 2) replacement)])
+    replacement))
+
+(defn- ordered-allocation-inputs
+  "Construct pending argument completions from one actual global typed invocation.
+   Allocator classification selects a candidate only; it grants no allocation contract.
+   The original input-region owner still owes execution, storage and correspondence."
+  [{:keys [emission input-body]} root first-index fresh!]
+  (let [{original :expression original-path :path} (completion-leaf (:original-expression root))
+        {candidate :expression} (completion-leaf (:expression root))]
+    (when (and (seq? original) (= '.invk (first original))
+               (descriptor/alloc-op? (descriptor/semantic-op original))
+               (= 2 (count (descriptor/call-args original)))
+               (symbol? (first (descriptor/call-args original)))
+               (seq? (second (descriptor/call-args original))))
+      (let [observed (bytecode/retained-input-completed-invocation-context emission input-body original)
+            ^java.lang.reflect.Method method (:method observed)
+            carriers (when (instance? java.lang.reflect.Method method)
+                       (vec (.getParameterTypes method)))
+            size-source (bytecode/retained-input-invocation-input-source emission input-body original 1)
+            candidate-arguments (vec (descriptor/call-args candidate))]
+        (when-not (and observed (= :global-typed-indy (:invocation-mode observed))
+                       (identical? original (:source-input observed))
+                       (not (.isVarArgs method)) (= 2 (count carriers))
+                       (dtype/dtype-for-jvm-array-class (first carriers))
+                       (identical? Long/TYPE (second carriers))
+                       size-source
+                       (identical? (second (descriptor/call-args original)) (:source-input size-source))
+                       (seq? candidate) (= '.invk (first candidate))
+                       (= 2 (count candidate-arguments))
+                       (identical? (second original) (second candidate))
+                       (identical? (second original) (:receiver observed)))
+          (decline! "Allocation argument staging requires its exact ordered invocation inputs"
+                    {:root-index (:root-index root)}))
+        (let [arguments
+              (mapv
+               (fn [ordinal ^Class carrier input completed operand]
+                 (let [contract (completion/planned-bytecode-input-contract
+                                 carrier (:context input) (:emitted-type completed))
+                       id (fresh!)
+                       expression (completion/complete-value contract operand)]
+                   {:input-index ordinal :call-binding-index (+ first-index ordinal)
+                    :template-source-path (into [1 (inc (* 2 (:root-index root)))]
+                                       (conj original-path (+ 2 ordinal)))
+                    :original-operand (nth (vec (descriptor/call-args original)) ordinal)
+                    :operand operand :contract contract :input input :completion completed
+                    :binding [id expression] :status :pending}))
+               (range) carriers (:inputs observed) (:input-completions observed) candidate-arguments)
+              rebuilt (util/remake-from candidate
+                                        (into (vec (take 2 candidate)) (map (comp first :binding) arguments)))]
+          {:source-call original :template-call-path original-path
+           :candidate-call candidate :constructed-call rebuilt :observed observed
+           :input-expression (:expression root)
+           :arguments arguments
+           :expression (replace-completion-leaf (:expression root) rebuilt)})))))
+
 (defn instantiate-value-source
   "Construct a pending canonical call from an exact generated entry.
 
@@ -378,12 +446,47 @@
                     (range binding-count)
                     (partition 2 (second (:original proposal)))
                     (partition 2 (second (:source proposal))) body-bindings)
+        used (volatile! (into #{} (filter symbol?)
+                              (tree-seq coll? seq [projected staged arguments (mapv :binding input-obligations)])))
+        fresh! (fn []
+                 (loop []
+                   (let [id (gensym "invocation_input__")]
+                     (if (contains? @used id) (recur)
+                         (do (vswap! used conj id) id)))))
+        body
+        (reduce
+         (fn [{:keys [bindings] :as state} root]
+           (let [first-index (+ (count staged) (count input-obligations) (count bindings))
+                 construction (ordered-allocation-inputs physical root first-index fresh!)
+                 arguments (:arguments construction)
+                 expression (if construction (:expression construction) (:expression root))
+                 root (cond-> (assoc root :call-binding-index (+ first-index (count arguments))
+                                         :expression expression)
+                        construction (assoc :argument-construction construction))]
+             (-> state
+                 (update :bindings into (map :binding arguments))
+                 (update :bindings conj [(:id root) expression])
+                 (update :roots conj root))))
+         {:bindings [] :roots []} roots)
+        roots (:roots body)
+        body-bindings (:bindings body)
         ;; Declarations for the candidate normalizer, NOT completed input/body
         ;; facts. The unchanged pending obligations still own every conversion.
         root-requirements
         (into {} (keep (fn [{:keys [original-id id]}]
                          (when-let [dt (fact-dtype (get (:normal-return-facts proposal) original-id))]
                            [id dt]))) roots)
+        root-requirements
+        (reduce (fn [requirements {:keys [argument-construction]}]
+                  (reduce (fn [requirements {:keys [binding completion]}]
+                            (let [id (first binding)
+                                  ^Class carrier (:parameter-carrier completion)]
+                              (if-let [dt (dtype/dtype-for-jvm-array-class carrier)]
+                                (assoc-in requirements [:array-types id] dt)
+                                (assoc-in requirements [:scalar-types id]
+                                          (dtype/dtype-for-scalar-tag (symbol (.getName carrier)))))))
+                          requirements (:arguments argument-construction)))
+                {:scalar-types root-requirements :array-types {}} roots)
         normalization-requirements
         (reduce (fn [requirements {:keys [slot source-dtype target-dtype]}]
                   (let [{:keys [object-binder input-binder parameter-class]} slot
@@ -392,7 +495,7 @@
                       source-dtype (assoc-in [:scalar-types object-binder] source-dtype)
                       target-dtype (assoc-in [:scalar-types input-binder] target-dtype)
                       array-dtype (update :array-types assoc object-binder array-dtype input-binder array-dtype))))
-                {:scalar-types root-requirements :array-types {}} input-obligations)]
+                root-requirements input-obligations)]
     {:proposal proposal :argument-plan plan :input-obligations input-obligations
      :qualified-source qualified :hygienic-source hygienic :projected-source projected
      :qualification-lookups @lookups :qualification-construction @qualification-construction
@@ -403,6 +506,139 @@
      :bindings (into (into staged (map :binding input-obligations)) body-bindings)
      :outputs (mapv #(if (symbol? %) (with-meta % nil) %) outputs)
      :admitted? false}))
+
+(defn- completion-replacement? [before after old-leaf new-leaf]
+  (if (completion/canonical-form? before)
+    (and (completion/canonical-form? after)
+         (identical? (second before) (second after))
+         (completion-replacement? (nth before 2) (nth after 2) old-leaf new-leaf))
+    (and (identical? before old-leaf) (identical? after new-leaf))))
+
+(defn ^:no-doc value-source-binding-layout
+  "Revalidate the complete pending call topology against original invocation observations.
+   Returns occurrence coordinates, never admission or successful completion evidence."
+  [{:keys [proposal argument-plan input-obligations root-bindings bindings projected-source]}]
+  (let [physical (:physical proposal)
+        {:keys [emission input-body]} physical
+        slots (:slots argument-plan)
+        prefix (into (mapv (fn [slot] [(:object-binder slot) (:original-argument slot)]) slots)
+                     (map :binding input-obligations))
+        original-roots (vec (partition 2 (second (:original proposal))))
+        projected-roots (vec (partition 2 (second projected-source)))
+        occupied (into #{} (filter symbol?) (tree-seq coll? seq [projected-source prefix]))
+        same-pair? (fn [a b] (and (= 2 (count a) (count b))
+                                  (every? true? (map identical? a b))))
+        expanded (into prefix
+                       (mapcat (fn [root]
+                                 (concat (map :binding (get-in root [:argument-construction :arguments]))
+                                         [[(:id root) (:expression root)]])))
+                       root-bindings)
+        ids (mapv first expanded)]
+    (when (and (vector? bindings) (vector? root-bindings)
+               (identical? (:template proposal) (::value-source-template physical))
+               (identical? (:original proposal) (get-in proposal [:template :original]))
+               (= (count (:completion-obligations proposal))
+                  (count (get-in proposal [:template :completion-obligations])))
+               (every? true?
+                       (map (fn [obligation original]
+                              (and (identical? (:token obligation) (:token original))
+                                   (identical? (:source obligation) (:source original))
+                                   (identical? (:contract obligation) (:contract original))
+                                   (= (:path obligation) (:path original))))
+                            (:completion-obligations proposal)
+                            (get-in proposal [:template :completion-obligations])))
+               (= (count root-bindings) (count original-roots) (count projected-roots))
+               (= (count expanded) (count bindings))
+               (every? lexical-id? ids) (= (count ids) (count (set ids)))
+               (every? true? (map same-pair? expanded bindings))
+               (loop [remaining (seq root-bindings) next-index (count prefix) ordinal 0]
+                 (if-let [root (first remaining)]
+                   (let [construction (:argument-construction root)
+                         arguments (:arguments construction)
+                         expected-root-index (+ next-index (count arguments))
+                         original-expression (second (nth original-roots ordinal))
+                         projected-expression (second (nth projected-roots ordinal))
+                         {original :expression path :path} (completion-leaf original-expression)
+                         observed (when construction
+                                    (bytecode/retained-input-completed-invocation-context
+                                     emission input-body original))
+                         ^java.lang.reflect.Method method (:method observed)
+                         carriers (when (instance? java.lang.reflect.Method method)
+                                    (vec (.getParameterTypes method)))
+                         candidate (:candidate-call construction)
+                         rebuilt (:constructed-call construction)
+                         argument-valid?
+                         (fn [ordinal argument]
+                           (let [[id expression] (:binding argument)
+                                 parts (completion/canonical-parts expression)
+                                 input (nth (:inputs observed) ordinal nil)
+                                 completed (nth (:input-completions observed) ordinal nil)]
+                             (and parts (not (contains? occupied id))
+                                  (= :pending (:status argument))
+                                  (= ordinal (:input-index argument))
+                                  (= (+ next-index ordinal) (:call-binding-index argument))
+                                  (= (into [1 (inc (* 2 (:root-index root)))] (conj path (+ 2 ordinal)))
+                                     (:template-source-path argument))
+                                  (identical? (nth (vec (descriptor/call-args original)) ordinal nil)
+                                              (:original-operand argument))
+                                  (identical? input (:input argument))
+                                  (identical? completed (:completion argument))
+                                  (identical? (nth (vec (descriptor/call-args candidate)) ordinal nil)
+                                              (:operand argument))
+                                  (identical? (:operand argument) (:operand parts))
+                                  (identical? (:contract argument) (:contract parts))
+                                  (= (:contract argument)
+                                     (completion/planned-bytecode-input-contract
+                                      (nth carriers ordinal) (:context input) (:emitted-type completed)))
+                                  (identical? id (nth (vec (descriptor/call-args rebuilt)) ordinal nil)))))
+                         valid?
+                         (and (= ordinal (:root-index root))
+                              (= expected-root-index (:call-binding-index root))
+                              (identical? original-expression (:original-expression root))
+                              (if construction
+                                (and observed (= :global-typed-indy (:invocation-mode observed))
+                                     (identical? original (:source-input observed))
+                                     (identical? original (get-in construction [:observed :source-input]))
+                                     (= 2 (count arguments) (count carriers))
+                                     (not (.isVarArgs method))
+                                     (dtype/dtype-for-jvm-array-class (first carriers))
+                                     (identical? Long/TYPE (second carriers))
+                                     (identical? original (:source-call construction))
+                                     (= path (:template-call-path construction))
+                                     (identical? (:expression observed) (get-in construction [:observed :expression]))
+                                     (identical? method (get-in construction [:observed :method]))
+                                     (identical? (:inputs observed) (get-in construction [:observed :inputs]))
+                                     (identical? (:input-completions observed)
+                                                 (get-in construction [:observed :input-completions]))
+                                     (identical? (:receiver observed) (get-in construction [:observed :receiver]))
+                                     (= (:invocation-mode observed) (get-in construction [:observed :invocation-mode]))
+                                     (identical? projected-expression (:input-expression construction))
+                                     (identical? candidate (:expression (completion-leaf projected-expression)))
+                                     (seq? rebuilt) (= 4 (count rebuilt))
+                                     (identical? (first candidate) (first rebuilt))
+                                     (identical? (second candidate) (second rebuilt))
+                                     (identical? (second original) (:receiver observed))
+                                     (identical? (second original) (second candidate))
+                                     (completion-replacement? projected-expression (:expression root) candidate rebuilt)
+                                     (every? true? (map-indexed argument-valid? arguments)))
+                                (identical? projected-expression (:expression root))))]
+                     (and valid? (recur (next remaining) (inc expected-root-index) (inc ordinal))))
+                   (= next-index (count bindings)))))
+      (let [indices
+            (mapv (fn [{:keys [path]}]
+               (let [[container position] path
+                     index (when (and (= container 1) (integer? position) (pos? position) (odd? position))
+                             (quot position 2))
+                     root (when (and index (< index (count root-bindings))) (nth root-bindings index))
+                     arguments (get-in root [:argument-construction :arguments])
+                     matches (filterv (fn [{prefix :template-source-path}]
+                                        (= prefix (vec (take (count prefix) path)))) arguments)]
+                 (when (and root (<= (count matches) 1))
+                   (if-let [argument (first matches)]
+                     (:call-binding-index argument) (:call-binding-index root)))))
+                  (:completion-obligations proposal))]
+        (when (every? integer? indices)
+          {:bindings expanded :body-obligation-indices indices})))))
 
 (defn- reference-check [carrier value]
   (if (or (nil? carrier) (= Object carrier)) value

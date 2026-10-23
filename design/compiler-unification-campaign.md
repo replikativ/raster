@@ -28,6 +28,36 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 ordered-argument construction checkpoint: the generated-call constructor
+now exposes the real allocator's positional completions as pending bindings. It
+retains the exemplar CHECKCAST, then original size evaluation plus Long coercion,
+then the same helper call on completed locals. Boxed public-entry arguments retain
+their different, existing all-operands-before-wrapper-conversions convention.
+Only exact flat global typed invocation roots with retained two-input observations
+and array/Long Method carriers are covered. Classifier metadata selects a candidate;
+it does not establish an allocation contract or successful completion.
+
+One checked layout joins every original root and derived input to its exact binding,
+original Method/receiver/mode/input vectors, physical entry and template occurrence.
+Body completions moved with an argument follow its template `:operand` path; outer
+completions stay on the root. Copied, missing, sibling-redirected and ambiguous
+occurrences refuse. The original bytecode input observer now handles an immediate
+canonical completion through its existing private catalog, not a new registry.
+
+Affected-layer checks pass 102 tests / 1,596 assertions. These include raw-bit
+whole-program JVM comparisons on changed training inputs and malformed/empty arrays,
+plus a nonvacuous nested-completion case distinguishing a bad exemplar's cast from
+division-by-zero in the following size. Review identified and corrected the semantic
+template-path convention before landing. The real pending capture has three allocator
+constructions, six new input obligations and 75 total obligations; it is unadmitted.
+
+The remaining production boundary is unchanged: join the original host shape input
+executor to InvocationPlan, validate the logical/backing relation before acquiring
+resident buffers, prove numerical continuations separately, and finalize all origins
+and completions before removing any exact import marker. No second JVM module is
+required to certify the helper that the allocation contract will replace. No kernel,
+model, performance, full-CI or resident-admission acceptance is claimed by these tests.
+
 October 22 root-coordinate checkpoint: generated-call roots now carry explicit
 root and call-binding indices. Import construction validates each index against
 the exact binder/expression pair before mapping any completion obligation through

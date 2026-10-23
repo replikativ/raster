@@ -151,32 +151,21 @@
         before-lift (pairs (:original (unique-stage events :lift-scalar-reductions)))
         by-source (group-by :source-index origins)]
     (mapv
-     (fn [import-index {:keys [call placement import]}]
+     (fn [import-index {:keys [call placement import physical]}]
        (let [prefix (get-in placement [:binding-site :prefix])
              start (count prefix)
              bindings (:bindings call)
              end (+ start (count bindings))
              ninputs (count (:input-obligations call))
              slots (get-in call [:argument-plan :slots])
-             expected-layout (into (into (mapv (fn [slot] [(:object-binder slot) (:original-argument slot)]) slots)
-                                         (map :binding (:input-obligations call)))
-                                   (map (juxt :id :expression) (:root-bindings call)))]
-         (when-not (and (= ninputs (count slots))
+             layout (generated/value-source-binding-layout call)
+             expected-layout (:bindings layout)]
+         (when-not (and (identical? physical (get-in call [:proposal :physical]))
+                        layout (= ninputs (count slots))
                         (= (count expected-layout) (count bindings))
                         (every? true? (map #(identical? %1 (:slot %2)) slots (:input-obligations call)))
                         (every? true? (map same-pair? expected-layout bindings)))
            (refuse! "prepared module obligation layout differs from its staged argument and body plan" {:import-index import-index}))
-         (when-not (every? true?
-                          (map-indexed
-                           (fn [index {:keys [root-index call-binding-index id expression]}]
-                             (and (= index root-index)
-                                  (integer? call-binding-index)
-                                  (<= (* 2 ninputs) call-binding-index)
-                                  (< call-binding-index (count bindings))
-                                  (same-pair? [id expression] (nth bindings call-binding-index))))
-                           (:root-bindings call)))
-           (refuse! "prepared module root mapping differs from its constructed binding"
-                    {:import-index import-index}))
          (when-not (and (<= end (count source-pairs))
                         (every? true? (map same-pair? prefix (take start source-pairs)))
                         (every? true? (map same-pair? bindings (subvec source-pairs start end)))
@@ -197,19 +186,30 @@
                                           (nth binding-origins (+ ninputs index))]})
                      (range) (:input-obligations call))
                body-obligations
-               (mapv (fn [index obligation]
+               (mapv (fn [index obligation call-binding-index]
                        (let [[container position] (:path obligation)
                              root-index (when (and (= 1 container) (integer? position) (pos? position) (odd? position))
                                           (quot position 2))]
-                         (when-not (and root-index (< root-index (count (:root-bindings call))))
+                         (when-not (and root-index (< root-index (count (:root-bindings call)))
+                                        (integer? call-binding-index)
+                                        (<= 0 call-binding-index) (< call-binding-index (count binding-origins)))
                            (refuse! "prepared completion is outside the retained root binding interval" {:path (:path obligation)}))
                          {:id [import-index :body index] :obligation obligation
-                          :binding-origins [(nth binding-origins
-                                                 (:call-binding-index
-                                                  (nth (:root-bindings call) root-index)))]}))
-                     (range) (get-in call [:proposal :completion-obligations]))]
+                          :binding-origins [(nth binding-origins call-binding-index)]}))
+                     (range) (get-in call [:proposal :completion-obligations])
+                     (:body-obligation-indices layout))
+               argument-obligations
+               (into []
+                     (mapcat
+                      (fn [{:keys [root-index argument-construction]}]
+                        (map (fn [{:keys [input-index call-binding-index] :as argument}]
+                               {:id [import-index :argument root-index input-index]
+                                :obligation argument
+                                :binding-origins [(nth binding-origins call-binding-index)]})
+                             (:arguments argument-construction))))
+                     (:root-bindings call))]
            {:import import :call call :binding-origins binding-origins
-            :obligation-origins (into input-obligations body-obligations)})))
+            :obligation-origins (into (into input-obligations body-obligations) argument-obligations)})))
      (range) imports)))
 
 (deftype ^:private PreparedModulePhase [context observations]

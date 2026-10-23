@@ -1219,7 +1219,8 @@
 (defn ^:no-doc retained-input-source-context
   "Associate a compound input with its ORIGINAL owned source occurrence.
    This proves correspondence, not semantic equivalence of arbitrary expanded
-   syntax. Consumers must still close the admitted lexical/read/call region.
+   syntax. Immediate call, binding, reduction and canonical completion origins
+   are supported. Consumers must still close the admitted lexical/read/call region.
    A transformed wrapper without the same immediate occurrence refuses."
   [emission original input-index]
   (when-let [parent (retained-invocation-context emission original)]
@@ -1232,6 +1233,7 @@
               actual (:operand input)
               scope-token (::binding-scope-occurrence (meta source))
               call-token (::call-occurrence (meta source))
+              completed (retained-owned-completion-context emission source)
               reduction (retained-reduction-emission emission source)]
           (when (or (and scope-token
                          (identical? source (get (:binding-catalog emission) scope-token))
@@ -1239,6 +1241,11 @@
                     (and call-token
                          (identical? source (get (:invocation-catalog emission) call-token))
                          (identical? call-token (::call-occurrence (meta actual))))
+                    ;; A canonical input completion is its own catalogued occurrence.
+                    ;; Preserve the immediate wrapper, not just a nested call token.
+                    (and completed
+                         (or (identical? actual source)
+                             (identical? actual (:expression completed))))
                     ;; Reduction expansion changes the immediate input's
                     ;; syntax. Its actual emitted bound scope, not a copied
                     ;; source token, establishes this parent/region edge.
@@ -1257,7 +1264,8 @@
         (let [source (nth arguments input-index)
               owned-source (or (input-origin emission input-body source :invocation)
                                (input-origin emission input-body source :binding)
-                               (input-origin emission input-body source :reduction))
+                               (input-origin emission input-body source :reduction)
+                               (input-origin emission input-body source :completion))
               input (retained-input-source-context emission owned-parent input-index)]
           (when (and owned-source input (identical? owned-source (:source-original input)))
             (assoc input :source-input source)))))))
