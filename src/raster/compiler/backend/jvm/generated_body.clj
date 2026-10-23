@@ -368,11 +368,14 @@
         [_ bindings outputs] projected
         body-bindings (mapv (fn [[id expression]] [(with-meta id nil) expression])
                             (partition 2 bindings))
-        roots (mapv (fn [[original-id original-expression] [candidate-id candidate-expression]
+        roots (mapv (fn [root-index [original-id original-expression] [candidate-id candidate-expression]
                          [id expression]]
-                      {:original-id original-id :original-expression original-expression
+                      {:root-index root-index
+                       :call-binding-index (+ (count staged) (count input-obligations) root-index)
+                       :original-id original-id :original-expression original-expression
                        :candidate-id candidate-id :candidate-expression candidate-expression
                        :id id :expression expression})
+                    (range binding-count)
                     (partition 2 (second (:original proposal)))
                     (partition 2 (second (:source proposal))) body-bindings)
         ;; Declarations for the candidate normalizer, NOT completed input/body

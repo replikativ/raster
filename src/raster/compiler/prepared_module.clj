@@ -166,6 +166,17 @@
                         (every? true? (map #(identical? %1 (:slot %2)) slots (:input-obligations call)))
                         (every? true? (map same-pair? expected-layout bindings)))
            (refuse! "prepared module obligation layout differs from its staged argument and body plan" {:import-index import-index}))
+         (when-not (every? true?
+                          (map-indexed
+                           (fn [index {:keys [root-index call-binding-index id expression]}]
+                             (and (= index root-index)
+                                  (integer? call-binding-index)
+                                  (<= (* 2 ninputs) call-binding-index)
+                                  (< call-binding-index (count bindings))
+                                  (same-pair? [id expression] (nth bindings call-binding-index))))
+                           (:root-bindings call)))
+           (refuse! "prepared module root mapping differs from its constructed binding"
+                    {:import-index import-index}))
          (when-not (and (<= end (count source-pairs))
                         (every? true? (map same-pair? prefix (take start source-pairs)))
                         (every? true? (map same-pair? bindings (subvec source-pairs start end)))
@@ -193,7 +204,9 @@
                          (when-not (and root-index (< root-index (count (:root-bindings call))))
                            (refuse! "prepared completion is outside the retained root binding interval" {:path (:path obligation)}))
                          {:id [import-index :body index] :obligation obligation
-                          :binding-origins [(nth binding-origins (+ (* 2 ninputs) root-index))]}))
+                          :binding-origins [(nth binding-origins
+                                                 (:call-binding-index
+                                                  (nth (:root-bindings call) root-index)))]}))
                      (range) (get-in call [:proposal :completion-obligations]))]
            {:import import :call call :binding-origins binding-origins
             :obligation-origins (into input-obligations body-obligations)})))

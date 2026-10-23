@@ -138,6 +138,13 @@
        (is (= #{:reduction :continuation} (set (map :lift-role (val split)))))
        (is (= 5 (count (:input-obligations call))))
        (is (identical? call (:call joined)))
+       (is (every? true?
+                    (map (fn [{:keys [call-binding-index id expression]}]
+                           (let [[actual-id actual-expression]
+                                 (nth (:bindings call) call-binding-index)]
+                             (and (identical? id actual-id)
+                                  (identical? expression actual-expression))))
+                         (:root-bindings call))))
        (is (identical? (:import (first imports)) (:import joined)))
        (is (= (count (:bindings call)) (count (:binding-origins joined))))
        (is (= (+ (count (:input-obligations call)) (count (get-in call [:proposal :completion-obligations])))
@@ -343,3 +350,15 @@
                        (let [call (apply construct args) bindings (:bindings call)]
                          (assoc call :bindings (assoc bindings 0 (nth bindings 1) 1 (nth bindings 0)))))]
          (is (= :unclosed-prepared-module-phase (reason capture))))))))
+
+(deftest root-index-mappings-cannot-redirect-completion-obligations
+  (let [construct generated/instantiate-value-source]
+    (doseq [alter [(fn [call] (update-in call [:root-bindings 0] dissoc :call-binding-index))
+                  (fn [call] (assoc-in call [:root-bindings 0 :call-binding-index] 0))
+                  (fn [call] (update-in call [:root-bindings 0 :call-binding-index] inc))
+                  (fn [call] (assoc-in call [:root-bindings 0 :root-index] 1))]]
+      (entry/call-with-definition-inputs
+       (fn []
+         (with-redefs [generated/instantiate-value-source
+                       (fn [& args] (alter (apply construct args)))]
+           (is (= :unclosed-prepared-module-phase (reason capture)))))))))

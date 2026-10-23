@@ -28,6 +28,24 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 22 root-coordinate checkpoint: generated-call roots now carry explicit
+root and call-binding indices. Import construction validates each index against
+the exact binder/expression pair before mapping any completion obligation through
+it. Four forged/missing/redirection cases refuse. Prepared-module controls pass
+15 tests / 164 assertions. This replaces positional root arithmetic without yet
+adding argument staging or granting admission.
+
+The next constructor change is owner-authenticated argument ANF: preserve each
+actual invocation input's completion in evaluation order, then consume the completed
+locals in the allocation contract. Real allocator observations have exemplar
+CHECKCAST followed by selected size evaluation and Object-to-Long coercion; treating
+either as identity from its logical type would be unsound. Reuse the retained
+invocation-input region for the host-only shape computation, not a new executor
+or resident integer arithmetic theorem. Numerical continuations remain resident.
+The rebuilt helper need not be JVM-emitted: original physical Method/mode/receiver
+and input-completion evidence plus exact constructor joins own the correspondence.
+Derived input/root indices will require one disjoint, complete topology check.
+
 October 22 ordered-storage checkpoint: source storage analysis now threads actual
 AbstractValues through bindings in source order. Public scalar declarations may
 supply scalar carriers, but later local declarations cannot authorize an earlier
