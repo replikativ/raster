@@ -1988,9 +1988,48 @@
     (is (identical? (get-in roots [:array-type-witness-root :constructed])
                     (get-in roots [:lift-scalar-reductions :original])))
     (is (identical? output (get-in roots [:normalize-source :constructed])))
+    (let [spine (first (filter #(= :normalize-binding-spine (:stage %)) @events))
+          input-pairs (vec (partition 2 (second (:original spine))))
+          output-pairs (vec (partition 2 (second output)))
+          entries (:entries spine)
+          outputs (mapcat :outputs entries)]
+      (is (identical? (get-in roots [:lift-scalar-reductions :constructed]) (:original spine)))
+      (is (identical? output (:constructed spine)))
+      (is (= (vec (range (count input-pairs))) (mapv :input-index entries)))
+      (is (= (vec (range (count output-pairs))) (mapv :index outputs)))
+      (doseq [[entry pair] (map vector entries input-pairs)]
+        (is (every? true? (map identical? pair (:input-binding entry)))))
+      (doseq [{:keys [index binding origin]} outputs]
+        (is (every? true? (map identical? binding (nth output-pairs index)))))
+      (is (every? #(= :source-binding (:origin %)) outputs)))
     (let [count-before (count @events)]
       (doall output)
       (is (= count-before (count @events)) "no lazy notices escape the capture interval"))))
+
+(deftest normalization-spine-records-derived-extent-bindings-at-their-owning-source-position
+  (let [source '(let* [alias xs
+                      effect (raster.par/map! out i (clojure.core/* rows width)
+                                             double (clojure.core/aget alias i))]
+                 out)
+        options {:source-ns *ns* :array-types {'xs :double 'out :double}
+                 :scalar-types {'rows :long 'width :long}}
+        events (atom [])
+        output (frontend/normalize-source source options #(swap! events conj %))
+        spine (first (filter #(= :normalize-binding-spine (:stage %)) @events))
+        [alias-entry map-entry] (:entries spine)
+        output-pairs (vec (partition 2 (second output)))
+        outputs (mapcat :outputs (:entries spine))]
+    (is (= output (frontend/normalize-source source options)) "observation does not alter normalization")
+    (is (= 2 (count (:entries spine))))
+    (is (= [0 1] (mapv :input-index (:entries spine))))
+    (is (= [:source-binding] (mapv :origin (:outputs alias-entry))))
+    (is (= [:derived-normalization-binding :source-binding] (mapv :origin (:outputs map-entry))))
+    (is (= [0 1 2] (mapv :index outputs)))
+    (is (identical? output (:constructed spine)))
+    (doseq [{:keys [index binding]} outputs]
+      (is (every? true? (map identical? binding (nth output-pairs index)))))
+    (is (identical? (first (:input-binding map-entry))
+                    (get-in map-entry [:outputs 1 :binding 0])))))
 
 (deftest value-normalization-excludes-device-copy-and-extent-projections
   (let [source '(let* [copy (clojure.core/aclone input)

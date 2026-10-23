@@ -4116,8 +4116,8 @@
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
             occupied-symbols (set (filter symbol? (tree-seq coll? seq source)))
-            {:keys [normalized]}
-            (reduce
+            origins (when *normalization-observer* (volatile! []))
+            step
              (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
                          local-scalar-types buffer-aliases]
                    :as state}
@@ -4360,10 +4360,42 @@
 
                    :else
                    (update state :normalized conj [symbol expression]))))
+            {:keys [normalized]}
+            (reduce
+             (if-not origins step
+               (fn [state [ordinal pair :as input]]
+                 (let [prefix (:normalized state)
+                       start (count prefix)
+                       next-state (step state input)
+                       output (:normalized next-state)]
+                   (when-not (<= start (count output))
+                     (fail! :raster/bug "normalization origin recorder lost its output prefix"
+                            {:input-index ordinal}))
+                   (vswap! origins conj
+                           {:input-index ordinal :input-binding pair
+                            :outputs (mapv (fn [index binding]
+                                             {:index index :binding binding
+                                              :origin (if (identical? (first pair) (first binding))
+                                                        :source-binding :derived-normalization-binding)})
+                                           (range start (count output)) (subvec output start))})
+                   next-state)))
              {:normalized [] :compound-extents {} :checked-extents {} :allocation-lengths {}
               :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
-             (map-indexed vector pairs))]
-        (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
+             (map-indexed vector pairs))
+            constructed (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source))]
+        (if origins
+          (let [recorded (into [] (mapcat :outputs) @origins)]
+            ;; Check the persistent pair objects once at the end, rather than
+            ;; rescanning every prefix at every binding (quadratic capture).
+            (when-not (and (= (count recorded) (count normalized))
+                           (every? true?
+                                   (map-indexed (fn [index output]
+                                                  (and (= index (:index output))
+                                                       (identical? (:binding output) (nth normalized index))))
+                                                recorded)))
+              (fail! :raster/bug "normalization origins do not cover the final binding spine" {}))
+            (observe-normalization! :normalize-binding-spine source constructed {:entries @origins}))
+          constructed))
       source)))
 
 (defn- alength-array

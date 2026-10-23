@@ -10017,6 +10017,29 @@ wide-add/narrow test passes ten assertions on OpenCL/Level Zero with changed rep
 and explicit resident-API refusal. This is host-result qualification, not resident
 composition or a broad green CI receipt.
 
+### Prepared-module normalization correspondence (in progress)
+
+The generated-AD import path now observes the final normalization binding spine
+at its constructor, including extent bindings inserted immediately before their
+owning operation. Each post-lift input position retains its exact input pair and
+the ordered output pair objects it produced. A final linear identity check rejects
+missing, rebuilt or reordered pairs; the ordinary no-observer path has no origin
+capture or scan. These notices are correspondence inputs, not admission evidence.
+
+The focused recorder gate passes 2 tests / 52 assertions in the reused REPL.
+The complete frontend namespace still reports 18 failures / 1 error; rerunning
+the 142 unaffected tests with the committed normalizer reproduces all of them.
+Those ownership, loop and mixed-radix coverage failures remain debt, not waived
+tests. The exact-head CI for 8cb5408c also remains red: distributed training and
+fixture emission decline unclosed generated completions; OpenCL additionally
+exposes unchecked scalar/stage-observation and resident-step-count obligations.
+
+Next, a private phase owner must seal the actual source-construction and
+normalization histories and join every final binding to its physical module
+obligations. Neither observer data nor logical dtype declarations can close the
+prepared-import marker. Publication still requires complete ordered execution,
+completion, storage, runtime-view and output accounting.
+
 ### Observable scalar checkpoints alongside resident state
 
 A returned loss can precede VJP and optimizer effects, while the typed envelope
