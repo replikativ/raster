@@ -149,16 +149,39 @@
       (refuse! "prepared module value cannot be declared as both scalar and array" {:binding id}))
     result))
 
+(defn- import-insertion-site
+  [source {:keys [placement call assembly]}]
+  (let [original-prefix (get-in placement [:binding-site :prefix])
+        bindings (:bindings call)
+        source-pairs (pairs source)
+        prefix (if assembly (:prefix assembly) original-prefix)
+        start (if assembly (:start assembly) (count prefix))
+        end (when (integer? start) (+ start (count bindings)))]
+    (when assembly
+      (let [original-pairs (pairs (:original-source assembly))
+            original-start (count original-prefix)
+            original-end (+ original-start (count bindings))]
+        (when-not (and (identical? source (:constructed-source assembly))
+                       (= original-start (:original-start assembly))
+                       (<= original-end (count original-pairs))
+                       (every? true? (map same-pair? original-prefix (subvec original-pairs 0 original-start)))
+                       (every? true? (map same-pair? bindings (subvec original-pairs original-start original-end))))
+          (refuse! "import assembly lost its original exact cut" {}))))
+    (when-not (and (vector? original-prefix) (vector? prefix) (vector? bindings) (seq bindings)
+                   (integer? start) (= start (count prefix))
+                   (<= 0 start end (count source-pairs))
+                   (every? true? (map same-pair? prefix (subvec source-pairs 0 start)))
+                   (every? true? (map same-pair? bindings (subvec source-pairs start end))))
+      (refuse! "import assembly lost its constructed insertion interval" {}))
+    {:prefix prefix :start start :end end}))
+
 (defn- import-origins [source events origins imports]
-  (let [source-pairs (pairs source)
-        before-lift (pairs (:original (unique-stage events :lift-scalar-reductions)))
+  (let [before-lift (pairs (:original (unique-stage events :lift-scalar-reductions)))
         by-source (group-by :source-index origins)]
     (mapv
-     (fn [import-index {:keys [call placement import physical]}]
-       (let [prefix (get-in placement [:binding-site :prefix])
-             start (count prefix)
+     (fn [import-index {:keys [call import physical] :as descriptor}]
+       (let [{:keys [start end]} (import-insertion-site source descriptor)
              bindings (:bindings call)
-             end (+ start (count bindings))
              ninputs (count (:input-obligations call))
              slots (get-in call [:argument-plan :slots])
              layout (generated/value-source-binding-layout call)
@@ -169,9 +192,7 @@
                         (every? true? (map #(identical? %1 (:slot %2)) slots (:input-obligations call)))
                         (every? true? (map same-pair? expected-layout bindings)))
            (refuse! "prepared module obligation layout differs from its staged argument and body plan" {:import-index import-index}))
-         (when-not (and (<= end (count source-pairs))
-                        (every? true? (map same-pair? prefix (take start source-pairs)))
-                        (every? true? (map same-pair? bindings (subvec source-pairs start end)))
+         (when-not (and (<= end (count before-lift))
                         (every? true? (map #(identical? (first %1) (first %2))
                                            bindings (subvec before-lift start end))))
            (refuse! "prepared module bindings lost their exact cut insertion interval" {:import-index import-index}))
@@ -223,18 +244,22 @@
     (doseq [import (:imports context)] (assert-import-current! import))
     true))
 
+(declare authored-source-layout prepare-authored-layout)
+
 (defn construct-source
   "Construct, represent and normalize one exact frontend under its source history.
    Requires an active definition collector. Only direct public-parameter inputs
    currently have prepared-call carrier evidence; other imported expressions refuse.
-   Compiler preparation precedes the final AD cut. Representation runs once after
+   The optional authored-segment preparer discovers real cuts first, prepares
+   only their caller segments, then records a new assembly construction. Ordinary
+   preparation still runs on whole no-import source. Representation runs once after
    closing that pre-SoA source construction; imported spines currently require an
    identity representation. Ordinary no-import sources use the same construction
    and normalization path without manufacturing a PreparedModulePhase.
    The returned handoff map is NOT authority: its retained objects own provenance.
    A prepared phase seals construction only, never admission or marker closure."
   ([source-frontend options] (construct-source source-frontend options {}))
-  ([source-frontend options {:keys [prepare-source represent-source]
+  ([source-frontend options {:keys [prepare-source represent-source prepare-authored-segment]
                              :or {prepare-source identity
                                   represent-source (fn [source options]
                                                      {:body source :options options})}}]
@@ -248,41 +273,70 @@
         normalized-source (first (transport/effective-body (:walked-body normalization)))
         environment (zipmap parameters (get-in source-frontend [:source-entry :tags]))
         minted (volatile! [])
+        assembly (volatile! nil)
+        consume
+        (fn [event placement]
+          (let [caller @caller
+                prepared (:prepared event)
+                physical (reverse/prepared-bytecode-entry prepared)
+                _ (when-not (and physical (reverse/adopt-prepared-program-inputs! prepared))
+                    (refuse! "prepared module producer could not join its enclosing owner" {}))
+                _ (when-not caller
+                    (refuse! "prepared module has no actual caller entry carriers" {}))
+                facts (mapv (:parameter-facts caller) (:arguments event))
+                _ (when-not (every? some? facts)
+                    (refuse! "prepared module call requires exact public parameter arguments" {}))
+                call (generated/instantiate-value-source physical (:params prepared)
+                                                         (vec (:arguments event)) facts)
+                nonce (Object.)
+                import {:event event :call call :status :pending :admitted? false :nonce nonce}
+                ports (if (= :grad (:mode event)) (vec (rest (:outputs call))) (:outputs call))]
+            (vswap! minted conj {:event event :placement placement :prepared prepared
+                                 :physical physical :call call :import import :nonce nonce})
+            {:ports ports :bindings (:bindings call) :import import}))
+        discover
+        (fn [source]
+          (binding [inline/*defer-prepared-ad-expansion?* false
+                    transport/*prepared-program-consumer* consume]
+            (inline/inline-ad-applications source environment)))
         expanded
         (transport/with-source-construction-history
          (:source-normalization normalization)
-         #(let [prepared-source
-                ;; Do not expose the insertion consumer to earlier passes. A
-                ;; generated spine inserted here would be rewritten again by
-                ;; preparation, invalidating its occurrence-owned obligations.
-                (binding [transport/*prepared-program-consumer* nil
-                          inline/*defer-prepared-ad-expansion?* true]
-                  (prepare-source normalized-source))]
-            (binding [inline/*defer-prepared-ad-expansion?* false
-                      transport/*prepared-program-consumer*
-                  (fn [event placement]
-                    (let [caller @caller
-                          prepared (:prepared event)
-                          physical (reverse/prepared-bytecode-entry prepared)
-                          _ (when-not (and physical (reverse/adopt-prepared-program-inputs! prepared))
-                              (refuse! "prepared module producer could not join its enclosing owner" {}))
-                          _ (when-not caller
-                              (refuse! "prepared module has no actual caller entry carriers" {}))
-                          facts (mapv (:parameter-facts caller) (:arguments event))
-                          _ (when-not (every? some? facts)
-                              (refuse! "prepared module call requires exact public parameter arguments" {}))
-                          call (generated/instantiate-value-source physical (:params prepared)
-                                                                   (vec (:arguments event)) facts)
-                          nonce (Object.)
-                          import {:event event :call call :status :pending :admitted? false :nonce nonce}
-                          ports (if (= :grad (:mode event)) (vec (rest (:outputs call))) (:outputs call))]
-                      (vswap! minted conj {:event event :placement placement :prepared prepared
-                                           :physical physical :call call :import import :nonce nonce})
-                      {:ports ports :bindings (:bindings call) :import import}))]
-              (inline/inline-ad-applications prepared-source environment))))
+         #(let [discovered (when prepare-authored-segment (discover normalized-source))
+                prepared-source
+                ;; Whole-source preparation is only legal before a cut exists.
+                ;; Once discovered, generated spines stay outside all rewriting.
+                (when-not (seq @minted)
+                  (binding [transport/*prepared-program-consumer* nil
+                            inline/*defer-prepared-ad-expansion?* true]
+                    (prepare-source normalized-source)))
+                source (if (seq @minted) discovered (discover prepared-source))]
+            (if (and prepare-authored-segment (seq @minted))
+              (let [prepared (binding [transport/*prepared-program-consumer* nil
+                                       inline/*defer-prepared-ad-expansion?* true]
+                               (prepare-authored-layout
+                                (authored-source-layout source @minted) environment
+                                (assoc options :source-ns (get-in source-frontend [:source-entry :source-ns]))
+                                prepare-authored-segment))
+                    result (:source prepared)
+                    imports (mapv (fn [import]
+                                    (update import :assembly assoc :original-source source :constructed-source result))
+                                  (:imports prepared))]
+                (vreset! assembly (assoc prepared :original source :constructed result :imports imports))
+                (vreset! minted imports)
+                (transport/observe-construction! source result environment)
+                result)
+              source)))
         construction (transport/source-construction-view (:source-construction expanded)
                                                          (:source-normalization normalization) (:form expanded))
         cuts (:prepared-program-cuts construction)]
+    (when @assembly
+      (let [{:keys [original constructed]} @assembly
+            edges (filterv #(and (identical? original (:original %))
+                                  (identical? constructed (:constructed %)))
+                           (:type-elaborations construction))]
+        (when-not (= 1 (count edges))
+          (refuse! "authored assembly lacks its exact construction-history edge" {}))))
     (when-not (and construction (= (count cuts) (count @minted))
                    (every? true?
                            (map (fn [cut {:keys [event placement call import nonce]}]
@@ -333,6 +387,7 @@
           import-origins (when (seq @minted)
                            (import-origins physical-source @events origins @minted))
           context {:source-construction (:source-construction expanded)
+                   :authored-assembly @assembly
                    :normalization (:source-normalization normalization)
                    :source (:form expanded) :physical-source physical-source
                    :normalized normalized :options physical-options
@@ -418,15 +473,9 @@
   (let [source-pairs (pairs source)]
     (loop [remaining imports cursor 0 stages []]
       (if-let [import (first remaining)]
-        (let [prefix (get-in import [:placement :binding-site :prefix])
-              bindings (get-in import [:call :bindings])
-              start (count prefix)
-              end (+ start (count bindings))]
-          (when-not (and (vector? prefix) (vector? bindings)
-                         (<= cursor start end (count source-pairs))
-                         (seq bindings)
-                         (every? true? (map same-pair? prefix (subvec source-pairs 0 start)))
-                         (every? true? (map same-pair? bindings (subvec source-pairs start end)))
+        (let [{:keys [start end]} (import-insertion-site source import)
+              bindings (get-in import [:call :bindings])]
+          (when-not (and (<= cursor start)
                          (generated/value-source-binding-layout (:call import))
                          (identical? (:physical import) (get-in import [:call :proposal :physical])))
             (refuse! "authored preparation lost an exact nonoverlapping import interval"

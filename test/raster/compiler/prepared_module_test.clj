@@ -43,6 +43,22 @@
         second-gradient (clojure.core/nth second-vg 1)]
     (raster.dl.nn/residual-add first-gradient second-gradient width)))
 
+(core/deftm hidden-gradient
+  [theta :- (Array float) x :- (Array float) y :- (Array float)
+   rows :- Long width :- Long] :- (Array float)
+  (let [vg ((reverse/value+grad (var raster.compiler.fixtures.distributed-training/local-loss)
+                              :wrt [0]) theta x y rows width)]
+    (clojure.core/nth vg 1)))
+
+(core/deftm authored-with-hidden-gradient
+  [theta :- (Array float) x :- (Array float) y :- (Array float)
+   rows :- Long width :- Long] :- (Array float)
+  (let [vg ((reverse/value+grad (var raster.compiler.fixtures.distributed-training/local-loss)
+                              :wrt [0]) theta x y rows width)
+        first-gradient (clojure.core/nth vg 1)
+        second-gradient (hidden-gradient theta x y rows width)]
+    (raster.dl.nn/residual-add first-gradient second-gradient width)))
+
 (deftest two-late-imports-retain-distinct-occurrence-and-obligation-identities
   (entry/call-with-definition-inputs
    (fn []
@@ -229,6 +245,116 @@
       (is (every? #(not (contains? (:values %) 'future)) @seen))
       (is (every? #(not (contains? (:values %) 'a)) @seen))
       (is (= 1 (quot (count (second (:source result))) 2))))))
+
+(deftest authored-assembly-composes-construction-and-normalization-history
+  (doseq [[source expected-imports] [[#'training/local-gradient-sum 1] [#'two-gradient-imports 2]]]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [root (core/resolve-deftm-var source)
+             _ (core/prepare-deftm-frontend! root)
+             frontend (entry/original-source-frontend root)
+             normalizations (atom 0)
+             normalize frontend/normalize-source
+             result (with-redefs [frontend/normalize-source
+                                  (fn [& args] (swap! normalizations inc) (apply normalize args))]
+                      (module/construct-source
+                       frontend {:dtype :float :target-device :ocl:assembled-source :segmented-plans? true}
+                       {:prepare-source (fn [_] (throw (AssertionError. "unresolved source entered whole preparation")))
+                        :prepare-authored-segment
+                        (fn [source options]
+                          (pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes options))}))
+             phase (:prepared-phase result)
+             normalized (:frontend-source result)
+             view (module/view phase normalized)
+             assembly (:authored-assembly view)
+             construction (transport/source-construction-view (:construction result) (:normalization result)
+                                                              (:represented-source result))
+             components (module/analyze-source-components phase normalized)]
+         (is (= 1 @normalizations))
+         (is (some? phase))
+         (is (identical? (:constructed assembly) (:represented-source result)))
+         (is (not (identical? (:original assembly) (:constructed assembly))))
+         (is (= expected-imports (count (:prepared-program-cuts construction))))
+         (is (= (* 3 expected-imports) (count (:allocations components))))
+         (is (= (* 6 expected-imports) (count (:pending-inputs components))))
+         (is (= expected-imports (count (:unclosed-source-imports @entry/*emission-inputs*))))
+         (is (false? (:admitted? view)))
+         (is (nil? (#'frontend/continue-source-components* components)))
+         (is (= (inc (* 2 expected-imports)) (count (module/authored-layout phase normalized)))))))))
+
+(deftest authored-assembly-tracks-shifted-cuts-and-refuses-damaged-history
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [root (core/resolve-deftm-var #'two-gradient-imports)
+           _ (core/prepare-deftm-frontend! root)
+           frontend (entry/original-source-frontend root)
+           options {:dtype :float :target-device :ocl:shifted-assembly :segmented-plans? true}
+           prepare (fn [source options]
+                     (let [prepared (pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes options)
+                           fresh (with-meta (gensym "assembly_local_") {:raster.type/tag 'long})]
+                       (list* (first prepared) (into (vec (second prepared)) [fresh 0]) (drop 2 prepared))))
+           result (module/construct-source frontend options {:prepare-authored-segment prepare})
+           phase (:prepared-phase result)
+           normalized (:frontend-source result)
+           view (module/view phase normalized)
+           second-import (second (:imports view))
+           insertion (:assembly second-import)
+           components (module/analyze-source-components phase normalized)]
+       (is (= (inc (:original-start insertion)) (:start insertion)))
+       (is (= 6 (count (:allocations components))))
+       (is (= 12 (count (:pending-inputs components))))
+       (doseq [change [#(update % :start inc)
+                       #(update % :original-start inc)
+                       #(dissoc % :original-source)
+                       #(update % :constructed-source (fn [source] (apply list source)))]]
+         (is (= :unclosed-prepared-module-phase
+                (reason #(#'module/import-insertion-site
+                          (:source view) (update second-import :assembly change))))))
+       (is (= 2 (count (:unclosed-source-imports @entry/*emission-inputs*)))))))
+  (entry/call-with-definition-inputs
+   (fn []
+     (with-redefs [transport/observe-construction! (fn [& _] nil)]
+       (is (= :unclosed-prepared-module-phase
+              (reason #(module/construct-source
+                        (source-frontend) {:dtype :float}
+                        {:prepare-authored-segment (fn [source _] source)}))))))))
+
+(deftest modular-construction-keeps-ordinary-preparation-once
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [root (core/resolve-deftm-var #'ordinary-source)
+           _ (core/prepare-deftm-frontend! root)
+           calls (atom 0)
+           result (module/construct-source
+                   (entry/original-source-frontend root) {:dtype :double}
+                   {:prepare-source (fn [source] (swap! calls inc) source)
+                    :prepare-authored-segment (fn [& _] (throw (AssertionError. "ordinary source prepared as import")))})]
+       (is (= 1 @calls))
+       (is (nil? (:prepared-phase result)))
+       (is (empty? (:unclosed-source-imports @entry/*emission-inputs*)))))))
+
+(deftest authored-preparation-cannot-expand-an-undiscovered-import
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [root (core/resolve-deftm-var #'authored-with-hidden-gradient)
+           _ (core/prepare-deftm-frontend! root)
+           failure (try
+                     (module/construct-source
+                      (entry/original-source-frontend root) {:dtype :float :target-device :ocl:undiscovered-import}
+                      {:prepare-authored-segment
+                       (fn [source options]
+                         (is (true? inline/*defer-prepared-ad-expansion?*))
+                         (is (nil? transport/*prepared-program-consumer*))
+                         (pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes options))})
+                     nil
+                     (catch clojure.lang.ExceptionInfo error
+                       (if (contains? #{:stale-definition-proof-input :unstable-definition-proof-input}
+                                      (:reason (ex-data error)))
+                         (throw error)
+                         (ex-data error))))]
+       (is (some? failure))
+       (is (or (seq (:non-exempt-untagged failure)) (seq (:undevirtualized failure))))
+       (is (empty? (:unclosed-source-imports @entry/*emission-inputs*)))))))
 
 (deftest ordinary-multiform-source-keeps-every-statement-in-order
   (entry/call-with-definition-inputs

@@ -28,6 +28,33 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 source-history integration checkpoint: the shared constructor can now
+discover canonical prepared calls before authored preparation, then record the
+assembled result under a new actual source-construction edge. The old placement
+records remain unchanged. One insertion-site validator checks both their original
+prefix/member interval and the new source identity, prefix and shifted offset
+before composing with ordinary normalization origins. This removes repeated span
+validation rather than adding a parallel source-origin interpretation.
+
+Actual one/two-import constructor tests normalize once, retain three/six Float
+allocations and six/twelve pending input occurrences, and still refuse semantic
+continuation. Shifted cuts, damaged history/source/offset records and missing
+construction observations refuse. Ordinary modular no-import construction still
+prepares once. Imported representation remains identity-only.
+
+Authored preparation explicitly disables the prepared consumer and defers further
+AD expansion. A previously undiscovered application exposed through a helper is
+rejected by the unchanged GPU census; it cannot create an untracked legacy spine.
+Supporting further discovery requires another explicit cut/assembly composition,
+not a census exception. Failed construction publishes no pending marker to its
+parent. The test preserves existing whole-compilation retries for cold lazy
+definition changes rather than catching staleness as an expected domain refusal.
+
+Independent review approved the composition and the hidden-import hardening.
+The affected gate passes 127 tests / 1,404 assertions. Equation-first adoption,
+whole-source typing/import/InvocationPlan/source-owner finalization and resident
+model acceptance remain work; this constructor result does not authorize them.
+
 October 23 authored preparation/assembly checkpoint: a private constructor now
 runs the existing preparation pipeline only on authored segments, retaining all
 intermediate exports and splicing original imported binding members unchanged.
