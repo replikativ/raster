@@ -344,7 +344,13 @@
               (throw (ex-info "prepared module canonical spine is not a complete fresh pending import"
                               {:reason :unclosed-prepared-program-bindings}))))
           (let [initial (get-in placement [:binding-site :live-symbols])
-                known (into (into reserved initial) (map first bindings))]
+                ;; Reservations include operator spellings and other nonlocal
+                ;; syntax. They prevent name collisions, but must not turn a
+                ;; cast such as `float` into a phantom captured local.
+                known (into initial
+                            (concat (map first bindings)
+                                    (map first (:bindings projection))
+                                    (take-nth 2 (second (get-in placement [:binding-site :scope])))))]
             (binding [util/*shadowing-locals* known]
               (reduce (fn [live [id expression]]
                         (let [missing (remove live (util/free-syms expression))]

@@ -54,6 +54,38 @@ The affected reused-REPL gate passes 104 tests / 970 assertions across source
 transport/construction, prepared imports, inlining, and generated boxed-entry
 and module proposals. Independent review approved this construction-only slice.
 
+The unchanged complete `local-gradient-sum` construction now also reaches the
+normalizer through its actual caller cut in a non-executing REPL prototype:
+one import, five input obligations, 64 body-completion obligations and 69 final
+bindings, with the one original import marker still open. The observer records
+the actual uniquification, array-type-witness and reduction-split edges. The
+same six scalar/allocation sites refuse; no permissive frontend switch was used.
+This exercise exposed a closure bug: broad collision reservations include
+operator spellings, so only actual lexical binder families may seed free-local
+recognition. A regression protects bare `float` cast syntax and retains the
+negative forward-reference controls.
+
+Fresh CI passes namespace loading after the declaration fix, then identifies
+missing logical declarations on the new boxed-entry completion results. These
+are now supplied at construction from exact builtin target Classes using the
+existing type tables. No operand hint, JVM hint, normal-return evidence or
+ownership permission follows. The unchanged typedness census and explicit
+completion barriers remain enforced.
+
+Reviewed integration seam: provisional frontend admission must be limited to
+exact owned-import binding obligations sealed against the normalization trace.
+The existing ordered-source traversal should consume the prepared producer's
+guarded physical context and compile scalar continuations in its one step map.
+Post-reduction division must depend on the produced reduction value, not outline
+and rerun the original whole initializer. Allocations must join existing storage
+contracts rather than become scalar callbacks. Only complete step, allocation,
+completion and result coverage may close the exact marker. This remains future
+production work, not a permission granted by the prototype.
+Qualification of the constructor/closure corrections passes 168 tests / 1,430
+assertions in the reused REPL, plus the focused unchanged-census test's four
+assertions. Independent review approved the complete correction diff. These
+receipts do not supersede full exact-head CI or establish runtime admission.
+
 October 22 prepared-module positioning checkpoint: the early AD module cut now
 retains the inliner's actual scope, binding ordinal and already-constructed prefix.
 Compilation-local identity registration authenticates both the scope and the exact

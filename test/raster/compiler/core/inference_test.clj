@@ -4,6 +4,14 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.par]))
 
+(deftest late-inference-retains-boxed-entry-result-declarations
+  (doseq [[carrier tag] [[Float/TYPE 'float] [Double/TYPE 'double] [Long/TYPE 'long]
+                         [(class (double-array 0)) 'doubles] [(class (float-array 0)) 'floats]]]
+    (let [term (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier)
+                                          (with-meta 'input {:raster.type/tag 'wrong}))]
+      (is (= tag (inf/infer-arg-tag term {'input 'Object})))
+      (is (nil? (:tag (meta term))) "logical declaration is not a JVM storage hint"))))
+
 (deftest source-qualification-transports-only-a-completions-operand
   (let [scope (create-ns (gensym "raster.qualified-completion."))
         contract (completion/bytecode-result-context-contract

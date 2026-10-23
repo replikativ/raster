@@ -17,6 +17,13 @@
     (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
       (test!))))
 
+(deftest a-boxed-entry-logical-declaration-is-not-an-owned-producer-fact
+  (let [term (completion/complete-value
+              (completion/bytecode-boxed-parameter-contract Float/TYPE) 'input)]
+    (is (= 'float (:raster.type/tag (meta term))))
+    (is (nil? (normal/completed-scalar-fact term {} *ns*)))
+    (is (nil? (normal/completed-scalar-fact term {'input {:carrier Object}} *ns*)))))
+
 (deftest completion-presence-does-not-infer-a-payload-or-authorize-execution
   (doseq [contract [completion/object-input-contract
                     (completion/reference-check-contract Number)

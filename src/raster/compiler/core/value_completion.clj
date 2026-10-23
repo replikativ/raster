@@ -8,6 +8,7 @@
    None is inferred from a scalar tag or permission to reorder calls or enable
    an AD rule."
   (:require [raster.compiler.core.util :as util]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.source-policy :as source-policy]))
 
 (def completion-symbol
@@ -209,9 +210,23 @@
 (defn- value-meta [contract expression]
   ;; A new value term cannot inherit the original callee's identity/effects or
   ;; a JVM hint which changes physical compilation. Retain declarations only.
-  (select-keys (meta expression)
-               (cond-> [:line :column :file]
-                 (= object-input-contract contract) (conj :raster.type/tag))))
+  (let [metadata (select-keys (meta expression)
+                              (cond-> [:line :column :file]
+                                (= object-input-contract contract) (conj :raster.type/tag)))
+        ;; This conversion declares its result, not its operand. Carry the
+        ;; wrapper's explicit builtin target to the logical type pipeline at
+        ;; construction; never repair a lost type by guessing at a consumer.
+        ;; No JVM hint, successful conversion, presence or physical input fact
+        ;; follows from this declaration. Exact Class identity stays in contract.
+        ^Class target (:target-carrier contract)
+        tag (when (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
+              (if (.isPrimitive target)
+                (let [tag (symbol (.getName target))]
+                  (when (and (contains? types/primitive-info tag)
+                             (identical? target (types/tag->java-class tag))) tag))
+                (some (fn [[tag carrier]] (when (identical? target carrier) tag))
+                      types/primitive-array-info)))]
+    (cond-> metadata tag (assoc :raster.type/tag tag))))
 
 (defn complete-value
   "Build a checked completion term. The contract must come from the original

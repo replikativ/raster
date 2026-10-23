@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest testing is]]
             [pattern.nanopass.dialect :as nanopass]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.simplify :as simplify]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
@@ -13,6 +14,21 @@
             [raster.compiler.ad.flatten :as flat]
             [raster.compiler.ir.dialects :as dialects]
             [raster.ad.reverse :as rad]))
+
+(deftest boxed-entry-construction-transports-types-through-the-existing-census
+  (let [floating (completion/complete-value (completion/bytecode-boxed-parameter-contract Float/TYPE) 'input)
+        array (completion/complete-value
+               (completion/bytecode-boxed-parameter-contract (class (double-array 0))) 'array)
+        source (list 'let* ['floating floating 'storage array] '[floating storage])
+        tagged (#'pipeline/tag-expr-types source {'input 'Object 'array 'Object})
+        declarations (mapv #(get (meta %) :raster.type/tag) (take-nth 2 (second tagged)))
+        census (#'pipeline/record-fixpoint-census! :final tagged
+                {:target-device :cuda:equation-first-compile-gate})]
+    (is (= '[float doubles] declarations))
+    (is (zero? (:non-exempt-untagged census)))
+    (is (zero? (:undevirtualized census)))
+    (is (completion/contains-completion? tagged)
+        "typedness does not erase the conversion or discharge its owner")))
 
 (defn- isolated-fixpoint [input expand]
   ;; Isolate termination from producer behavior. Real compiled workloads remain

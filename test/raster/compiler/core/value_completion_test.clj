@@ -1,9 +1,26 @@
 (ns raster.compiler.core.value-completion-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as completion]))
 
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
+
+(deftest boxed-entry-results-carry-the-explicit-builtin-target-declaration
+  (doseq [[tag carrier] (concat (map (fn [[tag _]] [tag (types/tag->java-class tag)])
+                                    types/primitive-info)
+                               types/primitive-array-info)]
+    (let [operand (with-meta 'value {:raster.type/tag 'wrong :tag 'Object
+                                    :line 7 :raster.effect/effectful true})
+          term (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier) operand)]
+      (is (= {:line 7 :raster.type/tag tag} (meta term)))
+      (is (identical? operand (:operand (completion/canonical-parts term))))
+      (is (identical? carrier (get-in (completion/canonical-parts term) [:contract :target-carrier])))
+      (is (nil? (completion/object-value-declaration term)))))
+  (doseq [carrier [Object String java.lang.Number (class (object-array 0))]]
+    (let [term (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier)
+                                          (with-meta 'value {:tag 'double :raster.type/tag 'float}))]
+      (is (empty? (meta term)) "unknown/reference target must not inherit an operand's numeric type"))))
 
 (deftest boxed-entry-contract-is-a-distinct-bytecode-only-boundary
   (doseq [carrier [Double/TYPE Float/TYPE Long/TYPE Integer/TYPE Boolean/TYPE

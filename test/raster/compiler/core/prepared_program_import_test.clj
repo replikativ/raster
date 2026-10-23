@@ -180,6 +180,20 @@
     (is (contains? (get-in @seen [:binding-site :live-symbols])
                    (ffirst (get-in @seen [:binding-site :prefix]))))))
 
+(deftest reserved-operator-spellings-do-not-become-phantom-locals
+  (let [consume transport/consume-prepared-program-projection
+        calls (atom 0)]
+    (with-redefs [transport/consume-prepared-program-projection
+                  (fn [projection placement]
+                    (consume projection (update placement :reserved-symbols conj 'float)))]
+      (expand (fn [event _]
+                (swap! calls inc)
+                {:ports '[module_loss module_gradient nil]
+                 :bindings '[[module_loss (float 1.0)]
+                             [module_gradient (float module_loss)]]
+                 :import {:event event :status :pending}})))
+    (is (= 1 @calls))))
+
 (deftest grad-mode-keeps-its-own-ordered-slots-without-a-loss-port
   (let [seen (atom nil)
         imported (expand #'grad-root
