@@ -125,6 +125,12 @@
     (when-not plan
       (fail! :resident-projection-invocation
              "resident emitted-program projection requires its typed invocation plan" {}))
+    (when-let [step (first (filter invocation/reference-completion? (:steps plan)))]
+      ;; Graph liveness does not make a source check removable. This projection
+      ;; has no source executor, even when no numerical graph reads its result.
+      (fail! :unclosed-invocation-reference-completion
+             "resident marker projection cannot discard a retained reference check"
+             {:step (:id step)}))
     (when (get-in plan [:attributes :terminal-host-result])
       (fail! :explicit-host-result-required
              "resident marker projection cannot discard terminal host observation" {}))

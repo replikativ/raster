@@ -841,6 +841,8 @@
                                 (get-in semantic [:attributes :allocations])))
              expression (or (:source-expression allocation)
                             (when (= :result-allocation (:kind realization)) (:expression realization)))]
+         (when (invocation/reference-completion? step)
+           (refuse! source-entry :reference-completion))
          (when (invocation/scalar-compute? step)
            (when-not (identical? step (get-in scalar-source [:steps (:id step) :step]))
              (refuse! source-entry :scalar-compute)))

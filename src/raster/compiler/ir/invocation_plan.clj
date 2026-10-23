@@ -15,6 +15,7 @@
             [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.invocation-source :as invocation-source]
@@ -29,6 +30,9 @@
 (defrecord BufferAllocation [id symbol operands initialization value])
 (defrecord BufferClone [id symbol operands source value])
 (defrecord ValueAlias [id symbol operands source value])
+;; An owner-local source action, not a portable cast or a storage alias. Its
+;; Class-bearing completion occurrence remains exact; an executor is still owed.
+(defrecord ReferenceCompletion [id symbol operands source completion value])
 (defrecord InvocationPlan
            [id parameters steps bindings storage-bindings
             program-inputs program-outputs values attributes])
@@ -49,6 +53,8 @@
   (record-kind? "raster.compiler.ir.invocation_plan.BufferClone" x))
 (defn value-alias? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.ValueAlias" x))
+(defn reference-completion? [x]
+  (record-kind? "raster.compiler.ir.invocation_plan.ReferenceCompletion" x))
 (defn invocation-plan? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.InvocationPlan" x))
 
@@ -240,7 +246,8 @@
 (defn invocation-step?
   [x]
   (or (shape-projection? x) (scalar-compute? x)
-      (buffer-allocation? x) (buffer-clone? x) (value-alias? x)))
+      (buffer-allocation? x) (buffer-clone? x) (value-alias? x)
+      (reference-completion? x)))
 
 (defn- fail!
   [reason message data]
@@ -381,6 +388,16 @@
        (= (:dtype left) (:dtype right))
        (av/storage-contract-compatible? left right)))
 
+(defn- reference-completion-parts
+  "Recognize a retained reference check, not permission to erase or execute it."
+  [expression]
+  (when-let [{:keys [contract operand] :as parts} (completion/canonical-parts expression)]
+    (when (and (contains? #{:jvm-checkcast :jvm-bytecode-reference-input}
+                          (:source-context contract))
+               (symbol? operand)
+               (dtype/dtype-for-jvm-array-class (:target-carrier contract)))
+      parts)))
+
 (defn- validate-step!
   [step values available]
   (when-not (invocation-step? step)
@@ -468,6 +485,21 @@
                        (compatible-value? source-value value))
           (fail! :invocation-buffer-clone
                  "buffer clone requires one storage-compatible source"
+                 {:step id :source (:source step) :value value})))
+
+      (reference-completion? step)
+      (let [{:keys [contract operand]} (reference-completion-parts (:completion step))
+            source-value (get values (:source step))]
+        (when-not (and contract (buffer-value? value)
+                       (= 1 (count operands))
+                       (= (:source step) (get operands operand))
+                       ;; A reference check cannot change logical layout, leases,
+                       ;; presence or capacity, even when storage is compatible.
+                       (= source-value value)
+                       (= (dtype/canon (:dtype value))
+                          (dtype/dtype-for-jvm-array-class (:target-carrier contract))))
+          (fail! :invocation-reference-completion
+                 "reference completion requires one unchanged typed buffer and its retained check"
                  {:step id :source (:source step) :value value})))
 
       (value-alias? step)
@@ -705,6 +737,11 @@
       (cond-> (->BufferAllocation id symbol (allocation-operands value environment)
                                   initialization value)
         (:helper projection) (assoc :source-projection projection))
+
+      (and (buffer-value? value) (reference-completion-parts expression))
+      (let [operand (:operand (reference-completion-parts expression))]
+        (->ReferenceCompletion id symbol (referenced-operands expression environment)
+                               (get environment operand) expression value))
 
       (symbol? expression)
       (->ValueAlias id symbol (referenced-operands expression environment)
@@ -958,13 +995,32 @@
                         (fail! :invocation-source-projection
                                "source length conversions are not the retained exact projection"
                                {:binding symbol :source canonical}))
+                    _ (when (and (reference-completion? actual)
+                                 (not (identical? canonical (:completion actual))))
+                        (fail! :invocation-source-reference-completion
+                               "reference completion lost its exact source occurrence"
+                               {:binding symbol}))
                     step (prefix-step (:id plan) ordinal symbol canonical
                                       (:value (get steps-by-symbol symbol)) environment
                                       (into {} (map (fn [[symbol id]] [symbol (get-in plan [:values id])])) environment))]
                 {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
             {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
             (map-indexed vector step-pairs)))
-          _ (when-not (semantic/equivalent? expected-steps (:steps plan))
+          _ (when-not (and (= (count expected-steps) (count (:steps plan)))
+                           (every?
+                            true?
+                            (map (fn [expected actual]
+                                   (if (reference-completion? expected)
+                                     ;; Class-bearing source is owner-local, not
+                                     ;; serializable semantic fingerprint data.
+                                     ;; Compare its exact retained occurrence;
+                                     ;; fingerprint all remaining pure IR fields.
+                                     (and (reference-completion? actual)
+                                          (identical? (:completion expected) (:completion actual))
+                                          (semantic/equivalent? (dissoc expected :completion)
+                                                                (dissoc actual :completion)))
+                                     (semantic/equivalent? expected actual)))
+                                 expected-steps (:steps plan))))
               (fail! :invocation-source-step-mismatch
                      "invocation steps differ from their canonical source producers"
                      {:expected expected-steps :actual (:steps plan)}))

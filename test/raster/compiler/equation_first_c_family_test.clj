@@ -7,6 +7,7 @@
             [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.core.hardware :as compiler-hardware]
             [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.equation-artifact :as equation-artifact]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -24,6 +25,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
@@ -34,6 +36,7 @@
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
@@ -1854,6 +1857,36 @@
       (is (= :portable-segmap
              (get-in kernel [:attributes :kernel-body :attributes :kind])))
       (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest resident-marker-projection-cannot-prune-an-unused-reference-check
+  (let [compilation (equation-first/compile #'c-family-elementwise {:target cuda-target :dtype :float})
+        emitted (:emitted compilation)
+        old-plan (get-in emitted [:attributes :invocation-plan])
+        input-value (:value (first (:parameters old-plan)))
+        expression (completion/complete-value
+                    (completion/reference-check-contract (class (float-array 0))) 'input)
+        _ (is (empty? (:steps old-plan)) "fixture has no other host prefix")
+        plan (invocation/from-prefix
+              {:id (:id old-plan)
+               :parameters (mapv :symbol (:parameters old-plan))
+               :parameter-values (into {} (map (juxt :symbol :value)) (:parameters old-plan))
+               :bindings [['unused-check expression]] :binding-values {'unused-check input-value}
+               :program-values (:values old-plan)
+               :program-inputs (:program-inputs old-plan) :program-outputs (:program-outputs old-plan)
+               :attributes (:attributes old-plan)})
+        source (:source emitted)
+        with-check (-> emitted
+                       (assoc :source (apply list (first source)
+                                             (into (second source) ['unused-check expression])
+                                             (drop 2 source)))
+                       (assoc-in [:attributes :invocation-plan] plan))]
+    (is (seq (:kernels compilation)) "the numerical graph remains live")
+    (is (identical? with-check (emitted-program/validate! with-check)))
+    (is (some #(= 'unused-check (:binding %)) (invocation/source-order plan with-check)))
+    (is (not-any? #(some '#{unused-check} (:operands %)) (:equations with-check)))
+    (is (= :unclosed-invocation-reference-completion
+           (try (resident-projection/project with-check cuda-target) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
 
 (deftest public-scan-uses-one-portable-kernel-body-graph
   (doseq [[target program-dialect module-target]

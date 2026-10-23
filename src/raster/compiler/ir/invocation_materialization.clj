@@ -455,6 +455,11 @@
         id (:id step)
         materialized
         (cond
+          (invocation/reference-completion? step)
+          (fail! :unclosed-invocation-reference-completion
+                 "a retained reference check requires its source-owned executor"
+                 {:step id})
+
           (invocation/shape-projection? step)
           (let [source (get values (:source step))]
             (when-not (materialized-buffer? source)
@@ -658,6 +663,13 @@
    return one typed scalar. It is neither retained nor called for shapes, allocations or aliases."
   [plan arguments evaluate-scalar]
   (let [initial (begin-materialization plan arguments)
+        _ (when-let [step (first (filter invocation/reference-completion?
+                                        (get-in initial [:plan :steps])))]
+            ;; Eager materialization has no source owner. Refuse the complete
+            ;; capability set before invoking even an earlier scalar callback.
+            (fail! :unclosed-invocation-reference-completion
+                   "a retained reference check requires its source-owned executor"
+                   {:step (:id step)}))
         final (reduce (fn [state _] (advance-materialization state evaluate-scalar))
                       initial (get-in initial [:plan :steps]))]
     ;; The eager chain is produced here, not supplied by a caller. Keep its

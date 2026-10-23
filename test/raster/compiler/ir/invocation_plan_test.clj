@@ -5,6 +5,7 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-source :as invocation-source]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.parallel-program :as program]))
 
 (defn- scalar [dtype]
@@ -34,6 +35,85 @@
                  {:id :sum :site [:binding 'total] :source '(sum x)
                   :operands '[x] :results '[total] :operations '[(reduce)]
                   :effects #{} :provenance {} :attributes {}})]}))
+
+(defn- reference-fixture [expression input output]
+  (let [plan (invocation/from-prefix
+              {:id :retained-reference :parameters '[x] :parameter-values {'x input}
+               :bindings [['checked expression]] :binding-values {'checked output}
+               :program-values {'checked output 'total (scalar :double)}
+               :program-inputs '[checked] :program-outputs '[total]})
+        p (-> (terminal-program 'total)
+              (assoc :source (list 'let* ['checked expression 'total '(sum checked)] 'total)
+                     :inputs '[checked]
+                     :values {'checked output 'total (scalar :double)})
+              (assoc-in [:equations 0 :source] '(sum checked))
+              (assoc-in [:equations 0 :operands] '[checked]))]
+    [plan p]))
+
+(deftest reference-completion-is-an-ordered-check-not-an-alias
+  (let [value (array-value :double 4)
+        expression (completion/complete-value
+                    (completion/reference-check-contract (class (double-array 0))) 'x)
+        [plan p] (reference-fixture expression value value)
+        step (first (:steps plan))
+        evaluator-calls (atom 0)]
+    (is (invocation/reference-completion? step))
+    (is (not (invocation/value-alias? step)))
+    (is (identical? expression (:completion step)))
+    (is (identical? value (:value step)))
+    (is (= (:id step) (:invocation-step (first (invocation/source-order plan p)))))
+    (is (= (:id step) (:invocation-step (first (invocation/source-host-actions plan p)))))
+    (is (= :unclosed-invocation-reference-completion
+           (reason-of #(materialization/materialize
+                        plan [(double-array 4)]
+                        (fn [& _] (swap! evaluator-calls inc) {:type :double :value 0.0})))))
+    (is (zero? @evaluator-calls))
+    (let [with-earlier-scalar
+          (invocation/from-prefix
+           {:id :reference-preflight :parameters '[x] :parameter-values {'x value}
+            :bindings [['prior '(clojure.core/+ 1 2)] ['checked expression]]
+            :binding-values {'prior (scalar :long) 'checked value}
+            :program-values {'checked value}
+            :program-inputs '[checked] :program-outputs '[checked]})]
+      (is (= :unclosed-invocation-reference-completion
+             (reason-of #(materialization/materialize
+                          with-earlier-scalar [(double-array 4)]
+                          (fn [& _] (swap! evaluator-calls inc) {:type :long :value 3})))))
+      (is (zero? @evaluator-calls)))
+    (let [copy (with-meta (apply list expression) (meta expression))]
+      (is (= :invocation-source-reference-completion
+             (reason-of #(invocation/source-order
+                          (assoc-in plan [:steps 0 :completion] copy) p)))))
+    (doseq [changed [(array-value :float 4) (array-value :double 5)
+                     (assoc value :attributes {:presence :present})]]
+      (is (= :invocation-reference-completion
+             (reason-of #(reference-fixture expression value changed)))))))
+
+(deftest reference-completion-requires-the-canonical-array-check-and-earlier-operand
+  (let [value (array-value :double 4)]
+    (doseq [contract [(completion/reference-check-contract (class (float-array 0)))]]
+      (is (= :invocation-reference-completion
+             (reason-of #(reference-fixture (completion/complete-value contract 'x) value value)))))
+    (is (= :invocation-prefix-free-value
+           (reason-of #(reference-fixture
+                        (completion/complete-value
+                         (completion/reference-check-contract (class (double-array 0))) 'later)
+                        value value))))
+    (is (= :invocation-prefix-unsupported
+           (reason-of #(reference-fixture
+                        (completion/complete-value completion/object-input-contract 'x)
+                        value value))))))
+
+(deftest bytecode-reference-input-keeps-its-original-check-contract
+  (let [value (array-value :float 4)
+        contract (completion/planned-bytecode-input-contract
+                  (class (float-array 0))
+                  (completion/bytecode-operand-context {:preserve-source-call-results? true}) :ref)
+        expression (completion/complete-value contract 'x)
+        [plan p] (reference-fixture expression value value)]
+    (is (invocation/reference-completion? (first (:steps plan))))
+    (is (identical? expression (get-in plan [:steps 0 :completion])))
+    (is (= 1 (count (invocation/source-host-actions plan p))))))
 
 (def terminal-context
   {:source-policy {:unchecked-math false}

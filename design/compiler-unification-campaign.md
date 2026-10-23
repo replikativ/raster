@@ -28,6 +28,39 @@ items 3 and 5; it does not replace the other six obligations.
 
 ### October 21 operand-order repair and the next executable boundary
 
+October 23 reference-action checkpoint: `InvocationPlan` now distinguishes a
+retained `ReferenceCompletion` from a check-free `ValueAlias`. Both prefix
+construction and source-order rederivation use the same canonical reference
+contract over one preceding lexical buffer. The complete AV must remain
+unchanged; no non-null, capacity, initialization or successful-check fact is
+created. The original Class-bearing occurrence is compared by identity, not
+serialized or converted into a portable fingerprint; remaining pure IR fields
+retain semantic comparison.
+
+The new step is a source host action. Eager materialization rejects the whole
+unsupported capability set before earlier scalar evaluators; incremental
+materialization and ordered source preflight also refuse it. Review found that
+resident marker projection could otherwise prune a dead checked result. It now
+rejects these steps before graph-driven prefix pruning. A real emitted CUDA
+elementwise graph with a valid but unused reference-check prefix verifies that
+the check cannot disappear while numerical work stays live.
+
+Plan/materialization regressions pass 30 tests / 265 assertions; the real
+dead-check projection regression passes 1 test / 6 assertions. This represents
+an obligation, not its execution or whole-import closure. The actual training
+manifest still contains 75 obligations: five entry inputs, 64 body completions,
+and six allocator arguments. The six arguments comprise three reference checks
+and three checked Long size computations. A conditional candidate and the
+existing source owner's complete, transactional cover remain the next work;
+the ordinary pending-input continuation barrier is unchanged.
+
+The broader source-order/ordered-owner check reports 33 tests / 221 assertions,
+with one failure: `square` lacks the expected host-only equation in the
+source-position regression. Replacing only the planner functions with exact
+`2e5e2f79` versions in the same warm process reproduces that assertion failure;
+the new functions are restored afterwards. It remains an unresolved gate, not
+a skip or evidence that reference execution works.
+
 October 23 equation-first adoption checkpoint: the public compiler now uses the
 shared source constructor, including authored-segment preparation for discovered
 AD imports. Ordinary physical representation and storage-alias canonicalization
