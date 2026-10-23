@@ -74,11 +74,31 @@
   ;; Invert the existing builtin carrier table; no new type/function registry.
   ;; Object itself is not a numeric type. Only an independently established
   ;; exact builtin payload may supply its conditional normal-return dtype.
-  (some (fn [[tag boxed]]
-          (when (or (identical? boxed (:builtin-class fact))
-                    (identical? (types/tag->java-class tag) (:carrier fact)))
-            (dtype/dtype-for-scalar-tag tag)))
-        types/primitive-info))
+  (let [matches (into #{}
+                      (keep (fn [[tag boxed]]
+                              (when (or (identical? boxed (:builtin-class fact))
+                                        (identical? (types/tag->java-class tag) (:carrier fact)))
+                                (dtype/dtype-for-scalar-tag tag))))
+                      types/primitive-info)]
+    (when (= 1 (count matches)) (first matches))))
+
+(defn- project-numeric-completion [value from target details]
+  (let [to (fact-dtype {:carrier target})
+        operation (when to (symbol "clojure.core" (str "unchecked-" (name to))))
+        policy (when (and from to (not= from to)) (conversion/source-policy from to operation))]
+    (when-not (and from to)
+      (decline! "Generated numeric completion lacks an unambiguous builtin source and target"
+                (assoc details :source from :target to)))
+    {:source-dtype from :target-dtype to
+     :classification (if (= from to) :numeric-identity :scalar-conversion)
+     :candidate (if (= from to) value
+                    (if policy
+                      (let [[rounding overflow] policy]
+                        (list conversion/scalar-convert-symbol
+                              {:source-dtype from :target-dtype to :rounding rounding
+                               :overflow overflow :source-op operation} value))
+                      (decline! "Generated numeric completion has no exact scalar conversion"
+                                (assoc details :source from :target to))))}))
 
 (defn propose-value-source
   "Construct a canonical-source candidate plus EVERY outstanding completion.
@@ -151,28 +171,15 @@
                                                     (:input-carrier observed))
                                      (if (= :bool (:input-carrier observed)) :boolean (:input-carrier observed)))
                                    (fact-dtype source-fact)))
-                        to (when numeric?
-                             (some (fn [[tag _]]
-                                     (when (identical? (types/tag->java-class tag) (:target-carrier contract))
-                                       (dtype/dtype-for-scalar-tag tag))) types/primitive-info))
-                        operation (when to (symbol "clojure.core" (str "unchecked-" (name to))))
-                        policy (when (and from to (not= from to))
-                                 (conversion/source-policy from to operation))
+                        numeric (when numeric?
+                                  (project-numeric-completion value from (:target-carrier contract)
+                                                              {:path path :source-fact source-fact}))
+                        to (:target-dtype numeric)
                         projected
                         (cond
                           (= :jvm-primitive-input context)
                           (decline! "Source-policy input completion needs its own ordered projection" {:path path})
-                          (and numeric? (or (nil? from) (nil? to)))
-                          (decline! "Generated numeric completion lacks its exact builtin source payload"
-                                    {:path path :source-fact source-fact :contract contract})
-                          (and numeric? (not= from to))
-                          (if policy
-                            (let [[rounding overflow] policy]
-                              (list conversion/scalar-convert-symbol
-                                    {:source-dtype from :target-dtype to :rounding rounding :overflow overflow
-                                     :source-op operation} value))
-                            (decline! "Generated numeric completion has no exact scalar conversion"
-                                      {:path path :source from :target to}))
+                          numeric? (:candidate numeric)
                           :else value)]
                     (vswap! obligations conj {:source node :path path :observed observed
                                               :classification
@@ -181,7 +188,7 @@
                                                 :jvm-bytecode-result-context :result-context
                                                 (:jvm-checkcast :jvm-bytecode-reference-input) :reference-check
                                                 (if numeric?
-                                                  (if (= from to) :numeric-identity :scalar-conversion)
+                                                  (:classification numeric)
                                                   :reference-check))
                                               :candidate projected :status :pending
                                               :source-fact source-fact :source-dtype from :target-dtype to})
@@ -198,6 +205,100 @@
           {:source candidate :original source :physical physical
            :normal-return-facts facts :completion-obligations @obligations
            :admitted? false})))))
+
+(defn- validate-call-spine! [source binding-count output-count]
+  (let [[head bindings outputs] (when (seq? source) source)
+        ids (when (vector? bindings) (take-nth 2 bindings))]
+    (when-not (and (= 'let* head) (= 3 (count source))
+                   (vector? bindings) (= (* 2 binding-count) (count bindings))
+                   (= binding-count (count (set ids)))
+                   (every? #(and (symbol? %) (nil? (namespace %))) ids)
+                   (vector? outputs) (= output-count (count outputs)))
+      (decline! "Generated call construction did not preserve the complete flat spine" {})))
+  source)
+
+(defn instantiate-value-source
+  "Construct a pending canonical call from an exact generated entry.
+
+   `input-facts` are conditional producer requirements supplied by the caller,
+   NOT authenticated here. Every staged Object context, wrapper conversion and
+   body completion remains an explicit pending obligation. This constructor
+   grants no source correspondence, successful checks, scheduling or execution.
+   A later importer must authenticate these facts against the caller and join
+   the retained construction to normalization and one ordered InvocationPlan.
+
+   All original arguments are staged before ANY conversion. Unknown numeric
+   payloads refuse rather than borrowing the parameter's result declaration."
+  [physical parameters arguments input-facts]
+  (when-not (and (vector? input-facts) (= (count arguments) (count input-facts)))
+    (decline! "Generated call needs one pending producer requirement per original argument" {}))
+  (let [proposal (propose-value-source physical parameters)
+        plan (instantiate-boxed-entry-inputs physical parameters arguments)
+        source-ns (get-in physical [:emission :source-ns])
+        _ (when-not (and (instance? clojure.lang.Namespace source-ns)
+                         (identical? source-ns (find-ns (ns-name source-ns))))
+            (decline! "Generated call source namespace is no longer installed" {}))
+        staged (mapv (fn [[id node]] [id (:operand (completion/canonical-parts node))])
+                     (:object-bindings plan))
+        input-obligations
+        (mapv
+         (fn [slot fact [_ object-node] [_ conversion-node]]
+           (let [{:keys [parameter-class object-binder input-binder]} slot
+                 ^Class target parameter-class
+                 from (fact-dtype fact)
+                 numeric? (.isPrimitive target)
+                 numeric (when numeric?
+                           (project-numeric-completion object-binder from target
+                                                       {:ordinal (:ordinal slot) :input-fact fact}))]
+             {:slot slot :input-fact fact :source-dtype from :target-dtype (:target-dtype numeric)
+              :object-context object-node :conversion-context conversion-node
+              :classification (cond numeric? (:classification numeric)
+                                    (identical? Object target) :reference-identity
+                                    :else :reference-check)
+              :binding [input-binder (if numeric? (:candidate numeric) object-binder)] :status :pending}))
+         (:slots plan) input-facts (:object-bindings plan) (:input-bindings plan))
+        lookups (volatile! [])
+        qualification-construction (volatile! [])
+        qualified (inference/qualify-body-symbols
+                   (:source proposal) source-ns (set parameters) #(vswap! lookups conj %)
+                   (fn [original constructed bound]
+                     (vswap! qualification-construction conj {:original original :constructed constructed
+                                                               :bound bound})))
+        alpha-construction (volatile! [])
+        hygienic (util/alpha-convert
+                  {} qualified
+                  (fn [original constructed environment]
+                    (vswap! alpha-construction conj {:original original :constructed constructed
+                                                     :environment environment})))
+        substitution-construction (volatile! [])
+        projected (util/subst-syms
+                   (:substitutions plan) hygienic (fn [substitutions id] (get substitutions id id))
+                   (fn [original constructed substitutions]
+                     (vswap! substitution-construction conj {:original original :constructed constructed
+                                                              :substitutions substitutions})))
+        binding-count (quot (count (second (:original proposal))) 2)
+        output-count (count (last (:original proposal)))
+        _ (doseq [spine [(:source proposal) qualified hygienic projected]]
+            (validate-call-spine! spine binding-count output-count))
+        [_ bindings outputs] projected
+        body-bindings (mapv (fn [[id expression]] [(with-meta id nil) expression])
+                            (partition 2 bindings))
+        roots (mapv (fn [[original-id original-expression] [candidate-id candidate-expression]
+                         [id expression]]
+                      {:original-id original-id :original-expression original-expression
+                       :candidate-id candidate-id :candidate-expression candidate-expression
+                       :id id :expression expression})
+                    (partition 2 (second (:original proposal)))
+                    (partition 2 (second (:source proposal))) body-bindings)]
+    {:proposal proposal :argument-plan plan :input-obligations input-obligations
+     :qualified-source qualified :hygienic-source hygienic :projected-source projected
+     :qualification-lookups @lookups :qualification-construction @qualification-construction
+     :alpha-construction @alpha-construction
+     :substitution-construction @substitution-construction
+     :root-bindings roots
+     :bindings (into (into staged (map :binding input-obligations)) body-bindings)
+     :outputs (mapv #(if (symbol? %) (with-meta % nil) %) outputs)
+     :admitted? false}))
 
 (defn- reference-check [carrier value]
   (if (or (nil? carrier) (= Object carrier)) value
@@ -267,7 +368,8 @@
                       (when terminal
                         (mapcat
                          (fn [statement]
-                           (let [id (gensym "generated_effect__")
+                           (let [id (with-meta (gensym "generated_effect__")
+                                      {:raster.effect/effectful true})
                                  value (completion/complete-value
                                         (completion/bytecode-result-context-contract
                                          (:context terminal) :ref)

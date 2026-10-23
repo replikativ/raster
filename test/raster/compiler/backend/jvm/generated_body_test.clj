@@ -75,12 +75,14 @@
            pairs (partition 2 (second (first (:walked-body normalized))))]
        (is (some? normalized))
        (is (< 3 (count pairs)))
-       (is (some (fn [[_ value]]
-                   (when-let [{:keys [contract operand]} (completion/canonical-parts value)]
-                     (and (= :jvm-bytecode-result-context (:source-context contract))
-                          (seq? operand) (= 'do (first operand))
-                          (= 3 (count operand)) (nil? (last operand)))))
-                 pairs))
+       (let [statements (filter (fn [[_ value]]
+                                  (when-let [{:keys [contract operand]} (completion/canonical-parts value)]
+                                    (and (= :jvm-bytecode-result-context (:source-context contract))
+                                         (seq? operand) (= 'do (first operand))
+                                         (= 3 (count operand)) (nil? (last operand))))) pairs)]
+         (is (seq statements))
+         (is (every? #(true? (:raster.effect/effectful (meta (first %)))) statements)
+             "the producer carries the existing statement contract, not a guessed numerical dtype"))
        (doseq [x [2.75 -3.25 0.0]]
          (let [left (float-array [10.0 20.0]) right (aclone left)]
            (is (identical? left (invoke original [left x])))

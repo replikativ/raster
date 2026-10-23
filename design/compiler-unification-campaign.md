@@ -86,6 +86,38 @@ assertions in the reused REPL, plus the focused unchanged-census test's four
 assertions. Independent review approved the complete correction diff. These
 receipts do not supersede full exact-head CI or establish runtime admission.
 
+The real-call construction is now factored into the existing generated-body
+module, rather than duplicated in the REPL importer. It stages every argument
+before conversion, retains the exact caller input requirements and wrapper
+contexts as pending obligations, and uses the same numeric-completion projection
+law as body projection. Contradictory builtin/physical dtype requirements refuse.
+Qualification, alpha-renaming and substitution retain their actual constructor
+events; complete flat-spine validation precedes the original/candidate/projected
+root join so it cannot silently truncate. No new producer API or registry is
+needed: existing prepared-entry queries and observation adoption suffice for a
+compiler-local guarded import context.
+
+An actual caller-cut regression now retains the unchanged training program's
+five input and 64 body obligations with the original marker open. Additional
+tests reject unknown/ambiguous numeric requirements, shortened or duplicated
+spines and detached source namespaces. This still does not install provisional
+frontend admission or close the scalar, allocation and runtime-view obligations.
+
+Fresh unit CI also exposed generated discarded-statement bindings without the
+existing effect-statement marker. The helper constructor now carries that marker
+at the authenticated original terminal-discard position. It adds no numerical
+type, conversion success or census exemption. Existing emitted value and failure
+domain comparisons, including the whole unchanged training helpers, remain the
+semantic oracle.
+The affected gate passes 178 tests / 1,568 assertions before removal of one
+redundant statement-shape assertion. The targeted hardware-free distributed
+training-composition test advances past the repaired census boundary but still
+errors at direct TypedSOAC coverage; it is not counted green or skipped. Complete
+owned-module admission and ordered scalar/allocation closure remain required.
+The final deduplicated statement namespace passes 6 tests / 88 assertions.
+Independent review approved the call constructor, conversion factoring, complete
+trace checks and producer statement-marker repair.
+
 October 22 prepared-module positioning checkpoint: the early AD module cut now
 retains the inliner's actual scope, binding ordinal and already-constructed prefix.
 Compilation-local identity registration authenticates both the scope and the exact
