@@ -3,6 +3,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
+            [raster.compiler.ir.ordered-invocation-realization-test :as allocation-fixture]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -17,6 +18,42 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest public-preparation-selects-order-before-evaluating-source-work
+  (let [arguments [(double-array [7.0]) (double-array 1) Long/MAX_VALUE]
+        forbidden (fn [& _] (throw (Exception. "preparation evaluated source work or touched a driver")))]
+    (with-redefs [scalar/evaluate-invocation-step forbidden scalar/evaluate-host-equation forbidden
+                  gpu/make-session forbidden equation-first/lower forbidden]
+      (let [prepared (compiled/lower #'fixture/write-before-shape arguments
+                                     {:compiler :equation-first :target :ocl:0 :dtype :double})]
+        (is (compiled/prepared? prepared))
+        (is (some? (:ordered-invocation prepared)))
+        (is (nil? (:lowering prepared)))
+        (is (= :semantic-preparation (get-in prepared [:preparation-report :phase])))
+        (is (false? (get-in prepared [:preparation-report :concrete-plan-available?]))))
+      (doseq [options [{:donate '[x]} {:outputs '[first-output]} {:taps '[x]}
+                       {:profile? true} {:session :borrowed}]]
+        (is (= :compiled-ordered-capability
+               (reason #(compiled/lower #'fixture/write-before-shape arguments
+                                         (merge {:compiler :equation-first :target :ocl:0 :dtype :double}
+                                                options)))))))))
+
+(deftest direct-eager-lowering-refuses-before-a-late-check-can-run
+  (let [compilation (equation-first/compile #'fixture/write-before-shape
+                                           {:target :ocl:0 :dtype :double})
+        forbidden (fn [& _] (throw (Exception. "eager lowering evaluated a late check")))]
+    (with-redefs [scalar/evaluate-invocation-step forbidden scalar/evaluate-host-equation forbidden]
+      (is (= :equation-first-ordered-preparation
+             (reason #(equation-first/lower compilation
+                                            [(double-array [7.0]) (double-array 1) Long/MAX_VALUE])))))))
+
+(deftest public-preparation-retains-the-concrete-route-for-an-ordered-prefix
+  (with-redefs [gpu/make-session (fn [& _] (throw (Exception. "lowering opened a session")))]
+    (let [prepared (compiled/lower #'allocation-fixture/shape-before-first-stage
+                                   [(double-array [7.0]) (double-array 1)]
+                                   {:compiler :equation-first :target :ocl:0 :dtype :double})]
+      (is (some? (:lowering prepared)))
+      (is (nil? (:ordered-invocation prepared))))))
 
 (deftest source-action-coverage-is-shared-before-preparation-and-native-capture
   (let [compilation (equation-first/compile #'fixture/write-before-shape {:target :ocl:0 :dtype :double})
@@ -139,12 +176,23 @@
       (is (= 3 @(:completed-replays (:executable c))))
       (is (= [100.0] (vec state)))
       (finally (compiled/close! c))))
-  (let [compilation (equation-first/compile #'fixture/write-before-shape {:target target :dtype :double})
-        prepared (#'compiled/prepare-ordered-equation-first
-                  compilation [(double-array [7.0]) (double-array 1) Long/MAX_VALUE] {} nil)
+  (let [prepared (compiled/lower #'fixture/write-before-shape
+                                 [(double-array [7.0]) (double-array 1) Long/MAX_VALUE]
+                                 {:compiler :equation-first :target target :dtype :double})
         c (compiled/instantiate! prepared)]
     (try
       (is (instance? ArithmeticException (try (c) nil (catch Throwable error error))))
+      (let [executable (:executable c)
+            state @(:execution-state executable)
+            token (get-in state [:ordered :current :realized :buffers 'first-output])
+            view (get-in state [:ordered :node-views token])
+            actual (double-array 1)]
+        (is (some? view))
+        (when view
+          (gpu/download-range! (:session executable) view actual {:elements 1})
+          (is (= [8.0] (vec actual)) "the public route completes the earlier write before overflow"))
+        (is (= 2 (count (get-in state [:ordered :roots])))
+            "failure acquires no suffix allocation"))
       (is (nil? @(:live-outputs c)) "late source failure publishes no public output wrapper")
       (is (zero? @(:completed-replays (:executable c))))
       (is (= :link-execution-poisoned (reason #(c))))

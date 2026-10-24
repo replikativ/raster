@@ -725,7 +725,7 @@
   #{[:explicit-typed-algorithm :source-free-typed-invocation]
     [:explicit-typed-effect-algorithm :source-free-typed-effect-invocation]})
 
-(defn- source-free-program?
+(defn ^:no-doc source-free-program?
   "Recognize the source-free boundary from the validated program, never from plan attributes."
   [program]
   (let [origin [(:front-end (:provenance program)) (:pass (:provenance program))]

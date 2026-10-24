@@ -769,6 +769,12 @@
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))
+  (let [requirement (invocation-link/ordered-preparation-requirement
+                     compilation retained-validation caller-options)]
+    (when (:required? requirement)
+      (fail! :equation-first-ordered-preparation
+             "source actions require ordered preparation before numerical execution"
+             {:function (:function compilation) :barriers (:barriers requirement)})))
   (let [started (System/nanoTime)
         source-ns (:source-ns compilation)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])

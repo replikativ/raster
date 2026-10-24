@@ -12,6 +12,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.passes.parallel.structured-control-route :as route]
@@ -34,6 +35,89 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest ordered-preparation-requirement-is-static-and-owner-checked
+  (let [late (equation-first/compile #'fixture/write-before-shape {:target :ocl:0 :dtype :double})
+        simple (equation-first/compile #'shape-before-first-stage {:target :ocl:0 :dtype :double})
+        proof (emitted-program/validate-with-physical-results! (:emitted late))
+        other-proof (emitted-program/validate-with-physical-results! (:emitted simple))
+        forbidden (fn [& _] (throw (ex-info "static ordering query evaluated source" {})))]
+    (with-redefs [scalar/evaluate-invocation-step forbidden
+                  scalar/evaluate-host-equation forbidden
+                  materialization/begin-materialization forbidden
+                  materialization/materialize-next forbidden]
+      (let [report (invocation-link/ordered-preparation-requirement late)]
+        (is (true? (:required? report)))
+        (is (some #(= :after-numerical (:reason %)) (:barriers report)))
+        (is (every? #(and (integer? (:position %)) (integer? (:preceding-position %)))
+                    (:barriers report)))
+        (is (string? (fingerprint/fingerprint report)) "diagnostics contain only portable data")
+        (is (= report (invocation-link/ordered-preparation-requirement late proof nil))))
+      (is (= {:required? false :barriers []}
+             (invocation-link/ordered-preparation-requirement simple)))
+      (is (= :emitted-parallel-program-retained-validation
+             (reason #(invocation-link/ordered-preparation-requirement late other-proof nil))))
+      (is (= :invocation-ordered-program
+             (reason #(invocation-link/ordered-preparation-requirement
+                       (assoc late :emitted (:emitted simple)))))))))
+
+(deftest ordering-query-keeps-source-free-origin-separate-from-source-execution
+  (let [tensor (av/tensor {:dtype :double :shape [3]})
+        typed (soac/make
+               (soac/default-program-facts
+                {:values {'input tensor 'output tensor} :inputs '[input]
+                 :equations {:map (soac/default-equation-facts)}})
+               [(list '= :map '[output]
+                      (list 'map {:index 'index :extent 3} '[input] []
+                            (soac/lambda-form '[element] '[(* element 2.0)])))] '[output])
+        semantic (route/promote-source-free-algorithm typed)
+        options {:dtype :double :target-dialect :opencl-portable}
+        emitted (:program (program-c-family/emit-program
+                           (route/schedule-program semantic options) options))
+        compilation {:semantic semantic :emitted emitted :target :ocl:0}
+        forged (assoc-in compilation [:semantic :provenance :pass] :forged)]
+    (is (invocation/source-free-program? semantic))
+    (is (= {:required? false :barriers []}
+           (invocation-link/ordered-preparation-requirement compilation)))
+    (is (= :invocation-program-mismatch
+           (reason #(invocation-link/ordered-preparation-requirement forged))))
+    (is (= :invocation-source-order-boundary
+           (reason #(invocation-link/begin-ordered-realization compilation [(double-array 3)] nil))))))
+
+(deftest invocation-prefix-cannot-cross-an-earlier-host-equation
+  (let [values {'n (av/tensor {:dtype :long :shape []})
+                'xs (av/tensor {:dtype :double :shape '[(extent xs)]})
+                'checked (av/tensor {:dtype :int :shape []})
+                'length (av/tensor {:dtype :int :shape []})}
+        expression '(clojure.core/int n)
+        algorithm (soac/make
+                   (soac/default-program-facts
+                    {:values (select-keys values '[n checked]) :inputs '[n]
+                     :equations {:check (soac/default-equation-facts)}})
+                   [(list '= :check '[checked]
+                          (list 'scalar {:dtypes [:int]} '[n]
+                                (soac/lambda-form '[n] [expression])))] '[checked])
+        equation (parallel-program/map->ProgramEquation
+                  {:id :check :site [:binding 'checked] :source expression
+                   :operands '[n] :results '[checked] :algorithm algorithm
+                   :operations [] :effects #{} :provenance {} :attributes {:host-only true}})
+        plan (invocation/from-prefix
+              {:id :host-before-prefix :parameters '[n xs]
+               :parameter-values (select-keys values '[n xs])
+               :bindings [['length '(clojure.core/alength xs)]]
+               :binding-values (select-keys values '[length]) :program-values values
+               :program-inputs '[n xs] :program-outputs '[checked]})
+        program (parallel-program/make
+                 {:dialect :opencl-parallel :values values :inputs '[n xs] :outputs '[checked]
+                  :equations [equation]
+                  :source '(let* [checked (clojure.core/int n)
+                                  length (clojure.core/alength xs)] checked)
+                  :attributes {:invocation-plan plan}})]
+    (is (= {:required? true
+            :barriers [{:reason :prefix-after-host :position 1 :preceding-position 0
+                        :action :invocation-step}]}
+           (invocation-link/ordered-preparation-requirement
+            {:semantic program :emitted program :target :ocl:0})))))
 
 (deftest ordered-value-aliases-preserve-the-existing-buffer-without-execution
   (let [saved (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})

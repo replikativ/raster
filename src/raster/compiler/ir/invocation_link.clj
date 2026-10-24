@@ -559,17 +559,18 @@
     (assoc layout :nodes (mapv #(assoc % :role (get refresh (:id %))) (:nodes layout))
                   :entry-refresh refresh)))
 
-(defn ^:no-doc begin-ordered-realization
-  "Begin owner-local realization without evaluating invocation steps or acquiring resources.
-   The returned map is runtime construction state, not a portable completion certificate."
-  [compilation arguments caller-options]
+(defn- checked-compilation-boundary
+  "Check the existing exact semantic/emitted boundary without materializing source work."
+  [compilation retained-validation caller-options]
   (let [semantic-program (:semantic compilation)
         invocation (get-in semantic-program [:attributes :invocation-plan])
         invocation (invocation/validate-against! invocation semantic-program)
-        order (invocation/source-order invocation semantic-program)
-        checked (if (nil? caller-options)
-                  (emitted-program/validate-with-physical-results! (:emitted compilation))
-                  (emitted-program/validate-with-physical-results! (:emitted compilation) caller-options))
+        checked (if retained-validation
+                  (emitted-program/checked-retained-validation!
+                   (:emitted compilation) retained-validation caller-options)
+                  (if (nil? caller-options)
+                    (emitted-program/validate-with-physical-results! (:emitted compilation))
+                    (emitted-program/validate-with-physical-results! (:emitted compilation) caller-options)))
         program (:program checked)
         boundary #(mapv (fn [equation]
                           (select-keys equation [:id :operands :results :algorithm]))
@@ -580,6 +581,57 @@
                                                       (keys (:values semantic-program)))))
       (fail! :invocation-ordered-program
              "ordered realization requires the exact retained semantic and emitted boundary" {}))
+    {:semantic-program semantic-program :invocation invocation :checked checked :program program}))
+
+(defn ^:no-doc ordered-preparation-requirement
+  "Report source-order barriers to eager preparation, without evaluating any source operand.
+   This pure diagnostic is not reusable validation or completion authority. Source-free programs
+   retain their separately validated origin contract; this query does not admit them to the
+   source-ordered executor. Optional validation must belong to the exact emitted program/request."
+  ([compilation] (ordered-preparation-requirement compilation nil nil))
+  ([compilation retained-validation caller-options]
+   (let [{:keys [semantic-program invocation program]}
+         (checked-compilation-boundary compilation retained-validation caller-options)]
+     (if (invocation/source-free-program? semantic-program)
+       {:required? false :barriers []}
+       (let [host-ids (into #{} (comp (filter #(true? (get-in % [:attributes :host-only])))
+                                      (map :id)) (:equations program))
+             result
+             (reduce
+              (fn [{:keys [numerical-position host-position allocation-position] :as state} entry]
+                (let [position (:position entry)
+                      prefix? (some? (:invocation-step entry))
+                      host? (and (:equation entry) (contains? host-ids (:equation entry)))
+                      numerical? (and (:equation entry) (not host?))
+                      action (when (:realization entry)
+                               (invocation-source/realization-action semantic-program entry))
+                      allocation? (or (:storage entry) (= :result-allocation (:kind action)))
+                      kind (cond allocation? :allocation prefix? :invocation-step host? :host-equation)
+                      barrier (fn [reason preceding]
+                                {:reason reason :position position :preceding-position preceding
+                                 :action kind})]
+                  (cond-> state
+                    (and (some? numerical-position) (or prefix? host? allocation?))
+                    (update :barriers conj (barrier :after-numerical numerical-position))
+                    (and prefix? (some? host-position))
+                    (update :barriers conj (barrier :prefix-after-host host-position))
+                    (and prefix? (some? allocation-position))
+                    (update :barriers conj (barrier :prefix-after-allocation allocation-position))
+                    (and host? (not prefix?) (some? allocation-position))
+                    (update :barriers conj (barrier :host-after-allocation allocation-position))
+                    numerical? (assoc :numerical-position position)
+                    (and host? (not prefix?)) (assoc :host-position position)
+                    (and allocation? (not prefix?)) (assoc :allocation-position position))))
+              {:barriers []} (invocation/source-order invocation semantic-program))]
+         {:required? (boolean (seq (:barriers result))) :barriers (:barriers result)})))))
+
+(defn ^:no-doc begin-ordered-realization
+  "Begin owner-local realization without evaluating invocation steps or acquiring resources.
+   The returned map is runtime construction state, not a portable completion certificate."
+  [compilation arguments caller-options]
+  (let [{:keys [semantic-program invocation checked program]}
+        (checked-compilation-boundary compilation nil caller-options)
+        order (invocation/source-order invocation semantic-program)]
     {:program program :source-order order :source-cursor 0
      :source-realizations (into {} (keep (fn [entry]
                                           (when-let [action (invocation-source/realization-action semantic-program entry)]

@@ -144,9 +144,9 @@ The next source-evaluation audit found a missing public execution gate. The
 frontend's checked-cast retention predicate does not retain a dead scalar marked
 `:raster.effect/preserve-evaluation`; the real Q8-LoRA example is checked integer
 multiplication after earlier contractions. Retaining that expression is necessary
-but not sufficient. Ordinary `compiled/lower` still uses eager equation lowering,
-while `prepare-ordered-equation-first` is currently only an explicitly qualified
-constructor. Eager host evaluation checks device data dependencies but does not
+but not sufficient. At the audit boundary, ordinary `compiled/lower` used eager
+equation lowering, while `prepare-ordered-equation-first` was only an explicitly
+qualified constructor. Eager host evaluation checks device data dependencies but does not
 by itself preserve a late independent exception after earlier device writes.
 Do not broaden scalar admission until public ordered preparation and its port,
 donation, replay and lifetime capabilities are qualified, or eager admission
@@ -160,7 +160,24 @@ they acquire no storage, invoke no scalar evaluator, create no host-scalar
 results and remain absent from the numerical interface. Pending-action barriers,
 changed-source and future-reference controls remain active. Ordered realization,
 materialization and preparation qualification passes 27 tests / 369 assertions.
-Public automatic ordered selection and training port capabilities remain open.
+Training port capabilities remain open; public selection is qualified below.
+
+Public equation-first preparation now shares one source-order requirement with
+the eager lowerer. It derives conservative phase-inversion barriers from exact
+source positions and the independently validated semantic/emitted boundary,
+including auxiliary source allocations. Diagnostics are pure data, not new
+validation authority. Source-free programs retain their existing validated
+origin contract. Direct eager lowering refuses before materialization when
+ordering is required; public `compiled/lower` selects the existing deferred
+Prepared instead, with no eager retry for unsupported capabilities. A simple
+ordered prefix still produces a concrete plan. Source-order, preparation,
+materialization and artifact qualification passes 62 tests / 636 assertions.
+Actual public OpenCL/Level Zero calls complete the earlier write (`8.0`) before
+late overflow, acquire no suffix allocation and publish no failed output.
+Selection is intentionally conservative. Donation, explicit outputs/taps,
+aggregate ports, resident replacements and other deferred capabilities still
+need their existing ownership contracts extended before training/composition
+acceptance can close; concrete-plan/performance gates are not retired.
 
 Public Float fixture qualification exposed an additional type-policy mismatch:
 the Double-only `contract-mm` source retained a Double effect-return binder while
