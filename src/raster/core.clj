@@ -537,6 +537,9 @@
   (when-not me/*emission-inputs*
     (throw (ex-info "static source preparation requires a compiler owner"
                     {:reason :missing-definition-preparation-owner})))
+  ;; Source walking, not JIT: close only this selected static producer before
+  ;; its first historical source observation, as the inliner already does.
+  (prepare-emission-source-walk! source-var)
   (when-let [frontend (me/original-source-frontend source-var)]
     (me/assert-frontend-source! frontend source-var)
     (me/assert-frontend-selection! frontend source-var)

@@ -45,6 +45,11 @@ Keep the original eight objectives below. The current landing order is:
    actual device execution separately from compile-only vendor coverage.
 
 Use one bounded REPL for affected tests and exact-head CI for full qualification.
+AD producers establish the existing shared effect/rule context before source
+observations and epoch capture. Revision queries and execution guards are
+observational; they do not load libraries or register rules. Static producers
+also settle their selected root's missing source-walk cache before observing it,
+without reexpanding an existing frontend or eagerly emitting a JVM receiver.
 Warm preparation is not a substitute for a cold-process lifecycle check. Review
 shared ownership changes before broadening them, consolidate existing test matrices
 where possible, and keep stale-history/alias/effect controls alongside numerical

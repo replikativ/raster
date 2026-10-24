@@ -1021,6 +1021,10 @@
                  ;; Source freezing is not physical preparation or admission.
                  frontend (when (= :double (dtype/dtype-for-scalar-tag return-tag))
                             (rcore/prepare-deftm-frontend! resolved-var)
+                            ;; Settle this exact root's source cache before
+                            ;; observing it. Later physical preparation must
+                            ;; not introduce a missing source input mid-proof.
+                            (rcore/prepare-emission-source-walk! resolved-var)
                             (method-entry/original-source-frontend resolved-var))
                  entry (when frontend (method-entry/frontend-body-entry-carriers frontend resolved-var))]
              (when (and entry (every? #(identical? Double/TYPE %) (:parameter-carriers entry)))

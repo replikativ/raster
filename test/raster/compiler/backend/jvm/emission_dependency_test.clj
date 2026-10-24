@@ -346,9 +346,25 @@
           (eval '(defmacro original-value []
                    (throw (AssertionError. "a frozen frontend must not reexpand source")))))
         (binding [*unchecked-math* :warn-on-boxed]
-          (is (identical? body (core/prepare-emission-source-walk! child))))
+          (let [prepared (method-entry/call-with-definition-inputs
+                          #(core/prepare-original-static-source! child))]
+            (is (identical? body (:body prepared)))
+            (is (identical? (:source-frontend frontend)
+                            (get-in prepared [:frontend :source-frontend])))))
         (is (identical? body (:raster.core/deftm-walked-body (meta child))))
         (is (identical? implementation (var-get receiver)))
+        (let [poison '[42.0]]
+          (alter-meta! child assoc :raster.core/deftm-walked-body poison)
+          (let [prepared (method-entry/call-with-definition-inputs
+                          #(core/prepare-original-static-source! child))
+                before-jit (method-entry/emission-definition-snapshot child)]
+            (is (identical? poison (:raster.core/deftm-walked-body (meta child)))
+                "existing source caches are not replaced by static preparation")
+            (is (identical? body (:body prepared)))
+            (is (identical? implementation (var-get receiver)) "source preparation emits no receiver")
+            (core/ensure-current-owned-bytecode! receiver)
+            (is (method-entry/var-snapshot-current? before-jit)
+                "later JIT preparation publishes no new source-cache input")))
         (is (= {:unchecked-math false} (get-in frontend [:source-entry :source-policy]))))
       (finally (remove-ns (ns-name scope))))))
 
