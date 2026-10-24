@@ -66,6 +66,7 @@
             [raster.compiler.core.hoist :as hoist]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as value-completion]
+            [raster.compiler.core.binding-completion :as binding-completion]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.walker :as walker]
@@ -870,6 +871,18 @@
       (core-hw/abstract-machine (or target-descriptor (core-hw/descriptor-for target-device)))
       (catch Throwable _ nil))))
 
+(defn- source-binding-resolution-context
+  "Capture an already-loaded source emitter policy, without loading a backend
+   during an optional query. Declined proof observations stay request-local."
+  [source]
+  (when (and me/*emission-inputs* (form/binding-form? source)
+             (vector? (second source))
+             (some (fn [[_ expression]] (value-completion/object-input-parts expression))
+                   (partition 2 (second source))))
+    (when-let [source-emitter (find-ns 'raster.compiler.backend.jvm.bytecode)]
+      (when-let [policy (ns-resolve source-emitter 'binding-completion-plan)]
+        (binding-completion/capture-resolution-context policy)))))
+
 (defn- semantic-program-attempt
   "Try the finite semantic-program variants in specificity order.
 
@@ -912,6 +925,8 @@
                     :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
                     :values values
+                    :source-ns (:source-ns opts)
+                    :source-binding-context (source-binding-resolution-context source)
                     :abstract-machine abstract-machine}
                      (some? (:public-parameters common))
                      (assoc :lexical-inputs (:public-parameters common))))

@@ -10,6 +10,7 @@
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.binding-completion :as binding-completion]
             [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.inference :as inf]
@@ -146,7 +147,7 @@
 
 (defn- typed-interface?
   "True if this symbol/string names a Raster typed function interface (IFn__)."
-  [s] (and s (.contains (str s) "IFn__")))
+  [s] (binding-completion/typed-interface? s))
 
 ;; ================================================================
 ;; invokedynamic bootstrap (MutableCallSite dispatch)
@@ -4120,8 +4121,7 @@
    planning its completion. Kept shared so pre-emission work cannot invent a
    second alias/return/interop hint policy."
   [sym init locs ctx]
-  (or (:tag (meta sym))
-        (:raster.type/tag (meta sym))
+  (or (binding-completion/declared-binding-hint sym)
         ;; Alias: inherit from source
         (when (symbol? init)
           (:hint (get locs init)))
@@ -4230,35 +4230,14 @@
             (inf/infer-arg-tag init local-env))
           (catch Throwable _ nil))))
 
-(defn ^:no-doc binding-completion-plan
-  "Plan the emitter's existing lexical CHECKCAST and resulting local facts.
-   `actual` must be an established raw stack carrier, not a logical annotation.
-   Resolving a hint here does not establish the initializer's carrier or totality.
-   Slot allocation and execution remain the emitter's responsibility."
-  [tag actual ctx]
-  (let [tag (if (and (symbol? tag) (zero? (count (name tag)))) nil tag)
-        reference-class
-        (when (and tag (= actual :ref) (not (typed-interface? tag)))
-          (let [src-ns (or (:source-ns ctx) *ns*)
-                cls (cond
-                      (= tag 'objects) (Class/forName "[Ljava.lang.Object;")
-                      (= tag 'doubles) (Class/forName "[D")
-                      (= tag 'floats) (Class/forName "[F")
-                      (= tag 'ints) (Class/forName "[I")
-                      (= tag 'longs) (Class/forName "[J")
-                      (= tag 'bytes) (Class/forName "[B")
-                      (= tag 'shorts) (Class/forName "[S")
-                      :else
-                      (let [tag-str (str tag)]
-                        (when (pos? (count tag-str))
-                          (or (try (Class/forName tag-str) (catch Exception _ nil))
-                              (when-let [r (ns-resolve src-ns (symbol tag-str))]
-                                (when (class? r) r))))))]
-            (when (and cls (not= cls Object)) cls)))]
-    {:checkcast-class reference-class
-     :local-facts (cond-> {:type actual :hint tag
-                          :verified (boolean (and tag (not= tag 'Object)))}
-                    (= :ref actual) (assoc :reference-class (or reference-class Object)))}))
+(def ^{:no-doc true :arglists '([tag actual ctx])
+       :doc "Plan lexical CHECKCAST/local facts using this actual emitter's defining loader."}
+  binding-completion-plan
+  (fn binding-completion-plan [tag actual ctx]
+    ;; Named self-binding is essential: a rebound public Var must not supply
+    ;; another function's loader for an already captured emitter invocation.
+    (binding-completion/binding-completion-plan
+     tag actual (assoc ctx :hint-classloader (.getClassLoader (class binding-completion-plan))))))
 
 (declare typed-invocation-plan plan-form-carrier plan-argument-carrier plan-flat-bindings primitive-tags)
 

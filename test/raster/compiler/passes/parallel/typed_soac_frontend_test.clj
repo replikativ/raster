@@ -15,12 +15,81 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.binding-completion :as binding-completion]
+            [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.passes.scalar.host-abstract-value :as host-av]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
+
+(deftest dead-object-snapshots-respect-lexical-binding-completion
+  (let [scope (the-ns 'raster.compiler.passes.parallel.typed-soac-frontend-test)
+        object-input #(completion/complete-value completion/object-input-contract %)
+        snapshot (with-meta 'snapshot {:tag 'Object})
+        normalize (fn [source]
+                    (entry/call-with-definition-inputs
+                     #(frontend/normalize-source
+                       source {:source-ns scope :lexical-inputs '[x calls]
+                               :source-binding-context
+                               (binding-completion/capture-resolution-context
+                                #'bytecode/binding-completion-plan)})))
+        source (list 'let*
+                     ['producer '(do (clojure.core/swap! calls clojure.core/conj :producer) x)
+                      snapshot (object-input 'producer)
+                      'after '(clojure.core/swap! calls clojure.core/conj :after)]
+                     'producer)
+        normalized (normalize source)
+        original-pairs (mapv vec (partition 2 (second source)))
+        compile-source (fn [source]
+                         (binding [*ns* scope]
+                           (eval (list 'fn* '[x calls]
+                                       (completion/project-to-jvm-source source)))))
+        original (compile-source source)
+        optimized (compile-source normalized)]
+    (is (= [(first original-pairs) (last original-pairs)]
+           (mapv vec (partition 2 (second normalized))))
+        "only the dead snapshot disappears; its eager producer and later effects remain verbatim")
+    (doseq [value [nil (Object.) (Double/valueOf -0.0) Double/NaN]]
+      (let [left (atom []) right (atom [])]
+        (is (identical? value (original value left)))
+        (is (identical? value (optimized value right)))
+        (is (= [:producer :after] @left @right))))
+    (let [source (list 'let*
+                       ['producer '(do (clojure.core/swap! calls clojure.core/conj :producer)
+                                       (clojure.core/double x))
+                        snapshot (object-input 'producer)] 0.0)
+          normalized (normalize source)]
+      (doseq [program [source normalized]]
+        (let [events (atom [])]
+          (is (thrown? NullPointerException ((compile-source program) nil events)))
+          (is (= [:producer] @events))))
+      (is (= (first (partition 2 (second source)))
+             (first (partition 2 (second normalized))))
+          "the snapshot is not permission to eliminate an eager checked producer"))
+    (doseq [binder [(with-meta 'snapshot {:tag 'String})
+                    (with-meta 'snapshot {:tag 'doubles})
+                    (with-meta 'snapshot {:tag 'not-a-class})
+                    (with-meta 'snapshot {:tag 'IFn__double})
+                    (with-meta 'snapshot {:tag 'Object :raster.effect/preserve-evaluation true})]]
+      (let [source (list 'let* ['producer 'x binder (object-input 'producer)] 'producer)]
+        (is (= source (normalize source)) "a dead result does not waive the binder's own obligations")))
+    (doseq [[binder operand body]
+            [[snapshot 'future 'x]
+             [snapshot 'unbound-global 'x]
+             [snapshot '(clojure.core/double x) 'x]
+             [snapshot 'x 'snapshot]
+             [(with-meta 'count {:tag 'Object}) 'x 'count]
+             [(with-meta '.snapshot {:tag 'Object}) 'x '.snapshot]]]
+      (let [source (list 'clojure.core/let [binder (object-input operand)] body)]
+        (is (= source (normalize source))
+            "liveness includes core-spelled locals; unsupported symbol spellings abstain")))
+    (let [source (list 'let* ['producer 'x snapshot (object-input 'producer)
+                             'still-reads 'snapshot] 'producer)]
+      (is (= source (normalize source))
+          "deadness uses the original suffix, not transitive producer DCE"))))
 
 (deftest object-buffer-aliases-use-the-actual-destination-before-later-uses
   (let [object-input #(completion/complete-value completion/object-input-contract %)

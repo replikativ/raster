@@ -16,6 +16,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.binding-completion :as binding-completion]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -4001,6 +4002,64 @@
        expression))
    source))
 
+(defn- snapshot-evaluation-required?
+  [expression]
+  (or (some (fn [[key value]]
+              (and (keyword? key) (= "raster.effect" (namespace key)) value))
+            (meta expression))
+      (seq (:flags (effects/descriptor expression)))))
+
+(defn- prune-dead-object-snapshots
+  "Remove only a checkless Object snapshot of a preceding lexical value.
+   Deadness uses the ORIGINAL suffix, never a recursively pruned producer.
+   Initializer meaning and the binding's own completion are separate proofs."
+  [source {:keys [source-ns source-binding-context lexical-inputs]}]
+  (if-not (and source-binding-context (instance? clojure.lang.Namespace source-ns)
+               (form/binding-form? source) (vector? (second source))
+               (even? (count (second source)))
+               (every? symbol? (take-nth 2 (second source))))
+    source
+    (binding [util/*shadowing-locals*
+              (into util/*shadowing-locals*
+                    (concat lexical-inputs (take-nth 2 (second source))))]
+     (let [[head bindings & body] source
+          pairs (vec (map vec (partition 2 bindings)))
+          positions (zipmap (map first pairs) (range))
+          frequencies (frequencies (map first pairs))
+          public (set lexical-inputs)
+          initial-live (reduce set/union #{} (map util/free-syms body))
+          {:keys [retained removed]}
+          (reduce
+           (fn [{:keys [live] :as state} index]
+             (let [[id expression :as pair] (nth pairs index)
+                   operand (:operand (completion/object-input-parts expression))
+                   position (get positions operand)
+                   lexical? (and (symbol? operand)
+                                 (if (some? position)
+                                   (and (< position index) (= 1 (get frequencies operand)))
+                                   (contains? public operand)))
+                   candidate? (and lexical? (= 1 (get frequencies id))
+                                   (contains? (util/free-syms id) id)
+                                   (contains? (util/free-syms operand) operand)
+                                   (not (contains? live id)))
+                   declaration (when candidate? (completion/object-value-declaration expression))
+                   declared-result (:raster.type/tag (meta id))
+                   remove? (and candidate?
+                                (or (nil? declaration) (nil? declared-result)
+                                    (= declaration declared-result))
+                                (not-any? snapshot-evaluation-required? [id expression operand])
+                                (binding-completion/object-binding-without-check?
+                                 id source-ns source-binding-context))]
+               (cond-> (update state :live into (util/free-syms expression))
+                 remove? (update :removed inc)
+                 (not remove?) (update :retained conj pair))))
+           {:live initial-live :retained [] :removed 0}
+           (range (dec (count pairs)) -1 -1))]
+      (if (zero? removed)
+        source
+        (with-meta (list* head (with-meta (vec (mapcat identity (rseq retained))) (meta bindings)) body)
+          (meta source)))))))
+
 (declare ^:private advance-source-description ^:private initial-source-description-state
          ^:private description-host-buffer?)
 
@@ -4038,6 +4097,7 @@
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
   (let [source (util/uniquify-rebindings (util/free-syms source) source)
+        source (prune-dead-object-snapshots source options)
         ;; A locally bound scalar can reuse a public array's name. Only free array
         ;; parameters may borrow the entry type; local arrays need their own tag.
         public-array-types (select-keys array-types (util/free-syms source))

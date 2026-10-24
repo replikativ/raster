@@ -114,6 +114,23 @@ regions still need their own certified local input context; outer prefix value
 shapes alone do not supply that authority. Local consumer/ownership qualification
 does not replace complete public-workload and exact-head CI acceptance.
 
+Initializer completion and lexical binding completion are separate obligations.
+Even a dead binding can request a throwing reference cast. The shared binding
+policy now preserves the bytecode emitter's declaration precedence and actual
+defining classloader; an optional structural proof requires the resolved hint to
+be the bootstrap Object Class, not merely a missing cast or logical dtype.
+Namespace and first-loader lookup decisions retain their original private input
+history and replay without class initialization. Declined queries adopt nothing.
+
+The source normalizer can consequently remove an unused exact Object-input
+snapshot of a stable preceding local, while retaining every other original
+binding. Liveness uses the original suffix, with complete lexical shadowing;
+used snapshots, reference checks, evaluation obligations and unresolved hints
+remain intact. This is neither generic DCE nor permission to remove a used box.
+The next source-entry obligation is distinct again: a checked JVM array input
+must be represented by the public tensor-to-resident adapter, not treated as an
+unchecked identity on the strength of a buffer dtype.
+
 #### Source meaning and executable bindings
 
 The implementation distinguishes the existing immutable `SourceFrontend` from
