@@ -63,6 +63,13 @@ receiver/module history. Reacquiring source does not refresh an old physical
 artifact. Exact-candidate source preparation closes the existing walk cache
 before observation; queries themselves do not compile or execute anything.
 These guards stay process-local, outside portable TypedSOAC facts and cache keys.
+Pure source qualification retains only the identities it consumes: original
+lookups, canonical Var/intern/namespace identity, and Class/alias/miss decisions.
+That observation survives harmless Var-root/JIT publication; it grants no value,
+body or Method facts. Actual accepted global type inference reads instead retain
+full definition snapshots before consuming metadata or constant values. Declined
+type queries discard their temporary observations. Reference observations never
+erase or refresh an earlier stronger definition observation.
 The mixed body reader is retired. Normal-return constructor/alias summaries read
 the authentic frozen semantic frontend for Object/primitive-array reference
 returns, retaining bootstrap constructor/nil-test observations. Void and unknown

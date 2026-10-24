@@ -21,6 +21,7 @@
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
@@ -2025,20 +2026,30 @@ stable physical-leaf order on every backend."}
   fold firing — the declared tag alone lets dispatch on the reference
   devirtualize. Only consulted as a fallback after env + symbol metadata miss."
   [sym]
-  (try
-    (when-let [v (resolve sym)]
-      (when (and (var? v) (not (:raster.core/generic-function (meta v))))
-        (let [m (meta v)
-              t (:tag m)]
-          (cond
-            (contains? '#{double float long int} t) t
-            (:const m) (condp instance? @v
-                         Double 'double
-                         Float  'float
-                         Long   'long
-                         Integer 'int
-                         nil)))))
-    (catch Throwable _ nil)))
+  (when-let [v (try (resolve sym) (catch Exception _ nil))]
+    (when (var? v)
+      (method-entry/call-with-optional-definition-inputs
+       (fn []
+         ;; Accepted metadata/value facts are real definition consumption, not
+         ;; qualification. Observe before reading; a refused function/interface
+         ;; lookup rolls back this child instead of pinning a cold receiver.
+         (when method-entry/*emission-inputs*
+           (method-entry/observe-definition-input! v *ns* sym))
+         (let [snapshot (when method-entry/*emission-inputs*
+                          (get-in @method-entry/*emission-inputs* [:definition-proofs v]))
+               m (if snapshot (:metadata snapshot) (meta v))
+               t (:tag m)]
+           (when-not (:raster.core/generic-function m)
+             (cond
+               (contains? '#{double float long int} t) t
+               (:const m) (let [value (if snapshot (:value snapshot)
+                                        (when (bound? v) (var-get v)))]
+                            (condp instance? value
+                              Double 'double
+                              Float  'float
+                              Long   'long
+                              Integer 'int
+                              nil))))))))))
 
 (defn- late-env-tag
   "Return `sym`'s dispatch tag from either compiler type-environment shape.

@@ -146,6 +146,14 @@
   RetainedProducerInput
   (assert-producer-current! [_]
     (when-not (and (identical? source-ns (find-ns (ns-name source-ns)))
+                   (or (not (var? result))
+                       (var-reference-current?
+                        {:var result
+                         ;; Qualification reads these immutable Var fields,
+                         ;; not the editable :ns/:name metadata or its root.
+                         :metadata {:ns (.ns ^clojure.lang.Var result)
+                                    :name (.sym ^clojure.lang.Var result)}
+                         :lookups #{[source-ns lookup-symbol]}}))
                    (or (not (instance? clojure.lang.Namespace result))
                        (identical? result (find-ns (ns-name result))))
                    (identical? result
@@ -158,35 +166,50 @@
                       {:reason :stale-source-resolution :kind kind :symbol lookup-symbol})))
     true))
 
-(defn observe-source-resolution!
-  "Retain one actual source-qualification decision in the current owner.
-   Vars reuse definition observations at their ORIGINAL lookup site. Classes,
-   namespace/alias identities and misses have identity-only producer guards. No scan,
-   code emission, source correspondence or normal-completion fact is supplied."
+(defn- validate-source-resolution!
   [{:keys [kind source-ns symbol result]}]
+  (when-not (and (instance? clojure.lang.Namespace source-ns) (symbol? symbol)
+                 (case kind
+                   :symbol-resolution (or (nil? result) (var? result) (class? result))
+                   :alias-resolution (or (nil? result) (instance? clojure.lang.Namespace result))
+                   :namespace-resolution (or (nil? result) (instance? clojure.lang.Namespace result))
+                   false))
+    (throw (ex-info "source qualification needs an actual lookup decision"
+                    {:reason :invalid-source-resolution}))))
+
+(defn observe-source-reference!
+  "Retain the actual identity-only lookup used to qualify a source reference.
+   A Var's name/namespace is not its current value or definition metadata. Root
+   rebinding may preserve this reference; alias/intern/namespace drift may not.
+   Consumers of a value, metadata, Method or body must separately observe those
+   inputs. This grants no type, invocation, inlining or code-emission permission."
+  [{:keys [kind source-ns symbol result] :as decision}]
   (when *emission-inputs*
-    (when-not (and (instance? clojure.lang.Namespace source-ns) (symbol? symbol)
-                   (case kind
-                     :symbol-resolution (or (nil? result) (var? result) (class? result))
-                     :alias-resolution (or (nil? result) (instance? clojure.lang.Namespace result))
-                     :namespace-resolution (or (nil? result) (instance? clojure.lang.Namespace result))
-                     false))
-      (throw (ex-info "source qualification needs an actual lookup decision"
-                      {:reason :invalid-source-resolution})))
-    (if (var? result)
-      (observe-definition-input! result source-ns symbol)
-      (let [input (SourceResolutionInput. kind source-ns symbol result)]
-        (assert-producer-current! input)
-        (swap! *emission-inputs*
-               (fn [inputs]
-                 (if (some #(and (instance? SourceResolutionInput %)
-                                 (= kind (.-kind ^SourceResolutionInput %))
-                                 (identical? source-ns (.-source-ns ^SourceResolutionInput %))
-                                 (= symbol (.-lookup-symbol ^SourceResolutionInput %))
-                                 (identical? result (.-result ^SourceResolutionInput %)))
-                           (:producer-inputs inputs))
-                   inputs
-                   (retain-producer-inputs inputs [input])))))))
+    (validate-source-resolution! decision)
+    (let [input (SourceResolutionInput. kind source-ns symbol result)]
+      (assert-producer-current! input)
+      (swap! *emission-inputs*
+             (fn [inputs]
+               (if (some #(and (instance? SourceResolutionInput %)
+                               (= kind (.-kind ^SourceResolutionInput %))
+                               (identical? source-ns (.-source-ns ^SourceResolutionInput %))
+                               (= symbol (.-lookup-symbol ^SourceResolutionInput %))
+                               (identical? result (.-result ^SourceResolutionInput %)))
+                         (:producer-inputs inputs))
+                 inputs
+                 (retain-producer-inputs inputs [input]))))))
+  result)
+
+(defn observe-source-resolution!
+  "Retain a source decision whose consumer also reads a resolved Var definition.
+   Vars retain full value/metadata observations at their ORIGINAL lookup site.
+   Classes/namespaces/misses reuse reference guards. Pure name qualification
+   must use observe-source-reference! instead of pinning an unrelated root."
+  [{:keys [source-ns symbol result] :as decision}]
+  (if (and *emission-inputs* (var? result))
+    (do (validate-source-resolution! decision)
+        (observe-definition-input! result source-ns symbol))
+    (observe-source-reference! decision))
   result)
 
 (defn assert-definition-inputs-current!

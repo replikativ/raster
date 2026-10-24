@@ -268,7 +268,7 @@
                 parameter-set (set (map #(if (symbol? %) % (symbol (name %))) parameters))
                 qualified (if source-ns
                             (mapv #(inf/qualify-body-symbols % source-ns parameter-set
-                                                           method-entry/observe-source-resolution!) hygienic)
+                                                           method-entry/observe-source-reference!) hygienic)
                             hygienic)]
             (when frontend
               (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var])))
