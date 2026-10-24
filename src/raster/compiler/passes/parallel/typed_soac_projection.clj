@@ -14,6 +14,7 @@
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
 (defn contraction-binding
@@ -191,16 +192,17 @@
 (defn- scalar-fold-parts
   [attributes expression]
   (let [accumulator (first (:accumulators attributes))
-        arguments (vec (when (seq? expression) (descriptor/call-args expression)))]
+        {:keys [combine element accumulator-position]}
+        (reduction/scalar-recurrence-view
+         {:acc accumulator :init (first (:identities attributes)) :lambda expression}
+         (first (:dtypes attributes)))]
     ;; `par/contract` spells the fold as (combine accumulator element).  Reversing a merely
     ;; associative, non-commutative fold here would be a semantic change, so refuse that shape.
-    (when-not (and (seq? expression) (= 2 (count arguments))
-                   (= accumulator (first arguments)))
+    (when-not (= 0 accumulator-position)
       (throw (ex-info "segmented reduction has no ordered scalar contract projection"
                       {:reason :typed-soac-contract-projection
                        :accumulator accumulator :expression expression})))
-    {:combine (descriptor/semantic-op expression)
-     :element (second arguments)}))
+    {:combine combine :element element}))
 
 (defn- result-transform-epilogue
   [transform]

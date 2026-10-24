@@ -20,6 +20,14 @@ Keep the original eight objectives below. The current landing order is:
    Construct the complete recurrence once, then share its ProductReduction view
    across contraction projection and scheduling. Do not strip casts or weaken
    the exact-product gate of a schedule that replaces the summand.
+   The first consolidation now shares the existing certified recurrence view
+   across scalar construction and both projection readers. Typed carry and
+   element conversions survive; ordered adapters still reject a reversed
+   accumulator. This currently rederives certification on demand, not a new
+   portable cache or completed construct-once producer. Selected-helper numerical
+   recipe/domain composition and request-local reuse remain required. The real
+   nonsquare AD probe advances past the bare-accumulator refusal but still
+   refuses derived matrix intent without its complete numerical recipe.
 3. Close result-completion and residency obligations separately. In particular,
    checked Double-to-Float completion cannot silently become unchecked on a GPU,
    and a resident result has no implicit host readback on which to run the check.

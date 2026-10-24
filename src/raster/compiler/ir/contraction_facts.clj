@@ -323,15 +323,18 @@
   (when-not (facts? facts)
     (throw (ex-info "contraction reduction view requires verified facts"
                     {:reason :raster/bug :facts facts})))
-  (let [{:keys [acc init lambda]} (reduction/scalar-op (:reduction facts))]
-    (when-not (and (seq? lambda) (= 3 (count lambda)) (= acc (second lambda)))
+  (let [{:keys [acc init lambda] :as operation} (reduction/scalar-op (:reduction facts))
+        dtype (first (reduction/dtypes (:reduction facts)))
+        {:keys [combine element accumulator-position]}
+        (reduction/scalar-recurrence-view operation dtype)]
+    (when-not (= 0 accumulator-position)
       (throw (ex-info "canonical contraction reduction is not an accumulator/element fold"
                       {:reason :raster/bug :accumulator acc :lambda lambda})))
     {:accumulator acc
      :neutral init
-     :combine (first lambda)
-     :element (nth lambda 2)
-     :dtype (first (reduction/dtypes (:reduction facts)))}))
+     :combine combine
+     :element element
+     :dtype dtype}))
 
 ;; ── body shape: what a leaf that DISCARDS the body must first account for ────────────
 (defn single-axis-accumulator-stage

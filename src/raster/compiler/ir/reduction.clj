@@ -7,6 +7,7 @@
    and SegOp layers, while physical scratch is introduced only during scheduling/materialization."
   (:require [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.scan :as scan]))
@@ -254,6 +255,30 @@
     {:acc accumulator :init neutral :lambda step-result}
     dtype supplied-projection)))
 
+(defn scalar-recurrence-view
+  "Derive the element/combine view of one complete certified scalar recurrence.
+
+   The original recurrence remains the execution authority. The shared algebra
+   constructor, rather than each target projection, proves accumulator identity,
+   element independence and any accumulator-independent prefix scope. In
+   particular, a carry conversion already admitted by that constructor does not
+   require a bare accumulator spelling here. Element conversions are retained;
+   this view grants neither selected-helper numerical semantics nor permission
+   for a schedule to replace the summand. The accumulator position is explicit
+   so an ordered target adapter can refuse a reversed spelling. No extra proof
+   representation is stored on ProductReduction."
+  ([operation dtype] (scalar-recurrence-view operation dtype nil))
+  ([{:keys [acc init lambda]} dtype supplied-projection]
+   (let [{:keys [certificate element normalized-step-result]}
+         (certify-projected-reassociation lambda supplied-projection acc init dtype)
+         arguments (vec (descriptor/call-args normalized-step-result))
+         element-position (.indexOf ^java.util.List arguments element)]
+     {:accumulator acc :neutral init :dtype (dtype/canon dtype)
+      :combine (:combine certificate) :element element
+      :accumulator-position (- 1 element-position)
+      :step-result lambda :normalized-step-result normalized-step-result
+      :certificate certificate})))
+
 (defn scalar
   "Construct the canonical, proof-carrying representation of `raster.par/reduce`.
 
@@ -279,8 +304,8 @@
          step-result)
         {certified :certificate original-element :element
          normalized-step-result :normalized-step-result}
-        (certify-projected-reassociation typed-step-result certification-step-result
-                                         accumulator neutral dtype)
+        (scalar-recurrence-view {:acc accumulator :init neutral :lambda typed-step-result}
+                                dtype certification-step-result)
         step-result normalized-step-result
         declared (declare-element-conversion step-result original-element dtype)
         converted? (not (identical? declared step-result))

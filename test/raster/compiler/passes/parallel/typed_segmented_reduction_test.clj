@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-facts :as contraction]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.numerical-contract :as numerics]
@@ -193,6 +194,41 @@
                                       source :dtype :float
                                       :flat-idx (get-in operation [:space :flat-idx])))))
         (is (= (:reduction operation) (:reduction projected)))))))
+
+(deftest segmented-projection-retains-certified-conversions-without-product-permission
+  (let [original (program)
+        [equation] (dialect/equations original)
+        operation (dialect/operation-parts equation)
+        body '(clojure.core/+
+               (clojure.core/double acc)
+               (clojure.core/double
+                (clojure.core/* (clojure.core/aget lhs (+ (* i inner) l))
+                                (clojure.core/aget rhs (+ (* l width) j)))))
+        attributes (assoc (:attributes operation) :dtypes [:double]
+                          :algebra [(scan/certify-reassociation
+                                     {:acc 'acc :init 0.0 :lambda body} :double)])
+        equation (list '= (second equation) (nth equation 2)
+                       (list 'segmented-reduce attributes [] (:captures operation)
+                             (dialect/lambda-form '[acc lhs rhs width inner] [body])))
+        facts (reduce #(assoc-in %1 [:values %2 :dtype] :double)
+                      (dialect/facts original) '[A B C])
+        source (dialect/make facts [equation] '[C])
+        {:keys [components facts]}
+        (projection/segmented-reduce-contraction-context source equation)
+        element (:body components)]
+    (is (= 'clojure.core/double (first element)))
+    (is (= element (:element (contraction/scalar-reduction-view facts))))
+    (is (= 'clojure.core/+ (:combine (contraction/scalar-reduction-view facts))))
+    (is (nil? (contraction/body-product-of element '[A B]))
+        "a cast-wrapped summand is not permission for a body-replacing matrix schedule")
+    (is (false? (:ok (contraction/dense-matrix-view facts))))
+    (is (= :typed-soac-contract-projection
+           (try
+             (#'projection/scalar-fold-parts
+              attributes (list 'clojure.core/+ (nth body 2) (second body)))
+             nil
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        "the ordered projection must refuse a reversed certified recurrence")))
 
 (deftest semantic-projection-retains-core-shadowing-shape-operands
   (let [source (dialect/remap-values (program) {'m 'seq 'n 'count 'k 'first})]
