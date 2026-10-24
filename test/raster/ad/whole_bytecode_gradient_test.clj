@@ -280,7 +280,7 @@
         (is (= (Double/doubleToRawLongBits (widened-object-local x))
                (Double/doubleToRawLongBits value)))))))
 
-(deftest cold-selected-helpers-restart-the-whole-bytecode-preparation-owner
+(deftest cold-selected-helpers-settle-before-physical-preparation-observations
   (let [once-var (ns-resolve 'raster.ad.reverse 'prepare-owned-bytecode-value+grad-once)
         once! @once-var]
     (doseq [tag '[Double Float] nested? [false true]]
@@ -316,7 +316,8 @@
                        (prepared function)))
                 invoke (#'reverse/compile-prepared-value+grad p)
                 x (if (= tag 'Float) (float 2.0) 2.0)]
-            (is (<= 2 @attempts) "cold helper publication discards and reconstructs the whole derivation")
+            (is (= 1 @attempts)
+                "the selected semantic helper frontier settles before physical derivation observations")
             (is (not (identical? original (var-get receiver))))
             (is (nil? (:raster.core/jit-spec (meta receiver))))
             (is (= 4.0 (function x)))
