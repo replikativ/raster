@@ -1744,6 +1744,35 @@
                                                 :float Float :double Double :predicate Boolean)
              :nonthrowing? true}))))))))
 
+(defn- selected-fp-body-recipe
+  "Construct the actual selected body's numerical recipe, not caller facts.
+   The source view was acquired under this definition owner. Its actual formal
+   Classes and owned return bridge are evidence about that body only; no logical
+   operand dtype discharges an original caller's unboxing or argument effects."
+  [{:keys [entry body original-body body-context arguments definition]}]
+  (when method-entry/*emission-inputs*
+    (when-let [bridge (and (not (:pending-source? entry))
+                          ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge)
+                           (:emission entry)))]
+      (let [parameters (:parameters definition)
+            carriers (:parameter-carriers entry)
+            actual (completed-fp-body-carrier
+                    body (zipmap parameters carriers) true
+                    {:source-ns (:source-ns body-context)
+                     ;; Qualification may rebuild bare casts. Such a clone
+                     ;; is not an original Java invocation occurrence.
+                     :emission (when (identical? body original-body) (:emission entry))})
+            program (when (and (= (:invocation-method entry) (:invocation-method bridge))
+                               (= carriers (:parameter-carriers bridge))
+                               (every? #{Float/TYPE Double/TYPE} carriers)
+                               (= actual (:payload-carrier bridge)))
+                      (checked-scalar-program
+                       body (zipmap parameters (map #(if (= Float/TYPE %) :float :double) carriers))))]
+        (when (= (if (= actual Float/TYPE) :float :double) (:type program))
+          {:scope :owned-fp-return-payload :result-carrier Object :payload-carrier actual
+           :parameters parameters :parameter-carriers carriers :arguments (vec arguments)
+           :computation program :bridge bridge})))))
+
 (defn checked-selected-fp-payload
   "Retain a primitive SSA computation behind an ACTUAL owned Object-return bridge.
    This bounded leaf admits primitive FP formals and a closed source body.
@@ -1759,28 +1788,9 @@
   [expression argument-facts]
   (method-entry/call-with-optional-definition-inputs
    (fn []
-     (when-let [{:keys [entry body original-body body-context arguments definition]}
-                (selected-scalar-source expression)]
-       (when-let [bridge (and (not (:pending-source? entry))
-                             ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge)
-                              (:emission entry)))]
-         (let [parameters (:parameters definition)
-               carriers (:parameter-carriers entry)
-               actual (completed-fp-body-carrier
-                       body (zipmap parameters carriers) true
-                       {:source-ns (:source-ns body-context)
-                        ;; Qualification may rebuild bare casts. Such a clone
-                        ;; is not an original Java invocation occurrence.
-                        :emission (when (identical? body original-body) (:emission entry))})
-               program (when (and (vector? argument-facts)
-                                  (= (count arguments) (count argument-facts))
-                                  (= (:invocation-method entry) (:invocation-method bridge))
-                                  (= carriers (:parameter-carriers bridge))
-                                  (every? true? (map completed-fp-argument? argument-facts carriers))
-                                  (= actual (:payload-carrier bridge)))
-                         (checked-scalar-program
-                          body (zipmap parameters (map #(if (= Float/TYPE %) :float :double) carriers))))]
-           (when (= (if (= actual Float/TYPE) :float :double) (:type program))
-             {:scope :owned-fp-return-payload :result-carrier Object :payload-carrier actual
-              :parameters parameters :parameter-carriers carriers :arguments (vec arguments)
-              :computation program :bridge bridge})))))))
+     (when-let [{:keys [entry arguments] :as source} (selected-scalar-source expression)]
+       (when (and (vector? argument-facts)
+                  (= (count arguments) (count argument-facts))
+                  (every? true? (map completed-fp-argument?
+                                     argument-facts (:parameter-carriers entry))))
+         (selected-fp-body-recipe source))))))
