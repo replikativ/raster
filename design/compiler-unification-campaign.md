@@ -71,6 +71,49 @@ oracles. Typed Clojure startup optimization is deferred; correctness and a coher
 producer path remain the current priority. These are completion obligations, not
 a claim that PR #1566 or the overall campaign is qualified.
 
+#### Next closure: host references versus logical state
+
+Keep lexical availability, actual host-return kind, numerical AbstractValues and
+storage identity distinct. A logical buffer result can represent a mutation whose
+source binding returns nil (`:host-return :effect`); its buffer AV is not authority
+to treat that host binding as an array reference. Alias analysis must consume the
+certified source-return relation, not copied outer annotations or dtype hints.
+
+The bounded next vertical is exact Object-input completion of an already-bound
+buffer reference. Host analysis owns the source-ordered alias relation; consumers
+rederive it rather than trusting persisted alias maps. It requires stable SSA
+names, excludes future seeded facts and shadowing, and preserves checked casts
+and scalar boxing. Integrate it into the existing pre-TypedSOAC buffer-alias
+normalizer: later operations then refer to their original producer when the graph
+is first constructed. Use source-description host-return contracts at that
+frontier, with certified result-storage as a later independent check. Neither
+declared array tags nor `:effect-only?` establish a buffer return. Consumer
+integration must qualify all three cases:
+
+- Public/prefix buffer aliases reuse the existing `ValueAlias` storage identity.
+- Return-only aliases of kernel results resolve to the original certified result.
+- Aliases used by later kernels preserve producer/use dependencies through typed
+  normalization or certified realization, never by inventing a pre-device input.
+
+Source-return validation must see the normalized semantic-source copy without
+changing the original SourceFrontend. Ordered realization and effect-return
+counterexamples are mandatory gates; passing only unused AD-field cases is not
+completion of this vertical.
+
+The bounded buffer-reference lane now shares an incremental HostAV transfer with
+ordinary host analysis. The source normalizer advances the existing operation
+descriptions once per emitted binding, with a separate local-ID supply, only when
+an exact Object-input candidate exists. Destination-return identity is resolved
+before this query, retaining backing capacity rather than a writer's traversal
+shape. Explicit effect/mixed/unknown return contracts cannot become buffer aliases
+through copied logical tensor facts. Tail rewriting uses only the resulting
+source-ordered alias relation, not the older whole-source array-name table; an
+executable global-capture regression protects this distinction. Parameter names
+come from the actual public context, never all value-table keys. Inner structured
+regions still need their own certified local input context; outer prefix value
+shapes alone do not supply that authority. Local consumer/ownership qualification
+does not replace complete public-workload and exact-head CI acceptance.
+
 #### Source meaning and executable bindings
 
 The implementation distinguishes the existing immutable `SourceFrontend` from

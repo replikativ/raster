@@ -16,6 +16,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
@@ -33,7 +34,8 @@
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
-            [raster.compiler.passes.scalar.effects :as effects]))
+            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.host-abstract-value :as host-av]))
 
 (defn- fail!
   [reason message data]
@@ -3999,8 +4001,37 @@
        expression))
    source))
 
+(declare ^:private advance-source-description ^:private initial-source-description-state
+         ^:private description-host-buffer?)
+
+(defn- advance-normalized-alias-facts
+  [state [id expression]]
+  (if-not (:host-analysis state)
+    state
+    (let [description-state
+          ;; This observation must not consume the normalizer/emitter's SSA
+          ;; supply. Descriptions share their own existing regional supply.
+          (binding [*region-local-counter* (:alias-description-counter state)]
+            (advance-source-description
+             (:default-dtype state) true (:source-description-state state)
+             [(count (:descriptions (:source-description-state state))) [id expression]]))
+          description (peek (:descriptions description-state))
+          inherited? (and (symbol? expression) (contains? (:host-buffer-values state) expression))
+          described? (description-host-buffer? description)
+          host-analysis (host-av/advance-binding (:host-analysis state) id expression
+                                                 (not (or inherited? described?)))
+          alias-source (get-in host-analysis [:analysis :aliases id])
+          buffer? (or described? alias-source)
+          alias-dtype (when alias-source (get-in host-analysis [:analysis :values alias-source :dtype]))]
+      (when buffer?
+        (set! *declared-kinds* (update *declared-kinds* :arrays conj id)))
+      (assoc state :host-analysis host-analysis
+             :host-buffer-values (cond-> (:host-buffer-values state) buffer? (conj id))
+             :source-description-state
+             (cond-> description-state alias-dtype (assoc-in [:array-types id] alias-dtype))))))
+
 (defn- normalize-source*
-  [source array-types scalar-types]
+  [source array-types scalar-types options]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
@@ -4016,15 +4047,29 @@
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
+            lexical? (and (contains? options :lexical-inputs)
+                          (some (fn [[_ expression]]
+                                  (some-> expression completion/object-input-parts :operand symbol?)) pairs))
             occupied-symbols (set (filter symbol? (tree-seq coll? seq source)))
-            {:keys [normalized]}
+            {:keys [normalized host-analysis object-buffer-alias?]}
             (reduce
              (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
                          local-scalar-types buffer-aliases]
                    :as state}
                   [ordinal [symbol expression]]]
-               (let [expression (-> (util/subst-syms buffer-aliases expression)
+               (let [previous-count (count (:normalized state))
+                     expression (-> (util/subst-syms buffer-aliases expression)
                                     resolve-direct-allocation-alengths)
+                     object-alias
+                     (when (and (:host-analysis state) (completion/object-input-parts expression))
+                       (host-av/binding-buffer-alias-source
+                        (update-in (:host-analysis state) [:analysis :available]
+                                   #(set/intersection % (:host-buffer-values state)))
+                        symbol expression))
+                     expression (or object-alias expression)
+                     state (cond-> state
+                             object-alias (assoc-in [:buffer-aliases symbol] object-alias)
+                             object-alias (assoc :object-buffer-alias? true))
                      return-index (:return-alias-arg (form/form-info expression))
                      returned (if (symbol? expression) expression
                                   (when (some? return-index)
@@ -4213,7 +4258,7 @@
                                (assoc-in state [:allocation-lengths symbol]
                                          (get allocation-lengths expression))
                                state))]
-                 (cond
+                 (let [next-state (cond
                    (nil? extent)
                    (update state :normalized conj [symbol expression])
 
@@ -4260,11 +4305,23 @@
                                     [symbol (replace-extent expression extent-id)]]))))
 
                    :else
-                   (update state :normalized conj [symbol expression]))))
-             {:normalized [] :compound-extents {} :checked-extents {} :allocation-lengths {}
-              :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
+                   (update state :normalized conj [symbol expression]))]
+                   (reduce advance-normalized-alias-facts next-state
+                           (subvec (:normalized next-state) previous-count)))))
+             (cond-> {:normalized [] :compound-extents {} :checked-extents {} :allocation-lengths {}
+                      :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
+               lexical? (assoc :host-analysis (host-av/begin-analysis source options)
+                               :alias-description-counter (atom -1)
+                               :default-dtype (or (:dtype options) :double)
+                               :source-description-state (initial-source-description-state public-array-types scalar-types)
+                               :host-buffer-values (set/intersection (set (:lexical-inputs options))
+                                                                    (set (keys public-array-types)))))
              (map-indexed vector pairs))]
-        (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
+        (with-meta (list* head (vec (mapcat identity normalized))
+                         (if object-buffer-alias?
+                           (map #(util/subst-syms (get-in host-analysis [:analysis :aliases]) %) body)
+                           body))
+          (meta source)))
       source)))
 
 (defn- alength-array
@@ -4275,16 +4332,37 @@
              (= 1 (count (descriptor/call-args expression))))
     (first (descriptor/call-args expression))))
 
-(defn- source-descriptions
-  ([pairs default-dtype array-types scalar-types]
-   (source-descriptions pairs default-dtype array-types scalar-types false))
-  ([pairs default-dtype array-types scalar-types segmented-plans?]
+(defn- description-allocation-dtype [{:keys [kind expr]}]
+  (when (and (= :scalar kind) (seq? expr) (descriptor/alloc-op? (descriptor/semantic-op expr)))
+    (let [operation (descriptor/semantic-op expr)
+          array-tag (or (get descriptor/alloc-sym->array-tag operation)
+                        (get descriptor/alloc-sym->array-tag (some-> operation name symbol)))]
+      (some-> array-tag dtype/dtype-for-array-tag dtype/canon))))
+
+(defn- description-logical-array-dtype [description]
+  (when (contains? #{:map :scatter :segmented-weighted-reduction-plan} (:kind description))
+    (some-> (if (= :segmented-weighted-reduction-plan (:kind description))
+              (get-in description [:plan :output :dtype]) (:elem-type description)) dtype/canon)))
+
+(defn- description-host-buffer? [description]
+  (if (contains? description :result-storage)
+    (and (= 1 (count (:result-storage description)))
+         (= (:sym description) (:host-binding description))
+         (= :buffer (get-in description [:result-storage 0 :host-return])))
+    (or (and (= :scalar (:kind description))
+             (some? (allocation-length (:expr description))))
+        (description-logical-array-dtype description))))
+
+(defn- initial-source-description-state [array-types scalar-types]
+  {:descriptions [] :array-types array-types :scalar-definitions {}
+   :local-scalar-types scalar-types :stageable-prefix? true :before-parallel? true})
+
+(defn- advance-source-description
   ;; Earlier local allocations are authoritative array-type facts for later effects. Thread those
   ;; facts in source order instead of falling back to the program-wide arithmetic dtype: a local
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
-  (:descriptions
-   (reduce
-    (fn [{:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
+  [default-dtype segmented-plans?
+        {:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
                  before-parallel?] :as state}
          [id [symbol expression]]]
       (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
@@ -4345,25 +4423,12 @@
                   (when (index-algebra/monomial proof-scalar-expression)
                     proof-scalar-expression)
                   expression))
-            allocation-dtype
-            (when (and (= :scalar (:kind description))
-                       (seq? expression)
-                       (descriptor/alloc-op? (descriptor/semantic-op expression)))
-              (let [operation (descriptor/semantic-op expression)
-                    array-tag (or (get descriptor/alloc-sym->array-tag operation)
-                                  (get descriptor/alloc-sym->array-tag
-                                       (some-> operation name symbol)))]
-                (some-> array-tag dtype/dtype-for-array-tag dtype/canon)))
+            allocation-dtype (description-allocation-dtype description)
             logical-array-dtype
             ;; A functional map result is a typed array value available to later source
             ;; descriptions. This is the map's declared element contract, not a consumer guess;
             ;; a resident map binding may name a different caller-owned physical destination.
-            (when (contains? #{:map :scatter :segmented-weighted-reduction-plan}
-                             (:kind description))
-              (some-> (if (= :segmented-weighted-reduction-plan (:kind description))
-                        (get-in description [:plan :output :dtype])
-                        (:elem-type description))
-                      dtype/canon))]
+            (description-logical-array-dtype description)]
         (cond-> (update state :descriptions conj description)
           (or (not= :scalar (:kind description))
               (and (nil? allocation-dtype)
@@ -4377,9 +4442,15 @@
           allocation-dtype (assoc-in [:array-types symbol] allocation-dtype)
           logical-array-dtype (assoc-in [:array-types symbol] logical-array-dtype)
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
-    {:descriptions [] :array-types array-types :scalar-definitions {}
-     :local-scalar-types scalar-types :stageable-prefix? true :before-parallel? true}
-    (map-indexed vector pairs)))))
+
+(defn- source-descriptions
+  ([pairs default-dtype array-types scalar-types]
+   (source-descriptions pairs default-dtype array-types scalar-types false))
+  ([pairs default-dtype array-types scalar-types segmented-plans?]
+   (:descriptions
+    (reduce (partial advance-source-description default-dtype segmented-plans?)
+            (initial-source-description-state array-types scalar-types)
+            (map-indexed vector pairs)))))
 
 (defn- canonical-extent
   [equalities values extent]
@@ -4655,7 +4726,7 @@
    This normalization inserts an ordinary typed scalar binding immediately before its operation,
    so the same expression remains visible to JVM materialization and runtime specialization."
   ([source] (normalize-source source {}))
-  ([source {:keys [array-types scalar-types]}]
+  ([source {:keys [array-types scalar-types] :as options}]
    ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
    ;; binder an array, exactly as the walker stamps them.
    (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
@@ -4673,7 +4744,7 @@
                                                    (some-> % dtype/dtype-for-scalar-tag
                                                            dtype/canon))))}]
        (normalize-source* (copy-allocations->maps source array-types)
-                          array-types scalar-types)))))
+                          array-types scalar-types options)))))
 
 (declare coverage-decline*)
 

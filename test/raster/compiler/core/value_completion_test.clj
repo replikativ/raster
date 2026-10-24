@@ -5,6 +5,21 @@
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
 
+(deftest exact-object-input-syntax-does-not-generalize-other-completions
+  (let [operand (with-meta 'input {:raster.type/tag 'doubles})
+        term (completed operand)]
+    (is (identical? operand (:operand (completion/object-input-parts term))))
+    (is (= 'doubles (completion/object-value-declaration term)))
+    (doseq [expression [operand
+                        (completion/complete-value (completion/reference-check-contract Object) operand)
+                        (list completion/completion-symbol
+                              (assoc completion/object-input-contract :ownership :borrowed) operand)]]
+      (is (nil? (completion/object-input-parts expression))))
+    (is (= :conflicting-value-completion-declaration
+           (try (completion/object-value-declaration
+                 (with-meta term {:raster.type/tag 'floats})) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
 (deftest retained-context-barrier-is-quote-opaque-and-includes-invalid-terms
   (let [term (completed 'x)
         malformed (list completion/completion-symbol {:source-context :unknown} 'x)]

@@ -1273,7 +1273,8 @@
                  :scalar-types {'n :long}}
         attempt (fn [source]
                   (:program (typed-route/attempt source :double (:array-types options)
-                                                 {:scalar-types (:scalar-types options)})))
+                                                 {:scalar-types (:scalar-types options)
+                                                  :lexical-inputs (:public-parameters options)})))
         partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                  loss (opaque-loss y)] loss))]
     (is (= '[y] (:outputs partial)) "the island must still materialize its host consumer's input")
@@ -1289,9 +1290,10 @@
       (let [source (list 'let* '[y (raster.par/map! out i n double (clojure.core/aget x i))]
                          result)]
         (is (= '[y] (:outputs (route/promote-program (attempt source) options))))))
-    (doseq [aliased ['y 'out]]
+    (doseq [aliased ['y 'out]
+            wrap [identity #(completion/complete-value completion/object-input-contract %)]]
       (let [source (list 'let* (into '[y (raster.par/map! out i n double (clojure.core/aget x i))]
-                                   ['returned aliased 'final-result 'returned])
+                                   ['returned (wrap aliased) 'final-result (wrap 'returned)])
                          'final-result)]
         (is (= '[y] (:outputs (route/promote-program (attempt source) options)))
             "exact lexical aliases preserve logical/physical return identity")))
@@ -1335,6 +1337,33 @@
                (reason-of #(route/promote-program
                             (assoc complete :source (list 'let* ['y replacement] 'y)) options)))
             "removability cannot authorize a stale equation for a claimed binding")))))
+
+(deftest used-buffer-completion-keeps-the-original-kernel-dependency
+  (let [options {:dtype :double :public-parameters '[x out n]
+                 :array-types {'x :double 'out :double} :scalar-types {'n :long}}
+        prepare (fn [wrap]
+                  (let [source (list 'let*
+                                     (into '[y (raster.par/map! out i n double
+                                                               (clojure.core/aget x i))]
+                                           ['returned (wrap 'y)
+                                            'z '(raster.par/map! x i n double
+                                                                 (clojure.core/aget returned i))])
+                                     'z)
+                        result (typed-route/attempt
+                                source :double (:array-types options)
+                                {:scalar-types (:scalar-types options)
+                                 :lexical-inputs (:public-parameters options)})]
+                    (route/promote-program (:program result) options)))
+        plain (prepare identity)
+        completed (prepare #(completion/complete-value completion/object-input-contract %))]
+    (is (= 2 (count (:equations completed))))
+    (is (= (mapv #(select-keys % [:operands :results :effects :algorithm]) (:equations plain))
+           (mapv #(select-keys % [:operands :results :effects :algorithm]) (:equations completed)))
+        "completion must not disconnect the second kernel from the first writer")
+    (is (= (:inputs plain) (:inputs completed)))
+    (is (not-any? #{'returned} (:inputs completed))
+        "a result alias is not a new public device input")
+    (is (= '[z] (:outputs completed)))))
 
 (deftest checked-prefix-equations-are-not-pruned-into-the-invocation-prefix
   (let [source '(let* [checked (clojure.core/int n)

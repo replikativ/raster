@@ -904,7 +904,7 @@
       structured
       (let [typed (typed-soac-route/attempt
                    source (:dtype opts) (:array-types opts)
-                   {:resident-reductions? (or (true? (:resident-reductions? opts))
+                   (cond-> {:resident-reductions? (or (true? (:resident-reductions? opts))
                                               (device/gpu-target? (:target-device opts)))
                     :resident-initialization? (device/gpu-target? (:target-device opts))
                     :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
@@ -912,7 +912,9 @@
                     :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
                     :values values
-                    :abstract-machine abstract-machine})
+                    :abstract-machine abstract-machine}
+                     (some? (:public-parameters common))
+                     (assoc :lexical-inputs (:public-parameters common))))
             ;; Mixed source construction shares the ordinary frontend but cannot depend on
             ;; this route's validator without a namespace cycle. Certify the closed algorithm
             ;; union here, before exposing it as an accepted semantic program.

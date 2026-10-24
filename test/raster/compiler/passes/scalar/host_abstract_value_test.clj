@@ -1,10 +1,105 @@
 (ns raster.compiler.passes.scalar.host-abstract-value-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.host-abstract-value :as host-av]))
 
 (def ^:private initial
   (av/tensor {:dtype :double :shape ['?] :representation {:kind :plain}}))
+
+(defn- object-input [operand]
+  (completion/complete-value completion/object-input-contract operand))
+
+(deftest lexical-buffer-aliases-preserve-the-complete-source-value
+  (let [value (av/tensor {:dtype :double :shape ['n] :ownership :external
+                          :effects #{:memory/read} :attributes {:source :caller}
+                          :memory-space :device :placement {:device :arc}
+                          :sharding {:mesh :local}})
+        source (list 'let* ['y (object-input 'x) 'z 'y 'w (object-input 'z)] 'w)
+        analysis (host-av/analyze source {:values {'x value} :lexical-inputs '[x]})]
+    (is (= {'y 'x 'z 'y 'w 'z} (:aliases analysis)))
+    (doseq [id '[x y z w]] (is (= value (get-in analysis [:values id]))))
+    (is (= #{'x 'y 'z 'w} (:available analysis)))
+    (is (nil? (:aliases (host-av/analyze source {:values {'x value}}))))
+    (is (nil? (get-in (host-av/analyze source {:values {'x value}}) [:values 'y])))))
+
+(deftest alias-availability-is-not-inferred-from-future-seed-facts
+  (let [value (av/tensor {:dtype :double :shape ['n]})]
+    (doseq [expression ['x (object-input 'x)]
+            :let [source (list 'let* ['y expression 'z 'y 'x '(clojure.core/double-array n)] 'z)
+                  analysis (host-av/analyze source {:values {'x value 'y value 'z value}
+                                                   :lexical-inputs '[n]})]]
+      (is (= {} (:aliases analysis)))
+      (is (not (contains? (:available analysis) 'y)))
+      (is (not (contains? (:available analysis) 'z))))
+    (is (nil? (host-av/bound-buffer-alias-source 'x {'x value} #{} nil)))
+    (is (= 'x (host-av/bound-buffer-alias-source 'x {'x value} #{'x} nil)))))
+
+(deftest buffer-alias-queries-do-not-erase-checks-or-infer-physical-carriers
+  (let [buffer (av/tensor {:dtype :double :shape ['n]})
+        scalar (av/tensor {:dtype :double :shape []})
+        available #{'x 'scalar}
+        values {'x buffer 'scalar scalar}]
+    (doseq [expression [(object-input 'scalar)
+                        '(clojure.core/float x)
+                        (completion/complete-value (completion/reference-check-contract Object) 'x)
+                        (object-input '(identity x))
+                        (object-input (with-meta 'x {:raster.type/tag 'floats}))
+                        (with-meta (object-input 'x) {:raster.type/tag 'double})]]
+      (is (nil? (host-av/bound-buffer-alias-source expression values available nil))))
+    (doseq [expected [(assoc buffer :dtype :float)
+                       (assoc buffer :representation {:kind :quantized :scheme :q4-k})
+                       scalar]]
+      (is (nil? (host-av/bound-buffer-alias-source (object-input 'x) values available expected))))
+    (is (= :conflicting-value-completion-declaration
+           (try (host-av/bound-buffer-alias-source
+                 (with-meta (object-input (with-meta 'x {:raster.type/tag 'doubles}))
+                   {:raster.type/tag 'floats}) values available nil) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+    (is (= {} (:aliases (host-av/analyze
+                        (list 'let* ['boxed (object-input 'scalar) 'copied 'scalar] 'copied)
+                        {:values {'scalar scalar} :lexical-inputs '[scalar]}))))
+    (is (= scalar (get-in (host-av/analyze '(let* [copied scalar] copied)
+                                          {:values {'scalar scalar} :lexical-inputs '[scalar]})
+                          [:values 'copied])))))
+
+(deftest buffer-alias-analysis-refuses-unstable-flat-identities
+  (let [value (av/tensor {:dtype :double :shape ['n]})]
+    (doseq [[source inputs]
+            [[(list 'let* ['y 'x 'x (object-input 'input)] 'y) '[x input]]
+             [(list 'let* ['x (object-input 'input) 'y 'x 'x (object-input 'input)] 'y) '[input]]]]
+      (is (= {} (:aliases (host-av/analyze source
+                                          {:values {'x value 'input value}
+                                           :lexical-inputs inputs})))))
+    (is (= {} (:aliases (host-av/analyze (list 'let* [['y] 'x] 'y)
+                                        {:values {'x value} :lexical-inputs '[x]})))
+        "destructuring is not a flat SSA alias binder")
+    (let [id (with-meta 'y {:raster.type/tag 'floats})]
+      (is (= {} (:aliases (host-av/analyze (list 'let* [id (object-input 'x)] id)
+                                          {:values {'x value} :lexical-inputs '[x]})))))))
+
+(deftest certified-non-buffer-returns-cannot-become-aliases-through-logical-facts
+  (let [value (av/tensor {:dtype :double :shape ['n]})
+        source (list 'let*
+                     ['effect '(raster.par/stencil! destination [input] 1 :dirichlet double i n
+                                                  (clojure.core/aget input i))
+                      'wrapped (object-input 'effect) 'bare 'wrapped 'again (object-input 'bare)
+                      'other-effect (object-input 'input)]
+                     'again)]
+    (doseq [excluded ['[effect other-effect] #{'effect 'other-effect}]
+            :let [analysis (host-av/analyze
+                            source {:values (zipmap '[input destination effect wrapped bare again] (repeat value))
+                                    :lexical-inputs '[input destination n]
+                                    :non-buffer-bindings excluded})]]
+      (is (= {} (:aliases analysis)))
+      (is (= :tensor (get-in analysis [:values 'effect :kind])))
+      (is (= :double (get-in analysis [:values 'effect :dtype])))
+      (is (= ['n] (get-in analysis [:values 'effect :shape]))
+          "destination-write inference remains logical, not evidence of a host buffer"))
+    (doseq [invalid [nil '(effect) [:effect] #{42}]]
+      (is (= :host-abstract-value-non-buffer-bindings
+             (try (host-av/analyze source {:non-buffer-bindings invalid}) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
 
 (defn- source
   [copy-length]
@@ -136,3 +231,13 @@
   (testing "a dangling binding is never silently discarded"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"even binding vector"
                           (host-av/analyze '(let* [x 1 y] x) {})))))
+
+(deftest incremental-host-analysis-reuses-the-same-flat-transfer
+  (doseq [[form options]
+          [[(source 'n) {:values {'u0 initial}}]
+           [(list 'let* ['y (object-input 'x) 'z 'y] 'z)
+            {:values {'x initial} :lexical-inputs '[x]}]]]
+    (is (= (host-av/analyze form options)
+           (host-av/finish-analysis
+            (reduce (fn [context [id expression]] (host-av/advance-binding context id expression))
+                    (host-av/begin-analysis form options) (partition 2 (second form))))))))

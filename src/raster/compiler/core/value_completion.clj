@@ -246,6 +246,14 @@
   (when (canonical-form? expression)
     {:contract (second expression) :operand (nth expression 2)}))
 
+(defn object-input-parts
+  "Recognize ONLY the exact canonical Object-input completion syntax.
+   Its operand still owes evaluation and its own value/storage evidence. This
+   query grants no blanket conversion erasure, Class, presence or alias fact."
+  [expression]
+  (let [parts (canonical-parts expression)]
+    (when (= object-input-contract (:contract parts)) parts)))
+
 (defn bytecode-context-form?
   "A canonical region whose reconstruction needs original bytecode authority.
    Shape recognition is a rewrite barrier, not proof of ownership or execution."
@@ -260,15 +268,14 @@
    This conveys no presence or physical carrier and does not infer from hints.
    Other conversions need their own declaration authority."
   [expression]
-  (let [{:keys [contract operand]} (canonical-parts expression)]
-    (when (= object-input-contract contract)
-      (let [tag (:raster.type/tag (meta operand))
-            existing (:raster.type/tag (meta expression))]
-        (when (and tag existing (not= tag existing))
-          (throw (ex-info "Object completion has conflicting logical declarations"
-                          {:reason :conflicting-value-completion-declaration
-                           :operand-tag tag :completion-tag existing})))
-        tag))))
+  (when-let [{:keys [operand]} (object-input-parts expression)]
+    (let [tag (:raster.type/tag (meta operand))
+          existing (:raster.type/tag (meta expression))]
+      (when (and tag existing (not= tag existing))
+        (throw (ex-info "Object completion has conflicting logical declarations"
+                        {:reason :conflicting-value-completion-declaration
+                         :operand-tag tag :completion-tag existing})))
+      tag)))
 
 (defn contains-completion?
   "Whether executable syntax contains a retained input/result context. Quoted
