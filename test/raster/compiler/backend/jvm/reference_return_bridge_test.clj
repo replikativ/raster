@@ -136,8 +136,14 @@
            (is (nil? (entry/frontend-primitive-body-return-bridge changed)))
            (is (identical? before @parent)))
          (is (some? (entry/frontend-primitive-body-return-bridge frontend)))
-         (is (= 1 (count (:producer-inputs @parent))))
-         (is (satisfies? entry/RetainedProducerInput (first (:producer-inputs @parent)))))
+         (let [inputs @parent]
+           (is (seq (:producer-inputs inputs)))
+           (is (every? #(satisfies? entry/RetainedProducerInput %)
+                       (:producer-inputs inputs)))
+           ;; Semantic source and physical module guards have distinct duties;
+           ;; repeating the same observation must not duplicate either owner.
+           (is (some? (entry/frontend-primitive-body-return-bridge frontend)))
+           (is (= inputs @parent))))
        (let [dependency (:var (first (:dependency-snapshots emission)))
              metadata (meta dependency)]
          (is (var? dependency))

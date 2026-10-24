@@ -63,9 +63,18 @@ receiver/module history. Reacquiring source does not refresh an old physical
 artifact. Exact-candidate source preparation closes the existing walk cache
 before observation; queries themselves do not compile or execute anything.
 These guards stay process-local, outside portable TypedSOAC facts and cache keys.
-The mixed cold-source/warm-emission body reader still requires its planned
-consumer-by-consumer migration; this separation alone does not finish AD or
-transitive import closure.
+The mixed body reader is retired. Normal-return constructor/alias summaries read
+the authentic frozen semantic frontend for Object/primitive-array reference
+returns, retaining bootstrap constructor/nil-test observations. Void and unknown
+return adaptations abstain; formal/result tags never supply presence or a body
+array fact. Unresolved semantic aliases do not borrow current namespace lookup,
+and the original call/conversions remain. Physical scalar recipes use the exact
+typed-entry body history, while plain Clojure uses its separately frozen body and
+actual entry. This separation alone does not finish AD or transitive import closure.
+Structural internal `pmap` reuses the existing materializer's allocation rule;
+its element allocation and store conversion are distinct IR facets. This is not
+permission to infer helper purity, reinterpret arbitrary macro calls, or reuse
+the generic `par` destination-alias rules without their own source authority.
 
 #### Optional effect analysis is not a source owner
 

@@ -8,6 +8,7 @@
   (:require [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.source-arithmetic :as source-arithmetic]
@@ -33,6 +34,32 @@
 
 (declare summary)
 
+(defn- summary-source
+  "Semantic reference-return source, never a replaceable emitted body.
+   Other return adaptations need their own completion rule. In particular a
+   declared void entry discards even a value-producing body."
+  [{:keys [source-var receiver-var operation implementation-op parameters tags]
+    :as definition}]
+  (if receiver-var
+    (when-let [frontend (method-entry/selected-frontend-source
+                        operation implementation-op (count parameters) source-var
+                        (dtype/infer-dtype-from-tags tags))]
+      (let [lineage (:source-entry frontend)
+            return-tag (:return-tag lineage)]
+        (when (and (identical? (:source-body definition) (:source-body lineage))
+                   (or (= 'Object return-tag) (= Object return-tag)
+                       (contains? types/primitive-array-info return-tag)))
+          (assoc frontend :parameters (:params lineage) :tags (:tags lineage)
+                 :source-var source-var :source-ns (:source-ns lineage)
+                 :return-tag (:return-tag lineage)))))
+    ;; Plain Clojure has its own actual frozen body/entry correspondence.
+    (method-entry/selected-clojure-entry-body definition)))
+
+(defn- observe-semantic-intrinsic! [body-context operation]
+  (when (:source-frontend body-context)
+    (method-entry/assert-frontend-source! body-context (:source-var body-context))
+    (intrinsic-source/observe-original! (:source-ns body-context) operation)))
+
 (defn- materialized-result [expression env visited body-context]
   (let [key [:materialized-map expression]]
     (if (contains? visited key)
@@ -55,7 +82,7 @@
         definition (when (and method-entry/*emission-inputs*
                               (not (or lexical-callee (contains? env implementation-op))))
                      (if dispatch?
-                       (method-entry/observed-selected-definition :typed semantic-op implementation-op (count arguments))
+                       (method-entry/selected-definition semantic-op implementation-op (count arguments))
                        (or
                         (when-let [operation (mangled/impl->op implementation-op)]
                           (method-entry/observed-selected-definition :direct operation implementation-op
@@ -73,7 +100,7 @@
                                :direct implementation-op (:mangled-sym signature) (count arguments))))))))]
     (if definition
       (if-let [{:keys [source-var parameters body tags] :as selected-body}
-               (method-entry/selected-definition-body definition)]
+               (summary-source definition)]
         (if (contains? visited source-var)
           unknown
           (let [;; Only historical producer-owned bodies may prove constructors
@@ -82,14 +109,21 @@
             ;; Transport actual producer facts, never presence from formal tags.
             ;; A changed input carrier cannot certify a callee's array result.
             (if (seq body)
-              (summary (apply list 'do body)
-                       (zipmap parameters
-                               (map (fn [argument tag]
-                                      (let [fact (summary argument env visited body-context)]
-                                        (if (= tag (:array-tag fact)) fact
-                                            (dissoc fact :array-tag))))
-                                    arguments tags))
-                       (conj visited source-var) selected-body)
+              (let [result (summary (apply list 'do body)
+                                    (zipmap parameters
+                                            (map (fn [argument tag]
+                                                   (let [fact (summary argument env visited body-context)]
+                                                     (if (= tag (:array-tag fact)) fact
+                                                         (dissoc fact :array-tag))))
+                                                 arguments tags))
+                                    (conj visited source-var) selected-body)]
+                ;; A declared array return may checkcast, but cannot turn a
+                ;; different independently produced array into the desired one.
+                (if (and (:source-frontend selected-body) (:array-tag result)
+                         (contains? types/primitive-array-info (:return-tag selected-body))
+                         (not= (:return-tag selected-body) (:array-tag result)))
+                  unknown
+                  result))
               unknown)))
         unknown)
       unknown)))
@@ -119,6 +153,7 @@
                              (not (contains? env (first test))))
                    (second test))
         known (when argument (summary argument env visited body-context))]
+    (when argument (observe-semantic-intrinsic! body-context 'clojure.core/nil?))
     (case (:presence known)
       :present (summary else env visited body-context)
       :absent (summary then env visited body-context)
@@ -179,14 +214,18 @@
              (not (contains? env operation))
              (contains? descriptor/alloc-ops operation))
         (let [tag (get descriptor/alloc-sym->array-tag operation)]
+          (observe-semantic-intrinsic! body-context operation)
           (cond-> {:presence :present}
             (contains? types/primitive-array-info tag) (assoc :array-tag tag)))
-        ;; Use the existing pure-map materializer to expose its actual
-        ;; constructor and returned local; do not duplicate SOAC lowering.
-        (and (= 'raster.par/pmap operation) (par/par-map-pure-form? expression))
+        ;; pmap is structural compiler IR, not a source helper invocation. Use
+        ;; its existing materializer to expose the actual allocation/return,
+        ;; retaining constructor guards in a semantic frontend's context too.
+        (and (= 'raster.par/pmap operation) (par/par-map-pure-form? expression)
+             (= 5 (count expression)) (symbol? (second expression)))
         (materialized-result expression env visited body-context)
         ;; Only explicit destination identity contracts may forward a fact.
-        (and (symbol? operation) (= operation (first expression))
+        (and (not (:source-frontend body-context))
+             (symbol? operation) (= operation (first expression))
              ;; form-info accepts surface aliases such as par/scan. Such a
              ;; spelling is not a closed semantic operation in raw source.
              (= "raster.par" (namespace operation))

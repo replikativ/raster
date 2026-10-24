@@ -1050,34 +1050,42 @@
                                   (count (:raster.core/deftm-params metadata)) source-var
                                   (dtype/infer-dtype-from-tags (:raster.core/deftm-tags metadata)))))))
 
-(defn selected-definition-body
-  "Historical body for an already observed selected definition, never current
-   walked metadata. Typed methods retain actual receiver/emission correspondence.
-   Plain deftm declarations freeze the exact Clojure body at their producer.
-   Missing historical evidence abstains without compiling or invoking anything."
+(defn- retained-body-context!
+  [{:keys [source-var source-body]} lineage body context]
+  (when (and *emission-inputs* (seq body)
+             (identical? source-var (:source-var lineage))
+             (identical? source-body (:source-body lineage))
+             (source-entry-current? lineage))
+    (observe-definition-input! source-var (:ns (meta source-var)) (:name (meta source-var)))
+    (assert-definition-inputs-current! @*emission-inputs*)
+    (merge {:body body :parameters (:params lineage) :tags (:tags lineage)
+            :source-var source-var :source-ns (:source-ns lineage)} context)))
+
+(defn selected-typed-entry-body
+  "Physical typed-entry body for an already observed selection. Pending entries
+   retain their exact source-entry/receiver; published entries retain their actual
+   emitted body and lookup history. Never a semantic-source-only query: deriving
+   code facts here pins this physical binding even across genuine JIT rebinding."
   [{:keys [source-var receiver-var operation implementation-op parameters] :as definition}]
-  (when (and *emission-inputs* definition)
-    (let [projection (when receiver-var
-                       (selected-source-entry-carriers operation implementation-op
-                                                       (count parameters) source-var))
-          lineage (if receiver-var
-                    (:source-entry projection)
-                    (:raster.core/clojure-source-entry (meta source-var)))
-          body (when (and (identical? source-var (:source-var lineage))
-                          (identical? (:source-body definition) (:source-body lineage))
-                          (source-entry-current? lineage))
-                 (if receiver-var
-                   (if (:pending-source? projection)
-                     (:source-body lineage)
-                     (get-in projection [:emission :body]))
-                   (:clojure-body lineage)))]
-      (when (seq body)
-        (observe-definition-input! source-var (:ns (meta source-var)) (:name (meta source-var)))
-        (assert-definition-inputs-current! @*emission-inputs*)
-        {:body body :parameters (:params lineage) :tags (:tags lineage)
-         :source-var source-var :source-ns (:source-ns lineage)
-         :pending-source? (boolean (:pending-source? projection))
-         :dependency-snapshots (get-in projection [:emission :dependency-snapshots])}))))
+  (when (and *emission-inputs* receiver-var)
+    (when-let [projection (selected-source-entry-carriers
+                          operation implementation-op (count parameters) source-var)]
+      (let [lineage (:source-entry projection)
+            pending? (boolean (:pending-source? projection))]
+        (retained-body-context!
+         definition lineage
+         (if pending? (:source-body lineage) (get-in projection [:emission :body]))
+         {:pending-source? pending?
+          :dependency-snapshots (get-in projection [:emission :dependency-snapshots])})))))
+
+(defn selected-clojure-entry-body
+  "Exact producer-frozen Clojure body of an observed plain entry. This does not
+   borrow a typed receiver's source/emission mode or grant current alias lookup."
+  [{:keys [source-var receiver-var] :as definition}]
+  (when (and *emission-inputs* source-var (not receiver-var))
+    (let [lineage (:raster.core/clojure-source-entry (meta source-var))]
+      (retained-body-context! definition lineage (:clojure-body lineage)
+                              {:pending-source? false :dependency-snapshots nil}))))
 
 (defn original-body-entry-carriers
   "Actual parameters of the original typed or plain Clojure body entry.
@@ -1091,7 +1099,7 @@
        (fn []
          (when-let [definition (observed-selected-definition :direct operation implementation-op argument-count)]
            (when (and (identical? expected-source-var (:source-var definition))
-                      (selected-definition-body definition))
+                      (selected-clojure-entry-body definition))
              (let [lineage (:raster.core/clojure-source-entry (meta expected-source-var))
                    target (:source-root lineage)
                    methods (when (and target (source-entry-current? lineage))

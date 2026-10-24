@@ -1478,7 +1478,7 @@
         (when-let [entry (method-entry/selected-source-entry-carriers
                          semantic-op implementation-op (count arguments) (:source-var candidate))]
           (let [{:keys [parameters] :as definition} (:definition entry)
-                body-context (method-entry/selected-definition-body definition)
+                body-context (method-entry/selected-typed-entry-body definition)
                 source-body (:body body-context)
                 body (when (= 1 (count source-body))
                        (qualify-source-casts (first source-body) (set parameters) body-context))]
