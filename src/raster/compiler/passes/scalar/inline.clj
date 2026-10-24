@@ -288,21 +288,9 @@
     (source-owner/assert-portable-source! (try (meta @v) (catch Exception _ nil))))
   (let [;; Freeze the original producer first. Walking the legacy cache before
         ;; preparation would expand a cold helper's macros twice.
-        _ (when (and (var? v) (:raster.core/deftm (meta v)) method-entry/*emission-inputs*)
-            ;; Selection may already have observed several pending receivers.
-            ;; Freeze that known frontend frontier as one preparation batch,
-            ;; rather than consuming one whole-owner retry for each helper.
-            ;; The service checks the ORIGINAL history after the batch and
-            ;; forces the enclosing producer to restart on any publication.
-            (let [pending (into []
-                                (keep (fn [[receiver snapshot]]
-                                        (let [spec (get-in snapshot [:metadata :raster.core/jit-spec])]
-                                          (when (and (map? spec) (nil? (:frontend-source-owner spec)))
-                                            receiver))))
-                                (:definition-proofs @method-entry/*emission-inputs*))]
-              (when (seq pending)
-                (method-entry/prepare-pending-definition-inputs!
-                 rcore/prepare-implementation-frontend! pending))))
+        ;; This is the candidate selected by try-resolve-deftm, after its
+        ;; opacity checks. Earlier observations are not an inline frontier:
+        ;; they can include opaque callees whose bodies we never consume.
         _ (when (var? v) (rcore/prepare-deftm-frontend! v))
         retained-frontend (when (:raster.core/deftm (meta v))
                             (method-entry/original-source-frontend v))

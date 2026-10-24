@@ -19,14 +19,74 @@
   dispatch: it is always a bug, and the inliner must say so AT THE CALL — naming the
   callee and both arities."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.par]
             [raster.numeric]
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
+
+(deftest source-preparation-is-scoped-to-the-actual-inline-candidate
+  (let [scope (create-ns (gensym "raster.inline-source-frontier."))
+        attempts (atom 0)
+        prepared-sources (atom [])
+        prepare! core/prepare-deftm-frontend!]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm candidate [x :- Double] :- Double x))
+        (eval '(raster.core/deftm ^:no-inline opaque [x :- Double] :- Double x))
+        (let [candidate (core/resolve-deftm-var (ns-resolve scope 'candidate))
+              opaque (core/resolve-deftm-var (ns-resolve scope 'opaque))
+              receiver (fn [source]
+                         (ns-resolve scope (symbol (str (:name (meta source)) "-impl"))))
+              candidate-receiver (receiver candidate)
+              opaque-receiver (receiver opaque)
+              candidate-root (var-get candidate-receiver)
+              opaque-root (var-get opaque-receiver)
+              opaque-metadata (meta opaque-receiver)
+              candidate-symbol (symbol (str (ns-name scope)) (str (:name (meta candidate))))
+              opaque-symbol (symbol (str (ns-name scope)) (str (:name (meta opaque))))]
+          (is (map? (:raster.core/jit-spec (meta candidate-receiver))))
+          (is (nil? (get-in (meta candidate-receiver)
+                           [:raster.core/jit-spec :frontend-source-owner])))
+          (is (map? (:raster.core/jit-spec opaque-metadata)))
+          (is (nil? (get-in opaque-metadata [:raster.core/jit-spec :frontend-source-owner])))
+          (let [imported
+                (with-redefs [core/prepare-deftm-frontend!
+                              (fn [source]
+                                (swap! prepared-sources conj source)
+                                (prepare! source))]
+                  (entry/call-with-definition-inputs
+                   (fn []
+                     (swap! attempts inc)
+                     ;; Both are genuine earlier observations. Only the selected
+                     ;; candidate is a body consumer; opacity is checked before
+                     ;; the other source can enter preparation.
+                     (doseq [v [candidate-receiver opaque-receiver]]
+                       (entry/observe-definition-input! v scope (.sym ^clojure.lang.Var v)))
+                     (is (nil? (#'inline/try-resolve-deftm opaque-symbol)))
+                     (let [result (#'inline/try-resolve-deftm candidate-symbol)]
+                       (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
+                       result))))]
+            (is (some? imported))
+            (is (= '[x] (:walked-body imported)))
+            (is (= 2 @attempts)
+                "publishing the actual candidate frontend restarts its original owner once")
+            (is (seq @prepared-sources))
+            (is (every? #(identical? candidate %) @prepared-sources))
+            (is (some? (get-in (meta candidate-receiver)
+                              [:raster.core/jit-spec :frontend-source-owner])))
+            (is (identical? candidate-root (var-get candidate-receiver))
+                "source preparation does not JIT or execute the candidate")
+            (is (identical? opaque-root (var-get opaque-receiver)))
+            (is (identical? opaque-metadata (meta opaque-receiver)))
+            (is (identical? (:raster.core/jit-spec opaque-metadata)
+                            (:raster.core/jit-spec (meta opaque-receiver)))))))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest no-op-ad-hoisting-preserves-exact-source-occurrences
   (let [leaf (with-meta '(helper x) {:source-marker :leaf})
