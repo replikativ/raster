@@ -4799,7 +4799,11 @@
 (defn- postwalk-code
   "Postwalk executable forms, leaving quoted data untouched."
   [f body]
-  (util/postwalk-preserving-meta f body))
+  (util/postwalk-preserving-meta
+   (fn [node]
+     (if (and (seq? node) (contains? '#{quote clojure.core/quote} (first node)))
+       node
+       (f node))) body))
 
 (defn- binaryize-core-arithmetic
   "Express core arithmetic's variadic contract using identities, aliases,

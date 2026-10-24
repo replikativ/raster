@@ -234,9 +234,13 @@
                                                     '(raster.numeric/* x (raster.numeric/+ x 1.0))))
                 :accepted
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
-    (doseq [contract [(completion/reference-check-contract Double)
-                      (completion/primitive-input-contract Float/TYPE {:unchecked-math false})]]
-      (is (not (#'reverse/structural-completion? (completion/complete-value contract x)))))))
+    (is (#'reverse/structural-completion?
+         (completion/complete-value (completion/reference-check-contract Double) x))
+        "an explicit Class.cast is an operation, not a claim about its operand carrier")
+    (is (not (#'reverse/structural-completion?
+              (completion/complete-value
+               (completion/primitive-input-contract Float/TYPE {:unchecked-math false}) x)))
+        "an ordinary term still grants no owned primitive-conversion rule")))
 
 (deftest jvp-refuses-unclosed-and-malformed-completions-even-when-inactive
   (doseq [term [(completion/complete-value completion/object-input-contract
