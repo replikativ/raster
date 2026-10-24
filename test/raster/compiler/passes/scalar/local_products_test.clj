@@ -8,6 +8,7 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.normal-return :as normal-return]
+            [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.local-products :as products]))
 
 (deftm projected-product [x :- Double] :- Double
@@ -52,6 +53,113 @@
     (doubleValue []
       (swap! events conj label)
       (if (instance? Throwable value) (throw value) (double value)))))
+
+(deftm native-ad-unused-double [x :- Double unused :- Double] :- Double
+  (n/* x 2.0))
+
+(deftm native-ad-unused-double-gradient [x :- Double unused :- Double] :- Double
+  (let [result ((reverse/value+grad #'native-ad-unused-double :wrt [0]) x unused)]
+    (nth result 1)))
+
+(deftm native-ad-integral-boundary [x :- Double unused :- Long] :- Double
+  (n/* x 2.0))
+
+(deftm native-ad-integral-boundary-gradient [x :- Double unused :- Long] :- Double
+  (let [result ((reverse/value+grad #'native-ad-integral-boundary :wrt [0]) x unused)]
+    (nth result 1)))
+
+(deftm native-ad-local-argument-gradient [x :- Double] :- Double
+  (let [local x result ((reverse/value+grad #'scalar-square) local)]
+    (nth result 1)))
+
+(deftest native-ad-entry-roundtrip-keeps-all-public-conversions
+  (let [compiled (pipeline/compile-aot #'native-ad-unused-double-gradient :target :c :dtype :double)
+        events (atom [])]
+    (try
+      (is (= 2.0 (compiled (observed-double events :x 3.0)
+                           (observed-double events :unused 11.0))))
+      (is (= [:x :unused] @events))
+      (reset! events [])
+      (is (thrown? NullPointerException (compiled (observed-double events :x 3.0) nil)))
+      (is (= [:x] @events))
+      (reset! events [])
+      (is (thrown? ClassCastException (compiled "bad" (observed-double events :unused 11.0))))
+      (is (empty? @events))
+      (finally (when (instance? java.lang.AutoCloseable compiled)
+                 (.close ^java.lang.AutoCloseable compiled))))))
+
+(deftest native-ad-entry-construction-does-not-borrow-logical-parameter-types
+  (doseq [source [#'native-ad-integral-boundary-gradient #'native-ad-local-argument-gradient]]
+    (is (= :unclosed-c-family-value-completion
+           (:reason (ex-data (try (pipeline/compile-aot source :target :c :dtype :double) nil
+                                 (catch clojure.lang.ExceptionInfo error error))))))))
+
+(deftest native-ad-entry-projection-rejects-changed-actual-constructor-plans
+  (let [factory (requiring-resolve
+                 'raster.compiler.backend.jvm.generated-body/instantiate-boxed-entry-inputs)
+        original (var-get factory)]
+    (doseq [change [:bridge :slot-contract]]
+      (method-entry/call-with-definition-inputs
+       (fn []
+         (let [source-var (:resolved-var
+                           (pipeline/deftm-frontend-facts #'native-ad-unused-double-gradient :double))
+               _ (rcore/prepare-deftm-frontend! source-var)
+               frontend (method-entry/original-source-frontend source-var)
+               policy (get-in frontend [:source-entry :source-policy])
+               factory-calls (atom 0) consumers (atom 0)
+               result
+               (with-redefs-fn
+                 {factory
+                  (fn [physical parameters arguments]
+                    (let [plan (original physical parameters arguments)]
+                      (swap! factory-calls inc)
+                      (case change
+                        :bridge (assoc-in plan [:boxed-entry-bridge :kind] :changed-original-bridge)
+                        :slot-contract
+                        (let [slot (first (:slots plan))
+                              ;; A real canonical contract with the SAME actual
+                              ;; target Class, but not this boxed-entry operation.
+                              contract (completion/primitive-input-contract (:parameter-class slot) policy)
+                              input [(first (first (:input-bindings plan)))
+                                     (completion/complete-value contract (:object-binder slot))]
+                              inputs (assoc (:input-bindings plan) 0 input)]
+                          (assoc plan :slots (assoc-in (:slots plan) [0 :contract] contract)
+                                      :input-bindings inputs
+                                      :bindings (into (:object-bindings plan) inputs))))))}
+                 #(reverse/with-double-source-ad-projection
+                   frontend source-var (pipeline/build-param-env source-var :double)
+                   (fn [_] (swap! consumers inc) :unexpected-consumer)))]
+           (is (pos? @factory-calls) "interpose the actual prepared entry constructor")
+           (is (nil? result))
+           (is (zero? @consumers) "changed observations never reach the numerical consumer")))))))
+
+(deftest direct-ad-projection-normalization-keeps-the-original-evaluation-site
+  (let [source-ns (the-ns 'raster.compiler.passes.scalar.local-products-test)
+        application '((raster.ad.reverse/value+grad
+                       (var raster.compiler.passes.scalar.local-products-test/scalar-square)) x)
+        source (list 'let* '[before (record! :before)] (list 'clojure.core/nth application 1))
+        normalized (method-entry/call-with-definition-inputs
+                    #(inline/normalize-direct-ad-projections source source-ns))
+        bindings (partition 2 (second normalized))]
+    (is (= '[before (record! :before)] (first bindings)))
+    (is (identical? application (second (second bindings))))
+    (is (= (list 'clojure.core/nth (first (second bindings)) 1) (last normalized)))
+    (doseq [tail [(list 'consume! '(record! :operand) (list 'clojure.core/nth application 1))
+                  (list 'if 'pred (list 'clojure.core/nth application 1) 0.0)
+                  (list 'clojure.core/nth application 1 :missing)
+                  (list 'clojure.core/nth
+                        '((raster.ad.reverse/grad
+                           (var raster.compiler.passes.scalar.local-products-test/scalar-square)) x) 0)]]
+      (let [original (list 'let* [] tail)]
+        (is (= original (method-entry/call-with-definition-inputs
+                         #(inline/normalize-direct-ad-projections original source-ns))))))
+    (let [original-nth clojure.core/nth]
+      (with-redefs [clojure.core/nth (fn [& args] (apply original-nth args))]
+        (is (= :intrinsic-source-definition-mismatch
+               (:reason (ex-data (try
+                                   (method-entry/call-with-definition-inputs
+                                    #(inline/normalize-direct-ad-projections source source-ns)) nil
+                                   (catch clojure.lang.ExceptionInfo error error))))))))))
 
 (deftest native-object-storage-keeps-entry-conversions-before-the-source-guard
   (let [compiled (pipeline/compile-aot #'native-product-with-unused-input :target :c :dtype :double)
@@ -426,6 +534,24 @@
     (let [a (atom 0) b (atom 0)]
       (is (= NullPointerException (exception-class source a) (exception-class lowered b)))
       (is (= 1 @a @b)))))
+
+(deftest literal-nil-product-fields-need-no-object-snapshot
+  (let [source '(let* [p [(do (swap! calls conj :left) x) nil
+                         (do (swap! calls conj :right) x)]]
+                 (clojure.core/nth p 1))
+        lowered (products/lower-local-products source)
+        source-events (atom []) lowered-events (atom [])]
+    (is (nil? (run source 3.0 source-events)))
+    (is (nil? (run lowered 3.0 lowered-events)))
+    (is (= [:left :right] @source-events @lowered-events))
+    (is (= 2 (count (partition 2 (second lowered)))))
+    (is (not-any? #(and (completion/canonical-form? %)
+                        (nil? (:operand (completion/canonical-parts %))))
+                  (tree-seq coll? seq lowered))))
+  (let [source '(let* [p [nil (clojure.core/double x)]] (clojure.core/nth p 0))
+        lowered (products/lower-local-products source)]
+    (is (thrown? NullPointerException (run source nil nil)))
+    (is (thrown? NullPointerException (run lowered nil nil)))))
 
 (deftest failed-index-conversions-do-not-discharge-constructor-effects
   (let [source '(let* [p [(do (swap! calls inc) x)]]

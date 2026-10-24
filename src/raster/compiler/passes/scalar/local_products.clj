@@ -277,6 +277,12 @@
                  (and products? (product-shape? init))
                  (let [[prefix fields] (split-product (util/alpha-convert init))
                        snapshots (mapv (fn [value]
+                                        ;; Literal nil already is an Object
+                                        ;; reference. It has no evaluation or
+                                        ;; box identity to save; retain nil as
+                                        ;; the projected field, without a token
+                                        ;; or synthetic dead binding.
+                                        (when (some? value)
                                          [(with-meta (gensym "product_field__")
                                             (assoc (select-keys (meta value) [:raster.type/tag])
                                                    :tag 'Object))
@@ -285,7 +291,7 @@
                                           ;; binding its primitive value loses both that
                                           ;; producer context and the identity of its box.
                                           (completion/complete-value
-                                           completion/object-input-contract value)])
+                                           completion/object-input-contract value)]))
                                        fields)
                        lifted (vec (concat prefix (mapcat identity snapshots)))
                        [scope output] (reduce (fn [[local out] [id init]]

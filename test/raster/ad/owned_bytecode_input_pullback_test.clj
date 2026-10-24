@@ -4,6 +4,7 @@
             [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as n]))
 
@@ -87,6 +88,22 @@
           original (get-in prepared [:source-owner :input-region :invoke])]
       (is (= :jvm-bytecode (get-in prepared [:source-owner :backend])))
       (is (seq? (get-in prepared [:program :form])))
+      (let [region (get-in prepared [:source-owner :input-region])
+            spec (:spec region)
+            method ^java.lang.reflect.Method (:method region)]
+        (is (= :double (::bytecode/expected-completion-input-type spec)))
+        (is (not (contains? (get-in prepared [:source-owner :spec])
+                            ::bytecode/expected-completion-input-type)))
+        (binding [method-entry/*compilation-classloader*
+                  (.getClassLoader (.getDeclaringClass method))]
+          (is (= :bytecode-input-result-carrier
+                 (try
+                   (bytecode/compile-specialized-class!
+                    "raster.compiled.ChangedOriginalInputCarrier"
+                    [(assoc spec ::bytecode/expected-completion-input-type :ref)])
+                   nil
+                   (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))
+              "the original outline still rejects a changed emitted-carrier assertion")))
       (doseq [[a k x] [[0.8 0.7 1.0] [1.2 0.4 0.2] [-0.2 1.1 2.0]]]
         (let [args (arguments prepared a k x)
               [value pb] (apply f args)

@@ -13,7 +13,8 @@
         (keep (fn [operation]
                 (when-let [v (resolve operation)]
                   (when (var? v) [operation (entry/emission-definition-snapshot v)]))))
-        (into #{'clojure.core/nil? 'clojure.core/alength 'clojure.core/aget 'clojure.core/quot}
+        (into #{'clojure.core/nil? 'clojure.core/alength 'clojure.core/aget 'clojure.core/quot
+                'clojure.core/nth}
               (filter #(= "clojure.core" (namespace %)))
               (concat (keys descriptor/cast-ops) (keys descriptor/alloc-sym->array-tag)
                       descriptor/comparison-ops

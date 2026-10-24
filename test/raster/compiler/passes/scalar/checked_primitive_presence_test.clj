@@ -32,6 +32,28 @@
   (try {:value (apply f arguments)}
        (catch Throwable e {:error (class e)})))
 
+(deftest literal-nil-object-completion-is-only-a-reference-identity
+  (let [plain (completion/complete-value completion/object-input-contract nil)
+        marked (with-meta plain {:raster.effect/preserve-evaluation true})
+        checked (with-meta plain {:raster.effect/source-reference-cast true})
+        hinted (with-meta plain {:tag 'double})
+        effectful (completion/complete-value completion/object-input-contract
+                                             '(do (swap! events conj :operand) nil))]
+    (is (nil? (pe/pe plain)))
+    (is (= marked (pe/pe marked)))
+    (is (= (meta marked) (meta (pe/pe marked))))
+    (is (= checked (pe/pe checked)))
+    (is (= (meta checked) (meta (pe/pe checked))))
+    (is (= hinted (pe/pe hinted)))
+    (is (= (meta hinted) (meta (pe/pe hinted))))
+    (let [events (atom [])]
+      (is (nil? ((source-function '[events] (pe/pe effectful)) events)))
+      (is (= [:operand] @events)))
+    (doseq [contract [(completion/reference-check-contract Double)
+                      (completion/bytecode-boxed-parameter-contract Double/TYPE)]]
+      (let [original (completion/complete-value contract nil)]
+        (is (= original (pe/pe original)))))))
+
 (deftest canonical-primitive-presence-uses-checked-source-lowering
   (is (= {:type :double} (scalar/checked-primitive-result '(raster.numeric/- x) '{x :double})))
   (is (= {:type :float} (scalar/checked-primitive-result '(raster.numeric/* x y) '{x :float y :float})))

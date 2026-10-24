@@ -13,6 +13,7 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]
@@ -1350,6 +1351,39 @@
                          resolved-pairs)]
          {:form (list* 'let* (vec (mapcat identity all-pairs)) resolved-body)
           :inlined? @any-inlined?})))))
+
+(defn normalize-direct-ad-projections
+  "Stage only a whole constant nth of a direct value+grad application at its
+   original binding/tail site. Never descend into operands, branches or scopes.
+   This is call-by-value normalization, not numerical or tuple-result evidence."
+  [expression source-ns]
+  (if-not (and (seq? expression) (= 'let* (first expression))
+               (= 3 (count expression)) (vector? (second expression)))
+    expression
+    (let [used (volatile! (into #{} (filter symbol?) (tree-seq coll? seq expression)))
+          stage (fn [value]
+                  (when (and (seq? value) (= 'clojure.core/nth (first value)))
+                    ;; Existing direct-result projections are consumed by the
+                    ;; same inliner, even when no nested application is staged.
+                    (intrinsic-source/observe-original! source-ns 'clojure.core/nth))
+                  (when (and (seq? value) (= 'clojure.core/nth (first value))
+                             (not (:lexical-callee (op/call-description value)))
+                             (= 3 (count value)) (integer? (nth value 2))
+                             (= :value+grad (:mode (value+grad-call? (second value)))))
+                    (let [id (loop [id (gensym "ad_projection_")]
+                               (if (contains? @used id) (recur (gensym "ad_projection_")) id))]
+                      (vswap! used conj id)
+                      {:bindings [id (second value)]
+                       :value (util/remake-from value (list 'clojure.core/nth id (nth value 2)))})))
+          pairs (reduce (fn [bindings [id value]]
+                          (if-let [staged (stage value)]
+                            (into (into bindings (:bindings staged)) [id (:value staged)])
+                            (into bindings [id value]))) [] (partition 2 (second expression)))
+          tail (nth expression 2)
+          staged (stage tail)]
+      (util/remake-from expression
+                        (list 'let* (into pairs (:bindings staged))
+                              (if staged (:value staged) tail))))))
 
 (defn inline-ad-applications
   "Normalize direct AD applications in a walked straight-line let, preserving other calls.

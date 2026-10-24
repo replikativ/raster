@@ -10,6 +10,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
+            [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.support.mangled :as mangled]
@@ -346,10 +347,15 @@
       (when-let [{:keys [contract operand]} (completion/canonical-parts expression)]
         (and (= completion/object-input-contract contract)
              (double-storage-leaf? operand)))
-      (and (seq? expression)
+      (and (seq? expression) (not (:lexical-callee (descriptor/call-description expression)))
            (or (and (= 'clojure.core/double (first expression))
                     (= 2 (count expression))
-                    (double-storage-leaf? (second expression)))
+                    (double-storage-initializer? (second expression)))
+               (and (symbol? (first expression))
+                    (= "clojure.core" (namespace (first expression)))
+                    (source-arithmetic/binary-operator? (name (first expression)))
+                    (= 3 (count expression))
+                    (every? double-storage-initializer? (rest expression)))
                (and (= '.invk (first expression)) (symbol? (second expression))
                     (every? double-storage-leaf? (nnext expression)))))))
 
@@ -383,6 +389,51 @@
           (when (and entry (every? #(identical? Double/TYPE %) (:parameter-carriers entry)))
             entry))))))
 
+(defn- double-storage-expression-fact
+  [expression facts locals context source-ns]
+  (when (and (double-storage-annotations? expression)
+             (not (and (seq? expression)
+                       (:lexical-callee (descriptor/call-description expression)))))
+    (cond
+      (instance? Double expression) {:carrier Double/TYPE :presence :present :builtin-class Double}
+      (symbol? expression) (get facts expression)
+      (seq? expression)
+      (let [head (first expression)]
+        (cond
+          (= 'clojure.core/double head)
+          (when (and (= 2 (count expression))
+                     (present-double-payload?
+                      (double-storage-expression-fact (second expression) facts locals context source-ns))
+                     (intrinsic-source/observe-original! source-ns head))
+            {:carrier Double/TYPE :presence :present :builtin-class Double})
+
+          (= '.invk head)
+          (let [arguments (vec (nnext expression))
+                argument-facts (mapv #(double-storage-expression-fact % facts locals context source-ns) arguments)
+                invocation ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/typed-invocation-plan)
+                            (second expression) (count arguments) locals
+                            ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/binding-initializer-context) context))
+                payload (when (every? present-double-payload? argument-facts)
+                          (scalar-body/checked-selected-fp-payload expression argument-facts))]
+            (when (and payload (:global? invocation)
+                       (= (:method invocation) (get-in payload [:bridge :invocation-method]))
+                       (= (:parameter-carriers invocation) (:parameter-carriers payload))
+                       (every? #(identical? Double/TYPE %) (:parameter-carriers payload))
+                       (identical? Double/TYPE (:payload-carrier payload))
+                       (identical? Object (:interface-result-class invocation)))
+              {:carrier Object :presence :present :builtin-class Double}))
+
+          (and (symbol? head) (= "clojure.core" (namespace head))
+               (source-arithmetic/binary-operator? (name head)) (= 3 (count expression)))
+          (let [arguments (mapv #(double-storage-expression-fact % facts locals context source-ns) (rest expression))
+                actual (when (every? #(and (present-double-payload? %)
+                                          (identical? Double/TYPE (:carrier %))) arguments)
+                         (scalar-body/checked-core-fp-evaluation expression arguments source-ns))]
+            (when (and (:nonthrowing? actual) (identical? Double/TYPE (:result-carrier actual)))
+              {:carrier Double/TYPE :presence :present :builtin-class Double}))
+          :else nil))
+      :else nil)))
+
 (defn- construct-double-storage-source
   "Representation-only construction over the actual physical binding plan.
    Whole-spine closure is also the use check: no Object observation/escape or
@@ -409,44 +460,19 @@
              replacements {} bindings [] used used]
         (if-let [{:keys [binder initializer before raw-type completion]} (first rows)]
           (let [parts (raster.compiler.core.value-completion/canonical-parts initializer)
-                cast? (and (seq? initializer) (= 'clojure.core/double (first initializer)))
-                call? (and (seq? initializer) (= '.invk (first initializer)))
                 fact
-                (cond
-                  (double-storage-leaf? initializer) (leaf-fact initializer facts)
-                  parts (when-let [operand-fact (leaf-fact (:operand parts) facts)]
+                (if parts
+                  (when-let [operand-fact (leaf-fact (:operand parts) facts)]
                           (when (and (present-double-payload? operand-fact)
                                      (intrinsic-source/observe-original! source-ns 'clojure.core/double))
                             (assoc operand-fact :carrier Object :builtin-class Double)))
-                  cast? (when (and (present-double-payload? (leaf-fact (second initializer) facts))
-                                   (intrinsic-source/observe-original! source-ns 'clojure.core/double))
-                          {:carrier Double/TYPE :presence :present :builtin-class Double})
-                  call?
-                  (let [arguments (vec (nnext initializer))
-                        argument-facts (mapv #(leaf-fact % facts) arguments)
-                        invocation ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/typed-invocation-plan)
-                                    (second initializer) (count arguments) before
-                                    ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/binding-initializer-context)
-                                     context))
-                        payload (when (every? present-double-payload? argument-facts)
-                                  (scalar-body/checked-selected-fp-payload initializer argument-facts))]
-                    (when (and payload (:global? invocation)
-                               (= (:method invocation) (get-in payload [:bridge :invocation-method]))
-                               (= (:parameter-carriers invocation) (:parameter-carriers payload))
-                               (every? #(identical? Double/TYPE %) (:parameter-carriers payload))
-                               (identical? Double/TYPE (:payload-carrier payload))
-                               (identical? Object (:interface-result-class invocation)))
-                      {:carrier Object :presence :present :builtin-class Double})))
+                  (double-storage-expression-fact initializer facts before context source-ns))
                 expected (when fact (if (identical? Double/TYPE (:carrier fact)) :double :ref))
                 checkcast (:checkcast-class completion)]
             (when (and (present-double-payload? fact) (= expected raw-type) (nil? checkcast)
                        (double-storage-annotations? binder)
                        (double-storage-annotations? initializer)
-                       (every? double-storage-annotations?
-                               (cond parts [(:operand parts)]
-                                     cast? [(second initializer)]
-                                     call? (nnext initializer)
-                                     :else [])))
+                       (or (nil? parts) (double-storage-annotations? (:operand parts))))
               (let [new-id (if parts
                              (loop [candidate (gensym "numeric_snapshot_")]
                                (if (contains? used candidate)
@@ -493,7 +519,7 @@
              source-ns (get-in frontend [:source-entry :source-ns])
              locals (into (set parameters) (take-nth 2 (second source)))
              calls (filter #(and (seq? %) (= '.invk (first %)))
-                           (take-nth 2 (rest (second source))))
+                           (tree-seq coll? seq (vec (take-nth 2 (rest (second source))))))
              call-entries (mapv #(double-storage-call-entry % locals) calls)]
          (when (and entry (= parameters (:parameters entry))
                     (every? #(identical? Double/TYPE %) (:parameter-carriers entry))

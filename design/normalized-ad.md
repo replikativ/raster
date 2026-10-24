@@ -31,6 +31,38 @@ Clojure's Double intermediate and checked Float conversion at overflow. This
 landing does not repair or waive that debt; an actually selected `raster.numeric/*`
 Float helper has its own distinct FP32 contract.
 
+### Bounded scalar native consumer
+
+The native scalar path now consumes a closed all-Double source construction
+under the existing definition owner. Actual public Method parameters, selected
+helper return bridges and completed operands establish primitive/Object storage
+round trips; native ABI annotations do not supply those facts. The target must
+also use the Double scalar emission policy. Original selected calls stay in
+order, and the frozen definition guard runs after **all** original public scalar
+conversions, including unused arguments, before entering native code.
+
+Direct first-order AD imports use the same numerical constructor and finalizer.
+They consume the authenticated retained producer core, not its reconstructed JVM
+adapter. Only direct public Double argument reads qualify: the actual entry's
+Object snapshots remain, and its matched Double wrapper conversions become exact
+source `double` conversions at those same sites. Whole-site constant tuple
+projection normalization and original `nth` observations preserve source lookup
+and evaluation order. Nested preparation owns independent history; no outer
+projector or helper capability is borrowed by the child.
+
+`local-products-test` covers square/scaled continuations, unused public input
+checks, constructor-plan tampering, and refusal of integral or nonpublic input
+boundaries. Literal nil product fields require neither boxing nor an evaluation
+token; eager nonnil sibling fields and their failures remain ordered. Explicit
+nil Object-completion folding preserves both existing evaluation-denial markers.
+
+This is not general native AD closure. Float/integral/reference inputs, prior
+generated-entry histories, arbitrary Object uses, loops and arrays remain outside
+this construction. The density-gradient case is still unqualified: its Math/log
+and additional selected-helper recipes need actual Method/source correspondence,
+and cold preparation must close without weakening historical freshness. No
+mathematical result annotation or C completion waiver substitutes for that work.
+
 ## Ordered generated-call source owner
 
 The shared `core/ordered-call` consumer normalizes an already-resolved JVM

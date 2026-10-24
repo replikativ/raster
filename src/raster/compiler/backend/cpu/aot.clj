@@ -176,12 +176,14 @@
   "Run compile-aot's forward passes with the SCALAR backend (no SIMD lowering)
   to get the inlined, buffer-fused body as plain loops/lets — the dialect the C
   emitter consumes."
-  [f-var dtype simd? no-alias? frontend]
+  ([f-var dtype simd? no-alias? frontend]
+   (fused-scalar-form* f-var dtype simd? no-alias? frontend nil))
+  ([f-var dtype simd? no-alias? frontend constructed-body]
   (when-not (boolean? no-alias?)
     (throw (ex-info "Native :no-alias? must be Boolean"
                     {:reason :invalid-native-alias-policy :no-alias? no-alias?})))
   (let [params (if frontend (get-in frontend [:source-entry :params]) (pl/get-params f-var dtype))
-        wb     (if frontend (pl/normalize-source-bindings (:body frontend) params)
+        wb     (if frontend (pl/normalize-source-bindings (or constructed-body (:body frontend)) params)
                    (pl/get-walked-body f-var dtype))
         raw    (if (= 1 (count wb)) (first wb) (list* 'do wb))
         source-ns (or (get-in frontend [:source-entry :source-ns])
@@ -202,7 +204,7 @@
                     (parallel-program/validate! lowered segop/segop-node?))]
       {:form (if program (:source program) lowered)
        :parallel-program program
-       :params active :param-env penv})))
+       :params active :param-env penv}))))
 
 (defn fused-scalar-form
   "Run the existing scalar forward pipeline; no source completion is discharged."
@@ -1022,16 +1024,22 @@
                             (method-entry/original-source-frontend resolved-var))
                  entry (when frontend (method-entry/frontend-body-entry-carriers frontend resolved-var))]
              (when (and entry (every? #(identical? Double/TYPE %) (:parameter-carriers entry)))
-               (let [source-result (source-policy/call-with-policy
-                                    (get-in frontend [:source-entry :source-policy])
-                                    #(fused-scalar-form* resolved-var dtype simd? no-alias? frontend))]
-                 (when (nil? (:parallel-program source-result))
-                   (normal-return/with-closed-double-storage-source
-                    frontend resolved-var (:form source-result) (:params source-result)
-                    rcore/ensure-current-owned-bytecode!
-                    (fn [source finish!]
-                      (compile-aot-c-source f-var dtype reuse-buffers? no-alias?
-                                            (assoc source-result :form source) finish!))))))))))
+               (source-policy/call-with-policy
+                (get-in frontend [:source-entry :source-policy])
+                (fn []
+                  (let [consume! (fn [constructed-body]
+                                   (let [source-result (fused-scalar-form* resolved-var dtype simd? no-alias?
+                                                                          frontend constructed-body)]
+                                     (when (nil? (:parallel-program source-result))
+                                       (normal-return/with-closed-double-storage-source
+                                        frontend resolved-var (:form source-result) (:params source-result)
+                                        rcore/ensure-current-owned-bytecode!
+                                        (fn [source finish!]
+                                          (compile-aot-c-source f-var dtype reuse-buffers? no-alias?
+                                                                (assoc source-result :form source) finish!))))))]
+                    (or ((requiring-resolve 'raster.ad.reverse/with-double-source-ad-projection)
+                         frontend resolved-var (pl/build-param-env resolved-var dtype) consume!)
+                        (consume! nil))))))))))
       ;; Refusal adopts no candidate-only evidence and preserves the original
       ;; TC/walking route. The unchanged C completion barrier still applies.
       (compile-aot-c-source f-var dtype reuse-buffers? no-alias?

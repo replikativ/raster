@@ -4160,6 +4160,15 @@
              (= 2 (count expression)) (primitive-core-cast-carrier (name head)))
         (when (plan-form-carrier (second expression) locals (dissoc ctx :object-call-result?))
           (primitive-core-cast-carrier (name head)))
+        (and (symbol? head) (= "clojure.core" (namespace head))
+             (not (contains? locals head)) (is-clojure-core? head ctx)
+             (= 3 (count expression)) (source-arithmetic/binary-operator? (name head)))
+        (let [carriers (mapv #(plan-form-carrier % locals (dissoc ctx :object-call-result?))
+                             (rest expression))]
+          ;; This is only the existing emitter's physical Double recipe. Source
+          ;; totality/selection is independently checked by the consumer.
+          (when (= [:double :double] carriers)
+            (:result-carrier (source-arithmetic/binary-plan (name head) :double :double))))
         :else nil))
     :else nil))
 

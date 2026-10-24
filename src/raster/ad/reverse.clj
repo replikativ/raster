@@ -35,6 +35,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.call-boundary :as call-boundary]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
@@ -6298,6 +6299,118 @@
                           {:reason :ad-unclosed-completion-transpose})))))
     program))
 
+(defn with-double-source-ad-projection
+  "Consume direct AD imports of actual public Double parameters before their
+   JVM adapters. The real Object snapshots remain; only constructor-joined
+   Double wrapper inputs become exact core double conversions at the same site.
+   Numerical closure and final target/entry validation belong to consume!."
+  [frontend source-var param-env consume!]
+  (when method-entry/*emission-inputs*
+    (method-entry/call-with-optional-definition-inputs
+     (fn []
+       (method-entry/assert-frontend-selection! frontend source-var)
+       (let [entry (method-entry/frontend-body-entry-carriers frontend source-var)
+             parameters (:parameters entry)
+             source-ns (get-in frontend [:source-entry :source-ns])
+             body (:body frontend)]
+         (when (and entry (every? #(identical? Double/TYPE %) (:parameter-carriers entry))
+                    (= 1 (count body)))
+           (let [publics (set parameters)
+                 used (volatile! (into publics (filter symbol?) (tree-seq coll? seq body)))
+                 fresh! (fn [sym]
+                          (loop [id (gensym (str (name sym) "_source_"))]
+                            (if (contains? @used id) (recur (gensym (str (name sym) "_source_")))
+                                (do (vswap! used conj id) (with-meta id (meta sym))))))
+                 constructions (volatile! [])
+                 decline! #(throw (ex-info "AD source entry is outside the direct Double boundary"
+                                          {:reason :ad-double-source-boundary}))
+                 project! (fn [prepared arguments mode _ caller]
+                            (source-owner/assert-portable-source! prepared)
+                            (when-not (assert-prepared-program-source! prepared) (decline!))
+                            (let [core (assert-generated-producer-core! prepared)
+                                  owner (::generated-program-owner prepared)]
+                              (when-not (and core (= [] (::entry-constructions prepared))
+                                             (every? #(and (symbol? %) (contains? publics %)) arguments))
+                                (decline!))
+                              (let [source (flat-prepared-call-source! core arguments mode caller owner)
+                                    params (:params prepared)
+                                    physical (prepared-bytecode-entry prepared)
+                                    view ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/physical-entry-view)
+                                          physical params)
+                                    plan ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/instantiate-boxed-entry-inputs)
+                                          physical params (vec arguments))
+                                    slots (:slots plan)
+                                    objects (:object-bindings plan)
+                                    original-inputs (:input-bindings plan)
+                                    ids (mapcat (juxt :object-binder :input-binder) slots)]
+                                (when-not (and (vector? slots) (vector? objects) (vector? original-inputs)
+                                               (= (:boxed-entry-bridge plan) (:bridge view))
+                                               (= (count slots) (count arguments) (count objects) (count original-inputs)
+                                                  (count (:parameter-carriers view)))
+                                               (= (count ids) (count (set ids)))
+                                               (every? symbol? ids)
+                                               (= (count (:bindings plan)) (count ids))
+                                               (every? true? (map identical? (:bindings plan) (concat objects original-inputs)))
+                                               (= (:substitutions plan) (into {} (map (juxt :formal :input-binder)) slots))
+                                               (every? true?
+                                                       (map-indexed
+                                                        (fn [ordinal slot]
+                                                          (let [[object-id object-term] (nth objects ordinal)
+                                                                [input-id input-term] (nth original-inputs ordinal)
+                                                                object (value-completion/canonical-parts object-term)
+                                                                input (value-completion/canonical-parts input-term)]
+                                                           (and (= ordinal (:ordinal slot))
+                                                               (identical? (nth params ordinal) (:formal slot))
+                                                               (identical? (nth arguments ordinal) (:original-argument slot))
+                                                               (identical? Double/TYPE (:parameter-class slot))
+                                                               (identical? Double/TYPE (nth (:parameter-carriers view) ordinal))
+                                                               (identical? object-id (:object-binder slot))
+                                                               (identical? input-id (:input-binder slot))
+                                                               (identical? (:original-argument slot) (:operand object))
+                                                               (identical? object-id (:operand input))
+                                                               (identical? (:object-contract slot) (:contract object))
+                                                               (identical? (:contract slot) (:contract input))
+                                                               (= value-completion/object-input-contract (:object-contract slot))
+                                                               (= (value-completion/bytecode-boxed-parameter-contract Double/TYPE)
+                                                                  (:contract slot))))) slots))
+                                               (not-any? @used ids)
+                                               (not-any? (util/free-syms source) ids))
+                                  (decline!))
+                                (vswap! used into ids)
+                                (intrinsic-source/observe-original! source-ns 'clojure.core/double)
+                                ;; The existing tuple resolver also consumes
+                                ;; projections nested under scalar expressions.
+                                ;; Guard that actual import, not just the new
+                                ;; whole-site normalization's nth spelling.
+                                (intrinsic-source/observe-original! source-ns 'clojure.core/nth)
+                                (let [inputs (mapv (fn [{:keys [input-binder object-binder]}]
+                                                     [input-binder (list 'clojure.core/double object-binder)]) slots)
+                                      projected (:projection
+                                                 (project-flat-prepared-call
+                                                  source params (:source-ns prepared)
+                                                  (assoc plan :bindings (into (:object-bindings plan) inputs)) mode))]
+                                  (adopt-prepared-program-inputs! prepared)
+                                  (assert-prepared-program-source! prepared)
+                                  (vswap! constructions conj {:prepared prepared :plan plan :projection projected})
+                                  projected))))]
+             (try
+               (let [projected
+                     (binding [util/*fresh-binder* fresh!]
+                       (let [source (util/uniquify-rebindings parameters (first body))
+                             source (if (and (seq? source) (= 'let* (first source))) source
+                                        (list 'let* [] source))
+                             source (inline/normalize-direct-ad-projections source source-ns)]
+                         (binding [*generated-product-context* {:project-prepared-call project!}]
+                           (inline/flatten-nested-lets (inline/inline-ad-applications source param-env)))))]
+                 (when (seq @constructions)
+                   (method-entry/assert-frontend-selection! frontend source-var)
+                   ;; The continuation includes the ordinary numerical source
+                   ;; constructor, C emission and its post-marshalling guard.
+                   (consume! [projected])))
+               (catch clojure.lang.ExceptionInfo error
+                 (when-not (= :ad-double-source-boundary (:reason (ex-data error)))
+                   (throw error)))))))))))
+
 (defn ^:no-doc project-prepared-value+grad-call
   "Instantiate the shared flat preparation at one compiler call site.
    Validate the producer's padded result boundary before whole-form hygiene and
@@ -7574,7 +7687,11 @@
                                                  (list 'quote [(:companion helper)])) 0)]) helpers))
                      (:form program))
           walked-body [body]
-          spec (assoc (:spec region) :params params :return-tag 'Object :walked-body walked-body)
+          ;; The original outline already checked its operand's emitted carrier. That
+          ;; body-specific assertion cannot describe completions in this new paired body.
+          spec (assoc (dissoc (:spec region)
+                              :raster.compiler.backend.jvm.bytecode/expected-completion-input-type)
+                      :params params :return-tag 'Object :walked-body walked-body)
           source-ns (:source-ns emission)
           execution-guard ((requiring-resolve 'raster.ad.normalized-scalar/execution-guard)
                            source-ns expected
@@ -8199,7 +8316,12 @@
    consume this same generated program, physical entry and padded slot boundary."
   [f-var wrt]
   (method-entry/call-with-definition-inputs
-   #(or (try (build-grad-walked-body f-var wrt)
+   #(method-entry/call-with-independent-definition-inputs
+     (fn []
+       ;; The child owns its own generated context and preparation candidates.
+       ;; The enclosing source projector is restored before importing its result.
+       (binding [*generated-product-context* nil]
+        (or (try (build-grad-walked-body f-var wrt)
            (catch clojure.lang.ExceptionInfo error
              (if (= :ad-unowned-derived-pullback (:reason (ex-data error)))
                ;; Reenter from the actual selected emission, never certify the
@@ -8219,7 +8341,7 @@
                    "a fixed-point solve (adjoint-of-fixed-point rule), or a "
                    "registered op (e.g. a loss deftm with an AD template). "
                    "Runtime construction and compiled AD calls share this preparation gate.")
-              {:var f-var :reason :flatten-failed})))))
+              {:var f-var :reason :flatten-failed}))))))))
 
 (declare value+grad)
 

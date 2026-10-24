@@ -283,8 +283,19 @@
         ;; an algebraic identity. Its contract is data; only its operand is PE'd.
         (= head completion/completion-symbol)
         (if-let [{:keys [contract operand]} (completion/canonical-parts form)]
-          (util/remake-if-changed form
-                                  (list head contract (pe-pass operand const-env)))
+          (let [operand (pe-pass operand const-env)]
+            ;; The literal null reference already is its Object-context value:
+            ;; no boxing, coercion, allocation or operand evaluation remains.
+            ;; This is not a numeric presence fact or a general completion
+            ;; eraser. Explicit evaluation denials and carrier annotations
+            ;; that could impose another consumer conversion stay attached.
+            (if (and (= completion/object-input-contract contract) (nil? operand)
+                     (not (:raster.effect/preserve-evaluation (meta form)))
+                     (not (:raster.effect/source-reference-cast (meta form)))
+                     (every? #(or (nil? %) (contains? #{Object 'Object 'java.lang.Object} %))
+                             ((juxt :tag :raster.type/tag) (meta form))))
+              nil
+              (util/remake-if-changed form (list head contract operand))))
           (throw (ex-info "Malformed reserved value completion during partial evaluation"
                           {:reason :invalid-value-completion :expression form})))
 

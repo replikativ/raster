@@ -289,7 +289,10 @@
     (binding [entry/*emission-inputs* parent]
       (is (= [9.0 6.0] (result prepared 3.0))))
     (is (seq (:definition-proofs @parent)))
-    (is (= 1 (count (:producer-inputs @parent))))
+    (let [owner (:raster.ad.reverse/generated-program-owner prepared)
+          producers (:producer-inputs @parent)]
+      (is (= 1 (count (filter #(identical? owner %) producers))))
+      (is (every? #(satisfies? entry/RetainedProducerInput %) producers)))
     (is (entry/assert-definition-inputs-current! @parent))
     (let [revision (templates/registry-revision) before @parent]
       (with-redefs [templates/registry-revision (constantly (inc revision))]
@@ -304,9 +307,15 @@
         parent (atom {:static [] :values []})
         revision (templates/registry-revision)]
     (binding [entry/*emission-inputs* parent]
-      (reverse/adopt-prepared-program-inputs! prepared)
       (reverse/adopt-prepared-program-inputs! prepared))
-    (is (= 1 (count (:producer-inputs @parent))))
+    (let [first-inputs (:producer-inputs @parent)
+          owner (:raster.ad.reverse/generated-program-owner prepared)]
+      (binding [entry/*emission-inputs* parent]
+        (reverse/adopt-prepared-program-inputs! prepared))
+      (is (= 1 (count (filter #(identical? owner %) (:producer-inputs @parent)))))
+      (is (every? #(satisfies? entry/RetainedProducerInput %) first-inputs))
+      (is (= (count first-inputs) (count (:producer-inputs @parent))))
+      (is (every? true? (map identical? first-inputs (:producer-inputs @parent)))))
     (is (every? #(not (satisfies? entry/RetainedProducerInput %)) (:values @parent)))
     (with-redefs [templates/registry-revision (constantly (inc revision))]
       (is (= :ad-prepared-program-stale-rules
