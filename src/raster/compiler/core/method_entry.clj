@@ -968,6 +968,26 @@
     (assert-definition-inputs-current! @*emission-inputs*)
     current))
 
+(defn prepare-frontend-source!
+  "Explicitly prepare an authentic selected source BEFORE acquiring physical facts.
+   `prepare!` is a non-evaluating receiver compiler, not a numerical invocation.
+   Reacquire the current binding of the SAME opaque frontend after preparation.
+   Existing enclosing observations remain historical: neither physical captures
+   nor earlier source/definition inputs are refreshed or exempted from checks.
+   Returns the current same-source binding, or nil when it has no typed receiver."
+  [frontend source-var prepare!]
+  (let [current (assert-frontend-semantic-selection! frontend source-var)]
+    (when-let [receiver (get-in current [:definition :receiver-var])]
+      (let [owner *emission-inputs*
+            historical @owner]
+        (binding [*emission-inputs* nil]
+          (prepare! receiver))
+        (when-not (identical? historical @owner)
+          (throw (ex-info "source preparation changed its enclosing compiler owner"
+                          {:reason :unstable-definition-proof-input})))
+        (assert-definition-inputs-current! historical)
+        (assert-frontend-semantic-selection! frontend source-var)))))
+
 (defn assert-frontend-selection!
   "Authenticate and observe an original frontend's exact physical receiver entry.
    Producer preparation may use this before acquiring an emitted-module guard.

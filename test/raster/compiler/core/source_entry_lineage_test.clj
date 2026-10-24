@@ -107,6 +107,50 @@
     (is (true? (check semantic)))
     (is (= before @body-calls) "source preparation and JIT never invoke numerical code")))
 
+(deftest explicit-source-preparation-reacquires-only-an-unpinned-semantic-binding
+  (doseq [mode [:semantic :physical :changed-source :changed-owner :refused]]
+    (let [{:keys [source receiver]} (fresh-entry)
+          _ (core/prepare-emission-source-walk! source)
+          metadata (meta source)
+          before @body-calls
+          collector (atom {:static [] :values []})
+          refusal (ex-info "producer refused preparation" {:reason ::refused})]
+      (try
+        (binding [entry/*emission-inputs* collector]
+          (let [frontend (entry/original-source-frontend source)
+                original (:implementation frontend)
+                _ (when (= :physical mode)
+                    (entry/frontend-body-entry-carriers frontend source))
+                result (try
+                         (entry/prepare-frontend-source!
+                          frontend source
+                          (fn [selected]
+                            (is (identical? receiver selected))
+                            (if (= :refused mode)
+                              (throw refusal)
+                              (core/ensure-current-owned-bytecode! selected))
+                            (case mode
+                              :changed-source (alter-meta! source assoc
+                                                           :raster.core/deftm-source-body '[42.0])
+                              :changed-owner (swap! collector assoc ::changed true)
+                              nil)))
+                         (catch clojure.lang.ExceptionInfo failure failure))]
+            (case mode
+              :semantic
+              (do
+                (is (identical? (:source-frontend frontend) (:source-frontend result)))
+                (is (not (identical? original (:implementation result))))
+                (is (identical? (var-get receiver) (:implementation result)))
+                (is (map? (entry/assert-frontend-selection! result source))))
+              :refused
+              (do (is (identical? refusal result))
+                  (is (identical? original (var-get receiver))))
+              :changed-owner
+              (is (= :unstable-definition-proof-input (:reason (ex-data result))))
+              (is (= :stale-definition-proof-input (:reason (ex-data result)))))
+            (is (= before @body-calls) "preparation never evaluates numerical code")))
+        (finally (reset-meta! source metadata))))))
+
 (deftest semantic-source-selection-keeps-its-original-receiver-lookup
   (let [{:keys [source receiver]} (fresh-entry)
         _ (core/prepare-emission-source-walk! source)

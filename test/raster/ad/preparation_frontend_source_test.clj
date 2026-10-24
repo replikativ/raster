@@ -516,6 +516,7 @@
 
 (deftest cold-preparation-observes-the-producer-without-running-its-numeric-body
   ;; Repeated REPL runs must exercise a genuinely cold source receiver too.
+  (doseq [selection [:generic :mangled]]
   (binding [*ns* (the-ns 'raster.ad.preparation-frontend-source-test)]
     (eval '(deftm cold-squared-loss [x :- Double] :- Double
              (do (swap! preparation-body-calls inc) (numeric/* x x))))
@@ -545,7 +546,7 @@
                       ;; original-frontend preparation candidate by itself.
                       (entry/observe-definition-input!
                        unrelated-receiver (.ns unrelated-receiver) (.sym unrelated-receiver))
-                      (reverse/prepare-value+grad function [0]))))
+                      (reverse/prepare-value+grad (if (= selection :mangled) source function) [0]))))
         physical (reverse/prepared-bytecode-entry prepared)
         emission (:emission physical)]
     (is (= before @preparation-body-calls)
@@ -580,7 +581,23 @@
         (is (thrown? clojure.lang.ExceptionInfo (result prepared 4.0))
             "retained source history still guards the inlined producer")
         (is (= (+ before 2) @preparation-body-calls))
-        (finally (reset-meta! source original))))))
+        (finally (reset-meta! source original)))))))
+
+(deftest private-source-is-refused-before-preparation-work
+  (effects/init-raster-context!)
+  (doseq [selected [#'squared-loss (core/resolve-deftm-var #'squared-loss)]]
+    (let [metadata (meta selected)
+          attempts (atom 0)]
+      (try
+        (alter-meta! selected assoc :raster.compiler/source-owner (Object.))
+        (with-redefs [core/prepare-emission-source-walk!
+                      (fn [_] (swap! attempts inc)
+                        (throw (AssertionError. "private source reached extraction")))]
+          (is (= :unprojected-jvm-source-owner
+                 (try (reverse/prepare-value+grad #'squared-loss [0]) nil
+                      (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+        (is (zero? @attempts))
+        (finally (reset-meta! selected metadata))))))
 
 (deftest enclosing-owner-detects-a-source-change-during-ad-preparation
   (let [source (core/resolve-deftm-var #'squared-loss)

@@ -87,6 +87,10 @@ Native AD source rewriting first builds a lexical candidate, not an admitted
 Double entry. The existing closed-storage grammar and child-call checks decide
 whether to prepare its exact semantic root. Only then does the consumer acquire
 a fresh same-source binding and check actual Method Classes and return bridges.
+Native storage construction and reverse AD share this same preparation boundary.
+AD first checks source portability and settles its selected walk cache, then
+observes/reselects the definition and prepares pending receivers before retaining
+physical entry facts. Captured programs never use this path to renew their owner.
 Declined ordinary C candidates keep their independent fallback; source tags
 select work but cannot grant physical carrier or emission permission.
 These guards stay process-local, outside portable TypedSOAC facts and cache keys.

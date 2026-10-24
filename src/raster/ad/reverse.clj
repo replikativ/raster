@@ -4249,6 +4249,21 @@
 
 (declare adopt-prepared-program-inputs! captured-prepared-callable)
 
+(defn- select-deftm-var
+  "Select preparation work without consuming a definition or captured producer.
+   Accepted AD construction must subsequently resolve and observe that selection."
+  [f-var]
+  ;; These are negative work filters, not source observations or permission to
+  ;; extract a private helper. Repeat accepted observations in resolve below.
+  (source-owner/assert-portable-source! (meta f-var))
+  (when (var? f-var)
+    (source-owner/assert-portable-source! (meta (var-get f-var))))
+  (let [selected (rcore/resolve-deftm-var
+                  f-var {:deref-value? true :on-miss :self
+                         :ambiguity-hint "Use the mangled var directly, e.g. #'ns/name_m_<tags>."})]
+    (source-owner/assert-portable-source! (meta selected))
+    selected))
+
 (defn ^:no-doc resolve-deftm-var
   "Resolve a deftm dispatch var to its backing mangled var for value+grad. Thin
   wrapper over the canonical raster.core/resolve-deftm-var with the AD policy:
@@ -4271,10 +4286,7 @@
       (source-owner/assert-portable-source! metadata)
       (when-let [{:keys [prepared]} (captured-prepared-callable value metadata)]
         (adopt-prepared-program-inputs! prepared))))
-  (let [resolved (rcore/resolve-deftm-var
-                  f-var {:deref-value? true
-          :on-miss :self
-          :ambiguity-hint "Use the mangled var directly, e.g. #'ns/name_m_<tags>."})]
+  (let [resolved (select-deftm-var f-var)]
     (source-owner/assert-portable-source! (meta resolved))
     resolved))
 
@@ -6596,26 +6608,40 @@
   ;; in the flat let* → the second SHADOWS the first → a template backward reads
   ;; the wrong dimension (gqa dW came out [hd,in] not [nq*hd,in]). Sharing one
   ;; monotonic counter keeps every generated name globally unique.
-  (let [resolved (resolve-deftm-var f-var)
+  (let [selected (select-deftm-var f-var)
+        ;; Settle the exact source-walk cache before the observed resolver can
+        ;; retain this definition. Selection alone grants no source/Method facts.
+        ;; An already captured gradient must retain its old producer instead.
+        _ (when-not (captured-prepared-callable selected (meta selected))
+            (rcore/prepare-emission-source-walk! selected))
+        resolved (resolve-deftm-var f-var)
+        _ (when-not (identical? selected resolved)
+            (throw (ex-info "AD source selection changed during preparation"
+                            {:reason :unstable-definition-proof-input})))
         captured (captured-prepared-callable resolved (meta resolved))
         parent (:prepared captured)
           ;; AD is another compiler consumer of the original semantic frontend,
           ;; not an owner of the replaceable walked-body metadata cache. Prepare
           ;; the producer before observing it, just like ordinary inlining.
           _ (when-not captured (rcore/prepare-deftm-frontend! resolved))
-        frontend (if captured
+        semantic (if captured
                    (.-frontend ^GeneratedPreparationOwner (::generated-program-owner parent))
                    (method-entry/original-source-frontend resolved))
-        ;; This exact original frontend is a consumed physical source producer,
-        ;; even when AD inlines its body and emits no call to the old receiver.
-        ;; Preparing it invalidates the ORIGINAL observations and restarts the
-        ;; whole derivation. An already captured parent is never renewed here.
-        _ (when-let [receiver (when-not captured (get-in frontend [:definition :receiver-var]))]
-            ;; Source availability is semantic evidence only. This physical
-            ;; origin consumer must observe its exact selected receiver itself.
-            (method-entry/assert-frontend-selection! frontend resolved)
-            (method-entry/prepare-pending-definition-inputs!
-             rcore/ensure-current-owned-bytecode! [receiver]))
+        ;; Prepare the authentic semantic root before any physical capture.
+        ;; Reacquisition cannot revive an old captured program or replace its
+        ;; original history. Untyped sources have no receiver to prepare.
+        frontend (if captured semantic
+                     (or (when semantic
+                           (method-entry/prepare-frontend-source!
+                            semantic resolved
+                            (fn [receiver]
+                              ;; Keep this consumer's existing pending-only
+                              ;; policy; warm renewal is a separate producer.
+                              (when (:raster.core/jit-spec (meta receiver))
+                                (rcore/ensure-current-owned-bytecode! receiver)))))
+                         semantic))
+        _ (when (and frontend (not captured))
+            (method-entry/assert-frontend-selection! frontend resolved))
         context (when frontend (source-ad-context (get-in frontend [:source-entry :source-policy])))
         captured-source (when captured
                           (let [{:keys [core source]} (freshen-prepared-core context parent (:mode captured))

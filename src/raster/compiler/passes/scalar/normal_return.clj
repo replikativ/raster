@@ -550,24 +550,6 @@
             (util/remake-from source
                               (list 'let* bindings (util/subst-syms replacements (nth source 2))))))))))
 
-(defn- prepare-storage-frontend!
-  "Prepare only an admitted candidate's authentic selected source receiver.
-   No physical root facts have been acquired at this boundary. Reacquire the
-   current binding of the SAME opaque frontend after preparation; never refresh
-   any historical observations already owned by the enclosing producer."
-  [frontend source-var prepare!]
-  (let [current (method-entry/assert-frontend-semantic-selection! frontend source-var)]
-    (when-let [receiver (get-in current [:definition :receiver-var])]
-      (let [owner method-entry/*emission-inputs*
-            historical @owner]
-        (binding [method-entry/*emission-inputs* nil]
-          (prepare! receiver))
-        (when-not (identical? historical @owner)
-          (throw (ex-info "storage source preparation changed its enclosing compiler owner"
-                          {:reason :unstable-definition-proof-input})))
-        (method-entry/assert-definition-inputs-current! historical)
-        (method-entry/assert-frontend-semantic-selection! frontend source-var)))))
-
 (defn with-closed-double-storage-source
   "Consume a bounded primitive/Object/primitive source construction lexically.
    The caller owns the actual frontend-to-source transformation and final target
@@ -609,7 +591,7 @@
                     (every? some? call-entries))
            (method-entry/prepare-owned-definition-inputs!
             prepare! (mapv #(get-in % [:definition :receiver-var]) call-entries))
-           (when-let [frontend (prepare-storage-frontend! semantic source-var prepare!)]
+           (when-let [frontend (method-entry/prepare-frontend-source! semantic source-var prepare!)]
              (let [entry (method-entry/frontend-body-entry-carriers frontend source-var)
                    bridge (when (and entry (= parameters (:parameters entry))
                                      (every? #(identical? Double/TYPE %) (:parameter-carriers entry)))
