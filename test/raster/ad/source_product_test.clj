@@ -11,7 +11,7 @@
   (let [source (list 'let* bindings result)
         ;; Exercise actual structural records, not successful scalar replacement
         ;; or a fabricated generated-call/source-policy owner.
-        transformed (with-redefs [local-products/lower-local-products identity]
+        transformed (with-redefs [local-products/lower-local-products (fn [body & _] body)]
                       (with-bindings {#'reverse/*source-memory-context*
                                       {:values parameters :value-facts {}
                                        :replayed {} :unprojectable {} :aliases {}}}
@@ -27,7 +27,7 @@
 
 (deftest public-modes-handle-normalized-product-index-temporaries
   (let [[reverse-fn forward-fn]
-        (with-redefs [local-products/lower-local-products identity]
+        (with-redefs [local-products/lower-local-products (fn [body & _] body)]
           [(reverse/value+grad #'retained-product-normalization)
            (jvp/jvp #'retained-product-normalization)])]
     (doseq [input [-2.0 0.0 3.5]]

@@ -45,11 +45,11 @@
                     #(reverse/transform-body % '[x])]]
       (let [captured (atom []) original products/lower-local-products]
         (with-redefs [products/lower-local-products
-                      (fn [body]
+                      (fn [body & options]
                         (swap! captured conj
                                (boolean (some #(:raster.ad.reverse/inexact-source-scan-checkpoint (meta %))
                                               (tree-seq coll? seq body))))
-                        (original body))]
+                        (apply original body options))]
           (reason #(prepare source)))
         (is (true? (first @captured))
             "source numerical obligations are captured before either boundary rewrites products")))
