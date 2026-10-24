@@ -38,7 +38,7 @@
       (binding [*ns* scope]
         (refer 'clojure.core)
         (eval '(raster.core/deftm twice [x :- Double] :- Double
-                 (let [left (double x) right (double x)]
+                 (let [left (clojure.core/double x) right (clojure.core/double x)]
                    (raster.ad.reverse/grad-acc left right)))))
       (let [source (core/resolve-deftm-var (ns-resolve scope 'twice))
             receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
@@ -57,7 +57,9 @@
             "the source helper call really was projected away")
         ;; The entry guard captures the actual original program before
         ;; ad-prepare erases this call; scanning only the projected form could
-        ;; not establish the dependency. Replacement must not execute.
+        ;; not establish the dependency. Qualified primitive conversions give
+        ;; this early projection actual intrinsic identities, not bare spelling.
+        ;; Replacement must not execute.
         (with-redefs [reverse/grad-acc (fn [& _] (throw (AssertionError. "must not invoke replacement")))]
           (is (= :ad-normalized-execution-callee (reason))))
         (is (nil? (reason))))

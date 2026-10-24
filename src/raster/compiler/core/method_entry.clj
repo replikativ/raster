@@ -1044,10 +1044,14 @@
     (guard)
     this))
 
-(defn- retain-frontend-emission! [emission]
-  ;; Only the exact authenticated emission from frontend-emission reaches here.
-  ;; An observation map alone cannot become a producer certificate. Deduplicate
-  ;; by module identity, never by equal code or equal dependency maps.
+(defn retain-emission-input-history!
+  "Retain an exact module's complete historical inputs in the current owner.
+   The caller must FIRST authenticate the actual module at its emitter/receiver
+   boundary. This supplies freshness only, not body, Class or invocation rights.
+   Reuse the original immutable history; never reconstruct it from current Vars."
+  [emission]
+  (assert-emission-inputs-current! emission)
+  ;; Deduplicate by module identity, never by equal code or dependency maps.
   (when-not (some #(and (instance? FrontendEmissionInput %)
                        (identical? emission (.-emission ^FrontendEmissionInput %)))
                   (:producer-inputs @*emission-inputs*))
@@ -1064,7 +1068,7 @@
          ;; module lineage, not just the currently selected caller's definition.
          ;; This proves freshness only: source-import closure and execution
          ;; permission still belong to their separate original producers.
-         (retain-frontend-emission! emission)
+         (retain-emission-input-history! emission)
          (assert-definition-inputs-current! @*emission-inputs*)
          observed)))))
 

@@ -72,9 +72,7 @@
   [operation implementation-op argument-count resolved-method prepare!]
   (method-entry/call-with-definition-inputs
    (fn []
-    (let [observed (method-entry/observed-selected-definition
-                    :typed operation implementation-op argument-count)
-          select! (fn []
+    (let [select! (fn []
                   (let [signature (selected-typed-signature
                                    operation implementation-op argument-count resolved-method)]
                     (when-not (= :known (:status signature))
@@ -83,18 +81,42 @@
                                        :operation operation :implementation-op implementation-op
                                        :decline (:reason signature)})))
                     signature))
+        ;; Actual descriptor checking selects preparation work; it does not
+        ;; yet pin the cold receiver which that work may legitimately replace.
         initial (select!)
+        selected-source (get-in initial [:definition :source-var])
+        selected-receiver (get-in initial [:definition :receiver-var])
+        _ ((requiring-resolve 'raster.core/prepare-deftm-frontend!) selected-source)
+        _ ((requiring-resolve 'raster.core/prepare-emission-source-walk!) selected-source)
+        frontend (or (method-entry/original-source-frontend selected-source)
+                     (throw (ex-info "selected helper has no original source frontend"
+                                     {:reason :ad-paired-helper-selected-definition
+                                      :operation operation :implementation-op implementation-op})))
+        receipt (volatile! nil)
+        _ (method-entry/prepare-frontend-source!
+           frontend selected-source
+           (fn [receiver]
+             (when-not (identical? selected-receiver receiver)
+               (throw (ex-info "selected helper receiver changed before preparation"
+                               {:reason :ad-paired-helper-selected-definition
+                                :operation operation :implementation-op implementation-op})))
+             (vreset! receipt
+                      ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/prepare-emitted-receiver!)
+                       receiver prepare!))))
+        observed (method-entry/observed-selected-definition
+                  :typed operation implementation-op argument-count)
+        {:keys [definition declaring-class] :as signature} (select!)
         _ (when-not (and observed
-                         (identical? (:receiver-var observed)
-                                     (get-in initial [:definition :receiver-var])))
-            (throw (ex-info "selected helper has no original definition observation"
+                         (identical? selected-source (:source-var definition))
+                         (identical? selected-receiver (:receiver-var definition))
+                         (identical? (:receiver-var observed) (:receiver-var definition)))
+            (throw (ex-info "selected helper lost its source/physical selection after preparation"
                             {:reason :ad-paired-helper-selected-definition
                              :operation operation :implementation-op implementation-op})))
-        _ (method-entry/prepare-owned-definition-inputs! prepare! [(:receiver-var observed)])
-        {:keys [definition declaring-class] :as signature} (select!)
         {:keys [source-var receiver-var parameters tags return-tag entry]} definition
         emission (:raster.core/bytecode-emission (meta receiver-var))]
     (when-not (and (= :jvm-bytecode (:backend emission))
+                   (identical? emission (:emission @receipt))
                    (identical? (:implementation emission) @receiver-var)
                    (identical? (:implementation emission) (:typed-impl entry))
                    (= (:params emission) parameters) (= (:tags emission) tags)
@@ -104,7 +126,12 @@
       (throw (ex-info "selected helper does not own its retained bytecode emission"
                       {:reason :ad-paired-helper-emission-correspondence
                        :operation operation :implementation-op implementation-op})))
-    (let [observations (mapv method-entry/var-snapshot [source-var receiver-var])
+    ;; Ordinary modules keep late-bound calls. A body consumer additionally
+    ;; retains the exact successful descendant readiness history, AFTER the
+    ;; semantic preparation boundary fenced the original enclosing owner.
+    (method-entry/adopt-definition-inputs! (:inputs @receipt))
+    (let [readiness-inputs (:inputs @receipt)
+          observations (mapv method-entry/var-snapshot [source-var receiver-var])
           selection-guard
           (fn []
             (let [current (select!)]
@@ -119,6 +146,7 @@
                                  :operation operation :implementation-op implementation-op})))))
           emission-guard (method-entry/prepare-emission-input-guard! emission)
           guard (fn [] (selection-guard)
+                  (method-entry/assert-definition-inputs-current! readiness-inputs)
                   (emission-guard)
                   nil)
           _ (guard)]

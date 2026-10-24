@@ -1281,6 +1281,52 @@
            false)))
      calls)))
 
+(declare ^:private consume-emitted-global-invocations!)
+
+(defn ^:no-doc prepare-emitted-receiver!
+  "Explicitly close one receiver's actual emitted call history under its own owner.
+   `prepare!` is the existing non-evaluating owned-bytecode compiler. Return its
+   exact current module and ORIGINAL successful local inputs, without adopting
+   them into an enclosing source owner or changing the registered module.
+   Request-local memoization never replaces current catalog validation."
+  [receiver prepare!]
+  (when (contains? *preparing-emitted-receivers* receiver)
+    (throw (ex-info "recursive pending receiver preparation cannot publish an owned emission"
+                    {:reason :recursive-emitted-receiver-preparation})))
+  ;; An explicit semantic source producer may call this while holding its own
+  ;; history. Preparation is independent; that producer fences/adopts the
+  ;; returned original history at its own publication boundary.
+  (binding [me/*emission-inputs* nil
+            *prepared-emitted-modules* (or *prepared-emitted-modules* (java.util.IdentityHashMap.))
+            *preparing-emitted-receivers* (conj *preparing-emitted-receivers* receiver)]
+    (let [prepared
+          (me/call-with-definition-inputs
+           (fn []
+             (let [emission (prepare! receiver emitted-global-history-current?)]
+               ;; Ordinary named emission is still late-bound. Only this
+               ;; explicit consumer closes actual descendants. The actual
+               ;; current module/catalog were checked even on a memo hit.
+               (if-let [retained (.get ^java.util.IdentityHashMap *prepared-emitted-modules* emission)]
+                 (try (me/adopt-definition-inputs! retained)
+                      (catch Throwable failure
+                        (.remove ^java.util.IdentityHashMap *prepared-emitted-modules* emission)
+                        (throw failure)))
+                 (consume-emitted-global-invocations! emission))
+               (me/assert-emission-inputs-current! emission)
+               (when-not (and (identical? emission (:raster.core/bytecode-emission (meta receiver)))
+                              (identical? (:implementation emission) (var-get receiver)))
+                 (throw (ex-info "prepared module no longer belongs to its selected receiver"
+                                 {:reason :unowned-emitted-global-invocation :receiver receiver})))
+               ;; Global-call observations alone omit leaf-local producer and
+               ;; static lineage. Retain every actual module's own history too.
+               (me/retain-emission-input-history! emission)
+               {:emission emission :inputs @me/*emission-inputs*})))]
+      ;; Store ONLY after the local owner's final publication fence succeeds.
+      ;; Rejected/retried attempts never contribute retained observations.
+      (.put ^java.util.IdentityHashMap *prepared-emitted-modules*
+            (:emission prepared) (:inputs prepared))
+      prepared)))
+
 (defn- consume-emitted-global-invocations!
   [source]
   (when-not me/*emission-inputs*
@@ -1320,37 +1366,9 @@
               completed (atom [])]
           (me/prepare-owned-definition-inputs!
            (fn [receiver]
-             ;; Only the currently preparing ancestor is active. A sibling
-             ;; queued later in the outer batch can legitimately be a child.
-             (binding [*preparing-emitted-receivers* (conj *preparing-emitted-receivers* receiver)]
-               (let [prepared
-                     (me/call-with-definition-inputs
-                      (fn []
-                        (let [emission (prepare! receiver emitted-global-history-current?)]
-                          ;; Ordinary named emission is still late-bound. Only
-                          ;; this derived consumer closes actual descendants.
-                          ;; A changed child rejects the whole local attempt.
-                          ;; The actual current module and its complete physical
-                          ;; catalog were checked ABOVE, even on a memo hit.
-                          ;; Reuse only a successful request-local traversal's
-                          ;; ORIGINAL inputs; never reobserve stale history.
-                          (if-let [retained (when *prepared-emitted-modules*
-                                             (.get ^java.util.IdentityHashMap
-                                                   *prepared-emitted-modules* emission))]
-                            (try (me/adopt-definition-inputs! retained)
-                                 (catch Throwable failure
-                                   (.remove ^java.util.IdentityHashMap
-                                            *prepared-emitted-modules* emission)
-                                   (throw failure)))
-                            (consume-emitted-global-invocations! emission))
-                          (me/assert-emission-inputs-current! emission)
-                          {:emission emission :inputs @me/*emission-inputs*})))]
-                 ;; The local owner has now passed its final publication
-                 ;; fence. Rejected attempts contribute no retained inputs.
-                 (when *prepared-emitted-modules*
-                   (.put ^java.util.IdentityHashMap *prepared-emitted-modules*
-                         (:emission prepared) (:inputs prepared)))
-                 (swap! completed conj (:inputs prepared)))))
+             ;; A queued sibling can legitimately be a child; only the
+             ;; currently preparing ancestors participate in cycle detection.
+             (swap! completed conj (:inputs (prepare-emitted-receiver! receiver prepare!))))
            receivers)
           ;; Preparation has already fenced the ORIGINAL outer observations.
           ;; Only a stable whole attempt may adopt the children's original

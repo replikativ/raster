@@ -5,6 +5,8 @@
             [raster.ad.reverse :as reverse]
             [raster.ad.templates :as templates]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.call-boundary :as boundary]
+            [raster.compiler.core.types :as types]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.backend.jvm.hoisted :as hoisted]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
@@ -526,6 +528,79 @@
             (finally (reset-meta! changed original)))))
         (is (guard)))
       (finally (remove-ns (ns-name scope)))))))
+
+(deftest selected-helper-capture-closes-descendants-before-physical-observation
+  (doseq [warm-root? [false true]]
+    (let [scope (create-ns (gensym "raster.helper-capture-readiness."))
+          events (atom [])
+          current (atom true)
+          producer (reify method-entry/RetainedProducerInput
+                     (assert-producer-current! [this]
+                       (when-not @current
+                         (throw (ex-info "leaf producer changed" {:reason ::stale-leaf-producer})))
+                       this))]
+      (try
+        (intern scope 'events events)
+        (binding [*ns* scope]
+          (refer 'clojure.core)
+          (eval '(raster.core/deftm leaf [x :- Double] :- Double
+                   (do (swap! events conj :leaf) x)))
+          (doseq [name '[left right]]
+            (eval (list 'raster.core/deftm name '[x :- Double] ':- 'Double '(leaf x))))
+          (eval '(raster.core/deftm top [x :- Double] :- Double
+                   (clojure.core/+ (left x) (right x))))
+          (eval '(raster.core/deftm unrelated [x :- Double] :- Double x)))
+        (let [source #(core/resolve-deftm-var (ns-resolve scope %))
+              receiver #(ns-resolve scope (symbol (str (:name (meta (source %))) "-impl")))
+              root (receiver 'top)
+              _ (when warm-root? (core/ensure-current-owned-bytecode! root))
+              _ (is (every? #(map? (:raster.core/jit-spec (meta (receiver %)))) '[left right leaf]))
+              interface (:iface-class (types/ensure-fn-interface! '[double]))
+              method (first (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                                    (.getDeclaredMethods ^Class interface)))
+              compile! bytecode/compile-typed-impl!
+              captured (with-redefs
+                         [bytecode/compile-typed-impl!
+                          (fn [& args]
+                            (when (and (identical? scope (nth args 5))
+                                       (= (str (:name (meta (source 'leaf)))) (nth args 8 nil)))
+                              (method-entry/adopt-definition-inputs! {:producer-inputs [producer]}))
+                            (apply compile! args))]
+                         (boundary/capture-selected-emission!
+                          (symbol (str (ns-name scope)) "top")
+                          (symbol (str (ns-name scope)) (str (:name (meta root))))
+                          1 method core/ensure-current-owned-bytecode!))
+              guard (:guard captured)
+              published (method-entry/call-with-definition-inputs
+                         #(bytecode/prepare-emitted-global-invocations! (:emission captured)))
+              publication-guard (method-entry/prepare-emission-input-guard! published)]
+          (is (empty? @events) "capturing readiness never evaluates numerical code")
+          (is (every? #(nil? (:raster.core/jit-spec (meta (receiver %)))) '[top left right leaf]))
+          (is (map? (:raster.core/jit-spec (meta (receiver 'unrelated)))))
+          (is (identical? (:emission captured) (:raster.core/bytecode-emission (meta root)))
+              "readiness does not replace the registered module with an augmented copy")
+          (is (nil? (guard)))
+          (is (= 6.0 ((ns-resolve scope 'top) 3.0)))
+          (is (= [:leaf :leaf] @events))
+          (let [leaf (receiver 'leaf) metadata (meta leaf)]
+            (try
+              (alter-meta! leaf assoc ::changed-history (Object.))
+              (is (thrown? clojure.lang.ExceptionInfo (guard))
+                  "the captured guard retains transitive readiness, not only root metadata")
+              (finally (reset-meta! leaf metadata))))
+          (is (nil? (guard)))
+          (is (some #(identical? producer %)
+                    (:producer-inputs (:raster.core/bytecode-emission (meta (receiver 'leaf))))))
+          (let [snapshots (mapv method-entry/var-snapshot
+                                (mapcat (fn [name] [(source name) (receiver name)])
+                                        '[top left right leaf]))]
+            (reset! current false)
+            (is (every? method-entry/var-snapshot-current? snapshots)
+                "only the leaf's genuine emission producer changed, not roots or metadata")
+            (doseq [check [guard publication-guard]]
+              (is (= ::stale-leaf-producer
+                     (try (check) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+        (finally (remove-ns (ns-name scope)))))))
 
 (deftest additional-history-does-not-launder-malformed-or-refusing-producers
   (let [scope (create-ns (gensym "raster.additional-physical-history."))]

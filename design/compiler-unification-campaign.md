@@ -20,6 +20,11 @@ Keep the original eight objectives below. The current landing order is:
    child histories join only after the original publication fence. Exact-module
    reuse is request-local and rechecks those original histories, not a new
    portable or runtime compiler cache.
+   Helper-body capture uses that same child-first readiness before retaining its
+   physical entry. Each authenticated module contributes its own complete input
+   guard as well as its global-call observations; a leaf producer can invalidate
+   history without changing any Var. Readiness never replaces the registered
+   module with a history-augmented copy or renews an old captured artifact.
 2. Normalize segmented scalar computations at their actual TypedSOAC producer.
    Factor the existing selected-method FP body recipe from its physical caller
    argument-completion gate. A semantic typed operand domain is not evidence of
