@@ -312,46 +312,53 @@
          :stable-reads (mapv body/stable-read
                              (distinct (remove #{output}
                                                (concat arrays (map :sym transform-operands)))))
-         :indices (vec (concat
-                        [(body/->IndexBinding group-index :group 0)
-                         (body/->IndexBinding local-index :local 0)
-                         (body/->IndexCompute
-                          segment-index
-                          (body/expression :add
-                                           (body/expression :mul
-                                                            (widen-builtin group-index)
-                                                            (widen-builtin workgroup-size))
-                                           (widen-builtin local-index)))]
-                        decomposition))
+         :indices [(body/->IndexBinding group-index :group 0)
+                   (body/->IndexBinding local-index :local 0)
+                   (body/->IndexCompute
+                    segment-index
+                    (body/expression :add
+                                     (body/expression :mul
+                                                      (widen-builtin group-index)
+                                                      (widen-builtin workgroup-size))
+                                     (widen-builtin local-index)))]
          :masks [(body/->Mask active-mask
                               [(body/predicate :lt segment-index
                                                (widen-builtin '_nseg))])]
          :operations
-         (vec
-          (concat
-           (if map-only?
-             operations
-             [(body/->ForLoop
-             (body/value reduced-index (if wide-indices? :long :int))
-             (widen-builtin 0) reduced-bound 1
-             [(body/->LoopArg (body/value accumulator dtype)
-                              (body/literal identity dtype))]
-             (vec (concat
-                   operations
-                   [(body/->ScalarCompute
-                     (body/value next-accumulator dtype)
-                     (body/scalar-expression operator dtype [accumulator result]))
-                    (body/->Yield [next-accumulator])]))
-             [(body/value reduction-result dtype)]
-             {})])
-           (:operations lowered-transform)
-           [(body/->ScalarStore output [segment-index] stored-result active-mask)]))
+         [(body/->Guard
+           active-mask
+           (vec
+            (concat
+             ;; Coordinate decomposition divides by free-axis bounds. Keep it inside
+             ;; the segment guard: an empty output has no coordinates to decompose.
+             ;; This also keeps all operand, reduction and epilogue work inactive.
+             decomposition
+             (if map-only?
+               operations
+               [(body/->ForLoop
+                 (body/value reduced-index (if wide-indices? :long :int))
+                 (widen-builtin 0) reduced-bound 1
+                 [(body/->LoopArg (body/value accumulator dtype)
+                                 (body/literal identity dtype))]
+                 (vec (concat
+                       operations
+                       [(body/->ScalarCompute
+                         (body/value next-accumulator dtype)
+                         (body/scalar-expression operator dtype [accumulator result]))
+                        (body/->Yield [next-accumulator])]))
+                 [(body/value reduction-result dtype)]
+                 {})])
+             (:operations lowered-transform)
+             [(body/->ScalarStore output [segment-index] stored-result active-mask)])))]
          :schedule {:strategy (if map-only? :independent-segments :sequential-segments)
                     :workgroup-size workgroup-size
                     :reduction-operator operator}
          :launch (launch/spec
                   {:workgroup-size [workgroup-size]
-                   :group-count [(launch/ceil-div launch-segment-count workgroup-size)]})
+                   ;; Match the existing guarded-map convention. Nonempty outputs
+                   ;; still run when the reduced bound is zero and store the identity.
+                   :group-count [(launch/maximum
+                                  1 (launch/ceil-div launch-segment-count workgroup-size))]})
          :provenance {:dialect :kernel-body :source-dialect :segcontract
                       :segop-id (:id segred)}
          :attributes {:kind :portable-contraction
