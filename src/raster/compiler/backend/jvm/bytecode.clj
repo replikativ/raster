@@ -1061,7 +1061,8 @@
   (or which own their own scoping); `lift-loop-operands` recurses into them but never
   ANF-lifts their operands."
   '#{if do let* loop* letfn* fn* quote var try catch finally case* set! throw def
-     monitor-enter monitor-exit . clojure.core/quote})
+     monitor-enter monitor-exit . clojure.core/quote reify* deftype* import*
+     clojure.core/import*})
 
 (defn- contains-loop?
   "Does `form` evaluate a `loop*` in its own frame (i.e. not inside a nested fn*)?"
@@ -1075,12 +1076,60 @@
     (map? form) (boolean (some contains-loop? (concat (keys form) (vals form))))
     :else false))
 
-(defn- atomic-operand? [form]
-  (or (symbol? form) (number? form) (keyword? form) (string? form) (nil? form)
+(defn- constant-operand?
+  "A literal whose evaluation reads no state."
+  [form]
+  (or (number? form) (keyword? form) (string? form) (nil? form)
       (true? form) (false? form) (char? form)))
 
+(defn- order-free-symbol?
+  "Is evaluating symbol operand `sym` independent of when it happens relative to the other
+   operands of the same call? Only two kinds of symbol are proved so:
+   - a lexical local: an unqualified symbol that resolves to nothing in the current namespace
+     can only be a local binding, and JVM/Clojure locals are immutable (the bytecode backend's
+     only `set!` is field mutation through a `(. obj field)` place, itself a compound operand);
+   - a class literal.
+   Everything else — a Var (any Var can be re-rooted, `set!` under a binding, or redefined by a
+   later operand), a qualified static-field read, or a name that fails to resolve — is a read of
+   mutable state and must be captured in its original position. A local that shadows a Var name
+   is conservatively captured too; that is a redundant copy, never a reordering."
+  [sym]
+  (and (symbol? sym)
+       (nil? (namespace sym))
+       (let [resolved (try (resolve sym) (catch Throwable _ ::unresolvable))]
+         (or (nil? resolved) (class? resolved)))))
+
+(defn- order-free-operand? [form]
+  (or (constant-operand? form) (order-free-symbol? form)))
+
+(defn- inline-var-call?
+  "Does `(v args...)` with `n` arguments compile to an inline expansion, i.e. without reading
+   the Var's root at run time?"
+  [v n]
+  (let [{:keys [inline inline-arities]} (meta v)]
+    (boolean (and inline (or (nil? inline-arities) (inline-arities n))))))
+
+(defn- reorderable-call-head?
+  "May the operands of `(h operands...)` be evaluated into locals before the call itself?
+   Clojure evaluates a non-inline Var head (reading its root) BEFORE the operands, and the
+   bytecode backend's source-call path does the same, so moving operands ahead of such a head
+   can let an operand's effect change which function is called. Only heads whose callee is
+   fixed at compile time or is an immutable local are reorderable:
+   `recur`, `new`, method sugar `.m` (its target is an ordinary first operand, see
+   `lift-loop-operands`), an inline Var call, or a local fn."
+  [h n-operands]
+  (cond
+    (contains? #{'recur 'new} h) true
+    (not (symbol? h)) false
+    (and (nil? (namespace h)) (.startsWith (name h) ".") (not= "." (name h))) true
+    :else (let [resolved (try (resolve h) (catch Throwable _ ::unresolvable))]
+            (cond
+              (var? resolved) (inline-var-call? resolved n-operands)
+              (nil? resolved) (nil? (namespace h))
+              :else false))))
+
 (defn lift-loop-operands
-  "A-normalize call operands that contain a `loop*`.
+  "A-normalize call operands that contain a `loop*`, preserving evaluation order.
 
   `(f a (loop* ...))` is emitted as a loop whose header executes with `a` (and, for
   array stores / instance calls, the receiver) still on the JVM operand stack. HotSpot C2
@@ -1088,8 +1137,15 @@
   stack, so such a loop — e.g. the inner product of a host-expanded `par/contract` written
   as `(aset out f (loop* [l 0 acc 0.0] ...))` — never reaches the optimizing tier when the
   enclosing method is invoked only a few times (it ran ~100x slower than the same loop
-  bound to a local first). Binding every non-atomic operand to a fresh local IN EVALUATION
-  ORDER preserves semantics and leaves the operand stack empty at every loop header.
+  bound to a local first).
+
+  The rewrite binds operands to fresh locals IN SOURCE ORDER: every operand is captured
+  except constants and order-free symbols (`order-free-symbol?`: lexical locals and class
+  literals). Var reads and static-field reads are captured where they stood, so an effect in
+  a later operand (e.g. a loop that `set!`s or re-roots that Var) cannot leak into an earlier
+  operand. The rewrite is declined — the form is left exactly as written — when the call head
+  is a run-time Var read (`reorderable-call-head?`), or when a method-sugar target is a
+  non-order-free symbol (capturing it would turn a linked `.invk` target into a plain local).
   Operand metadata (dtype stamps) is carried onto the temporary."
   [form]
   (cond
@@ -1101,10 +1157,15 @@
                               (not (symbol? h)) [0 nil]
                               (contains? non-call-heads h) [0 nil]
                               (= 'new h) [2 (drop 2 form')]
-                              :else [1 (rest form')])]
-      (if (and (seq operands) (some contains-loop? operands))
+                              :else [1 (rest form')])
+          method-target (when (and (symbol? h) (nil? (namespace h))
+                                   (.startsWith (name h) ".") (not= "." (name h)))
+                          (first operands))]
+      (if (and (seq operands) (some contains-loop? operands)
+               (reorderable-call-head? h (count operands))
+               (not (and (symbol? method-target) (not (order-free-symbol? method-target)))))
         (let [pairs (mapv (fn [op]
-                            (if (atomic-operand? op)
+                            (if (order-free-operand? op)
                               [nil op]
                               (let [m (select-keys (meta op) [:tag :raster.type/tag])
                                     s (with-meta (gensym "lift_op__") (not-empty m))]
