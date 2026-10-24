@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -12,6 +14,8 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
+            [raster.compiler.passes.parallel.structured-control-route :as route]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.core :refer [deftm]]
             [raster.par :as par]))
 
@@ -30,6 +34,73 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest ordered-value-aliases-preserve-the-existing-buffer-without-execution
+  (let [saved (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        chained (with-meta 'chained {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        identity (fn [source]
+                   (vary-meta (completion/complete-value completion/object-input-contract source)
+                              assoc :raster.effect/preserve-evaluation true))
+        source (list 'let* [saved (identity 'x) chained (identity saved)
+                            'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)
+        options {:dtype :double :public-parameters '[x out n]
+                 :array-types {'x :double 'out :double} :scalar-types {'n :long}}
+        promote (fn [source]
+                  (route/promote-program
+                   (:program (typed-route/attempt
+                              source :double (:array-types options)
+                              {:scalar-types (:scalar-types options)
+                               :lexical-inputs (:public-parameters options)})) options))
+        semantic (promote source)
+        emitted (:program (program-c-family/emit-program
+                           (route/schedule-program semantic options)
+                           (assoc options :target-dialect :opencl-portable)))
+        compilation {:semantic semantic :emitted emitted :target :ocl:0}
+        input (double-array [1 2 3])
+        initial (invocation-link/begin-ordered-realization compilation [input (double-array 3) 3] nil)
+        forbidden (fn [& _] (throw (ex-info "alias evaluated source or acquired storage" {})))
+        first-alias (first (get-in initial [:materialization :plan :steps]))
+        second-alias (second (get-in initial [:materialization :plan :steps]))
+        advanced (invocation-link/advance-host-source initial forbidden forbidden nil)
+        finished (invocation-link/advance-host-source advanced forbidden forbidden nil)
+        buffer (fn [state symbol]
+                 (let [prefix (:materialization state)]
+                   (get-in prefix [:values (get (:lexical prefix) symbol)])))]
+    (is (identical? initial (invocation-link/validate-ordered-source-actions! initial)))
+    (is (every? invocation/value-alias? [first-alias second-alias]))
+    (is (not-any? #{saved chained} (:inputs semantic)) "both preserved aliases are numerically dead")
+    (doseq [entry (take 2 (:source-order initial))]
+      (is (some? (:invocation-step entry)))
+      (is (nil? (:storage entry)))
+      (is (nil? (:equation entry))))
+    (is (= 1 (:source-cursor advanced)))
+    (is (= 2 (:source-cursor finished)))
+    (is (= 2 (get-in finished [:materialization :next-step])))
+    (is (identical? (buffer initial 'x) (buffer advanced saved)))
+    (is (identical? (buffer initial 'x) (buffer finished chained)))
+    (is (identical? input (:source (buffer finished chained))))
+    (is (not-any? #{saved chained}
+                  (keys (:program-buffers (materialization/prefix-bindings (:materialization finished)))))
+        "executing dead source identities does not manufacture numerical inputs")
+    (is (= (:realized initial) (:realized finished)))
+    (is (empty? (:acquired-storage finished)))
+    (is (empty? (:host-scalars finished)))
+    (is (empty? (:host-steps finished)))
+    (is (= :invocation-ordered-next-host
+           (reason #(invocation-link/advance-host-source finished forbidden forbidden nil)))
+        "the alias executor cannot advance the following numerical source action")
+    (is (= :invocation-ordered-pending
+           (reason #(invocation-link/advance-host-source
+                     (assoc initial :pending {:equation :earlier}) forbidden forbidden nil))))
+    (let [changed (assoc-in compilation
+                            [:semantic :attributes :invocation-plan :steps 0 :source-expression]
+                            (identity 'out))]
+      (is (= :invocation-value-alias-source
+             (reason #(invocation-link/begin-ordered-realization changed [input (double-array 3) 3] nil)))))
+    (is (= :host-abstract-value-reference-alias
+           (reason #(promote (list 'let* [chained (identity saved) saved (identity 'x)
+                                          'y '(raster.par/map! out i n double (clojure.core/aget x i))]
+                                  'y)))))))
 
 (deftest early-equation-binds-without-evaluating-the-late-checked-shape
   (let [compilation (equation-first/compile #'fixture/write-before-shape

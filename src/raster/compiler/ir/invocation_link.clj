@@ -624,8 +624,9 @@
       (when (or (and (:realization entry)
                      (not (contains? #{:result-allocation :storage-alias} (:kind action))))
                 (and step (not (or (invocation/scalar-compute? step)
-                                         (invocation/shape-projection? step)
-                                         (and (:storage entry) (invocation/buffer-allocation? step))))))
+                                  (invocation/shape-projection? step)
+                                  (invocation/value-alias? step)
+                                  (and (:storage entry) (invocation/buffer-allocation? step))))))
         (fail! :invocation-ordered-source-action
                "ordered source entry requires an unimplemented realization action" {:entry entry}))
       (when (some emitted-loop/emitted-loop? (:operations equation))
@@ -673,7 +674,8 @@
     arguments))
 
 (defn ^:no-doc advance-host-source
-  "Evaluate the next host source definition once, including shared invocation/equation producers.
+  "Advance the next host source definition once, including validated value aliases and shared
+   invocation/equation producers. Aliases retain the existing value without evaluating a scalar.
    This owner-local transition never acquires storage or acknowledges numerical completion."
   [state evaluate-step evaluate-host caller-options]
   (when-not (= caller-options (:caller-options state))
@@ -690,12 +692,13 @@
                    (or (not (:invocation-step entry))
                        (and (= (:invocation-step entry) (:id step))
                             (or (invocation/scalar-compute? step)
-                                (invocation/shape-projection? step))))
+                                (invocation/shape-projection? step)
+                                (invocation/value-alias? step))))
                    (or (not (:equation entry))
                        (and equation (true? (get-in equation [:attributes :host-only]))))
                    (or step equation))
       (fail! :invocation-ordered-next-host
-             "the next source entry is not an available scalar host definition" {:entry entry}))
+             "the next source entry is not an available host definition or value alias" {:entry entry}))
     (let [advanced (volatile! materialized)
           run-step! (fn []
                       (vreset! advanced

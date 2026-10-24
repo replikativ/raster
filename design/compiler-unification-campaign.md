@@ -140,6 +140,28 @@ fingerprinting are unchanged. Artifact/cache/store/dispatch qualification passes
 manually injected Vars, contexts and callbacks. This is not permission to drop
 arbitrary unsupported artifact data or reuse stale source-definition evidence.
 
+The next source-evaluation audit found a missing public execution gate. The
+frontend's checked-cast retention predicate does not retain a dead scalar marked
+`:raster.effect/preserve-evaluation`; the real Q8-LoRA example is checked integer
+multiplication after earlier contractions. Retaining that expression is necessary
+but not sufficient. Ordinary `compiled/lower` still uses eager equation lowering,
+while `prepare-ordered-equation-first` is currently only an explicitly qualified
+constructor. Eager host evaluation checks device data dependencies but does not
+by itself preserve a late independent exception after earlier device writes.
+Do not broaden scalar admission until public ordered preparation and its port,
+donation, replay and lifetime capabilities are qualified, or eager admission
+explicitly refuses the ordering. Reuse the existing source-order executor;
+leave checked-cast reuse distinct from preservation-only retention.
+
+Ordered source-action coverage now accepts the existing validated `ValueAlias`
+step through the same incremental materializer. Chained, numerically dead
+reference identities preserve the identical materialized buffer and source;
+they acquire no storage, invoke no scalar evaluator, create no host-scalar
+results and remain absent from the numerical interface. Pending-action barriers,
+changed-source and future-reference controls remain active. Ordered realization,
+materialization and preparation qualification passes 27 tests / 369 assertions.
+Public automatic ordered selection and training port capabilities remain open.
+
 Update the existing capability/compatibility ledger with each failure's owner,
 accepted or deliberately declined form, numerical/effect oracle and removal gate.
 Current node-wise AD composition is bounded but implemented; historical statements
