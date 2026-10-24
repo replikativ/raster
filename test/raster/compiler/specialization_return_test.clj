@@ -5,6 +5,7 @@
             [raster.ad.forward]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.types :as types])
   (:import [raster.ad.forward Dual]))
 
@@ -58,15 +59,17 @@
     (try
       (binding [*ns* source] (refer 'clojure.core) (intern source 'Target Number))
       (binding [*ns* caller] (refer 'clojure.core) (intern caller 'Target String))
-      (with-redefs [core/do-bytecode-upgrade! (fn [& _] (throw emission))]
-        (binding [*ns* caller]
-          (is (identical? emission
-                          (thrown #(#'core/register-parametric-specialization!
-                                    (symbol (str (ns-name source)) "boxed-result")
-                                    {:annotations '[T] :ret-annotation 'Target :type-vars '[T]
-                                     :params '[x] :body '(double x) :source-ns source}
-                                    {'T 'double} [])))
-              "Number accepts boxed Double even though caller's Target is String")))
+      (let [template (binding [*ns* source]
+                       {:annotations '[T] :ret-annotation 'Target :type-vars '[T]
+                        :params '[x] :body '(double x) :source-ns source
+                        :source-policy (source-policy/capture)})]
+        (with-redefs [core/do-bytecode-upgrade! (fn [& _] (throw emission))]
+          (binding [*ns* caller]
+            (is (identical? emission
+                            (thrown #(#'core/register-parametric-specialization!
+                                      (symbol (str (ns-name source)) "boxed-result")
+                                      template {'T 'double} [])))
+                "Number accepts boxed Double even though caller's Target is String"))))
       (finally (remove-ns (ns-name source)) (remove-ns (ns-name caller))))))
 
 (deftest invalid-specialization-refuses-before-emission-or-publication
