@@ -6038,53 +6038,100 @@
   [v]
   (dispatch/no-inline? v))
 
+(defn- method-parameter-scope
+  "Use Clojure's binding-pattern expansion and the shared closed-core scope
+   decomposition for method parameters, including supported vector patterns.
+   Only binding names are consumed; no parameter/default expression executes."
+  [parameters]
+  (let [bindings (clojure.core/destructure (vec (mapcat #(vector % nil) parameters)))
+        scope (form-ir/scope-info (list 'let* bindings nil))]
+    (into #{} (filter symbol?) (mapcat :binders (:scopes scope)))))
+
 (defn- scan-deftm-inputs
   "Walk forms to retain referenced deftm Vars and their actual lookup sites.
   Handles both direct calls (ns/fn args...) and .invk forms
-  (.invk ^IFace ns/fn-impl args...)."
-  [forms source-ns]
+  (.invk ^IFace ns/fn-impl args...). Binding scopes come from the same
+  decomposition as free-syms; neither local callees nor quoted data discover
+  global compiler inputs. Parameters belong to the actual enclosing method."
+  [forms source-ns parameters]
   (let [refs (atom #{})]
-    (letfn [(scan [form]
+    (letfn [(global? [symbol bound]
+              (and (symbol? symbol) (not (contains? bound symbol))
+                   (not (:raster.op/lexical-callee (meta symbol)))))
+            (retain! [symbol]
+              (when-let [v (try (ns-resolve source-ns symbol) (catch Exception _ nil))]
+                (when (and (var? v) (:raster.core/deftm (meta v))
+                           (not (no-inline-deftm? v)))
+                  (swap! refs conj {:var v :lookup [source-ns symbol]}))))
+            (scan [form bound]
               (cond
                 ;; Quoted bodies are data, not additional compilation inputs.
                 ;; Traversing them can even realize a quoted lazy sequence.
                 (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) nil
+                (and (seq? form) (form-ir/scope-info form))
+                (let [{:keys [scopes outer sequential? rec?]} (form-ir/scope-info form)]
+                  (doseq [expression outer] (scan expression bound))
+                  (doseq [{:keys [binders inits body]} scopes]
+                    (let [body-bound
+                          (if sequential?
+                            (reduce (fn [scope [binder initializer]]
+                                      (scan initializer scope)
+                                      (cond-> scope (symbol? binder) (conj binder)))
+                                    bound (map vector binders inits))
+                            (let [inner (into bound (filter symbol?) binders)]
+                              (doseq [initializer inits]
+                                (scan initializer (if rec? inner bound)))
+                              inner))]
+                      (doseq [expression body] (scan expression body-bound)))))
                 (and (seq? form) (symbol? (first form)))
                 (let [h (first form)]
                   (if (= h '.invk)
                     ;; .invk form: extract deftm var from -impl symbol
                     (when-let [impl-sym (second form)]
-                      (when (and (symbol? impl-sym) (namespace impl-sym)
+                      (when (and (not (:raster.op/lexical-callee (meta form)))
+                                 (global? impl-sym bound) (namespace impl-sym)
                                  (.endsWith (name impl-sym) "-impl"))
                         (let [base-name (subs (name impl-sym) 0 (- (count (name impl-sym)) 5))
                               base-sym (symbol (namespace impl-sym) base-name)]
-                          (when-let [v (try (ns-resolve source-ns base-sym) (catch Exception _ nil))]
-                            (when (and (var? v)
-                                       (:raster.core/deftm (meta v))
-                                       (not (no-inline-deftm? v)))
-                              (swap! refs conj {:var v :lookup [source-ns base-sym]})))))
-                      (doseq [f (drop 2 form)] (scan f)))
+                          (retain! base-sym)))
+                      (doseq [f (rest form)] (scan f bound)))
                     ;; Normal call
-                    (do (when-let [v (try (ns-resolve source-ns h) (catch Exception _ nil))]
-                          (when (and (var? v)
-                                     (:raster.core/deftm (meta v))
-                                     (not (no-inline-deftm? v)))
-                            (swap! refs conj {:var v :lookup [source-ns h]})))
-                        (doseq [f (rest form)] (scan f)))))
-                (seq? form) (doseq [f form] (scan f))
-                (vector? form) (doseq [f form] (scan f))
+                    (do (when (and (global? h bound)
+                                   (not (:raster.op/lexical-callee (meta form))))
+                          (retain! h))
+                        (doseq [f (rest form)] (scan f bound)))))
+                (or (seq? form) (vector? form) (set? form))
+                (doseq [f form] (scan f bound))
+                (map? form) (doseq [[k v] form] (scan k bound) (scan v bound))
                 :else nil))]
-      (doseq [f forms] (scan f)))
+      (doseq [f forms] (scan f (method-parameter-scope parameters))))
     @refs))
 
 (defn- scan-deftm-refs
   "Project the emitter's reference discovery onto its static sibling Var set."
-  [forms source-ns]
-  (into #{} (map :var) (scan-deftm-inputs forms source-ns)))
+  [forms source-ns parameters]
+  (into #{} (map :var) (scan-deftm-inputs forms source-ns parameters)))
 
 ;; ================================================================
 ;; tag->jvm-info — type tag to JVM descriptor mapping
 ;; ================================================================
+
+(defn- collect-emission-input-snapshots
+  [walked-body source-ns parameters prepare!]
+  (loop [pending (seq (scan-deftm-inputs walked-body source-ns parameters)) observations {}]
+    (if-let [{v :var lookup :lookup} (first pending)]
+      (if (contains? observations v)
+        (recur (next pending) (update-in observations [v :lookups] conj lookup))
+        (let [_ (when prepare! (prepare! v))
+              snapshot (assoc (me/emission-definition-snapshot v) :lookups #{lookup})
+              metadata (:metadata snapshot)
+              body (or (seq (:raster.core/deftm-walked-body-typed metadata))
+                       (seq (:raster.core/deftm-walked-body metadata)))
+              nested (when body
+                       (scan-deftm-inputs body (or (:ns metadata) source-ns)
+                                          (:raster.core/deftm-params metadata)))]
+          (recur (concat (next pending) nested) (assoc observations v snapshot))))
+      (mapv observations (sort-by str (keys observations))))))
 
 (defn ^:no-doc emission-input-snapshots
   "Observe retained global deftm inputs before emitting static/sibling methods.
@@ -6092,18 +6139,24 @@
    Traversal never invokes or materializes a numerical body. A missing walked
    body can be filled by emission itself, which then invalidates this snapshot
    and requires a fresh original emission before paired re-emission is admitted."
-  [walked-body source-ns]
-  (loop [pending (seq (scan-deftm-inputs walked-body source-ns)) observations {}]
-    (if-let [{v :var lookup :lookup} (first pending)]
-      (if (contains? observations v)
-        (recur (next pending) (update-in observations [v :lookups] conj lookup))
-        (let [snapshot (assoc (me/emission-definition-snapshot v) :lookups #{lookup})
-              metadata (:metadata snapshot)
-              body (or (:raster.core/deftm-walked-body-typed metadata)
-                       (:raster.core/deftm-walked-body metadata))
-              nested (when body (scan-deftm-inputs body (or (:ns metadata) source-ns)))]
-          (recur (concat (next pending) nested) (assoc observations v snapshot))))
-      (mapv observations (sort-by str (keys observations))))))
+  ([walked-body source-ns] (emission-input-snapshots walked-body source-ns []))
+  ([walked-body source-ns parameters]
+   (collect-emission-input-snapshots walked-body source-ns parameters nil)))
+
+(defn ^:no-doc prepare-emission-input-snapshots!
+  "Emission constructor, not an optional observation query. Close missing source
+   walks of actually referenced callees before taking their final snapshots.
+   Existing parent observations are never replaced: publication of a cache they
+   already observed must restart the whole owning compilation."
+  [walked-body source-ns parameters]
+  (let [historical (when me/*emission-inputs* @me/*emission-inputs*)
+        _ (when historical (me/assert-definition-inputs-current! historical))
+        snapshots (binding [me/*emission-inputs* nil]
+                    (collect-emission-input-snapshots
+                     walked-body source-ns parameters
+                     (requiring-resolve 'raster.core/prepare-emission-source-walk!)))]
+    (when historical (me/assert-definition-inputs-current! historical))
+    snapshots))
 
 (defn- tag->jvm-info
   "Map a deftm type tag to JVM type information.
@@ -6296,7 +6349,11 @@
         sibling-methods (into {} (map (fn [ms] [(str (:name ms)) (assoc ms :owner class-desc)]) method-specs))
         ;; Auto-discover deftm vars referenced in fn-spec bodies
         src-ns (or (:source-ns (first fn-specs)) *ns*)
-        deftm-refs (scan-deftm-refs (mapcat :walked-body fn-specs) src-ns)
+        deftm-refs (into #{}
+                        (mapcat #(scan-deftm-refs (:walked-body %)
+                                                  (or (:source-ns %) src-ns)
+                                                  (:params %)))
+                        fn-specs)
         deftm-method-specs (mapv
                             (fn [index v]
                               (let [m (meta v)
@@ -6899,8 +6956,9 @@
           tags        (:raster.core/deftm-tags m)
           return-tag  (:raster.core/return-tag m)
           source-ns   (:ns m)
+          dependency-snapshots (prepare-emission-input-snapshots! walked-body source-ns params)
+          _ (me/assert-definition-inputs-current! @emitted-inputs)
           source-snapshot (me/emission-definition-snapshot deftm-var)
-          dependency-snapshots (emission-input-snapshots walked-body source-ns)
           definition-revision (dispatch/compiler-definition-revision)
           class-name  (str (ns-name source-ns) "." (:name m) (gensym "__DeftmBC"))
           bc-info     (binding [*compiling-deftms* (conj *compiling-deftms* var-sym)

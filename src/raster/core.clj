@@ -382,15 +382,16 @@
            reduction-catalog :reduction-catalog completion-catalog :completion-catalog
            input-origins :input-origins}
           ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retain-invocation-occurrences) body)
-          dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/emission-input-snapshots)
-                        body source-ns)
-          revision (dispatch/compiler-definition-revision)
           inputs (atom (assoc (merge {:static [] :values []}
                                      (select-keys preparation-inputs
                                                   [:static :values :definition-proofs
                                                    :producer-inputs]))
                               :reduction-sources reduction-catalog))
           _ (me/assert-definition-inputs-current! @inputs)
+          dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/prepare-emission-input-snapshots!)
+                        body source-ns params)
+          _ (me/assert-definition-inputs-current! @inputs)
+          revision (dispatch/compiler-definition-revision)
           implementation
           (binding [me/*emission-inputs* inputs]
             (emitter (str class-name (gensym "__owned")) params tags return-tag
@@ -481,6 +482,38 @@
     (when-let [impl-var (ns-resolve (:ns (meta source-var))
                                    (symbol (str (:name (meta source-var)) "-impl")))]
       (prepare-implementation-frontend! impl-var))))
+
+(clojure.core/defn ^:no-doc prepare-emission-source-walk!
+  "Explicit emission preparation of a missing source-walk cache. Reuse the
+   original opaque frontend, not a new macro expansion or transformed module.
+   Existing cache contents are never replaced. Callers retain their original
+   observations and must restart if this publication invalidates them."
+  [source-var]
+  (when (and (var? source-var) (::deftm (meta source-var)))
+    (locking source-var
+      ;; The static sibling fallback calls ensure-walked-body!, whose cache is
+      ;; the source walk, not the independently retained typed variant.
+      (when-not (seq (::deftm-walked-body (meta source-var)))
+        (let [before (me/emission-definition-snapshot source-var)]
+          (when-let [frontend (prepare-deftm-frontend! source-var)]
+            (let [{:keys [source-entry body]} frontend
+                  assert-original!
+                  (fn []
+                    (me/assert-frontend-source! frontend source-var)
+                    (when-not (me/var-snapshot-current? before)
+                      (throw (ex-info "source changed during emission source-walk preparation"
+                                      {:reason :stale-definition-proof-input :source source-var}))))]
+              (assert-original!)
+              (when (seq body)
+                (alter-meta! source-var
+                             (fn [metadata]
+                               (assert-original!)
+                               (assoc metadata ::deftm-walked-body body)))
+                ;; A source change racing publication must not produce an
+                ;; executable. This is the existing sequential fence, not ABA
+                ;; protection or permission to refresh an earlier observation.
+                (me/assert-source-entry-current! source-entry)
+                body))))))))
 
 (clojure.core/defn ^:no-doc expand-retained-ad-body
   "Expand AD in already retained typed source under its existing compiler owner.

@@ -223,6 +223,135 @@
             (finally (reset-meta! child original)))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest explicit-emission-preparation-closes-only-referenced-source-walks
+  (let [scope (create-ns (gensym "raster.cold-emission-walks."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm grandchild [x :- Double] :- Double x))
+        (eval '(raster.core/deftm child [x :- Double] :- Double (grandchild x)))
+        (eval '(raster.core/deftm unused [x :- Double] :- Double x))
+        (eval '(raster.core/deftm parent [x :- Double] :- Double (child x))))
+      (let [selected #(core/resolve-deftm-var (ns-resolve scope %))
+            child (selected 'child)
+            grandchild (selected 'grandchild)
+            unused (selected 'unused)
+            parent (selected 'parent)
+            frontend (core/prepare-deftm-frontend! parent)
+            body (:body frontend)
+            params (get-in frontend [:source-entry :params])
+            cache #(get (meta %) :raster.core/deftm-walked-body)
+            before (mapv meta [child grandchild unused])]
+        (is (every? #(not (seq (cache %))) [child grandchild unused]))
+        (is (seq (bytecode/emission-input-snapshots body scope params)))
+        (is (= before (mapv meta [child grandchild unused])) "reader never prepares")
+        (let [attempts (atom 0)
+              old-proof (atom nil)
+              snapshots
+              (with-redefs [core/ensure-bytecode-implementation!
+                            (fn [& _] (throw (AssertionError. "source preparation must not JIT")))]
+                (method-entry/call-with-definition-inputs
+                 #(do
+                    (swap! attempts inc)
+                    (method-entry/observe-definition-input! child scope (:name (meta child)))
+                    (when (= 1 @attempts)
+                      (reset! old-proof (get-in @method-entry/*emission-inputs*
+                                               [:definition-proofs child])))
+                    (bytecode/prepare-emission-input-snapshots! body scope params))))]
+          (is (= 2 @attempts) "the whole old owner restarts, not its observations")
+          (is (not (method-entry/var-snapshot-current? @old-proof)))
+          (is (every? #(seq (cache %)) [child grandchild]))
+          (is (not (seq (cache unused))))
+          (is (every? (set (map :var snapshots)) [child grandchild]))
+          (is (every? method-entry/var-snapshot-current? snapshots))
+          (let [metadata (mapv meta [child grandchild unused])]
+            (is (= snapshots (bytecode/prepare-emission-input-snapshots! body scope params)))
+            (is (every? true? (map identical? metadata (map meta [child grandchild unused])))))
+          (let [original (meta grandchild)]
+            (try
+              (alter-meta! grandchild assoc :raster.core/deftm-walked-body '[42.0])
+              (is (not-every? method-entry/var-snapshot-current? snapshots)
+                  "real cache edits still invalidate old source dependencies")
+              (finally (reset-meta! grandchild original))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest emission-discovery-respects-method-and-local-scopes
+  (let [scope (create-ns (gensym "raster.scoped-emission-walks."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm child [x :- Double] :- Double x)))
+      (let [child (core/resolve-deftm-var (ns-resolve scope 'child))
+            name (:name (meta child))
+            qualified (symbol (str (ns-name scope)) (str name))
+            call (list name 'x)
+            before (meta child)]
+        (doseq [[form parameters]
+                [[call [name 'x]]
+                 [call [[name 'other] 'x]]
+                 [(list 'let* [name 'identity] call) ['x]]
+                 [(list 'let* [name 'identity 'value call] 'value) ['x]]
+                 [(list 'fn* [name] call) []]
+                 [(list 'letfn* [name (list 'fn* ['x] call)] call) []]
+                 [(list 'quote call) []]
+                 [(list 'clojure.core/quote call) []]
+                 [(with-meta (list qualified 'x) {:raster.op/lexical-callee true}) ['x]]]]
+          (is (empty? (bytecode/emission-input-snapshots [form] scope parameters)))
+          (is (empty? (bytecode/prepare-emission-input-snapshots! [form] scope parameters)))
+          (is (identical? before (meta child))))
+        ;; An initializer sees the outer binding, and qualification remains a
+        ;; global lookup even when a same-named unqualified local is present.
+        (doseq [form [(list 'let* [name call] name)
+                      (list 'let* [name 'identity] (list qualified 'x))]]
+          (is (some #(identical? child (:var %))
+                    (bytecode/emission-input-snapshots [form] scope ['x])))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest source-walk-preparation-rejects-mutation-before-cache-publication
+  (let [scope (create-ns (gensym "raster.source-walk-mutation."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm child [x :- Double] :- Double x)))
+      (let [child (core/resolve-deftm-var (ns-resolve scope 'child))
+            original (meta child)
+            prepare! core/prepare-deftm-frontend!]
+        (try
+          (with-redefs [core/prepare-deftm-frontend!
+                        (fn [source]
+                          (let [actual (prepare! source)]
+                            (alter-meta! source assoc :raster.core/deftm-source-body '[42.0])
+                            actual))]
+            (is (= :stale-definition-proof-input
+                   (try (core/prepare-emission-source-walk! child) :incorrectly-published
+                        (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))
+          (is (not (seq (:raster.core/deftm-walked-body (meta child)))))
+          (finally (reset-meta! child original))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest emission-source-cache-uses-the-frozen-body-not-a-new-macro-expansion
+  (let [scope (create-ns (gensym "raster.frozen-emission-walk."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(defmacro original-value [] 1.0))
+        (eval '(raster.core/deftm child [x :- Double] :- Double (original-value))))
+      (let [child (core/resolve-deftm-var (ns-resolve scope 'child))
+            frontend (core/prepare-deftm-frontend! child)
+            body (:body frontend)
+            receiver (ns-resolve scope (symbol (str (:name (meta child)) "-impl")))
+            implementation (var-get receiver)]
+        (is (not (seq (:raster.core/deftm-walked-body (meta child)))))
+        (binding [*ns* scope]
+          (eval '(defmacro original-value []
+                   (throw (AssertionError. "a frozen frontend must not reexpand source")))))
+        (binding [*unchecked-math* :warn-on-boxed]
+          (is (identical? body (core/prepare-emission-source-walk! child))))
+        (is (identical? body (:raster.core/deftm-walked-body (meta child))))
+        (is (identical? implementation (var-get receiver)))
+        (is (= {:unchecked-math false} (get-in frontend [:source-entry :source-policy]))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest detached-vars-cannot-certify-replaced-emission-inputs
   (let [scope (create-ns (gensym "raster.detached-emission."))
         v (intern scope 'child (fn [] :old))

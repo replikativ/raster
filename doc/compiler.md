@@ -54,9 +54,17 @@ them into shared storage, reducing peak memory usage.
 
 ### Lazy JIT
 
-Every `deftm` function is bytecode-compiled on first call. This happens
-transparently — the first invocation triggers compilation, subsequent calls
-use the compiled code.
+`deftm` supports lazy JVM compilation: normally the first invocation triggers
+compilation and subsequent calls use the compiled code. Explicit compiler
+preparation can materialize an implementation before numerical execution.
+
+Before emission takes dependency snapshots, a separate preparation step closes
+missing source-walk caches of referenced callees from their frozen frontends.
+Discovery respects lexical bindings and quoted data; unrelated functions are
+not warmed. Earlier observations are not refreshed: a preparation-induced change
+requires a whole construction retry. Source preparation and executable-callee
+readiness are distinct obligations; neither permits retrying numerical execution
+or accepting an old artifact after its retained definitions change.
 
 ### AOT via `compile-aot`
 
