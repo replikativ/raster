@@ -1056,6 +1056,69 @@
     (with-meta (mapv pre-expand-par-forms form) (meta form))
     :else form))
 
+(def ^:private non-call-heads
+  "Special forms whose operands are not evaluated onto the operand stack in order
+  (or which own their own scoping); `lift-loop-operands` recurses into them but never
+  ANF-lifts their operands."
+  '#{if do let* loop* letfn* fn* quote var try catch finally case* set! throw def
+     monitor-enter monitor-exit . clojure.core/quote})
+
+(defn- contains-loop?
+  "Does `form` evaluate a `loop*` in its own frame (i.e. not inside a nested fn*)?"
+  [form]
+  (cond
+    (seq? form) (let [h (first form)]
+                  (cond (contains? #{'quote 'clojure.core/quote 'fn*} h) false
+                        (= 'loop* h) true
+                        :else (boolean (some contains-loop? form))))
+    (vector? form) (boolean (some contains-loop? form))
+    (map? form) (boolean (some contains-loop? (concat (keys form) (vals form))))
+    :else false))
+
+(defn- atomic-operand? [form]
+  (or (symbol? form) (number? form) (keyword? form) (string? form) (nil? form)
+      (true? form) (false? form) (char? form)))
+
+(defn lift-loop-operands
+  "A-normalize call operands that contain a `loop*`.
+
+  `(f a (loop* ...))` is emitted as a loop whose header executes with `a` (and, for
+  array stores / instance calls, the receiver) still on the JVM operand stack. HotSpot C2
+  and Graal refuse on-stack replacement at a loop header with a non-empty expression
+  stack, so such a loop — e.g. the inner product of a host-expanded `par/contract` written
+  as `(aset out f (loop* [l 0 acc 0.0] ...))` — never reaches the optimizing tier when the
+  enclosing method is invoked only a few times (it ran ~100x slower than the same loop
+  bound to a local first). Binding every non-atomic operand to a fresh local IN EVALUATION
+  ORDER preserves semantics and leaves the operand stack empty at every loop header.
+  Operand metadata (dtype stamps) is carried onto the temporary."
+  [form]
+  (cond
+    (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) form
+    (seq? form)
+    (let [form' (with-meta (apply list (map lift-loop-operands form)) (meta form))
+          h (first form')
+          [keep-n operands] (cond
+                              (not (symbol? h)) [0 nil]
+                              (contains? non-call-heads h) [0 nil]
+                              (= 'new h) [2 (drop 2 form')]
+                              :else [1 (rest form')])]
+      (if (and (seq operands) (some contains-loop? operands))
+        (let [pairs (mapv (fn [op]
+                            (if (atomic-operand? op)
+                              [nil op]
+                              (let [m (select-keys (meta op) [:tag :raster.type/tag])
+                                    s (with-meta (gensym "lift_op__") (not-empty m))]
+                                [s op])))
+                          operands)
+              bindings (vec (mapcat (fn [[s op]] (when s [s op])) pairs))
+              call (with-meta (apply list (concat (take keep-n form')
+                                                  (map (fn [[s op]] (or s op)) pairs)))
+                     (meta form'))]
+          (list 'let* bindings call))
+        form'))
+    (vector? form) (with-meta (mapv lift-loop-operands form) (meta form))
+    :else form))
+
 (defn- materialize-form
   "Run the `materialize` pass on a single form: pure par/pmap (value-producing,
   no output buffer — e.g. from `broadcast`) → alloc + par/map!. Used in the
@@ -5709,7 +5772,7 @@
                                                             :source-ns        source-ns}
                                                        ctx (merge ctx body-input-context)
                                                        expanded-body (binding [*ns* source-ns]
-                                                                       (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                                       (mapv (comp lift-loop-operands pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        _ (when-let [token (::body-occurrence (meta walked-body))]
                                                            (when me/*emission-inputs*
                                                              (swap! me/*emission-inputs* update :body-contexts
@@ -5820,7 +5883,7 @@
                                                             :source-ns  source-ns
                                                             :typed-sibling-methods typed-sibling-methods}
                                                        expanded-body (binding [*ns* source-ns]
-                                                                       (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                                       (mapv (comp lift-loop-operands pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        ret-type (emit-body code expanded-body locals ctx)
                                                        target-st (:stack-type return-info)
                                                        ret-cd (:class-desc return-info)]
