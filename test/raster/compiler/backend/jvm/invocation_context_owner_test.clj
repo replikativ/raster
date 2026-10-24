@@ -101,9 +101,13 @@
     (is (identical? (get-in record [:inputs 0 :operand])
                     (get-in region [:input :operand])))
     (is (= Float/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
-    (doseq [value [0.1 -0.0 Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NaN]]
+    (doseq [value [0.1 -0.0 Double/NaN]]
       (is (= (Double/doubleToRawLongBits (narrowing-call value))
-             (Double/doubleToRawLongBits (double ((:invoke region) value))))))))
+             (Double/doubleToRawLongBits (double ((:invoke region) value))))))
+    (doseq [value [Double/MAX_VALUE Double/POSITIVE_INFINITY]]
+      (is (thrown? IllegalArgumentException (float value)))
+      (is (thrown? IllegalArgumentException (narrowing-call value)))
+      (is (thrown? IllegalArgumentException ((:invoke region) value))))))
 
 (deftest outlining-refuses-copied-occurrences-and-stale-dependencies
   (let [emitted (emission #'duplicate-calls)

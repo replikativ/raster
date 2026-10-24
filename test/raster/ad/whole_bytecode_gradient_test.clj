@@ -325,12 +325,18 @@
         (is (< (Math/abs (- (aget gradient 0) (/ (* 2.0 cnt) den))) 1e-12)))))
   (let [p (prepared #'explicit-float)
         f (#'reverse/compile-prepared-value+grad p)]
-    (doseq [x [0.1 -0.0 Double/MAX_VALUE Double/NaN]]
+    (doseq [x [0.1 -0.0 Double/NaN]]
       (let [[value gradient] (f x)]
         (is (instance? Float value))
         (is (= (Float/floatToRawIntBits (explicit-float x))
                (Float/floatToRawIntBits value)))
-        (is (= 1.0 gradient))))))
+        (is (= 1.0 gradient))))
+    ;; Explicit core/float retains Clojure's checked conversion. Neither AD
+    ;; nor an input outline may replace it with unchecked JVM D2F narrowing.
+    (doseq [x [Double/MAX_VALUE Double/POSITIVE_INFINITY]]
+      (is (thrown? IllegalArgumentException (float x)))
+      (is (thrown? IllegalArgumentException (explicit-float x)))
+      (is (thrown? IllegalArgumentException (f x))))))
 
 (deftest producer-renewal-replaces-code-without-revalidating-old-artifacts
   (let [scope (create-ns (gensym "raster.ad.owned-renewal."))]
