@@ -4,6 +4,7 @@
             [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-link :as invocation-link]
@@ -388,6 +389,64 @@
         (is (= 1 @runs))
         (is (= 1 @closes))
         ((:close! prepared))))))
+
+(deftest prepared-device-retains-instantiation-history-and-closes-rejected-runtime
+  (doseq [invalidate-during-instantiation? [false true]]
+    (let [owner (canonical-owner '(raster.numeric/* element element))
+          current (atom true)
+          producer (reify entry/RetainedProducerInput
+                     (assert-producer-current! [this]
+                       (when-not @current
+                         (throw (ex-info "instantiated module producer changed"
+                                         {:reason ::stale-producer})))
+                       this))
+          runs (atom 0)
+          closes (atom 0)
+          runtime (reify java.io.Closeable (close [_] (swap! closes inc)))]
+      (with-redefs [hardware/descriptor-for synthetic-descriptor
+                    link-module/instantiate!
+                    (fn [_ _]
+                      (entry/adopt-definition-inputs! {:producer-inputs [producer]})
+                      (when invalidate-during-instantiation? (reset! current false))
+                      runtime)
+                    link-module/run-and-lease!
+                    (fn [& _] (swap! runs inc) (throw (AssertionError. "stale module ran")))]
+        (let [prepare #(device/prepare-owner
+                        owner (arguments owner (float-array [1.0 2.0 3.0]))
+                        {:target :ocl:normalized-device :schedule {:precision :f32-scalar}})]
+          (if invalidate-during-instantiation?
+            (is (= ::stale-producer (reason prepare)))
+            (let [prepared (prepare)]
+              (reset! current false)
+              (try
+                (is (= ::stale-producer
+                       (reason #((:primal! prepared) {'x (float-array [2.0 3.0 4.0])}))))
+                (is (= ::stale-producer
+                       (reason #((:transpose! prepared) (float-array [1.0 1.0 1.0]) {}))))
+                (finally ((:close! prepared))))))
+          (is (zero? @runs))
+          (is (= 1 @closes)))))))
+
+(deftest rejected-device-publication-closes-the-constructed-owner
+  (let [owner (canonical-owner '(raster.numeric/* element element))
+        closes (atom 0)
+        current (atom true)
+        producer (reify entry/RetainedProducerInput
+                   (assert-producer-current! [this]
+                     (when-not @current
+                       (throw (ex-info "publication history changed" {:reason ::stale-producer})))
+                     this))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.ad.normalized-device 'assemble-map!) (fn [& _] {})
+       (ns-resolve 'raster.ad.normalized-device 'instantiate-prepared!)
+       (fn [& _]
+         (entry/adopt-definition-inputs! {:producer-inputs [producer]})
+         (reset! current false)
+         {:close! #(swap! closes inc)})}
+      #(is (= ::stale-producer
+              (reason (fn []
+                        (device/prepare-owner owner {} {:target :ocl:normalized-device}))))))
+    (is (= 1 @closes))))
 
 (deftest callee-replacement-stops-every-run-before-the-runtime
   (let [owner (canonical-owner '(raster.numeric/* element element))

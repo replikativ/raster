@@ -9,6 +9,7 @@
             [raster.ad.normalized-device :as device]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -19,6 +20,8 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
+            [raster.core :as core]
             [raster.gpu.link-module :as link-module]))
 
 (defn- reason [f]
@@ -119,6 +122,42 @@
 (defn- arguments [prepared a w] (mapv {'A a 'W w} (:inputs prepared)))
 (defn- active-slot [prepared active gradients]
   (nth gradients (.indexOf ^java.util.List (:inputs prepared) active)))
+
+(deftest double-segmented-numerical-frontier-precedes-proof-and-replay-is-readonly
+  (let [events (atom [])
+        freeze! core/prepare-emission-source-walk!
+        prepare! method-entry/prepare-frontend-source!
+        query scalar-body/checked-selected-fp-domain-recipe]
+    (with-redefs [core/prepare-emission-source-walk!
+                  (fn [source] (swap! events conj [:freeze source]) (freeze! source))
+                  method-entry/prepare-frontend-source!
+                  (fn [frontend source emit!]
+                    (swap! events conj [:prepare source])
+                    (prepare! frontend source emit!))
+                  scalar-body/checked-selected-fp-domain-recipe
+                  (fn [call] (swap! events conj [:query call *ns*]) (query call))]
+      (let [bundle (binding [*ns* (the-ns 'clojure.core)]
+                     (evidence (source :double 2 3 4 '[A W]) 'A))
+            initial @events
+            first-prepare (first (keep-indexed #(when (= :prepare (first %2)) %1) initial))
+            first-query (first (keep-indexed #(when (= :query (first %2)) %1) initial))
+            frozen (mapv second (filter #(= :freeze (first %)) initial))
+            prepared (mapv second (filter #(= :prepare (first %)) initial))]
+        (is (= 2 (count frozen)) "both the original addition and multiplication are prepared")
+        (is (= frozen prepared))
+        (is (every? #(= :freeze (first %)) (take first-prepare initial)))
+        (is (= prepared (mapv second (filter #(= :prepare (first %))
+                                             (take first-query initial))))
+            "the entire source frontier is prepared before the first physical numerical query")
+        (is (every? #(identical? (the-ns 'raster.ad.normalized-segmented-reduction-test)
+                                 (nth % 2))
+                    (filter #(= :query (first %)) initial))
+            "construction uses the explicit producer namespace, never its caller's")
+        (reset! events [])
+        (is (identical? bundle (normalized/validate! bundle)))
+        (is (seq @events))
+        (is (every? #(= :query (first %)) @events)
+            "validation rederives numerical bodies without preparing any source or receiver")))))
 
 (deftest segmented-ad-reuses-one-contraction-projection-for-read-minima
   (doseq [dtype [:float :double] active '[A W]]
@@ -435,7 +474,9 @@
                                 #'normalized/allocate-segmented-interface reject-allocation
                                 #'normalized/node-equation-ids reject-allocation
                                 #'normalized/linearize-program reject-allocation}
-                  #(#'normalized/segmented-node-lifecycle description (:source-ns checked) nil node))
+                  #(method-entry/call-with-definition-inputs
+                    (fn [] (#'normalized/segmented-node-lifecycle
+                            description (:source-ns checked) nil node))))
           ports (:ports built) stage (:stage built)
           selected (first (:active ports))
           passive (if (= active 'A) 'W 'A)
@@ -805,7 +846,9 @@
                         #'normalized/allocate-segmented-interface reject-allocation
                         #'normalized/node-equation-ids reject-allocation
                         #'normalized/linearize-program reject-allocation}
-          #(vector (#'normalized/reconstructed-map-proof checked) (normalized/validate! checked)))
+          #(method-entry/call-with-definition-inputs
+            (fn [] (vector (#'normalized/reconstructed-map-proof checked)
+                           (normalized/validate! checked)))))
         unary-map (fn [id result input]
                     (list '= id [result]
                           (list 'map {:index 'p :extent 8} [input] []
@@ -927,7 +970,9 @@
                           #'normalized/allocate-segmented-interface reject-allocation
                           #'normalized/node-equation-ids reject-allocation
                           #'normalized/linearize-program reject-allocation}
-            #(vector (#'normalized/reconstructed-map-proof checked) (normalized/validate! checked)))]
+            #(method-entry/call-with-definition-inputs
+              (fn [] (vector (#'normalized/reconstructed-map-proof checked)
+                             (normalized/validate! checked)))))]
       (is (identical? checked validated))
       (is (= #{:source-equations :execution-equation :scalar-derivation :stage-interface :equation-ids}
              (set (keys (get-in checked [:map-programs :proof :nodes 0])))))

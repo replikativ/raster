@@ -32,10 +32,14 @@ Keep the original eight objectives below. The current landing order is:
    across scalar construction and both projection readers. Typed carry and
    element conversions survive; ordered adapters still reject a reversed
    accumulator. This currently rederives certification on demand, not a new
-   portable cache or completed construct-once producer. Selected-helper numerical
-   recipe/domain composition and request-local reuse remain required. The real
-   nonsquare AD probe advances past the bare-accumulator refusal but still
-   refuses derived matrix intent without its complete numerical recipe.
+   portable cache or completed construct-once producer. The bounded Double
+   segmented producer now prepares its complete primal/linear/transpose helper
+   frontier before physical queries, joins actual selected numerical recipes,
+   and lowers each ordered scalar region through the shared checked SSA lowerer.
+   The original witness/primal remain authoritative; readonly replay reconstructs
+   the same generated programs. Nonsquare JVP/VJP and independent finite-difference
+   oracles pass. Float precision changes, broader scalar operations and request-local
+   reconstruction reuse remain separate work, not permission to widen this rule.
 3. Close result-completion and residency obligations separately. In particular,
    checked Double-to-Float completion cannot silently become unchecked on a GPU,
    and a resident result has no implicit host readback on which to run the check.
@@ -45,6 +49,11 @@ Keep the original eight objectives below. The current landing order is:
    actual device execution separately from compile-only vendor coverage.
 
 Use one bounded REPL for affected tests and exact-head CI for full qualification.
+Prepared CPU and resident-device consumers own validation through compilation and
+retain the final immutable definition history in execution guards, including
+delayed pullbacks. Device construction closes failed local allocations; the shared
+whole-producer discard boundary closes a returned owner rejected at publication.
+No process-local history or guard is stored in portable derivation bundles.
 AD producers establish the existing shared effect/rule context before source
 observations and epoch capture. Revision queries and execution guards are
 observational; they do not load libraries or register rules. Static producers
