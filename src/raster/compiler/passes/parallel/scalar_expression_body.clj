@@ -1751,9 +1751,22 @@
    operand dtype discharges an original caller's unboxing or argument effects."
   [{:keys [entry body original-body body-context arguments definition]}]
   (when method-entry/*emission-inputs*
-    (when-let [bridge (and (not (:pending-source? entry))
-                          ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge)
-                           (:emission entry)))]
+    (when-let [bridge
+               (when-not (:pending-source? entry)
+                 (let [frontend (method-entry/original-source-frontend (:source-var definition))
+                       ;; Source/receiver snapshots alone do not retain every
+                       ;; historical input of this transformed module. Reuse
+                       ;; the existing authenticated frontend observation path
+                       ;; before deriving its numerical body.
+                       boxed (when (identical? (:emission entry) (:emission frontend))
+                               (method-entry/frontend-boxed-entry-bridge frontend))
+                       typed (when boxed
+                               ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge)
+                                (:emission entry)))]
+                   (when (and typed
+                              (= (:invocation-method typed) (:invocation-method boxed))
+                              (= (:compute-method typed) (:compute-method boxed)))
+                     typed)))]
       (let [parameters (:parameters definition)
             carriers (:parameter-carriers entry)
             actual (completed-fp-body-carrier
@@ -1772,6 +1785,48 @@
           {:scope :owned-fp-return-payload :result-carrier Object :payload-carrier actual
            :parameters parameters :parameter-carriers carriers :arguments (vec arguments)
            :computation program :bridge bridge})))))
+
+(defn checked-selected-fp-domain-recipe
+  "Project a bounded selected body's numerical domain, NOT caller JVM carriers.
+
+   Actual owned primitive formal Classes and the complete checked body must
+   prove one ordered homogeneous Double addition or multiplication. Canonical
+   operand dtypes never supply physical Class/presence facts. Only symbolic
+   argument ports are accepted; consumers must establish their lexical ownership.
+   Arbitrary argument evaluation is not erased or moved by this query. Consumers
+   still own the ordered surrounding scalar region and all its conversions.
+
+   Returned terms/dtypes contain no Method, Class or execution permission.
+   The enclosing definition owner retains the original module history. Pending,
+   unowned and unsupported bodies abstain; this query never prepares or invokes
+   a helper. Float narrowing remains outside this bounded domain constructor."
+  [expression]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when-let [{:keys [arguments operation] :as source} (selected-scalar-source expression)]
+       (when (and (= 2 (count arguments)) (every? symbol? arguments))
+         (when-let [{:keys [parameters parameter-carriers payload-carrier computation]}
+                    (selected-fp-body-recipe source)]
+           (let [{:keys [operations result type]} computation
+                 operation-node (first operations)
+                 scalar-expression (:expression operation-node)
+                 operator (:op scalar-expression)]
+             (when (and (= [Double/TYPE Double/TYPE] parameter-carriers)
+                        (= Double/TYPE payload-carrier)
+                        (= :double type)
+                        (= 1 (count operations))
+                        (instance? raster.compiler.ir.kernel_body.ScalarCompute operation-node)
+                        (instance? raster.compiler.ir.kernel_body.ScalarExpr scalar-expression)
+                        (= result (get-in operation-node [:result :id]))
+                        (= :double (get-in operation-node [:result :type])
+                           (:result-type scalar-expression))
+                        (contains? #{:+ :*} operator)
+                        (= operator (intrinsics/canonical operation))
+                        (= (vec parameters) (:arguments scalar-expression))
+                        (empty? (:options scalar-expression)))
+               {:parameter-dtypes [:double :double] :result-dtype :double
+                :expression (list* (symbol "clojure.core" (name operator))
+                                   (map #(with-meta % nil) arguments))}))))))))
 
 (defn checked-selected-fp-payload
   "Retain a primitive SSA computation behind an ACTUAL owned Object-return bridge.

@@ -10,28 +10,30 @@
 (def ^:private fp {:carrier Double/TYPE :presence :present})
 (def ^:private boxed-fp {:carrier Object :presence :present :builtin-class Double})
 
-(defn- fixture! [scope-name body & [type]]
+(defn- fixture! [scope-name body & [type operation]]
   (let [scope (create-ns (gensym scope-name))
+        operation (or operation '*)
         [left right] (if (vector? type) type [(or type 'Double) (or type 'Double)])]
     (binding [*ns* scope]
       (refer 'clojure.core)
-      (ns-unmap scope '*)
-      (eval (list 'raster.core/deftm '*
+      (ns-unmap scope operation)
+      (eval (list 'raster.core/deftm operation
                   ['x ':- left 'y ':- right]
                   ':- left body)))
-    (let [source (core/resolve-deftm-var (ns-resolve scope '*))]
-      {:scope scope :generic (ns-resolve scope '*) :source source
+    (let [source (core/resolve-deftm-var (ns-resolve scope operation))]
+      {:scope scope :generic (ns-resolve scope operation) :source source :operation operation
        :receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))})))
 
 (defn- with-selected-fixture [fixture run!]
   ;; Only the original operation's table selects this actual typed call. No
   ;; numerical invocation goes through the temporarily described generic root.
-  (let [generic #'n/* original (meta generic)
+  (let [operation (symbol "raster.numeric" (name (:operation fixture)))
+        generic (find-var operation) original (meta generic)
         receiver (:receiver fixture)
         call (with-meta
                (list '.invk (symbol (str (:scope fixture))
                                     (str (:name (meta receiver)))) 'a 'b)
-               {:raster.op/original 'raster.numeric/*})]
+               {:raster.op/original operation})]
     (try
       (alter-meta! generic assoc :raster.core/dispatch-table
                    (:raster.core/dispatch-table (meta (:generic fixture))))
@@ -40,6 +42,92 @@
 
 (defn- payload [call facts]
   (entry/call-with-definition-inputs #(scalar/checked-selected-fp-payload call facts)))
+
+(defn- domain-recipe [call]
+  (entry/call-with-definition-inputs #(scalar/checked-selected-fp-domain-recipe call)))
+
+(deftest numerical-domain-recipes-prove-actual-ordered-double-bodies
+  (doseq [[operation body expected]
+          [['* '(clojure.core/* (clojure.core/double x) (clojure.core/double y))
+            '(clojure.core/* a b)]
+           ['+ '(clojure.core/+ (clojure.core/double x) (clojure.core/double y))
+            '(clojure.core/+ a b)]]]
+    (let [{:keys [scope receiver] :as fixture}
+          (fixture! "raster.domain-recipe." body 'Double operation)]
+      (try
+        (with-selected-fixture fixture
+          (fn [call]
+            (with-redefs [core/ensure-bytecode-implementation!
+                          (fn [& _] (throw (AssertionError. "domain query forced the JIT")))
+                          core/ensure-current-owned-bytecode!
+                          (fn [& _] (throw (AssertionError. "domain query prepared a module")))]
+              (is (nil? (domain-recipe call))))
+            (is (some? (:raster.core/jit-spec (meta receiver))))
+            (core/ensure-bytecode-implementation! receiver)
+            (let [recipe (with-redefs [core/ensure-bytecode-implementation!
+                                      (fn [& _] (throw (AssertionError. "warm domain query forced the JIT")))
+                                      core/ensure-current-owned-bytecode!
+                                      (fn [& _] (throw (AssertionError. "warm domain query prepared a module")))]
+                           (domain-recipe call))]
+              (is (= {:parameter-dtypes [:double :double] :result-dtype :double
+                      :expression expected} recipe))
+              (is (not-any? #(or (class? %) (instance? java.lang.reflect.Method %) (fn? %))
+                            (tree-seq coll? seq recipe)))
+              (is (nil? (payload call [{:carrier Object :presence :unknown} fp])))
+              (is (nil? (domain-recipe
+                         (with-meta (list '.invk (second call) '(side-effect!) 'b) (meta call)))))
+              (is (nil? (scalar/checked-selected-fp-domain-recipe call))
+                  "a numerical recipe still requires its owning historical guard"))))
+        (finally (remove-ns (ns-name scope)))))))
+
+(deftest numerical-domains-do-not-trust-the-selected-operation-spelling
+  (doseq [[body type]
+          [['(clojure.core/+ x y) 'Double]
+           ['(clojure.core/* y x) 'Double]
+           ['(clojure.core/* x x) 'Double]
+           ['(clojure.core/* (clojure.core/* x y) x) 'Double]
+           ['(clojure.core/float (clojure.core/* x y)) 'Float]
+           ['(clojure.core/* x y) 'Long]]]
+    (let [{:keys [scope receiver] :as fixture}
+          (fixture! "raster.refused-domain-recipe." body type)]
+      (try
+        (core/ensure-bytecode-implementation! receiver)
+        (with-selected-fixture fixture #(is (nil? (domain-recipe %))))
+        (finally (remove-ns (ns-name scope)))))))
+
+(deftest selected-fp-recipes-retain-the-complete-original-module-guard
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.domain-module-history." '(clojure.core/* x y))
+        current (atom true)
+        producer (reify entry/RetainedProducerInput
+                   (assert-producer-current! [this]
+                     (when-not @current
+                       (throw (ex-info "test numerical body producer changed"
+                                       {:reason :test-stale-numerical-producer})))
+                     this))
+        compile! bytecode/compile-typed-impl!]
+    (try
+      (with-redefs [bytecode/compile-typed-impl!
+                    (fn [& args]
+                      (entry/adopt-definition-inputs! {:producer-inputs [producer]})
+                      (apply compile! args))]
+        (core/ensure-bytecode-implementation! receiver))
+      (with-selected-fixture fixture
+        (fn [call]
+          (let [domain-owner (atom {:static [] :values []})
+                physical-owner (atom {:static [] :values []})
+                receiver-metadata (meta receiver)]
+            (binding [entry/*emission-inputs* domain-owner]
+              (is (some? (scalar/checked-selected-fp-domain-recipe call))))
+            (binding [entry/*emission-inputs* physical-owner]
+              (is (some? (scalar/checked-selected-fp-payload call [fp fp]))))
+            (reset! current false)
+            (is (identical? receiver-metadata (meta receiver)))
+            (doseq [owner [domain-owner physical-owner]]
+              (is (= :test-stale-numerical-producer
+                     (:reason (ex-data (try (entry/assert-definition-inputs-current! @owner) nil
+                                           (catch clojure.lang.ExceptionInfo failure failure))))))))))
+      (finally (remove-ns (ns-name scope))))))
 
 (defn- execute-fp-program
   "Independent test oracle for this closed FP leaf, not a compiler lowering."
