@@ -158,7 +158,7 @@
         (is (some #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
                        (= :cast (get-in % [:expression :op]))
                        (= expected (get-in % [:expression :result-type])))
-                  (:operations kernel)))
+                  (get-in kernel [:operations 0 :operations])))
         (is (= :kernel-body (artifact/emission-route (:artifact routed)))))))
   (testing "a register-only schedule does not fabricate a result conversion"
     (try

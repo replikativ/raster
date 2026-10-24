@@ -16,6 +16,10 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]))
 
+(defn- segment-operations [kernel]
+  (vec (remove #(instance? raster.compiler.ir.kernel_body.IndexCompute %)
+               (:operations (first (:operations kernel))))))
+
 (deftest widened-register-certificate-retains-types-and-fails-closed
   (let [source '(let* [result (raster.par/contract C [[i 3] [j 5]] [[k 7]]
                               (* (aget A (+ (* i 7) k)) (aget B (+ (* k 5) j))))] result)
@@ -127,6 +131,70 @@
         segred (lower/contract-form->segred matvec :dtype :float :facts verified)]
     (schedule/plan-portable-body verified segred nil)))
 
+(defn- symbolic-matrix-plan []
+  (let [form '(raster.par/contract C [[i m] [j n]] [[l k]]
+                (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
+        verified (facts/contraction-facts form :dtype :float)
+        segred (lower/contract-form->segred form :dtype :float :facts verified)]
+    (schedule/plan-portable-body verified segred nil
+                                 {:scalar-types {'m :long 'n :long 'k :long}})))
+
+(deftest empty-portable-contraction-guards-coordinate-decomposition-and-all-work
+  (let [plan (symbolic-matrix-plan)
+        kernel (:body plan)
+        guard (first (:operations kernel))
+        coordinates (take 2 (:operations guard))]
+    (is (:ok plan))
+    (is (= kernel (body/validate! kernel)))
+    (is (= ['segment-group 'segment-lane 'segment-index]
+           (mapv :id (:indices kernel))))
+    (is (= 1 (count (:operations kernel))))
+    (is (instance? raster.compiler.ir.kernel_body.Guard guard))
+    (is (= :active-segment (:mask guard)))
+    (is (= ['i 'j] (mapv :id coordinates)))
+    (is (every? #(instance? raster.compiler.ir.kernel_body.IndexCompute %) coordinates))
+    (is (= :lt (get-in kernel [:masks 0 :predicates 0 :op])))
+    (is (= 'segment-index (first (get-in kernel [:masks 0 :predicates 0 :arguments]))))
+    (doseq [[m n] [[0 5] [7 0] [0 0]]]
+      (let [values {'m m 'n n 'k 3}
+            geometry (launch/realize (:launch kernel) values)]
+        (is (= 0 (launch/resolve-expression
+                  values (get-in kernel [:attributes :launch-segment-count]))))
+        (is (= [1] (:group-count geometry)))
+        (is (= [256] (:workgroup-size geometry)))))
+    (doseq [dialect [:opencl-portable :cuda :hip]]
+      (let [source (:source (emit/generate-contraction-kernel-body
+                            kernel :target-dialect dialect))
+            guard-position (str/index-of source "if (")
+            division-position (str/index-of source " / ")
+            modulo-position (str/index-of source " % ")]
+        (is (and guard-position division-position modulo-position
+                 (< guard-position division-position)
+                 (< guard-position modulo-position))
+            "zero-axis division and modulo must be emitted inside the active guard")))))
+
+(deftest portable-contraction-with-empty-reduction-still-stores-its-identity
+  (let [plan (symbolic-matrix-plan)
+        kernel (:body plan)
+        operations (segment-operations kernel)
+        loop (first operations)
+        store (last operations)
+        values {'m 7 'n 5 'k 0}]
+    (is (:ok plan))
+    (is (= 35 (launch/resolve-expression
+               values (get-in kernel [:attributes :launch-segment-count]))))
+    (is (= [1] (:group-count (launch/realize (:launch kernel) values))))
+    (is (instance? raster.compiler.ir.kernel_body.ForLoop loop))
+    (is (= 0 (launch/resolve-expression values (:upper loop))))
+    (is (zero? (get-in loop [:iter-args 0 :initial :value])))
+    (is (= 'C (:buffer store)))
+    (is (= (get-in loop [:results 0 :id]) (:value store)))
+    (is (= :active-segment (:predicate store)))
+    (is (= ['segment-index] (:coordinates store)))
+    (doseq [dialect [:opencl-portable :cuda :hip]]
+      (is (string? (:source (emit/generate-contraction-kernel-body
+                            kernel :target-dialect dialect)))))))
+
 (deftest portable-dimensions-retain-core-named-lexical-captures
   (doseq [dimension '[seq count first]]
     (let [form (list 'raster.par/contract 'y [['i dimension]] '[[l k]]
@@ -159,7 +227,7 @@
     (is (= '[3] (:shape (parameters 'b))))
     (is (= :independent-segments (get-in kernel [:schedule :strategy])))
     (is (not-any? #(instance? raster.compiler.ir.kernel_body.ForLoop %)
-                  (:operations kernel)))
+                  (segment-operations kernel)))
     (doseq [dialect [:opencl-intel :cuda :hip]]
       (is (string? (:source (emit/generate-contraction-kernel-body
                             kernel :target-dialect dialect)))))))
@@ -223,8 +291,8 @@
     (is (= :kernel-body (artifact/emission-route (:artifact routed))))
     (is (= transform (get-in kernel [:attributes :result-transform])))
     (is (identical? kernel (body/validate! kernel)))
-    (is (= 2 (count (filter #(= 'A (:buffer %)) (:operations kernel)))))
-    (is (= 1 (count (filter #(= 'C (:buffer %)) (:operations kernel)))))
+    (is (= 2 (count (filter #(= 'A (:buffer %)) (segment-operations kernel)))))
+    (is (= 1 (count (filter #(= 'C (:buffer %)) (segment-operations kernel)))))
     (let [converted (assoc transform :expr '(clojure.core/double (clojure.core/float acc)))
           converted-facts (facts/from-components
                            (assoc (select-keys verified
@@ -232,7 +300,7 @@
                                   :opts (assoc (:opts verified) :epilogue converted)))
           converted-route (route/route-contraction nil :facts converted-facts :dtype :double)
           converted-body (:kernel-body converted-route)
-          casts (filter #(= :cast (get-in % [:expression :op])) (:operations converted-body))
+          casts (filter #(= :cast (get-in % [:expression :op])) (segment-operations converted-body))
           [narrow widen] casts]
       (is (= :kernel-body (artifact/emission-route (:artifact converted-route))))
       (is (identical? converted-body (body/validate! converted-body)))
@@ -240,7 +308,7 @@
       (is (= {:rounding :nearest-even :overflow :ieee} (get-in narrow [:expression :options])))
       (is (= {:rounding :exact :overflow :exact} (get-in widen [:expression :options])))
       (is (= [(get-in narrow [:result :id])] (get-in widen [:expression :arguments])))
-      (is (= (get-in widen [:result :id]) (:value (last (:operations converted-body))))))
+      (is (= (get-in widen [:result :id]) (:value (last (segment-operations converted-body))))))
     (doseq [captured ['(clojure.core/+ acc bias) '(clojure.core/aget C 0)]]
       (let [failure (try
                       (route/route-contraction nil
@@ -266,7 +334,7 @@
                    (route/route-contraction nil :facts verified :dtype :double))
           kernel (:kernel-body routed)
           parameters (into {} (map (juxt :id identity)) (:parameters kernel))
-          loads (filter #(= 'A (:buffer %)) (:operations kernel))]
+          loads (filter #(= 'A (:buffer %)) (segment-operations kernel))]
       (is (= :kernel-body (artifact/emission-route (:artifact routed))))
       (is (= :segmap (:strategy routed)))
       (is (= [extent] (:shape (parameters 'A))))
@@ -316,7 +384,7 @@
                :scalar-types {'m :long 'k :int 'scale :float}})
         kernel (:body plan)
         parameters (into {} (map (juxt :id :dtype)) (:parameters kernel))
-        loop (first (:operations kernel))]
+        loop (first (segment-operations kernel))]
     (is (:ok plan))
     (is (= kernel (body/validate! kernel)))
     (is (= :float (get parameters 'x)))
@@ -379,7 +447,7 @@
 (deftest portable-contraction-is-a-complete-scheduled-kernel-body
   (let [plan (portable-plan)
         kernel (:body plan)
-        loop (first (:operations kernel))]
+        loop (first (segment-operations kernel))]
     (is (:ok plan))
     (is (body/kernel-body? kernel))
     (is (= :sequential-segments (get-in kernel [:schedule :strategy])))
@@ -390,12 +458,13 @@
     (is (= '[A x y k m _nseg] (mapv :id (:parameters kernel))))
     (is (= [:input :input :output :scalar :scalar :scalar]
            (mapv :kind (:parameters kernel))))
-    (is (= 'i (:id (last (:indices kernel))))
-        "the free output coordinate is decomposed from the flat segment index")
+    (is (= 'segment-index (:id (last (:indices kernel)))))
+    (is (= 'i (get-in kernel [:operations 0 :operations 0 :id]))
+        "the free output coordinate is decomposed only inside the segment guard")
     (is (= 'l (get-in loop [:index :id])))
     (is (= 'k (:upper loop)))
     (is (= 1 (:step loop)))
-    (is (= :active-segment (:predicate (last (:operations kernel)))))))
+    (is (= :active-segment (:predicate (last (segment-operations kernel)))))))
 
 (deftest one-portable-body-emits-through-every-c-family-dialect
   (let [kernel (:body (portable-plan))]
@@ -475,7 +544,7 @@
 (deftest portable-result-transform-is-typed-scalar-ssa-on-every-c-family-target
   (let [plan (portable-result-transform-plan)
         kernel (:body plan)
-        operations (:operations kernel)
+        operations (segment-operations kernel)
         epilogue-operations (subvec operations 1 (dec (count operations)))
         classes (mapv #(some-> % class .getSimpleName) epilogue-operations)]
     (is (:ok plan))
@@ -522,7 +591,7 @@
                                                          (raster.math/exp
                                                           (raster.numeric/* -1.0 x))))))
           kernel (:body plan)
-          operations (:operations kernel)
+          operations (segment-operations kernel)
           epilogue-operations (subvec operations 1 (dec (count operations)))
           operators (keep #(get-in % [:expression :op]) epilogue-operations)]
       (is (:ok plan))
@@ -537,7 +606,7 @@
           (is (= '[bias] (:epilogue-operands emitted)))))))
   (testing "a let binder shadows the accumulator lexically"
     (let [plan (let-epilogue-plan '(let [acc (raster.numeric/* acc 2.0)] acc))
-          operations (:operations (:body plan))
+          operations (segment-operations (:body plan))
           epilogue-operations (subvec operations 1 (dec (count operations)))]
       (is (:ok plan))
       ;; Half accumulator -> Double product -> declared Float result -> Half store.
