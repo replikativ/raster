@@ -855,35 +855,41 @@
   "Bind one retained numerical equation using the ordinary checked ABI/dispatch path.
    No host equation is evaluated and no driver resource is acquired. This proves the selected
    call, not that preceding source work completed: the enclosing invocation cursor owns order,
-   storage initialization and lifetime. Structured loops retain their bounded call constructor."
-  [parallel-program equation-id buffers scalar-values result-views caller-options]
-  (let [{:keys [program projections buffers scalars]}
-        (checked-stage-inputs parallel-program buffers scalar-values {} result-views nil caller-options)
-        equation (some #(when (= equation-id (:id %)) %) (:equations program))]
-    (when-not (and equation
-                   (not (true? (get-in equation [:attributes :host-only])))
-                   (not (emitted-loop/emitted-loop? (first (:operations equation)))))
-      (fail! :emitted-program-ready-equation
-             "one numerical equation call requires an existing non-loop numerical equation"
-             {:equation equation-id}))
-    (prepare-equation-call equation (:values program) buffers scalars result-views projections)))
+   storage initialization and lifetime. Structured loops retain their bounded call constructor.
+   The explicit retained-validation arity reuses only sealed static program checks."
+  ([parallel-program equation-id buffers scalar-values result-views caller-options]
+   (make-equation-call parallel-program equation-id buffers scalar-values result-views nil caller-options))
+  ([parallel-program equation-id buffers scalar-values result-views retained-validation caller-options]
+   (let [{:keys [program projections buffers scalars]}
+         (checked-stage-inputs parallel-program buffers scalar-values {} result-views retained-validation caller-options)
+         equation (some #(when (= equation-id (:id %)) %) (:equations program))]
+     (when-not (and equation
+                    (not (true? (get-in equation [:attributes :host-only])))
+                    (not (emitted-loop/emitted-loop? (first (:operations equation)))))
+       (fail! :emitted-program-ready-equation
+              "one numerical equation call requires an existing non-loop numerical equation"
+              {:equation equation-id}))
+     (prepare-equation-call equation (:values program) buffers scalars result-views projections))))
 
 (defn ^:no-doc make-host-equation-step
   "Evaluate only the selected retained host equation through the ordinary checked binding path.
-   Source order and device completion remain obligations of the enclosing invocation owner."
-  [parallel-program equation-id buffers scalar-values evaluate-host caller-options]
-  (let [{:keys [program projections buffers scalars]}
-        (checked-stage-inputs parallel-program buffers scalar-values {} {} nil caller-options)
-        equation (some #(when (= equation-id (:id %)) %) (:equations program))]
-    (when-not equation
-      (fail! :emitted-program-ready-host-equation "host equation does not exist"
-             {:equation equation-id}))
-    (validate-host-device-dependencies!
-     equation (into #{} (mapcat #(device-equation-results % projections caller-options))
-                    (take-while #(not= equation-id (:id %)) (:equations program))))
-    (let [step (evaluate-host-step equation (:values program) buffers scalars evaluate-host)]
-      (merge-host-results scalars equation (:results step))
-      step)))
+   Source order and device completion remain obligations of the enclosing invocation owner.
+   The explicit retained-validation arity reuses only sealed static program checks."
+  ([parallel-program equation-id buffers scalar-values evaluate-host caller-options]
+   (make-host-equation-step parallel-program equation-id buffers scalar-values evaluate-host nil caller-options))
+  ([parallel-program equation-id buffers scalar-values evaluate-host retained-validation caller-options]
+   (let [{:keys [program projections buffers scalars]}
+         (checked-stage-inputs parallel-program buffers scalar-values {} {} retained-validation caller-options)
+         equation (some #(when (= equation-id (:id %)) %) (:equations program))]
+     (when-not equation
+       (fail! :emitted-program-ready-host-equation "host equation does not exist"
+              {:equation equation-id}))
+     (validate-host-device-dependencies!
+      equation (into #{} (mapcat #(device-equation-results % projections caller-options))
+                     (take-while #(not= equation-id (:id %)) (:equations program))))
+     (let [step (evaluate-host-step equation (:values program) buffers scalars evaluate-host)]
+       (merge-host-results scalars equation (:results step))
+       step))))
 
 (defn- construct-staged-call
   "Construct only from inputs just staged by this namespace. Host evaluation remains outside

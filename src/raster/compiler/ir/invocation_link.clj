@@ -488,6 +488,14 @@
                                                     (concrete-shape token abstract scalars buffers storage))
                           :leaves [{:name :value :node token}]}))) tokens)})
 
+(defn- checked-ordered-validation [state]
+  (let [checked (emitted-program/checked-retained-validation!
+                 (:program state) (:retained-validation state) (:caller-options state))]
+    (when-not (identical? (:projections checked) (:projections state))
+      (fail! :invocation-ordered-projections
+             "ordered projections must belong to the exact retained program validation" {}))
+    checked))
+
 (defn ^:no-doc ordered-entry-roles
   "Derive conservative semantic entry roles from checked graph accesses plus caller intent.
    This establishes no storage placement, initialization or completion. Written public buffers
@@ -505,7 +513,7 @@
                        (get-in state [:program :equations]))
             (fail! :invocation-ordered-entry-control
                    "structured control needs its own complete entry-access projection" {}))
-        boundaries (equation-boundaries (:program state) (:projections state))
+        boundaries (equation-boundaries (:program state) (:projections (checked-ordered-validation state)))
         written (into #{}
                       (filter (fn [id]
                                 (some #(contains? #{:write :read-write}
@@ -581,7 +589,7 @@
      :acquired-storage #{}
      :source-allocations (into {} (map (juxt :destination :source-expression))
                               (get-in semantic-program [:attributes :allocations]))
-     :projections (:projections checked) :target (:target compilation)
+     :projections (:projections checked) :retained-validation checked :target (:target compilation)
      :caller-options caller-options}))
 
 (defn- validate-source-result-allocation! [state entry action]
@@ -589,7 +597,7 @@
         equation (some #(when (= (:equation action) (:id %)) %) (get-in state [:program :equations]))
         operation (first (:operations equation))
         projection (when operation
-                     (emitted-program/operation-projection (:projections state) operation))]
+                     (emitted-program/operation-projection (:projections (checked-ordered-validation state)) operation))]
     ;; Prefix-result views and distinct logical/physical storage need their own reconciliation.
     (when-not (and (symbol? destination)
                    (contains? (:physical-results projection) destination)
@@ -717,8 +725,9 @@
                                     (get-in (run-step!) [:values (:id step)])})
                          (when evaluate-host
                            (fn [equation context]
-                             (evaluate-host equation (assoc context :buffer-shapes buffer-shapes)))))
-                       caller-options))
+                             (link/without-validation-context
+                              #(evaluate-host equation (assoc context :buffer-shapes buffer-shapes))))))
+                       (checked-ordered-validation state) caller-options))
           _ (when (and step (not equation)) (run-step!))]
       (cond-> (-> state
                   (assoc :materialization @advanced)
@@ -871,7 +880,7 @@
           available (materialization/prefix-bindings materialization)
           scalars (merge (invocation-shape-scalars materialization)
                          (:program-scalars available) (:host-scalars state))
-          boundaries (equation-boundaries {:equations [equation]} (:projections state))
+          boundaries (equation-boundaries {:equations [equation]} (:projections (checked-ordered-validation state)))
           required (required-materialized-buffers
                     {:values (:values program) :equations [equation] :outputs (:results equation)}
                     boundaries)
@@ -890,10 +899,11 @@
           realized (add-materialized-inputs (:realized state) unacquired (:values program)
                                             overwrite required)
           realized (lower-equation-storage realized (get-in materialization [:plan :id]) equation
-                                            (:values program) scalars (:projections state))
+                                            (:values program) scalars (:projections (checked-ordered-validation state)))
           result-views (into {} (keep :result-view) (vals (:storage realized)))
           {:keys [call buffers]} (program-call/make-equation-call
-                                 program equation-id (:buffers realized) scalars result-views caller-options)
+                                 program equation-id (:buffers realized) scalars result-views
+                                 (checked-ordered-validation state) caller-options)
           _ (when (seq (:result-views call))
               (fail! :invocation-ordered-result-views
                      "ready graph stages must retain logical prefix-result contracts before admission"

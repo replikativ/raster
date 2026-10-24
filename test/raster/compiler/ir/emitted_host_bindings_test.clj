@@ -79,6 +79,44 @@
                       #(call/validate-with-retained-program! % proof)]]
       (is (= expected (reason #(validate (assoc-in original path 99)))) (pr-str path)))))
 
+(deftest retained-host-steps-recheck-bindings-without-revalidating-the-program
+  (let [p (scalar-program :long)
+        validate emitted/validate-with-physical-results!
+        checks (atom 0)
+        evaluator (partial scalar/evaluate-host-equation *ns*)
+        request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]
+    (with-redefs [emitted/validate-with-physical-results!
+                  (fn [& arguments] (swap! checks inc) (apply validate arguments))]
+      (let [proof (emitted/validate-with-physical-results! p)]
+        (is (= 1 @checks))
+        (doseq [[x y expected] [[7 10 18] [-4 2 -1]]]
+          (let [inputs {'x {:type :long :value x} 'y {:type :long :value y}}
+                retained-before @checks
+                retained-first (call/make-host-equation-step p :first {} inputs evaluator proof nil)
+                retained-second (call/make-host-equation-step
+                                 p :second {} (merge inputs (:results retained-first)) evaluator proof nil)
+                before @checks
+                fresh-first (call/make-host-equation-step p :first {} inputs evaluator nil)
+                fresh-second (call/make-host-equation-step
+                              p :second {} (merge inputs (:results fresh-first)) evaluator nil)]
+            (is (= retained-before before) "retained stages do not repeat static validation")
+            (is (= retained-first fresh-first))
+            (is (= retained-second fresh-second))
+            (is (= expected (get-in retained-second [:results 'b :value])))
+            (is (= (+ before 2) @checks) "public independent stages still revalidate static IR")))
+        (doseq [construct [#(call/make-host-equation-step p :first {} % evaluator proof nil)
+                           #(call/make-host-equation-step p :first {} % evaluator nil)]]
+          (is (= :emitted-program-host-operand (reason #(construct {'y {:type :long :value 2}}))))
+          (is (= :emitted-program-host-result-conflict
+                 (reason #(construct {'x {:type :long :value 7} 'y {:type :long :value 10}
+                                      'a {:type :long :value 99}})))))
+        (doseq [[program evidence options] [[(with-meta p {:copy true}) proof nil]
+                                            [p (assoc proof :copy true) nil]
+                                            [p proof request]]]
+          (is (= :emitted-parallel-program-retained-validation
+                 (reason #(call/make-host-equation-step
+                           program :first {} {'x {:type :long :value 1}} evaluator evidence options)))))))))
+
 (deftest host-binding-comparison-preserves-ieee-values
   (doseq [x [Double/NaN Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY -0.0]]
     (let [original (make-call :double x 0.0)]
