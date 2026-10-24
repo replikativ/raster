@@ -10,7 +10,8 @@
   - Tag→Class resolution
   - Name mangling
   - Warning system"
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [raster.compiler.support.mangled :as mangled]))
 
 ;; ================================================================
 ;; Type Utilities
@@ -588,9 +589,8 @@
 ;; ================================================================
 
 (def op-name-map
-  "Map operator characters to safe identifier names."
-  {\+ "plus", \- "minus", \* "star", \/ "div", \< "lt", \> "gt",
-   \= "eq", \! "bang", \? "pred", \& "amp", \| "pipe", \~ "tilde"})
+  "Compatibility alias for the shared structural operator codec table."
+  mangled/op-name-map)
 
 (defn- flatten-tag
   "Flatten a tag for mangling."
@@ -602,10 +602,7 @@
 (defn mangle
   "Mangle name: foo + [long String] -> foo_m_long_String"
   [base-name tags]
-  (let [safe-name (let [n (name base-name)]
-                    (if (every? #(contains? op-name-map %) n)
-                      (str "_" (str/join "" (map op-name-map n)) "_")
-                      n))]
+  (let [safe-name (mangled/encode-operator-name base-name)]
     (symbol (str safe-name "_m_"
                  (str/join "_" (map flatten-tag tags))))))
 
