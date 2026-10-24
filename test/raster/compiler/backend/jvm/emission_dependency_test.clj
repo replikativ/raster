@@ -90,6 +90,47 @@
                   (finally (reset-meta! selected original))))))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest typed-siblings-retain-distinct-namespace-identities
+  (let [left (create-ns (gensym "raster.sibling-left."))
+        right (create-ns (gensym "raster.sibling-right."))]
+    (try
+      (doseq [[scope constant] [[left 1.0] [right 10.0]]]
+        (binding [*ns* scope]
+          (refer 'clojure.core)
+          (eval (list 'raster.core/deftm 'same-name ['x ':- 'Double] ':- 'Double
+                      (list 'raster.numeric/+ 'x constant)))))
+      (let [sources (mapv #(core/resolve-deftm-var (ns-resolve % 'same-name)) [left right])
+            qualified (mapv #(symbol (str (ns-name (:ns (meta %))))
+                                    (str (:name (meta %)))) sources)
+            body [(list 'clojure.core/+
+                        (list (first qualified) 'x)
+                        (list 'clojure.core/* 10.0 (list (second qualified) 'x)))]
+            {:keys [implementation emission]}
+            (core/emit-owned-bytecode!
+             (fn [class-name params tags return-tag body source-ns & _]
+               (let [artifact (bytecode/compile-deftm-method!
+                               class-name "run" params tags return-tag body source-ns)
+                     method (:method artifact)]
+                 (fn [value] (.invoke ^java.lang.reflect.Method method nil (object-array [value])))))
+             "raster.compiled.DistinctNamespaceSiblings" '[x] '[double] 'double
+             body left nil 'run)]
+        (is (not (identical? (first sources) (second sources))))
+        (is (= (name (first qualified)) (name (second qualified))))
+        (is (= 123.0 (implementation 2.0)))
+        (is (= 79.0 (implementation -2.0)))
+        (doseq [source sources]
+          (is (some #(identical? source (:var %)) (:dependency-snapshots emission)))
+          (let [original (meta source)]
+            (try
+              (alter-meta! source assoc ::changed-sibling true)
+              (is (= :stale-emission-inputs
+                     (try (method-entry/assert-emission-inputs-current! emission) nil
+                          (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+              (finally (reset-meta! source original))))))
+      (finally
+        (remove-ns (ns-name left))
+        (remove-ns (ns-name right))))))
+
 (deftest actual-root-and-static-emissions-retain-producer-inputs
   (let [scope (create-ns (gensym "raster.producer-emission."))
         current (atom true)

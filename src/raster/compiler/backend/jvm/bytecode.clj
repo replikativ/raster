@@ -3512,6 +3512,15 @@
             {:source v :callable-class (class-desc-of callable-class)
              :method-type (MethodTypeDesc/of obj-cd (into-array ClassDesc (repeat (count args) obj-cd)))}))))))
 
+(defn- typed-sibling-var
+  "Resolve the actual global lookup used by a typed sibling call, not its local name."
+  [head ctx]
+  (when (and (symbol? head)
+             (or (seq (:typed-sibling-methods ctx))
+                 (seq (get-in ctx [:local-callee-names :typed]))))
+    (try (ns-resolve (or (:source-ns ctx) *ns*) head)
+         (catch Exception _ nil))))
+
 (defn- emit-fn-call
   "Emit bytecode for function calls (Java static, deftm, sibling, var, local IFn)."
   [code head head-name args locals ctx]
@@ -3608,9 +3617,9 @@
 
     ;; ---- Typed deftm sibling method (same-class, JIT-friendly) ----
         (and (symbol? head) (:typed-sibling-methods ctx)
-             (get (:typed-sibling-methods ctx) (name head)))
+             (get (:typed-sibling-methods ctx) (typed-sibling-var head ctx)))
         (let [{:keys [method-name method-type return-stack-type param-infos]}
-              (get (:typed-sibling-methods ctx) (name head))]
+              (get (:typed-sibling-methods ctx) (typed-sibling-var head ctx))]
           (doseq [[arg info] (map vector args param-infos)]
             (let [target-cd (:class-desc info)
                   t (if (.equals target-cd obj-cd)
@@ -3841,7 +3850,7 @@
     :else
     (boolean
      (or (and (seq? expression) (symbol? (first expression))
-              (or (contains? (:typed names) (name (first expression)))
+              (or (contains? (:typed names) (typed-sibling-var (first expression) ctx))
                   (contains? (:untyped names) (str (first expression)))))
          (and (coll? expression)
               (some #(method-local-callee-candidate? % ctx) expression)))))))
@@ -6280,7 +6289,7 @@
         src-ns (or (:source-ns (first fn-specs)) *ns*)
         deftm-refs (scan-deftm-refs (mapcat :walked-body fn-specs) src-ns)
         deftm-method-specs (mapv
-                            (fn [v]
+                            (fn [index v]
                               (let [m (meta v)
                                     deftm-ns (or (:ns m) src-ns)
                                     deftm-params (:raster.core/deftm-params m)
@@ -6296,7 +6305,13 @@
                                     static-source (original-static-source v prepare-source!)
                                     qualified-wb (mapv #(inf/qualify-body-symbols % deftm-ns param-set)
                                                        (:body static-source))]
-                                {:method-name (clojure.lang.Compiler/munge (str (:name m)))
+                                {:source-var v
+                                 :method-name
+                                 (loop [candidate (str "__rstr_deftm_" index "_"
+                                                      (clojure.lang.Compiler/munge (str (:name m))))]
+                                   (if (some #(= candidate (:method-name %)) method-specs)
+                                     (recur (str "_" candidate))
+                                     candidate))
                                  :method-type mt
                                  :params deftm-params
                                  :tags deftm-tags
@@ -6307,8 +6322,8 @@
                                  :walked-body qualified-wb
                                  :source-policy (get-in static-source [:frontend :source-entry :source-policy])
                                  :source-ns deftm-ns}))
-                            deftm-refs)
-        typed-sibling-methods (into {} (map (fn [ms] [(:method-name ms) ms])
+                            (range) (sort-by str deftm-refs))
+        typed-sibling-methods (into {} (map (fn [ms] [(:source-var ms) ms])
                                             deftm-method-specs))
         local-callee-names {:typed (set (keys typed-sibling-methods))
                             :untyped (set (keys sibling-methods))}
