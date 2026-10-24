@@ -19,9 +19,9 @@
   (let [[program {:keys [binding expression]}] (fixture)
         unrelated (mapv #(vector (symbol (str "unrelated_" %)) (Object.)) (range 32))
         program (append-pairs program unrelated)
-        original semantic/equivalent?
+        original semantic/retained-source-equivalent?
         pairs (atom [])]
-    (with-redefs [semantic/equivalent?
+    (with-redefs [semantic/retained-source-equivalent?
                   (fn [left right]
                     (when (and (vector? left) (vector? right)
                                (= 2 (count left) (count right))
