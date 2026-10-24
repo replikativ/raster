@@ -11,8 +11,9 @@
    DCE, CSE and algebraic simplification cannot erase or duplicate the possible
    exceptional control transfer.
 
-   The raster context pre-registers raster.numeric and raster.math vars
-   as :pure so beichte doesn't need to analyze their source each time."
+   The Raster context registers declared contracts but disables unowned source
+   lookup. Reading a Var's file/line does not authenticate its current root;
+   expanding type/protocol declarations can also mutate JVM class identity."
   (:require [beichte.core :as b]
             [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
@@ -23,6 +24,16 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
+
+(defn- declared-context [registry]
+  (let [context (b/make-context {:registry registry :source-resolver nil})]
+    ;; Older Beichte versions silently ignored unknown options. Never silently
+    ;; re-enable source expansion when this compiler boundary requests none.
+    (when-not (and (contains? context :source-resolver)
+                   (nil? (:source-resolver context)))
+      (throw (ex-info "Effect analysis requires source lookup to be disabled"
+                      {:reason :unowned-effect-source-analysis})))
+    context))
 
 (defonce ^:private raster-context
   (delay
@@ -96,7 +107,7 @@
               {}))
           raster-entries (merge pure-entries array-entries loss-entries ad-entries)
           reg (b/extend-registry (b/default-registry) raster-entries)]
-      (b/make-context {:registry reg}))))
+      (declared-context reg))))
 
 (defn init-raster-context!
   "Force initialization of the shared Raster Beichte context."
@@ -134,9 +145,9 @@
   (:effect (descriptor expr)))
 
 (defn analyze-var-effect
-  "Analyze a var and return its effect level using fresh source evidence."
+  "Return the declared effect of a Var; unknown source is not compiler evidence."
   [v]
-  (b/analyze-var v (b/make-context {:registry (:registry @raster-context)})))
+  (b/analyze-var v (declared-context (:registry @raster-context))))
 
 (defn- semantic-calls
   "Restore walker-devirtualized calls to the source-level operation recorded in
@@ -301,7 +312,7 @@
         (try
           (let [semantic-expr (semantic-calls expr)
                 locals (collect-locals semantic-expr)
-                context (b/make-context {:registry (:registry @raster-context)})
+                context (declared-context (:registry @raster-context))
                 result (b/analyze-full semantic-expr context locals)]
             (if (map? result)
               (update result :flags #(or % #{}))

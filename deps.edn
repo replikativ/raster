@@ -7,7 +7,7 @@
         org.typedclojure/typed.clj.checker {:mvn/version "1.4.0"}
         org.replikativ/boring {:mvn/version "0.1.29"}
         org.replikativ/pattern {:mvn/version "1.0.452"}
-        org.replikativ/beichte {:mvn/version "0.2.7"}}
+        org.replikativ/beichte {:mvn/version "0.2.9"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner

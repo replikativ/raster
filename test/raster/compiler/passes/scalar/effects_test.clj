@@ -1,8 +1,24 @@
 (ns raster.compiler.passes.scalar.effects-test
   (:require [clojure.test :refer [deftest is]]
+            [beichte.analyze :as beichte-analyze]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.op-descriptor :as descriptor]))
+
+(defn unowned-effect-source [value] value)
+
+(deftest optional-effect-analysis-never-replays-unowned-var-source
+  (let [lookups (atom [])
+        operation 'raster.compiler.passes.scalar.effects-test/unowned-effect-source]
+    (with-redefs [beichte-analyze/source-var
+                  (fn [v]
+                    (swap! lookups conj v)
+                    (throw (ex-info "compiler must not expand this source" {})))]
+      (is (= :io (effects/analyze-var-effect #'unowned-effect-source)))
+      (is (= :io (:effect (effects/descriptor (list operation 1)))))
+      (is (not (effects/removable-expr? (list operation 1))))
+      (is (= :pure (:effect (effects/descriptor '(clojure.core/+ 1 2)))))
+      (is (empty? @lookups)))))
 
 (deftest producer-denials-do-not-reinterpret-ordinary-arithmetic-contracts
   (let [ordinary '(clojure.core/+ x 1)
