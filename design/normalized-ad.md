@@ -58,10 +58,14 @@ nil Object-completion folding preserves both existing evaluation-denial markers.
 
 This is not general native AD closure. Float/integral/reference inputs, prior
 generated-entry histories, arbitrary Object uses, loops and arrays remain outside
-this construction. The density-gradient case is still unqualified: its Math/log
-and additional selected-helper recipes need actual Method/source correspondence,
-and cold preparation must close without weakening historical freshness. No
-mathematical result annotation or C completion waiver substitutes for that work.
+this construction. Double Math leaves additionally require the original emitted
+Java invocation occurrence, its actual Method and identity input conversions,
+the existing intrinsic totality facet, and the same source Class lookup. Missing
+historical records, copied occurrences and different Classes abstain; queries do
+not compile or execute callees. Primitive Double negation closes separately through
+the actual JVM negation recipe. This qualifies the bounded scalar density-gradient
+case, not general density programs or loops. Historical freshness remains required;
+no mathematical result annotation or C completion waiver substitutes for that work.
 
 ## Ordered generated-call source owner
 

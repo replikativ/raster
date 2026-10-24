@@ -3356,20 +3356,20 @@
         (when-not method
           (throw (ex-info (str "Cannot resolve static method: " head)
                           {:class (.getName cls) :method meth-name :arity (count args)})))
-        (let [param-types (.getParameterTypes method)]
-          (doseq [[arg ^Class pt] (map vector args param-types)]
-            (let [t      (emit-argument-value code arg pt locals ctx)
-                  target (class-type->stack pt)]
-              (if (and (= t :ref) (= target :ref) (not (.equals pt Object)))
-                (.checkcast code (class-desc-of pt))
-                (when (not= t target) (emit-coerce code t target))))))
-        (let [^Class ret-class (.getReturnType method)
+        (let [completions (emit-typed-call-arguments
+                           code (vec args) (vec (.getParameterTypes method)) locals ctx true)
+              ^Class ret-class (.getReturnType method)
               mt (MethodTypeDesc/of (class-desc-of ret-class)
                                     (into-array ClassDesc (mapv class-desc-of (.getParameterTypes method))))]
           ;; Interface static methods require the isInterface flag
           (if (.isInterface cls)
             (.invokestatic code (class-desc-of cls) meth-name mt true)
             (.invokestatic code (class-desc-of cls) meth-name mt))
+          ;; The same occurrence catalog owns the actual resolved Java Method
+          ;; and each emitted conversion. Later consumers cannot reconstruct a
+          ;; historical Class lookup from a current Math/name spelling.
+          (retain-invocation-context! method nil (vec args) :java-static
+                                      ret-class completions locals ctx)
           ;; Void methods → push nil (matches Clojure semantics)
           (let [st (class-type->stack ret-class)]
             (if (= st :void) (do (.aconst_null code) :ref) st)))))))

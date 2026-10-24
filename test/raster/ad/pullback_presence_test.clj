@@ -43,6 +43,36 @@
           (when (instance? java.lang.AutoCloseable compiled)
             (.close ^java.lang.AutoCloseable compiled)))))))
 
+(deftest density-native-retains-double-math-and-negation-boundaries
+  (let [compiled (pipeline/compile-aot #'density-gradient :target :c :dtype :double)]
+    (try
+      ;; Log's primitive domain failures are IEEE values, not exceptions. Its
+      ;; primal remains in the source; wrt x still gives -s at these inputs.
+      (doseq [[x s] [[0.5 2.0] [-3.0 0.5] [1.0 -2.0] [3.0 0.0] [4.0 -0.0]
+                     [0.0 Double/POSITIVE_INFINITY] [2.0 Double/NaN]]]
+        (let [actual (double (compiled x s))
+              expected (clojure.core/- (double s))]
+          (is (or (and (Double/isNaN actual) (Double/isNaN expected))
+                  (= (Double/doubleToRawLongBits expected) (Double/doubleToRawLongBits actual))))))
+      (is (thrown? NullPointerException (compiled 0.5 nil)))
+      (is (thrown? ClassCastException (compiled "bad" 2.0)))
+      (let [source-ns (the-ns 'raster.math)
+            original-class (ns-resolve source-ns 'Math)]
+        (try
+          (ns-unmap source-ns 'Math)
+          (.importClass source-ns 'Math java.lang.StrictMath)
+          (is (= :stale-source-resolution
+                 (:reason (ex-data (try (compiled 0.5 2.0) nil
+                                       (catch clojure.lang.ExceptionInfo error error))))))
+          (is (thrown? NullPointerException (compiled 0.5 nil))
+              "public conversion failure still precedes the retained source guard")
+          (finally
+            (ns-unmap source-ns 'Math)
+            (.importClass source-ns 'Math original-class))))
+      (finally
+        (when (instance? java.lang.AutoCloseable compiled)
+          (.close ^java.lang.AutoCloseable compiled))))))
+
 (deftest template-fragment-is-lazy-only-for-an-absent-edge
   (let [gradient (with-meta 'gradient {:raster.type/tag 'double})
         before (assoc (context) :marker :retained)

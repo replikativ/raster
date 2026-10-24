@@ -1463,13 +1463,13 @@
          node)))
    body))
 
-(defn- selected-strict-scalar-source
+(defn- selected-scalar-source
+  "Read the actual selected source and its emission without granting scalar
+   semantics. Numerical constructors below separately close the complete body."
   [expression]
   (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
         (descriptor/call-description expression)]
     (when (and dispatch? (not lexical-callee)
-               (or (descriptor/scalar-op? semantic-op)
-                   (descriptor/comparison-kind semantic-op))
                (some-> semantic-op intrinsics/canonical intrinsics/descriptor))
       ;; Discover only the candidate identity. Current metadata is not proof
       ;; that an existing implementation was emitted from that metadata.
@@ -1482,9 +1482,18 @@
                 source-body (:body body-context)
                 body (when (= 1 (count source-body))
                        (qualify-source-casts (first source-body) (set parameters) body-context))]
-            (when (and (seq? body) (strict-core-expression? body (set parameters)))
-              {:definition definition :entry entry :body body :arguments arguments
+            (when (seq? body)
+              {:definition definition :entry entry :body body :original-body (first source-body)
+               :body-context body-context :arguments arguments
                :operation semantic-op :implementation-op implementation-op})))))))
+
+(defn- selected-strict-scalar-source [expression]
+  ;; Keep the old generic presence-query grammar. A new numerical source
+  ;; constructor must not silently widen normal-return/presence authority.
+  (let [operation (:semantic-op (descriptor/call-description expression))]
+    (when (or (descriptor/scalar-op? operation) (descriptor/comparison-kind operation))
+      (when-let [{:keys [body definition] :as source} (selected-scalar-source expression)]
+        (when (strict-core-expression? body (set (:parameters definition))) source)))))
 
 (defn checked-selected-primitive-result
   "Prove OUTPUT presence from the current selected implementation's closed
@@ -1506,12 +1515,68 @@
         (let [proof (checked-scalar-result body (zipmap parameters scalar-types))]
           (when (= result-type (:type proof)) proof))))))))
 
+(defn- owned-double-math-call-carrier
+  "Close one actual emitted Math invocation, not a name-based library recipe.
+   The existing occurrence catalog supplies the historical Method and input
+   conversions. A current lookup only checks that same Class and is retained as
+   a freshness dependency; it cannot replace a missing emission observation."
+  [expression carriers {:keys [emission source-ns]}]
+  (let [operation (first expression)
+        arguments (vec (rest expression))]
+    (when (and emission (instance? clojure.lang.Namespace source-ns)
+               (symbol? operation) (contains? #{"Math" "java.lang.Math"} (namespace operation))
+               (= operation (descriptor/semantic-op expression))
+               (not (:lexical-callee (descriptor/call-description expression)))
+               (seq carriers) (every? #(identical? Double/TYPE %) carriers)
+               (intrinsics/primitive-fp-total? operation carriers))
+      (when-let [record ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-invocation-context)
+                         emission expression)]
+        (let [^java.lang.reflect.Method method (:method record)
+              inputs (:inputs record) completions (:input-completions record)
+              current-class (if (= "java.lang.Math" (namespace operation)) java.lang.Math
+                                (ns-resolve source-ns 'Math))]
+          (when (and (= :java-static (:invocation-mode record))
+                     (instance? java.lang.reflect.Method method)
+                     (java.lang.reflect.Modifier/isStatic (.getModifiers method))
+                     (java.lang.reflect.Modifier/isPublic (.getModifiers method))
+                     (not (.isVarArgs method))
+                     (identical? java.lang.Math (.getDeclaringClass method))
+                     (identical? current-class (.getDeclaringClass method))
+                     (= (name operation) (.getName method))
+                     (= carriers (vec (.getParameterTypes method)))
+                     (identical? Double/TYPE (.getReturnType method))
+                     (identical? Double/TYPE (:return-carrier record))
+                     (vector? inputs) (vector? completions)
+                     (= (count arguments) (count inputs) (count completions))
+                     (every? true?
+                             (map-indexed
+                              (fn [index [argument input completed]]
+                                (let [origin (when-not (identical? argument (:operand input))
+                                               ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-source-context)
+                                                emission expression index))]
+                                    (and (or (identical? argument (:operand input))
+                                             (and (identical? argument (:source-original origin))
+                                                  (identical? (:operand origin) (:operand input))))
+                                         (identical? (:operand input) (:operand completed))
+                                         (not (:unretained-sibling-calls? input))
+                                         (= :double (:emitted-type completed))
+                                         (identical? Double/TYPE (:parameter-carrier completed))
+                                         (= :identity (:adaptation completed)))))
+                              (map vector arguments inputs completions))))
+            (when (= "Math" (namespace operation))
+              (method-entry/observe-source-resolution!
+               {:kind :symbol-resolution :source-ns source-ns :symbol 'Math :result current-class}))
+            Double/TYPE))))))
+
 (defn- completed-fp-body-carrier
   "Bounded completion summary INSIDE a selected primitive entry, not source inference.
-   Only exact core binary FP operations and FP conversions are admitted. Reuse the
-   emitter's arithmetic plan and the intrinsic table's independent totality facet."
+   Reuse the emitter's arithmetic plan and the independent totality facet.
+   Only the selected payload constructor supplies actual source/emission context
+   for Double unary negation and occurrence-owned Java Math invocations."
   ([expression parameters] (completed-fp-body-carrier expression parameters false))
   ([expression parameters check-retained-types?]
+   (completed-fp-body-carrier expression parameters check-retained-types? nil))
+  ([expression parameters check-retained-types? source-context]
    (let [actual
          (cond
            (symbol? expression) (get parameters expression)
@@ -1520,13 +1585,25 @@
            (seq? expression)
            (let [operation (descriptor/semantic-op expression)
                  arguments (vec (descriptor/call-args expression))
-                 carriers (mapv #(completed-fp-body-carrier % parameters check-retained-types?) arguments)
+                 carriers (mapv #(completed-fp-body-carrier % parameters check-retained-types? source-context) arguments)
                  intrinsic (intrinsics/descriptor operation)]
-             (when (and (= operation (first expression))
+             (or (when source-context
+                   (owned-double-math-call-carrier expression carriers source-context))
+              (when (and (= operation (first expression))
                         (= "clojure.core" (namespace operation))
                         (not (contains? parameters operation))
+                        (not (:lexical-callee (descriptor/call-description expression)))
+                        (or (nil? source-context)
+                            (intrinsic-source/observe-original! (:source-ns source-context) operation))
                         (every? #{Float/TYPE Double/TYPE} carriers))
                (cond
+                 ;; This is the existing JVM dneg recipe, never an integral
+                 ;; negateExact or a nullable Numbers.minus invocation.
+                 (and source-context (= 'clojure.core/- operation)
+                      (= [Double/TYPE] carriers)
+                      (intrinsics/primitive-fp-total? :neg carriers))
+                 Double/TYPE
+
                  (and (= 1 (count arguments)) (descriptor/cast-op? operation))
                  (let [target (types/tag->java-class (descriptor/cast-result-tag operation))
                        source (first carriers)]
@@ -1554,7 +1631,7 @@
                                (if (= Float/TYPE (first carriers)) :float :double)
                                (if (= Float/TYPE (second carriers)) :float :double))]
                      (when (= :primitive (:kind plan))
-                       (case (:result-carrier plan) :float Float/TYPE :double Double/TYPE nil)))))))
+                       (case (:result-carrier plan) :float Float/TYPE :double Double/TYPE nil))))))))
            :else nil)
          tag (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
          retained (or (when (and (keyword? tag) (dtype/known? tag)) (dtype/canon tag))
@@ -1669,8 +1746,10 @@
 
 (defn checked-selected-fp-payload
   "Retain a primitive SSA computation behind an ACTUAL owned Object-return bridge.
-   This bounded leaf admits only primitive FP formals and the same closed core
-   body checked by completed-fp evaluation. No query invokes the JIT or a method.
+   This bounded leaf admits primitive FP formals and a closed source body.
+   Double Math operations additionally require the exact historical Java Method
+   occurrence; generic presence queries do not borrow that numerical closure.
+   No query invokes the JIT or a method.
    Cold source entries and unknown Object/generic/nested selected recipes abstain.
 
    Physical result remains Object. Payload type is NOT the carrier supplied to a
@@ -1680,14 +1759,19 @@
   [expression argument-facts]
   (method-entry/call-with-optional-definition-inputs
    (fn []
-     (when-let [{:keys [entry body arguments definition]}
-                (selected-strict-scalar-source expression)]
+     (when-let [{:keys [entry body original-body body-context arguments definition]}
+                (selected-scalar-source expression)]
        (when-let [bridge (and (not (:pending-source? entry))
                              ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-typed-return-bridge)
                               (:emission entry)))]
          (let [parameters (:parameters definition)
                carriers (:parameter-carriers entry)
-               actual (completed-fp-body-carrier body (zipmap parameters carriers) true)
+               actual (completed-fp-body-carrier
+                       body (zipmap parameters carriers) true
+                       {:source-ns (:source-ns body-context)
+                        ;; Qualification may rebuild bare casts. Such a clone
+                        ;; is not an original Java invocation occurrence.
+                        :emission (when (identical? body original-body) (:emission entry))})
                program (when (and (vector? argument-facts)
                                   (= (count arguments) (count argument-facts))
                                   (= (:invocation-method entry) (:invocation-method bridge))

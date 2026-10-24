@@ -61,6 +61,8 @@
                             :cast a
                             :* (clojure.core/* (double a) (double b))
                             :+ (clojure.core/+ (double a) (double b))
+                            :neg (clojure.core/- (double a))
+                            :log (Math/log (double a))
                             :div (clojure.core// (double a) (double b)))]
                 (assoc values (get-in operation [:result :id]) (round-value result-type value))))
             inputs operations)]
@@ -230,6 +232,113 @@
                      (raster.numeric// a b) (raster.numeric// a b))]
     (is (nil? (payload expression [fp fp])))
     (is (nil? (scalar/checked-selected-fp-payload expression [fp fp])))))
+
+(deftest math-payload-requires-the-actual-java-method-occurrence
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.math-return-payload." '(Math/log (clojure.core/double x)))]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (with-redefs [core/ensure-bytecode-implementation!
+                        (fn [& _] (throw (AssertionError. "Math query forced the JIT")))]
+            (is (nil? (payload call [fp fp]))))
+          (core/ensure-bytecode-implementation! receiver)
+          (let [emitted (:raster.core/bytecode-emission (meta receiver))
+                original (first (:body emitted))
+                record (bytecode/retained-invocation-context emitted original)
+                method (:method record)
+                proof (payload call [fp fp])
+                owner (atom {:static [] :values []})]
+            (is (= :java-static (:invocation-mode record)))
+            (is (= (.getMethod java.lang.Math "log" (into-array Class [Double/TYPE])) method))
+            (is (= [:double] (mapv :emitted-type (:input-completions record))))
+            (is (= [:identity] (mapv :adaptation (:input-completions record))))
+            (is (nil? (bytecode/retained-invocation-context
+                       emitted (with-meta (apply list original) (meta original)))))
+            (is (= Object (:result-carrier proof)))
+            (is (= Double/TYPE (:payload-carrier proof)))
+            (doseq [x [-1.0 -0.0 0.0 0.5 1.0 Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NaN]]
+              (let [actual (clojure.lang.Reflector/invokeInstanceMethod
+                            @receiver "invk" (object-array [x 7.0]))
+                    projected (execute-fp-program (:computation proof)
+                                                 (zipmap (:parameters proof) [x 7.0]))]
+                (is (instance? Double actual))
+                (is (or (and (Double/isNaN actual) (Double/isNaN projected))
+                        (= (Double/doubleToRawLongBits actual) (Double/doubleToRawLongBits projected))))))
+            (binding [entry/*emission-inputs* owner]
+              (is (some? (scalar/checked-selected-fp-payload call [fp fp]))))
+            (try
+              (ns-unmap scope 'Math)
+              (.importClass scope 'Math java.lang.StrictMath)
+              (is (nil? (payload call [fp fp])) "a current Class lookup cannot replace the emitted Method")
+              (is (= :stale-source-resolution
+                     (:reason (ex-data (try (entry/assert-definition-inputs-current! @owner) nil
+                                           (catch clojure.lang.ExceptionInfo error error))))))
+              (finally
+                (ns-unmap scope 'Math)
+                (.importClass scope 'Math java.lang.Math))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest a-different-actual-java-method-is-not-the-math-payload-recipe
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.foreign-math-payload." '(Math/log (clojure.core/double x)))]
+    (try
+      (ns-unmap scope 'Math)
+      (.importClass scope 'Math java.lang.StrictMath)
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (core/ensure-bytecode-implementation! receiver)
+          (let [emitted (:raster.core/bytecode-emission (meta receiver))
+                original (first (:body emitted))
+                record (bytecode/retained-invocation-context emitted original)]
+            (is (= :java-static (:invocation-mode record)))
+            (is (= java.lang.StrictMath (.getDeclaringClass ^java.lang.reflect.Method (:method record))))
+            (is (nil? (payload call [fp fp]))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest missing-java-call-history-is-not-reconstructed-from-a-current-class
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.unrecorded-math-payload." '(Math/log (clojure.core/double x)))
+        retain-var (ns-resolve 'raster.compiler.backend.jvm.bytecode 'retain-invocation-context!)
+        original-retain @retain-var]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          ;; Emit real code without the new optional observation, modeling an
+          ;; older actual emission. Neither its owner nor its Classes are forged.
+          (with-redefs-fn {retain-var
+                          (fn [method receiver arguments mode & remaining]
+                            (when-not (= :java-static mode)
+                              (apply original-retain method receiver arguments mode remaining)))}
+            #(core/ensure-bytecode-implementation! receiver))
+          (is (some? (bytecode/retained-typed-return-bridge
+                      (:raster.core/bytecode-emission (meta receiver)))))
+          (with-redefs [core/ensure-bytecode-implementation!
+                        (fn [& _] (throw (AssertionError. "missing history forced preparation")))]
+            (is (nil? (payload call [fp fp]))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest double-unary-negation-keeps-the-original-primitive-recipe
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.double-negation-payload." '(clojure.core/- x))]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (core/ensure-bytecode-implementation! receiver)
+          (let [proof (payload call [fp fp])]
+            (is (= Double/TYPE (:payload-carrier proof)))
+            (doseq [x [-0.0 0.0 -3.0 Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+              (let [actual (clojure.lang.Reflector/invokeInstanceMethod
+                            @receiver "invk" (object-array [x 7.0]))
+                    projected (execute-fp-program (:computation proof)
+                                                 (zipmap (:parameters proof) [x 7.0]))]
+                (is (= (Double/doubleToRawLongBits (clojure.core/- (double x)))
+                       (Double/doubleToRawLongBits actual) (Double/doubleToRawLongBits projected))))))))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest nested-width-stamps-are-not-actual-producer-carriers
   (let [inner (with-meta '(clojure.core/* x x) {:raster.type/tag 'float})
