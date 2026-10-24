@@ -16,7 +16,6 @@
   (:require [beichte.core :as b]
             [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
-            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -172,19 +171,17 @@
                       (apply list (symbol "clojure.core" (name operation))
                              (descriptor/call-args expression))))))
           (and source target
-               (contains? #{[:exact :exact] [:nearest-even :exact]}
-                          (scalar-conversion/source-policy
-                           source target (descriptor/semantic-op expression))))))))
+               (= [:exact :exact] (scalar-conversion/policy source target)))))))
 
 (defn- source-evaluation-flags
-  "Evaluation obligations for source conversions/arithmetic from shared descriptors.
+  "Existing checked conversion obligations and explicit source-owner denials.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   checked integral/Float casts remain conservatively non-removable.
-   Arithmetic purity proves neither successful operand completion nor absence
-   of overflow/division errors. Keep that obligation until a source-owned proof
-   closes it; logical dtype tags are not physical operand evidence. Local product
+   checked integral casts remain conservatively non-removable. This reader does
+   not globally reinterpret arithmetic purity as source totality. New local
+   product rewrites retain their actual evaluations explicitly; migration of
+   ordinary arithmetic classification requires its target consumers too. Local product
    lowering additionally retains its generic factory's reference conversion
    obligation explicitly. Untyped scoped binders require their own type evidence;
    this does not globally reinterpret their casts as reference conversions."
@@ -193,17 +190,10 @@
    (mapcat (fn [node]
              (let [operation (when (seq? node) (descriptor/semantic-op node))]
                     (cond-> []
-                        (and (seq? node)
-                             (or (contains? #{:+ :- :* :div :neg :quot :rem :mod}
-                                            (intrinsics/canonical operation))
-                                 (descriptor/increment-op? operation)
-                                 (descriptor/decrement-op? operation)))
-                        (conj :unclosed-source-arithmetic)
                         (and (seq? node) (not (proven-total-cast? node))
                              (descriptor/cast-op? operation)
                              (= :reject (descriptor/cast-integral-narrowing operation))
-                             (or (contains? '#{byte int long} (descriptor/cast-result-tag operation))
-                                 (= :checked (descriptor/cast-floating-narrowing operation))))
+                             (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
                         (conj :checked-source-cast)
                         ;; This is denial-only evidence from the source factory:
                         ;; no optimizer may erase its conversion merely because
@@ -285,11 +275,10 @@
    context; cached source analysis must not survive helper redefinition."
   [expr]
   (if (not (seq? expr))
-    ;; Collection literals evaluate their children. They are not scalar leaves,
-    ;; and their evaluation/exception obligations must survive DCE and CSE too.
-    (if (coll? expr)
-      (analyze-descriptor expr)
-      {:effect :pure :flags (source-evaluation-flags expr)})
+    ;; Preserve the general API's existing leaf/collection effect convention.
+    ;; Explicit denials still survive here, including a marked collection or
+    ;; symbol produced by the new occurrence-owned representation rewrites.
+    {:effect :pure :flags (source-evaluation-flags expr)}
     (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
                    [(descriptor-key expr) proof])

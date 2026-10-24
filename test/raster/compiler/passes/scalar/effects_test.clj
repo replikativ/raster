@@ -1,7 +1,24 @@
 (ns raster.compiler.passes.scalar.effects-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.op-descriptor :as descriptor]))
+
+(deftest producer-denials-do-not-reinterpret-ordinary-arithmetic-contracts
+  (let [ordinary '(clojure.core/+ x 1)
+        retained (with-meta ordinary {:raster.effect/preserve-evaluation true})]
+    (is (effects/removable-expr? ordinary) "the existing general arithmetic API is unchanged")
+    (doseq [expression [retained [retained] (list 'do retained 2.0)]]
+      (is (contains? (:flags (effects/descriptor expression)) :preserve-source-evaluation))
+      (is (not (effects/removable-expr? expression))))
+    (is (not (contains? (:flags (effects/descriptor (list 'quote retained)))
+                       :preserve-source-evaluation)))
+    (is (effects/removable-expr? ordinary) "metadata-distinct cache observations stay separate"))
+  (let [attributes {:source-dtype :double :target-dtype :float
+                    :rounding :nearest-even :overflow :ieee :source-op 'clojure.core/float}]
+    (is (conversion/canonical-attributes? attributes))
+    (is (not (conversion/canonical-attributes? (assoc attributes :overflow :trap)))
+        "existing numerical IR policy is not a new checked JVM source-cast proof")))
 
 (deftest storage-contracts-deny-cse-without-body-analysis
   (doseq [contract [{:buffer-write {:mode :overwrite :buf-arg-idx 0}}

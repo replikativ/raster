@@ -2,6 +2,26 @@
 
 ## Reconciled execution plan
 
+The CPU frozen-source producer landing preserves the existing optimizer's
+classification of ordinary unmarked arithmetic; it does not claim blanket
+source-exception equivalence for that legacy behavior (for example, an unused
+inactive division). The general descriptor also retains its existing pure
+leaf/collection convention, while reading explicit denial markers inside
+collections; this is not a new proof that arbitrary collection children are
+effect-free. New presence/product rewrites have a narrower, mandatory
+obligation: retain every evaluation they newly make dead, including eager
+sibling fields and transitive opaque producers. Occurrence-owned evaluation
+tokens, opaque Object completions and explicit denial markers supply that
+boundary before PE/CSE/DCE. Marked let/do/if regions must not lose their denial
+when PE rebuilds or collapses them. Automatic arithmetic/Float-cast effect
+classification and checked TypedSOAC scalar-conversion policy migration remain
+coupled to their target/source-owner consumers, not this CPU landing. This
+deferral grants no new Class, totality, movability or source-conversion proof.
+The existing TypedSOAC conversion attributes remain numerical-dialect policy;
+actual JVM source conversions still execute under their retained source policy.
+Eager product fields remain reserved Object completions until that backend
+consumes them, and marked regions are not ANF-lifted into unmarked dead actions.
+
 This checkpoint preserves the original eight-item campaign. The entries below are completion
 obligations, not claims that their already-landed foundations must be implemented again. Historical
 receipts remain below; fresh acceptance must distinguish compile-only, hardware-free simulation,

@@ -174,7 +174,8 @@
         (if-not pairs
           ;; All bindings processed — PE the body
           (let [pe-body (map #(pe-fn % env) body)]
-            (if (empty? new-bindings)
+            (if (and (empty? new-bindings)
+                     (not (true? (:raster.effect/preserve-evaluation (meta form)))))
               ;; All bindings eliminated — just return the body
               (if (= 1 (count pe-body))
                 (first pe-body)
@@ -222,7 +223,8 @@
         pe-test (pe-fn test const-env)]
     (cond
       ;; Only nil and false are falsy in Clojure; zero is truthy.
-      (constant? pe-test)
+      (and (constant? pe-test)
+           (not (true? (:raster.effect/preserve-evaluation (meta form)))))
       (if pe-test
         (pe-fn then const-env)
         (if else-present? (pe-fn else const-env) nil))
@@ -307,10 +309,15 @@
                        (if (seq kept-init)
                          (concat kept-init [last-form])
                          [last-form])))]
-          (case (count kept)
-            0 nil
-            1 (first kept)
-            (cons 'do kept)))
+          (if (true? (:raster.effect/preserve-evaluation (meta form)))
+            ;; This denial belongs to the whole original evaluation, not its
+            ;; last child's JVM carrier/type metadata. Keep the wrapper even
+            ;; when only one child survives constant-statement elimination.
+            (util/remake-if-changed form (cons 'do kept))
+            (case (count kept)
+              0 nil
+              1 (first kept)
+              (util/remake-if-changed form (cons 'do kept)))))
 
         ;; fn/fn* — recurse into body to substitute env for non-shadowed syms.
         ;; Without this, when PE inlines a binding [h x] (drops h, env[h] = x),
