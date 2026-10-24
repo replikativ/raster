@@ -6465,9 +6465,11 @@
             (throw (ex-info "Generated AD bytecode entry could not be emitted"
                             {:reason :ad-generated-entry-unavailable})))
         _ ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/validate-program-emission!)
-           program emission)]
-    ;; The shared emitter has already prepared its ACTUAL global invocations.
-    ;; Retained source-only observations are not additional physical calls.
+           program emission)
+        emission ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/prepare-emitted-global-invocations!)
+                  emission)]
+    ;; Only this derived producer consumes the actual invocation histories.
+    ;; Ordinary named emission must preserve late-bound recursive calls.
     {:implementation implementation :emission emission :input-body walked-body
      :interface-class (:iface-class interface) :source-policy policy
      :guard (method-entry/prepare-emission-input-guard! emission)}))
@@ -6571,6 +6573,13 @@
         frontend (if captured
                    (.-frontend ^GeneratedPreparationOwner (::generated-program-owner parent))
                    (method-entry/original-source-frontend resolved))
+        ;; This exact original frontend is a consumed physical source producer,
+        ;; even when AD inlines its body and emits no call to the old receiver.
+        ;; Preparing it invalidates the ORIGINAL observations and restarts the
+        ;; whole derivation. An already captured parent is never renewed here.
+        _ (when-let [receiver (when-not captured (get-in frontend [:definition :receiver-var]))]
+            (method-entry/prepare-pending-definition-inputs!
+             rcore/ensure-current-owned-bytecode! [receiver]))
         context (when frontend (source-ad-context (get-in frontend [:source-entry :source-policy])))
         captured-source (when captured
                           (let [{:keys [core source]} (freshen-prepared-core context parent (:mode captured))

@@ -1138,7 +1138,13 @@
    A Method or interface hint alone does not select a deftm implementation."
   [^java.lang.reflect.Method method receiver v arity ctx]
   (when me/*emission-inputs*
-    (let [source-ns (or (:source-ns ctx) *ns*)
+    ;; These are physical emission observations, not automatically consumed
+    ;; numerical premises. Ordinary late-bound calls (including recursion)
+    ;; must not pin their receiver before its own publication. A derived
+    ;; producer explicitly adopts this ORIGINAL history before using it.
+    (let [observations (atom {:static [] :values []})]
+     (binding [me/*emission-inputs* observations]
+      (let [source-ns (or (:source-ns ctx) *ns*)
           _ (when-not (and (var? v) (bound? v))
               (throw (ex-info "global typed invocation has no actual receiver"
                               {:reason :unowned-emitted-global-invocation :receiver receiver})))
@@ -1166,7 +1172,8 @@
                               (identical? (:value snapshot) (get-in definition [:entry :typed-impl])))))
         (throw (ex-info "global invocation differs from its selected physical entry"
                         {:reason :unowned-emitted-global-invocation :receiver receiver})))
-      {:snapshot snapshot :selection selection})))
+      (me/assert-definition-inputs-current! @observations)
+      {:snapshot snapshot :selection selection :observations @observations})))))
 
 (defn- retain-invocation-context!
   [method receiver arguments mode return-carrier completions locals ctx & [global-receiver]]
@@ -1205,17 +1212,13 @@
 
 (def ^:private ^:dynamic *preparing-emitted-receivers* #{})
 
-(defn ^:no-doc prepare-emitted-global-invocations!
-  "Complete an actual emitter's known global-call receiver preparations.
-   Only constructor-recorded calls nominate receivers; source-only history is
-   not execution. Preparation changes reject the whole owning attempt through
-   its ORIGINAL observations, never refresh this emitted body or old artifact."
-  []
+(defn- consume-emitted-global-invocations!
+  [source]
   (when-not me/*emission-inputs*
     (throw (ex-info "emitted invocation preparation requires its compiler owner"
                     {:reason :missing-definition-preparation-owner})))
-  (let [historical @me/*emission-inputs*
-        _ (me/assert-definition-inputs-current! historical)
+  (let [historical source
+        _ (me/assert-definition-inputs-current! @me/*emission-inputs*)
         physical (filterv (fn [[_ record]] (contains? record ::physical-invocation))
                           (:invocation-contexts historical))
         calls (mapv val physical)
@@ -1235,12 +1238,19 @@
                                  (vals (:invocation-contexts historical)))))
       (throw (ex-info "emitted global invocation readiness is incomplete"
                       {:reason :unclosed-emitted-global-invocations})))
-    (let [receivers
+    (let [observations (atom {:static [] :values []})
+          _ (binding [me/*emission-inputs* observations]
+              (doseq [{:keys [global-receiver]} (sort-by :emission-ordinal calls)]
+                (when-not (map? (:observations global-receiver))
+                  (throw (ex-info "emitted receiver has no original observation history"
+                                  {:reason :unowned-emitted-global-invocation})))
+                (me/adopt-definition-inputs! (:observations global-receiver))))
+          receivers
           (reduce
            (fn [result {:keys [method global-receiver]}]
              (let [{:keys [snapshot selection]} global-receiver
                    v (:var snapshot)
-                   retained (get-in historical [:definition-proofs v])
+                   retained (get-in @observations [:definition-proofs v])
                    pending? (map? (get-in snapshot [:metadata :raster.core/jit-spec]))
                    definition (:definition selection)]
                ;; Later actual occurrences may merge additional lookup edges
@@ -1258,7 +1268,8 @@
                                  {:reason :unowned-emitted-global-invocation :receiver v})))
                (if (and pending? (not (some #(identical? v %) result)))
                  (conj result v) result)))
-           [] (sort-by :emission-ordinal calls))]
+           [] (sort-by :emission-ordinal calls))
+          _ (me/adopt-definition-inputs! @observations)]
       (when (some *preparing-emitted-receivers* receivers)
         (throw (ex-info "recursive pending receiver preparation cannot publish an owned emission"
                         {:reason :recursive-emitted-receiver-preparation})))
@@ -1270,7 +1281,24 @@
              ;; queued later in the outer batch can legitimately be a child.
              (binding [*preparing-emitted-receivers* (conj *preparing-emitted-receivers* receiver)]
                (prepare! receiver)))
-           receivers))))))
+           receivers)))
+      @observations)))
+
+(defn ^:no-doc prepare-emitted-global-invocations!
+  "Explicit derived-publication consumer of actual physical call history.
+   Adopt original observations before preparing receivers; never refresh a
+   rejected body. Ordinary named/static emission only records this history.
+   The emission arity returns the same constructed artifact with these exact
+   consumed observations included in its existing execution guard inputs."
+  ([] (consume-emitted-global-invocations! (when me/*emission-inputs* @me/*emission-inputs*)) nil)
+  ([emission]
+   (me/assert-emission-inputs-current! emission)
+   (let [observations (consume-emitted-global-invocations! emission)
+         completed (-> emission
+                       (update :dependency-snapshots into (:values observations))
+                       (update :producer-inputs #(into (vec %) (:producer-inputs observations))))]
+     (me/assert-emission-inputs-current! completed)
+     completed)))
 
 (defn ^:no-doc retained-invocation-context
   "Query one ORIGINAL occurrence from a trusted, guarded bytecode emission.
@@ -6190,11 +6218,11 @@
     (letfn [(global? [symbol bound]
               (and (symbol? symbol) (not (contains? bound symbol))
                    (not (:raster.op/lexical-callee (meta symbol)))))
-            (retain! [symbol]
+            (retain! [symbol call-kind]
               (when-let [v (try (ns-resolve source-ns symbol) (catch Exception _ nil))]
                 (when (and (var? v) (:raster.core/deftm (meta v))
                            (not (no-inline-deftm? v)))
-                  (swap! refs conj {:var v :lookup [source-ns symbol]}))))
+                  (swap! refs conj {:var v :lookup [source-ns symbol] :call-kind call-kind}))))
             (scan [form bound]
               (cond
                 ;; Quoted bodies are data, not additional compilation inputs.
@@ -6225,12 +6253,12 @@
                                  (.endsWith (name impl-sym) "-impl"))
                         (let [base-name (subs (name impl-sym) 0 (- (count (name impl-sym)) 5))
                               base-sym (symbol (namespace impl-sym) base-name)]
-                          (retain! base-sym)))
+                          (retain! base-sym :invk)))
                       (doseq [f (rest form)] (scan f bound)))
                     ;; Normal call
                     (do (when (and (global? h bound)
                                    (not (:raster.op/lexical-callee (meta form))))
-                          (retain! h))
+                          (retain! h :direct))
                         (doseq [f (rest form)] (scan f bound)))))
                 (or (seq? form) (vector? form) (set? form))
                 (doseq [f form] (scan f bound))
@@ -6240,9 +6268,12 @@
     @refs))
 
 (defn- scan-deftm-refs
-  "Project the emitter's reference discovery onto its static sibling Var set."
+  "Select direct-call candidates for the emitter's static sibling table.
+   An .invk dependency is always emitted through its global/local interface,
+   never through this table. Dependency-history traversal still retains it."
   [forms source-ns parameters]
-  (into #{} (map :var) (scan-deftm-inputs forms source-ns parameters)))
+  (into #{} (comp (filter #(= :direct (:call-kind %))) (map :var))
+        (scan-deftm-inputs forms source-ns parameters)))
 
 ;; ================================================================
 ;; tag->jvm-info — type tag to JVM descriptor mapping
@@ -7113,8 +7144,6 @@
           (recur (inc attempt))
           (do
             (when failure (throw failure))
-            (binding [me/*emission-inputs* emitted-inputs]
-              (prepare-emitted-global-invocations!))
             (alter-meta! deftm-var
                          (fn [metadata]
                            (when (and (contains? preparation :expected-cache)

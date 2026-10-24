@@ -415,6 +415,7 @@
                     :terminal-contexts (:terminal-contexts @inputs)
                     :typed-return-bridges (:typed-return-bridges @inputs)
                     :invocation-contexts (:invocation-contexts @inputs)
+                    :invocation-emission-ordinal (:invocation-emission-ordinal @inputs -1)
                     ;; The interface registry and method entry use a nominal
                     ;; symbol. Frozen source serializes that name as a string;
                     ;; renewal must publish the same nominal representation.
@@ -431,9 +432,6 @@
       (if (and failure (< attempt 2) (me/retryable-emission-change? failure))
         (recur (inc attempt))
         (do (when failure (throw failure))
-            (when implementation
-              (binding [me/*emission-inputs* inputs]
-                ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/prepare-emitted-global-invocations!))))
             {:implementation implementation :emission emission})))))
 
 (clojure.core/defn ^:no-doc prepare-implementation-frontend!

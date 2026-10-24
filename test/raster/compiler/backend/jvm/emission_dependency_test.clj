@@ -387,12 +387,11 @@
                             (swap! prepared conj v)
                             (actual-prepare! v))
                           bytecode/prepare-emitted-global-invocations!
-                          (fn []
-                            (let [original @method-entry/*emission-inputs*]
-                              (try (actual-ready!)
-                                   (catch clojure.lang.ExceptionInfo failure
-                                     (swap! rejected conj original)
-                                     (throw failure)))))]
+                          (fn [emission]
+                            (try (actual-ready! emission)
+                                 (catch clojure.lang.ExceptionInfo failure
+                                   (swap! rejected conj @method-entry/*emission-inputs*)
+                                   (throw failure))))]
               (method-entry/call-with-definition-inputs
                #(let [_ (swap! attempts inc)
                       ;; This is real historical source input, deliberately NOT
@@ -401,11 +400,14 @@
                       frontend (core/prepare-deftm-frontend! caller)
                       _ (method-entry/assert-frontend-source! frontend caller)
                       _ (method-entry/observe-frontend-source-identity! frontend)
-                      {:keys [params tags return-tag typed-interface]} (:source-entry frontend)]
-                  (core/emit-owned-bytecode!
-                   bytecode/compile-typed-impl! "raster.compiled.ReceiverReadiness"
-                   params tags return-tag (:body frontend) scope typed-interface
-                   (:name (meta caller)) @method-entry/*emission-inputs*))))
+                      {:keys [params tags return-tag typed-interface]} (:source-entry frontend)
+                      emitted (core/emit-owned-bytecode!
+                               bytecode/compile-typed-impl! "raster.compiled.ReceiverReadiness"
+                               params tags return-tag (:body frontend) scope typed-interface
+                               (:name (meta caller)) @method-entry/*emission-inputs*)]
+                  ;; Only the derived-publication consumer adopts physical
+                  ;; histories and prepares these actually emitted calls.
+                  (update emitted :emission bytecode/prepare-emitted-global-invocations!))))
             emitted (:emission result)
             guard (method-entry/prepare-emission-input-guard! emitted)
             records (into [] (keep (fn [[key record]]
@@ -472,22 +474,77 @@
                            nil (object-array [4.0])))))
       (finally (remove-ns (ns-name scope))))))
 
-(deftest recursive-pending-receiver-preparation-refuses-before-publication
-  (let [scope (create-ns (gensym "raster.recursive-receiver-readiness."))]
+(deftest ordinary-recursive-receivers-retain-late-bound-call-semantics
+  (let [scope (create-ns (gensym "raster.recursive-receiver-readiness."))
+        events (atom [])]
     (try
+      (intern scope 'events events)
       (binding [*ns* scope]
         (refer 'clojure.core)
         (eval '(raster.core/deftm recursive-value [x :- Double] :- Double
-                 (recursive-value x))))
+                 (do (swap! events conj x)
+                     (if (clojure.core/<= x 0.0) x
+                         (recursive-value (clojure.core/- x 1.0)))))))
       (let [source (core/resolve-deftm-var (ns-resolve scope 'recursive-value))
             receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
             original (var-get receiver)
-            failure (try (core/ensure-current-owned-bytecode! receiver) nil
-                         (catch clojure.lang.ExceptionInfo failure failure))]
-        (is (some? failure))
-        (is (some #(= :recursive-emitted-receiver-preparation (:reason (ex-data %)))
-                  (take-while some? (iterate ex-cause failure))))
-        (is (identical? original (var-get receiver))))
+            emission (core/ensure-current-owned-bytecode! receiver)
+            guard (method-entry/prepare-emission-input-guard! emission)]
+        (is (empty? @events) "ordinary preparation executes no recursive numerical body")
+        (is (not (identical? original (var-get receiver))))
+        (is (identical? (:implementation emission) (var-get receiver)))
+        (is (identical? emission (core/ensure-current-owned-bytecode! receiver)))
+        (is (= 0.0 ((var-get source) 3.0)))
+        (is (= [3.0 2.0 1.0 0.0] @events))
+        (is (identical? emission (guard))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest static-sibling-discovery-distinguishes-direct-calls-from-invk-dependencies
+  (let [scope (create-ns (gensym "raster.static-call-kinds."))
+        static-source-var (ns-resolve 'raster.compiler.backend.jvm.bytecode 'original-static-source)
+        original-static-source @static-source-var]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm leaf [x :- Double] :- Double (clojure.core/+ x 1.0)))
+        (eval '(raster.core/deftm caller [x :- Double] :- Double (leaf x))))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'caller))
+            leaf (core/resolve-deftm-var (ns-resolve scope 'leaf))
+            receiver (ns-resolve scope (symbol (str (:name (meta leaf)) "-impl")))
+            frontend (core/prepare-deftm-frontend! source)
+            params (get-in frontend [:source-entry :params])
+            direct (list (symbol (str (ns-name scope)) (str (:name (meta leaf)))) (first params))
+            invk (first (filter #(and (seq? %) (= '.invk (first %)))
+                                (tree-seq coll? seq (:body frontend))))
+            compile! (fn [body]
+                       (let [visited (atom [])
+                             artifact
+                             (with-redefs-fn
+                               {static-source-var (fn [v prepare!]
+                                                    (swap! visited conj v)
+                                                    (original-static-source v prepare!))}
+                               #(bytecode/compile-specialized-class!
+                                 "raster.compiled.StaticCallKinds"
+                                 [{:name 'run :params (mapv (fn [p] (vary-meta p assoc :tag 'double)) params)
+                                   :return-tag 'double :source-ns scope :walked-body [body]}]))]
+                         {:artifact artifact :visited @visited}))]
+        (is (seq invk))
+        (doseq [body [direct invk]]
+          (is (some #(identical? leaf (:var %))
+                    (bytecode/emission-input-snapshots [body] scope params))
+              "both call kinds remain guarded source dependencies"))
+        ;; The direct static consumer needs the source body; .invk intentionally
+        ;; resolves its live receiver and must not manufacture an unused sibling.
+        (let [direct-result (compile! direct)
+              invk-result (compile! invk)
+              invoke #(let [^java.lang.reflect.Method method (get-in % [:artifact :methods 'run])]
+                        (.invoke method nil (object-array [2.0])))]
+          (is (some #(identical? leaf %) (:visited direct-result)))
+          (is (empty? (:visited invk-result)))
+          (is (map? (:raster.core/jit-spec (meta receiver))))
+          (is (= 3.0 (invoke direct-result)))
+          (is (map? (:raster.core/jit-spec (meta receiver))) "static execution does not invoke the leaf receiver")
+          (is (= 3.0 (invoke invk-result)))))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest emitted-global-aliases-use-the-actual-resolved-var-target

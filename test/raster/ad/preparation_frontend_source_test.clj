@@ -495,10 +495,16 @@
   ;; Repeated REPL runs must exercise a genuinely cold source receiver too.
   (binding [*ns* (the-ns 'raster.ad.preparation-frontend-source-test)]
     (eval '(deftm cold-squared-loss [x :- Double] :- Double
-             (do (swap! preparation-body-calls inc) (numeric/* x x)))))
+             (do (swap! preparation-body-calls inc) (numeric/* x x))))
+    (eval '(deftm unrelated-cold-producer [x :- Double] :- Double x)))
   (let [function (ns-resolve 'raster.ad.preparation-frontend-source-test 'cold-squared-loss)
         source (core/resolve-deftm-var function)
         receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))
+        unrelated (core/resolve-deftm-var
+                   (ns-resolve 'raster.ad.preparation-frontend-source-test 'unrelated-cold-producer))
+        unrelated-receiver (ns-resolve (.ns unrelated)
+                                      (symbol (str (:name (meta unrelated)) "-impl")))
+        unrelated-implementation (var-get unrelated-receiver)
         before @preparation-body-calls
         implementation (var-get receiver)
         _ (is (some? (:raster.core/jit-spec (meta receiver))))
@@ -510,29 +516,47 @@
                                   (when (.startsWith ^String class-name "raster.compiled.PreparedGradient")
                                     (swap! attempts conj result))
                                   result))]
-                   (reverse/prepare-value+grad function [0]))
+                   (entry/call-with-definition-inputs
+                    (fn []
+                      ;; A historical observation is not an execution or
+                      ;; original-frontend preparation candidate by itself.
+                      (entry/observe-definition-input!
+                       unrelated-receiver (.ns unrelated-receiver) (.sym unrelated-receiver))
+                      (reverse/prepare-value+grad function [0]))))
         physical (reverse/prepared-bytecode-entry prepared)
         emission (:emission physical)]
     (is (= before @preparation-body-calls)
         "materializing an observed dependency must not evaluate the model")
-    (is (identical? implementation (var-get receiver))
-        "an inlined source producer is not an additional physical invocation")
-    (is (map? (:raster.core/jit-spec (meta receiver))))
+    (is (not (identical? implementation (var-get receiver)))
+        "the consumed original frontend's receiver is ready before derivative publication")
+    (is (nil? (:raster.core/jit-spec (meta receiver))))
+    (is (identical? (var-get receiver)
+                    (:implementation (core/ensure-current-owned-bytecode! receiver))))
+    (is (identical? unrelated-implementation (var-get unrelated-receiver)))
+    (is (map? (:raster.core/jit-spec (meta unrelated-receiver)))
+        "an unrelated source-only history observation is not prepared")
     (is (identical? (:implementation emission) (:implementation physical)))
     (is (identical? emission ((entry/prepare-emission-input-guard! emission))))
     (is (<= 1 (count @attempts)) "the actual numerical producer was emitted")
-    (is (identical? (:emission (last @attempts))
-                    (:emission (reverse/prepared-bytecode-entry prepared)))
-        "only the newly emitted module belongs to the completed preparation")
+    (let [constructed (:emission (last @attempts))]
+      (is (every? (fn [[key value]] (identical? value (get emission key)))
+                  (dissoc constructed :dependency-snapshots :producer-inputs))
+          "finalization retains the exact last module, source and physical observations")
+      (doseq [field [:dependency-snapshots :producer-inputs]]
+        (is (and (<= (count (get constructed field)) (count (get emission field)))
+                 (every? true? (map identical? (get constructed field)
+                                    (take (count (get constructed field)) (get emission field)))))
+            "newly consumed histories extend rather than refresh original observations")))
+    (is (= 16.0 (function 4.0)))
     (is (= [16.0 8.0] (result prepared 4.0)))
-    (is (= (inc before) @preparation-body-calls)
+    (is (= (+ before 2) @preparation-body-calls)
         "the prepared call executes the original effect exactly once")
     (let [original (meta source)]
       (try
         (alter-meta! source assoc :raster.core/deftm-source-body '[42.0])
         (is (thrown? clojure.lang.ExceptionInfo (result prepared 4.0))
             "retained source history still guards the inlined producer")
-        (is (= (inc before) @preparation-body-calls))
+        (is (= (+ before 2) @preparation-body-calls))
         (finally (reset-meta! source original))))))
 
 (deftest enclosing-owner-detects-a-source-change-during-ad-preparation
