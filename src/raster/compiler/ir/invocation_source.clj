@@ -22,6 +22,32 @@
    :long ['clojure.core/long-array 'longs 'long]
    :byte ['clojure.core/byte-array 'bytes 'byte]})
 
+(defn reference-identity-source
+  "The explicit normalized reference-identity grammar, not a JVM Class proof.
+   Source admission owns normalization of the binder's physical completion.
+   Consumers additionally require compatible preceding BUFFER values. Unknown
+   evaluation obligations and implicit binder checks are not admitted here."
+  [binder expression]
+  (let [parts (completion/object-input-parts expression)
+        operand (:operand parts)
+        allowed? (fn [node]
+                   (and (not-any? (fn [[key value]]
+                                    (and value (keyword? key) (= "raster.effect" (namespace key))
+                                         (or (not= key :raster.effect/preserve-evaluation)
+                                             (not (true? value)))))
+                                  (meta node))
+                        (every? #{:preserve-source-evaluation} (:flags (effects/descriptor node)))))]
+    (when (and (symbol? binder) (= 'java.lang.Object (:tag (meta binder)))
+               (some? (dtype/dtype-for-array-tag (:raster.type/tag (meta binder))))
+               (symbol? operand) (every? allowed? [binder expression operand]))
+      operand)))
+
+(defn preserved-reference-identity?
+  [binder expression]
+  (and (some? (reference-identity-source binder expression))
+       (or (true? (:raster.effect/preserve-evaluation (meta binder)))
+           (true? (:raster.effect/preserve-evaluation (meta expression))))))
+
 (defn shape-projection-source
   [expression]
   (loop [expression expression]

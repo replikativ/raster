@@ -20,6 +20,7 @@
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.ir.extent-proof :as extent-proof]
@@ -4063,18 +4064,34 @@
                                          (symbol? expression) expression)
                            {:keys [formal carrier] :as provenance} (get carriers operand)
                            array-carrier? (some? (some-> carrier dtype/dtype-for-jvm-array-class))
+                           normalized-id (vary-meta id assoc :tag 'java.lang.Object)
+                           normalized-expression (when checked
+                                                   (with-meta
+                                                     (completion/complete-value completion/object-input-contract operand)
+                                                     (meta expression)))
+                           preserved? (and checked
+                                           (invocation-source/preserved-reference-identity?
+                                            normalized-id normalized-expression))
                            identity? (and provenance array-carrier?
                                           (or (nil? checked)
                                               (identical? carrier (get-in checked [:contract :target-carrier])))
                                           (= (some-> carrier dtype/dtype-for-jvm-array-class dtype/canon)
                                              (some-> (get array-types formal) dtype/canon))
                                           (reference-array-declarations-compatible? carrier [id expression operand])
-                                          (not-any? snapshot-evaluation-required? [id expression operand])
+                                          (not-any? snapshot-evaluation-required? [id operand])
+                                          (or (not (snapshot-evaluation-required? expression)) preserved?)
                                           (binding-completion/reference-binding-without-check?
-                                           id source-ns source-binding-context carrier))
+                                           id source-ns source-binding-context carrier)
+                                          (or (not preserved?)
+                                              (binding-completion/object-binding-without-check?
+                                               normalized-id source-ns source-binding-context)))
                            project? (and identity? checked)]
                        (cond-> (-> state
-                                   (update :projected into [id (if project? operand expression)])
+                                   (update :projected into
+                                           [(if (and project? preserved?) normalized-id id)
+                                            (cond (and project? preserved?) normalized-expression
+                                                  project? operand
+                                                  :else expression)])
                                    (update :carriers dissoc id))
                          identity? (assoc-in [:carriers id] provenance)
                          project? (update :replaced inc))))

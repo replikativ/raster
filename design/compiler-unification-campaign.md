@@ -47,6 +47,44 @@ qualification removes three of four boxed-array checks in the recorded LoRA
 producer; its remaining preserved target snapshot is still an open continuation
 obligation, not evidence of successful GPU training.
 
+The bounded continuation vertical under qualification is an **ordered reference identity**:
+
+1. An authenticated entry proof may replace a redundant boxed-array check with
+   exact Object-input completion, keeping the original-position binding and its
+   evaluation metadata. It must not turn checked Float conversion or an unknown
+   reference cast into an unchecked operation.
+2. The existing invocation `ValueAlias` should realize that exact reference
+   identity over a compatible preceding buffer. The retained source expression
+   and its metadata remain part of source replay, not a new advisory certificate.
+3. Preserved reference identities must remain invocation roots even when their
+   numerical result is dead. Their dependency closure and source order must be
+   explicit; an arbitrary host continuation still needs its own executor.
+4. Direct invocation materialization must execute the alias without scalar code,
+   copies or driver allocation. Compatibility projection must not rebuild an
+   unmarked symbol: the old descriptor adapter has no retained-invocation executor
+   and explicitly refuses required wrapped identities before registration.
+   Qualify changed-source rejection, unused identities,
+   nullable inputs, incompatible storage, and checked/effectful negative controls.
+
+The implementation reuses existing invocation
+steps rather than adding a parallel completion/ownership IR. It does not close
+the older source-binder CHECKCAST omission before generic copy propagation.
+Review refinement: after proving the original binder completion, normalize its
+physical hint to explicit `java.lang.Object` while retaining the logical array
+tag, and independently prove that normalized binder under the original policy.
+Keep those JVM queries at owned source admission. Portable invocation validation
+must check explicit normalized syntax and exact source replay, not resolve Classes
+or accept an advisory metadata certificate. Liveness retention is needed in both
+whole-program invocation-prefix construction and resident projection (including
+retention before the compatibility adapter's explicit refusal). No new descriptor
+ABI or implicit fallback is introduced.
+Dead identities obtain their AV only from an existing public or preceding
+selected prefix value, never from a future value-table seed or kernel result.
+The actual LoRA producer now advances beyond its boxed-array entry refusal to a
+missing extent dependency in the prefix. This is not complete training or phase
+qualification; the independent result/precision, write-coverage and legacy
+implicit-binder obligations remain open.
+
 Update the existing capability/compatibility ledger with each failure's owner,
 accepted or deliberately declined form, numerical/effect oracle and removal gate.
 Current node-wise AD composition is bounded but implemented; historical statements

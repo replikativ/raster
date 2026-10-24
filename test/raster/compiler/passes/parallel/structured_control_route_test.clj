@@ -1267,6 +1267,50 @@
              (reason-of #(validate malformed (retained-aget 0))))
           "malformed inner evidence fails closed at the source-result boundary"))))
 
+(deftest preserved-reference-identities-remain-prefix-roots-when-numerically-dead
+  (let [binder (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        chained (with-meta 'chained {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        identity (vary-meta (completion/complete-value completion/object-input-contract 'x)
+                            assoc :raster.effect/preserve-evaluation true)
+        chained-identity (vary-meta (completion/complete-value completion/object-input-contract binder)
+                                    assoc :raster.effect/preserve-evaluation true)
+        source (list 'let* [binder identity
+                            chained chained-identity
+                            'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)
+        options {:dtype :double :public-parameters '[x out n]
+                 :array-types {'x :double 'out :double} :scalar-types {'n :long}}
+        attempt (:program (typed-route/attempt source :double (:array-types options)
+                                               {:scalar-types (:scalar-types options)
+                                                :lexical-inputs (:public-parameters options)}))
+        promoted (route/promote-program attempt options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        alias (first (filter #(= binder (:symbol %)) (:steps plan)))]
+    (is (some? attempt))
+    (is (not (some #{binder} (:inputs promoted))) "no numerical kernel needs the snapshot")
+    (is (invocation/value-alias? alias))
+    (is (= (meta identity) (meta (:source-expression alias))))
+    (is (some #(= (:id alias) (:invocation-step %)) (invocation/source-order plan promoted)))
+    (let [second-alias (first (filter #(= chained (:symbol %)) (:steps plan)))]
+      (is (invocation/value-alias? second-alias))
+      (is (= (:id alias) (:source second-alias)))
+      (is (= (:value alias) (:value second-alias))))
+    (let [future-source (list 'let* [chained chained-identity binder identity
+                                     'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)
+          future-program (:program (typed-route/attempt future-source :double (:array-types options)
+                                                         {:scalar-types (:scalar-types options)
+                                                          :lexical-inputs (:public-parameters options)}))]
+      (is (= :structured-control-prefix-identity-source
+             (reason-of #(route/promote-program future-program options)))
+          "a later definition cannot populate an earlier invocation identity"))
+    (let [ordinary-source (list 'let* [binder (vary-meta identity dissoc :raster.effect/preserve-evaluation)
+                                      'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)
+          ordinary (:program (typed-route/attempt ordinary-source :double (:array-types options)
+                                                   {:scalar-types (:scalar-types options)
+                                                    :lexical-inputs (:public-parameters options)}))]
+      (is (not-any? #(= binder (:symbol %))
+                    (get-in (route/promote-program ordinary options) [:attributes :invocation-plan :steps]))
+          "ordinary dead aliases do not acquire evaluation roots"))))
+
 (deftest island-live-outs-do-not-prove-whole-source-completion
   (let [options {:dtype :double :public-parameters '[x out n]
                  :array-types {'x :double 'out :double}

@@ -48,6 +48,17 @@
         projected (normalize body {})]
     (is (= 'values (get (into {} (map vec) (partition 2 (second projected))) 'array-input)))
     (is (= 'array-input (last projected)) "the existing alias/return path owns the public projection")
+    (let [expression (vary-meta (checked array-class 'values)
+                                assoc :raster.effect/preserve-evaluation true)
+          retained (normalize (list 'let* [binder expression] 'values) {})
+          [id identity] (take 2 (second retained))]
+      (is (= 'java.lang.Object (:tag (meta id))))
+      (is (= 'doubles (:raster.type/tag (meta id))))
+      (is (= 'values (:operand (completion/object-input-parts identity))))
+      (is (true? (:raster.effect/preserve-evaluation (meta identity))))
+      (is (= :jvm-bytecode-boxed-parameter-input
+             (:source-context (:contract (completion/boxed-reference-input-parts expression))))
+          "the original checked source remains unchanged"))
     (let [snapshot (with-meta 'snapshot {:tag 'Object :raster.type/tag 'doubles})
           object-input #(completion/complete-value completion/object-input-contract %)
           chained (list 'let* [snapshot (object-input 'values)
@@ -78,7 +89,7 @@
              [(list 'let* ['values '(clojure.core/float-array 1)
                           binder (checked array-class 'values)] 'array-input) {}]
              [(list 'let* [binder (vary-meta (checked array-class 'values)
-                                            assoc :raster.effect/preserve-evaluation true)]
+                                            assoc :raster.effect/source-reference-cast true)]
                     'array-input) {}]]]
       (let [unchanged (frontend/normalize-source candidate (merge baseline-options changes))
             result (normalize candidate changes)]

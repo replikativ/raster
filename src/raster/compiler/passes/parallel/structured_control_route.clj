@@ -320,7 +320,12 @@
         available (set (keys definitions))]
     (loop [required (set/intersection available (set roots))]
       (let [dependencies (->> required
-                              (mapcat #(util/free-syms (get definitions %)))
+                              (mapcat (fn [symbol]
+                                        (let [expression (get definitions symbol)]
+                                          (if-let [source (invocation-source/reference-identity-source
+                                                           symbol expression)]
+                                            [source]
+                                            (util/free-syms expression)))))
                               set
                               (set/intersection available))
             required' (set/union required dependencies)]
@@ -362,7 +367,10 @@
                 (comp (mapcat (comp #(mapcat util/free-syms %) :shape val))
                       (filter #(scalar-value? (get prefix-values %))))
                 program-values)
-          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots)
+          retained-identities (into #{} (keep (fn [[symbol expression]]
+                                               (when (invocation-source/preserved-reference-identity?
+                                                      symbol expression) symbol))) candidates)
+          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots retained-identities)
                                 (set public-parameters))
           required (required-prefix-symbols candidates roots)
           bindings (filterv (comp required first) candidates)
@@ -827,17 +835,25 @@
         parallel-program (assoc parallel-program :values program-values)
         prefix (invocation-prefix parallel-program public-parameters host-values)
         _ (validate-host-coverage! parallel-program prefix (set public-parameters))
-        binding-values
-        (into {}
-              (map (fn [[symbol expression]]
-                     (let [program-value (get program-values symbol)
-                           host-value (get host-values symbol)
+        [binding-values _]
+        (reduce (fn [[resolved available] [symbol expression]]
+                     (let [identity-source (invocation-source/reference-identity-source symbol expression)
+                           ;; A dead identity may have no numerical equation/AV.
+                           ;; It still denotes exactly one preceding invocation
+                           ;; value; use that existing contract, not array hints.
+                           identity-value (when identity-source (get available identity-source))
+                           _ (when (and identity-source (nil? identity-value))
+                               (fail! :structured-control-prefix-identity-source
+                                      "reference identity requires a preceding invocation value"
+                                      {:symbol symbol :source identity-source}))
+                           program-value (get program-values symbol)
+                           host-value (or identity-value (get host-values symbol))
                            value (cond
                                    ;; An exact lexical alias keeps one runtime storage identity.
                                    ;; Its program-side symbolic shape remains authoritative and
                                    ;; materialization later proves both symbolic extents resolve to
                                    ;; the same concrete view before binding.
-                                   (and program-value host-value (symbol? expression))
+                                   (and program-value host-value (or (symbol? expression) identity-source))
                                    program-value
 
                                    (and program-value host-value)
@@ -856,7 +872,8 @@
                          (fail! :structured-control-prefix-value
                                 "host-prefix binding has no retained AbstractValue"
                                 {:symbol symbol :expression expression}))
-                       [symbol value])))
+                       [(assoc resolved symbol value) (assoc available symbol value)]))
+              [{} parameter-values]
               prefix)
         program-values
         (reduce-kv (fn [values symbol value]
