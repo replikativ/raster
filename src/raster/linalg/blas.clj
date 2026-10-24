@@ -1049,6 +1049,41 @@
     (catch Exception _ false)))
 
 ;; ================================================================
+;; Guards for the compiler's dense-contraction BLAS leaf
+;; ================================================================
+
+(defonce ^:private gemm-provider
+  (delay (boolean (try (available?) (catch Throwable _ false)))))
+
+(defn gemm-provider-ready?
+  "Cached: is a BLAS GEMM provider loaded and functional in this JVM? Any admission error
+   counts as unavailable, because callers (the compiler's dense-contraction leaf) always hold
+   an exact generated fallback."
+  []
+  @gemm-provider)
+
+(defn dense-gemm-admissible?
+  "Run-time guard of the compiler's BLAS leaf for C := A·B with logical shapes m×k, k×n
+   (any of the :nn/:nt/:tn orientations; capacities are orientation independent).
+   True only when the provider is ready, A, B and C are arrays of `elem` (:double/:float),
+   C is identical to neither A nor B (JVM arrays never partially overlap, so identity is
+   exactly overlap), every extent is in [0, Integer/MAX_VALUE], and m·k ≤ |A|, k·n ≤ |B|,
+   m·n ≤ |C|. False means: run the generated loop instead."
+  [elem A B C m k n]
+  (let [array-class (case elem :double (Class/forName "[D") :float (Class/forName "[F") nil)
+        in-range? (fn [x] (and (integer? x) (<= 0 (long x) Integer/MAX_VALUE)))]
+    (boolean
+     (and array-class
+          (gemm-provider-ready?)
+          (instance? array-class A) (instance? array-class B) (instance? array-class C)
+          (not (identical? C A)) (not (identical? C B))
+          (in-range? m) (in-range? k) (in-range? n)
+          (let [m (long m) k (long k) n (long n)]
+            (and (<= (* m k) (java.lang.reflect.Array/getLength A))
+                 (<= (* k n) (java.lang.reflect.Array/getLength B))
+                 (<= (* m n) (java.lang.reflect.Array/getLength C))))))))
+
+;; ================================================================
 ;; Backward helper for dgemm! (template-based AD codegen)
 ;; C = alpha * A @ B + beta * C
 ;; dA = alpha * dC @ B^T, dB = alpha * A^T @ dC
