@@ -20,6 +20,7 @@
   (:require [clojure.walk]
             [raster.ad.purity :as purity]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
@@ -413,7 +414,7 @@
                                {:init init})))
         reduce-form (with-meta reduce-form {:raster.type/elem-type et})]
     (if post-fn
-      (clojure.walk/postwalk-replace {acc reduce-form} post-fn)
+      (util/postwalk-preserving-meta #(get {acc reduce-form} % %) post-fn)
       reduce-form)))
 
 (defn- let-form?

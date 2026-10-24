@@ -793,7 +793,7 @@
                         (cond-> result callee (vary-meta assoc :raster.op/lexical-callee callee))))))
                 (vector? expression) (mapv #(go % lexical known) expression)
                 (record? expression) (reduce-kv (fn [r k v] (assoc r k (go v lexical known))) expression expression)
-                (map? expression) (into (empty expression) (map (fn [[k v]] [(go k lexical known) (go v lexical known)]) expression))
+                (map? expression) (util/map-preserving-identity #(go % lexical known) expression)
                 (set? expression) (into (empty expression) (map #(go % lexical known) expression))
                 :else expression))]
       (go source (set (keys param-env)) {}))))

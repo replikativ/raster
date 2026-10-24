@@ -396,7 +396,7 @@
         (or (project-scalar-accumulation env lowered)
             (project-array-accumulation env lowered) lowered)))
     (vector? expression) (util/remake-if-changed expression (mapv #(lower env % products?) expression))
-    (map? expression) (into (empty expression) (map (fn [[k v]] [(lower env k products?) (lower env v products?)])) expression)
+    (map? expression) (util/map-preserving-identity #(lower env % products?) expression)
     (set? expression) (into (empty expression) (map #(lower env % products?)) expression)
     :else expression))
 

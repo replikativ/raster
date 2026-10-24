@@ -55,10 +55,14 @@
                          :object-binder (fresh! "entry_object__")
                          :input-binder (fresh! "entry_input__")
                          :parameter-class carrier
+                         ;; A distinct existing contract term identifies this
+                         ;; actual snapshot constructor across lexical hygiene.
+                         ;; Its data/semantics remain ordinary Object completion.
+                         :object-contract (into {} completion/object-input-contract)
                          :contract (completion/bytecode-boxed-parameter-contract carrier)})
                       (range) parameters arguments carriers)
-          objects (mapv (fn [{:keys [object-binder original-argument]}]
-                          [object-binder (completion/complete-value completion/object-input-contract
+          objects (mapv (fn [{:keys [object-binder original-argument object-contract]}]
+                          [object-binder (completion/complete-value object-contract
                                                                     original-argument)]) slots)
           inputs (mapv (fn [{:keys [input-binder object-binder contract]}]
                          [input-binder (completion/complete-value contract object-binder)]) slots)]

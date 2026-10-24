@@ -25,6 +25,21 @@
   (doseq [empty-form ['() []]]
     (is (identical? empty-form (util/remake-if-changed empty-form [])))))
 
+(deftest map-reconstruction-preserves-only-unchanged-child-identities
+  (let [original (with-meta (array-map :class Double/TYPE :value 'x) {:line 7})]
+    (doseq [result [(util/map-preserving-identity identity original)
+                    (util/subst-syms {} original)
+                    (util/alpha-convert original)
+                    (util/postwalk-preserving-meta identity original)]]
+      (is (identical? original result)))
+    (let [changed (with-meta (symbol "x") {:tag 'double})
+          result (util/map-preserving-identity #(if (= 'x %) changed %) original)]
+      (is (= original result) "equality ignores a changed child's metadata")
+      (is (not (identical? original result)))
+      (is (identical? changed (:value result)))
+      (is (identical? (meta original) (meta result)))
+      (is (= (class original) (class result))))))
+
 (deftest result-effect-branches-bind-only-their-continuation
   (let [source '(effect-region []
                  [(effect out :unique 0 true joined)

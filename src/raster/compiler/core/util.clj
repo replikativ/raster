@@ -190,6 +190,20 @@
       (vary-meta replacement merge (meta expr))
       replacement)))
 
+(defn map-preserving-identity
+  "Rewrite ordinary map keys/values, retaining the occurrence on a true no-op.
+   Changed metadata is a changed child even when equality is unchanged. This
+   preserves inert constructor data; it grants no source or execution proof."
+  [f original]
+  (let [changed? (volatile! false)
+        entries (mapv (fn [[key value]]
+                        (let [key' (f key) value' (f value)]
+                          (when-not (and (identical? key key') (identical? value value'))
+                            (vreset! changed? true))
+                          [key' value'])) original)]
+    (if-not @changed? original
+      (with-meta (into (empty original) entries) (meta original)))))
+
 (defn subst-syms
   "Capture-avoiding substitution of free symbol occurrences per
    smap {old-sym → replacement-expr}, over a closed-core S-expression.
@@ -225,7 +239,7 @@
        ;; IR records (KernelBody IndexExpr, SegOps, ...) are maps whose type must survive:
        ;; substitute inside their fields, never `empty` them.
        (record? expr) (reduce-kv (fn [r k v] (assoc r k (subst-syms smap v leaf-fn observe!))) expr expr)
-       (map? expr) (into (empty expr) (map (fn [[k v]] [(subst-syms smap k leaf-fn observe!) (subst-syms smap v leaf-fn observe!)]) expr))
+       (map? expr) (map-preserving-identity #(subst-syms smap % leaf-fn observe!) expr)
        (set? expr) (into (empty expr) (map #(subst-syms smap % leaf-fn observe!) expr))
        :else expr))]
      (when observe! (observe! expr constructed smap))
@@ -290,7 +304,7 @@
        (remake-from form (map #(alpha-convert env % observe!) form)))
      (vector? form) (with-meta (mapv #(alpha-convert env % observe!) form) (meta form))
      (record? form) (reduce-kv (fn [r k v] (assoc r k (alpha-convert env v observe!))) form form)
-     (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k observe!) (alpha-convert env v observe!)]) form))
+     (map? form) (map-preserving-identity #(alpha-convert env % observe!) form)
      (set? form) (into (empty form) (map #(alpha-convert env % observe!) form))
      :else form)]
      (when observe! (observe! form constructed env))
@@ -516,9 +530,7 @@
                         (and (seq? form) (contains? '#{quote clojure.core/quote} (first form))) form
                         (or (seq? form) (vector? form)) (remake-if-changed form (mapv go form))
                         (record? form) (reduce-kv (fn [r k v] (assoc r k (go v))) form form)
-                        (map? form) (with-meta
-                                      (into (empty form) (map (fn [[k v]] [(go k) (go v)])) form)
-                                      (meta form))
+                        (map? form) (map-preserving-identity go form)
                         (set? form) (with-meta (into (empty form) (map go) form) (meta form))
                         :else form))]
                (when observe! (observe! form constructed))

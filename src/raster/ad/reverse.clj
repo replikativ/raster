@@ -374,6 +374,38 @@
 (declare ^:private product-expression)
 (declare ^:private generated-helper-record)
 (declare ^:private generated-bytecode-helper-record)
+(declare assert-prepared-program-source! prepared-bytecode-entry)
+(declare ^:private assert-generated-producer-core!)
+
+(defn- generated-helper-context?
+  "The existing helper interpreter needs its actual invocation-local resources.
+   An entry-slot construction scope alone is not a helper or general completion
+   consumer; it must retain ordinary source refusal/fallback behavior."
+  []
+  (boolean (if (= :jvm-bytecode (:backend *generated-product-context*))
+             (:owned-helper-calls *generated-product-context*)
+             (:helpers *generated-product-context*))))
+
+(defn- owned-entry-slot!
+  [contract role]
+  (let [^java.util.IdentityHashMap entries (:entry-contracts *generated-product-context*)
+        entry (when entries (.get entries contract))
+        {:keys [construction slot]} entry
+        prepared (:prepared construction)
+        physical (when prepared (prepared-bytecode-entry prepared))
+        ordinal (:ordinal slot)
+        carrier (when physical
+                  (nth (:parameter-carriers
+                        ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/physical-entry-view)
+                         physical (:params prepared))) ordinal nil))]
+    (when-not (and entry (= role (:role entry))
+                   (assert-prepared-program-source! prepared)
+                   (identical? (:core construction) (assert-generated-producer-core! prepared))
+                   (identical? carrier (:parameter-class slot))
+                   (identical? contract (get slot (if (= role :object) :object-contract :contract))))
+      (throw (ex-info "Boxed input has no actual prepared entry constructor"
+                      {:reason :ad-unclosed-completion-transpose :source-context (:source-context contract)})))
+    entry))
 
 (defn- assert-completion-transpose-domain! [contract]
   (when (contains? #{:jvm-bytecode-result-context :jvm-bytecode-integral-input
@@ -384,13 +416,18 @@
                      :source-context (:source-context contract)}))))
 
 (defn- structural-completion?
-  "Object input completion needs no generated compilation policy. Primitive
-   inputs and checked references still belong to their explicit source owner."
+  "Object completion and explicit Class.cast retain their actual primal action
+   and need no helper interpreter. Primitive input contexts still belong to
+   their explicit source owner; boxed entry contexts need their actual slot."
   [expression]
   (when-let [{:keys [contract]} (value-completion/canonical-parts expression)]
     (assert-completion-transpose-domain! contract)
-    (or (= value-completion/object-input-contract contract)
-        (some? *generated-product-context*))))
+    (or (when (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
+          (owned-entry-slot! contract :boxed)
+          true)
+        (= value-completion/object-input-contract contract)
+        (= :jvm-checkcast (:source-context contract))
+        (generated-helper-context?))))
 
 (defn- init-active?
   "Decide whether a binding init carries gradient (is active), given the current
@@ -609,6 +646,8 @@
     (when-not (= :jvm-bytecode (:backend *generated-product-context*))
       (throw (ex-info "Bytecode completion transpose requires its bytecode program owner"
                       {:reason :ad-unclosed-completion-transpose})))
+    :jvm-bytecode-boxed-parameter-input
+    (owned-entry-slot! contract :boxed)
     (throw (ex-info "Floating completion has no owned transpose context"
                     {:reason :ad-unclosed-completion-transpose})))
   (when-not (and (value-completion/canonical-contract? contract)
@@ -620,7 +659,7 @@
                      :source-tag source-tag :result-tag result-tag})))
   {:source-tag source-tag})
 
-(defmethod ad-record :completion [_ sym init activity]
+(defn- record-completion [sym init activity]
   (let [{:keys [contract operand]} (value-completion/canonical-parts init)]
    (assert-completion-transpose-domain! contract)
    (if (and (= value-completion/object-input-contract contract)
@@ -660,6 +699,38 @@
         {:record {:type :alias :sym sym :source operand :result-aliases #{operand}}}
         {:record nil})
 
+      :jvm-bytecode-boxed-parameter-input
+      (let [{:keys [slot]} (owned-entry-slot! contract :boxed)
+            input-fact (get-in *source-memory-context* [:value-facts operand])
+            carrier (:parameter-class slot)
+            source-tag (::entry-source-tag input-fact)
+            active? (get activity operand)
+            result-tag (get {Float/TYPE 'float Double/TYPE 'double} carrier)]
+        (when-not (and (identical? slot (::entry-slot input-fact))
+                       (identical? carrier (:target-carrier contract)))
+          (throw (ex-info "Prepared input lost its preceding Object snapshot"
+                          {:reason :ad-unclosed-completion-transpose :binding sym})))
+        (cond
+          (not (.isPrimitive ^Class carrier))
+          (do
+            (when (and active? (or (= Object carrier)
+                                   (not= :array (:kind (tangent/tangent-kind source-tag)))))
+              (throw (ex-info "Active reference entry has no array tangent provenance"
+                              {:reason :ad-unclosed-completion-transpose :binding sym})))
+            {:record {:type :alias :sym sym :source operand :result-aliases #{operand}}})
+
+          (not active?) {:record {:type :primal :sym sym}}
+
+          (and result-tag (contains? #{'float 'double} source-tag)
+               (= result-tag (types/sym-type-tag sym)))
+          {:record (merge {:type :floating-completion :sym sym :source operand}
+                          (floating-completion-tangent-plan
+                           contract operand source-tag result-tag
+                           (:source-policy *generated-product-context*)))}
+
+          :else (throw (ex-info "Active prepared input lacks a floating tangent edge"
+                                {:reason :ad-unclosed-completion-transpose :binding sym}))))
+
       (:jvm-primitive-input :jvm-bytecode-floating-input)
       (do
         ;; Validate through the source projection authority. This is the actual
@@ -678,6 +749,27 @@
                             (floating-completion-tangent-plan
                              contract operand source-tag result-tag
                              (:source-policy *generated-product-context*)))}))))))))
+
+(defmethod ad-record :completion [_ sym init activity]
+  (let [{:keys [contract operand]} (value-completion/canonical-parts init)
+        ^java.util.IdentityHashMap entries (:entry-contracts *generated-product-context*)
+        entry (when entries (.get entries contract))
+        result (record-completion sym init activity)]
+    (if-not entry result
+      (let [role (:role entry)
+            _ (owned-entry-slot! contract role)
+            ^java.util.IdentityHashMap seen (:entry-seen *generated-product-context*)]
+        (when (.containsKey seen contract)
+          (throw (ex-info "Prepared entry constructor occurs more than once in this AD scope"
+                          {:reason :ad-unclosed-completion-transpose :binding sym})))
+        (.put seen contract sym)
+        (if-not (= :object role) result
+          (let [source-tag (when (symbol? operand)
+                             (types/sym-type-tag
+                              (exact-replay-root operand (:value-facts *source-memory-context*))))]
+            (update result :record
+                    #(assoc-in (or % {:type :primal :sym sym}) [:value-facts sym]
+                               {::entry-slot (:slot entry) ::entry-source-tag source-tag}))))))))
 
 ;; out[e] = src[index[e]] (strided: blocks of `stride`). The forward runs as
 ;; written; the pullback is its transpose, a scatter-add into d_src.
@@ -899,7 +991,7 @@
                      (when (tmpl/reverse-rule? (first candidate)) candidate)))
         has-active-args? (some #(and (symbol? %) (get activity % false))
                                (cond-> args lexical (conj lexical)))]
-    (if-let [owned (when (and *generated-product-context* (not resolved))
+    (if-let [owned (when (and (generated-helper-context?) (not resolved))
                      (generated-helper-record sym init-expr activity))]
       owned
       (do
@@ -4707,12 +4799,7 @@
 (defn- postwalk-code
   "Postwalk executable forms, leaving quoted data untouched."
   [f body]
-  (letfn [(step [form]
-            (if (and (seq? form)
-                     (contains? '#{quote clojure.core/quote} (first form)))
-              form
-              (f (walk/walk step identity form))))]
-    (step body)))
+  (util/postwalk-preserving-meta f body))
 
 (defn- binaryize-core-arithmetic
   "Express core arithmetic's variadic contract using identities, aliases,
@@ -6046,6 +6133,167 @@
                     :elements (if (= mode :value+grad) results gradients)}]
     {:qualified qualified :hygienic hygienic :projected projected :projection projection}))
 
+(defn- register-entry-construction! [context construction]
+  (let [prepared (:prepared construction)
+        physical (prepared-bytecode-entry prepared)
+        carriers (:parameter-carriers
+                  ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/physical-entry-view)
+                   physical (:params prepared)))
+        slots (:slots construction)
+        ^java.util.IdentityHashMap entries (:entry-contracts context)]
+    (when-not (and (identical? (:core construction) (assert-generated-producer-core! prepared))
+                   (contains? #{:grad :value+grad} (:mode construction))
+                   (vector? slots) (= (count slots) (count carriers) (count (:params prepared)))
+                   (every? true?
+                           (map-indexed
+                            (fn [ordinal slot]
+                              (and (= ordinal (:ordinal slot))
+                                   (identical? (nth (:params prepared) ordinal) (:formal slot))
+                                   (identical? (nth carriers ordinal) (:parameter-class slot))
+                                   (= value-completion/object-input-contract (:object-contract slot))
+                                   (= (value-completion/bytecode-boxed-parameter-contract
+                                       (:parameter-class slot)) (:contract slot)))) slots)))
+      (throw (ex-info "Prepared source construction differs from its actual entry slots"
+                      {:reason :ad-unclosed-completion-transpose})))
+    (when (some #(and (some? %) (.isArray ^Class (class %)))
+                (tree-seq coll? seq (map :original-argument slots)))
+      (throw (ex-info "Prepared source history cannot capture a numerical runtime array"
+                      {:reason :ad-unclosed-completion-transpose})))
+    (doseq [slot (:slots construction)
+            [role contract] [[:object (:object-contract slot)] [:boxed (:contract slot)]]]
+      (when (.containsKey entries contract)
+        (throw (ex-info "Prepared entry constructor was registered twice"
+                        {:reason :ad-unclosed-completion-transpose})))
+      (.put entries contract {:role role :construction construction :slot slot}))
+    (swap! (:entry-constructions context) conj construction)
+    construction))
+
+(defn- freshen-prepared-core
+  "Instantiate actual retained constructor terms, not copied metadata permission.
+   Whole-form hygiene may rename values; the paired contract identities still
+   connect each Object snapshot to its own checked input in the forward scope."
+  [context prepared mode]
+  (assert-prepared-program-source! prepared)
+  (let [core (assert-generated-producer-core! prepared)
+        history (::entry-constructions prepared)
+        ^java.util.IdentityHashMap replacements (java.util.IdentityHashMap.)
+        constructions (atom [])]
+    (when-not (and core (vector? history) (contains? #{:grad :value+grad} mode))
+      (throw (ex-info "Prepared AD source has no retained constructor history"
+                      {:reason :ad-unclosed-completion-transpose})))
+    (doseq [original history]
+      (let [slots (mapv (fn [slot]
+                          (reduce (fn [slot key]
+                                    (let [old (get slot key)
+                                          fresh (into {} old)]
+                                      (when (.containsKey replacements old)
+                                        (throw (ex-info "Prepared constructor history repeats a term"
+                                                        {:reason :ad-unclosed-completion-transpose})))
+                                      (.put replacements old fresh)
+                                      (assoc slot key fresh)))
+                                  slot [:object-contract :contract]))
+                        (:slots original))]
+        ;; The origin is an actual retained return under the authenticated
+        ;; parent, not an independently supplied proof catalog.
+        (swap! constructions conj
+               {:prepared (:prepared original) :core (:core original) :mode (:mode original)
+                :slots slots :import-parent prepared :import-origin original})))
+    (let [source (first (:walked-body core))
+          fresh (util/postwalk-preserving-meta
+                 (fn [node] (if (.containsKey replacements node) (.get replacements node) node)) source)]
+      (doseq [construction @constructions]
+        (register-entry-construction! context (assoc construction :source fresh)))
+      {:core core :source fresh})))
+
+(defn- project-source-ad-call [context prepared arguments mode param-env caller]
+  (source-owner/assert-portable-source! prepared)
+  (let [{:keys [params source-ns]} prepared
+        owner (::generated-program-owner prepared)
+        {:keys [core source]} (freshen-prepared-core context prepared mode)
+        _ (flat-prepared-call-source! core arguments mode caller owner)
+        physical (prepared-bytecode-entry prepared)
+        plan ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/instantiate-boxed-entry-inputs)
+              physical params (vec arguments))
+        _ (when-not (and (= (count arguments) (count (:slots plan)))
+                          (every? true? (map identical? arguments (map :original-argument (:slots plan)))))
+            (throw (ex-info "Prepared input construction changed its original arguments"
+                            {:reason :ad-unclosed-completion-transpose})))
+        construction (assoc plan :prepared prepared :core core :mode mode)
+        _ (register-entry-construction! context construction)
+        result (:projection (project-flat-prepared-call source params source-ns plan mode))]
+    (adopt-prepared-program-inputs! prepared)
+    (assert-prepared-program-source! prepared)
+    result))
+
+(defn- source-ad-context [policy]
+  (let [context {:source-policy policy
+                 :entry-contracts (java.util.IdentityHashMap.)
+                 :entry-seen (java.util.IdentityHashMap.)
+                 :entry-constructions (atom [])}]
+    (assoc context :project-prepared-call
+           (fn [prepared arguments mode param-env caller]
+             (project-source-ad-call context prepared arguments mode param-env caller)))))
+
+(defn- assert-entry-construction-history! [program]
+  (let [history (::entry-constructions program)
+        core (assert-generated-producer-core! program)
+        ^java.util.IdentityHashMap contracts (java.util.IdentityHashMap.)
+        ^java.util.IdentityHashMap seen (java.util.IdentityHashMap.)]
+    (when-not (vector? history)
+      (throw (ex-info "Generated program lost its actual entry construction history"
+                      {:reason :ad-unclosed-completion-transpose})))
+    (doseq [construction history
+            :let [prepared (:prepared construction)]
+            slot (:slots construction)]
+      (when-not (and (assert-prepared-program-source! prepared)
+                     (identical? (:core construction) (assert-generated-producer-core! prepared))
+                     (or (nil? (:import-parent construction))
+                         (let [parent (:import-parent construction)]
+                           (and (assert-prepared-program-source! parent)
+                                (some #(identical? % (:import-origin construction))
+                                      (::entry-constructions parent))))))
+        (throw (ex-info "Generated entry history lost its original guarded constructor"
+                        {:reason :ad-unclosed-completion-transpose})))
+      (doseq [contract [(:object-contract slot) (:contract slot)]]
+        (when (.containsKey contracts contract)
+          (throw (ex-info "Generated entry history repeats a contract occurrence"
+                          {:reason :ad-unclosed-completion-transpose})))
+        (.put contracts contract slot)))
+    (doseq [node (tree-seq #(and (coll? %) (not (and (seq? %) (contains? '#{quote clojure.core/quote} (first %)))))
+                          seq (:walked-body (or core program)))
+            :let [{:keys [contract]} (value-completion/canonical-parts node)]
+            :when (= :jvm-bytecode-boxed-parameter-input (:source-context contract))]
+      (when (or (not (.containsKey contracts contract)) (.containsKey seen contract))
+        (throw (ex-info "Generated core has an unowned or duplicated boxed input"
+                        {:reason :ad-unclosed-completion-transpose})))
+      (.put seen contract true))
+    ;; Every imported entry is a call-by-value boundary, including inactive
+    ;; parameters. Audit the actual flat producer after normalization: the
+    ;; snapshots all precede the conversions, and each conversion reads its
+    ;; own snapshot. Missing checks cannot be justified by an unused tangent.
+    (let [source (first (:walked-body (or core program)))
+          bindings (when (and (form/binding-form? source) (vector? (second source)))
+                     (partition 2 (second source)))
+          ^java.util.IdentityHashMap occurrences (java.util.IdentityHashMap.)]
+      (doseq [[position [sym init]] (map-indexed vector bindings)
+              :let [{:keys [contract operand]} (value-completion/canonical-parts init)]
+              :when (.containsKey contracts contract)]
+        (when (.containsKey occurrences contract)
+          (throw (ex-info "Generated entry repeats a required input action"
+                          {:reason :ad-unclosed-completion-transpose})))
+        (.put occurrences contract {:position position :sym sym :operand operand}))
+      (doseq [construction history
+              :let [slots (:slots construction)
+                    objects (mapv #(.get occurrences (:object-contract %)) slots)
+                    inputs (mapv #(.get occurrences (:contract %)) slots)]]
+        (when-not (and (every? some? objects) (every? some? inputs)
+                       (or (empty? slots)
+                           (apply < (concat (map :position objects) (map :position inputs))))
+                       (every? true? (map #(= (:sym %1) (:operand %2)) objects inputs)))
+          (throw (ex-info "Generated core lost or reordered an actual entry boundary"
+                          {:reason :ad-unclosed-completion-transpose})))))
+    program))
+
 (defn ^:no-doc project-prepared-value+grad-call
   "Instantiate the shared flat preparation at one compiler call site.
    Validate the producer's padded result boundary before whole-form hygiene and
@@ -6056,6 +6304,9 @@
   ([prepared arguments mode param-env]
    (project-prepared-value+grad-call prepared arguments mode param-env nil))
   ([{:keys [params source-ns] :as prepared} arguments mode param-env caller]
+  (if-let [project! (:project-prepared-call *generated-product-context*)]
+    (project! prepared arguments mode param-env caller)
+    (do
   (source-owner/assert-portable-source! prepared)
   (assert-prepared-program-source! prepared)
   (let [owner (::generated-program-owner prepared)
@@ -6070,7 +6321,7 @@
       ;; Commit input history only after successful shape/arity/projection work.
       ;; Hygiene is not an entry/return conversion or device realization proof.
       (adopt-prepared-program-inputs! prepared)
-      projection)))
+      projection)))))
 
 (defn- emit-generated-program-entry! [program frontend]
   (let [{:keys [params tags walked-body source-ns]} program
@@ -6116,12 +6367,13 @@
 (defn- freeze-generated-preparation [program frontend template-revision parameter-plan]
   (if-not frontend
     program
-    (do
+    (let [program (update program ::entry-constructions #(or % []))]
       (when-not (= template-revision (tmpl/registry-revision))
         ;; Retry the whole producer, never attach the final epoch to mixed rules.
         (throw (ex-info "AD rules changed during preparation"
                         {:reason :stale-definition-proof-input :phase :reverse-ad-rules})))
       (let [_ (assert-generated-producer-core! program)
+            _ (assert-entry-construction-history! program)
             physical (emit-generated-program-entry! program frontend)
             program (assoc program ::generated-entry physical
                            ::callable-identities {:value+grad (promise) :grad (promise)})
@@ -6202,11 +6454,26 @@
   ;; the wrong dimension (gqa dW came out [hd,in] not [nq*hd,in]). Sharing one
   ;; monotonic counter keeps every generated name globally unique.
   (let [resolved (resolve-deftm-var f-var)
+        captured (captured-prepared-callable resolved (meta resolved))
+        parent (:prepared captured)
           ;; AD is another compiler consumer of the original semantic frontend,
           ;; not an owner of the replaceable walked-body metadata cache. Prepare
           ;; the producer before observing it, just like ordinary inlining.
-          _ (rcore/prepare-deftm-frontend! resolved)
-        frontend (method-entry/original-source-frontend resolved)]
+          _ (when-not captured (rcore/prepare-deftm-frontend! resolved))
+        frontend (if captured
+                   (.-frontend ^GeneratedPreparationOwner (::generated-program-owner parent))
+                   (method-entry/original-source-frontend resolved))
+        context (when frontend (source-ad-context (get-in frontend [:source-entry :source-policy])))
+        captured-source (when captured
+                          (let [{:keys [core source]} (freshen-prepared-core context parent (:mode captured))
+                                _ (flat-prepared-call-source!
+                                   core (:params parent) (:mode captured) nil
+                                   (::generated-program-owner parent))
+                                [head bindings results] source
+                                gradients (vec (rest results))
+                                result (if (= :value+grad (:mode captured)) results
+                                           (if (= 1 (count gradients)) (first gradients) gradients))]
+                            (util/remake source head bindings result)))]
     (binding [*unchecked-math* (if frontend
                                 (source-policy/unchecked-math
                                  (get-in frontend [:source-entry :source-policy]))
@@ -6215,7 +6482,8 @@
         (let [template-revision (tmpl/registry-revision)
           m (meta resolved)
           params (deftm-params-or-throw f-var resolved)
-          walked-body (or (:body frontend)
+          walked-body (or (when captured-source [captured-source])
+                          (:body frontend)
                           (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body on var" {:var f-var})))
           tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
@@ -6235,7 +6503,7 @@
           diff-active-params (:candidate-params parameter-plan)
           constant-gradient-arrays (set (remove (set diff-active-params)
                                                 all-params))
-          source-ns (or (:ns m) *ns*)
+          source-ns (or (:source-ns parent) (:ns m) *ns*)
         ;; Π: the SEED is the cotangent of the RESULT of the differentiated
         ;; GRAPH, so its dtype derives from the walked body's TAIL tag (the
         ;; actual primal flowing) — not from a global binary any-param-is-float
@@ -6256,11 +6524,13 @@
         ;; Shared pre-AD preparation (lower composites → materialize → hoist
         ;; into flat ANF) — see ad-prepare, shared with the JVP path.
           hoisted (binding [*ns* source-ns
+                            *generated-product-context* context
                             *constant-gradient-arrays* constant-gradient-arrays]
                     (ad-prepare qualified-source (zipmap all-params tags)))
         ;; transform-body delegates binding-position loops to gen-reverse-let's
         ;; activity-aware routing; inactive loops remain in the primal prefix.
           ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays
+                            *generated-product-context* context
                             *source-memory-context* {:values all-params
                                                      :value-facts {} :unprojectable {}
                                                      :replayed {} :aliases {}}
@@ -6289,12 +6559,27 @@
               (assert-unique-ad-minted-binds! bindings f-var)
               (list op bindings output-vec)))]
       (when flat
-        (let [program {:walked-body [padded-form]
+        (let [program (cond-> {:walked-body [padded-form]
                        :params all-params :tags tags :source-ns source-ns
                        :result-sym (:result-sym flat) :param-adj-syms (:param-adj-syms flat)}
-              canonical (when frontend (normalize-generated-preparation program parameter-plan))]
-          (freeze-generated-preparation (or canonical program)
-                                        frontend template-revision parameter-plan))))))))
+                        context (assoc ::entry-constructions @(:entry-constructions context)))
+              canonical (when frontend (normalize-generated-preparation program parameter-plan))
+              ;; Optional product normalization can abstain without changing
+              ;; the identity of the actual flat numerical producer. Retain
+              ;; that constructor result too; do not select the JVM adapter as
+              ;; the next derivative's numerical input.
+              result (freeze-generated-preparation (or canonical (assoc program ::producer-core program))
+                                                   frontend template-revision parameter-plan)]
+          (when parent
+            (let [view (requiring-resolve 'raster.compiler.backend.jvm.generated-body/physical-entry-view)
+                  previous (:parameter-carriers (view (prepared-bytecode-entry parent) (:params parent)))
+                  current (:parameter-carriers (view (prepared-bytecode-entry result) (:params result)))]
+              (when-not (and (= (count previous) (count current))
+                             (every? true? (map identical? previous current)))
+                (throw (ex-info "Captured derivative changed its original public input conversions"
+                                {:reason :ad-unclosed-completion-transpose}))))
+            (assert-prepared-program-source! parent))
+          result)))))))
 
 (defn- runtime-function-form
   [params body]
@@ -6432,7 +6717,7 @@
   (let [completion (value-completion/canonical-parts expression)
         {:keys [operation arguments dispatch?]} (when (seq? expression) (op/call-description expression))
         operator (when (symbol? operation) (resolve operation))
-        helper (when (and dispatch? *generated-product-context*) (generated-helper-owner expression))
+        helper (when (and dispatch? (generated-helper-context?)) (generated-helper-owner expression))
         fail! #(throw (ex-info "generated product binding has an unclosed input or effect scope"
                                {:reason :ad-generated-product-region :expression expression}))]
     (cond
