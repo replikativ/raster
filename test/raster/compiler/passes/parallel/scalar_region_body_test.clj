@@ -21,6 +21,33 @@
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
 
+(deftest retained-arithmetic-keeps-independent-source-width-before-storage
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))]
+    (doseq [strict? [false true]]
+      (let [lower (:lower (scalar/make-lowerer
+                          {:array-types {'x :float} :arrays #{'x}
+                           :scalar-types {'coefficient :double 'i :long}
+                           :lower-index (fn [expression _] expression)
+                           :require-source-types? strict? :decline! decline!}))
+            result (lower (with-meta '(clojure.core/* coefficient (clojure.core/aget x i))
+                            {:raster.type/tag 'double})
+                          :float {'coefficient :double 'i :long})
+            multiply (first (filter #(= :* (get-in % [:expression :op]))
+                                    (:operations result)))
+            value-types (into {'coefficient :double 'i :long}
+                              (map (fn [operation]
+                                     [(get-in operation [:result :id])
+                                      (get-in operation [:result :type])]))
+                              (:operations result))]
+        (is (= :float (:type result)))
+        (is (= :double (get-in multiply [:result :type])))
+        (is (= [:double :double]
+               (mapv value-types (get-in multiply [:expression :arguments]))))
+        (is (= :float (get-in (last (:operations result)) [:result :type])))
+        (is (= [(get-in multiply [:result :id])]
+               (get-in (last (:operations result)) [:expression :arguments])))))))
+
 (deftest comparison-operands-retain-independent-source-widths
   (doseq [strict? [false true]
           [expression types expected]

@@ -32,8 +32,11 @@
         (:abi artifact)))
 
 (deftest mixed-scale-retains-independent-scalar-and-storage-dtypes
-  (let [compiled (equation-first/compile
-                  #'storage/mixed-scale (merge policy {:target target :dtype :double}))
+  (doseq [kernel-dtype [:float :double]]
+   (let [compiled (equation-first/compile
+                  #'storage/mixed-scale (merge policy {:target target :dtype kernel-dtype}))
+        resident (pipeline/compile-gpu-program #'storage/mixed-scale target :dtype kernel-dtype
+                                              :preserve-declared-array-storage? true)
         artifact (first (:kernels compiled))]
     (is (= 1 (count (:kernels compiled))))
     (is (= :float (get-in compiled [:options :array-types 'values])))
@@ -41,7 +44,13 @@
     (is (every? #(= :float (:dtype %))
                 (remove #(= :scalar (:kind %)) (:abi artifact))))
     (is (= :double (:dtype (first (filter #(= 'coefficient (:name %))
-                                        (:abi artifact))))))))
+                                        (:abi artifact))))))
+    (doseq [artifact (cons artifact (map :artifact (:steps resident)))]
+      (is (not (str/includes? (:source artifact)
+                             "rstr_narrow_f64_f32_rte(coefficient)"))
+          "the Double coefficient is not rounded before multiplication")
+      (is (re-find #"double rstr_map_value_[0-9]+ =" (:source artifact))
+          "multiplication retains its independent Double result before Float storage")))))
 
 (deftest float-loss-seed-retains-declared-double-scale-on-both-public-verticals
   (let [eq (equation-first/compile #'loss/mse-grad {:target target :dtype :float})
