@@ -13,6 +13,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.numerical-contract :as numerics]
@@ -1380,6 +1381,51 @@
                (every? known? arguments))
       (checked-scalar-result expression present-types))))
 
+(defn checked-scalar-normal-return
+  "Prove only nonnull-on-normal-return for a bounded closed numeric expression.
+   Payload dtypes validate the existing scalar grammar; they are NOT actual
+   argument carriers or source overload evidence. Consequently this API returns
+   no dtype, payload or storage information. Unknown calls and lexical callees
+   decline. The caller must keep the original producer, conversions and order."
+  [expression present-types]
+  (when (seq? expression)
+    (let [closed?
+          (loop [pending [[expression 0]] visits 0]
+            (cond
+              (empty? pending) true
+              (>= visits 10000) false
+              :else
+              (let [[node depth] (peek pending)
+                    remaining (pop pending)]
+                (cond
+                  (> depth 128) false
+                  (number? node) (recur remaining (inc visits))
+                  (symbol? node) (and (contains? present-types node)
+                                      (recur remaining (inc visits)))
+                  (seq? node)
+                  (let [arguments (descriptor/call-args node)
+                        argument-count (bounded-count (inc (- 10000 visits)) arguments)
+                        operation (descriptor/semantic-op node)
+                        cast (descriptor/cast-result-tag operation)]
+                    (and (= operation (first node))
+                         (not (contains? present-types operation))
+                         (not (:raster.op/lexical-callee (meta node)))
+                         (not= '.invk (first node))
+                         (<= (+ visits (count remaining) argument-count) 10000)
+                         (symbol? operation)
+                         (contains? #{"clojure.core" "Math" "java.lang.Math"}
+                                    (namespace operation))
+                         (or (and cast (= 1 argument-count))
+                             (and (or (descriptor/scalar-op? operation)
+                                      (descriptor/comparison-kind operation))
+                                  (some-> operation intrinsics/canonical intrinsics/descriptor)))
+                         (recur (into remaining (map #(vector % (inc depth))
+                                                     arguments))
+                                (inc visits))))
+                  :else false))))]
+      (when (and closed? (checked-scalar-program expression present-types))
+        {:presence :present}))))
+
 (defn- strict-core-expression?
   "Closed scalar producer grammar, not a purity test. A root symbol may be
    nullable; only a real strict core call/cast proves a result on normal return."
@@ -1493,7 +1539,14 @@
                                   (if (= target Float/TYPE) :float :double))))
                      target))
 
-                 (intrinsics/primitive-fp-total? operation carriers)
+                 ;; Nonthrowing evidence is independent of the result-carrier
+                 ;; recipe. This summary owns only core comparisons and the
+                 ;; existing binary arithmetic planner, not library functions.
+                 (and (intrinsics/primitive-fp-total? operation carriers)
+                      (or (= :cmp (:kind intrinsic))
+                          (and (= :infix (:kind intrinsic))
+                               (= 2 (:arity intrinsic))
+                               (source-arithmetic/binary-operator? (:c intrinsic)))))
                  (if (= :cmp (:kind intrinsic))
                    Boolean/TYPE
                    (let [plan (source-arithmetic/binary-plan
@@ -1528,6 +1581,50 @@
                 (contains? #{Float Double} builtin-class)
                 (or (= target Double/TYPE) (= builtin-class Float))
                 (.isAssignableFrom ^Class carrier ^Class builtin-class)))))
+
+(defn checked-core-fp-evaluation
+  "Summarize one original core arithmetic/comparison call AFTER its operands complete.
+   Reuses the selected-body carrier planner and totality check, not inferred tags.
+   One actual primitive Double operand fixes the source's Double computation.
+   The other may be primitive FP or a proved present builtin FP payload behind
+   its actual reference carrier. Input carrier facts are never upgraded. Calls
+   without that Double anchor, integral arithmetic, casts and lexical calls abstain.
+   This grants neither operand completion nor permission to move/remove the call."
+  [expression argument-facts source-ns]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (let [{:keys [semantic-op arguments lexical-callee]} (descriptor/call-description expression)
+           intrinsic (intrinsics/descriptor semantic-op)
+           carriers (mapv :carrier argument-facts)]
+       (when (and method-entry/*emission-inputs* (instance? clojure.lang.Namespace source-ns)
+                  (seq? expression) (vector? argument-facts)
+                  (= semantic-op (first expression)) (not lexical-callee)
+                  (symbol? semantic-op) (= "clojure.core" (namespace semantic-op))
+                  (= 2 (count arguments) (count argument-facts))
+                  (some #{Double/TYPE} carriers)
+                  (every? #(completed-fp-argument? % Double/TYPE) argument-facts)
+                  (or (= :cmp (:kind intrinsic))
+                      (and (= :infix (:kind intrinsic))
+                           (source-arithmetic/binary-operator? (:c intrinsic)))))
+         (when (intrinsic-source/observe-original! source-ns semantic-op)
+           (let [parameters '[core-left core-right]
+                 body (apply list semantic-op parameters)
+                 source-carriers (mapv #(if (.isPrimitive ^Class %)
+                                          (keyword (.getName ^Class %)) :ref) carriers)
+                 source-result (if (= :cmp (:kind intrinsic)) Boolean/TYPE
+                                   (case (:result-carrier
+                                          (apply source-arithmetic/binary-plan
+                                                 (:c intrinsic) source-carriers))
+                                     :double Double/TYPE nil))
+                 ;; The original source overload still sees reference ports.
+                 ;; Present Float/Double payloads make its Double conversion exact;
+                 ;; only the arithmetic proof uses the resulting numeric carriers.
+                 arithmetic-carriers (mapv #(if (.isPrimitive ^Class %) % Double/TYPE) carriers)
+                 actual (completed-fp-body-carrier body (zipmap parameters arithmetic-carriers))]
+             (when (and source-result (= source-result actual))
+               {:result-carrier actual :scope :completed-fp-scalar :presence :present
+                :builtin-class (get types/primitive-info (symbol (.getName ^Class actual)))
+                :nonthrowing? true}))))))))
 
 (defn checked-selected-primitive-evaluation
   "Prove a bounded selected scalar call has no source arithmetic/conversion failure.

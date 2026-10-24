@@ -93,7 +93,7 @@
 
    Returns {:statics-class Class, :wrapper-class Class, :methods {...}}."
   [class-name fn-specs instance-spec]
-  (let [statics-result (bytecode/compile-specialized-class! class-name fn-specs)
+  (let [statics-result (bytecode/compile-specialized-class! class-name fn-specs (:prepare-static-source instance-spec))
         statics-class (:class statics-result)
         statics-cd (class-desc-of statics-class)
         {:keys [field-tags fn-param-tags return-tag compute-name iface-class]} instance-spec

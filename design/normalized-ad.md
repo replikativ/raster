@@ -1,5 +1,36 @@
 # Normalized AD design proposal
 
+## CPU frozen-source producer landing boundary
+
+This landing connects the original frozen frontend and definition-owned policy to
+the existing CPU/JVM AD producer, generated physical entry, and explicit JIT/AOT
+renewal. It does not replace either draft #1480 or #1508 wholesale, activate the
+opt-in normalized engines by default, or qualify a GPU source import.
+
+The landing's qualification anchors are the existing tests below; campaign-tree
+receipts must not be substituted for a run against this reconstructed tree.
+
+| CPU obligation | Test anchors |
+| --- | --- |
+| Frozen body/policy, poisoned walking caches, exact source/implementation ownership | `source-policy-test`, `source-entry-lineage-test`, `preparation-frontend-source-test` |
+| Shared generated program, physical entry, padded inactive slots and Float checkpoints | `generated-body-test`, `boxed-entry-test`, `generated-entry-test`, `typed-emission-test` |
+| All original parameter checks before body effects | `boxed-entry-test`, `preparation-frontend-source-test` |
+| New code after actual rule changes; stale old owners, no-op preparation and publication races refuse | `emission-dependency-test`, `preparation-frontend-source-test` |
+| Child preparation does not borrow parent history or partially adopt failed work | `definition-preparation-test`, `independent-preparation-keeps-parent-history-out-of-child-candidates` |
+| Absent versus zero cotangents, open pullbacks, replay/mutation and unsupported-domain refusals | `product-boundaries-test`, `conditional-replay-projection-test`, `source-replay-boundary-test`, `source-write-identity-test`, `owned-bytecode-input-pullback-test`, `normalized-scalar-runtime-guard-test` |
+
+Existing source/default and opt-in normalized AD paths retain their separate
+numerical and lifecycle controls. Normalized device families, general loop/record/
+model coverage, prepared-module provenance, checked GPU continuations and resident
+training remain later work. External push/pull, inverse, density and log-Jacobian
+capabilities are not admitted here.
+
+Frozen source ownership is not a blanket Clojure scalar-equivalence theorem. In
+particular, the pre-existing core Float/Float arithmetic recipe differs from plain
+Clojure's Double intermediate and checked Float conversion at overflow. This
+landing does not repair or waive that debt; an actually selected `raster.numeric/*`
+Float helper has its own distinct FP32 contract.
+
 ## Ordered generated-call source owner
 
 The shared `core/ordered-call` consumer normalizes an already-resolved JVM

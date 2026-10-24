@@ -21,6 +21,7 @@
   (:require [clojure.string]
             [clojure.pprint :as pp]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.scalar.dce :as dce]
@@ -65,6 +66,7 @@
             [raster.compiler.core.hoist :as hoist]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as value-completion]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.inference :as inf]
@@ -136,6 +138,12 @@
                     (#{:float :double} element-dtype) (assoc :element-dtype element-dtype))]
     (mapv #(walker/walk-body % walk-opts) body)))
 
+(defn normalize-source-bindings
+  "Scope normalization shared by fresh and retained typed source; never retypes it."
+  [body params]
+  (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
+    (mapv #(util/uniquify-rebindings param-syms %) body)))
+
 (defn get-walked-body [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)
         m (meta resolved)]
@@ -159,7 +167,8 @@
                 element-dtype (or dtype (infer-dtype resolved))
                 ;; Available source is authoritative. A failed fresh walk is a compiler failure,
                 ;; not permission to execute a stale definition-time body with older type facts.
-                walked (walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype)]
+                walked (source-policy/call-with-owner
+                        m #(walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype))]
             ;; SSA-normalize let* rebindings (seeded with the params) BEFORE the
             ;; pass pipeline: a rebinding like `x = (alloc-op x)` otherwise
             ;; conflates the op's input and freshly-allocated output buffer in
@@ -167,8 +176,7 @@
             ;; body's read of `x` hits the uninitialized output). Distinct names
             ;; remove the hazard; non-shadowing bindings are untouched.
             (when walked
-              (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
-                (mapv #(util/uniquify-rebindings param-syms %) walked)))))
+              (normalize-source-bindings walked params))))
         ;; Legacy source-less metadata: use a pre-walked body only when no source was available.
         (:raster.core/deftm-walked-body-typed m)
         (:raster.core/deftm-walked-body m)
@@ -219,6 +227,7 @@
      :param-env param-env
      :param-specs (mapv (fn [p] {:sym p :tag (get param-env p)}) parameters)
      :effective-dtype effective-dtype :source-ns source-ns
+     :source-policy (:raster.core/source-policy metadata)
      :return-tag (:raster.core/return-tag metadata)}))
 
 ;; ================================================================
@@ -286,7 +295,8 @@
    Tags let/let* forms (recurse into bindings), par forms (from init/buffer),
    and loop forms. Does not descend into opaque calls."
   [expr env]
-  (cond
+  (let [constructed
+   (cond
     (not (seq? expr)) (inf/mask-unknown-local expr env)
     ;; let/let*: tag binding symbols + recurse into init exprs and body
     (form/binding-form? expr)
@@ -296,12 +306,22 @@
           (reduce
            (fn [[env acc] [sym init-expr]]
              (let [tagged-init (tag-expr-types init-expr env)
-                   tag (or (inf/hint-tag sym) (inf/infer-arg-tag tagged-init env))
+                   object-input? (and (value-completion/canonical-form? tagged-init)
+                                      (= value-completion/object-input-contract
+                                         (:contract (value-completion/canonical-parts tagged-init))))
+                   object-storage? (or object-input?
+                                       (and (symbol? tagged-init)
+                                            (= Object (get-in env [tagged-init :physical-carrier]))))
+                   tag (if object-input?
+                         (inf/infer-arg-tag tagged-init env)
+                         (or (inf/hint-tag sym) (inf/infer-arg-tag tagged-init env)))
                    tagged-sym (cond-> sym
-                                tag (vary-meta assoc :tag tag :raster.type/tag tag)
+                                tag (vary-meta assoc :tag (if object-storage? 'Object tag)
+                                               :raster.type/tag tag)
                                 (util/void-form? tagged-init)
                                 (vary-meta assoc :raster.effect/effectful true))
-                   new-env (assoc env sym tag)]
+                   new-env (assoc env sym (if object-storage?
+                                           {:tag tag :physical-carrier Object} tag))]
                [new-env (conj acc tagged-sym tagged-init)]))
            [env []]
            pairs)
@@ -317,7 +337,8 @@
       (if (and tag (not (:tag (meta expr))))
         (try (with-meta expr (assoc (or (meta expr) {}) :tag tag))
              (catch Exception _ expr))
-        expr))))
+        expr)))]
+    constructed))
 
 (defn- tag-binding-types
   "Walk a form and attach :tag metadata to binding symbols and expressions.
@@ -332,12 +353,12 @@
    nested binder. This pass attaches only the authoritative void contract of the immediate RHS;
    it performs no type inference and leaves value-producing expressions untouched."
   [form]
-  (clojure.walk/postwalk
+  (util/postwalk-preserving-meta
    (fn [expression]
      (if-not (form/binding-form? expression)
        expression
-       (let [[head bindings & body] expression
-             pairs (vec (partition 2 bindings))
+       (let [[head original-bindings & body] expression
+             pairs (vec (partition 2 original-bindings))
              bindings
              (vec
               (mapcat
@@ -349,10 +370,12 @@
                        statement? (or (util/void-form? initializer)
                                       (and unused? (util/effect-loop-statement? initializer)))]
                    [(cond-> symbol
-                      statement? (vary-meta assoc :raster.effect/effectful true))
+                      (and statement? (not (true? (:raster.effect/effectful (meta symbol)))))
+                      (vary-meta assoc :raster.effect/effectful true))
                     initializer]))
                (range) pairs))]
-         (with-meta (list* head bindings body) (meta expression)))))
+         (util/remake-if-changed
+          expression (list* head (util/remake-if-changed original-bindings bindings) body)))))
    form))
 
 (defn- pass-region-copy
@@ -1392,7 +1415,7 @@
 ;; Diagnostic runner for show-pipeline
 ;; ================================================================
 
-(defn- run-passes-diagnostic
+(defn ^:no-doc run-passes-diagnostic
   "Run passes with full intermediate recording for diagnostics.
   Returns {:form final-form :stages {stage-key form} :stats {stage-key stats}}."
   ([form passes opts]
@@ -1434,7 +1457,10 @@
 (declare compile-aot-jvm)
 
 (defn compile-aot
-  "Compile a deftm var into an optimized forward function with buffer fusion.
+  "Compile a deftm var or capture-free ftm into an optimized forward function.
+   Anonymous ftm currently uses the JVM path with checked source arithmetic;
+   lexical captures and unchecked source arithmetic require their own retained
+   lowering authority and are refused rather than reinterpreted in the caller.
 
   Pipeline: walker → inline → DCE → buffer-fuse → typed SOAC fusion → backend
             → mem-merge → hoist → eval
@@ -1468,7 +1494,22 @@
   [f-var & {:keys [inline? simd? dtype target-device target preserve-declared-array-storage?
                    reuse-buffers? no-alias?]
             :or {inline? true simd? true no-alias? true}}]
-  (if (= target :c)
+  (let [anonymous? (not (var? f-var))
+        metadata (meta f-var)
+        policy (:raster.core/source-policy metadata)]
+    (when anonymous?
+      (source-owner/assert-portable-source! metadata)
+      (when-not (and (:raster.core/anonymous-function metadata)
+                     (value-completion/source-policy? policy)
+                     (some-> (:raster.core/deftm-source-ns metadata) find-ns))
+        (throw (ex-info "Anonymous AOT requires retained ftm source context"
+                        {:reason :unclosed-anonymous-aot-source})))
+      (when (or target target-device)
+        (throw (ex-info "Anonymous AOT target requires its own retained source owner"
+                        {:reason :unsupported-anonymous-aot-target :target target :device target-device}))))
+  (source-owner/call-with-source-context metadata
+   (fn []
+   (if (= target :c)
     ;; Native CPU-C backend: emit the whole fused body as one C function (no
     ;; per-op JVM dispatch) + Panama FFM. Bypasses the bytecode/hoist path.
     ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
@@ -1476,7 +1517,7 @@
     (compile-aot-jvm f-var :inline? inline? :simd? simd? :dtype dtype
                      :target-device target-device
                      :preserve-declared-array-storage? preserve-declared-array-storage?
-                     :reuse-buffers? reuse-buffers?)))
+                     :reuse-buffers? reuse-buffers?))))))
 
 (defn- retained-compilation-loader
   "Preserve retained class identities when defining AOT bytecode.
@@ -1539,7 +1580,7 @@
                     (if (instance? clojure.lang.DynamicClassLoader tcl)
                       tcl
                       ;; Find a DCL from the f-var's namespace
-                      (let [root (try (.getRawRoot ^clojure.lang.Var f-var)
+                      (let [root (try (if (var? f-var) (.getRawRoot ^clojure.lang.Var f-var) f-var)
                                       (catch Exception _ nil))
                             var-cl (when root (.getClassLoader (class root)))]
                         (if (instance? clojure.lang.DynamicClassLoader var-cl)
@@ -1598,7 +1639,8 @@
                                         (first walked-body)
                                         (list* 'do walked-body))
                              form (run-passes raw-form forward-passes opts)
-                             hoist-opts (cond-> {:dtype effective-dtype :reuse-buffers? reuse-buffers?}
+                             hoist-opts (cond-> {:dtype effective-dtype :reuse-buffers? reuse-buffers?
+                                                :prepare-static-source rcore/prepare-original-static-source!}
                                           param-env (assoc :param-env param-env)
                                           return-tag (assoc :return-tag return-tag)
                                           ;; Thread the deftm's defining namespace so the bytecode
@@ -1622,10 +1664,10 @@
                                            (list 'let* [] form)
                                            active-params active-params hoist-opts))))]
                        ;; Store diagnostics on the compiled function's metadata
-                         (alter-meta! f-var assoc
-                                      ::compiled-diagnostics
-                                      (dissoc result :fn))
-                         (:fn result)))]
+                         (when (var? f-var)
+                           (alter-meta! f-var assoc ::compiled-diagnostics (dissoc result :fn)))
+                         (if (var? f-var) (:fn result)
+                             (vary-meta (:fn result) assoc ::compiled-diagnostics (dissoc result :fn)))))]
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
           (compile!))))))

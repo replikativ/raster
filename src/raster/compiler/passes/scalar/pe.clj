@@ -17,6 +17,7 @@
   beyond the transformations above — preserves metadata, qualified symbols, etc."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.simplify :as simp]
             [raster.core :as rcore]))
 
@@ -250,11 +251,13 @@
   ordinary forms. Typed `.invk` nodes retain their boundary and metadata rather
   than recovering operator semantics from impl spelling. Type tags are preserved."
   [form result changed?]
-  (if-let [m (meta form)]
-    (if (instance? clojure.lang.IMeta result)
-      (with-meta result (if changed? (dissoc m :raster.op/original) m))
-      result)
-    result))
+  (if (identical? form result)
+    form
+    (if-let [m (meta form)]
+      (if (instance? clojure.lang.IMeta result)
+        (with-meta result (if changed? (dissoc m :raster.op/original) m))
+        result)
+      result)))
 
 (defn pe-pass
   "Single pass of partial evaluation.
@@ -274,6 +277,15 @@
     (seq? form)
     (let [head (first form)]
       (cond
+        ;; A completion is an evaluation boundary, not a generic function or
+        ;; an algebraic identity. Its contract is data; only its operand is PE'd.
+        (= head completion/completion-symbol)
+        (if-let [{:keys [contract operand]} (completion/canonical-parts form)]
+          (util/remake-if-changed form
+                                  (list head contract (pe-pass operand const-env)))
+          (throw (ex-info "Malformed reserved value completion during partial evaluation"
+                          {:reason :invalid-value-completion :expression form})))
+
         ;; let/let*/loop
         (and (symbol? head) (contains? #{:binding :scope} (:kind (form/form-info form))))
         (pe-let form const-env pe-pass)
@@ -348,7 +360,7 @@
         form
 
         ;; quote — leave alone
-        (= head 'quote)
+        (contains? '#{quote clojure.core/quote} head)
         form
 
         ;; recur — PE the args but keep recur
@@ -414,14 +426,15 @@
         ;; General call — PE args, then try constant folding
         :else
         (let [pe-children (map #(pe-pass % const-env) form)
-              called (apply list pe-children)
-              r (simp/simplify-1 called)]
+              called (util/remake-if-changed form pe-children)
+              r (simp/simplify-1 called)
+              result (reattach-meta form r (not= r called))]
           ;; drop stale :raster.op/original iff simplify changed the head (task #78)
-          (reattach-meta form r (not= r called)))))
+          result)))
 
     ;; Vector
     (vector? form)
-    (mapv #(pe-pass % const-env) form)
+    (util/remake-if-changed form (mapv #(pe-pass % const-env) form))
 
     ;; Map
     (map? form)

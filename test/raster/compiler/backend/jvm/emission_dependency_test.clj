@@ -2,7 +2,11 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :as core]
             [raster.numeric]
+            [raster.ad.reverse :as reverse]
+            [raster.ad.templates :as templates]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.backend.jvm.hoisted :as hoisted]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
 (deftest actual-owned-emission-retries-changed-inputs-before-returning-code
@@ -49,6 +53,67 @@
                       (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
           (is (= 3 (count @emitted)) "persistent change is bounded, not recertified")
           (finally (reset-meta! dependency original))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest actual-root-and-static-emissions-retain-producer-inputs
+  (let [scope (create-ns (gensym "raster.producer-emission."))
+        current (atom true)
+        producer (reify method-entry/RetainedProducerInput
+                   (assert-producer-current! [this]
+                     (when-not @current
+                       (throw (ex-info "test producer changed" {:reason :test-stale-producer})))
+                     this))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm square [x :- Double] :- Double
+                 (raster.numeric/* x x))))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'square))
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            _ (core/ensure-bytecode-implementation! receiver)
+            {:keys [params tags return-tag body typed-interface]}
+            (:raster.core/bytecode-emission (meta receiver))
+            retain! #(method-entry/adopt-definition-inputs! {:producer-inputs [producer]})
+            {:keys [implementation emission]}
+            (#'core/emit-owned-bytecode!
+             (fn [& arguments] (retain!) (apply bytecode/compile-typed-impl! arguments))
+             "raster.compiled.ProducerInput" params tags return-tag body scope
+             typed-interface (:name (meta source)))
+            compile-static bytecode/compile-deftm-method!
+            artifact (with-redefs [bytecode/compile-deftm-method!
+                                  (fn [& arguments] (retain!) (apply compile-static arguments))]
+                       (#'bytecode/compile-and-cache-deftm! source))]
+        (is (= 9.0 (implementation 3.0)))
+        (is (= [producer] (:producer-inputs emission)))
+        (is (= [producer] (get-in artifact [:raster.compiler/emission-inputs :producer-inputs])))
+        (let [root-guard (method-entry/prepare-emission-input-guard! emission)
+              static-guard (method-entry/prepare-emission-input-guard!
+                            (:raster.compiler/emission-inputs artifact))]
+          (reset! current false)
+          (doseq [guard [root-guard static-guard]]
+            (is (= :test-stale-producer
+                   (try (guard) nil
+                        (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest root-materialization-is-independent-of-an-unrelated-stale-analysis
+  (let [scope (create-ns (gensym "raster.independent-materialization."))
+        dependency (intern scope 'observed (Object.))
+        parent (atom {:static [] :values []})]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm square [x :- Double] :- Double (raster.numeric/* x x))))
+      (binding [method-entry/*emission-inputs* parent]
+        (method-entry/observe-definition-input! dependency scope 'observed)
+        (let [before @parent]
+          (with-redefs-fn {dependency (Object.)}
+            #(do
+               (is (= 9.0 ((ns-resolve scope 'square) 3.0)))
+               (is (identical? before @parent))
+               (is (= :stale-definition-proof-input
+                      (try (method-entry/assert-definition-inputs-current! @parent) nil
+                           (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest emission-inputs-retain-transitive-static-source-observations
@@ -232,6 +297,28 @@
         (reset-meta! v original-meta)
         (remove-ns (ns-name scope))))))
 
+(deftest emission-guards-retain-process-local-producer-dependencies
+  (let [current (atom true)
+        checks (atom 0)
+        producer (reify method-entry/RetainedProducerInput
+                   (assert-producer-current! [this]
+                     (swap! checks inc)
+                     (when-not @current
+                       (throw (ex-info "test producer changed" {:reason :test-stale-producer})))
+                     this))
+        emission {:dependency-snapshots [] :static-inputs [] :producer-inputs [producer]
+                  :definition-revision 1 :completed-definition-revision 1}
+        guard (method-entry/prepare-emission-input-guard! emission)]
+    (is (identical? emission (guard)))
+    (reset! checks 0)
+    (guard)
+    (is (= 1 @checks) "the prepared fast guard must not skip a producer dependency")
+    (reset! current false)
+    (doseq [invoke [guard #(method-entry/assert-emission-inputs-current! emission)]]
+      (is (= :test-stale-producer
+             (try (invoke) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))))))
+
 (deftest prepared-emission-guards-preserve-historical-live-checks
   (let [scope (create-ns (gensym "raster.prepared-emission."))
         caller (create-ns (gensym "raster.prepared-emission-caller."))
@@ -355,6 +442,193 @@
           (is (= 9.0 (invoke cached)) "held original code is not mutated")
           (is (identical? renewed (:raster.core/deftm-bytecode (meta source))))
           (is (identical? renewed (method-entry/assert-static-emission-current! source renewed)))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest static-ad-renewal-consumes-frozen-source-not-walk-or-runtime-caches
+  (let [scope (create-ns (gensym "raster.static-ad-renewal."))
+        rule-op 'raster.numeric/*
+        original-rule (templates/get-template rule-op)
+        macro-calls (atom 0)]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(defmacro frozen-square [x] (list 'raster.numeric/* x x)))
+        (eval '(raster.core/deftm loss [x :- Double] :- Double (frozen-square x)))
+        (eval '(raster.core/deftm derivative [x :- Double] :- Double
+                 (let [vg ((raster.ad.reverse/value+grad (var loss) :wrt [0]) x)]
+                   (clojure.core/nth vg 1))))
+        (eval '(raster.core/deftm consumer [x :- Double] :- Double (derivative x)))
+        (eval '(raster.core/deftm jit-consumer [x :- Double] :- Double (consumer x))))
+      (let [loss (ns-resolve scope 'loss)
+            source (core/resolve-deftm-var (ns-resolve scope 'derivative))
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            _ (doseq [v [(core/resolve-deftm-var loss) source]] (core/prepare-deftm-frontend! v))
+            frontend (method-entry/call-with-definition-inputs #(method-entry/original-source-frontend source))
+            prepared (reverse/prepare-value+grad loss [0])
+            invoke (fn [artifact] (.invoke ^java.lang.reflect.Method (:method artifact)
+                                          nil (object-array [3.0])))
+            reason (fn [f] (try (f) nil
+                                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            prepare! core/prepare-original-static-source!]
+        ;; Poison ONLY a replaceable cache before the static source snapshot.
+        ;; The exact old/new guards must therefore reach the real rule boundary.
+        (alter-meta! source assoc :raster.core/deftm-walked-body '[42.0]
+                     :raster.core/deftm-walked-body-typed '[42.0])
+        (with-redefs-fn {(ns-resolve scope 'frozen-square)
+                        (fn [& _] (swap! macro-calls inc)
+                          (throw (ex-info "frozen macro was reexpanded" {})))}
+          (fn []
+            (let [old (#'bytecode/compile-and-cache-deftm! source {:prepare-source prepare!})
+                  runtime (var-get receiver)]
+              (is (= 6.0 (invoke old)))
+              (templates/register-template!
+               rule-op {:params '[a b] :result 'result :adjoint 'dy
+                        :grads '[(raster.numeric/* dy (raster.numeric/* 2.0 b))
+                                 (raster.numeric/* dy (raster.numeric/* 2.0 a))]})
+              (is (= :ad-prepared-program-stale-rules
+                     (reason #(method-entry/assert-static-emission-current! source old))))
+              (is (= :ad-prepared-program-stale-rules
+                     (reason #(#'bytecode/current-cached-deftm! source old))))
+              (let [spec {:name 'probe :params [(with-meta 'x {:tag 'double})]
+                          :return-tag 'double :source-ns scope
+                          :walked-body [(list (symbol (str (ns-name scope))
+                                                      (str (:name (meta source)))) 'x)]}
+                    compile! #(bytecode/compile-specialized-class!
+                               "raster.compiled.StaticADSibling" [spec] %)]
+                (is (= :ad-prepared-program-stale-rules
+                       (reason #(method-entry/call-with-definition-inputs (fn [] (compile! nil)))))
+                    "direct sibling discovery cannot fall through to poisoned walked source")
+                (let [sibling (method-entry/call-with-definition-inputs #(compile! prepare!))]
+                  (is (= 12.0 (.invoke ^java.lang.reflect.Method (get-in sibling [:methods 'probe])
+                                      nil (object-array [3.0]))))
+                  (is (identical? old (:raster.core/deftm-bytecode (meta source)))
+                      "a new direct sibling does not refresh an unused static artifact")))
+              (doseq [[prepare expected]
+                      [[(constantly nil) :unowned-static-renewal-source]
+                       [(fn [_] {:frontend (assoc frontend :body '[42.0]) :body '[42.0]})
+                        :unowned-checked-result-frontend]
+                       [(fn [_] (throw (ex-info "preparation refused" {:reason :test-static-preparation})))
+                        :test-static-preparation]
+                       [(fn [v]
+                          (let [prepared-source (prepare! v)]
+                            (templates/register-template! rule-op (templates/get-template rule-op))
+                            prepared-source))
+                        :ad-prepared-program-stale-rules]]]
+                (is (= expected
+                       (reason #(method-entry/call-with-definition-inputs
+                                 (fn [] (#'bytecode/current-cached-deftm! source old prepare))))))
+                (is (identical? old (:raster.core/deftm-bytecode (meta source)))))
+              (let [replacement (atom nil)
+                    interpose (fn [v]
+                                (when-not @replacement
+                                  (reset! replacement
+                                          (#'bytecode/compile-and-cache-deftm!
+                                           v {:prepare-source prepare!})))
+                                (prepare! v))]
+                (is (= :stale-definition-proof-input
+                       (reason #(binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
+                                  (#'bytecode/current-cached-deftm! source old interpose)))))
+                (is (identical? @replacement (:raster.core/deftm-bytecode (meta source)))
+                    "a reconstruction cannot overwrite a genuinely published intervening artifact")
+                (is (= 12.0 (invoke @replacement))))
+              ;; Equal public registration still advances the intentionally
+              ;; conservative rule epoch; the next static acquisition renews.
+              (templates/register-template! rule-op (templates/get-template rule-op))
+              (let [attempts (atom 0)
+                    fresh (method-entry/call-with-definition-inputs
+                           (fn []
+                             (swap! attempts inc)
+                             (#'bytecode/current-cached-deftm!
+                              source (:raster.core/deftm-bytecode (meta source)) prepare!)))]
+                (is (= 2 @attempts))
+                (is (not (identical? old fresh)))
+                (is (= 12.0 (invoke fresh)) "the changed USED rule owns the new derivative")
+                (is (identical? fresh (#'bytecode/current-cached-deftm! source fresh)))
+                (is (identical? runtime (var-get receiver)) "static rebuild does not publish a runtime receiver")
+                (is (= :ad-prepared-program-stale-rules
+                       (reason #(method-entry/assert-static-emission-current! source old))))
+                (is (= :ad-prepared-program-stale-rules
+                       (reason #(reverse/assert-prepared-program-source! prepared))))
+                (is (not= '[42.0] (get-in fresh [:raster.compiler/emission-inputs :body])))
+                (let [compile-hoisted! hoisted/compile-hoisted-class!
+                      callback-path (atom [])
+                      compiled (with-redefs [hoisted/compile-hoisted-class!
+                                             (fn [name specs options]
+                                               (swap! callback-path conj
+                                                      (identical? prepare! (:prepare-static-source options)))
+                                               (compile-hoisted! name specs options))]
+                                 (pipeline/compile-aot (ns-resolve scope 'consumer)
+                                                       :inline? false :simd? false))]
+                  (is (= 12.0 (compiled 3.0)))
+                  (is (and (seq @callback-path) (every? true? @callback-path)))
+                  (is (not-any? #(identical? prepare! %)
+                                (tree-seq coll? seq (meta compiled)))
+                      "the lexical preparer is not published as callable metadata"))
+                (let [emit! bytecode/compile-typed-impl!
+                      callbacks (atom [])
+                      value (with-redefs [bytecode/compile-typed-impl!
+                                          (fn [& arguments]
+                                            (swap! callbacks conj (last arguments))
+                                            (apply emit! arguments))]
+                              ((ns-resolve scope 'jit-consumer) 3.0))]
+                  (is (= 12.0 value))
+                  (is (some #(identical? prepare! %) @callbacks)
+                      "the named runtime compiler passes the same lexical static preparer"))
+                (is (zero? @macro-calls)))))))
+      (finally
+        (templates/register-template! rule-op original-rule)
+        (remove-ns (ns-name scope))))))
+
+(deftest original-static-source-keeps-its-policy-under-opposite-ambient-math
+  (let [scope (create-ns (gensym "raster.static-source-policy."))
+        outcome (fn [^java.lang.reflect.Method method]
+                  (try {:value (.invoke method nil (object-array [Long/MAX_VALUE]))}
+                       (catch java.lang.reflect.InvocationTargetException failure
+                         {:error (class (.getCause failure))})))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (doseq [[name policy] [['checked false] ['unchecked true]]]
+          (binding [*unchecked-math* policy]
+            (eval (list 'raster.core/deftm name '[x :- Long] ':- 'Long
+                        (if policy '(clojure.core/unchecked-add x 1)
+                            '(clojure.core/+ x 1)))))))
+      (doseq [[name policy expected] [['checked false {:error ArithmeticException}]
+                                     ['unchecked true {:value Long/MIN_VALUE}]]]
+        (let [source (core/resolve-deftm-var (ns-resolve scope name))
+              _ (core/prepare-deftm-frontend! source)
+              prepare! core/prepare-original-static-source!
+              observed-policy (atom [])
+              emit-body-var (ns-resolve 'raster.compiler.backend.jvm.bytecode 'emit-body)
+              emit-body @emit-body-var
+              spec {:name 'probe :params [(with-meta 'x {:tag 'long})]
+                    :return-tag 'long :source-ns scope
+                    :walked-body [(list (symbol (str (ns-name scope))
+                                                (str (:name (meta source)))) 'x)]}
+              [artifact sibling]
+              (with-redefs-fn
+                {emit-body-var
+                 (fn [code body locals context]
+                   (when (and (identical? scope (:source-ns context))
+                              (some '#{clojure.core/+ clojure.core/unchecked-add}
+                                    (tree-seq coll? seq body)))
+                     (swap! observed-policy conj *unchecked-math*))
+                   (emit-body code body locals context))}
+                #(binding [*unchecked-math* (not policy)]
+                   [(#'bytecode/compile-and-cache-deftm! source {:prepare-source prepare!})
+                    (method-entry/call-with-definition-inputs
+                     (fn [] (bytecode/compile-specialized-class!
+                             "raster.compiled.StaticPolicySibling" [spec] prepare!)))]))]
+          ;; Checked and explicit unchecked operators retain distinct overflow
+          ;; behavior. Independently observe the declaration's policy INSIDE
+          ;; both real emitters, not merely at the callback/AD-expansion seam.
+          (is (= expected (outcome (:method artifact))))
+          (is (= expected (outcome (get-in sibling [:methods 'probe]))))
+          (is (and (<= 2 (count @observed-policy))
+                   (every? #(= policy %) @observed-policy)))
+          (is (= policy (get-in (method-entry/call-with-definition-inputs
+                                #(method-entry/original-source-frontend source))
+                               [:source-entry :source-policy :unchecked-math])))))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest static-parent-tracks-consumed-grandchild-not-unused-sibling-cache

@@ -6,6 +6,7 @@
             [raster.par :as par]
             [raster.ad.jvp :as jvp]
             [raster.ad.reverse :as reverse]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.local-products :as products]))
 
 (deftm product-stored-loop [x :- Double] :- Double
@@ -36,6 +37,10 @@
         reason (fn [f] (try (f) nil
                             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
     (is (= 0.25 (product-stored-loop 16777216.5)))
+    (is (zero? (let [rounded (double (float 16777216.5))
+                     residual (- rounded 16777216.0)]
+                 (* residual residual)))
+        "using Float output storage as the Double loop carry would change the source result")
     (doseq [prepare [#(reverse/ad-prepare % {'x 'double})
                     #(reverse/transform-body % '[x])]]
       (let [captured (atom []) original products/lower-local-products]
@@ -50,10 +55,14 @@
             "source numerical obligations are captured before either boundary rewrites products")))
     (is (= :ad-scan-carry-precision
            (reason #(reverse/transform-body source '[x]))))
-    (doseq [[construct expected] [[reverse/value+grad :par-scan-carry-precision]
-                                 [jvp/jvp :jvp-scan-carry-precision]]]
-      (is (= expected
-             (reason #(construct #'product-stored-loop)))))))
+    (doseq [construct [reverse/value+grad jvp/jvp]]
+      (let [data (try (construct #'product-stored-loop) nil
+                      (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= :ad-scan-carry-precision (:reason data))
+            "both modes retain the shared preparation boundary's precision refusal")
+        (is (true? (:raster.ad.reverse/inexact-source-scan-checkpoint
+                    (meta (:loop data))))
+            "the refusal carries the original inexact-storage witness")))))
 
 (deftest inactive-stored-carry-remains-ordinary-primal-code
   (is (= [2.0625 1.0] ((reverse/value+grad #'inactive-product-stored-loop) 2.0)))
@@ -141,8 +150,28 @@
                       second (clojure.core/nth tuple 1)] second)
         prepared (reverse/ad-prepare source)
         execute (fn [program x]
+                  ;; Prepared AD is canonical IR, not directly evaluable source.
+                  ;; Exercise its actual source projection rather than defining a
+                  ;; runtime implementation of the reserved completion term.
                   (eval (list 'let* ['trace '(atom []) 'x x]
-                              [program '(deref trace)])))]
+                              [(completion/project-to-jvm-source program) '(deref trace)])))]
+    (is (some completion/canonical-parts (tree-seq coll? seq prepared))
+        "the oracle must cross the canonical completion boundary")
     (doseq [x [-2.0 1.5]]
       (is (= [(* x x) [:first :second]]
              (execute source x) (execute prepared x))))))
+
+(deftest product-source-projection-preserves-a-failing-field-evaluation
+  (let [source '(let* [tuple [(do (swap! trace conj :first) x)
+                             (do (swap! trace conj :second)
+                                 (throw (ex-info "field failure" {})))]
+                      selected (clojure.core/nth tuple 0)] selected)
+        execute (fn [program]
+                  (let [trace (atom [])
+                        f (eval (list 'fn ['trace 'x]
+                                      (completion/project-to-jvm-source program)))]
+                    (try [:value (f trace 1.5) @trace]
+                         (catch clojure.lang.ExceptionInfo e
+                           [:error (.getMessage e) @trace]))))]
+    (is (= [:error "field failure" [:first :second]]
+           (execute source) (execute (reverse/ad-prepare source))))))

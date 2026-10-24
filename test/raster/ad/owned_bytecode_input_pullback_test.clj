@@ -30,6 +30,10 @@
   (let [amplitude (n/+ a 0.0)
         threshold (n/+ k 0.0)]
     (n/* 2.0 (response amplitude (n/+ threshold x) x))))
+(deftm consume-long [value :- Long] :- Long value)
+(deftm long-response [value :- Double] :- Long (long value))
+(deftm integral-operand [value :- Double] :- Long
+  (consume-long (long-response value)))
 
 (use-fixtures :once (fn [run] (response 0.8 0.7 1.0) (run)))
 
@@ -154,6 +158,15 @@
   (is (= :ad-unclosed-bytecode-input-region
          (try (prepare #'branch-factor 'raster.numeric/* 1 ["a" "k"])
               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+
+(deftest integral-operand-outlining-does-not-grant-floating-ad-permission
+  (with-redefs [reverse/derive-flat-product-program
+                (fn [& _] (throw (AssertionError. "integer operand reached AD derivation")))]
+    (is (= :ad-unclosed-bytecode-input-region
+           (try (prepare #'integral-operand
+                         'raster.ad.owned-bytecode-input-pullback-test/consume-long 0 ["value"])
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
 
 (deftest earlier-object-input-completes-before-nested-later-call
   (let [prepared (prepare #'shadow-tree-factor 'raster.numeric/* 1 ["amplitude" "threshold"])

@@ -49,6 +49,7 @@
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.specialize :as specialize]
@@ -369,39 +370,58 @@
                    (catch Throwable _ form)))
             walked-body))))
 
-(clojure.core/defn ^:private emit-owned-bytecode!
+(clojure.core/defn ^:no-doc emit-owned-bytecode!
   "Emit against historical inputs and validate BEFORE publishing an impl.
    Lazy materialization can change dependency metadata on the first attempt;
    retry the emission, not its certificate, using the same bounded policy as
-   static bytecode production. No numeric body executes here."
-  [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym]
+   static bytecode production. No numeric body executes here. Named and generated
+   producers share this service; it publishes no Var, dispatch entry or cache."
+  [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym & [preparation-inputs]]
   (loop [attempt 0]
     (let [{owned-body :body invocation-catalog :catalog binding-catalog :binding-catalog
-           reduction-catalog :reduction-catalog}
+           reduction-catalog :reduction-catalog completion-catalog :completion-catalog
+           input-origins :input-origins}
           ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retain-invocation-occurrences) body)
           dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/emission-input-snapshots)
                         body source-ns)
           revision (dispatch/compiler-definition-revision)
-          inputs (atom {:static [] :values [] :reduction-sources reduction-catalog})
+          inputs (atom (assoc (merge {:static [] :values []}
+                                     (select-keys preparation-inputs
+                                                  [:static :values :definition-proofs
+                                                   :producer-inputs]))
+                              :reduction-sources reduction-catalog))
+          _ (me/assert-definition-inputs-current! @inputs)
           implementation
           (binding [me/*emission-inputs* inputs]
             (emitter (str class-name (gensym "__owned")) params tags return-tag
                      owned-body source-ns typed-interface (str (ns-name source-ns)) (str mangled-sym)))
           emission {:backend :jvm-bytecode :implementation implementation
                     :params params :tags tags :return-tag return-tag :body owned-body :source-ns source-ns
-                    :invocation-catalog invocation-catalog
+                    ;; Extraction-local generated calls have actual emission
+                    ;; observations, but intentionally no frontend InputOrigins.
+                    :invocation-catalog (merge invocation-catalog (:invocation-catalog @inputs))
                     :binding-catalog binding-catalog :binding-contexts (:binding-contexts @inputs)
+                    :completion-catalog completion-catalog
+                    :completion-contexts (:completion-contexts @inputs)
                     :floating-conversion-contexts (:floating-conversion-contexts @inputs)
                     :array-read-contexts (:array-read-contexts @inputs)
                     :array-allocation-contexts (:array-allocation-contexts @inputs)
                     :reduction-catalog reduction-catalog
+                    :input-origins input-origins
                     :reduction-expansions (:reduction-expansions @inputs)
                     :reduction-contexts (:reduction-contexts @inputs)
                     :body-contexts (:body-contexts @inputs)
+                    :terminal-contexts (:terminal-contexts @inputs)
                     :typed-return-bridges (:typed-return-bridges @inputs)
                     :invocation-contexts (:invocation-contexts @inputs)
-                    :typed-interface typed-interface
+                    ;; The interface registry and method entry use a nominal
+                    ;; symbol. Frozen source serializes that name as a string;
+                    ;; renewal must publish the same nominal representation.
+                    ;; Actual Method/Class and implementation ownership remain
+                    ;; separate identity checks, never inferred from this name.
+                    :typed-interface (some-> typed-interface str symbol)
                     :dependency-snapshots (into dependencies (:values @inputs))
+                    :producer-inputs (:producer-inputs @inputs)
                     :static-inputs (:static @inputs) :definition-revision revision
                     :completed-definition-revision (dispatch/compiler-definition-revision)}
           failure (when implementation
@@ -412,28 +432,131 @@
         (do (when failure (throw failure))
             {:implementation implementation :emission emission})))))
 
+(clojure.core/defn ^:no-doc prepare-implementation-frontend!
+  "Freeze the original frontend under the existing implementation lock.
+   Does not invoke numerical code or emit a JVM module. Both GPU-first and
+   JVM-first compilation consume this exact semantic frontend."
+  [impl-var]
+  (locking impl-var
+    (if-let [spec (::jit-spec (meta impl-var))]
+      (if-let [owner (:frontend-source-owner spec)]
+        (me/frontend-source-input! owner (var-get impl-var))
+        (let [source-ns (find-ns (:source-ns-name spec))
+              source-var (when source-ns (ns-resolve source-ns (:mangled-sym spec)))
+              lineage (when source-var
+                        (me/capture-source-entry
+                         source-var (assoc spec :source-ns source-ns
+                                                :typed-interface (:typed-iface-name spec))))]
+          (when lineage
+            (let [implementation (var-get impl-var)
+                  inputs (atom {:static [] :values []})
+                  body (binding [me/*emission-inputs* inputs]
+                         (source-policy/call-with-policy
+                          (:source-policy lineage)
+                          #(jit-walk-with-tc (vec (:source-body lineage))
+                                             (:params lineage) (:tags lineage)
+                                             (:annotations lineage) source-ns)))
+                  element-dtype (dtype/infer-dtype-from-tags (:tags lineage))
+                  frontend (me/freeze-source-frontend
+                            lineage body {:element-dtype element-dtype
+                                          :parameter-dtype element-dtype} @inputs)
+                  owner (me/bind-source-frontend frontend implementation)]
+              (me/assert-source-entry-current! lineage)
+              (alter-meta! impl-var
+                           (fn [metadata]
+                             (when-not (and (identical? spec (::jit-spec metadata))
+                                            (identical? implementation (var-get impl-var)))
+                               (throw (ex-info "pending source changed during frontend preparation"
+                                               {:reason :unstable-pending-frontend :source source-var})))
+                             (assoc-in metadata [::jit-spec :frontend-source-owner] owner)))
+              (me/frontend-source-input! owner implementation)))))
+      (when-let [owner (get-in (meta impl-var) [::bytecode-emission :frontend-source-owner])]
+        ;; Renewal may replace a target module, never reconstruct its source.
+        (me/frontend-source-input! owner (var-get impl-var))))))
+
+(clojure.core/defn ^:no-doc prepare-deftm-frontend!
+  "Prepare an already selected source specialization without executing it."
+  [source-var]
+  (when (and (var? source-var) (::deftm (meta source-var)))
+    (when-let [impl-var (ns-resolve (:ns (meta source-var))
+                                   (symbol (str (:name (meta source-var)) "-impl")))]
+      (prepare-implementation-frontend! impl-var))))
+
+(clojure.core/defn ^:no-doc expand-retained-ad-body
+  "Expand AD in already retained typed source under its existing compiler owner.
+   This stage does not rewalk macros, select SIMD policy or publish a receiver."
+  [body params tags source-ns]
+  (if (some '#{raster.ad.reverse/value+grad raster.ad.reverse/grad}
+            (tree-seq coll? seq body))
+    (me/call-with-independent-definition-inputs
+     #(binding [*ns* (or source-ns *ns*)]
+        (mapv (fn [expression]
+                (@inline-ad-applications-fn expression (zipmap params tags))) body)))
+    body))
+
+(clojure.core/defn ^:no-doc prepare-original-static-source!
+  "Explicit static-compiler preparation from an authentic frozen frontend.
+   No receiver is emitted merely to obtain source. Existing AD helper capture
+   may still prepare actual physical invocations. The caller owns the NEW
+   static transformation and must retain these observations before publication."
+  [source-var]
+  (when-not me/*emission-inputs*
+    (throw (ex-info "static source preparation requires a compiler owner"
+                    {:reason :missing-definition-preparation-owner})))
+  (when-let [frontend (me/original-source-frontend source-var)]
+    (me/assert-frontend-source! frontend source-var)
+    (me/assert-frontend-selection! frontend source-var)
+    (me/observe-frontend-source-identity! frontend)
+    (let [{:keys [params tags source-ns source-policy]} (:source-entry frontend)
+          body (raster.compiler.core.source-policy/call-with-policy
+                source-policy #(expand-retained-ad-body (:body frontend) params tags source-ns))]
+      (me/assert-frontend-source! frontend source-var)
+      {:frontend frontend :body body})))
+
 (clojure.core/defn ^:no-doc do-bytecode-upgrade!
   "Compile a deftm body to bytecode and swap the -impl var.
   Julia model: re-walks from source body with TC at JIT time for
   TC-quality devirtualization. Required source walking must succeed before
   optional bytecode compilation; never uses a stale body after a failed walk."
   [impl-var mangled-sym params tags return-tag walked-body source-ns typed-iface-name
-   & {:keys [annotations source-body]}]
-  (let [;; Create compilation DCL if not already in a compilation scope.
+   & {:keys [annotations source-body source-policy] :as options}]
+  (let [source-var (ns-resolve source-ns mangled-sym)
+        retained-policy? (contains? options :source-policy)
+        source-metadata (meta source-var)
+        _ (when retained-policy? (source-policy/unchecked-math source-policy))
+        _ (when (and (or retained-policy? (contains? source-metadata ::source-policy))
+                     (or (not retained-policy?)
+                         (not (contains? source-metadata ::source-policy))
+                         (not= source-policy (::source-policy source-metadata))))
+            (throw (ex-info "Bytecode compilation lost its definition-owned source policy"
+                            {:reason :source-policy-mismatch :source source-var})))
+        ;; Create compilation DCL if not already in a compilation scope.
         ;; Required walking retains the same loader as subsequent emission.
           needs-cl? (nil? me/*compilation-classloader*)
           cl (when needs-cl?
                (clojure.lang.DynamicClassLoader.
                 (.getContextClassLoader (Thread/currentThread))))]
-    (binding [me/*compilation-classloader* (or me/*compilation-classloader* cl)]
-      (let [source-var (ns-resolve source-ns mangled-sym)
-            source-entry (me/capture-source-entry
+    (binding [me/*compilation-classloader* (or me/*compilation-classloader* cl)
+              *unchecked-math* (if retained-policy?
+                                (source-policy/unchecked-math source-policy)
+                                *unchecked-math*)]
+      (let [prepared (prepare-implementation-frontend! impl-var)
+            captured-entry (me/capture-source-entry
                           source-var {:params params :tags tags :annotations annotations
                                       :source-body source-body :source-ns source-ns
+                                      :source-policy source-policy
                                       :typed-interface typed-iface-name :return-tag return-tag})
-            fresh-body (if (and source-body annotations)
+            _ (when (and prepared (not= captured-entry (:source-entry prepared)))
+                (throw (ex-info "JVM emission request differs from its frozen frontend"
+                                {:reason :frontend-emission-source-mismatch :source source-var})))
+            source-entry (or (:source-entry prepared) captured-entry)
+            _ (when (and retained-policy? (nil? captured-entry))
+                (throw (ex-info "Bytecode source ownership changed before lineage capture"
+                                {:reason :unclosed-bytecode-source-entry :source source-var})))
+            fresh-body (if prepared (:body prepared)
+                         (if (and source-body annotations)
                          (jit-walk-with-tc (vec source-body) params tags annotations source-ns)
-                         walked-body)]
+                         walked-body))]
         (try
         (let [;; Publish the genuine source-walk cache before emission captures
               ;; dependencies. A later AOT cache fill must not invalidate code
@@ -448,26 +571,35 @@
                                    metadata
                                    (assoc metadata ::deftm-walked-body (vec fresh-body)))))
                   (me/assert-source-entry-current! source-entry))
-              ;; Re-walk from source body with TC for better devirtualization
-              effective-body fresh-body
-              ;; Use the same retained AD program as AOT, without expanding ordinary
-              ;; helper boundaries or rewalking its typed conversions. Lazy resolution
-              ;; avoids the scalar.inline -> raster.core namespace cycle.
-              effective-body
-              (if (some '#{raster.ad.reverse/value+grad raster.ad.reverse/grad}
-                        (tree-seq coll? seq effective-body))
-                (binding [*ns* (or source-ns *ns*)]
-                  (mapv #(@inline-ad-applications-fn % (zipmap params tags)) effective-body))
-                effective-body)
-              ;; Vectorize par/map + par/reduce out of the box (scalar fallback inside).
-              effective-body (simd-expand-jit-body effective-body source-ns)
-              class-name (str "raster.compiled.DT_"
-                              (.replace (str mangled-sym) "." "_")
-                              "_" (bit-and (hash effective-body) 0x7FFFFFFF)
-                              "_" (mod (System/nanoTime) 1000000))
               {:keys [implementation emission]}
-              (emit-owned-bytecode! @compile-typed-impl-fn class-name params tags return-tag
-                                    effective-body source-ns typed-iface-name mangled-sym)
+              ;; Transformation and emission share a historical input owner.
+              ;; Retrying emission alone cannot refresh a transformed AD body.
+              ;; Publication below happens only after this whole producer passes.
+              ;; Materialization is its own producer, not an extension of an
+              ;; unrelated analysis or caller's historical proof transaction.
+              ;; Callers still detect any promotion against THEIR old inputs.
+              (binding [me/*emission-inputs* nil]
+               (me/call-with-definition-inputs
+               (fn []
+                 (let [effective-body fresh-body
+                       ;; Use retained AD, without expanding ordinary helpers or
+                       ;; rewalking conversions. Lazy lookup avoids a namespace cycle.
+                       effective-body
+                       (expand-retained-ad-body effective-body params tags source-ns)
+                       effective-body (simd-expand-jit-body effective-body source-ns)
+                       class-name (str "raster.compiled.DT_"
+                                       (.replace (str mangled-sym) "." "_")
+                                       "_" (bit-and (hash effective-body) 0x7FFFFFFF)
+                                       "_" (mod (System/nanoTime) 1000000))
+                       result
+                       (emit-owned-bytecode!
+                        (fn [& arguments]
+                          (apply @compile-typed-impl-fn
+                                 (concat arguments [nil prepare-original-static-source!])))
+                        class-name params tags return-tag
+                                             effective-body source-ns typed-iface-name mangled-sym
+                                             @me/*emission-inputs*)]
+                   result))))
               impl implementation]
           (when impl
             ;; Original source lineage was captured BEFORE walking. The emitted
@@ -509,8 +641,18 @@
                 ;; assertion. Consumers must match the implementation by identity
                 ;; and retain the ordinary selected-definition/dependency guards.
                 ;; Attach only after successful dispatch/callsite publication.
-                (alter-meta! impl-var assoc ::bytecode-emission
-                             (cond-> emission source-entry (assoc :source-entry source-entry)))
+                (alter-meta! impl-var
+                             (fn [metadata published]
+                               (assoc (dissoc metadata ::jit-spec) ::bytecode-emission published))
+                             (cond-> emission source-entry
+                               (assoc :source-entry source-entry
+                                      :frontend-source-owner
+                                      (if prepared
+                                        (me/bind-source-frontend (:source-frontend prepared) impl)
+                                        (me/own-frontend-source
+                                         source-entry impl fresh-body
+                                         {:element-dtype (dtype/infer-dtype-from-tags tags)
+                                          :parameter-dtype (dtype/infer-dtype-from-tags tags)})))))
                 impl
                 (catch Exception e
               ;; Rollback var to old impl on dispatch table or callsite failure
@@ -557,7 +699,8 @@
         (do-bytecode-upgrade!
          impl-var (:mangled-sym spec) (:params spec) (:tags spec) (:return-tag spec)
          (:walked-body spec) (the-ns (:source-ns-name spec)) (:typed-iface-name spec)
-         :annotations (:annotations spec) :source-body (:source-body spec))
+         :annotations (:annotations spec) :source-body (:source-body spec)
+         :source-policy (:source-policy spec))
         (alter-meta! impl-var dissoc ::jit-spec)))))
 
 (clojure.core/defn ^:no-doc ensure-current-owned-bytecode!
@@ -584,7 +727,14 @@
       (if-not (or failure missing-walk?)
         emission
         (do
-          (when (and failure (not (me/retryable-emission-change? failure)))
+          ;; A generated AD module may outlive its rule epoch while its
+          ;; original source remains current. Only this authenticated source
+          ;; reconstruction may renew it; an emit-only retry must not reuse
+          ;; that transformed module or bless its old owner.
+          (when (and failure
+                     (not (or (me/retryable-emission-change? failure)
+                              (= :ad-prepared-program-stale-rules
+                                 (:reason (ex-data failure))))))
             (throw failure))
           (let [{:keys [source-name params tags return-tag source-ns typed-interface
                         annotations source-body] :as lineage} (:source-entry emission)]
@@ -597,7 +747,7 @@
                            (= (.sym ^clojure.lang.Var impl-var) (symbol (str source-name "-impl")))
                            (= params (:params emission)) (= tags (:tags emission))
                            (= return-tag (:return-tag emission))
-                           (= typed-interface (:typed-interface emission)))
+                           (= (str typed-interface) (str (:typed-interface emission))))
               (throw (ex-info "Bytecode renewal lost its original source correspondence"
                               {:reason :unowned-bytecode-renewal :var impl-var})))
             ;; Do not lend an enclosing stale proof owner to dependency
@@ -607,7 +757,8 @@
                       *jit-silent-fallback?* false]
               (do-bytecode-upgrade! impl-var source-name params tags return-tag nil
                                     source-ns typed-interface
-                                    :annotations annotations :source-body source-body))
+                                    :annotations annotations :source-body source-body
+                                    :source-policy (:source-policy lineage)))
             (let [fresh (::bytecode-emission (meta impl-var))]
               (when-not (and (not (identical? fresh emission))
                              (not (identical? (:implementation fresh) (:implementation emission)))
@@ -668,11 +819,12 @@
                           (throw (ex-info "Retained source namespace is unavailable"
                                           {:reason :missing-deftm-source-namespace
                                            :var v :source-ns (::deftm-source-ns m)})))
-                      walked (jit-walk-with-tc (vec src)
+                      walked (source-policy/call-with-owner
+                              m #(jit-walk-with-tc (vec src)
                                                (::deftm-params m)
                                                (::deftm-tags m)
                                                (::deftm-annotations m)
-                                               source-ns)]
+                                               source-ns))]
                   (alter-meta! v assoc ::deftm-walked-body (vec walked))
                   (vec walked))))))))
 
@@ -689,7 +841,8 @@
 
   Exported as `defn` — use (:refer-clojure :exclude [defn]) in ns form."
   [name & fdecl]
-  (let [;; Parse optional docstring
+  (let [policy (source-policy/capture)
+        ;; Parse optional docstring
         [docstring fdecl] (if (string? (first fdecl))
                             [(first fdecl) (rest fdecl)]
                             [nil fdecl])
@@ -743,6 +896,7 @@
                               ::deftm-walked-body (:walked-body reg#)
                               ::deftm-raw-body (:source-body reg#)
                               ::deftm-source-ns '~(symbol (str *ns*))
+                              ::source-policy '~policy
                               ::deftm-params '~(vec clean-params)
                               ::deftm-tags '~tags))
                (dispatch/bump-compiler-definition-revision!)
@@ -752,11 +906,14 @@
           `(do ~defn-form
                (alter-meta! (var ~name) assoc
                             ::deftm-source-ns '~(symbol (str *ns*))
+                            ::source-policy '~policy
                             ::deftm-params '~(vec clean-params)
                             ::deftm-tags '~tags)
                (dispatch/bump-compiler-definition-revision!)
                (var ~name))
-          defn-form)))))
+          `(do ~defn-form
+               (alter-meta! (var ~name) assoc ::source-policy '~policy)
+               (var ~name)))))))
 
 ;; Export as `defn` — consumers use (:refer-clojure :exclude [defn])
 (def ^{:macro true
@@ -805,7 +962,8 @@
   {:arglists '([name [params...] :- RetType & body]
                [name docstring [params...] & body])}
   [fn-name & args]
-  (let [;; Auto-qualify: if fn-name is unqualified but resolves to a generic function
+  (let [policy (source-policy/capture)
+        ;; Auto-qualify: if fn-name is unqualified but resolves to a generic function
         ;; var from another namespace (via :refer), use the qualified name so that
         ;; deftm extends the existing dispatch table instead of shadowing it.
         ;; This is the Julia semantics: `+(a::MyType, b::MyType) = ...` extends Base.+
@@ -907,7 +1065,7 @@
               '~(or ret-type 'Object)
               '~(vec params)
               '~(if (= 1 (count body)) (first body) (cons 'do body))
-              *ns*)
+              *ns* '~policy)
            ;; Generate concrete double specialization so the dispatch table
            ;; has a concrete overload for AD inline expansion and compilation
              (deftm ~fn-name ~concrete-params
@@ -985,6 +1143,7 @@
                           ::deftm-tags '~tags
                           ::deftm-annotations '~(vec annotations)
                           ::deftm-source-ns '~(symbol (str *ns*))
+                          ::source-policy '~policy
                           ::deftm-source-body (:source-body reg#)
                           ::deftm-walked-body (:walked-body reg#)
                           ::deftm-walked-body-typed (:walked-body-typed reg#)
@@ -1000,9 +1159,15 @@
                                         :annotations '~annotations
                                         :return-tag '~(or ret-tag 'Object)
                                         :source-body (:source-body reg#)
+                                        :source-policy '~policy
                                         :source-ns *ns* :typed-interface nil
                                         :clojure-body (:walked-body reg#)})]
-                 (alter-meta! source# assoc ::clojure-source-entry lineage#)))
+                 (alter-meta! source# assoc ::clojure-source-entry lineage#
+                              ::frontend-source-owner
+                              (me/own-frontend-source
+                               lineage# (var-get source#) (:walked-body reg#)
+                               {:element-dtype nil
+                                :parameter-dtype (dtype/infer-dtype-from-tags '~tags)}))))
            ~(when (seq fn-param-checks)
               `(alter-meta! (var ~mangled) assoc ::has-fn-params true))
            ~@(when generate-typed?
@@ -1037,6 +1202,7 @@
                                                 :tags '~tags
                                                 :annotations '~annotations
                                                 :return-tag '~(or ret-tag 'Object)
+                                                :source-policy '~policy
                                                 :source-body (:source-body reg#)
                                                 :walked-body (or (:walked-body-typed reg#) (:walked-body reg#))
                                                 :source-ns-name '~(ns-name *ns*)
@@ -1060,6 +1226,16 @@
 ;; ================================================================
 ;; Public API: ftm macro (typed anonymous function)
 ;; ================================================================
+
+(clojure.core/defn ^:no-doc anonymous-capture-fields
+  "Actual reify storage catches captures introduced by macro expansion too.
+   Static constants and reify's metadata slot are not lexical input ports."
+  [function]
+  (into #{} (keep (fn [^java.lang.reflect.Field field]
+                    (when-not (or (java.lang.reflect.Modifier/isStatic (.getModifiers field))
+                                  (= "__meta" (.getName field)))
+                      (.getName field))))
+        (.getDeclaredFields (class function))))
 
 (defmacro ftm
   "Typed anonymous function via reify on a shared interface.
@@ -1109,26 +1285,45 @@
         ;; Build IFn invoke arity — uses un-walked body for dispatch compatibility
         invoke-params (mapv (fn [p] (gensym (str p "__"))) params)
         invoke-let-bindings (vec (interleave params invoke-params))
+        ;; Source syntax catches elided constant captures; actual reify fields
+        ;; below also catch macro-introduced captures without expanding twice.
+        captured-source (binding [util/*shadowing-locals*
+                                  (into util/*shadowing-locals* (keys &env))]
+                          (set (filter (set (keys &env))
+                                       (util/free-syms
+                                        (list* 'fn* (vec params)
+                                               (concat (or walker-source-body body) walked-body))))))
+        source-policy {:unchecked-math *unchecked-math*}
         this-sym (gensym "this__")
         invk-sym 'invk]  ;; returns Object (interface contract)
     `(do
        (import ~iface-name)
-       (vary-meta
-        (reify
+       (let [function# (reify
           ~iface-name  ;; extends raster.compiler.core.types.TypedFn (marker for function algebra dispatch)
           (~invk-sym [~this-sym ~@prim-hinted-params] ~@walked-body)
           clojure.lang.IFn
           (~'invoke [~this-sym ~@invoke-params]
             (let ~invoke-let-bindings
-              ~@(or walker-source-body body))))
-        merge {::deftm true
+              ~@(or walker-source-body body))))]
+        (vary-meta function# merge {::deftm true
+               ::anonymous-function true
+               :ns (the-ns '~(ns-name *ns*))
+               ::deftm-source-ns '~(ns-name *ns*)
+               ::deftm-annotations '~(vec annotations)
+               ;; Both IFn.invoke and the shared typed invk interface return
+               ;; Object. A declaration must not invent a primitive completion.
+               ::return-tag '~'Object
+               ::deftm-return-annotation '~ret-type
+               ::source-policy '~source-policy
+               ::lexical-captures (into ~(set (map str captured-source))
+                                        (anonymous-capture-fields function#))
                ::deftm-walked-body '~(vec walked-body)
                 ;; Source body for AD: walker's pre-walk source (uses raster.numeric
                 ;; dispatch which handles Dual) when ftm is inside a walked deftm body.
                 ;; Falls back to the raw body when ftm is used standalone.
                ::deftm-source-body '~(vec (or walker-source-body body))
                ::deftm-params '~(vec params)
-               ::deftm-tags '~tags}))))
+               ::deftm-tags '~tags})))))
 
 ;; ================================================================
 ;; Public API: defvalue macro
@@ -1734,7 +1929,8 @@
   the invoke(Object) path is a bytecoded unboxing bridge (like manual deftm),
   not a Clojure-compiled fn with TC type hints that break array interop."
   [fn-name template bindings args]
-  (binding [dispatch/*installing-derived-specialization* true]
+  (binding [dispatch/*installing-derived-specialization* true
+            *unchecked-math* (source-policy/unchecked-math (:source-policy template))]
     (let [{:keys [annotations ret-annotation params body source-ns]} template
         ;; Specialize parametric value types (defvalue with All [T])
         ;; Value-class specialization tag: any NON-double binding (float/int/long
@@ -1920,6 +2116,7 @@
                            ::return-tag ret-tag
                            ::deftm-walked-body walked-body
                            ::deftm-source-body body-forms
+                           ::source-policy (:source-policy template)
                            ::deftm-annotations concrete-anns
                            ::deftm-source-ns (ns-name source-ns))
                 ;; Bytecode compile: creates invk (typed) + invoke(Object) bridge
@@ -1928,7 +2125,8 @@
                  impl-var mangled-sym params tags ret-tag
                  walked-body source-ns typed-iface-name
                  :annotations concrete-anns
-                 :source-body body-forms)
+                 :source-body body-forms
+                 :source-policy (:source-policy template))
                 ;; Register in dispatch table
                 ;; Match ordinary deftm registration: MethodEntry contains
                 ;; concrete function/implementation objects, not a name and a

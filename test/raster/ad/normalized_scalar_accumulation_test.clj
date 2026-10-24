@@ -4,6 +4,7 @@
             [raster.ad.normalized-map-runtime :as runtime]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.reverse :as reverse]
+            [raster.ad.accumulation :as checked-accumulation]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as soac]))
 
@@ -20,6 +21,20 @@
 (defn- project [values result expression]
   (#'normalized/canonical-scalar-accumulation! values result expression))
 
+(defn- expected-addition [dtype]
+  (if (= :double dtype)
+    '(clojure.core/+ (clojure.core/double left) (clojure.core/double right))
+    '(raster.numeric/+ left right)))
+
+(deftest array-accumulation-projection-retains-evaluation-obligations
+  (let [expression (with-meta '(raster.ad.reverse/grad-acc left right)
+                     {:raster.effect/preserve-evaluation true})
+        facts (repeat 2 {:presence :present :array-tag 'doubles})
+        projected (checked-accumulation/project-checked-array-addition
+                   expression facts (fn [_ tag] (= 'doubles tag)))]
+    (is (= '(raster.numeric/+ left right) projected))
+    (is (true? (:raster.effect/preserve-evaluation (meta projected))))))
+
 (deftest exact-homogeneous-non-nil-accumulations-project-to-typed-addition
   (doseq [dtype [:float :double]]
     (let [values {'left (scalar dtype) 'right (scalar dtype) 'result (scalar dtype)}
@@ -29,8 +44,7 @@
                                         ['result expression] '[result])
           region (#'normalized/scalar-program-lambda program '[left right] '[result])
           local (first (:locals (soac/lambda-parts region)))]
-      (is (= (list (if (= :double dtype) 'clojure.core/+ 'raster.numeric/+) 'left 'right)
-             projected))
+      (is (= (expected-addition dtype) projected))
       (is (= (case dtype :float 'float :double 'double)
              (:raster.type/tag (meta projected))))
       (is (= dtype (:dtype local)))
@@ -93,7 +107,7 @@
           (is (= :ad-normalized-scalar-accumulation (reason construct))))
         (is (zero? @calls) "definition/dispatch checks never invoke the unapproved helper"))
       (is (true? (reverse/approved-grad-acc-definition?)))
-      (is (= (list (if (= :double dtype) 'clojure.core/+ 'raster.numeric/+) 'left 'right)
+      (is (= (expected-addition dtype)
              (project values 'result expression)))
       (is (map? (build)) "restoring the exact library root restores construction"))))
 
@@ -114,7 +128,7 @@
         (finally (reset-meta! v original-metadata)))
       (is (true? (reverse/approved-grad-acc-definition?)))
       (is (= original-metadata (meta v)))
-      (is (= (list (if (= :double dtype) 'clojure.core/+ 'raster.numeric/+) 'left 'right)
+      (is (= (expected-addition dtype)
              (project values 'result expression)))
       (is (map? (build)) "restoring exact metadata restores construction"))))
 

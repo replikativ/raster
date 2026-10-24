@@ -220,54 +220,87 @@
       (walk expr))
     expr))
 
-(defn- stamp-emitted-bindings
-  "Post-process the bindings a grads-fn just emitted (plan 1c):
-   1. LHS: the gradient binding for parameter i gets Π(tag of actual arg i)
-      when the grads-fn didn't already mint it tagged (positional net for
-      sites not yet using the tagged gensym arity). Only stamps when the
-      primal tag is PRESENT — absent tags leave the emission untouched.
-   2. RHS: resolve fully-tagged backward calls at emission
-      (resolve-emitted-expr), threading earlier tagged LHS syms as env.
-   3. RHS call forms get the binding's tag as :raster.type/tag when known,
-      so downstream consumers (walker signature-result-tag,
-      resolve-generic-deftm-calls) read it instead of re-deriving.
-  Returns [bindings' grad-syms']."
-  [new-bindings actual-params grad-syms]
-  (let [;; Positional Π map for RETURNED grad syms still untagged; a sym
-        ;; returned for two conflicting slots is dropped (never guess).
+(defn- close-template-output-ports
+  "Resolve actual emitted values, then close scalar cotangent output ports.
+   A returned scalar's requested Π tag is an obligation, not evidence about
+   its raw RHS. Keep raw numerical/kernel bindings flat and project each port
+   separately before publishing that port's declaration. Intermediate and
+   array declarations retain their existing producer contracts."
+  [new-bindings actual-params grad-syms gensym-fn]
+  (let [targets (mapv grad-tag actual-params)
+        scalar? #(= :scalar (:kind (tangent/tangent-kind %)))
+        _ (doseq [[source ports] (group-by first (map vector grad-syms targets))
+                  :when (some? source)]
+            (let [spaces (set (map second ports))
+                  arrays (filter #(= :array (:kind (tangent/tangent-kind %))) spaces)]
+              (when (and (seq arrays)
+                         (or (some scalar? spaces) (> (count arrays) 1)))
+                (throw (ex-info "One template source cannot establish incompatible array/scalar ports"
+                                {:reason :ad-template-output-interface-conflict
+                                 :source source :targets spaces})))))
+        local-ids (set (take-nth 2 new-bindings))
+        raw-ids (into #{} (keep (fn [[g target]]
+                                 (when (and (symbol? g) (contains? local-ids g)
+                                            (scalar? target)) g)))
+                      (map vector grad-syms targets))
+        raw-symbol (fn [s] (if (contains? raw-ids s)
+                            (vary-meta s dissoc :raster.type/tag) s))
+        raw-expression (fn [e env]
+                         (util/subst-syms
+                          (zipmap raw-ids (repeat nil)) e
+                          (fn [visible s]
+                            (if (contains? visible s)
+                              (cond-> (raw-symbol s) (get env s)
+                                (vary-meta assoc :raster.type/tag (get env s)))
+                              s))))
+        ;; Array ports still refer to their producer-owned typed shadow buffers.
+        ;; Scalar ports are established separately below, never by this net.
         pos-tags (reduce
                   (fn [m [i g]]
-                    (if (and (symbol? g) (nil? (:raster.type/tag (meta g))))
-                      (if-let [t (grad-tag (nth actual-params i nil))]
-                        (if (and (contains? m g) (not= (get m g) t))
-                          (dissoc m g)
-                          (assoc m g t))
-                        m)
+                    (if (and (symbol? g) (nil? (:raster.type/tag (meta g)))
+                             (= :array (:kind (tangent/tangent-kind (nth targets i nil)))))
+                      (update m g (fnil conj #{}) (nth targets i))
                       m))
                   {} (map-indexed vector grad-syms))
         stamp-sym (fn [s]
-                    (if-let [t (and (symbol? s) (get pos-tags s))]
-                      (vary-meta s assoc :raster.type/tag t)
+                    (if-let [ts (and (symbol? s) (get pos-tags s))]
+                      (if (= 1 (count ts)) (vary-meta s assoc :raster.type/tag (first ts)) s)
                       s))
         [pairs _] (reduce
                    (fn [[acc env] [s e]]
-                     (let [s (stamp-sym s)
+                     (let [s (stamp-sym (raw-symbol s))
                            t (when (symbol? s) (:raster.type/tag (meta s)))
-                           e (resolve-emitted-expr e env)
+                           e (resolve-emitted-expr (raw-expression e env) env)
                            e (if (and t (seq? e)
                                       (nil? (:raster.type/tag (meta e))))
                                (vary-meta e assoc :raster.type/tag t)
                            e)
-                           ;; Preserve result facts of earlier intermediate
-                           ;; expressions for subsequent call selection. This
-                           ;; uses the compiler's existing inference, not the
-                           ;; desired tangent type of a later gradient slot.
-                           ;; Keep it in the lexical environment only: a dtype
-                           ;; fact is not a non-null or primitive-local proof.
-                           result-tag (or t (inference/infer-arg-tag e env))]
+                           ;; Dispatch inference may widen conditional branches;
+                           ;; that is not proof of a runtime boxed scalar dtype.
+                           result-tag (if (contains? raw-ids s)
+                                        (tangent/scalar-value-tag e)
+                                        (or t (inference/infer-arg-tag e env)))
+                           e (if (and result-tag (contains? raw-ids s) (seq? e)
+                                      (nil? (:raster.type/tag (meta e))))
+                               (vary-meta e assoc :raster.type/tag result-tag) e)
+                           s (if (and result-tag (contains? raw-ids s))
+                               (vary-meta s assoc :raster.type/tag result-tag) s)]
                        [(conj acc s e) (if (symbol? s) (assoc env s result-tag) env)]))
-                   [[] {}] (partition 2 new-bindings))]
-    [pairs (mapv stamp-sym grad-syms)]))
+                   [[] {}] (partition 2 new-bindings))
+        declarations (into {} (map (fn [s] [s s])) (take-nth 2 pairs))
+        binding-map (into {} (map vec (partition 2 pairs)))]
+    (reduce (fn [[bindings outputs] [g target]]
+              (let [raw (get declarations g g)]
+                (if (and (some? g) (scalar? target))
+                  (let [projected (tangent/project-expr target raw
+                                                       {:binding-map binding-map})]
+                    (if (identical? raw projected)
+                      [bindings (conj outputs (if (symbol? raw)
+                                               (vary-meta raw assoc :raster.type/tag target) raw))]
+                      (let [output (gensym-fn "projected_gradient" target)]
+                        [(conj bindings output projected) (conj outputs output)])))
+                  [bindings (conj outputs (stamp-sym raw))])))
+            [pairs []] (map vector grad-syms targets))))
 
 (defn- compile-grads-to-fn
   "Compile static :grads data into a :grads-fn closure.
@@ -298,10 +331,10 @@
   The gensym-fn handed to the grads-fn is canonicalized tag-capable
   (bind-ctx/tag-capable), so every emission site can mint Π-tagged syms.
 
-  Emitted bindings are post-processed (stamp-emitted-bindings): gradient
-  LHS syms carry Π(primal arg tag), fully-tagged backward calls are
-  devirtualized at emission, and tagged call forms carry :raster.type/tag —
-  all no-ops when the primal args carry no tags.
+  Emitted bindings pass through close-template-output-ports: actual typed
+  backward calls are devirtualized, then scalar gradient ports are projected
+  into their declared tangent spaces. Desired port types are never raw-RHS
+  evidence. Untagged arguments retain their existing emission.
 
   Returns [updated-ctx, [grad-sym ...]] where grad-syms are the symbols
   bound to gradient values for each parameter."
@@ -322,9 +355,9 @@
                        :actual-params (vec actual-params)
                        :declared-params (:params template)})))
     (let [bindings' (:bindings ctx')
-          [new-part grad-syms'] (stamp-emitted-bindings
+          [new-part grad-syms'] (close-template-output-ports
                                  (subvec (vec bindings') n-before)
-                                 (vec actual-params) (vec grad-syms))]
+                                 (vec actual-params) (vec grad-syms) gensym-fn)]
       [(assoc ctx' :bindings (into (vec (take n-before bindings')) new-part))
        (when grad-syms grad-syms')])))
 
@@ -564,9 +597,9 @@
                                  (let [gx (gensym-fn "dg_x" (grad-tag x))
                                        gy (gensym-fn "dg_y" (grad-tag y))]
                                    [(update ctx :bindings into
-                                            [gx (list 'if (list 'clojure.core/<= (list 'double x) (list 'double y))
+                                            [gx (list 'if (list 'clojure.core/<= (list 'clojure.core/double x) (list 'clojure.core/double y))
                                                       adjoint-sym 0.0)
-                                             gy (list 'if (list 'clojure.core/<= (list 'double x) (list 'double y))
+                                             gy (list 'if (list 'clojure.core/<= (list 'clojure.core/double x) (list 'clojure.core/double y))
                                                       0.0 adjoint-sym)])
                                     [gx gy]]))})
 
@@ -577,9 +610,9 @@
                                  (let [gx (gensym-fn "dg_x" (grad-tag x))
                                        gy (gensym-fn "dg_y" (grad-tag y))]
                                    [(update ctx :bindings into
-                                            [gx (list 'if (list 'clojure.core/>= (list 'double x) (list 'double y))
+                                            [gx (list 'if (list 'clojure.core/>= (list 'clojure.core/double x) (list 'clojure.core/double y))
                                                       adjoint-sym 0.0)
-                                             gy (list 'if (list 'clojure.core/>= (list 'double x) (list 'double y))
+                                             gy (list 'if (list 'clojure.core/>= (list 'clojure.core/double x) (list 'clojure.core/double y))
                                                       0.0 adjoint-sym)])
                                     [gx gy]]))})
 
@@ -845,15 +878,15 @@
            ;; (All [T]) mse-grad SOAC (a broadcast), NOT the CPU-era ^:no-inline
            ;; BLAS helper daxpy-diff! — so the fused backward lowers to a resident
            ;; GPU kernel (on-device LoRA training) and SIMD-vectorizes on CPU. The
-           ;; scale is a plain Double — it becomes mse-grad's declared scalar
-           ;; kernel param (a uniform, emitted float at :float dtype), so it does
-           ;; not drag the forward array into a host size/scalar closure and does
-           ;; not become a double intermediate in the float kernel.
+           ;; The scale's Double arithmetic is source semantics, separate from
+           ;; the gradient array's storage precision. Later lowering must retain
+           ;; its evaluation and justify any boundary conversion explicitly.
+           ;; Builtin casts belong to this producer, not the caller namespace.
                              scale (gensym-fn "mse_scale")
                              n-long (gensym-fn "mse_n")
                              ctx1 (update ctx :bindings into
-                                          [n-long (list 'long n)
-                                           scale (list 'raster.numeric// (list 'raster.numeric/* 2.0 adjoint-sym) (list 'double n-long))
+                                          [n-long (list 'clojure.core/long n)
+                                           scale (list 'raster.numeric// (list 'raster.numeric/* 2.0 adjoint-sym) (list 'clojure.core/double n-long))
                                            d-pred (list 'raster.dl.loss/mse-grad pred target scale n-long)])]
                          [ctx1 [d-pred nil nil]]))})
 
@@ -1042,8 +1075,8 @@
                                                      (list 'clojure.core/+ (list 'clojure.core/+ w (list 'clojure.core/* 2 pad-w))
                                                            (list 'clojure.core/- kw))
                                                      stride-w))
-                                   ckk   (list 'long (list 'clojure.core/* c-in (list 'clojure.core/* kh kw)))
-                                   bhw   (list 'long (list 'clojure.core/* batch (list 'clojure.core/* h-out w-out)))
+                                   ckk   (list 'clojure.core/long (list 'clojure.core/* c-in (list 'clojure.core/* kh kw)))
+                                   bhw   (list 'clojure.core/long (list 'clojure.core/* batch (list 'clojure.core/* h-out w-out)))
            ;; rearrange dy -> dy_cols[c_out, bhw]
                                    (vary-meta dy-cols-buf assoc :hoistable true)
                                    (list 'raster.arrays/zeros-like W (list 'clojure.core/* c-out bhw))
@@ -1104,7 +1137,7 @@
                                    n-in   n-in-expr
            ;; forward with argmax tracking — inline size exprs for hoistability
                                    out-buf (list 'raster.arrays/zeros-like x n-out-expr)
-                                   argmax  (list 'long-array n-out-expr)
+                                   argmax  (list 'clojure.core/long-array n-out-expr)
                                    fwd     (list 'raster.dl.nn/maxpool2d! x out-buf argmax
                                                  batch channels h w kh kw)
            ;; backward: scatter dy to argmax positions

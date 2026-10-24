@@ -1129,7 +1129,8 @@
                                   :emit-region materialize-locals})))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
-                (bc/desugar-invk (or typed-region-body (:lambda segmap))))]
+                (bc/desugar-invk
+                 (soac-dialect/scalar-converts->source (or typed-region-body (:lambda segmap)))))]
       (list 'let* [n-sym (list 'int bound)]
             (list 'loop* [j-sym '(int 0)]
                   (list 'if (ix< j-sym n-sym)
@@ -1160,7 +1161,10 @@
                        " acc=" acc " init=" init
                        " inputs=" (vec (:inputs segred)))))
         {:keys [species-expr from-array broadcast] cf :cast-fn} (get simd-type-info elem-type)]
-    (when (and acc init idx bound lambda)
+    ;; A retained integral reduction is valid IR, but this emitter currently
+    ;; owns only Float/Double species. Decline before constructing vector forms;
+    ;; the caller retains the scalar reduction rather than changing its dtype.
+    (when (and (contains? simd-type-info elem-type) acc init idx bound lambda)
       ;; Unwrap let* in lambda
       (let [[let-bindings inner-body]
             (if (and (seq? lambda) (contains? #{'let* 'let} (first lambda)))

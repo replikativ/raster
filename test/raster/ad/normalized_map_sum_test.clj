@@ -275,7 +275,7 @@
         operation (apply list (assoc operation 4 (soac/lambda-form '[total element] [body])))
         tampered (apply list (assoc (vec source) 2
                                    (assoc equations 1 (apply list (assoc reduction 3 operation)))))]
-    (is (= :ad-normalized-sum-step (reason #(build tampered 'xs))))))
+    (is (= :ad-normalized-value-declaration (reason #(build tampered 'xs))))))
 
 (deftest recertification-cannot-break-source-or-snapshot-correspondence
   (let [bundle (build (source :double) 'xs)
