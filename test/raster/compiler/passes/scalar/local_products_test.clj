@@ -3,6 +3,8 @@
             [raster.core :refer [deftm]]
             [raster.numeric :as n]
             [raster.ad.reverse :as reverse]
+            [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.local-products :as products]))
 
@@ -36,7 +38,10 @@
                    (.close ^java.lang.AutoCloseable compiled)))))))
 
 (defn- run [expression & arguments]
-  (apply (eval (list 'fn* '[x calls] expression)) arguments))
+  (binding [*unchecked-math* false]
+    (let [policy (source-policy/capture)
+          source (completion/project-to-jvm-source (list 'fn* '[x calls] expression) policy)]
+      (apply (eval source) arguments))))
 
 (deftest scalar-accumulation-lowering-requires-independent-present-carriers
   (let [source '(let* [left (clojure.core/double x)
