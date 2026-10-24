@@ -26,8 +26,35 @@
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
+
+(defn- owned-inline-function [parameters construct!]
+  (let [policy (source-policy/capture)]
+    (entry/call-with-definition-inputs
+     #(source-policy/call-with-policy
+       policy
+       (fn []
+         (let [{:keys [projection body]} (construct!)
+               tags (vec (repeat (count parameters) 'Object))
+               interface (types/ensure-fn-interface! tags)
+               {:keys [implementation emission]}
+               (core/emit-owned-bytecode!
+                bytecode/compile-typed-impl! "raster.compiled.InlineBodyTest"
+                parameters tags 'Object [body]
+                (the-ns 'raster.compiler.passes.scalar.inline-test)
+                (:iface-name interface) 'inline-body @entry/*emission-inputs*)
+               emission (bytecode/prepare-emitted-global-invocations! emission)
+               guard (entry/prepare-emission-input-guard! emission)]
+           [projection (fn [& arguments]
+                         (guard)
+                         (let [result (apply implementation arguments)]
+                           (guard)
+                           result))]))))))
 
 (deftest source-preparation-is-scoped-to-the-actual-inline-candidate
   (let [scope (create-ns (gensym "raster.inline-source-frontier."))
@@ -302,12 +329,14 @@
 
 (deftest ad-arguments-evaluate-once-in-source-order-even-when-unused
   (doseq [mode [:value+grad :grad]]
-    (let [expanded (inline/inline-value+grad-call
-                    {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
-                     :args '[(draw :first) (draw :unused)] :mode mode})
-          f (eval (list 'fn '[draw]
-                        (list 'let* (vec (mapcat identity (:bindings expanded)))
-                              (:elements expanded))))
+    (let [[_ f]
+          (owned-inline-function
+           '[draw]
+           #(let [expanded (inline/inline-value+grad-call
+                            {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
+                             :args '[(draw :first) (draw :unused)] :mode mode})]
+              {:projection expanded
+               :body (list 'let* (vec (mapcat identity (:bindings expanded))) (:elements expanded))}))
           trace (atom [])
           draw (fn [id] (swap! trace conj id) (if (= id :first) 3.0 7.0))]
       (is (= (if (= mode :value+grad)
@@ -334,13 +363,30 @@
        (inline/inline-value+grad-call
         {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
          :args '[x] :mode :value+grad})))
-  (let [expanded (inline/inline-value+grad-call
-                  {:var-sym 'raster.compiler.passes.scalar.inline-test/option-one-loss
-                   :args '[(clojure.core/float (draw))] :mode :value+grad})
-        [argument expression] (first (:bindings expanded))]
-    (is (= '(clojure.core/float (draw)) expression))
-    (is (= 'float (:raster.type/tag (meta argument)))
-        "the Double formal must not widen the lifted Float producer")))
+  (let [authored '(clojure.core/float (draw))
+        [expanded execute]
+        (owned-inline-function
+         '[draw]
+         #(let [expanded (inline/inline-value+grad-call
+                          {:var-sym 'raster.compiler.passes.scalar.inline-test/option-one-loss
+                           :args [authored] :mode :value+grad})]
+            {:projection expanded
+             :body (list 'let* (vec (mapcat identity (:bindings expanded))) (:elements expanded))}))
+        [argument expression] (first (:bindings expanded))
+        {:keys [contract operand]} (completion/canonical-parts expression)
+        expected ((rev/value+grad #'option-one-loss) (clojure.core/float 0.3))
+        actual (execute (constantly 0.3))
+        bits #(mapv (fn [value] (Double/doubleToRawLongBits (double value))) %)]
+    (is (= completion/object-input-contract contract))
+    (is (= authored operand) "the Object snapshot retains the authored Float producer")
+    (is (not-any? '#{float double long int Float Double Long Integer}
+                  ((juxt :tag :raster.type/tag) (meta argument)))
+        "an Object snapshot must not claim its producer's primitive carrier")
+    (is (every? #(instance? Double %) actual))
+    (is (= (bits expected) (bits actual))
+        "the Double formal consumes the already-rounded Float value and gradient")
+    (is (thrown? IllegalArgumentException (clojure.core/float Double/MAX_VALUE)))
+    (is (thrown? IllegalArgumentException (execute (constantly Double/MAX_VALUE))))))
 
 (deftm option-overloaded-loss [x :- Float n :- Long] :- Float
   (raster.numeric/* x x))
@@ -352,12 +398,14 @@
   (doseq [[tag argument] [['float (float 2.0)] ['double 2.0]]]
     (let [callee 'raster.compiler.passes.scalar.inline-test/option-overloaded-loss
           resolved (#'inline/resolve-deftm-for-ad callee [tag 'long])
-          result (inline/inline-value+grad-call
-                  {:var-sym callee :args '[x n] :mode :value+grad}
-                  :param-env {'x tag 'n 'long})
-          f (eval (list 'fn '[x n]
-                        (list 'let* (vec (mapcat identity (:bindings result)))
-                              (:elements result))))
+          [result f]
+          (owned-inline-function
+           '[x n]
+           #(let [result (inline/inline-value+grad-call
+                          {:var-sym callee :args '[x n] :mode :value+grad}
+                          :param-env {'x tag 'n 'long})]
+              {:projection result
+               :body (list 'let* (vec (mapcat identity (:bindings result))) (:elements result))}))
           actual (f argument (long 3))]
       (is (= ((rev/value+grad (:var resolved)) argument (long 3)) actual))
       (is (= [4.0 4.0 nil] actual))
@@ -386,15 +434,17 @@
                              (var raster.compiler.passes.scalar.inline-test/option-loss)
                              :mode :reverse :wrt [0])
                    vg (gradient x y)] vg)]]
-    (let [expanded (inline/inline-deftm-calls source)
-          f (eval (list 'fn '[x y] expanded))]
+    (let [[_ f] (owned-inline-function
+                 '[x y] #(let [expanded (inline/inline-deftm-calls source)]
+                           {:projection expanded :body expanded}))]
       (is (= [10.0 7.0 nil] (f 2.0 3.0)))
       (is (= ((rev/value+grad #'option-loss :wrt [0]) 2.0 3.0) (f 2.0 3.0)))))
   (let [source '(let* [gradient ((raster.ad.reverse/grad
                                   (var raster.compiler.passes.scalar.inline-test/option-loss)
                                   :wrt [0]) x y)] gradient)
-        expanded (inline/inline-deftm-calls source)
-        f (eval (list 'fn '[x y] expanded))]
+        [_ f] (owned-inline-function
+               '[x y] #(let [expanded (inline/inline-deftm-calls source)]
+                         {:projection expanded :body expanded}))]
     (is (= [7.0 nil] (f 2.0 3.0))))
   (doseq [source ['(let* [g ((raster.ad.reverse/grad
                              (var raster.compiler.passes.scalar.inline-test/option-one-loss)
@@ -403,15 +453,17 @@
                                     (var raster.compiler.passes.scalar.inline-test/option-one-loss)
                                     :wrt [0])
                           g (gradient x)] g)]]
-    (let [expanded (inline/inline-deftm-calls source)
-          f (eval (list 'fn '[x] expanded))]
+    (let [[_ f] (owned-inline-function
+                 '[x] #(let [expanded (inline/inline-deftm-calls source)]
+                         {:projection expanded :body expanded}))]
       (is (= ((rev/grad #'option-one-loss :wrt [0]) 2.0) (f 2.0)))
       (is (= 4.0 (f 2.0)))))
   (let [source '(let* [vg ((raster.ad.reverse/value+grad
                             (var raster.compiler.passes.scalar.inline-test/option-loss)
                             :wrt []) x y)] vg)
-        expanded (inline/inline-deftm-calls source)
-        f (eval (list 'fn '[x y] expanded))]
+        [_ f] (owned-inline-function
+               '[x y] #(let [expanded (inline/inline-deftm-calls source)]
+                         {:projection expanded :body expanded}))]
     (is (= [10.0 nil nil] (f 2.0 3.0))))
   (doseq [wrt [[-1] [2] [0 0]]]
     (is (thrown? clojure.lang.ExceptionInfo
