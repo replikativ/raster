@@ -741,9 +741,28 @@
   "Realize or renew an owned implementation without executing numerical code.
    Renewal emits NEW code from still-current frozen source; it never refreshes
    an old artifact's observations. Enclosing owners must discard/retry after
-   any dependency change, and previously returned executables remain stale."
-  [impl-var]
-  (locking impl-var
+   any dependency change, and previously returned executables remain stale.
+   An optional compiler-local, non-preparing predicate can additionally refuse
+   reuse of an ordinary module. False requests NEW emission from the same
+   authenticated source; true grants no proof and never bypasses the ordinary
+   guard. Malformed histories must throw rather than request renewal. This is
+   a sequential history check, not concurrent mutation/ABA protection."
+  ([impl-var] (ensure-current-owned-bytecode! impl-var nil))
+  ([impl-var additional-inputs-current?]
+  (when-not (or (nil? additional-inputs-current?) (ifn? additional-inputs-current?))
+    (throw (ex-info "Additional bytecode history validation requires a predicate"
+                    {:reason :invalid-bytecode-additional-input-validation :var impl-var})))
+  (let [additional-current?
+        (fn [emission]
+          (if-not additional-inputs-current?
+            true
+            (let [current? (additional-inputs-current? emission)]
+              (when-not (boolean? current?)
+                (throw (ex-info "Additional bytecode history validation must return a boolean"
+                                {:reason :invalid-bytecode-additional-input-validation
+                                 :var impl-var})))
+              current?)))]
+   (locking impl-var
     (binding [me/*emission-inputs* nil *jit-silent-fallback?* false]
       (ensure-bytecode-implementation! impl-var))
     (let [emission (::bytecode-emission (meta impl-var))
@@ -753,12 +772,13 @@
                               {:reason :unowned-bytecode-implementation :var impl-var})))
           failure (try (me/assert-emission-inputs-current! emission) nil
                        (catch clojure.lang.ExceptionInfo error error))
+          additional-history-current? (additional-current? emission)
           ;; Older concrete producers may predate source-cache publication.
           ;; Renew from frozen source rather than restamping their observations.
           source-var (some-> (:source-entry emission) :source-var)
           missing-walk? (and source-var
                              (not (seq (::deftm-walked-body (meta source-var)))))]
-      (if-not (or failure missing-walk?)
+      (if-not (or failure missing-walk? (false? additional-history-current?))
         emission
         (do
           ;; A generated AD module may outlive its rule epoch while its
@@ -800,7 +820,10 @@
                 (throw (ex-info "Bytecode renewal did not publish a new owned implementation"
                                 {:reason :failed-bytecode-renewal :var impl-var})))
               (me/assert-emission-inputs-current! fresh)
-              fresh)))))))
+              (when-not (additional-current? fresh)
+                (throw (ex-info "New bytecode does not close the additional historical inputs"
+                                {:reason :unclosed-bytecode-additional-inputs :var impl-var})))
+              fresh)))))))))
 
 ;; ================================================================
 ;; Walked body registry — avoids quoting large walked bodies into

@@ -12,6 +12,14 @@ Keep the original eight objectives below. The current landing order is:
    share dependency discovery, but `.invk` must not manufacture unused static
    siblings. Changed inputs during construction require discarding the whole
    attempt. Invoking an old captured artifact must still refuse, not retry it.
+   Derived publication closes the actual emitted call graph child-before-parent,
+   including source-owned warm intermediates with cold descendants. Ordinary
+   modules keep late-bound calls. Additional historical validation can only
+   refuse reuse and request new emission from authenticated unchanged source;
+   it cannot restamp an old module or override a malformed producer. Successful
+   child histories join only after the original publication fence. Exact-module
+   reuse is request-local and rechecks those original histories, not a new
+   portable or runtime compiler cache.
 2. Normalize segmented scalar computations at their actual TypedSOAC producer.
    Factor the existing selected-method FP body recipe from its physical caller
    argument-completion gate. A semantic typed operand domain is not evidence of

@@ -1211,16 +1211,18 @@
                                             :global-receiver global-receiver)))))))))))
 
 (def ^:private ^:dynamic *preparing-emitted-receivers* #{})
+(def ^:private ^:dynamic *prepared-emitted-modules* nil)
 
-(defn- consume-emitted-global-invocations!
-  [source]
-  (when-not me/*emission-inputs*
-    (throw (ex-info "emitted invocation preparation requires its compiler owner"
-                    {:reason :missing-definition-preparation-owner})))
-  (let [historical source
-        _ (me/assert-definition-inputs-current! @me/*emission-inputs*)
-        physical (filterv (fn [[_ record]] (contains? record ::physical-invocation))
-                          (:invocation-contexts historical))
+(defn- emitted-global-invocations
+  "Authenticate the original physical catalog without preparing or adopting it.
+   Malformed accounting/ownership is not historical staleness and cannot request
+   a fresh module through the additional-reuse predicate."
+  [historical]
+  (let [contexts (:invocation-contexts historical)
+        _ (when-not (or (nil? contexts) (map? contexts))
+            (throw (ex-info "emitted global invocation catalog is malformed"
+                            {:reason :unclosed-emitted-global-invocations})))
+        physical (filterv (fn [[_ record]] (contains? record ::physical-invocation)) contexts)
         calls (mapv val physical)
         ordinals (mapv :emission-ordinal calls)]
     (when-not (and (every? (fn [[key record]] (identical? key (::physical-invocation record))) physical)
@@ -1238,50 +1240,125 @@
                                  (vals (:invocation-contexts historical)))))
       (throw (ex-info "emitted global invocation readiness is incomplete"
                       {:reason :unclosed-emitted-global-invocations})))
+    (doseq [{:keys [method global-receiver]} calls]
+      (let [{:keys [snapshot selection observations]} global-receiver
+            v (:var snapshot)
+            retained (get-in observations [:definition-proofs v])
+            pending? (map? (get-in snapshot [:metadata :raster.core/jit-spec]))
+            definition (:definition selection)]
+        (when-not (and (map? observations) (map? snapshot) (var? v)
+                       (true? (:bound? snapshot)) (map? (:metadata snapshot))
+                       (set? (:lookups snapshot)) (seq (:lookups snapshot))
+                       (map? retained) (me/same-var-snapshot? snapshot retained)
+                       (every? (:lookups retained) (:lookups snapshot))
+                       (.isInstance (.getDeclaringClass ^java.lang.reflect.Method method) (:value snapshot))
+                       (or (not pending?)
+                           (and (= method (:invocation-method selection))
+                                (identical? v (:receiver-var definition))
+                                (identical? (:value snapshot)
+                                            (get-in definition [:entry :typed-impl])))))
+          (throw (ex-info "emitted receiver lost its original selected-entry observation"
+                          {:reason :unowned-emitted-global-invocation :receiver v})))))
+    (vec (sort-by :emission-ordinal calls))))
+
+(defn- emitted-global-history-current?
+  "Additional, refusal-only module history check for explicit readiness.
+   Genuine Var history drift requests NEW source-owned emission. Other producer
+   guard failures remain hard refusals; no exception is reclassified as renewal."
+  [emission]
+  (let [calls (emitted-global-invocations emission)]
+    ;; Producer protocol/ownership failures remain hard refusals even when a
+    ;; Var snapshot in the same history is also stale. Check every producer
+    ;; before the staleness predicate can short-circuit on an earlier call.
+    (doseq [{:keys [global-receiver]} calls]
+      (me/assert-definition-inputs-current!
+       (dissoc (:observations global-receiver) :definition-proofs)))
+    (every?
+     (fn [{:keys [global-receiver]}]
+       (let [historical (:observations global-receiver)]
+         (if (every? me/var-snapshot-current? (vals (:definition-proofs historical)))
+           true
+           false)))
+     calls)))
+
+(defn- consume-emitted-global-invocations!
+  [source]
+  (when-not me/*emission-inputs*
+    (throw (ex-info "emitted invocation preparation requires its compiler owner"
+                    {:reason :missing-definition-preparation-owner})))
+  (let [_ (me/assert-definition-inputs-current! @me/*emission-inputs*)
+        calls (emitted-global-invocations source)]
     (let [observations (atom {:static [] :values []})
           _ (binding [me/*emission-inputs* observations]
-              (doseq [{:keys [global-receiver]} (sort-by :emission-ordinal calls)]
-                (when-not (map? (:observations global-receiver))
-                  (throw (ex-info "emitted receiver has no original observation history"
-                                  {:reason :unowned-emitted-global-invocation})))
+              (doseq [{:keys [global-receiver]} calls]
                 (me/adopt-definition-inputs! (:observations global-receiver))))
           receivers
           (reduce
-           (fn [result {:keys [method global-receiver]}]
-             (let [{:keys [snapshot selection]} global-receiver
+           (fn [result {:keys [global-receiver]}]
+             (let [snapshot (:snapshot global-receiver)
                    v (:var snapshot)
                    retained (get-in @observations [:definition-proofs v])
                    pending? (map? (get-in snapshot [:metadata :raster.core/jit-spec]))
-                   definition (:definition selection)]
+                   owned? (map? (get-in snapshot [:metadata :raster.core/bytecode-emission]))]
                ;; Later actual occurrences may merge additional lookup edges
                ;; into the SAME first definition observation. Keep this call's
                ;; original snapshot; do not demand map identity after that merge.
                (when-not (and (me/same-var-snapshot? snapshot retained)
                               (every? (:lookups retained) (:lookups snapshot))
-                              (me/var-snapshot-current? snapshot)
-                              (or (not pending?)
-                                  (and (= method (:invocation-method selection))
-                                       (identical? v (:receiver-var definition))
-                                       (identical? (:value snapshot)
-                                                   (get-in definition [:entry :typed-impl])))))
+                              (me/var-snapshot-current? snapshot))
                  (throw (ex-info "emitted receiver lost its original selected-entry observation"
                                  {:reason :unowned-emitted-global-invocation :receiver v})))
-               (if (and pending? (not (some #(identical? v %) result)))
+               (if (and (or pending? owned?) (not (some #(identical? v %) result)))
                  (conj result v) result)))
-           [] (sort-by :emission-ordinal calls))
+           [] calls)
           _ (me/adopt-definition-inputs! @observations)]
       (when (some *preparing-emitted-receivers* receivers)
         (throw (ex-info "recursive pending receiver preparation cannot publish an owned emission"
                         {:reason :recursive-emitted-receiver-preparation})))
       (when (seq receivers)
-        (let [prepare! (requiring-resolve 'raster.core/ensure-current-owned-bytecode!)]
-          (me/prepare-pending-definition-inputs!
+        (let [prepare! (requiring-resolve 'raster.core/ensure-current-owned-bytecode!)
+              completed (atom [])]
+          (me/prepare-owned-definition-inputs!
            (fn [receiver]
              ;; Only the currently preparing ancestor is active. A sibling
              ;; queued later in the outer batch can legitimately be a child.
              (binding [*preparing-emitted-receivers* (conj *preparing-emitted-receivers* receiver)]
-               (prepare! receiver)))
-           receivers)))
+               (let [prepared
+                     (me/call-with-definition-inputs
+                      (fn []
+                        (let [emission (prepare! receiver emitted-global-history-current?)]
+                          ;; Ordinary named emission is still late-bound. Only
+                          ;; this derived consumer closes actual descendants.
+                          ;; A changed child rejects the whole local attempt.
+                          ;; The actual current module and its complete physical
+                          ;; catalog were checked ABOVE, even on a memo hit.
+                          ;; Reuse only a successful request-local traversal's
+                          ;; ORIGINAL inputs; never reobserve stale history.
+                          (if-let [retained (when *prepared-emitted-modules*
+                                             (.get ^java.util.IdentityHashMap
+                                                   *prepared-emitted-modules* emission))]
+                            (try (me/adopt-definition-inputs! retained)
+                                 (catch Throwable failure
+                                   (.remove ^java.util.IdentityHashMap
+                                            *prepared-emitted-modules* emission)
+                                   (throw failure)))
+                            (consume-emitted-global-invocations! emission))
+                          (me/assert-emission-inputs-current! emission)
+                          {:emission emission :inputs @me/*emission-inputs*})))]
+                 ;; The local owner has now passed its final publication
+                 ;; fence. Rejected attempts contribute no retained inputs.
+                 (when *prepared-emitted-modules*
+                   (.put ^java.util.IdentityHashMap *prepared-emitted-modules*
+                         (:emission prepared) (:inputs prepared)))
+                 (swap! completed conj (:inputs prepared)))))
+           receivers)
+          ;; Preparation has already fenced the ORIGINAL outer observations.
+          ;; Only a stable whole attempt may adopt the children's original
+          ;; histories. A promoted enclosing attempt cannot refresh itself.
+          (doseq [historical @completed]
+            (binding [me/*emission-inputs* observations]
+              (me/adopt-definition-inputs! historical)))
+          (me/adopt-definition-inputs! @observations)))
       @observations)))
 
 (defn ^:no-doc prepare-emitted-global-invocations!
@@ -1290,15 +1367,19 @@
    rejected body. Ordinary named/static emission only records this history.
    The emission arity returns the same constructed artifact with these exact
    consumed observations included in its existing execution guard inputs."
-  ([] (consume-emitted-global-invocations! (when me/*emission-inputs* @me/*emission-inputs*)) nil)
+  ([]
+   (binding [*prepared-emitted-modules* (or *prepared-emitted-modules* (java.util.IdentityHashMap.))]
+     (consume-emitted-global-invocations! (when me/*emission-inputs* @me/*emission-inputs*))
+     nil))
   ([emission]
-   (me/assert-emission-inputs-current! emission)
-   (let [observations (consume-emitted-global-invocations! emission)
-         completed (-> emission
-                       (update :dependency-snapshots into (:values observations))
-                       (update :producer-inputs #(into (vec %) (:producer-inputs observations))))]
-     (me/assert-emission-inputs-current! completed)
-     completed)))
+   (binding [*prepared-emitted-modules* (or *prepared-emitted-modules* (java.util.IdentityHashMap.))]
+     (me/assert-emission-inputs-current! emission)
+     (let [observations (consume-emitted-global-invocations! emission)
+           completed (-> emission
+                         (update :dependency-snapshots into (:values observations))
+                         (update :producer-inputs #(into (vec %) (:producer-inputs observations))))]
+       (me/assert-emission-inputs-current! completed)
+       completed))))
 
 (defn ^:no-doc retained-invocation-context
   "Query one ORIGINAL occurrence from a trusted, guarded bytecode emission.

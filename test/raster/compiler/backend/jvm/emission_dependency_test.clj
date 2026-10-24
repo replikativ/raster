@@ -383,9 +383,10 @@
             actual-ready! bytecode/prepare-emitted-global-invocations!
             result
             (with-redefs [core/ensure-current-owned-bytecode!
-                          (fn [v]
-                            (swap! prepared conj v)
-                            (actual-prepare! v))
+                          (fn [v & additional-checks]
+                            (when (:raster.core/jit-spec (meta v))
+                              (swap! prepared conj v))
+                            (apply actual-prepare! v additional-checks))
                           bytecode/prepare-emitted-global-invocations!
                           (fn [emission]
                             (try (actual-ready! emission)
@@ -435,6 +436,154 @@
             (is (thrown? clojure.lang.ExceptionInfo (guard)))
             (finally (reset-meta! changed original))))
         (is (guard)))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest completed-emitter-closes-a-cold-deep-diamond-without-numerical-execution
+  (doseq [warm-intermediates? [false true]]
+   (let [scope (create-ns (gensym "raster.deep-receiver-readiness."))
+        events (atom [])
+        chain (mapv #(symbol (str "level" %)) (range 5))]
+    (try
+      (intern scope 'events events)
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm leaf [x :- Double] :- Double
+                 (do (swap! events conj :leaf) x)))
+        (doseq [[name child] (reverse (map vector chain (conj (subvec chain 1) 'leaf)))]
+          (eval (list 'raster.core/deftm name '[x :- Double] ':- 'Double (list child 'x))))
+        (doseq [name '[left right]]
+          (eval (list 'raster.core/deftm name '[x :- Double] ':- 'Double
+                      (list (first chain) 'x))))
+        (eval '(raster.core/deftm unused [x :- Double] :- Double x))
+        (eval '(raster.core/deftm caller [x :- Double] :- Double
+                 (clojure.core/+ (left x) (right x)))))
+      (let [source #(core/resolve-deftm-var (ns-resolve scope %))
+            receiver #(ns-resolve scope (symbol (str (:name (meta (source %))) "-impl")))
+            caller (source 'caller)
+            all-receivers (mapv receiver (concat '[leaf] (reverse chain) '[left right]))
+            _ (when warm-intermediates?
+                (doseq [name '[left right]] (core/ensure-current-owned-bytecode! (receiver name))))
+            _ (is (every? #(map? (:raster.core/jit-spec (meta (receiver %))))
+                           (conj chain 'leaf))
+                  "ordinary intermediate compilation leaves its descendants cold")
+            unused (receiver 'unused)
+            attempts (atom 0)
+            traversals (atom [])
+            result
+            (method-entry/call-with-definition-inputs
+             #(let [_ (swap! attempts inc)
+                    frontend (core/prepare-deftm-frontend! caller)
+                    _ (method-entry/assert-frontend-source! frontend caller)
+                    _ (method-entry/observe-frontend-source-identity! frontend)
+                    {:keys [params tags return-tag typed-interface]} (:source-entry frontend)
+                    emitted (core/emit-owned-bytecode!
+                             bytecode/compile-typed-impl! "raster.compiled.DeepReceiverReadiness"
+                             params tags return-tag (:body frontend) scope typed-interface
+                             (:name (meta caller)) @method-entry/*emission-inputs*)]
+                (let [counts (java.util.IdentityHashMap.)
+                      consume @#'bytecode/consume-emitted-global-invocations!]
+                  (swap! traversals conj counts)
+                  (with-redefs-fn
+                    {#'bytecode/consume-emitted-global-invocations!
+                     (fn [module]
+                       (.put counts module (inc (or (.get counts module) 0)))
+                       (consume module))}
+                    (fn [] (update emitted :emission bytecode/prepare-emitted-global-invocations!))))))
+            guard (method-entry/prepare-emission-input-guard! (:emission result))]
+        (is (= 2 @attempts)
+            "the explicit preparation frontier closes before one whole-owner retry")
+        (is (empty? @events) "neither chain nor diamond preparation executes a numerical body")
+        (is (every? #(nil? (:raster.core/jit-spec (meta %))) all-receivers))
+        (is (every? (fn [counts] (every? #(= 1 %) (.values ^java.util.IdentityHashMap counts)))
+                    @traversals)
+            "each actual shared module is traversed once per public readiness invocation")
+        (is (map? (:raster.core/jit-spec (meta unused))) "an unrelated receiver stays cold")
+        (is (guard))
+        (is (= 6.0 ((:implementation result) 3.0)))
+        (is (= [:leaf :leaf] @events))
+        (doseq [name '[left leaf]]
+         (let [changed (receiver name)
+              original (meta changed)]
+          (try
+            (alter-meta! changed assoc ::real-source-change (Object.))
+            (is (thrown? clojure.lang.ExceptionInfo (guard)))
+            (finally (reset-meta! changed original)))))
+        (is (guard)))
+      (finally (remove-ns (ns-name scope)))))))
+
+(deftest additional-history-does-not-launder-malformed-or-refusing-producers
+  (let [scope (create-ns (gensym "raster.additional-physical-history."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm leaf [x :- Double] :- Double x))
+        (eval '(raster.core/deftm caller [x :- Double] :- Double (leaf x))))
+      (let [source #(core/resolve-deftm-var (ns-resolve scope %))
+            receiver #(ns-resolve scope (symbol (str (:name (meta (source %))) "-impl")))
+            emission (core/ensure-current-owned-bytecode! (receiver 'caller))
+            [key _] (first (filter (fn [[key record]]
+                                    (identical? key (::bytecode/physical-invocation record)))
+                                  (:invocation-contexts emission)))
+            leaf (receiver 'leaf)
+            metadata (meta leaf)
+            reason (fn [module]
+                     (try (#'bytecode/emitted-global-history-current? module) nil
+                          (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))]
+        (is (some? key))
+        (is (#'bytecode/emitted-global-history-current? emission))
+        (try
+          (alter-meta! leaf assoc ::real-source-change (Object.))
+          (is (false? (#'bytecode/emitted-global-history-current? emission)))
+          (is (= :unclosed-emitted-global-invocations
+                 (reason (update emission :invocation-contexts dissoc key))))
+          (is (= :unowned-emitted-global-invocation
+                 (reason (update-in emission [:invocation-contexts key :global-receiver]
+                                    dissoc :observations))))
+          (let [refusing (reify method-entry/RetainedProducerInput
+                           (assert-producer-current! [_]
+                             (throw (ex-info "refusing original producer"
+                                             {:reason :refusing-test-producer}))))]
+            (is (= :refusing-test-producer
+                   (reason (update-in emission
+                                      [:invocation-contexts key :global-receiver :observations :producer-inputs]
+                                      (fnil conj []) refusing)))))
+          (finally (reset-meta! leaf metadata))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest additional-module-history-check-can-only-refuse-reuse
+  (let [scope (create-ns (gensym "raster.additional-module-history."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm identity-value [x :- Double] :- Double x)))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'identity-value))
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            original (core/ensure-current-owned-bytecode! receiver)
+            original-implementation (var-get receiver)
+            reason (fn [check]
+                     (try (core/ensure-current-owned-bytecode! receiver check) nil
+                          (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))]
+        (is (identical? original (core/ensure-current-owned-bytecode! receiver (constantly true))))
+        (is (= :invalid-bytecode-additional-input-validation (reason (constantly nil))))
+        (is (= :malformed-test-module
+               (reason (fn [_] (throw (ex-info "malformed history" {:reason :malformed-test-module}))))))
+        (is (identical? original-implementation (var-get receiver))
+            "invalid or unknown history refusal cannot trigger renewal")
+        (let [checked (atom [])
+              fresh (core/ensure-current-owned-bytecode!
+                     receiver (fn [module]
+                                (swap! checked conj module)
+                                (not (identical? original module))))]
+          (is (= 2 (count @checked)))
+          (is (identical? original (first @checked)))
+          (is (identical? fresh (second @checked)))
+          (is (not (identical? original fresh)))
+          (is (not (identical? original-implementation (var-get receiver))))
+          (is (identical? (:implementation fresh) (var-get receiver)))
+          (is (identical? fresh (core/ensure-current-owned-bytecode! receiver)))
+          (is (= :unclosed-bytecode-additional-inputs (reason (constantly false))))
+          (is (not (identical? fresh (core/ensure-current-owned-bytecode! receiver)))
+              "even failed final validation never restamps the previous module")))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest tokenless-static-emission-records-do-not-become-source-occurrences
@@ -496,7 +645,13 @@
         (is (identical? emission (core/ensure-current-owned-bytecode! receiver)))
         (is (= 0.0 ((var-get source) 3.0)))
         (is (= [3.0 2.0 1.0 0.0] @events))
-        (is (identical? emission (guard))))
+        (is (identical? emission (guard)))
+        (let [before @events]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (method-entry/call-with-definition-inputs
+                        #(bytecode/prepare-emitted-global-invocations! emission)))
+              "ordinary recursion is not an acyclic derived-readiness proof")
+          (is (= before @events) "refused derived preparation executes no recursive body")))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest static-sibling-discovery-distinguishes-direct-calls-from-invk-dependencies
