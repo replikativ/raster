@@ -18,7 +18,8 @@
     ;; producer action before the read-only query's independent owner begins.
     (doseq [name '[allocated effectful-allocation recursive-array borrowed-array
                   nullable-array borrowed-array-with-count throwing-array
-                  discarded-array object-array-result mismatched-array-result broadcast-array]]
+                  discarded-array object-array-result mismatched-array-result broadcast-array
+                  effectful-primitive-return boxed-reference-return]]
       (when-let [v (ns-resolve 'raster.compiler.passes.scalar.normal-return-test name)]
         (core/prepare-emission-source-walk! (core/resolve-deftm-var v))))
     (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
@@ -99,6 +100,12 @@
 (deftm broadcast-array [input :- (Array double) n :- Long] :- (Array double)
   (broadcast [input] input))
 
+(deftm effectful-primitive-return [events :- (Array long) value :- Object] :- Double
+  (aset events 0 (inc (aget events 0)))
+  value)
+
+(deftm boxed-reference-return [n :- Long] :- java.lang.Double nil)
+
 (defn- selected-call [v args]
   (let [m (meta v) operation (symbol (str (:ns m)) (str (:name m)))
         entry (first (get (core/methods-of v) (count args)))
@@ -150,6 +157,58 @@
                     (method-entry/call-with-definition-inputs #(normal/result-fact call)))
                   :accepted
                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest primitive-return-completion-is-not-totality-or-body-carrier-evidence
+  (is (= {:presence :unknown}
+         (normal/result-fact (selected-call #'boxed-reference-return '[n]))))
+  (is (nil? (boxed-reference-return 0)) "an explicitly boxed reference may return nil")
+  (is (= {:presence :unknown}
+         (normal/result-fact (with-meta '(unknown-number) {:raster.type/tag 'double}))))
+  (let [call (selected-call #'effectful-primitive-return '[events input])
+        receiver (find-var (second call))
+        raw (list 'let* ['result call] '(if (clojure.core/nil? result) :absent :present))
+        captured (method-entry/call-with-definition-inputs
+                  #(let [fact (normal/result-fact call)
+                         lowered (products/lower-local-products raw)]
+                     {:fact fact :lowered lowered :inputs @method-entry/*emission-inputs*}))
+        compile! #(eval (list 'fn* '[events input] %))
+        original (compile! raw)
+        optimized (compile! (:lowered captured))
+        observe (fn [function value]
+                  (let [events (long-array [0])
+                        outcome (try {:value (function events value)}
+                                     (catch Throwable error {:error (class error)}))]
+                    (assoc outcome :events (vec events))))]
+    (is (= {:presence :present :scalar-type :double} (:fact captured)))
+    (is (not (contains? (:definition-proofs (:inputs captured)) receiver)))
+    (is (= 1 (count (filter #(= call %) (tree-seq coll? seq (:lowered captured))))))
+    (doseq [value [2.0 nil (Object.)]]
+      (let [expected (observe original value)
+            actual (observe optimized value)]
+        (is (= expected actual))
+        (is (= [1] (:events actual)) "unknown body effects and return conversions run once")
+        (if (number? value)
+          (is (= :present (:value actual)))
+          (is (class? (:error actual)) "presence is conditional on successful return"))))
+    (is (true? (method-entry/assert-definition-inputs-current! (:inputs captured)))
+        "genuine JIT did not change the semantic return contract")))
+
+(deftest return-domain-does-not-import-hints-or-promote-branch-widths
+  (is (= {:presence :present}
+         (normal/result-fact 'input {'input {:presence :present :scalar-type :double
+                                            :producer-scalar-type :float}})))
+  (let [operation 'raster.numeric//
+        signature (inference/registered-call-signature operation '[float float])
+        implementation (symbol (str (:mangled-sym signature) "-impl"))
+        _ (core/prepare-deftm-frontend! (find-var (:mangled-sym signature)))
+        float-call (with-meta (list '.invk implementation 'left 'right)
+                     {:raster.op/original operation})
+        double-call (selected-call #'effectful-primitive-return '[events input])
+        fact #(method-entry/call-with-definition-inputs (fn [] (normal/result-fact %)))]
+    (is (= {:presence :present :scalar-type :float} (fact float-call)))
+    (is (= {:presence :present} (fact (list 'if 'condition float-call double-call))))
+    (is (= {:presence :present :scalar-type :float}
+           (fact (list 'if 'condition float-call float-call))))))
 
 (deftest presence-never-uses-source-captured-before-its-observation
   (doseq [selection [:typed :direct] phase [:before-observation :after-observation]]

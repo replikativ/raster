@@ -36,7 +36,8 @@
 (deftest direct-allocation-projection-is-derived-from-the-selected-definition
   (with-source
     (fn [source]
-      (define-allocator 'pure-like '[ref :- (Array double) n :- Long] '(double-array n))
+      (define-allocator 'pure-like '[ref :- (Array double) n :- Long]
+        '(double-array (clojure.core/long n)))
       (let [op (operation source "pure-like" "doubles_long")
             implementation (symbol (namespace op) (str (name op) "-impl"))
             make-call (fn [arguments]
@@ -46,7 +47,7 @@
             values {'x {:dtype :double :shape ['m]} 'cnt {:dtype :long :shape []}}
             projection (descriptor/direct-allocation-projection call values)]
         (is (= '(clojure.core/double-array (clojure.core/long cnt)) (:constructor projection))
-            "projection retains the helper's explicit parameter conversion")
+            "projection retains the conversion authored in the actual helper body")
         (is (= implementation (get-in projection [:helper :implementation])))
         (is (= ['x 'cnt] (get-in projection [:helper :arguments])))
         (doseq [selected [(ns-resolve source (symbol (name implementation)))
@@ -66,6 +67,16 @@
           '(let [out (double-array n)] (aset out 0 9.0) out))
         (is (nil? (descriptor/direct-allocation-projection call values))
             "an alloc/compute helper is not a pure constructor, even after a previous projection"))
+      (define-allocator 'bare-like '[ref :- (Array double) n :- Long] '(double-array n))
+      (let [op (operation source "bare-like" "doubles_long")
+            implementation (symbol (namespace op) (str (name op) "-impl"))
+            call (with-meta (list '.invk implementation 'x 'cnt)
+                   {:raster.op/original (symbol (namespace op) "bare-like")})]
+        (is (= '(clojure.core/double-array cnt)
+               (:constructor (descriptor/direct-allocation-projection
+                              call {'x {:dtype :double :shape ['m]}
+                                    'cnt {:dtype :long :shape []}})))
+            "semantic constructor projection does not invent a physical entry adapter"))
       (let [op (symbol (str (ns-name source)) "tick")
             fake {:allocates? true :auto-detected? true
                   :direct-allocation {:parameters '[n] :parameter-tags '[long]

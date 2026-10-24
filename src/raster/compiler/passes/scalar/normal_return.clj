@@ -30,14 +30,16 @@
       :else
       (cond-> {:presence (if (= pa pb) pa :unknown)}
         (and (:array-tag a) (= (:array-tag a) (:array-tag b)))
-        (assoc :array-tag (:array-tag a))))))
+        (assoc :array-tag (:array-tag a))
+        (and (:scalar-type a) (= (:scalar-type a) (:scalar-type b)))
+        (assoc :scalar-type (:scalar-type a))))))
 
 (declare summary)
 
 (defn- summary-source
-  "Semantic reference-return source, never a replaceable emitted body.
-   Other return adaptations need their own completion rule. In particular a
-   declared void entry discards even a value-producing body."
+  "Authentic semantic return source, never a replaceable emitted body.
+   Primitive return completion is nonnullable; reference returns need body facts.
+   Void discards even a value-producing body, so remains outside this rule."
   [{:keys [source-var receiver-var operation implementation-op parameters tags]
     :as definition}]
   (if receiver-var
@@ -48,6 +50,7 @@
             return-tag (:return-tag lineage)]
         (when (and (identical? (:source-body definition) (:source-body lineage))
                    (or (= 'Object return-tag) (= Object return-tag)
+                       (contains? types/primitive-info return-tag)
                        (contains? types/primitive-array-info return-tag)))
           (assoc frontend :parameters (:params lineage) :tags (:tags lineage)
                  :source-var source-var :source-ns (:source-ns lineage)
@@ -101,7 +104,17 @@
     (if definition
       (if-let [{:keys [source-var parameters body tags] :as selected-body}
                (summary-source definition)]
-        (if (contains? visited source-var)
+        (if (and (:source-frontend selected-body)
+                 (contains? types/primitive-info (:return-tag selected-body)))
+          ;; This is the producer-enforced RETURN completion, not presence from
+          ;; a naked annotation or a claim about the body's result carrier.
+          ;; A cold stub first compiles; the primitive compute return converts
+          ;; and the public Object entry boxes it. Nil/invalid bodies may throw,
+          ;; but cannot normally return nil across this boundary. Keep the call.
+          (cond-> {:presence :present}
+            (dtype/dtype-for-scalar-tag (:return-tag selected-body))
+            (assoc :scalar-type (dtype/dtype-for-scalar-tag (:return-tag selected-body))))
+          (if (contains? visited source-var)
           unknown
           (let [;; Only historical producer-owned bodies may prove constructors
                 ;; or aliases. Current walked metadata is not code evidence.
@@ -113,8 +126,12 @@
                                     (zipmap parameters
                                             (map (fn [argument tag]
                                                    (let [fact (summary argument env visited body-context)]
-                                                     (if (= tag (:array-tag fact)) fact
-                                                         (dissoc fact :array-tag))))
+                                                     (cond-> fact
+                                                       (not= tag (:array-tag fact))
+                                                       (dissoc :array-tag)
+                                                       (not= (dtype/dtype-for-scalar-tag tag)
+                                                             (:scalar-type fact))
+                                                       (dissoc :scalar-type))))
                                                  arguments tags))
                                     (conj visited source-var) selected-body)]
                 ;; A declared array return may checkcast, but cannot turn a
@@ -124,7 +141,7 @@
                          (not= (:return-tag selected-body) (:array-tag result)))
                   unknown
                   result))
-              unknown)))
+              unknown))))
         unknown)
       unknown)))
 
@@ -235,15 +252,18 @@
         :else (selected-result expression env visited body-context))))))
 
 (defn result-fact
-  "Normal-return presence plus an independently derived primitive-array carrier.
+  "Normal-return presence plus independent array/domain information.
    Lexical facts come from actual producers; formal/result annotations cannot
-   establish either presence or a physical array carrier. Extra owner-local
+   establish presence or a physical carrier. An authenticated primitive return
+   COMPLETION can additionally supply :scalar-type: its converted and canonically
+   boxed value domain, not a JVM operand Class or nonthrowing claim. Symbolic
+   inputs do not import a caller's consumer-overridden scalar tag. Extra owner-local
    facts are ignored, and no call is executed or moved by this analysis.
    Selected definitions require an enclosing compilation-input owner; otherwise
    definition-dependent facts are unknown rather than silently losing provenance."
   ([expression] (result-fact expression {}))
   ([expression lexical-facts]
-   (select-keys (summary expression lexical-facts #{}) [:presence :array-tag])))
+   (select-keys (summary expression lexical-facts #{}) [:presence :array-tag :scalar-type])))
 
 (defn presence
   "Return :present, :absent, :unknown, or :no-return for a closed source region.

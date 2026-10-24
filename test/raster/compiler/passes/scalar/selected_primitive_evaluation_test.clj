@@ -22,6 +22,11 @@
   (entry/call-with-definition-inputs
    #(scalar/checked-selected-primitive-evaluation expression facts)))
 
+(defn- stale-source-data [operation]
+  (try (operation) nil
+       (catch clojure.lang.ExceptionInfo failure
+         (select-keys (ex-data failure) [:reason :source]))))
+
 (deftest completion-is-separate-from-presence-and-the-object-result-carrier
   (is (= {:type :double}
          (entry/call-with-definition-inputs
@@ -49,8 +54,17 @@
   (let [owner (atom {:static [] :values []})]
     (binding [entry/*emission-inputs* owner]
       (is (nil? (scalar/checked-selected-primitive-evaluation divide [primitive-double {}])))
-      (is (= {:presence :unknown} (normal/result-fact divide)))
-      (is (empty? (:definition-proofs @owner))))))
+      (is (empty? (:definition-proofs @owner)))
+      (is (empty? (:producer-inputs @owner)))))
+  (let [source (find-var 'raster.numeric/_div__m_double_double)
+        receiver (find-var 'raster.numeric/_div__m_double_double-impl)
+        owner (atom {:static [] :values []})]
+    (core/prepare-deftm-frontend! source)
+    (binding [entry/*emission-inputs* owner]
+      (is (= {:presence :present :scalar-type :double} (normal/result-fact divide))
+          "successful primitive return completion establishes presence, not a physical scalar proof")
+      (is (not (contains? (:definition-proofs @owner) receiver)))
+      (is (entry/assert-definition-inputs-current! @owner)))))
 
 (deftest ieee-division-and-comparison-have-real-value-oracles
   (let [receiver @(find-var 'raster.numeric/_div__m_double_double-impl)
@@ -176,6 +190,11 @@
       (core/ensure-bytecode-implementation! receiver)
       (alter-meta! generic assoc :raster.core/dispatch-table
                    (:raster.core/dispatch-table (meta fixture)))
+      (let [body (list 'let* ['x 2.0 'y 3.0 'result expression]
+                       '(if (clojure.core/nil? result) :absent :present))
+            lowered (entry/call-with-definition-inputs #(products/lower-local-products body))
+            evaluate #((eval (list 'fn* [] %)))]
+        (is (= :absent (evaluate body) (evaluate lowered))))
       ;; Roots/registration remain unchanged; only the description now claims
       ;; unrelated numeric code. A new definition snapshot alone would accept it.
       (alter-meta! source assoc :raster.core/deftm-source-body '[(clojure.core/* x y)]
@@ -185,10 +204,13 @@
       (is (nil? (entry/call-with-definition-inputs
                  #(scalar/checked-selected-primitive-result expression))))
       (is (nil? (proof expression [primitive-double primitive-double])))
+      (is (= {:reason :stale-definition-proof-input :source source}
+             (stale-source-data #(entry/call-with-definition-inputs
+                                  (fn [] (normal/result-fact expression))))))
       (let [body (list 'let* ['x 2.0 'y 3.0 'result expression]
-                       '(if (clojure.core/nil? result) :absent :present))
-            lowered (entry/call-with-definition-inputs #(products/lower-local-products body))
-            evaluate #((eval (list 'fn* [] %)))]
-        (is (= :absent (evaluate body) (evaluate lowered))))
+                       '(if (clojure.core/nil? result) :absent :present))]
+        (is (= {:reason :stale-definition-proof-input :source source}
+               (stale-source-data #(entry/call-with-definition-inputs
+                                    (fn [] (products/lower-local-products body)))))))
       (finally (reset-meta! source original-source)
                (reset-meta! generic original-generic)))))

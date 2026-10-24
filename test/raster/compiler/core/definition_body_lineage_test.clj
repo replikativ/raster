@@ -31,6 +31,11 @@
 (defn- fact [expression & [env]]
   (entry/call-with-definition-inputs #(normal/result-fact expression env)))
 
+(defn- stale-source-data [operation]
+  (try (operation) nil
+       (catch clojure.lang.ExceptionInfo failure
+         (select-keys (ex-data failure) [:reason :source]))))
+
 (defn- product-outcome [call]
   (let [body (list 'let* ['result call]
                    '(if (clojure.core/nil? result) :absent :present))
@@ -43,11 +48,23 @@
     (let [{:keys [source receiver call]} (selected generic)
           original (meta source)]
       (when receiver (core/ensure-bytecode-implementation! receiver))
+      (is (= [:absent :absent] (product-outcome call)))
       (try
         (alter-meta! source assoc :raster.core/deftm-source-body
                      '[(clojure.core/double-array 0)])
-        (is (= {:presence :unknown} (fact call)))
-        (is (= [:absent :absent] (product-outcome call)))
+        (if receiver
+          (do
+            (is (= {:reason :stale-definition-proof-input :source source}
+                   (stale-source-data #(fact call))))
+            (is (= {:reason :stale-definition-proof-input :source source}
+                   (stale-source-data #(product-outcome call)))))
+          (do
+            ;; Plain Clojure's optional lineage reader abstains rather than
+            ;; consuming a contradictory typed frontend owner.
+            (is (= {:presence :unknown} (fact call)))
+            (is (= [:absent :absent] (product-outcome call)))))
+        (is (nil? ((eval (list 'fn* '[input] call)) 2.0))
+            "the unchanged executable still returns nil; only its claimed source changed")
         (finally (reset-meta! source original))))))
 
 (deftest mutable-walked-metadata-is-not-the-executable-body
@@ -89,12 +106,34 @@
       (finally (reset-meta! source original)))))
 
 (deftest bare-constructor-proofs-do-not-depend-on-a-mutable-walk-cache
-  (let [{:keys [source receiver call]} (selected #'bare-array)]
-    (is (= {:presence :present :array-tag 'doubles} (fact call)))
-    (core/ensure-walked-body! source)
-    (is (= {:presence :present :array-tag 'doubles} (fact call)))
-    (core/ensure-bytecode-implementation! receiver)
-    (is (= {:presence :present :array-tag 'doubles} (fact call))))
+  (let [scope (create-ns (gensym "raster.cold-constructor-lineage."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm bare-array [n :- Long] :- (Array double) (double-array n))))
+      (let [{:keys [source receiver call]} (selected (ns-resolve scope 'bare-array))
+            source-before (meta source) receiver-before (meta receiver)
+            implementation (var-get receiver)]
+        (is (= {:presence :unknown} (fact call)) "a query does not prepare its producer")
+        (is (identical? source-before (meta source)))
+        (is (identical? receiver-before (meta receiver)))
+        (core/ensure-walked-body! source)
+        (is (= {:presence :unknown} (fact call)) "a mutable walk cache is not a frozen producer")
+        (with-redefs [core/ensure-bytecode-implementation!
+                      (fn [& _] (throw (AssertionError. "source query invoked the JIT")))]
+          (core/prepare-deftm-frontend! source)
+          (is (= {:presence :present :array-tag 'doubles} (fact call))))
+        (is (identical? implementation (var-get receiver)))
+        (let [original (meta source)]
+          (try
+            (alter-meta! source assoc :raster.core/deftm-walked-body '[nil])
+            (is (= {:presence :present :array-tag 'doubles} (fact call))
+                "the authenticated body does not come from the mutable cache")
+            (finally (reset-meta! source original))))
+        (core/ensure-bytecode-implementation! receiver)
+        (is (= {:presence :present :array-tag 'doubles} (fact call))
+            "receiver publication retains the same frozen semantic body"))
+      (finally (remove-ns (ns-name scope)))))
   (let [operation 'raster.arrays/zeros-like
         signature (inference/registered-call-signature operation '[doubles long])
         source (find-var (:mangled-sym signature))
@@ -103,6 +142,7 @@
         receiver (find-var receiver-name)
         call (with-meta (list '.invk receiver-name 'input 'count)
                {:raster.op/original operation})]
+    (core/prepare-deftm-frontend! source)
     (is (= {:presence :present :array-tag 'doubles} (fact call)))
     (core/ensure-walked-body! source)
     (is (= {:presence :present :array-tag 'doubles} (fact call)))
@@ -144,7 +184,8 @@
             ;; not replace A's raw body, Clojure body or lazy JIT specification.
             _ (macroexpand-1 (declaration '(clojure.core/double-array 0)))]
         (eval original)
-        (let [{:keys [receiver call]} (selected (ns-resolve *ns* name))]
+        (let [{:keys [source receiver call]} (selected (ns-resolve *ns* name))]
+          (when receiver (core/prepare-deftm-frontend! source))
           (is (= {:presence :absent} (fact call)))
           (is (= [:absent :absent] (product-outcome call)))
           (when receiver

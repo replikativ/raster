@@ -137,10 +137,17 @@
                                                            [argument (:producer-scalar-type known)])))
                                                scope))]
                     (assoc proof :present? true)))
+        ;; Conditional presence consumes semantic return completion. It must
+        ;; not acquire a physical body/receiver merely to remove a nil-test;
+        ;; numerical evaluation and carrier erasure have separate authorities.
         known (or known
-                  (when-let [proof (scalar-body/checked-selected-primitive-result init)]
-                    {:present? true :scalar-type (:type proof)})
-                  (let [result (normal-return/result-fact init scope)]
+                  (let [producer-scope (into {}
+                                             (map (fn [[id known]]
+                                                    [id (cond-> (dissoc known :scalar-type)
+                                                          (:producer-scalar-type known)
+                                                          (assoc :scalar-type (:producer-scalar-type known)))]))
+                                             scope)
+                        result (normal-return/result-fact init producer-scope)]
                     (when (= :present (:presence result))
                       (assoc result :present? true)))
                   ;; Prepared AD may contain a nested lexical projection whose

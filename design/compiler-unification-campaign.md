@@ -71,6 +71,14 @@ array fact. Unresolved semantic aliases do not borrow current namespace lookup,
 and the original call/conversions remain. Physical scalar recipes use the exact
 typed-entry body history, while plain Clojure uses its separately frozen body and
 actual entry. This separation alone does not finish AD or transitive import closure.
+An authenticated typed frontend's primitive **return completion** also proves
+conditional nonnil: the cold stub compiles before delegation, compute emission
+enforces the primitive return conversion, and the public Object entry boxes it.
+This is not a theorem about naked annotations, actual caller Classes, numerical
+body semantics, or totality. Unknown/effectful bodies and failing conversions
+still execute at the original call. Object/array/void declarations do not receive
+that primitive rule. Local-product nil-test refinement consumes this semantic
+completion instead of pinning a physical scalar body merely for presence.
 Structural internal `pmap` reuses the existing materializer's allocation rule;
 its element allocation and store conversion are distinct IR facets. This is not
 permission to infer helper purity, reinterpret arbitrary macro calls, or reuse
