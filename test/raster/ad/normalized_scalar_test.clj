@@ -167,7 +167,7 @@
     (is (identical? bundle (normalized/validate! bundle)))
     (is (= :ad-normalized-linear-interface
            (reason #(normalized/jvp-body (assoc bundle :residuals [])))))
-    (is (= :ad-normalized-certificate
+    (is (= :ad-normalized-operation
            (reason #(normalized/jvp-body (assoc bundle :linear changed-linear)))))
     (is (= :ad-normalized-stale-rules
            (reason #(normalized/value+grad-body (update bundle :template-revision dec)))))

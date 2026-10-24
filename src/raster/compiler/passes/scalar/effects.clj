@@ -11,8 +11,9 @@
    DCE, CSE and algebraic simplification cannot erase or duplicate the possible
    exceptional control transfer.
 
-   The raster context pre-registers raster.numeric and raster.math vars
-   as :pure so beichte doesn't need to analyze their source each time."
+   The Raster context registers declared contracts but disables unowned source
+   lookup. Reading a Var's file/line does not authenticate its current root;
+   expanding type/protocol declarations can also mutate JVM class identity."
   (:require [beichte.core :as b]
             [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
@@ -23,6 +24,16 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
+
+(defn- declared-context [registry]
+  (let [context (b/make-context {:registry registry :source-resolver nil})]
+    ;; Older Beichte versions silently ignored unknown options. Never silently
+    ;; re-enable source expansion when this compiler boundary requests none.
+    (when-not (and (contains? context :source-resolver)
+                   (nil? (:source-resolver context)))
+      (throw (ex-info "Effect analysis requires source lookup to be disabled"
+                      {:reason :unowned-effect-source-analysis})))
+    context))
 
 (defonce ^:private raster-context
   (delay
@@ -96,7 +107,7 @@
               {}))
           raster-entries (merge pure-entries array-entries loss-entries ad-entries)
           reg (b/extend-registry (b/default-registry) raster-entries)]
-      (b/make-context {:registry reg}))))
+      (declared-context reg))))
 
 (defn init-raster-context!
   "Force initialization of the shared Raster Beichte context."
@@ -134,9 +145,9 @@
   (:effect (descriptor expr)))
 
 (defn analyze-var-effect
-  "Analyze a var and return its effect level using fresh source evidence."
+  "Return the declared effect of a Var; unknown source is not compiler evidence."
   [v]
-  (b/analyze-var v (b/make-context {:registry (:registry @raster-context)})))
+  (b/analyze-var v (declared-context (:registry @raster-context))))
 
 (defn- semantic-calls
   "Restore walker-devirtualized calls to the source-level operation recorded in
@@ -165,27 +176,33 @@
                          dtype/dtype-for-scalar-tag)
           target (some-> (descriptor/semantic-op expression) descriptor/cast-result-tag
                          dtype/dtype-for-scalar-tag)]
-      (or (some? (numeric-constant/value expression))
+      (or (some? (when-let [operation (descriptor/semantic-op expression)]
+                   (when (descriptor/cast-op? operation)
+                     (numeric-constant/source-value
+                      (apply list (symbol "clojure.core" (name operation))
+                             (descriptor/call-args expression))))))
           (and source target
                (= [:exact :exact] (scalar-conversion/policy source target)))))))
 
-(defn- source-cast-flags
-  "Evaluation obligations for source casts derived from the shared descriptor.
+(defn- source-evaluation-flags
+  "Existing checked conversion obligations and explicit source-owner denials.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   checked integral casts remain conservatively non-removable. Local product
+   checked integral casts remain conservatively non-removable. This reader does
+   not globally reinterpret arithmetic purity as source totality. New local
+   product rewrites retain their actual evaluations explicitly; migration of
+   ordinary arithmetic classification requires its target consumers too. Local product
    lowering additionally retains its generic factory's reference conversion
    obligation explicitly. Untyped scoped binders require their own type evidence;
    this does not globally reinterpret their casts as reference conversions."
   [expr]
   (into #{}
    (mapcat (fn [node]
-           (when (seq? node)
-             (let [operation (descriptor/semantic-op node)]
-               (when (descriptor/cast-op? operation)
+             (let [operation (when (seq? node) (descriptor/semantic-op node))]
                     (cond-> []
-                        (and (not (proven-total-cast? node))
+                        (and (seq? node) (not (proven-total-cast? node))
+                             (descriptor/cast-op? operation)
                              (= :reject (descriptor/cast-integral-narrowing operation))
                              (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
                         (conj :checked-source-cast)
@@ -193,8 +210,17 @@
                         ;; no optimizer may erase its conversion merely because
                         ;; the projected field is not otherwise used.
                         (true? (:raster.effect/source-reference-cast (meta node)))
-                        (conj :source-reference-cast))))))
-         (tree-seq coll? seq expr))))
+                        (conj :source-reference-cast)
+                        ;; A value proof consumed by simplification is not a
+                        ;; proof that its original evaluation can disappear.
+                        ;; This obligation is independent of numeric width,
+                        ;; external purity, and actual primitive/Object storage.
+                        (true? (:raster.effect/preserve-evaluation (meta node)))
+                        (conj :preserve-source-evaluation))))
+         (tree-seq #(and (coll? %)
+                         (not (and (seq? %)
+                                   (contains? '#{quote clojure.core/quote} (first %)))))
+                   seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)
 
@@ -260,7 +286,10 @@
    context; cached source analysis must not survive helper redefinition."
   [expr]
   (if (not (seq? expr))
-    {:effect :pure :flags #{}}
+    ;; Preserve the general API's existing leaf/collection effect convention.
+    ;; Explicit denials still survive here, including a marked collection or
+    ;; symbol produced by the new occurrence-owned representation rewrites.
+    {:effect :pure :flags (source-evaluation-flags expr)}
     (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
                    [(descriptor-key expr) proof])
@@ -274,21 +303,32 @@
 
 (defn- analyze-descriptor
   [expr]
+  ;; A failed optional purity analysis cannot discharge independently retained
+  ;; source obligations. Read those from original syntax, not its Beichte-only
+  ;; call projection, and merge them even when that analysis abstains.
   (try
-    (let [semantic-expr (semantic-calls expr)
-          locals (collect-locals semantic-expr)
-          context (b/make-context {:registry (:registry @raster-context)})
-          result (b/analyze-full semantic-expr context locals)
-          result (if (map? result)
-                   (update result :flags #(or % #{}))
-                   {:effect (or result :io) :flags #{}})]
-      (update result :flags into (source-cast-flags semantic-expr)))
-    (catch Exception _
-      ;; Conservative: unknown = effectful
-      {:effect :io :flags #{}})
-    (catch StackOverflowError _
-      ;; Deep expressions overflow tools.analyzer — assume effectful
-      {:effect :io :flags #{}})))
+   (let [obligations (source-evaluation-flags expr)
+        result
+        (try
+          (let [semantic-expr (semantic-calls expr)
+                locals (collect-locals semantic-expr)
+                context (declared-context (:registry @raster-context))
+                result (b/analyze-full semantic-expr context locals)]
+            (if (map? result)
+              (update result :flags #(or % #{}))
+              {:effect (or result :io) :flags #{}}))
+          (catch Exception _
+            ;; Conservative: unknown = effectful, not obligation-free.
+            {:effect :io :flags #{}})
+          (catch StackOverflowError _
+            ;; Deep expressions overflow tools.analyzer — assume effectful.
+            {:effect :io :flags #{}}))]
+    (update result :flags into obligations))
+   ;; Obligation discovery is optional analysis too. If it cannot complete,
+   ;; retain a NON-WAIVABLE unknown obligation, not a preservation-only marker
+   ;; whose ordering could be relaxed by an independent total-value proof.
+   (catch Exception _ {:effect :io :flags #{:unclosed-source-obligations}})
+   (catch StackOverflowError _ {:effect :io :flags #{:unclosed-source-obligations}})))
 
 (defn removable-expr?
   "True if an unused expression can be dropped without changing semantics."

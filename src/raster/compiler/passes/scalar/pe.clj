@@ -17,6 +17,7 @@
   beyond the transformations above — preserves metadata, qualified symbols, etc."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.simplify :as simp]
             [raster.core :as rcore]))
 
@@ -173,7 +174,8 @@
         (if-not pairs
           ;; All bindings processed — PE the body
           (let [pe-body (map #(pe-fn % env) body)]
-            (if (empty? new-bindings)
+            (if (and (empty? new-bindings)
+                     (not (true? (:raster.effect/preserve-evaluation (meta form)))))
               ;; All bindings eliminated — just return the body
               (if (= 1 (count pe-body))
                 (first pe-body)
@@ -221,7 +223,8 @@
         pe-test (pe-fn test const-env)]
     (cond
       ;; Only nil and false are falsy in Clojure; zero is truthy.
-      (constant? pe-test)
+      (and (constant? pe-test)
+           (not (true? (:raster.effect/preserve-evaluation (meta form)))))
       (if pe-test
         (pe-fn then const-env)
         (if else-present? (pe-fn else const-env) nil))
@@ -250,11 +253,13 @@
   ordinary forms. Typed `.invk` nodes retain their boundary and metadata rather
   than recovering operator semantics from impl spelling. Type tags are preserved."
   [form result changed?]
-  (if-let [m (meta form)]
-    (if (instance? clojure.lang.IMeta result)
-      (with-meta result (if changed? (dissoc m :raster.op/original) m))
-      result)
-    result))
+  (if (identical? form result)
+    form
+    (if-let [m (meta form)]
+      (if (instance? clojure.lang.IMeta result)
+        (with-meta result (if changed? (dissoc m :raster.op/original) m))
+        result)
+      result)))
 
 (defn pe-pass
   "Single pass of partial evaluation.
@@ -274,6 +279,26 @@
     (seq? form)
     (let [head (first form)]
       (cond
+        ;; A completion is an evaluation boundary, not a generic function or
+        ;; an algebraic identity. Its contract is data; only its operand is PE'd.
+        (= head completion/completion-symbol)
+        (if-let [{:keys [contract operand]} (completion/canonical-parts form)]
+          (let [operand (pe-pass operand const-env)]
+            ;; The literal null reference already is its Object-context value:
+            ;; no boxing, coercion, allocation or operand evaluation remains.
+            ;; This is not a numeric presence fact or a general completion
+            ;; eraser. Explicit evaluation denials and carrier annotations
+            ;; that could impose another consumer conversion stay attached.
+            (if (and (= completion/object-input-contract contract) (nil? operand)
+                     (not (:raster.effect/preserve-evaluation (meta form)))
+                     (not (:raster.effect/source-reference-cast (meta form)))
+                     (every? #(or (nil? %) (contains? #{Object 'Object 'java.lang.Object} %))
+                             ((juxt :tag :raster.type/tag) (meta form))))
+              nil
+              (util/remake-if-changed form (list head contract operand))))
+          (throw (ex-info "Malformed reserved value completion during partial evaluation"
+                          {:reason :invalid-value-completion :expression form})))
+
         ;; let/let*/loop
         (and (symbol? head) (contains? #{:binding :scope} (:kind (form/form-info form))))
         (pe-let form const-env pe-pass)
@@ -295,10 +320,15 @@
                        (if (seq kept-init)
                          (concat kept-init [last-form])
                          [last-form])))]
-          (case (count kept)
-            0 nil
-            1 (first kept)
-            (cons 'do kept)))
+          (if (true? (:raster.effect/preserve-evaluation (meta form)))
+            ;; This denial belongs to the whole original evaluation, not its
+            ;; last child's JVM carrier/type metadata. Keep the wrapper even
+            ;; when only one child survives constant-statement elimination.
+            (util/remake-if-changed form (cons 'do kept))
+            (case (count kept)
+              0 nil
+              1 (first kept)
+              (util/remake-if-changed form (cons 'do kept)))))
 
         ;; fn/fn* — recurse into body to substitute env for non-shadowed syms.
         ;; Without this, when PE inlines a binding [h x] (drops h, env[h] = x),
@@ -348,7 +378,7 @@
         form
 
         ;; quote — leave alone
-        (= head 'quote)
+        (contains? '#{quote clojure.core/quote} head)
         form
 
         ;; recur — PE the args but keep recur
@@ -414,14 +444,15 @@
         ;; General call — PE args, then try constant folding
         :else
         (let [pe-children (map #(pe-pass % const-env) form)
-              called (apply list pe-children)
-              r (simp/simplify-1 called)]
+              called (util/remake-if-changed form pe-children)
+              r (simp/simplify-1 called)
+              result (reattach-meta form r (not= r called))]
           ;; drop stale :raster.op/original iff simplify changed the head (task #78)
-          (reattach-meta form r (not= r called)))))
+          result)))
 
     ;; Vector
     (vector? form)
-    (mapv #(pe-pass % const-env) form)
+    (util/remake-if-changed form (mapv #(pe-pass % const-env) form))
 
     ;; Map
     (map? form)

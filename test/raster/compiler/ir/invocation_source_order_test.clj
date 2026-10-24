@@ -6,6 +6,8 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as auxiliary]
             [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
@@ -108,6 +110,33 @@
                :binding-values (select-keys values '[out]) :program-values values
                :program-inputs '[out] :program-outputs '[out]})]
     [program plan]))
+
+(deftest retained-source-class-identity-does-not-relax-effects-or-portability
+  (let [values (zipmap '[x y] (repeat (av/tensor {:dtype :double :shape []})))
+        expression (with-meta '(clojure.core/+ x 0.0) {:tag Double/TYPE})
+        program (parallel-program/make
+                 {:dialect :typed-parallel :values values :inputs '[y] :outputs '[y]
+                  :source (list 'let* ['y expression] 'y)})
+        plan (invocation/from-prefix
+              {:id :retained-completion-source :parameters '[x]
+               :parameter-values (select-keys values '[x])
+               :bindings [['y expression]] :binding-values (select-keys values '[y])
+               :program-values values :program-inputs '[y] :program-outputs '[y]})
+        changed (with-meta expression {:tag Float/TYPE})
+        checked-input (completion/complete-value
+                       (completion/bytecode-boxed-parameter-contract Double/TYPE) 'x)]
+    (is (vector? (invocation/source-order plan program)))
+    (is (= :invocation-source-step-mismatch
+           (reason #(invocation/source-order plan (assoc program :source (list 'let* ['y changed] 'y))))))
+    (is (= :semantic-fingerprint-unsupported (reason #(semantic/fingerprint plan)))
+        "local source comparison cannot make a Class-bearing plan persistable")
+    (is (= :invocation-scalar-effect
+           (reason #(invocation/from-prefix
+                     {:id :unclosed-entry-check :parameters '[x]
+                      :parameter-values (select-keys values '[x])
+                      :bindings [['y checked-input]] :binding-values (select-keys values '[y])
+                      :program-values values :program-inputs '[y] :program-outputs '[y]})))
+        "equal completion source does not discharge its checked-conversion effects")))
 
 (deftest structured-allocation-cannot-erase-changed-constructor-arguments
   (let [[program plan] (allocation-boundary)]

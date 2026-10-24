@@ -371,7 +371,16 @@
                        (compatible-value? source-value value))
           (fail! :invocation-value-alias
                  "value alias requires one storage-compatible earlier value"
-                 {:step id :source (:source step) :value value}))))
+                 {:step id :source (:source step) :value value}))
+        (when (contains? step :source-expression)
+          (let [source (invocation-source/reference-identity-source symbol (:source-expression step))]
+            (when-not (and source (buffer-value? source-value) (buffer-value? value)
+                           (= source (:symbol (first (:operands step))))
+                           (= (:dtype value)
+                              (some-> (:raster.type/tag (meta symbol)) dtype/dtype-for-array-tag dtype/canon)))
+              (fail! :invocation-value-alias-source
+                     "wrapped reference alias requires explicit normalized buffer identity"
+                     {:step id :expression (:source-expression step)}))))))
     (conj available id)))
 
 (defn validate-parameter-projection!
@@ -603,6 +612,19 @@
       (symbol? expression)
       (->ValueAlias id symbol (referenced-operands expression environment)
                     (get environment expression) value)
+
+      (and (buffer-value? value)
+           (invocation-source/reference-identity-source symbol expression))
+      (let [source (invocation-source/reference-identity-source symbol expression)]
+        ;; This grammar names one lexical operand, even if its spelling is a
+        ;; clojure.core Var. Do not turn a missing reference into a global read.
+        (when-not (contains? environment source)
+          (fail! :invocation-prefix-free-value
+                 "reference identity requires a preceding lexical value"
+                 {:symbol source :expression expression :available (set (keys environment))}))
+        (assoc (->ValueAlias id symbol [{:symbol source :value (get environment source)}]
+                            (get environment source) value)
+               :source-expression expression))
 
       (scalar-value? value)
       (let [operands (referenced-operands expression environment)]
@@ -849,7 +871,7 @@
                 {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
             {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
             (map-indexed vector step-pairs)))
-          _ (when-not (semantic/equivalent? expected-steps (:steps plan))
+          _ (when-not (semantic/retained-source-equivalent? expected-steps (:steps plan))
               (fail! :invocation-source-step-mismatch
                      "invocation steps differ from their canonical source producers"
                      {:expected expected-steps :actual (:steps plan)}))
@@ -866,7 +888,7 @@
                    equation (parallel-program/equation-for-binding program symbol expression)
                    realization (invocation-source/realization-equation program symbol expression)
                    allocation? (and (contains? allocations symbol)
-                                    (semantic/equivalent? expression (get allocations symbol)))]
+                                    (semantic/retained-source-equivalent? expression (get allocations symbol)))]
                (when (and equation realization)
                  (fail! :invocation-source-order-ambiguous
                         "one source binding cannot be two different equation sites"
@@ -884,7 +906,7 @@
                                   (:values plan) public symbol expression)]
                    (when-not (and (true? (get-in equation [:attributes :host-only]))
                                   (= [symbol] (:results equation))
-                                  (semantic/equivalent?
+                                  (semantic/retained-source-equivalent?
                                    canonical (invocation-source/scalar-equation-source equation)))
                      (fail! :invocation-source-order-shared-producer
                             "shared invocation/equation bindings require one identical host computation"
@@ -905,7 +927,7 @@
              (let [matches (filterv
                             #(and (or (= [:body index] (:site %))
                                       (and (= index (dec (count body))) (= [:return] (:site %))))
-                                  (semantic/equivalent? expression (:source %)))
+                                  (semantic/retained-source-equivalent? expression (:source %)))
                             (:equations program))]
                (when (> (count matches) 1)
                  (fail! :invocation-source-order-ambiguous

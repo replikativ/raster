@@ -80,9 +80,15 @@
 
 (deftest dependency-denial-follows-the-original-emitter-lookup-keys
   (let [candidate? #'bytecode/method-local-callee-candidate?
-        typed {:typed-sibling-methods {"local-value" :method}}
+        typed {:source-ns (:ns (meta #'local-value))
+               :typed-sibling-methods {#'local-value :method}}
         ordinary {:sibling-methods {"local-value" :method}}]
-    (is (true? (candidate? '(other/local-value x) typed)))
+    (is (false? (candidate? '(other/local-value x) typed)))
+    (is (true? (candidate? '(raster.compiler.backend.jvm.owned-input-dependency-test/local-value x)
+                            typed)))
+    (is (true? (candidate? '(local-value x)
+                            {:source-ns (:ns (meta #'local-value))
+                             :local-callee-names {:typed #{#'local-value}}})))
     (is (false? (candidate? '(other/local-value x) ordinary)))
     (is (true? (candidate? '(local-value x) ordinary)))
     (is (true? (candidate? '(fn* [] (local-value x)) typed)))

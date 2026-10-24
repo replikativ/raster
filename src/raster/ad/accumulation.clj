@@ -6,6 +6,8 @@
    operation registry, or permission to reassociate contributions."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.dtype :as dtype]))
 
 (defn- retain-approved-premise! []
@@ -47,12 +49,41 @@
           ;; dispatch; Float uses it. Never replace the Double branch with a
           ;; potentially user-redefined raster.numeric/+ method.
           operation (if (= :double dt) 'clojure.core/+ 'raster.numeric/+)
-          addition (with-meta (list* operation arguments)
-                     (assoc (select-keys (meta expression) [:line :column :file])
+          ;; The Double branch explicitly unboxes BOTH inputs. Preserve that
+          ;; consumer contract even when an operand lives in an Object slot.
+          ;; Presence and homogeneous producer-width premises above make these
+          ;; exact conversions; neither a nullable value nor a result hint can
+          ;; acquire them. Float still goes through its original typed dispatch.
+          operands (if (= :double dt)
+                     (mapv #(list 'clojure.core/double %) arguments)
+                     arguments)
+          addition (with-meta (list* operation operands)
+                     (assoc (select-keys (meta expression)
+                                         [:line :column :file :raster.effect/preserve-evaluation])
                             :raster.type/tag (dtype/scalar-tag-for-dtype dt)))]
       (when (validate-addition addition dt)
         (retain-approved-premise!)
         addition))))
+
+(defn project-absent-identity
+  "Project the approved optional sum's nil identity for lexical operands/literal
+   nil only. Retain the selected input's original Object completion; even a
+   lexical primitive can box at this call boundary. Compound operands retain
+   the original call because absence cannot discard their evaluation."
+  [expression operand-facts]
+  (let [arguments (:arguments (descriptor/call-description expression))]
+    (when (and (= 2 (count arguments) (count operand-facts))
+               (every? #(or (symbol? %) (nil? %)) arguments)
+               (approved-call? expression)
+               ;; A call-level denial is independent of the nil identity law.
+               ;; This projection has no authority to discharge that marker.
+               (empty? (:flags (effects/descriptor expression))))
+      (let [index (cond (= :absent (:presence (first operand-facts))) 1
+                        (= :absent (:presence (second operand-facts))) 0)]
+        (when (some? index)
+          (retain-approved-premise!)
+          {:expression (completion/complete-value completion/object-input-contract
+                                                  (nth arguments index))})))))
 
 (defn nullable-result-tag
   "Project the existing result facet only for the approved helper's closed
@@ -79,7 +110,8 @@
     (let [tag (:array-tag (first operand-facts))
           addition (with-meta
                      (list* 'raster.numeric/+ (:arguments (descriptor/call-description expression)))
-                     (assoc (select-keys (meta expression) [:line :column :file])
+                     (assoc (select-keys (meta expression)
+                                         [:line :column :file :raster.effect/preserve-evaluation])
                             :raster.type/tag tag))]
       (when (validate-addition addition tag)
         (retain-approved-premise!)

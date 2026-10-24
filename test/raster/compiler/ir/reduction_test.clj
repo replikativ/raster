@@ -66,6 +66,39 @@
     (is (= {:acc 'acc :init 0.0 :lambda '(+ acc (aget values i))}
            (reduction/scalar-op operator)))))
 
+(deftest scalar-recurrence-view-retains-carry-and-element-conversions
+  (let [element '(clojure.core/double (clojure.core/aget values i))
+        step (list 'clojure.core/+ '(clojure.core/double acc) element)
+        view (reduction/scalar-recurrence-view
+              {:acc 'acc :init 0.0 :lambda step} :double)]
+    (is (identical? step (:step-result view)))
+    (is (= step (:normalized-step-result view)))
+    (is (= element (:element view)))
+    (is (= 'clojure.core/+ (:combine view)))
+    (is (= 0 (:accumulator-position view)))
+    (let [reversed (reduction/scalar-recurrence-view
+                    {:acc 'acc :init 0.0
+                     :lambda (list 'clojure.core/+ element '(clojure.core/double acc))}
+                    :double)]
+      (is (= element (:element reversed)))
+      (is (= 1 (:accumulator-position reversed))
+          "an ordered adapter must not silently commute a reversed recurrence")))
+  (doseq [step '[(clojure.core/+ (clojure.core/float acc) (clojure.core/aget values i))
+                (clojure.core/+ (clojure.core/double acc) (clojure.core/* acc 2.0))]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (reduction/scalar-recurrence-view
+                  {:acc 'acc :init 0.0 :lambda step} :double)))))
+
+(deftest scalar-recurrence-view-preserves-once-only-element-scope
+  (let [step '(let* [term (clojure.core/aget values i)]
+                (clojure.core/+ (clojure.core/double acc) (clojure.core/double term)))
+        view (reduction/scalar-recurrence-view {:acc 'acc :init 0.0 :lambda step} :double)]
+    (is (identical? step (:step-result view)))
+    (is (= '(let* [term (clojure.core/aget values i)] (clojure.core/double term))
+           (:element view)))
+    (is (= (list 'clojure.core/+ '(clojure.core/double acc) (:element view))
+           (:normalized-step-result view)))))
+
 (deftest lane-strided-tree-cannot-schedule-associativity-alone
   ;; Affine-function composition is associative, not commutative. The existing two-lane tree
   ;; groups e0,e2 then e1,e3 instead of preserving e0,e1,e2,e3.

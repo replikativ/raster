@@ -1,5 +1,72 @@
 # Normalized AD design proposal
 
+## CPU frozen-source producer landing boundary
+
+This landing connects the original frozen frontend and definition-owned policy to
+the existing CPU/JVM AD producer, generated physical entry, and explicit JIT/AOT
+renewal. It does not replace either draft #1480 or #1508 wholesale, activate the
+opt-in normalized engines by default, or qualify a GPU source import.
+
+The landing's qualification anchors are the existing tests below; campaign-tree
+receipts must not be substituted for a run against this reconstructed tree.
+
+| CPU obligation | Test anchors |
+| --- | --- |
+| Frozen body/policy, poisoned walking caches, exact source/implementation ownership | `source-policy-test`, `source-entry-lineage-test`, `preparation-frontend-source-test` |
+| Shared generated program, physical entry, padded inactive slots and Float checkpoints | `generated-body-test`, `boxed-entry-test`, `generated-entry-test`, `typed-emission-test` |
+| All original parameter checks before body effects | `boxed-entry-test`, `preparation-frontend-source-test` |
+| New code after actual rule changes; stale old owners, no-op preparation and publication races refuse | `emission-dependency-test`, `preparation-frontend-source-test` |
+| Child preparation does not borrow parent history or partially adopt failed work | `definition-preparation-test`, `independent-preparation-keeps-parent-history-out-of-child-candidates` |
+| Absent versus zero cotangents, open pullbacks, replay/mutation and unsupported-domain refusals | `product-boundaries-test`, `conditional-replay-projection-test`, `source-replay-boundary-test`, `source-write-identity-test`, `owned-bytecode-input-pullback-test`, `normalized-scalar-runtime-guard-test` |
+
+Existing source/default and opt-in normalized AD paths retain their separate
+numerical and lifecycle controls. Normalized device families, general loop/record/
+model coverage, prepared-module provenance, checked GPU continuations and resident
+training remain later work. External push/pull, inverse, density and log-Jacobian
+capabilities are not admitted here.
+
+Frozen source ownership is not a blanket Clojure scalar-equivalence theorem. In
+particular, the pre-existing core Float/Float arithmetic recipe differs from plain
+Clojure's Double intermediate and checked Float conversion at overflow. This
+landing does not repair or waive that debt; an actually selected `raster.numeric/*`
+Float helper has its own distinct FP32 contract.
+
+### Bounded scalar native consumer
+
+The native scalar path now consumes a closed all-Double source construction
+under the existing definition owner. Actual public Method parameters, selected
+helper return bridges and completed operands establish primitive/Object storage
+round trips; native ABI annotations do not supply those facts. The target must
+also use the Double scalar emission policy. Original selected calls stay in
+order, and the frozen definition guard runs after **all** original public scalar
+conversions, including unused arguments, before entering native code.
+
+Direct first-order AD imports use the same numerical constructor and finalizer.
+They consume the authenticated retained producer core, not its reconstructed JVM
+adapter. Only direct public Double argument reads qualify: the actual entry's
+Object snapshots remain, and its matched Double wrapper conversions become exact
+source `double` conversions at those same sites. Whole-site constant tuple
+projection normalization and original `nth` observations preserve source lookup
+and evaluation order. Nested preparation owns independent history; no outer
+projector or helper capability is borrowed by the child.
+
+`local-products-test` covers square/scaled continuations, unused public input
+checks, constructor-plan tampering, and refusal of integral or nonpublic input
+boundaries. Literal nil product fields require neither boxing nor an evaluation
+token; eager nonnil sibling fields and their failures remain ordered. Explicit
+nil Object-completion folding preserves both existing evaluation-denial markers.
+
+This is not general native AD closure. Float/integral/reference inputs, prior
+generated-entry histories, arbitrary Object uses, loops and arrays remain outside
+this construction. Double Math leaves additionally require the original emitted
+Java invocation occurrence, its actual Method and identity input conversions,
+the existing intrinsic totality facet, and the same source Class lookup. Missing
+historical records, copied occurrences and different Classes abstain; queries do
+not compile or execute callees. Primitive Double negation closes separately through
+the actual JVM negation recipe. This qualifies the bounded scalar density-gradient
+case, not general density programs or loops. Historical freshness remains required;
+no mathematical result annotation or C completion waiver substitutes for that work.
+
 ## Ordered generated-call source owner
 
 The shared `core/ordered-call` consumer normalizes an already-resolved JVM

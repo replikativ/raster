@@ -3,11 +3,11 @@
 
   Takes a deftm generic function and produces a devirtualized,
   bytecode-compiled version specialized for a specific element type."
-  (:require [clojure.string :as str]
-            [raster.compiler.core.types :as types]
+  (:require [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.core.walker :as walker]))
+            [raster.compiler.core.walker :as walker]
+            [raster.compiler.support.mangled :as mangled]))
 
 (def ^:dynamic *specializing*
   "Set of [fn-var element-type] pairs currently being specialized.
@@ -187,10 +187,7 @@
                                 (mapv replace-fn-calls walked-body))
                               walked-body)
             ;; Generate specialized function name
-                safe-fn-name (let [n (clojure.core/name fn-name)]
-                               (if (every? #(contains? types/op-name-map %) n)
-                                 (str "_" (str/join "" (map types/op-name-map n)) "_")
-                                 n))
+                safe-fn-name (mangled/encode-operator-name fn-name)
                 specialized-sym (symbol (str safe-fn-name "__" element-type))]
         ;; Recursively specialize any deftm calls found in the walked body
             (let [dependency-calls (atom #{})

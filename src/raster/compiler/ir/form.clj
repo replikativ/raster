@@ -200,6 +200,22 @@
   [form & children]
   (with-meta (apply list children) (meta form)))
 
+(defn map-structural-classes
+  "Project class references hidden from lexical scope traversal.
+   `class-symbol` handles classes only, never Vars or lexical binders. Method
+   names and other structural syntax remain unchanged."
+  [class-symbol expression]
+  (if-not (seq? expression)
+    expression
+    (case (first expression)
+      catch (let [[head class binder & body] expression]
+              (apply rl expression head (class-symbol class) binder body))
+      reify* (let [[head interfaces & methods] expression]
+               (apply rl expression head (with-meta (mapv class-symbol interfaces) (meta interfaces)) methods))
+      new (let [[head class & arguments] expression]
+            (apply rl expression head (class-symbol class) arguments))
+      expression)))
+
 (defn- effect-result-paths
   "Locations of an effect's exported declarations, introduced only for subsequent effects."
   [effect]
@@ -300,7 +316,7 @@
 
    `:rebuild` reconstructs the form from transformed scope maps (same shape and
    arity as `:scopes`) and a transformed `:outer` vector. Structural non-value
-   bits (fn* name, ftm `:- ret`/source-body prefix, catch ex-type, reify*
+   bits (ftm `:- ret`/source-body prefix, catch ex-type, reify*
    interfaces/method-names, par layout) are carried in the rebuild closure and
    reattached verbatim — they are never exposed for scanning/substitution.
 
@@ -319,7 +335,7 @@
            :scopes [{:binders (mapv first pairs) :inits (mapv second pairs) :body (vec body)}]
            :outer []
            :rebuild (fn [[{:keys [binders inits body]}] _]
-                      (apply rl form head (vec (interleave binders inits)) body))})
+                      (apply rl form head (with-meta (vec (interleave binders inits)) (meta bindings)) body))})
 
         ;; dotimes / loop / loop*
         :scope
@@ -336,7 +352,7 @@
              :scopes [{:binders (mapv first pairs) :inits (mapv second pairs) :body (vec body)}]
              :outer []
              :rebuild (fn [[{:keys [binders inits body]}] _]
-                        (apply rl form head (vec (interleave binders inits)) body))}))
+                        (apply rl form head (with-meta (vec (interleave binders inits)) (meta bindings)) body))}))
 
         ;; fn / fn* / ftm — one independent scope per arity (params local to it)
         :lambda
@@ -354,7 +370,17 @@
                            (concat tprefix
                                    (mapcat (fn [v] [:raster.walker/source-body v]) aux)
                                    body))]
-          {:sequential? false
+          (if nm
+            ;; A named lambda's self binding encloses ALL arities. Model that
+            ;; as one ordinary scope around the anonymous arity form so every
+            ;; scope consumer shares the same recursion/capture semantics.
+            {:sequential? false
+             :scopes [{:binders [nm] :inits []
+                       :body [(apply rl form head (nnext form))]}]
+             :outer []
+             :rebuild (fn [[{:keys [binders body]}] _]
+                        (apply rl form (first (first body)) (first binders) (rest (first body))))}
+            {:sequential? false
            :scopes (mapv (fn [{:keys [params body sbodies]}]
                            ;; :aux = source-body vecs — renamed by subst/alpha (they
                            ;; share the arity scope) but invisible to free-syms.
@@ -375,7 +401,7 @@
                                               (apply list (reapply-binders params binders)
                                                      (arity-tail tprefix aux body)))
                                             parsed scopes')]
-                          (apply rl form head (concat (when nm [nm]) arities')))))})
+                          (apply rl form head (concat (when nm [nm]) arities')))))}))
 
         ;; (fold attrs (lambda [acc index] (region [(let-value id dtype init) ...] [step])))
         ;; Synthetic nil initializers let the generic sequential-scope machinery model lambda
@@ -601,7 +627,7 @@
              :scopes [{:binders (mapv first pairs) :inits (mapv second pairs) :body (vec body)}]
              :outer []
              :rebuild (fn [[{:keys [binders inits body]}] _]
-                        (apply rl form head (vec (interleave binders inits)) body))})
+                        (apply rl form head (with-meta (vec (interleave binders inits)) (meta bindings)) body))})
 
           ;; reify* — (reify* [interfaces] (mname [this & args] body...) ...)
           ;; each method binds this+args within its body; interfaces & method

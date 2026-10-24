@@ -182,7 +182,9 @@
 
 (defn- pure-map-step?
   "Ask shared effect analysis about the concrete implementation being replayed.
-   A derivative rule or recorded source name is not a purity certificate."
+   A derivative rule or recorded source name is not a purity certificate.
+   The original map executes first: its source evaluation obligations need
+   not be removable, and remain on the primal body."
   [body]
   (let [semantic-body
         (walk/postwalk
@@ -195,7 +197,7 @@
                  form))
              form))
          body)]
-    (effects/removable-expr? semantic-body)))
+    (= :pure (effects/analyze-effect semantic-body))))
 
 (defn- fold-fresh-map!
   "Linearize a pure indexed map into a freshly allocated buffer. The primal

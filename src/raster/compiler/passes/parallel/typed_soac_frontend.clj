@@ -16,7 +16,11 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.binding-completion :as binding-completion]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.ir.extent-proof :as extent-proof]
@@ -33,7 +37,8 @@
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
-            [raster.compiler.passes.scalar.effects :as effects]))
+            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.host-abstract-value :as host-av]))
 
 (defn- fail!
   [reason message data]
@@ -3999,14 +4004,193 @@
        expression))
    source))
 
+(defn- snapshot-evaluation-required?
+  [expression]
+  (or (some (fn [[key value]]
+              (and (keyword? key) (= "raster.effect" (namespace key)) value))
+            (meta expression))
+      (seq (:flags (effects/descriptor expression)))))
+
+(defn- reference-array-declarations-compatible?
+  [carrier expressions]
+  (let [element-type (some-> carrier dtype/dtype-for-jvm-array-class dtype/canon)]
+    (and element-type
+         (every? (fn [expression]
+                   (let [tag (types/sym-type-tag expression)]
+                     (or (nil? tag) (contains? #{'Object 'java.lang.Object} tag)
+                         (identical? Object tag) (identical? carrier tag)
+                         (= element-type (some-> tag dtype/dtype-for-array-tag dtype/canon)))))
+                 expressions))))
+
+(defn- project-redundant-array-entry-checks
+  "Project redundant array CHECKCASTs using source-ordered reference provenance.
+   Registered Method Classes supply the carrier evidence, never AVs or tags.
+   Exact aliases retain that evidence only after their own binding completion
+   is proved checkless. This is physical carrier evidence, not storage analysis."
+  [source {:keys [source-var lexical-inputs source-ns source-binding-context array-types]}]
+  (or
+   (when (and method-entry/*emission-inputs* (var? source-var)
+              (vector? lexical-inputs) source-binding-context
+              (instance? clojure.lang.Namespace source-ns)
+              (form/binding-form? source) (vector? (second source))
+              (even? (count (second source)))
+              (every? symbol? (take-nth 2 (second source)))
+              (some #(completion/boxed-reference-input-parts (second %))
+                    (partition 2 (second source))))
+     (method-entry/call-with-optional-definition-inputs
+      (fn []
+        (when-let [physical (method-entry/source-var-body-entry-carriers source-var)]
+          (when (and (= lexical-inputs (:parameters physical))
+                     (identical? source-ns (get-in physical [:source-entry :source-ns])))
+            (let [[head bindings & body] source
+                  ;; A source parameter shadowed by any local is not this
+                  ;; optional rule's direct public occurrence, even if another
+                  ;; pass has not seeded its alpha-renaming with public names.
+                  shadowed (set (take-nth 2 bindings))
+                  carriers (into {}
+                                 (keep (fn [[formal carrier]]
+                                         (when (and (class? carrier)
+                                                    (not (.isPrimitive ^Class carrier))
+                                                    (not (contains? shadowed formal)))
+                                           [formal {:formal formal :carrier carrier}])))
+                                 (map vector (:parameters physical) (:parameter-carriers physical)))
+                  {:keys [projected replaced]}
+                  (reduce
+                   (fn [{:keys [carriers] :as state} [id expression]]
+                     (let [checked (completion/boxed-reference-input-parts expression)
+                           object-input (completion/object-input-parts expression)
+                           operand (cond checked (:operand checked)
+                                         object-input (:operand object-input)
+                                         (symbol? expression) expression)
+                           {:keys [formal carrier] :as provenance} (get carriers operand)
+                           array-carrier? (some? (some-> carrier dtype/dtype-for-jvm-array-class))
+                           normalized-id (vary-meta id assoc :tag 'java.lang.Object)
+                           normalized-expression (when checked
+                                                   (with-meta
+                                                     (completion/complete-value completion/object-input-contract operand)
+                                                     (meta expression)))
+                           preserved? (and checked
+                                           (invocation-source/preserved-reference-identity?
+                                            normalized-id normalized-expression))
+                           identity? (and provenance array-carrier?
+                                          (or (nil? checked)
+                                              (identical? carrier (get-in checked [:contract :target-carrier])))
+                                          (= (some-> carrier dtype/dtype-for-jvm-array-class dtype/canon)
+                                             (some-> (get array-types formal) dtype/canon))
+                                          (reference-array-declarations-compatible? carrier [id expression operand])
+                                          (not-any? snapshot-evaluation-required? [id operand])
+                                          (or (not (snapshot-evaluation-required? expression)) preserved?)
+                                          (binding-completion/reference-binding-without-check?
+                                           id source-ns source-binding-context carrier)
+                                          (or (not preserved?)
+                                              (binding-completion/object-binding-without-check?
+                                               normalized-id source-ns source-binding-context)))
+                           project? (and identity? checked)]
+                       (cond-> (-> state
+                                   (update :projected into
+                                           [(if (and project? preserved?) normalized-id id)
+                                            (cond (and project? preserved?) normalized-expression
+                                                  project? operand
+                                                  :else expression)])
+                                   (update :carriers dissoc id))
+                         identity? (assoc-in [:carriers id] provenance)
+                         project? (update :replaced inc))))
+                   {:carriers carriers :projected [] :replaced 0}
+                   (partition 2 bindings))]
+              (when (pos? replaced)
+                (with-meta (list* head (with-meta projected (meta bindings)) body) (meta source)))))))))
+   source))
+
+(defn- prune-dead-object-snapshots
+  "Remove only a checkless Object snapshot of a preceding lexical value.
+   Deadness uses the ORIGINAL suffix, never a recursively pruned producer.
+   Initializer meaning and the binding's own completion are separate proofs."
+  [source {:keys [source-ns source-binding-context lexical-inputs]}]
+  (if-not (and source-binding-context (instance? clojure.lang.Namespace source-ns)
+               (form/binding-form? source) (vector? (second source))
+               (even? (count (second source)))
+               (every? symbol? (take-nth 2 (second source))))
+    source
+    (binding [util/*shadowing-locals*
+              (into util/*shadowing-locals*
+                    (concat lexical-inputs (take-nth 2 (second source))))]
+     (let [[head bindings & body] source
+          pairs (vec (map vec (partition 2 bindings)))
+          positions (zipmap (map first pairs) (range))
+          frequencies (frequencies (map first pairs))
+          public (set lexical-inputs)
+          initial-live (reduce set/union #{} (map util/free-syms body))
+          {:keys [retained removed]}
+          (reduce
+           (fn [{:keys [live] :as state} index]
+             (let [[id expression :as pair] (nth pairs index)
+                   operand (:operand (completion/object-input-parts expression))
+                   position (get positions operand)
+                   lexical? (and (symbol? operand)
+                                 (if (some? position)
+                                   (and (< position index) (= 1 (get frequencies operand)))
+                                   (contains? public operand)))
+                   candidate? (and lexical? (= 1 (get frequencies id))
+                                   (contains? (util/free-syms id) id)
+                                   (contains? (util/free-syms operand) operand)
+                                   (not (contains? live id)))
+                   declaration (when candidate? (completion/object-value-declaration expression))
+                   declared-result (:raster.type/tag (meta id))
+                   remove? (and candidate?
+                                (or (nil? declaration) (nil? declared-result)
+                                    (= declaration declared-result))
+                                (not-any? snapshot-evaluation-required? [id expression operand])
+                                (binding-completion/object-binding-without-check?
+                                 id source-ns source-binding-context))]
+               (cond-> (update state :live into (util/free-syms expression))
+                 remove? (update :removed inc)
+                 (not remove?) (update :retained conj pair))))
+           {:live initial-live :retained [] :removed 0}
+           (range (dec (count pairs)) -1 -1))]
+      (if (zero? removed)
+        source
+        (with-meta (list* head (with-meta (vec (mapcat identity (rseq retained))) (meta bindings)) body)
+          (meta source)))))))
+
+(declare ^:private advance-source-description ^:private initial-source-description-state
+         ^:private description-host-buffer?)
+
+(defn- advance-normalized-alias-facts
+  [state [id expression]]
+  (if-not (:host-analysis state)
+    state
+    (let [description-state
+          ;; This observation must not consume the normalizer/emitter's SSA
+          ;; supply. Descriptions share their own existing regional supply.
+          (binding [*region-local-counter* (:alias-description-counter state)]
+            (advance-source-description
+             (:default-dtype state) true (:source-description-state state)
+             [(count (:descriptions (:source-description-state state))) [id expression]]))
+          description (peek (:descriptions description-state))
+          inherited? (and (symbol? expression) (contains? (:host-buffer-values state) expression))
+          described? (description-host-buffer? description)
+          host-analysis (host-av/advance-binding (:host-analysis state) id expression
+                                                 (not (or inherited? described?)))
+          alias-source (get-in host-analysis [:analysis :aliases id])
+          buffer? (or described? alias-source)
+          alias-dtype (when alias-source (get-in host-analysis [:analysis :values alias-source :dtype]))]
+      (when buffer?
+        (set! *declared-kinds* (update *declared-kinds* :arrays conj id)))
+      (assoc state :host-analysis host-analysis
+             :host-buffer-values (cond-> (:host-buffer-values state) buffer? (conj id))
+             :source-description-state
+             (cond-> description-state alias-dtype (assoc-in [:array-types id] alias-dtype))))))
+
 (defn- normalize-source*
-  [source array-types scalar-types]
+  [source array-types scalar-types options]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
   (let [source (util/uniquify-rebindings (util/free-syms source) source)
+        source (project-redundant-array-entry-checks source options)
+        source (prune-dead-object-snapshots source options)
         ;; A locally bound scalar can reuse a public array's name. Only free array
         ;; parameters may borrow the entry type; local arrays need their own tag.
         public-array-types (select-keys array-types (util/free-syms source))
@@ -4016,15 +4200,30 @@
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
+            lexical? (and (contains? options :lexical-inputs)
+                          (some (fn [[_ expression]]
+                                  (some-> expression completion/object-input-parts :operand symbol?)) pairs))
             occupied-symbols (set (filter symbol? (tree-seq coll? seq source)))
-            {:keys [normalized]}
+            {:keys [normalized host-analysis object-buffer-alias?]}
             (reduce
              (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
                          local-scalar-types buffer-aliases]
                    :as state}
                   [ordinal [symbol expression]]]
-               (let [expression (-> (util/subst-syms buffer-aliases expression)
+               (let [previous-count (count (:normalized state))
+                     expression (-> (util/subst-syms buffer-aliases expression)
                                     resolve-direct-allocation-alengths)
+                     object-alias
+                     (when (and (:host-analysis state) (completion/object-input-parts expression)
+                                (not-any? snapshot-evaluation-required? [symbol expression]))
+                       (host-av/binding-buffer-alias-source
+                        (update-in (:host-analysis state) [:analysis :available]
+                                   #(set/intersection % (:host-buffer-values state)))
+                        symbol expression))
+                     expression (or object-alias expression)
+                     state (cond-> state
+                             object-alias (assoc-in [:buffer-aliases symbol] object-alias)
+                             object-alias (assoc :object-buffer-alias? true))
                      return-index (:return-alias-arg (form/form-info expression))
                      returned (if (symbol? expression) expression
                                   (when (some? return-index)
@@ -4213,7 +4412,7 @@
                                (assoc-in state [:allocation-lengths symbol]
                                          (get allocation-lengths expression))
                                state))]
-                 (cond
+                 (let [next-state (cond
                    (nil? extent)
                    (update state :normalized conj [symbol expression])
 
@@ -4260,11 +4459,27 @@
                                     [symbol (replace-extent expression extent-id)]]))))
 
                    :else
-                   (update state :normalized conj [symbol expression]))))
-             {:normalized [] :compound-extents {} :checked-extents {} :allocation-lengths {}
-              :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
+                   (update state :normalized conj [symbol expression]))]
+                   (reduce advance-normalized-alias-facts next-state
+                           (subvec (:normalized next-state) previous-count)))))
+             (cond-> {:normalized [] :compound-extents {} :checked-extents {} :allocation-lengths {}
+                      :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
+               lexical? (assoc :host-analysis (host-av/begin-analysis source options)
+                               :alias-description-counter (atom -1)
+                               :default-dtype (or (:dtype options) :double)
+                               :source-description-state (initial-source-description-state public-array-types scalar-types)
+                               :host-buffer-values (set/intersection (set (:lexical-inputs options))
+                                                                    (set (keys public-array-types)))))
              (map-indexed vector pairs))]
-        (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
+        (with-meta (list* head (vec (mapcat identity normalized))
+                         (if object-buffer-alias?
+                           (let [blocked (keep (fn [[id expression]]
+                                                 (when (some snapshot-evaluation-required? [id expression]) id))
+                                               normalized)
+                                 aliases (apply dissoc (get-in host-analysis [:analysis :aliases]) blocked)]
+                             (map #(util/subst-syms aliases %) body))
+                           body))
+          (meta source)))
       source)))
 
 (defn- alength-array
@@ -4275,16 +4490,37 @@
              (= 1 (count (descriptor/call-args expression))))
     (first (descriptor/call-args expression))))
 
-(defn- source-descriptions
-  ([pairs default-dtype array-types scalar-types]
-   (source-descriptions pairs default-dtype array-types scalar-types false))
-  ([pairs default-dtype array-types scalar-types segmented-plans?]
+(defn- description-allocation-dtype [{:keys [kind expr]}]
+  (when (and (= :scalar kind) (seq? expr) (descriptor/alloc-op? (descriptor/semantic-op expr)))
+    (let [operation (descriptor/semantic-op expr)
+          array-tag (or (get descriptor/alloc-sym->array-tag operation)
+                        (get descriptor/alloc-sym->array-tag (some-> operation name symbol)))]
+      (some-> array-tag dtype/dtype-for-array-tag dtype/canon))))
+
+(defn- description-logical-array-dtype [description]
+  (when (contains? #{:map :scatter :segmented-weighted-reduction-plan} (:kind description))
+    (some-> (if (= :segmented-weighted-reduction-plan (:kind description))
+              (get-in description [:plan :output :dtype]) (:elem-type description)) dtype/canon)))
+
+(defn- description-host-buffer? [description]
+  (if (contains? description :result-storage)
+    (and (= 1 (count (:result-storage description)))
+         (= (:sym description) (:host-binding description))
+         (= :buffer (get-in description [:result-storage 0 :host-return])))
+    (or (and (= :scalar (:kind description))
+             (some? (allocation-length (:expr description))))
+        (description-logical-array-dtype description))))
+
+(defn- initial-source-description-state [array-types scalar-types]
+  {:descriptions [] :array-types array-types :scalar-definitions {}
+   :local-scalar-types scalar-types :stageable-prefix? true :before-parallel? true})
+
+(defn- advance-source-description
   ;; Earlier local allocations are authoritative array-type facts for later effects. Thread those
   ;; facts in source order instead of falling back to the program-wide arithmetic dtype: a local
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
-  (:descriptions
-   (reduce
-    (fn [{:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
+  [default-dtype segmented-plans?
+        {:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
                  before-parallel?] :as state}
          [id [symbol expression]]]
       (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
@@ -4345,25 +4581,12 @@
                   (when (index-algebra/monomial proof-scalar-expression)
                     proof-scalar-expression)
                   expression))
-            allocation-dtype
-            (when (and (= :scalar (:kind description))
-                       (seq? expression)
-                       (descriptor/alloc-op? (descriptor/semantic-op expression)))
-              (let [operation (descriptor/semantic-op expression)
-                    array-tag (or (get descriptor/alloc-sym->array-tag operation)
-                                  (get descriptor/alloc-sym->array-tag
-                                       (some-> operation name symbol)))]
-                (some-> array-tag dtype/dtype-for-array-tag dtype/canon)))
+            allocation-dtype (description-allocation-dtype description)
             logical-array-dtype
             ;; A functional map result is a typed array value available to later source
             ;; descriptions. This is the map's declared element contract, not a consumer guess;
             ;; a resident map binding may name a different caller-owned physical destination.
-            (when (contains? #{:map :scatter :segmented-weighted-reduction-plan}
-                             (:kind description))
-              (some-> (if (= :segmented-weighted-reduction-plan (:kind description))
-                        (get-in description [:plan :output :dtype])
-                        (:elem-type description))
-                      dtype/canon))]
+            (description-logical-array-dtype description)]
         (cond-> (update state :descriptions conj description)
           (or (not= :scalar (:kind description))
               (and (nil? allocation-dtype)
@@ -4377,9 +4600,15 @@
           allocation-dtype (assoc-in [:array-types symbol] allocation-dtype)
           logical-array-dtype (assoc-in [:array-types symbol] logical-array-dtype)
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
-    {:descriptions [] :array-types array-types :scalar-definitions {}
-     :local-scalar-types scalar-types :stageable-prefix? true :before-parallel? true}
-    (map-indexed vector pairs)))))
+
+(defn- source-descriptions
+  ([pairs default-dtype array-types scalar-types]
+   (source-descriptions pairs default-dtype array-types scalar-types false))
+  ([pairs default-dtype array-types scalar-types segmented-plans?]
+   (:descriptions
+    (reduce (partial advance-source-description default-dtype segmented-plans?)
+            (initial-source-description-state array-types scalar-types)
+            (map-indexed vector pairs)))))
 
 (defn- canonical-extent
   [equalities values extent]
@@ -4655,7 +4884,7 @@
    This normalization inserts an ordinary typed scalar binding immediately before its operation,
    so the same expression remains visible to JVM materialization and runtime specialization."
   ([source] (normalize-source source {}))
-  ([source {:keys [array-types scalar-types]}]
+  ([source {:keys [array-types scalar-types] :as options}]
    ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
    ;; binder an array, exactly as the walker stamps them.
    (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
@@ -4673,7 +4902,7 @@
                                                    (some-> % dtype/dtype-for-scalar-tag
                                                            dtype/canon))))}]
        (normalize-source* (copy-allocations->maps source array-types)
-                          array-types scalar-types)))))
+                          array-types scalar-types options)))))
 
 (declare coverage-decline*)
 
@@ -5902,7 +6131,9 @@
   "Establish allocation-owned extents before a consumer can infer element shapes.
    Allocation capacity is not permission to flatten a declared logical layout. Reuse the same
    allocation contracts for initialization later; no consumer extent may become its own producer."
-  [pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
+   (source-storage-analysis pairs dtype array-types scalar-types segmented-plans? values shape-equalities nil))
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities lexical-inputs]
   (let [descriptions (normalize-extents
                       (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
                       shape-equalities values)
@@ -5911,8 +6142,35 @@
                   (if (and (= :scalar kind) scalar-dtype)
                     (assoc types sym scalar-dtype) types))
                 scalar-types descriptions)
-        allocations (allocation-contracts descriptions array-types source-scalar-types values
-                                          shape-equalities)
+        capacities
+        (when (some? lexical-inputs)
+          (let [buffer-sources (into {}
+                                     (keep (fn [description]
+                                             (when (and (contains? description :result-storage)
+                                                        (description-host-buffer? description))
+                                               [(:sym description)
+                                                (get-in description [:result-storage 0 :destination])])))
+                                     descriptions)
+                effects (into #{} (keep (fn [description]
+                                         (let [storage (:result-storage description)]
+                                           (when (and (seq storage)
+                                                      (every? #(= :effect (:host-return %)) storage))
+                                             (:sym description))))) descriptions)]
+            (host-av/analyze-capacities
+             (list 'let* (vec (mapcat identity pairs)) nil)
+             {:dtype dtype :values values :array-types array-types
+              :scalar-types source-scalar-types :lexical-inputs lexical-inputs
+              :non-buffer-bindings effects
+              :reference-aliases
+              (invocation-source/capacity-reference-aliases pairs lexical-inputs buffer-sources)})))
+        allocations
+        (mapv (fn [allocation]
+                ;; Existing source allocation typing supplies a missing element
+                ;; contract; the constructor's original count remains the recipe.
+                (update allocation :dtype
+                        #(or % (when-not (binding-completion/declared-binding-hint (:destination allocation))
+                                 (get-in capacities [:definition-values (:destination allocation) :dtype])))))
+              (allocation-contracts descriptions array-types source-scalar-types values shape-equalities))
         values (reduce (fn [known {:keys [destination extent dtype]}]
                          (let [prior (get known destination)]
                            (if (and dtype
@@ -5925,9 +6183,24 @@
                                               (tensor-value dtype [extent]))
                                           shape-equalities)
                              known)))
-                       values allocations)]
+                       values allocations)
+        ;; A reference identity is not an elementwise traversal input. Give its
+        ;; source-owned capacity to the EXISTING storage-input conversion before
+        ;; equation construction can infer the consumer's domain as its shape.
+        values
+        (if (nil? capacities)
+          values
+          (reduce (fn [known {:keys [kind sym expr]}]
+                      (if-let [capacity (when (and (= :scalar kind)
+                                                  (or (symbol? expr)
+                                                      (invocation-source/reference-identity-source sym expr)))
+                                         (get-in capacities [:definition-values sym]))]
+                        (if (seq (:shape capacity))
+                          (merge-value known sym capacity shape-equalities)
+                          known)
+                        known)) values descriptions))]
     {:descriptions (preserve-map-storage-inputs descriptions values)
-     :values values :allocations allocations}))
+     :values values :allocations allocations})))
 
 (defn canonicalize-fresh-full-write-maps
   "Project a closed single-write effect region to the existing functional map contract.
@@ -6104,7 +6377,7 @@
        :rewrites (:rewrites rebuilt) :declines (:declines rebuilt)}))))
 
 (defn- form->program*
-  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
+  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans? lexical-inputs
                  preserve-declared-array-storage? host-scalars?]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
@@ -6114,7 +6387,7 @@
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
           {descriptions :descriptions storage-values :values allocations :allocations}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
-                                   values shape-equalities)]
+                                   values shape-equalities lexical-inputs)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)

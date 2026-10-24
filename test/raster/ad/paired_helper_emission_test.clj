@@ -3,6 +3,7 @@
             [raster.ad.reverse :as reverse]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.core :as core]
             [raster.arrays]
             [raster.par]
@@ -37,7 +38,7 @@
       (binding [*ns* scope]
         (refer 'clojure.core)
         (eval '(raster.core/deftm twice [x :- Double] :- Double
-                 (let [left (double x) right (double x)]
+                 (let [left (clojure.core/double x) right (clojure.core/double x)]
                    (raster.ad.reverse/grad-acc left right)))))
       (let [source (core/resolve-deftm-var (ns-resolve scope 'twice))
             receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
@@ -56,7 +57,9 @@
             "the source helper call really was projected away")
         ;; The entry guard captures the actual original program before
         ;; ad-prepare erases this call; scanning only the projected form could
-        ;; not establish the dependency. Replacement must not execute.
+        ;; not establish the dependency. Qualified primitive conversions give
+        ;; this early projection actual intrinsic identities, not bare spelling.
+        ;; Replacement must not execute.
         (with-redefs [reverse/grad-acc (fn [& _] (throw (AssertionError. "must not invoke replacement")))]
           (is (= :ad-normalized-execution-callee (reason))))
         (is (nil? (reason))))
@@ -74,10 +77,22 @@
             _ (core/ensure-bytecode-implementation! receiver)
             emission (:raster.core/bytecode-emission (meta receiver))
             artifact (#'reverse/get-paired-helper-program emission [0])
+            companion-emission (:companion-emission artifact)
             [value pullback] ((:companion artifact) 3.0)
             dependency (:var (first (:dependency-snapshots emission)))
             reason (fn [f] (try (f) nil
                                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+        (is (= :jvm-bytecode (:backend companion-emission)))
+        (is (identical? emission (:emission artifact))
+            "the companion does not renew or replace its original input module")
+        (is (identical? (:companion artifact) (:implementation companion-emission)))
+        (is (= (:params emission) (:params companion-emission)))
+        (is (= (:tags emission) (:tags companion-emission)))
+        (is (= 'Object (:return-tag companion-emission)))
+        (is (some? (bytecode/retained-body-context companion-emission)))
+        (is (identical? companion-emission
+                        (method-entry/assert-emission-inputs-current! companion-emission))
+            "executing the companion must not first materialize one of its guarded callees")
         (is (= 9.0 value))
         (is (= [6.0] (pullback 1.0)))
         (is (= [12.0] (pullback 2.0)))

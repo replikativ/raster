@@ -184,7 +184,7 @@
   [program-values public-inputs equation]
   (if-let [expression (invocation-source/scalar-equation-expression equation)]
     (let [projected (invocation-source/project-scalar-metadata program-values public-inputs expression)]
-      (if (semantic/equivalent? expression projected)
+      (if (semantic/retained-source-equivalent? expression projected)
         equation
         (let [result (first (:results equation))
               scalar-types (into {} (keep (fn [[id value]]
@@ -320,7 +320,12 @@
         available (set (keys definitions))]
     (loop [required (set/intersection available (set roots))]
       (let [dependencies (->> required
-                              (mapcat #(util/free-syms (get definitions %)))
+                              (mapcat (fn [symbol]
+                                        (let [expression (get definitions symbol)]
+                                          (if-let [source (invocation-source/reference-identity-source
+                                                           symbol expression)]
+                                            [source]
+                                            (util/free-syms expression)))))
                               set
                               (set/intersection available))
             required' (set/union required dependencies)]
@@ -362,7 +367,10 @@
                 (comp (mapcat (comp #(mapcat util/free-syms %) :shape val))
                       (filter #(scalar-value? (get prefix-values %))))
                 program-values)
-          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots)
+          retained-identities (into #{} (keep (fn [[symbol expression]]
+                                               (when (invocation-source/preserved-reference-identity?
+                                                      symbol expression) symbol))) candidates)
+          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots retained-identities)
                                 (set public-parameters))
           required (required-prefix-symbols candidates roots)
           bindings (filterv (comp required first) candidates)
@@ -570,6 +578,26 @@
           value))))
     (catch Exception _ nil)))
 
+(defn- certified-source-storage
+  "One source-return view of the existing validated result-storage groups.
+   Logical effect results name storage but do not return host buffer references."
+  [parallel-program]
+  (let [groups (vec (mapcat (partial certified-result-storage parallel-program)
+                            (:equations parallel-program)))
+        buffer-host-entries (keep (fn [{:keys [entries host-binding]}]
+                                    (when (and host-binding (= 1 (count entries))
+                                               (= :buffer (:host-return (second (first entries)))))
+                                      [host-binding (first entries)])) groups)]
+    {:entries (mapcat :entries groups)
+     :buffer-host-bindings (into {} (map (fn [[binding [result _ _]]] [binding result])) buffer-host-entries)
+     :buffer-reference-sources (into {} (map (fn [[binding [_ storage _]]]
+                                              [binding (:destination storage)])) buffer-host-entries)
+     :effect-bindings (into #{}
+                            (keep (fn [{:keys [entries host-binding]}]
+                                    (when (and host-binding (seq entries)
+                                               (every? #(= :effect (:host-return (second %))) entries))
+                                      host-binding))) groups)}))
+
 (defn- source-result-projection
   "Prove one complete source return and return `{:kind ... :outputs [...]}`, or nil.
 
@@ -597,9 +625,9 @@
                                                              (conj seen symbol))
                             (contains? outputs symbol) symbol
                             :else symbol)))
-        equations (:equations parallel-program)
-        storage-groups (mapcat (partial certified-result-storage parallel-program) equations)
-        storage-entries (mapcat :entries storage-groups)
+        {:keys [entries buffer-host-bindings effect-bindings]}
+        (certified-source-storage parallel-program)
+        storage-entries entries
         storage-source-kind (fn [storage]
                               (case (:host-return storage)
                                 :buffer :buffer
@@ -615,20 +643,6 @@
                                         [(:destination storage)
                                          {:output result :kind kind}])))
                            storage-entries)
-        buffer-host-bindings
-        (into {}
-              (keep (fn [{:keys [entries host-binding]}]
-                      (when (and host-binding (= 1 (count entries))
-                                 (= :buffer (:host-return (second (first entries)))))
-                        [host-binding (ffirst entries)])))
-              storage-groups)
-        effect-bindings
-        (into #{}
-              (keep (fn [{:keys [entries host-binding]}]
-                      (when (and host-binding (seq entries)
-                                 (every? #(= :effect (:host-return (second %))) entries))
-                        host-binding)))
-              storage-groups)
         symbol-output (fn [symbol]
                         (let [symbol (resolve-alias symbol)]
                           (cond
@@ -738,7 +752,7 @@
                       (:equations parallel-program))]
     (doseq [[symbol expression] (partition 2 (second (:source parallel-program)))
             :when (and (not (and (contains? prefix-bindings symbol)
-                                 (semantic/equivalent?
+                                 (semantic/retained-source-equivalent?
                                   (invocation-source/canonicalize-shape-projection
                                    (:values parallel-program)
                                    public-inputs
@@ -747,7 +761,7 @@
                        (not (program/equation-for-binding parallel-program symbol expression))
                        (not (invocation-source/realization-binding? parallel-program symbol expression))
                        (not (and (contains? allocations symbol)
-                                 (semantic/equivalent? expression (get allocations symbol))))
+                                 (semantic/retained-source-equivalent? expression (get allocations symbol))))
                        ;; A changed claimed binding invalidates its executor even when the new
                        ;; source expression is pure. Only unclaimed host work may be removed.
                        (or (contains? claimed symbol)
@@ -795,15 +809,24 @@
                                public-parameters)
         parallel-program (normalize-public-contracts parallel-program parameter-values)
         program-values (:values parallel-program)
-        host-values
-        (:values
-         (host-av/analyze
+        source-storage (certified-source-storage parallel-program)
+        host-analysis
+        (host-av/analyze-capacities
           (:source parallel-program)
-          (assoc options :values program-values
-                 :array-types array-types :scalar-types scalar-types)))
-        ;; Host relational analysis is authoritative only where it genuinely refines the typed
-        ;; program (not where it merely chooses a different symbolic spelling). This supplies flat
-        ;; physical allocation extents while preserving logical N-D result shapes.
+          (assoc options :values parameter-values :lexical-inputs public-parameters
+                 :array-types array-types :scalar-types scalar-types
+                 :non-buffer-bindings (:effect-bindings source-storage)
+                 :reference-aliases
+                 (invocation-source/capacity-reference-aliases
+                  (partition 2 (second (:source parallel-program))) public-parameters
+                  (:buffer-reference-sources source-storage))))
+        ;; Final relational representatives can name a LATER alength binding.
+        ;; Invocation capacities instead use each source definition's original
+        ;; point-in-time contract; numerical program shapes stay independent.
+        host-values (:definition-values host-analysis)
+        ;; An unknown physical extent may still be refined by its source-owned
+        ;; definition. Use only the causal snapshot, never final relational
+        ;; representatives, and leave every known numerical domain unchanged.
         program-values
         (reduce-kv (fn [values symbol host-value]
                      (if-let [program-value (get values symbol)]
@@ -827,17 +850,25 @@
         parallel-program (assoc parallel-program :values program-values)
         prefix (invocation-prefix parallel-program public-parameters host-values)
         _ (validate-host-coverage! parallel-program prefix (set public-parameters))
-        binding-values
-        (into {}
-              (map (fn [[symbol expression]]
-                     (let [program-value (get program-values symbol)
-                           host-value (get host-values symbol)
+        [binding-values _]
+        (reduce (fn [[resolved available] [symbol expression]]
+                     (let [identity-source (invocation-source/reference-identity-source symbol expression)
+                           ;; A dead identity may have no numerical equation/AV.
+                           ;; It still denotes exactly one preceding invocation
+                           ;; value; use that existing contract, not array hints.
+                           identity-value (when identity-source (get available identity-source))
+                           _ (when (and identity-source (nil? identity-value))
+                               (fail! :structured-control-prefix-identity-source
+                                      "reference identity requires a preceding invocation value"
+                                      {:symbol symbol :source identity-source}))
+                           program-value (get program-values symbol)
+                           host-value (or identity-value (get host-values symbol))
                            value (cond
                                    ;; An exact lexical alias keeps one runtime storage identity.
                                    ;; Its program-side symbolic shape remains authoritative and
                                    ;; materialization later proves both symbolic extents resolve to
                                    ;; the same concrete view before binding.
-                                   (and program-value host-value (symbol? expression))
+                                   (and program-value host-value (or (symbol? expression) identity-source))
                                    program-value
 
                                    (and program-value host-value)
@@ -856,7 +887,8 @@
                          (fail! :structured-control-prefix-value
                                 "host-prefix binding has no retained AbstractValue"
                                 {:symbol symbol :expression expression}))
-                       [symbol value])))
+                       [(assoc resolved symbol value) (assoc available symbol value)]))
+              [{} parameter-values]
               prefix)
         program-values
         (reduce-kv (fn [values symbol value]

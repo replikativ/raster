@@ -4,6 +4,7 @@
             [raster.numeric :as n]
             [raster.par :as par]
             [raster.ad.reverse :as reverse]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.source-owner :as source-owner]))
@@ -279,6 +280,60 @@
         (is (= (Double/doubleToRawLongBits (widened-object-local x))
                (Double/doubleToRawLongBits value)))))))
 
+(deftest cold-selected-helpers-settle-before-physical-preparation-observations
+  (let [once-var (ns-resolve 'raster.ad.reverse 'prepare-owned-bytecode-value+grad-once)
+        once! @once-var]
+    (doseq [tag '[Double Float] nested? [false true]]
+      (let [scope (create-ns (gensym "raster.ad.cold-whole-owner."))
+            attempts (atom 0)]
+        (try
+          (binding [*ns* scope]
+            (refer 'clojure.core)
+            (eval (list 'raster.core/deftm 'leaf ['x ':- tag] ':- tag
+                        '(raster.numeric/* x x)))
+            (eval (list 'raster.core/deftm 'caller ['x ':- tag] ':- 'Double
+                        '(let [contribution (leaf x)] contribution)))
+            (eval '(raster.core/deftm unrelated [x :- Double] :- Double x)))
+          (let [function (ns-resolve scope 'caller)
+                leaf (core/resolve-deftm-var (ns-resolve scope 'leaf))
+                receiver (ns-resolve scope (symbol (str (:name (meta leaf)) "-impl")))
+                original (var-get receiver)
+                unrelated (core/resolve-deftm-var (ns-resolve scope 'unrelated))
+                _ (is (map? (:raster.core/jit-spec (meta receiver))))
+                p (with-redefs-fn
+                    {once-var (fn [& arguments]
+                                (swap! attempts inc)
+                                (apply once! arguments))}
+                    #(if nested?
+                       (entry/call-with-definition-inputs
+                        (fn []
+                          (let [p (prepared function)]
+                            ;; This later consumer belongs to the enclosing
+                            ;; owner, not the derivative already constructed.
+                            (entry/observe-definition-input!
+                             unrelated scope (.sym ^clojure.lang.Var unrelated))
+                            p)))
+                       (prepared function)))
+                invoke (#'reverse/compile-prepared-value+grad p)
+                x (if (= tag 'Float) (float 2.0) 2.0)]
+            (is (= 1 @attempts)
+                "the selected semantic helper frontier settles before physical derivation observations")
+            (is (not (identical? original (var-get receiver))))
+            (is (nil? (:raster.core/jit-spec (meta receiver))))
+            (is (= 4.0 (function x)))
+            (let [[value gradient] (invoke x)]
+              (is (= 4.0 value gradient))
+              (is (instance? Double value))
+              (is (if (= tag 'Float) (instance? Float gradient) (instance? Double gradient))))
+            (when nested?
+              (let [metadata (meta unrelated)]
+                (try
+                  (alter-meta! unrelated assoc ::later-unrelated-change (Object.))
+                  (is (= [4.0 4.0] (invoke x))
+                      "the derivative guard freezes its construction history, not the mutable parent collector")
+                  (finally (reset-meta! unrelated metadata))))))
+          (finally (remove-ns (ns-name scope))))))))
+
 (deftest compound-input-regions-compose-with-the-existing-lexical-producer
   (doseq [v [#'scoped-input-factor #'array-input-factor]]
     (let [p (prepared v)
@@ -325,12 +380,18 @@
         (is (< (Math/abs (- (aget gradient 0) (/ (* 2.0 cnt) den))) 1e-12)))))
   (let [p (prepared #'explicit-float)
         f (#'reverse/compile-prepared-value+grad p)]
-    (doseq [x [0.1 -0.0 Double/MAX_VALUE Double/NaN]]
+    (doseq [x [0.1 -0.0 Double/NaN]]
       (let [[value gradient] (f x)]
         (is (instance? Float value))
         (is (= (Float/floatToRawIntBits (explicit-float x))
                (Float/floatToRawIntBits value)))
-        (is (= 1.0 gradient))))))
+        (is (= 1.0 gradient))))
+    ;; Explicit core/float retains Clojure's checked conversion. Neither AD
+    ;; nor an input outline may replace it with unchecked JVM D2F narrowing.
+    (doseq [x [Double/MAX_VALUE Double/POSITIVE_INFINITY]]
+      (is (thrown? IllegalArgumentException (float x)))
+      (is (thrown? IllegalArgumentException (explicit-float x)))
+      (is (thrown? IllegalArgumentException (f x))))))
 
 (deftest producer-renewal-replaces-code-without-revalidating-old-artifacts
   (let [scope (create-ns (gensym "raster.ad.owned-renewal."))]

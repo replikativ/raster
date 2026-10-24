@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.core.value-completion :as completion]
@@ -1267,13 +1268,164 @@
              (reason-of #(validate malformed (retained-aget 0))))
           "malformed inner evidence fails closed at the source-result boundary"))))
 
+(deftest capacity-reference-aliases-respect-source-order-and-conflicts
+  (let [saved (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        identity (completion/complete-value completion/object-input-contract 'x)]
+    (is (= {'saved 'x}
+           (invocation-source/capacity-reference-aliases [[saved identity]] '[x] {'saved 'x})))
+    (is (= :source-capacity-reference-conflict
+           (reason-of #(invocation-source/capacity-reference-aliases
+                        [[saved identity]] '[x y] {'saved 'y}))))
+    (is (= {}
+           (invocation-source/capacity-reference-aliases
+            [['effect '(opaque-call)] ['future '(clojure.core/double-array n)]]
+            '[n] {'effect 'future})))
+    (is (= {}
+           (invocation-source/capacity-reference-aliases
+            [['result '(opaque-call)]] '[n] {'result 'private-destination})))
+    (is (= {'result 'x}
+           (invocation-source/capacity-reference-aliases
+            [['result '(opaque-call)]] '[x] {'result 'x})))
+    (is (= {'saved 'future}
+           (invocation-source/capacity-reference-aliases
+            [[saved (completion/complete-value completion/object-input-contract 'future)]]
+            '[x] {}))
+        "explicit source syntax is retained so the capacity transfer can reject a future operand")))
+
+(deftest allocation-capacity-does-not-borrow-a-later-target-length
+  (let [source '(let* [out (clojure.core/double-array n)
+                       written (raster.par/map! out i n double (clojure.core/aget target i))
+                       later-length (clojure.core/alength target)] out)
+        options {:dtype :double :public-parameters '[target n]
+                 :array-types {'target :double} :scalar-types {'n :long}
+                 :values {'target (av/tensor {:dtype :double :shape ['(extent target)]})}}
+        attempt (:program (typed-route/attempt source :double (:array-types options)
+                                               {:scalar-types (:scalar-types options) :values (:values options)
+                                                :lexical-inputs (:public-parameters options)}))
+        promoted (route/promote-program attempt options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        allocation (first (get-in promoted [:attributes :allocations]))
+        emitted (:program (program-c-family/emit-program
+                           (route/schedule-program promoted options)
+                           (assoc options :target-dialect :opencl-portable)))
+        target (double-array [10.0 20.0 30.0 40.0 50.0 60.0])
+        materialize (fn [n]
+                      (materialization/materialize
+                       plan [target n] #(typed-scalar/evaluate-invocation-step *ns* %1 %2)))]
+    (is (= {:destination 'out :extent 'n :initialization :zero :dtype :double}
+           (select-keys allocation [:destination :extent :initialization :dtype])))
+    (is (= ['n] (get-in promoted [:values 'out :shape])))
+    (is (= {:position 0 :binding 'out :storage 'out}
+           (first (invocation/source-order plan promoted))))
+    (let [materialized (materialize 2)
+          linked (invocation-link/lower materialized emitted :ocl:0 nil)
+          output-node (get-in linked [:instances 0 :call :buffers 'out])
+          initial (invocation-link/begin-ordered-realization
+                   {:semantic promoted :emitted emitted :target :ocl:0}
+                   [target 2] nil)
+          prepared (invocation-link/prepare-source-allocation
+                    initial
+                    (fn [expression scalars]
+                      (typed-scalar/evaluate-array-size
+                       *ns* (update-vals scalars :value) expression)) nil)]
+      (is (= [2] (get-in linked [:nodes output-node :view :shape])))
+      (is (= 2 (:elements prepared)))
+      (is (= :zero (:initialization prepared)))
+      (is (= :source-allocation (get-in prepared [:state :pending :kind])))
+      (is (empty? (get-in prepared [:state :acquired-storage]))
+          "preparing a source allocation does not claim runtime acquisition or completion")
+      (is (= [6] (get-in materialized [:values (:id (first (:parameters plan))) :shape])))
+      (is (some? (link/validate! linked))))
+    (is (= :program-link-graph-range
+           (reason-of #(invocation-link/lower (materialize 7) emitted :ocl:0 nil)))
+        "inner operation demand remains checked against the unchanged supplied capacity")
+    (is (some? (invocation/source-order plan promoted)))
+    (is (= '(clojure.core/double-array n) (:source-expression allocation))
+        "an unused later capacity read cannot size an earlier source allocation")))
+
+(deftest retained-array-length-observes-capacity-not-the-read-domain
+  (let [source '(let* [out (clojure.core/double-array n)
+                       size (clojure.core/long (clojure.core/alength target))
+                       written (raster.par/map! out i n double
+                                 (+ (clojure.core/aget target i) (double size)))] out)
+        options {:dtype :double :public-parameters '[target n]
+                 :array-types {'target :double} :scalar-types {'n :long}
+                 :values {'target (av/tensor {:dtype :double :shape ['(extent target)]})}}
+        attempt (:program (typed-route/attempt source :double (:array-types options)
+                                               {:scalar-types (:scalar-types options) :values (:values options)
+                                                :lexical-inputs (:public-parameters options)}))
+        promoted (route/promote-program attempt options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        emitted (:program (program-c-family/emit-program
+                           (route/schedule-program promoted options)
+                           (assoc options :target-dialect :opencl-portable)))
+        materialized (materialization/materialize
+                      plan [(double-array 6) 2]
+                      (fn [& _] (throw (ex-info "array length needs no scalar evaluator" {}))))
+        linked (invocation-link/lower materialized emitted :ocl:0 nil)
+        call (get-in linked [:instances 0 :call])]
+    (is (= ['n] (get-in promoted [:values 'out :shape])))
+    (is (= 'n (get-in promoted [:attributes :allocations 0 :extent])))
+    (is (= {:position 0 :binding 'out :storage 'out}
+           (first (invocation/source-order plan promoted))))
+    (is (= {:type :long :value 6} (get-in call [:scalar-values 'size])))
+    (is (= {:type :long :value 2} (get-in call [:scalar-values 'n])))
+    (is (= [2] (get-in linked [:nodes (get-in call [:buffers 'out]) :view :shape])))
+    (is (= [6] (get-in linked [:nodes (get-in call [:buffers 'target]) :view :shape])))
+    (is (some? (link/validate! linked)))))
+
+(deftest preserved-reference-identities-remain-prefix-roots-when-numerically-dead
+  (let [binder (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        chained (with-meta 'chained {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        identity (vary-meta (completion/complete-value completion/object-input-contract 'x)
+                            assoc :raster.effect/preserve-evaluation true)
+        chained-identity (vary-meta (completion/complete-value completion/object-input-contract binder)
+                                    assoc :raster.effect/preserve-evaluation true)
+        source (list 'let* [binder identity
+                            chained chained-identity
+                            'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)
+        options {:dtype :double :public-parameters '[x out n]
+                 :array-types {'x :double 'out :double} :scalar-types {'n :long}}
+        attempt (:program (typed-route/attempt source :double (:array-types options)
+                                               {:scalar-types (:scalar-types options)
+                                                :lexical-inputs (:public-parameters options)}))
+        promoted (route/promote-program attempt options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        alias (first (filter #(= binder (:symbol %)) (:steps plan)))]
+    (is (some? attempt))
+    (is (not (some #{binder} (:inputs promoted))) "no numerical kernel needs the snapshot")
+    (is (invocation/value-alias? alias))
+    (is (= (meta identity) (meta (:source-expression alias))))
+    (is (some #(= (:id alias) (:invocation-step %)) (invocation/source-order plan promoted)))
+    (let [second-alias (first (filter #(= chained (:symbol %)) (:steps plan)))]
+      (is (invocation/value-alias? second-alias))
+      (is (= (:id alias) (:source second-alias)))
+      (is (= (:value alias) (:value second-alias))))
+    (let [future-source (list 'let* [chained chained-identity binder identity
+                                     'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)]
+      (is (= :host-abstract-value-reference-alias
+             (reason-of #(route/promote-program
+                          (:program (typed-route/attempt future-source :double (:array-types options)
+                                                          {:scalar-types (:scalar-types options)
+                                                           :lexical-inputs (:public-parameters options)})) options)))
+          "a later definition cannot populate an earlier invocation identity"))
+    (let [ordinary-source (list 'let* [binder (vary-meta identity dissoc :raster.effect/preserve-evaluation)
+                                      'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)
+          ordinary (:program (typed-route/attempt ordinary-source :double (:array-types options)
+                                                   {:scalar-types (:scalar-types options)
+                                                    :lexical-inputs (:public-parameters options)}))]
+      (is (not-any? #(= binder (:symbol %))
+                    (get-in (route/promote-program ordinary options) [:attributes :invocation-plan :steps]))
+          "ordinary dead aliases do not acquire evaluation roots"))))
+
 (deftest island-live-outs-do-not-prove-whole-source-completion
   (let [options {:dtype :double :public-parameters '[x out n]
                  :array-types {'x :double 'out :double}
                  :scalar-types {'n :long}}
         attempt (fn [source]
                   (:program (typed-route/attempt source :double (:array-types options)
-                                                 {:scalar-types (:scalar-types options)})))
+                                                 {:scalar-types (:scalar-types options)
+                                                  :lexical-inputs (:public-parameters options)})))
         partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                  loss (opaque-loss y)] loss))]
     (is (= '[y] (:outputs partial)) "the island must still materialize its host consumer's input")
@@ -1289,9 +1441,10 @@
       (let [source (list 'let* '[y (raster.par/map! out i n double (clojure.core/aget x i))]
                          result)]
         (is (= '[y] (:outputs (route/promote-program (attempt source) options))))))
-    (doseq [aliased ['y 'out]]
+    (doseq [aliased ['y 'out]
+            wrap [identity #(completion/complete-value completion/object-input-contract %)]]
       (let [source (list 'let* (into '[y (raster.par/map! out i n double (clojure.core/aget x i))]
-                                   ['returned aliased 'final-result 'returned])
+                                   ['returned (wrap aliased) 'final-result (wrap 'returned)])
                          'final-result)]
         (is (= '[y] (:outputs (route/promote-program (attempt source) options)))
             "exact lexical aliases preserve logical/physical return identity")))
@@ -1335,6 +1488,33 @@
                (reason-of #(route/promote-program
                             (assoc complete :source (list 'let* ['y replacement] 'y)) options)))
             "removability cannot authorize a stale equation for a claimed binding")))))
+
+(deftest used-buffer-completion-keeps-the-original-kernel-dependency
+  (let [options {:dtype :double :public-parameters '[x out n]
+                 :array-types {'x :double 'out :double} :scalar-types {'n :long}}
+        prepare (fn [wrap]
+                  (let [source (list 'let*
+                                     (into '[y (raster.par/map! out i n double
+                                                               (clojure.core/aget x i))]
+                                           ['returned (wrap 'y)
+                                            'z '(raster.par/map! x i n double
+                                                                 (clojure.core/aget returned i))])
+                                     'z)
+                        result (typed-route/attempt
+                                source :double (:array-types options)
+                                {:scalar-types (:scalar-types options)
+                                 :lexical-inputs (:public-parameters options)})]
+                    (route/promote-program (:program result) options)))
+        plain (prepare identity)
+        completed (prepare #(completion/complete-value completion/object-input-contract %))]
+    (is (= 2 (count (:equations completed))))
+    (is (= (mapv #(select-keys % [:operands :results :effects :algorithm]) (:equations plain))
+           (mapv #(select-keys % [:operands :results :effects :algorithm]) (:equations completed)))
+        "completion must not disconnect the second kernel from the first writer")
+    (is (= (:inputs plain) (:inputs completed)))
+    (is (not-any? #{'returned} (:inputs completed))
+        "a result alias is not a new public device input")
+    (is (= '[z] (:outputs completed)))))
 
 (deftest checked-prefix-equations-are-not-pruned-into-the-invocation-prefix
   (let [source '(let* [checked (clojure.core/int n)

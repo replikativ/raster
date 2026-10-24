@@ -40,7 +40,13 @@
           current-dtype (:dtype opts)
           scalar-tag (dtype/scalar-tag-for-dtype current-dtype)
           param-env (if-let [env (:param-env opts)]
-                      (dtype/remap-env env current-dtype)
+                      ;; Tensor policy may specialize array storage, but declared scalar
+                      ;; parameters own their independent arithmetic width. Rewalking a
+                      ;; Double coefficient as Float stamps a false result type on its body.
+                      (merge (if (:preserve-declared-array-storage? opts)
+                               env
+                               (dtype/remap-env env current-dtype))
+                             (into {} (filter (comp dtype/dtype-for-scalar-tag val)) env))
                       (if active-params
                         (into {}
                               (map (fn [param]

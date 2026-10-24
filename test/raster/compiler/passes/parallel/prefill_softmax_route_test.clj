@@ -60,10 +60,11 @@
         row-index-plus? (fn [form loop-index]
                           (and (seq? form) (= 'clojure.core/+ (first form))
                                (= 3 (count form))
-                               (seq? (second form))
-                               (= 'clojure.core/long (first (second form)))
-                               (symbol? (second (second form)))
-                               (= (list 'clojure.core/long loop-index) (nth form 2))))
+                               ;; The canonical region already retains these
+                               ;; integer carriers; redundant source long casts
+                               ;; are no longer part of its address expression.
+                               (symbol? (second form))
+                               (= loop-index (nth form 2))))
         shifted (rewrite
                  #(if (row-index-plus? % 'rstr_loop_index_1)
                     (list 'clojure.core/+ (second %) (nth % 2) 1)

@@ -4,6 +4,7 @@
             [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.source-owner :as source-owner]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as n]))
 
@@ -30,6 +31,10 @@
   (let [amplitude (n/+ a 0.0)
         threshold (n/+ k 0.0)]
     (n/* 2.0 (response amplitude (n/+ threshold x) x))))
+(deftm consume-long [value :- Long] :- Long value)
+(deftm long-response [value :- Double] :- Long (long value))
+(deftm integral-operand [value :- Double] :- Long
+  (consume-long (long-response value)))
 
 (use-fixtures :once (fn [run] (response 0.8 0.7 1.0) (run)))
 
@@ -83,6 +88,22 @@
           original (get-in prepared [:source-owner :input-region :invoke])]
       (is (= :jvm-bytecode (get-in prepared [:source-owner :backend])))
       (is (seq? (get-in prepared [:program :form])))
+      (let [region (get-in prepared [:source-owner :input-region])
+            spec (:spec region)
+            method ^java.lang.reflect.Method (:method region)]
+        (is (= :double (::bytecode/expected-completion-input-type spec)))
+        (is (not (contains? (get-in prepared [:source-owner :spec])
+                            ::bytecode/expected-completion-input-type)))
+        (binding [method-entry/*compilation-classloader*
+                  (.getClassLoader (.getDeclaringClass method))]
+          (is (= :bytecode-input-result-carrier
+                 (try
+                   (bytecode/compile-specialized-class!
+                    "raster.compiled.ChangedOriginalInputCarrier"
+                    [(assoc spec ::bytecode/expected-completion-input-type :ref)])
+                   nil
+                   (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))
+              "the original outline still rejects a changed emitted-carrier assertion")))
       (doseq [[a k x] [[0.8 0.7 1.0] [1.2 0.4 0.2] [-0.2 1.1 2.0]]]
         (let [args (arguments prepared a k x)
               [value pb] (apply f args)
@@ -154,6 +175,15 @@
   (is (= :ad-unclosed-bytecode-input-region
          (try (prepare #'branch-factor 'raster.numeric/* 1 ["a" "k"])
               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+
+(deftest integral-operand-outlining-does-not-grant-floating-ad-permission
+  (with-redefs [reverse/derive-flat-product-program
+                (fn [& _] (throw (AssertionError. "integer operand reached AD derivation")))]
+    (is (= :ad-unclosed-bytecode-input-region
+           (try (prepare #'integral-operand
+                         'raster.ad.owned-bytecode-input-pullback-test/consume-long 0 ["value"])
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
 
 (deftest earlier-object-input-completes-before-nested-later-call
   (let [prepared (prepare #'shadow-tree-factor 'raster.numeric/* 1 ["amplitude" "threshold"])

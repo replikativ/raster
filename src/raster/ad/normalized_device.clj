@@ -9,6 +9,7 @@
             [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
@@ -16,6 +17,7 @@
             [raster.compiler.ir.link-module-plan :as module-plan]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.gpu.link-module :as link-module]))
 
 (defn- fail! [reason message data]
@@ -35,9 +37,13 @@
       (fail! :normalized-device-family
              "device preparation received a different canonical normalized family"
              {:expected expected-kind :kind (:kind derivation)}))
-    (let [guard! (normalized/execution-guard
-                  (:source-ns owner) (normalized/revisions)
-                  (normalized/execution-sources bundle))]
+    (let [semantic-guard! (normalized/execution-guard
+                           (:source-ns owner) (normalized/revisions)
+                           (normalized/execution-sources bundle))
+          history @method-entry/*emission-inputs*
+          guard! (fn []
+                   (semantic-guard!)
+                   (method-entry/assert-definition-inputs-current! history))]
       {:owner owner
        :guard! guard!
        :check! (fn [] (guard!) (canonical/validate! owner))})))
@@ -847,7 +853,15 @@
         runtime (link-module/instantiate! module runtime-options)]
     (try
       (check!)
-      (let [pure-primal! (fn [inputs]
+      (let [history @method-entry/*emission-inputs*
+            ;; Include observations made by phase compilation and module
+            ;; instantiation, not only the earlier canonical authority check.
+            guard! (let [authority-guard! guard!]
+                     (fn []
+                       (authority-guard!)
+                       (method-entry/assert-definition-inputs-current! history)))
+            _ (guard!)
+            pure-primal! (fn [inputs]
                           (run-result! guard! runtime :primal
                                        (canonical-array-request! ports inputs)
                                        (:primal-output ports) frontier-values true))
@@ -894,6 +908,27 @@
         prepared)
       (catch Throwable primary (close-preserving! primary runtime)))))
 
+(defn- prepare-checked!
+  "Own admission, compilation and allocation together for every device family.
+   Failed construction closes locally; rejection AFTER return closes via the
+   existing whole-owner discard callback before a fresh attempt is considered."
+  [owner options expected-kind assemble! family]
+  (effects/init-raster-context!)
+  (when-not (and (map? options) (set/subset? (set (keys options)) option-keys))
+    (fail! :normalized-device-options
+           "normalized device preparation accepts only target, schedule, scalar-math and profile"
+           {:keys (when (map? options) (set (keys options)))}))
+  (when-not (keyword? (:target options))
+    (fail! :normalized-device-target
+           "normalized device preparation requires one explicit target keyword"
+           {:target (:target options)}))
+  (method-entry/call-with-definition-inputs
+   (fn []
+     (let [checked (authority owner expected-kind)
+           assembled (assemble! checked)]
+       (instantiate-prepared! checked assembled options family)))
+   (fn [prepared] ((:close! prepared)))))
+
 (defn prepare-owner
   "Prepare one canonical checked-map owner for explicit resident primal/transpose execution.
 
@@ -907,18 +942,9 @@
 
    No default AD engine, cache, host readback, mutable state, map-sum or indexed-map path is
    activated by this boundary."
-  [owner arguments {:keys [target] :as options}]
-   (when-not (and (map? options) (set/subset? (set (keys options)) option-keys))
-     (fail! :normalized-device-options
-            "normalized device preparation accepts only target, schedule, scalar-math and profile"
-            {:keys (when (map? options) (set (keys options)))}))
-   (when-not (keyword? target)
-     (fail! :normalized-device-target
-            "normalized device preparation requires one explicit target keyword"
-            {:target target}))
-   (let [checked (authority owner :checked-scalar-map)
-         assembled (assemble-map! checked arguments options)]
-     (instantiate-prepared! checked assembled options :map)))
+  [owner arguments options]
+  (prepare-checked! owner options :checked-scalar-map
+                    #(assemble-map! % arguments options) :map))
 
 (defn prepare-sum-owner
   "Prepare a canonical producer→certified-sum owner with a fixed typed cotangent seed.
@@ -934,18 +960,9 @@
 
    This opt-in boundary does not enable mutable state, indexed maps, arbitrary DAGs, caching,
    host readback, or a default AD engine."
-  [owner arguments fixed-seed {:keys [target] :as options}]
-  (when-not (and (map? options) (set/subset? (set (keys options)) option-keys))
-    (fail! :normalized-device-options
-           "normalized device preparation accepts only target, schedule, scalar-math and profile"
-           {:keys (when (map? options) (set (keys options)))}))
-  (when-not (keyword? target)
-    (fail! :normalized-device-target
-           "normalized device preparation requires one explicit target keyword"
-           {:target target}))
-  (let [checked (authority owner :checked-scalar-map-sum)
-        assembled (assemble-sum! checked arguments fixed-seed options)]
-    (instantiate-prepared! checked assembled options :map-sum)))
+  [owner arguments fixed-seed options]
+  (prepare-checked! owner options :checked-scalar-map-sum
+                    #(assemble-sum! % arguments fixed-seed options) :map-sum))
 
 (defn prepare-indexed-owner
   "Prepare one canonical fixed-geometry indexed map for resident gather/transpose execution.
@@ -961,15 +978,6 @@
    This opt-in lease boundary supports neither empty or per-call dynamic geometry nor general scatter,
    mutable state, caching, host readback, or default AD activation. Every issued lease must close
    before replaying an overlapping entry or calling `:close!`."
-  [owner arguments {:keys [target] :as options}]
-  (when-not (and (map? options) (set/subset? (set (keys options)) option-keys))
-    (fail! :normalized-device-options
-           "normalized device preparation accepts only target, schedule, scalar-math and profile"
-           {:keys (when (map? options) (set (keys options)))}))
-  (when-not (keyword? target)
-    (fail! :normalized-device-target
-           "normalized device preparation requires one explicit target keyword"
-           {:target target}))
-  (let [checked (authority owner :checked-scalar-indexed-map)
-        assembled (assemble-indexed! checked arguments options)]
-    (instantiate-prepared! checked assembled options :indexed-map)))
+  [owner arguments options]
+  (prepare-checked! owner options :checked-scalar-indexed-map
+                    #(assemble-indexed! % arguments options) :indexed-map))

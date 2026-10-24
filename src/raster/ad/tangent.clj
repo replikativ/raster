@@ -125,12 +125,14 @@
   "Runtime Π fallback: a zero cotangent shaped like the PRIMAL value `x`,
   deriving dtype+shape dynamically. Used only where no static tag exists
   (e.g. untagged if-result syms in runtime AD) — unlike a bare scalar 0.0
-  it can never mis-shape an array slot. nil (0̄) passes through."
+  it can never mis-shape an array slot. Immutable vector products recurse
+  pointwise, including the empty product; nil (0̄) passes through."
   [x]
   (cond
     (nil? x) nil
     (instance? Double x) 0.0
     (instance? Float x) (Float/valueOf (float 0.0))
+    (vector? x) (mapv zero-like x)
     (.isArray (class x))
     (java.lang.reflect.Array/newInstance (.getComponentType (class x))
                                          (java.lang.reflect.Array/getLength x))
@@ -144,12 +146,12 @@
     (let [tag (descriptor/cast-result-tag (descriptor/semantic-op expression))]
       (when (contains? scalar-tag->dtype tag) tag))))
 
-(defn- expr-manifest-tag
+(defn ^:no-doc scalar-value-tag
   "The statically KNOWN scalar tag of an IR expression — carried or manifest,
   never guessed from the target primal: a carried :raster.type/tag stamp,
   explicit cast, literal, or the approved optional sum's retained result facet.
   nil when the expression's type is not statically known."
-  ([expr] (expr-manifest-tag expr {}))
+  ([expr] (scalar-value-tag expr {}))
   ([expr binding-map]
    (letfn [(known-tag [expr seen]
              (or (cond
@@ -193,7 +195,7 @@
   ([tag cotangent-expr {:keys [materialized? binding-map]}]
   (let [{:keys [kind dtype]} (tangent-kind tag)]
     (if (= kind :scalar)
-      (let [ct (tangent-kind (expr-manifest-tag cotangent-expr binding-map))
+      (let [ct (tangent-kind (scalar-value-tag cotangent-expr binding-map))
             cast-tag (case dtype :float 'float :double 'double)
             cast-op (symbol "clojure.core" (name cast-tag))]
         (cond

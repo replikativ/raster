@@ -3,7 +3,9 @@
   This owns no compiler cache, derivative rules, source importer or GPU session."
   (:require [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-program-bundle :as canonical]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (defn- fail! [reason data]
@@ -152,8 +154,8 @@
           ;; to all three raw scalar programs, not through another importer.
           (conj (let [{:keys [parameters body-results]} (soac/lambda-parts lambda)]
                   {:parameters parameters :body body-results})))
-        guard! (normalized/execution-guard (:source-ns owner) expected
-                                          (into projections source-dependencies))
+        semantic-guard! (normalized/execution-guard (:source-ns owner) expected
+                                                   (into projections source-dependencies))
         ;; Bind the captured effective callees to the existing selected-call proof,
         ;; rather than blessing a mutation between adaptation and identity capture.
         residual-plan (canonical/execution-residual-plan owner)
@@ -186,8 +188,15 @@
                                          (when (= (first gradient-ids) (get-in binding [:consumer :result]))
                                            (:requirement binding)))
                                        physical-bindings))
-        _ (guard!)
+        _ (semantic-guard!)
         compiled (mapv #(compile-projection % (:source-ns owner)) projections)
+        ;; Validation and compilation consumed selected numerical bodies under
+        ;; this existing owner. Retain its FINAL immutable history, not the
+        ;; mutable collector or a new runtime observation of an old executable.
+        history @method-entry/*emission-inputs*
+        guard! (fn []
+                 (semantic-guard!)
+                 (method-entry/assert-definition-inputs-current! history))
         _ (guard!)
         [primal push pull] compiled
         run (fn [executable environment]
@@ -333,12 +342,16 @@
    receive fresh exclusive typed-zero owners. Epoch and executable identities are fenced.
    No default AD migration, implicit seed, device execution or general equation composition."
   [owner]
-  (prepare-validated-owner (canonical/validate! owner)))
+  (effects/init-raster-context!)
+  (method-entry/call-with-definition-inputs
+   #(prepare-validated-owner (canonical/validate! owner))))
 
 (defn prepare
   "Compatibility entry for checked derivation evidence. Canonical adaptation owns family
    admission; prepare-owner owns host execution. See prepare-owner for value/lifetime contracts."
   [bundle]
+  (effects/init-raster-context!)
   ;; Adaptation has just performed independent canonical validation. Reuse the private
   ;; consumer, not a skip flag: both public entries retain the post-capture proof/fence.
-  (prepare-validated-owner (canonical/adapt bundle)))
+  (method-entry/call-with-definition-inputs
+   #(prepare-validated-owner (canonical/adapt bundle))))

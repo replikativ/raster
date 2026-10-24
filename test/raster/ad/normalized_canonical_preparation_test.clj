@@ -7,12 +7,35 @@
             [raster.ad.normalized-map-sum-runtime-test :as sums]
             [raster.ad.normalized-indexed-runtime-test :as indexed]
             [raster.ad.normalized-scalar-capture-test :as capture]
+            [raster.ad.templates :as templates]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 (defn- plain [value] (if (number? value) value (vec value)))
+
+(deftest normalized-producers-bootstrap-before-epoch-capture
+  (let [initialize effects/init-raster-context!
+        revision templates/registry-revision
+        _ (initialize)
+        source (#'maps/map-program :double {})
+        sum (#'sums/identity-source :double)]
+    (doseq [construct [(fn [] (normalized/linearize-map-element source *ns*))
+                       (fn [] (normalized/linearize-map-program source *ns*))
+                       (fn [] (normalized/linearize-equation-program source *ns*))
+                       (fn [] (normalized/linearize-map-sum-program sum *ns* {:active-input 'xs}))]]
+      (let [events (atom [])]
+        (with-redefs [effects/init-raster-context!
+                      (fn [] (initialize) (swap! events conj :initialized) nil)
+                      templates/registry-revision
+                      (fn [] (swap! events conj :epoch) (revision))]
+          (construct))
+        (is (= :initialized (first @events)))
+        (is (some #{:epoch} @events))))))
+
 (defn- cases []
   ;; Preparing a later family may register lazy numeric specializations. Build each
   ;; witness immediately before using it; an eager vector would rightly stale earlier
@@ -87,3 +110,40 @@
                   route/materialize-host-program (fn [& _] (swap! projections inc))]
       (is (= :ad-normalized-stale-rules (reason #(runtime/prepare-owner owner))))
       (is (zero? @projections)))))
+
+(deftest prepared-cpu-closures-retain-final-compilation-producer-history
+  (doseq [prepare [(fn [bundle] (runtime/prepare bundle))
+                   (fn [bundle] (runtime/prepare-owner (canonical/adapt bundle)))]]
+    (let [bundle (normalized/linearize-map-program (#'maps/map-program :double {}) *ns*)
+          current (atom true)
+          producer (reify entry/RetainedProducerInput
+                     (assert-producer-current! [this]
+                       (when-not @current
+                         (throw (ex-info "compiled scalar producer changed"
+                                         {:reason ::stale-producer})))
+                       this))
+          compile-var (ns-resolve 'raster.ad.normalized-map-runtime 'compile-projection)
+          compile! @compile-var
+          compiles (atom 0)
+          prepared (with-redefs-fn
+                     {compile-var
+                      (fn [& args]
+                        (let [compiled (apply compile! args)]
+                          ;; Capture the LAST phase's dependency, not just the
+                          ;; adaptation history or the first compiled phase.
+                          (when (= 3 (swap! compiles inc))
+                            (entry/adopt-definition-inputs! {:producer-inputs [producer]}))
+                          compiled))}
+                     #(prepare bundle))
+          args (mapv {'n (long 2) 'x (double-array [2.0 -3.0])} (:inputs prepared))
+          [output pullback] ((:vjp prepared) args)]
+      (is (= 3 @compiles))
+      (is (some? output))
+      (is (vector? (pullback (double-array [1.0 1.0]))))
+      ;; No Var root or metadata mutation: semantic callee snapshots alone
+      ;; cannot detect an independently invalidated transitive producer.
+      (reset! current false)
+      (doseq [invoke [#((:vjp prepared) args)
+                      #((:jvp prepared) args (double-array [1.0 1.0]))
+                      #(pullback (double-array [1.0 1.0]))]]
+        (is (= ::stale-producer (reason invoke)))))))

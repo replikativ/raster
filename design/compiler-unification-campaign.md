@@ -2,6 +2,467 @@
 
 ## Reconciled execution plan
 
+### October 24 audited correctness/consolidation closure
+
+Keep all eight original objectives below. This phase is their correctness and
+qualification prerequisite, not a replacement campaign or a claim of arbitrary
+Clojure/AD completeness. The audit at `fe0b2375` groups remaining failures by
+shared producer boundary, rather than treating each test as a separate feature.
+
+| Order | Boundary and owner | Required closure |
+| --- | --- | --- |
+| 1 | Source entry → invocation prefix (`method-entry`, frontend, `invocation-plan`) | Use authenticated actual formal Classes to prove redundant internal reference checks. Public declaration tags alone are not authority. For genuine Object→array inputs, retain the check or establish an explicit entry adapter. |
+| 2 | Complete source result/continuation (`structured-control-route`) | Every surviving operation has an executor or replayable elimination proof, and every public result has an exact projection. Used boxing and checked Float completion are separate from dead Object snapshots. |
+| 3 | AD structural/precision producers (`reverse`, `jvp`, normalized scalar programs) | Close the observed Object-operand transpose, mixed-Float ordered carry and indexed-write/gather cases with original primal ordering and conversions intact. Do not weaken checkpoint denial or add a second operator registry. |
+| 4 | Initialization and physical write coverage (`typed-soac-initialization`, `write-coverage`) | Resolve retained native-provider obligations and failed positive rectangular-coverage cases independently. Preserve constructor capacity, exact address widths and ordered host reads. |
+| 5 | Workload composition and state versions (`normalized-program-bundle`, `Compiled`, `LinkPlan`) | Qualify real forward→VJP→optimizer execution and repeated resident replay, including public training/distributed fixtures and alias/lease/version failures before mutation. |
+| 6 | Compilation cost and final qualification | Measure bounded GSDM phase costs, identify real allocation/bytecode regressions versus obsolete assertions, remove covered duplication, and qualify the complete exact-head workload set. |
+
+The entry investigation has confirmed registered cold typed-entry evidence for
+the LoRA root: its public array formals are actual Float-array Classes and remain
+nullable. `selected-source-entry-carriers` supplies that evidence without JIT.
+The separate opaque-frontend query abstains in the recorded cold probes; a fresh
+walk is not itself an owned frontend. Any projection must retain exact registered
+source/implementation correspondence and the binding's independent completion.
+This does not assert that a DeviceArray is a JVM array or authorize Class-from-dtype.
+
+Reference-entry projection also needs source-ordered physical carrier provenance:
+generated helpers first snapshot operands in Object context and then perform
+their boxed-entry checks. Exact aliases may retain a public formal's actual
+carrier only after independently proving the alias binder's completion. Storage
+aliases and logical array annotations are not that proof. Review additionally
+identified an older, separate omission hazard: generic copy propagation and
+dead-host-binding admission can erase a hinted reference binder without making
+its CHECKCAST explicit. Closing that producer boundary before simplification,
+with checked and unused binding controls, is required before claiming complete
+source-binding semantics; merely retaining a syntactic pair is insufficient.
+
+Local-product analysis now accepts explicit lexical-input membership as empty
+facts at parameter-owning preparation boundaries. This prevents a lexical read
+from acquiring a new evaluation token merely because the pass lacked its scope;
+it proves neither presence nor a physical carrier. Existing preservation markers
+are unchanged. Object-buffer normalization separately refuses to erase flagged
+completions or substitute through their bindings at return. The initial scoped
+entry qualification removed three of four boxed-array checks in the LoRA producer;
+the ordered-identity cohort below subsequently represented the remaining preserved
+conversion. Neither cohort establishes successful GPU training.
+
+The bounded continuation vertical under qualification is an **ordered reference identity**:
+
+1. An authenticated entry proof may replace a redundant boxed-array check with
+   exact Object-input completion, keeping the original-position binding and its
+   evaluation metadata. It must not turn checked Float conversion or an unknown
+   reference cast into an unchecked operation.
+2. The existing invocation `ValueAlias` should realize that exact reference
+   identity over a compatible preceding buffer. The retained source expression
+   and its metadata remain part of source replay, not a new advisory certificate.
+3. Preserved reference identities must remain invocation roots even when their
+   numerical result is dead. Their dependency closure and source order must be
+   explicit; an arbitrary host continuation still needs its own executor.
+4. Direct invocation materialization must execute the alias without scalar code,
+   copies or driver allocation. Compatibility projection must not rebuild an
+   unmarked symbol: the old descriptor adapter has no retained-invocation executor
+   and explicitly refuses required wrapped identities before registration.
+   Qualify changed-source rejection, unused identities,
+   nullable inputs, incompatible storage, and checked/effectful negative controls.
+
+The implementation reuses existing invocation
+steps rather than adding a parallel completion/ownership IR. It does not close
+the older source-binder CHECKCAST omission before generic copy propagation.
+Review refinement: after proving the original binder completion, normalize its
+physical hint to explicit `java.lang.Object` while retaining the logical array
+tag, and independently prove that normalized binder under the original policy.
+Keep those JVM queries at owned source admission. Portable invocation validation
+must check explicit normalized syntax and exact source replay, not resolve Classes
+or accept an advisory metadata certificate. Liveness retention is needed in both
+whole-program invocation-prefix construction and resident projection (including
+retention before the compatibility adapter's explicit refusal). No new descriptor
+ABI or implicit fallback is introduced.
+Dead identities obtain their AV only from an existing public or preceding
+selected prefix value, never from a future value-table seed or kernel result.
+The actual LoRA producer now advances beyond its boxed-array entry refusal to a
+missing extent dependency in the prefix. This is not complete training or phase
+qualification; the independent result/precision, write-coverage and legacy
+implicit-binder obligations remain open.
+
+The current shape investigation confirms a distinct capacity/availability issue.
+The LoRA allocation originally has shape `[arg_n]`; a later `alength` of a target
+reference creates the equality `arg_n → rstr_extent_45`, and HostAV finalization
+rewrites that earlier allocation to the later name. The target's numerical
+read-prefix shape was incorrectly used as its full source-array capacity seed.
+
+The opt-in causal host-capacity implementation reuses the existing HostAV
+transfer, rather than introducing another shape/type inference engine:
+
+- Seed public capacities from exact invocation parameter contracts; do not seed
+  local capacities from the complete numerical program value table.
+- Derive local capacities in source order through actual allocation contracts and
+  authenticated reference identities. Reuse certified source `host-return`
+  classification; a tensor-valued effect result is not a host buffer.
+- Keep definition-time capacity AVs for invocation planning while retaining final
+  relational equalities for proof consumers. A global equality representative is
+  not automatically an available allocation recipe.
+- Preserve logical program AVs and checked constructor/count semantics; validate
+  source-allocation correspondence rather than substituting a plausible count.
+
+Reference capacities enter the existing frontend storage-input conversion before
+equation construction: a traversal of `n` elements does not resize a captured
+source buffer. An unannotated allocation may reuse its existing source-derived
+element dtype; this does not discharge an explicit binder check. Capacity
+analysis retains separate incremental logical and eligible-source views using
+the same transfer. Effect-only or unstable logical values cannot supply a clone's
+or exemplar allocation's capacity, including through a retained dtype hint.
+
+The critical independent oracles cover allocation of length `n` and both dead
+and retained later `alength` reads of a larger target. Linking a two-element
+traversal over a six-element input retains output capacity two and input capacity
+six; the retained length scalar is six, and a seven-element demand is rejected
+by the unchanged graph-range guard. The allocation is an ordered source-storage
+action, not necessarily a prefix `BufferAllocation`: its original count and zero
+initialization are prepared before runtime acquisition. No duplicate owner is
+introduced. Final affected qualification passes 248 tests / 1,904 assertions.
+It includes the graph-shape scalar-prefix control: an unknown allocation extent
+is refined only by its causal source-definition snapshot, preserving its checked
+size before allocation while retaining the equation as graph proof. Fresh
+Q8-LoRA compilation now reaches a
+different host-continuation refusal (retained checked integer multiplication);
+that is not successful training. Exact-head CI and the remaining audited
+families are still required before merge.
+
+Portable option qualification also exposed a boundary leak: entry admission's
+actual source Var was retained in `EquationFirstCompilation.options`, causing
+the strict artifact fingerprint to reject an otherwise portable compilation.
+The compilation producer now omits `:source-var` and `:source-binding-context`
+alongside its existing request-local `:values` omission. Source namespace symbols,
+resolved schedules and semantic programs remain retained; artifact encoding and
+fingerprinting are unchanged. Artifact/cache/store/dispatch qualification passes
+32 tests / 355 assertions, including real context omission and rejection of
+manually injected Vars, contexts and callbacks. This is not permission to drop
+arbitrary unsupported artifact data or reuse stale source-definition evidence.
+
+The next source-evaluation audit found a missing public execution gate. The
+frontend's checked-cast retention predicate does not retain a dead scalar marked
+`:raster.effect/preserve-evaluation`; the real Q8-LoRA example is checked integer
+multiplication after earlier contractions. Retaining that expression is necessary
+but not sufficient. Ordinary `compiled/lower` still uses eager equation lowering,
+while `prepare-ordered-equation-first` is currently only an explicitly qualified
+constructor. Eager host evaluation checks device data dependencies but does not
+by itself preserve a late independent exception after earlier device writes.
+Do not broaden scalar admission until public ordered preparation and its port,
+donation, replay and lifetime capabilities are qualified, or eager admission
+explicitly refuses the ordering. Reuse the existing source-order executor;
+leave checked-cast reuse distinct from preservation-only retention.
+
+Ordered source-action coverage now accepts the existing validated `ValueAlias`
+step through the same incremental materializer. Chained, numerically dead
+reference identities preserve the identical materialized buffer and source;
+they acquire no storage, invoke no scalar evaluator, create no host-scalar
+results and remain absent from the numerical interface. Pending-action barriers,
+changed-source and future-reference controls remain active. Ordered realization,
+materialization and preparation qualification passes 27 tests / 369 assertions.
+Public automatic ordered selection and training port capabilities remain open.
+
+Public Float fixture qualification exposed an additional type-policy mismatch:
+the Double-only `contract-mm` source retained a Double effect-return binder while
+the legacy dtype policy adapted its exemplar allocation and inputs to Float.
+Capacity admission correctly refused that alias. The forward and both pullbacks
+now use the existing `(All [T])` surface, producing genuine Float specializations
+instead of overriding source evidence. Double numerical/finite-difference AD,
+Float/Double forward and pullback storage, CUDA/HIP Float reduction/ABI types,
+compatibility-ledger and explain checks pass 13 tests / 127 assertions. Existing
+Double-oriented compiler tests explicitly request Double. This adds element-
+polymorphic library dispatch; it does not retire the broader legacy dtype-policy
+debt or authorize alias checks to ignore incompatible retained declarations.
+
+Update the existing capability/compatibility ledger with each failure's owner,
+accepted or deliberately declined form, numerical/effect oracle and removal gate.
+Current node-wise AD composition is bounded but implemented; historical statements
+that all composition/transposition is missing must not override current code.
+Likewise, fixes to entry checks do not establish used scalar boxing, Float narrowing,
+general AD loops, arbitrary DAG composition or complete bounds proofs.
+
+This phase is complete only when the failure census is resolved with evidence;
+independent calculus, mixed-precision, empty-domain and effect-order controls pass;
+cold/warm/redefinition and delayed-pullback histories remain original; actual local
+device training/replay passes with dtype/shape/overlap/release failures before
+mutation; designated workload compilation meets documented budgets; and all seven
+exact-head CI contexts exist and succeed (setup, build, test, emit, OpenCL, CUDA
+compile, HIP compile). Compile-only vendor success is not runtime evidence. No
+new numerical relaxation is implied, and no remaining-commit count is established.
+
+### Coordinated symbolic-superposition research integration (October 24)
+
+The independent `ss/research-experiments` branch contains three local CPU fixes
+based on `0a08a066`; it is not part of the current entry/capacity cohort. Its
+bilinear-model report supplies an external training workload (Float/Double,
+AdamW, SVD polar and Newton--Schulz), not a replacement acceptance gate.
+
+Land reviewed slices rather than the entire research branch:
+
+1. JVM loop-operand normalization (`e8e44a37`): retain the OSR improvement, but
+   preserve all operand reads and their order. A REPL review of the proposed
+   rewrite finds a mutable-Var read moved after a later operand: the original
+   returns `[1 1]`, the rewrite `[9 1]`. Stable lexical reads need proof; do not
+   treat every symbol as an immutable atom. Reuse source scopes/completions and
+   qualify structural bytecode, exception/effect order and cold/hot execution.
+2. Bare AD-application preparation (`1fa0c2c8`): expose the existing owned AD
+   application machinery, with no new rule registry/cache. Qualify repeated
+   calls, helpers, redefinition and delayed pullbacks; test absence of runtime
+   AD preparation independently of BLAS availability.
+3. JVM BLAS leaf (`23407b80`): reuse verified contraction layout facts, but also
+   require numerical admission, accumulator/conversion compatibility, provider
+   availability, checked dimensions/capacities and runtime alias legality before
+   native entry. Distinct symbols are not disjoint storage. Preserve the general
+   generated/fused route and precise portable fallback when this leaf is illegal.
+
+Do not adopt the experimental `critical(true)` GEMM downcall: arbitrary GEMM
+does not satisfy FFM's extremely-short-in-all-cases critical-call contract.
+Improve ordinary downcalls, typed invocation and native-resident storage instead.
+Follow-up training work should expose optimizer state transitions as ordinary
+typed programs/groups, reuse forward residuals for cross-entropy/softmax, close
+Float/Double library gaps, and make provider threading explicit. Keep approximate
+transcendentals opt-in and retain the original numerical policy. Benchmark cold
+load, compile, steady resident execution and concurrency separately; loaded-host
+timings and long-horizon learning endpoints are not interchangeable evidence.
+
+### Producer foundations and invariants retained through closure
+
+The first two bounded foundations below have local qualification. The completion
+and workload requirements in items 3–4 remain open; none of these alone establishes
+completion of the audited phase above:
+
+1. Close fresh-process source/AD preparation regressions before further admission.
+   Ordinary late-bound calls may remain recursive; only a derived consumer pins
+   the implementation history it actually used. Direct static calls and `.invk`
+   share dependency discovery, but `.invk` must not manufacture unused static
+   siblings. Changed inputs during construction require discarding the whole
+   attempt. Invoking an old captured artifact must still refuse, not retry it.
+   Derived publication closes the actual emitted call graph child-before-parent,
+   including source-owned warm intermediates with cold descendants. Ordinary
+   modules keep late-bound calls. Additional historical validation can only
+   refuse reuse and request new emission from authenticated unchanged source;
+   it cannot restamp an old module or override a malformed producer. Successful
+   child histories join only after the original publication fence. Exact-module
+   reuse is request-local and rechecks those original histories, not a new
+   portable or runtime compiler cache.
+   Helper-body capture uses that same child-first readiness before retaining its
+   physical entry. Each authenticated module contributes its own complete input
+   guard as well as its global-call observations; a leaf producer can invalidate
+   history without changing any Var. Readiness never replaces the registered
+   module with a history-augmented copy or renews an old captured artifact.
+2. Normalize segmented scalar computations at their actual TypedSOAC producer.
+   Factor the existing selected-method FP body recipe from its physical caller
+   argument-completion gate. A semantic typed operand domain is not evidence of
+   a JVM operand Class. Join the actual selected body, source history and return
+   bridge under the existing definition owner; keep cold preparation explicit.
+   Construct the complete recurrence once, then share its ProductReduction view
+   across contraction projection and scheduling. Do not strip casts or weaken
+   the exact-product gate of a schedule that replaces the summand.
+   The first consolidation now shares the existing certified recurrence view
+   across scalar construction and both projection readers. Typed carry and
+   element conversions survive; ordered adapters still reject a reversed
+   accumulator. This currently rederives certification on demand, not a new
+   portable cache or completed construct-once producer. The bounded Double
+   segmented producer now prepares its complete primal/linear/transpose helper
+   frontier before physical queries, joins actual selected numerical recipes,
+   and lowers each ordered scalar region through the shared checked SSA lowerer.
+   The original witness/primal remain authoritative; readonly replay reconstructs
+   the same generated programs. Nonsquare JVP/VJP and independent finite-difference
+   oracles pass. Float precision changes, broader scalar operations and request-local
+   reconstruction reuse remain separate work, not permission to widen this rule.
+3. Close result-completion and residency obligations separately. In particular,
+   checked Double-to-Float completion cannot silently become unchecked on a GPU,
+   and a resident result has no implicit host readback on which to run the check.
+   Qualify the chosen continuation or explicit numerical contract before routing.
+4. Re-run reusable training and external workload qualification, then resume the
+   retained performance, portability and distributed-planning objectives. Report
+   actual device execution separately from compile-only vendor coverage.
+
+Use one bounded REPL for affected tests and exact-head CI for full qualification.
+Prepared CPU and resident-device consumers own validation through compilation and
+retain the final immutable definition history in execution guards, including
+delayed pullbacks. Device construction closes failed local allocations; the shared
+whole-producer discard boundary closes a returned owner rejected at publication.
+No process-local history or guard is stored in portable derivation bundles.
+AD producers establish the existing shared effect/rule context before source
+observations and epoch capture. Revision queries and execution guards are
+observational; they do not load libraries or register rules. Static producers
+also settle their selected root's missing source-walk cache before observing it,
+without reexpanding an existing frontend or eagerly emitting a JVM receiver.
+Warm preparation is not a substitute for a cold-process lifecycle check. Review
+shared ownership changes before broadening them, consolidate existing test matrices
+where possible, and keep stale-history/alias/effect controls alongside numerical
+oracles. Typed Clojure startup optimization is deferred; correctness and a coherent
+producer path remain the current priority. These are completion obligations, not
+a claim that PR #1566 or the overall campaign is qualified.
+
+#### Next closure: host references versus logical state
+
+Keep lexical availability, actual host-return kind, numerical AbstractValues and
+storage identity distinct. A logical buffer result can represent a mutation whose
+source binding returns nil (`:host-return :effect`); its buffer AV is not authority
+to treat that host binding as an array reference. Alias analysis must consume the
+certified source-return relation, not copied outer annotations or dtype hints.
+
+The bounded next vertical is exact Object-input completion of an already-bound
+buffer reference. Host analysis owns the source-ordered alias relation; consumers
+rederive it rather than trusting persisted alias maps. It requires stable SSA
+names, excludes future seeded facts and shadowing, and preserves checked casts
+and scalar boxing. Integrate it into the existing pre-TypedSOAC buffer-alias
+normalizer: later operations then refer to their original producer when the graph
+is first constructed. Use source-description host-return contracts at that
+frontier, with certified result-storage as a later independent check. Neither
+declared array tags nor `:effect-only?` establish a buffer return. Consumer
+integration must qualify all three cases:
+
+- Public/prefix buffer aliases reuse the existing `ValueAlias` storage identity.
+- Return-only aliases of kernel results resolve to the original certified result.
+- Aliases used by later kernels preserve producer/use dependencies through typed
+  normalization or certified realization, never by inventing a pre-device input.
+
+Source-return validation must see the normalized semantic-source copy without
+changing the original SourceFrontend. Ordered realization and effect-return
+counterexamples are mandatory gates; passing only unused AD-field cases is not
+completion of this vertical.
+
+The bounded buffer-reference lane now shares an incremental HostAV transfer with
+ordinary host analysis. The source normalizer advances the existing operation
+descriptions once per emitted binding, with a separate local-ID supply, only when
+an exact Object-input candidate exists. Destination-return identity is resolved
+before this query, retaining backing capacity rather than a writer's traversal
+shape. Explicit effect/mixed/unknown return contracts cannot become buffer aliases
+through copied logical tensor facts. Tail rewriting uses only the resulting
+source-ordered alias relation, not the older whole-source array-name table; an
+executable global-capture regression protects this distinction. Parameter names
+come from the actual public context, never all value-table keys. Inner structured
+regions still need their own certified local input context; outer prefix value
+shapes alone do not supply that authority. Local consumer/ownership qualification
+does not replace complete public-workload and exact-head CI acceptance.
+
+Initializer completion and lexical binding completion are separate obligations.
+Even a dead binding can request a throwing reference cast. The shared binding
+policy now preserves the bytecode emitter's declaration precedence and actual
+defining classloader; an optional structural proof requires the resolved hint to
+be the bootstrap Object Class, not merely a missing cast or logical dtype.
+Namespace and first-loader lookup decisions retain their original private input
+history and replay without class initialization. Declined queries adopt nothing.
+
+The source normalizer can consequently remove an unused exact Object-input
+snapshot of a stable preceding local, while retaining every other original
+binding. Liveness uses the original suffix, with complete lexical shadowing;
+used snapshots, reference checks, evaluation obligations and unresolved hints
+remain intact. This is neither generic DCE nor permission to remove a used box.
+The next source-entry obligation is distinct again: a checked JVM array input
+must be represented by the public tensor-to-resident adapter, not treated as an
+unchecked identity on the strength of a buffer dtype.
+
+#### Source meaning and executable bindings
+
+The implementation distinguishes the existing immutable `SourceFrontend` from
+`FrontendSourceOwner`, its binding to one implementation. Genuine JIT compilation
+can bind the **same frontend** to a new implementation:
+
+```text
+                  frozen SourceFrontend
+                    /              \
+           pending binding      JIT binding + emitted module
+                    \              /
+               semantic selection guard
+
+The emitted module additionally retains its own strict physical input guard.
+```
+
+Source-only selection keeps the original source/dispatcher observations, lookup
+identities, compiler policies and opaque frontend identity. A changed binding is
+accepted only if the current registered implementation has an authentic binding
+to that identical frontend and satisfies its actual registered interface. This
+is not permission to infer a physical Class or successful conversion from dtype.
+
+Physical Method, return-bridge and occurrence consumers separately retain exact
+receiver/module history. Reacquiring source does not refresh an old physical
+artifact. Exact-candidate source preparation closes the existing walk cache
+before observation; queries themselves do not compile or execute anything.
+Native AD source rewriting first builds a lexical candidate, not an admitted
+Double entry. The existing closed-storage grammar and child-call checks decide
+whether to prepare its exact semantic root. Only then does the consumer acquire
+a fresh same-source binding and check actual Method Classes and return bridges.
+Native storage construction and reverse AD share this same preparation boundary.
+AD first checks source portability and settles its selected walk cache, then
+observes/reselects the definition and prepares pending receivers before retaining
+physical entry facts. Captured programs never use this path to renew their owner.
+Declined ordinary C candidates keep their independent fallback; source tags
+select work but cannot grant physical carrier or emission permission.
+These guards stay process-local, outside portable TypedSOAC facts and cache keys.
+Private retained-source correspondence can additionally compare actual Class
+identities, including Classes in owned JVM completion contracts. Its pair-local
+boolean comparison shares the canonical encoder's metadata and floating-bit rules,
+but exposes no bytes or local fingerprint. Portable fingerprints, cache keys and
+artifact seals still reject Classes and runtime handles. Source correspondence
+alone grants no invocation, purity, conversion-elision or persistence permission.
+Pure source qualification retains only the identities it consumes: original
+lookups, canonical Var/intern/namespace identity, and Class/alias/miss decisions.
+That observation survives harmless Var-root/JIT publication; it grants no value,
+body or Method facts. Actual accepted global type inference reads instead retain
+full definition snapshots before consuming metadata or constant values. Declined
+type queries discard their temporary observations. Reference observations never
+erase or refresh an earlier stronger definition observation.
+The mixed body reader is retired. Normal-return constructor/alias summaries read
+the authentic frozen semantic frontend for Object/primitive-array reference
+returns, retaining bootstrap constructor/nil-test observations. Void and unknown
+return adaptations abstain; formal/result tags never supply presence or a body
+array fact. Unresolved semantic aliases do not borrow current namespace lookup,
+and the original call/conversions remain. Physical scalar recipes use the exact
+typed-entry body history, while plain Clojure uses its separately frozen body and
+actual entry. This separation alone does not finish AD or transitive import closure.
+An authenticated typed frontend's primitive **return completion** also proves
+conditional nonnil: the cold stub compiles before delegation, compute emission
+enforces the primitive return conversion, and the public Object entry boxes it.
+This is not a theorem about naked annotations, actual caller Classes, numerical
+body semantics, or totality. Unknown/effectful bodies and failing conversions
+still execute at the original call. Object/array/void declarations do not receive
+that primitive rule. Local-product nil-test refinement consumes this semantic
+completion instead of pinning a physical scalar body merely for presence.
+Structural internal `pmap` reuses the existing materializer's allocation rule;
+its element allocation and store conversion are distinct IR facets. This is not
+permission to infer helper purity, reinterpret arbitrary macro calls, or reuse
+the generic `par` destination-alias rules without their own source authority.
+
+#### Optional effect analysis is not a source owner
+
+Raster's Beichte contexts disable fallback Var file/line source expansion. A
+fresh analysis cache cannot prove that source text describes a Var's current
+root, and macroexpanding a `defprotocol` can create a second interface Class
+without reloading its owning namespace. The cold protocol-identity regression
+must stay a failure, not become a Class-name equality exception.
+
+Declared effect contracts and direct expression analysis remain available;
+unknown helpers conservatively abstain. Beichte's optional source facility also
+rejects non-function declarations before analysis and disables reader evaluation.
+This does not sandbox arbitrary function macros. Future purity derivation from
+helper bodies must consume the existing owned semantic frontend, not silently
+restore filesystem lookup. Actual protocol/primitive invocations include their
+callee and receiver/operand effects rather than classifying arguments alone.
+
+The CPU frozen-source producer landing preserves the existing optimizer's
+classification of ordinary unmarked arithmetic; it does not claim blanket
+source-exception equivalence for that legacy behavior (for example, an unused
+inactive division). The general descriptor also retains its existing pure
+leaf/collection convention, while reading explicit denial markers inside
+collections; this is not a new proof that arbitrary collection children are
+effect-free. New presence/product rewrites have a narrower, mandatory
+obligation: retain every evaluation they newly make dead, including eager
+sibling fields and transitive opaque producers. Occurrence-owned evaluation
+tokens, opaque Object completions and explicit denial markers supply that
+boundary before PE/CSE/DCE. Marked let/do/if regions must not lose their denial
+when PE rebuilds or collapses them. Automatic arithmetic/Float-cast effect
+classification and checked TypedSOAC scalar-conversion policy migration remain
+coupled to their target/source-owner consumers, not this CPU landing. This
+deferral grants no new Class, totality, movability or source-conversion proof.
+The existing TypedSOAC conversion attributes remain numerical-dialect policy;
+actual JVM source conversions still execute under their retained source policy.
+Eager product fields remain reserved Object completions until that backend
+consumes them, and marked regions are not ANF-lifted into unmarked dead actions.
+
 This checkpoint preserves the original eight-item campaign. The entries below are completion
 obligations, not claims that their already-landed foundations must be implemented again. Historical
 receipts remain below; fresh acceptance must distinguish compile-only, hardware-free simulation,

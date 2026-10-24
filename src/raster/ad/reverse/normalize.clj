@@ -120,22 +120,62 @@
 
     :else [[] expr]))
 
+(defn- retain-lexical-declarations [expression declarations]
+  ;; Nil substitution values contain no free names, so this transports
+  ;; declarations without capture-driven renaming or replacing any value.
+  ;; The shared scope engine masks declarations under every nested binder.
+  (util/subst-syms
+   (zipmap (keys declarations) (repeat nil)) expression
+   (fn [visible reference]
+     (if-not (contains? visible reference)
+       reference
+       (let [tag (get declarations reference)
+             existing (:raster.type/tag (meta reference))]
+         (when (and existing (not= tag existing))
+           (throw (ex-info "AD normalization encountered conflicting lexical declarations"
+                           {:reason :ad-conflicting-lexical-declaration
+                            :symbol reference :declaration tag :reference-tag existing})))
+         (vary-meta reference assoc :raster.type/tag tag))))))
+
+(defn- binding-declarations [bindings initial-declarations]
+  (reduce (fn [declarations [id _]]
+            (if-let [tag (:raster.type/tag (meta id))]
+              (assoc declarations id tag)
+              (dissoc declarations id)))
+          initial-declarations (partition 2 bindings)))
+
 (defn anf-normalize-bindings
   "ANF-normalize all bindings: lift nested sub-expressions into flat bindings.
   Input: flat bindings vector [s1 e1 s2 e2 ...].
   Output: flat bindings vector with nested calls flattened."
-  [bindings gensym-fn]
-  (let [result (atom [])]
+  ([bindings gensym-fn] (anf-normalize-bindings bindings gensym-fn {}))
+  ([bindings gensym-fn initial-declarations]
+  (let [result (atom [])
+        declarations (atom initial-declarations)]
     (letfn [(retain-value-tag [id expression]
-              (if-let [tag (and (nil? (types/sym-type-tag id))
-                                 (:raster.type/tag (meta expression)))]
-                (vary-meta id assoc :raster.type/tag tag)
-                id))
+              (let [object-tag (completion/object-value-declaration expression)
+                    ;; This exact context preserves the operand's value while
+                    ;; boxing its representation. A physical Object hint is
+                    ;; not a conflicting logical declaration. Other contexts
+                    ;; may convert the value and have no such authority.
+                    tag (or (:raster.type/tag (meta expression))
+                            object-tag)
+                    existing (:raster.type/tag (meta id))]
+                (when (and object-tag existing (not= object-tag existing))
+                  (throw (ex-info "AD Object snapshot has conflicting logical declarations"
+                                  {:reason :ad-conflicting-lexical-declaration
+                                   :symbol id :declaration existing :reference-tag object-tag})))
+                (if (and tag (nil? (:raster.type/tag (meta id)))
+                         (or (nil? (types/sym-type-tag id))
+                             (and object-tag (= 'Object (:tag (meta id))))))
+                  (vary-meta id assoc :raster.type/tag tag)
+                  id)))
             (emit! [sym init]
               ;; Flatten only an initializer's lexical value region, at that
               ;; exact binding position. Do not move call arguments across
               ;; their original typed input conversions or speculate branches.
-              (let [sym (retain-value-tag sym init)]
+              (let [init (retain-lexical-declarations init @declarations)
+                    sym (retain-value-tag sym init)]
                (if (and (seq? init) (contains? #{'let 'let*} (first init)))
                 (let [[_ inner & body] (util/alpha-convert init)
                       _ (doseq [[id value] (partition 2 inner)] (emit! id value))
@@ -154,9 +194,15 @@
                       ;; this neither infers a type nor proves non-nullness.
                       sym (retain-value-tag sym normalized)]
                   (doseq [[id value] (partition 2 extras)] (emit! id value))
-                  (swap! result conj sym normalized)))))]
+                  (let [normalized (retain-lexical-declarations normalized @declarations)]
+                    (swap! result conj sym normalized)
+                    ;; Initializers see the previous binding. Publish this
+                    ;; occurrence only afterwards, including shadow masking.
+                    (swap! declarations
+                           #(if-let [tag (:raster.type/tag (meta sym))]
+                              (assoc % sym tag) (dissoc % sym))))))))]
       (doseq [[sym init] (partition 2 bindings)] (emit! sym init)))
-    @result))
+    @result)))
 
 (defn normalize-for-ad
   "Normalize a let form for uniform AD processing.
@@ -168,17 +214,22 @@
   - All call arguments are trivial (symbols or literals) — ANF
   - Conditional arms remain lexical regions, never eager sibling bindings
   - Nontrivial branch conditions are snapshotted before the selected arm"
-  [bindings body-exprs gensym-fn]
-  (let [anf-bindings (anf-normalize-bindings bindings gensym-fn)
-        body-expr (if (= 1 (count body-exprs))
-                    (first body-exprs)
-                    (cons 'do body-exprs))
+  ([bindings body-exprs gensym-fn] (normalize-for-ad bindings body-exprs gensym-fn {}))
+  ([bindings body-exprs gensym-fn initial-declarations]
+  (let [anf-bindings (anf-normalize-bindings bindings gensym-fn initial-declarations)
+        declarations (binding-declarations anf-bindings initial-declarations)
+        body-expr (retain-lexical-declarations
+                   (if (= 1 (count body-exprs))
+                     (first body-exprs)
+                     (cons 'do body-exprs))
+                   declarations)
         [extras normalized] (anf-normalize-expr body-expr gensym-fn)
         body-sym (if (symbol? normalized) normalized
                      (with-meta (gensym-fn "body") (meta body-expr)))]
-    [(into (vec anf-bindings)
-           (anf-normalize-bindings
-            (cond-> (vec extras)
-              (not (symbol? normalized)) (into [body-sym normalized]))
-            gensym-fn))
-     body-sym]))
+    (let [all-bindings (into (vec anf-bindings)
+                             (anf-normalize-bindings
+                              (cond-> (vec extras)
+                                (not (symbol? normalized)) (into [body-sym normalized]))
+                              gensym-fn declarations))]
+      [all-bindings
+       (retain-lexical-declarations body-sym (binding-declarations all-bindings initial-declarations))]))))

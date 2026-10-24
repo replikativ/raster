@@ -22,6 +22,51 @@
    :long ['clojure.core/long-array 'longs 'long]
    :byte ['clojure.core/byte-array 'bytes 'byte]})
 
+(defn reference-identity-source
+  "The explicit normalized reference-identity grammar, not a JVM Class proof.
+   Source admission owns normalization of the binder's physical completion.
+   Consumers additionally require compatible preceding BUFFER values. Unknown
+   evaluation obligations and implicit binder checks are not admitted here."
+  [binder expression]
+  (let [parts (completion/object-input-parts expression)
+        operand (:operand parts)
+        allowed? (fn [node]
+                   (and (not-any? (fn [[key value]]
+                                    (and value (keyword? key) (= "raster.effect" (namespace key))
+                                         (or (not= key :raster.effect/preserve-evaluation)
+                                             (not (true? value)))))
+                                  (meta node))
+                        (every? #{:preserve-source-evaluation} (:flags (effects/descriptor node)))))]
+    (when (and (symbol? binder) (= 'java.lang.Object (:tag (meta binder)))
+               (some? (dtype/dtype-for-array-tag (:raster.type/tag (meta binder))))
+               (symbol? operand) (every? allowed? [binder expression operand]))
+      operand)))
+
+(defn preserved-reference-identity?
+  [binder expression]
+  (and (some? (reference-identity-source binder expression))
+       (or (true? (:raster.effect/preserve-evaluation (meta binder)))
+           (true? (:raster.effect/preserve-evaluation (meta expression))))))
+
+(defn capacity-reference-aliases
+  "Combine explicit identities with caller-certified whole-buffer return sources.
+   Private graph destinations are not source-visible host references. The capacity
+   transfer must still check that a preceding source has an actual buffer AV."
+  [pairs lexical-inputs certified-sources]
+  (:aliases
+   (reduce
+    (fn [{:keys [visible] :as state} [id expression]]
+      (let [explicit (reference-identity-source id expression)
+            certified (get certified-sources id)]
+        (when (and explicit certified (not= explicit certified))
+          (throw (ex-info "source identity and certified buffer return disagree"
+                          {:reason :source-capacity-reference-conflict
+                           :binding id :explicit explicit :certified certified})))
+        (let [reference (or explicit (when (contains? visible certified) certified))]
+          (cond-> (update state :visible conj id)
+            reference (assoc-in [:aliases id] reference)))))
+    {:visible (set lexical-inputs) :aliases {}} pairs)))
+
 (defn shape-projection-source
   [expression]
   (loop [expression expression]
@@ -174,19 +219,19 @@
                (every? (fn [{:keys [binding expression]}]
                          (and (not= primary binding)
                               (= 1 (count (filter #(and (= binding (first %))
-                                                         (semantic/equivalent? [binding expression] (vec %)))
+                                                         (semantic/retained-source-equivalent? [binding expression] (vec %)))
                                                    source-pairs)))))
                        witness)
                (some (fn [{binding :binding generated :expression kind :kind}]
                        (and (= symbol binding)
-                            (semantic/equivalent? [symbol expression] [binding generated])
+                            (semantic/retained-source-equivalent? [symbol expression] [binding generated])
                             (case kind
                               :result-allocation
                               (and (some #{binding} (:results equation))
                                    (dialect/program-form? (:algorithm equation))
                                    (some (fn [inner]
                                            (and (some #{binding} (nth inner 2))
-                                                (semantic/equivalent?
+                                                (semantic/retained-source-equivalent?
                                                  [binding generated]
                                                  (equation-allocation-pair
                                                   (:values program) inner binding))))
@@ -295,7 +340,7 @@
                           :initialization (descriptor/allocation-initialization operation))))))
 
 (defn- same-integral-extent? [source dimension values]
-  (or (semantic/equivalent? source dimension)
+  (or (semantic/retained-source-equivalent? source dimension)
       (try
         (let [decline! (fn [& _] (throw (ex-info "not an exact typed extent" {:reason ::extent})))
               project #(index-expression/lower-typed % (set (keys values))

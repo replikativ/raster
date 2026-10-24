@@ -68,7 +68,7 @@
 
 (deftest the-cpu-path-still-compiles-and-is-numerically-right
   (testing "the production deftm through compile-aot on the JVM, against a scalar oracle"
-    (let [f (pl/compile-aot #'raster.linalg.contract/contract-mm)
+    (let [f (pl/compile-aot #'raster.linalg.contract/contract-mm :dtype :double)
           A (double-array (range 16)) B (double-array (range 16))
           ref (double-array (for [i (range 4) j (range 4)]
                               (reduce + (for [l (range 4)] (* (aget A (+ (* i 4) l)) (aget B (+ (* l 4) j)))))))]

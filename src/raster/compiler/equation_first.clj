@@ -140,6 +140,7 @@
             :active-params parameters
             :public-parameters parameters
             :source-ns source-ns
+            :source-var (:resolved-var frontend)
             :return-tag (:return-tag frontend)
             :array-types (:array-types parameter-types)
             :scalar-types (:scalar-types parameter-types)}
@@ -478,7 +479,10 @@
      id function-id target dtype source-ns
      (cond-> (-> compiler-options
                  (assoc :schedule resolved-schedule)
-                 (dissoc :values))
+                 ;; Entry admission consumes these process-local authorities.
+                 ;; The executable keeps its pure source/semantic contracts,
+                 ;; not the Var or emitter-policy context used to prove them.
+                 (dissoc :values :source-var :source-binding-context))
        source-ns (assoc :source-ns source-ns)
        (contains? options :resident-outputs)
        (assoc :resident-outputs (:resident-outputs options)))

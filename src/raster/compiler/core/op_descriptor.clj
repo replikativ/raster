@@ -75,6 +75,15 @@
   [expression]
   (array-alloc-size expression))
 
+(defn core-array-copy-source
+  "The operand of an exact qualified primitive clone, not nominal helper classification.
+   This retains a producer expression; it proves neither successful evaluation nor capacity."
+  [expression]
+  (when (and (seq? expression) (= 2 (count expression))
+             (= 'clojure.core/aclone (first expression))
+             (not (:raster.op/lexical-callee (meta expression))))
+    (second expression)))
+
 (defn- param-derived?
   "True if expr depends only on param-set symbols (transitively through bindings)."
   [expr param-set binding-map environment]
@@ -90,13 +99,11 @@
                        (every? #(param-derived? % param-set binding-map environment) args)))
     :else false))
 
-(defn- detect-auto-buffer-semantics
-  "Analyze a deftm var's walked body for the single-alloc-return pattern.
+(defn- detect-buffer-semantics-from-source
+  "Analyze a supplied deftm frontend body for the single-alloc-return pattern.
    Returns a buffer-semantics map or nil."
-  [v]
+  [v walked-body]
   (let [m (meta v)
-        walked-body (or (:raster.core/deftm-walked-body m)
-                        ((requiring-resolve 'raster.core/ensure-walked-body!) v))
         params (:raster.core/deftm-params m)
         parameter-types (zipmap params (:raster.core/deftm-tags m))
         ;; A one-argument constructor can also consume initializer data. Its
@@ -242,6 +249,11 @@
                        :rewrite-fn (fn [args buf-sym]
                                      (substitute (assoc (zipmap params args) buffer-placeholder buf-sym)
                                                  into-template))}))))))))))))
+
+(defn- detect-auto-buffer-semantics [v]
+  (detect-buffer-semantics-from-source
+   v (or (:raster.core/deftm-walked-body (meta v))
+         ((requiring-resolve 'raster.core/ensure-walked-body!) v))))
 
 (defn resolve-buffer-semantics
   "Resolve the buffer facet, handling mangled/unqualified names.
@@ -540,7 +552,9 @@
                 'clojure.core/float 'float})
          ;; Only the resolved core spelling is admitted: a lexical function named
          ;; unchecked-int is not a source conversion contract.
-         'clojure.core/unchecked-int {:result-tag 'int :integral-narrowing :wrap}))
+         'clojure.core/unchecked-int {:result-tag 'int :integral-narrowing :wrap}
+         'clojure.core/unchecked-float {:result-tag 'float :integral-narrowing :reject
+                                        :floating-narrowing :ieee}))
 
 (defn cast-op?
   "True if sym is a primitive cast operation."
@@ -556,6 +570,12 @@
   "Explicit source narrowing policy, or nil for a non-cast."
   [sym]
   (get-in cast-ops [sym :integral-narrowing]))
+
+(defn cast-floating-narrowing
+  "Source Float narrowing policy. Ordinary core float is checked; unchecked-float is IEEE."
+  [sym]
+  (when (= 'float (cast-result-tag sym))
+    (get-in cast-ops [sym :floating-narrowing] :checked)))
 
 ;; --- Scalar ops (type-preserving, pure) ---
 
@@ -1367,6 +1387,10 @@
 ;; "raster.par…") does not classify the bare "par" namespace, so it has no
 ;; :return-type-arg of its own.
 (register-result-type! 'par/reduce [:arg 1])
+
+;; The JVM array-length result is Int, independently of its use as a dimension.
+;; Typed array helpers retain their own selected method's declared return type.
+(register-result-type! 'clojure.core/alength 'int)
 
 ;; --- Devirtualization detection ---
 

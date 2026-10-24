@@ -1,10 +1,7 @@
 (ns raster.compiler.backend.jvm.source-owner
-  "Compile an owner-local JVM source projection with actual private captures.
-
-   This is a source compiler boundary, not another evaluator or executable
-   registry. The producer supplies the compilation policy, resolved Methods,
-   lexical ports and dependency guard. It must retain runtime/residual guards
-   and must not export these private captures as ordinary portable source."
+  "Leaf utilities for compiling JVM source under its producer's retained context.
+   These utilities own no ordered execution plan, completion or lifetime proof.
+   The producer retains those obligations and supplies actual private captures."
   (:require [clojure.set :as set]
             [raster.compiler.core.ordered-call :as ordered-call]
             [raster.compiler.core.value-completion :as completion]
@@ -16,11 +13,40 @@
   "Refuse source extraction that would discard an unprojected private owner.
    Prepared programs and callable metadata use separate, explicit owner slots."
   [program]
+  (when (:raster.core/anonymous-function program)
+    (let [retained (:ns program)
+          live (some-> (:raster.core/deftm-source-ns program) find-ns)]
+      (when-not (and (instance? clojure.lang.Namespace retained)
+                     (identical? retained live))
+        (throw (ex-info "Anonymous source namespace has been removed or replaced"
+                        {:reason :stale-anonymous-source-namespace
+                         :source-ns (:raster.core/deftm-source-ns program)}))))
+    (let [policy (:raster.core/source-policy program)]
+      (when-not (completion/source-policy? policy)
+        (throw (ex-info "Anonymous source has no retained compilation policy"
+                        {:reason :unclosed-anonymous-source-policy})))
+      (when-not (false? (:unchecked-math policy))
+        (throw (ex-info "Anonymous unchecked arithmetic needs source-owned lowering"
+                        {:reason :unsupported-anonymous-source-policy :source-policy policy})))))
   (when (or (contains? program :source-owner)
-            (contains? program :raster.compiler/source-owner))
+            (contains? program :raster.compiler/source-owner)
+            (seq (:raster.core/lexical-captures program)))
     (throw (ex-info "Private JVM source ownership requires a capture-aware projection"
                     {:reason :unprojected-jvm-source-owner})))
   program)
+
+(defn call-with-source-context
+  "Reuse an anonymous producer's actual namespace/policy, never the caller's.
+   Named and separately owned entries retain their existing context contracts."
+  [metadata compile!]
+  (if (:raster.core/anonymous-function metadata)
+    (do (assert-portable-source! metadata)
+        (binding [*ns* (:ns metadata)
+                  *unchecked-math* (get-in metadata [:raster.core/source-policy :unchecked-math])]
+          (let [compiled (compile!)]
+            (assert-portable-source! metadata)
+            compiled)))
+    (compile!)))
 
 (defn- bound-identifiers [source]
   (let [identifiers (volatile! #{})]
@@ -73,13 +99,18 @@
           used (into (into bound ports) (util/free-syms-flat [params body]))
           arguments (loop [id (gensym "owner_captures__")]
                       (if (contains? used id) (recur (gensym "owner_captures__")) id))
+          nth-method (.getMethod clojure.lang.RT "nth" (into-array Class [Object Integer/TYPE]))
+          nth-head (with-meta 'clojure.lang.RT/nth {:param-tags [Object Integer/TYPE]})
           bindings (vec (mapcat (fn [port index]
-                                 [port (list 'clojure.core/nth arguments index)]) ports (range)))
-          factory (list 'fn ['& arguments]
+                                 [port (list nth-head arguments (int index))]) ports (range)))
+          factory (list 'fn* ['& arguments]
                         (list 'let* bindings (function-form params body)))]
       (binding [*ns* source-ns *unchecked-math* (:unchecked-math source-policy)]
         (when guard (guard))
+        (ordered-call/verify-source-method! nth-method)
         (doseq [method methods] (ordered-call/verify-source-method! method))
         (let [execute (apply (eval factory) (mapv :value captures))]
+          (ordered-call/verify-source-method! nth-method)
+          (doseq [method methods] (ordered-call/verify-source-method! method))
           (when guard (guard))
           execute)))))

@@ -1,7 +1,26 @@
 (ns raster.compiler.passes.scalar.rewalk-test
   (:require [clojure.test :refer [deftest testing is]]
             [raster.compiler.core.walker :as walker]
+            [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.scalar.rewalk :as rewalk]))
+
+(deftest declared-scalars-survive-tensor-policy-rewalking
+  (doseq [preserve-arrays? [false true]]
+    (let [actual-env (atom nil)
+          source 'coefficient
+          options {:simplify? true :dtype :float :source-ns 'user
+                   :preserve-declared-array-storage? preserve-arrays?
+                   :param-env {'coefficient 'double 'small 'float 'n 'long
+                               'values 'floats 'wide-values 'doubles}}]
+      (with-redefs [inference/tc-infer-binding-tags
+                    (fn [env _] (reset! actual-env env) {})]
+        (rewalk/pe-rewalk source options))
+      (is (= 'double (get @actual-env 'coefficient)))
+      (is (= 'float (get @actual-env 'small)))
+      (is (= 'long (get @actual-env 'n)))
+      (is (= 'floats (get @actual-env 'values)))
+      (is (= (if preserve-arrays? 'doubles 'floats)
+             (get @actual-env 'wide-values))))))
 
 (deftest rewalk-failures-are-not-certified-passthroughs-test
   (doseq [failure [(ex-info "invariant" {:reason :raster/fatal})

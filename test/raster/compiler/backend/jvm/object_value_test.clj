@@ -40,8 +40,8 @@
   (let [call '(raster.compiler.backend.jvm.object-value-test/object-boundary-helper_m_double 2.0)
         source (ns-resolve 'raster.compiler.backend.jvm.object-value-test 'object-boundary-helper_m_double)]
     (doseq [quote-head '[quote clojure.core/quote]]
-      (is (empty? (#'bytecode/scan-deftm-refs [(list quote-head call)] *ns*))))
-    (is (contains? (#'bytecode/scan-deftm-refs [call] *ns*) source))))
+      (is (empty? (#'bytecode/scan-deftm-refs [(list quote-head call)] *ns* []))))
+    (is (contains? (#'bytecode/scan-deftm-refs [call] *ns* []) source))))
 
 (deftest wide-typed-apply-uses-the-actual-emitted-owner
   (let [tags (vec (repeat 22 'long))
@@ -63,6 +63,19 @@
         (let [[captured last-value] (apply owned (mapv (comp long #(+ offset %)) (range 22)))]
           (is (identical? token captured))
           (is (= (+ 21 offset) last-value)))))))
+
+(deftest destructured-method-parameters-mask-same-named-global-callees
+  (let [scope (the-ns 'raster.compiler.backend.jvm.object-value-test)
+        local 'object-boundary-helper_m_double
+        expression (list local 2.0)
+        _ (is (identical? (ns-resolve scope local)
+                          #'object-boundary-helper_m_double))
+        compiled (binding [*ns* scope]
+                   (with-redefs [raster.core/ensure-walked-body!
+                              (fn [& _]
+                                (throw (AssertionError. "local callee is not a static sibling")))]
+                     (compile-value [[local]] expression)))]
+    (is (= 7.0 ((:run compiled) [(fn [x] (+ x 5.0))])))))
 
 (deftest bitwise-input-representation-does-not-change-width-or-traps
   (let [outcome (fn [f left right trace]

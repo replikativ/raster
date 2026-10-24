@@ -142,12 +142,18 @@
                  [(Class/forName (:jvm-array-class-name facets)) dtype]))
           dtype-info)))
 
+(defn dtype-for-jvm-array-class
+  "Canonical storage dtype for a JVM primitive-array Class, or nil.
+   The class-level projection avoids allocating a dummy array during compilation."
+  [carrier]
+  (get @jvm-array-class->dtype carrier))
+
 (defn dtype-for-jvm-array
   "Canonical storage dtype for a supported JVM primitive array, or nil.
 
    This is the runtime reverse projection of `dtype-info`, not a backend-private type table."
   [value]
-  (when value (get @jvm-array-class->dtype (class value))))
+  (when value (dtype-for-jvm-array-class (class value))))
 
 (defn needs-pragma-for
   "The OpenCL extension pragma keyword this dtype requires (e.g. :half →

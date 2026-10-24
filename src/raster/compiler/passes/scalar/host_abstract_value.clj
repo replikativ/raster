@@ -8,6 +8,7 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]))
@@ -21,6 +22,36 @@
   (av/validate! value)
   (cond-> value
     (keyword? (:dtype value)) (update :dtype dtype/canon)))
+
+(defn- buffer-value? [value]
+  (and (= :tensor (:kind value)) (vector? (:shape value)) (seq (:shape value))))
+
+(defn- buffer-declaration-compatible? [symbol value]
+  (let [tag (types/sym-type-tag symbol)]
+    (or (nil? tag)
+        (and (keyword? (:dtype value))
+             (= (dtype/canon (:dtype value)) (some-> tag dtype/dtype-for-array-tag dtype/canon))))))
+
+(defn bound-buffer-alias-source
+  "Return a preceding stable-SSA BUFFER source for a bare reference or exact
+   Object-input completion of that reference, otherwise nil. Validated AVs,
+   not dtype-to-Class guesses, establish buffer/storage compatibility. This
+   analysis fact is not portable ownership or permission to erase evaluation."
+  [expression values available expected-value]
+  (let [parts (completion/object-input-parts expression)
+        _ (when parts (completion/object-value-declaration expression))
+        source (if parts (:operand parts) expression)
+        value (when (and (symbol? source) (contains? available source)) (get values source))]
+    (when value
+      (av/validate! value)
+      (when expected-value (av/validate! expected-value))
+      (when (and (buffer-value? value)
+                 (buffer-declaration-compatible? source value)
+                 (buffer-declaration-compatible? expression value)
+                 (or (nil? expected-value)
+                     (and (buffer-value? expected-value)
+                          (av/storage-contract-compatible? value expected-value))))
+        source))))
 
 (defn- scalar-cast-dtype
   [expression]
@@ -126,7 +157,7 @@
       (not= expression normalized) (assoc-in [:equalities expression] extent))))
 
 (defn- infer-value
-  [state symbol expression default-dtype]
+  [state symbol expression default-dtype bound-buffer-source]
   (let [values (:values state)
         retained-array-dtype
         (or (some-> symbol types/sym-type-tag dtype/dtype-for-array-tag)
@@ -162,6 +193,14 @@
                 (par/extract-par-map-info expression)]
             (when-not offset {:out out :bound bound :cast cast :elem-type elem-type})))]
     (cond
+      ;; The opt-in source-capacity view requires an actual preceding buffer
+      ;; exemplar. A retained result dtype cannot replace that dependency. The
+      ;; ordinary relational analysis deliberately retains its historical rules.
+      (and (:capacity-only? state)
+           (or clone-source (:source allocation))
+           (not (buffer-value? (get values (or clone-source (:source allocation))))))
+      state
+
       alength-expression
       (let [state (assoc-in state [:values symbol]
                             (tensor (or cast-dtype
@@ -223,10 +262,13 @@
 
       (symbol? expression)
       (if-let [value (get values expression)]
-        (cond-> (assoc-in state [:values symbol] value)
-          (and (= [] (:shape value))
-               (contains? #{:int :long} (dtype/canon (:dtype value))))
-          (assoc-in [:equalities expression] symbol))
+        (if (and (contains? state :available) (buffer-value? value)
+                 (not= expression bound-buffer-source))
+          state
+          (cond-> (assoc-in state [:values symbol] value)
+            (and (= [] (:shape value))
+                 (contains? #{:int :long} (dtype/canon (:dtype value))))
+            (assoc-in [:equalities expression] symbol)))
         state)
 
       cast-dtype
@@ -240,12 +282,10 @@
 
       :else state)))
 
-(defn analyze
-  "Analyze one flat let/let* source form and return value/shape equality facts.
-
-   Caller-provided AbstractValues are authoritative seeds. `:array-types` and `:scalar-types`
-   create conservative parameter seeds only when no value was supplied."
-  [source {:keys [values array-types scalar-types dtype]
+(defn ^:no-doc begin-analysis
+  "Initialize one ordered host analysis. The returned compiler-local work state
+   is not portable alias/ownership evidence. Advance each emitted binding once."
+  [source {:keys [values array-types scalar-types dtype lexical-inputs non-buffer-bindings] :as options
            :or {values {} array-types {} scalar-types {} dtype :double}}]
   (when-not (form/binding-form? source)
     (throw (ex-info "host AbstractValue analysis requires a flat binding form"
@@ -263,21 +303,160 @@
                            scalar-types)
         values (into {} (map (fn [[id value]] [id (normalize-value value)])) values)
         [_ bindings] source
-        pairs (partition 2 bindings)]
-    (let [analysis
-          (reduce (fn [state [symbol expression]]
-                    (infer-value state symbol expression dtype))
-                  {:values (merge seed-arrays seed-scalars values)
-                   :equalities {}
-                   :diagnostics []}
-                  pairs)]
-      (update analysis :values
-              (fn [values]
-                (into {}
-                      (map (fn [[id value]]
-                             [id (update value :shape
-                                         #(canonical-shape (:equalities analysis) %))]))
-                      values))))))
+        pairs (partition 2 bindings)
+        lexical? (contains? options :lexical-inputs)
+        _ (when (and lexical? (not (and (or (sequential? lexical-inputs) (set? lexical-inputs))
+                                      (every? symbol? lexical-inputs))))
+            (throw (ex-info "host alias analysis requires explicit lexical input names"
+                            {:reason :host-abstract-value-lexical-inputs})))
+        _ (when (and (contains? options :non-buffer-bindings)
+                     (not (and (or (vector? non-buffer-bindings) (set? non-buffer-bindings))
+                               (every? symbol? non-buffer-bindings))))
+            (throw (ex-info "host alias exclusions require certified binding names"
+                            {:reason :host-abstract-value-non-buffer-bindings})))
+        binders (map first pairs)
+        ineligible (into (into (set (filter (set lexical-inputs) binders)) non-buffer-bindings)
+                         (keep (fn [[id occurrences]] (when (< 1 occurrences) id)))
+                         (frequencies binders))]
+    {:dtype dtype :lexical? lexical? :ineligible ineligible
+     :analysis (cond-> {:values (merge seed-arrays seed-scalars values)
+                       :equalities {} :diagnostics []}
+                 lexical? (assoc :available (set lexical-inputs) :aliases {}))}))
+
+(defn ^:no-doc binding-buffer-alias-source
+  "Query the existing ordered binding context without advancing it."
+  [{:keys [analysis lexical? ineligible]} symbol expression]
+  (when (and lexical? (symbol? symbol) (not (contains? ineligible symbol)))
+    (when-let [source (bound-buffer-alias-source expression (:values analysis)
+                                                (apply disj (:available analysis) ineligible)
+                                                (get-in analysis [:values symbol]))]
+      (when (buffer-declaration-compatible? symbol (get-in analysis [:values source])) source))))
+
+(defn ^:no-doc advance-binding
+  "Advance an existing ordered analysis, optionally excluding a certified
+   non-buffer host result. Logical tensor facts remain intact."
+  ([context symbol expression] (advance-binding context symbol expression false))
+  ([{:keys [analysis dtype lexical? ineligible] :as context} symbol expression non-buffer?]
+   (let [ineligible (cond-> ineligible non-buffer? (conj symbol))
+         reference (if-let [parts (completion/object-input-parts expression)] (:operand parts) expression)
+         refused-buffer-reference?
+         (and (symbol? reference)
+              (or (buffer-value? (get-in analysis [:values reference]))
+                  (buffer-value? (get-in analysis [:values symbol]))))
+         source (binding-buffer-alias-source (assoc context :ineligible ineligible) symbol expression)
+         analysis (infer-value analysis symbol (or source expression) dtype source)]
+     (assoc context :ineligible ineligible
+            :analysis (cond-> analysis
+                        source (assoc-in [:aliases symbol] source)
+                        (and lexical? (or source (not refused-buffer-reference?)))
+                        (update :available conj symbol))))))
+
+(defn ^:no-doc finish-analysis [{:keys [analysis]}]
+  (update analysis :values
+          (fn [values]
+            (into {} (map (fn [[id value]]
+                            [id (update value :shape
+                                        #(canonical-shape (:equalities analysis) %))])) values))))
+
+(defn analyze
+  "Analyze flat host bindings using authoritative AV seeds and retained shapes.
+   Explicit :lexical-inputs admits stable-SSA aliases in source order;
+   :non-buffer-bindings excludes certified non-buffer results. Only :aliases,
+   not lexical availability or logical tensor shape alone, conveys safe aliases."
+  [source options]
+  (finish-analysis
+   (reduce (fn [context [id expression]] (advance-binding context id expression))
+           (begin-analysis source options) (partition 2 (second source)))))
+
+(defn analyze-capacities
+  "Analyze source capacities in binding order, retaining definition-time AVs.
+
+   Unlike analyze, seed maps describe only explicit lexical inputs, not results
+   of a later numerical analysis. :reference-aliases optionally supplies certified
+   source-return facts {binding preceding-buffer}; these are analysis-only facts,
+   not host type, purity, ownership, or permission to erase evaluation. The final
+   :values/:equalities remain relational; :definition-values never receives later
+   equality refinements and excludes certified non-buffer or unstable identities.
+   Capacity transfers cannot consume logical-only tensor results; :aliases and
+   :available likewise describe only the source-capacity view."
+  [source {:keys [lexical-inputs reference-aliases] :as options}]
+  (when-not (contains? options :lexical-inputs)
+    (throw (ex-info "source capacity analysis requires explicit lexical inputs"
+                    {:reason :host-abstract-value-lexical-inputs})))
+  (when-not (or (not (contains? options :reference-aliases))
+                (and (map? reference-aliases)
+                     (every? (fn [[id reference]] (and (symbol? id) (symbol? reference)))
+                             reference-aliases)))
+    (throw (ex-info "source capacity reference aliases require symbol identities"
+                    {:reason :host-abstract-value-reference-aliases})))
+  ;; Let the existing initializer validate the source and lexical contract before
+  ;; filtering. No future binder's seed may participate in any transfer rule.
+  (let [validated (begin-analysis source options)
+        inputs (set lexical-inputs)
+        options (reduce (fn [options key]
+                          (if (contains? options key)
+                            (update options key select-keys inputs)
+                            options))
+                        options [:values :array-types :scalar-types])
+        context (begin-analysis source options)
+        pairs (partition 2 (second source))
+        binders (set (map first pairs))
+        reject! (fn [id reference]
+                  (throw (ex-info "source capacity alias requires a preceding eligible buffer"
+                                  {:reason :host-abstract-value-reference-alias
+                                   :binding id :reference reference})))
+        _ (doseq [[id reference] reference-aliases]
+            (when (or (not (contains? binders id))
+                      (contains? (:ineligible validated) id)
+                      (contains? (:ineligible validated) reference))
+              (reject! id reference)))
+        initial-definitions (select-keys (get-in context [:analysis :values])
+                                         (remove (:ineligible context) inputs))
+        capacity-context (-> context
+                             (assoc-in [:analysis :values] initial-definitions)
+                             (assoc-in [:analysis :capacity-only?] true)
+                             (update-in [:analysis :available]
+                                        #(apply disj % (:ineligible context))))
+        result
+        (reduce
+         (fn [{:keys [context logical-context definitions]} [id expression]]
+           (let [reference (get reference-aliases id)
+                 explicit-reference (if-let [parts (completion/object-input-parts expression)]
+                                      (:operand parts) expression)
+                 _ (when (and reference
+                              (or (and (symbol? explicit-reference)
+                                       (not= explicit-reference reference))
+                                  (not= reference
+                                        (binding-buffer-alias-source context id reference))
+                                  (not (buffer-declaration-compatible?
+                                        expression
+                                        (get-in context [:analysis :values reference])))))
+                     (reject! id reference))
+                 ;; An unstable/excluded binder must not publish relational
+                 ;; equalities either (for example n -> a repeated alength id).
+                 next-context (if (contains? (:ineligible context) id)
+                                context
+                                (advance-binding context id (or reference expression)))
+                 eligible? (and (contains? (get-in next-context [:analysis :available]) id)
+                                (not (contains? (:ineligible next-context) id)))
+                 ;; Earlier capacity entries were already checked at definition.
+                 ;; Prune only this binding, not the entire growing value map.
+                 next-context (cond-> next-context
+                                (not eligible?) (update-in [:analysis :values] dissoc id)
+                                (not eligible?) (update-in [:analysis :available] disj id))
+                 value (when eligible?
+                         (when-let [value (get-in next-context [:analysis :values id])]
+                           (update value :shape
+                                   #(canonical-shape
+                                     (get-in next-context [:analysis :equalities]) %))))]
+             {:context next-context
+              :logical-context (advance-binding logical-context id (or reference expression))
+              :definitions (cond-> definitions value (assoc id value))}))
+         {:context capacity-context :logical-context context :definitions initial-definitions} pairs)]
+    (assoc (finish-analysis (:logical-context result))
+           :aliases (get-in result [:context :analysis :aliases])
+           :available (get-in result [:context :analysis :available])
+           :definition-values (:definitions result))))
 
 (defn- zero-index?
   [expression]
