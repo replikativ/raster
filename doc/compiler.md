@@ -70,10 +70,30 @@ gives HotSpot C2 full visibility for optimization across function boundaries:
 ```
 
 Options:
+
 - `:inline?` — inline `deftm` calls (default `true`)
 - `:simd?` — apply SIMD optimization (default `true`)
 - `:dtype` — numeric dtype (`:double` or `:float`)
 - `:target-device` — device for GPU backend (e.g. `:cuda:0`, `:ze:0`)
+
+### Native C and scalar product storage
+
+Use `(pipeline/compile-aot #'my-fn :target :c :dtype :double)` for native C.
+Non-escaping scalar product intermediates can be eliminated when the actual
+JVM entry, selected helper implementations, and every consumer establish the
+same Double value. This removes box storage, not operand evaluation; arithmetic
+and source order remain unchanged. A type hint alone is not sufficient evidence.
+
+This storage-elimination path currently requires Double-only parameters and
+result, Double emission policy, and a closed scalar body. Identity observations,
+checked integral work, arrays, and unclosed AD entry conversions are not admitted
+by this path. Other native lowering retains its existing coverage.
+
+The admitted path checks exact call arity, converts every argument in source
+order (including unused arguments), then checks retained source/producer
+freshness before the native call. A stale compiled function must be recompiled;
+the guard does not restamp it. Argument conversion failures retain precedence
+over stale-program errors.
 
 ### Diagnostics
 
