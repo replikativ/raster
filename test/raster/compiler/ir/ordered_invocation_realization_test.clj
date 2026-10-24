@@ -4,9 +4,11 @@
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
@@ -42,7 +44,10 @@
                       (:program-buffers available))
         scalars (:program-scalars available)
         program (:emitted compilation)
+        proof (emitted-program/validate-with-physical-results! program)
         early (first (:equations program))
+        constructors [#(program-call/make-equation-call program %1 %2 %3 {} nil)
+                      #(program-call/make-equation-call program %1 %2 %3 {} proof nil)]
         {:keys [call]} (program-call/make-equation-call program (:id early) buffers scalars {} nil)]
     (is (= 0 (:next-step state)))
     (is (= #{'x 'first-output} (set (keys (:program-buffers available)))))
@@ -56,17 +61,53 @@
     (is (= (:id early) (get-in call [:equation :id])))
     (is (= (get buffers 'first-output) (get-in call [:outputs 'written])))
     (is (not (contains? (:buffers call) 'out)))
-    (doseq [id (concat (:results early) ['first-output])]
+    (doseq [bindings [buffers (into {} (map (fn [[id _]] [id [:different-runtime-binding id]])) buffers)]]
+      (is (= ((first constructors) (:id early) bindings scalars)
+             ((second constructors) (:id early) bindings scalars))
+          "static reuse does not retain runtime buffer bindings"))
+    (doseq [construct constructors
+            id (concat (:results early) ['first-output])]
       (is (= :emitted-program-device-result-scalar
-             (reason #(program-call/make-equation-call
-                       program (:id early) buffers
-                       (assoc scalars id {:type :double :value 0.0}) {} nil)))))
-    (doseq [equation-id [(:id (second (:equations program))) :absent]]
+             (reason #(construct (:id early) buffers
+                                 (assoc scalars id {:type :double :value 0.0}))))))
+    (doseq [construct constructors
+            equation-id [(:id (second (:equations program))) :absent]]
       (is (= :emitted-program-ready-equation
-             (reason #(program-call/make-equation-call program equation-id buffers scalars {} nil)))))
-    (is (= :emitted-program-result-buffer
-           (reason #(program-call/make-equation-call
-                     program (:id (last (:equations program))) buffers scalars {} nil))))))
+             (reason #(construct equation-id buffers scalars)))))
+    (doseq [construct constructors]
+      (is (= :emitted-program-result-buffer
+             (reason #(construct (:id (last (:equations program))) buffers scalars)))))))
+
+(deftest ordered-stages-reuse-only-their-exact-static-validation
+  (let [compilation (equation-first/compile #'fixture/write-before-shape
+                                           {:target :ocl:0 :dtype :double})
+        validate emitted-program/validate-with-physical-results!
+        checks (atom 0)]
+    (with-redefs [emitted-program/validate-with-physical-results!
+                  (fn [& args] (swap! checks inc) (apply validate args))]
+      (let [state (invocation-link/begin-ordered-realization
+                   compilation [(double-array [7.0]) (double-array 1) Long/MAX_VALUE] nil)
+            equation-id (:id (first (:equations (:program state))))
+            ready (invocation-link/realize-ready-equation state equation-id nil)]
+        (is (= 1 @checks) "one request validates static IR once, not once per stage")
+        (is (identical? (:program state) (get-in state [:retained-validation :program])))
+        (is (identical? (:projections state) (get-in state [:retained-validation :projections])))
+        (is (= 0 (get-in ready [:state :source-cursor])))
+        (is (= equation-id (get-in ready [:state :pending :equation])))
+        (is (empty? (get-in ready [:state :acquired-storage]))
+            "static reuse grants neither completion nor acquired storage")
+        (is (= :invocation-ordered-projections
+               (reason #(invocation-link/realize-ready-equation
+                         (assoc state :projections (java.util.IdentityHashMap.)) equation-id nil))))
+        (doseq [changed [(assoc state :program (with-meta (:program state) {:copy true}))
+                         (update state :retained-validation assoc :copy true)]]
+          (is (= :emitted-parallel-program-retained-validation
+                 (reason #(invocation-link/realize-ready-equation changed equation-id nil)))))
+        (let [options {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]
+          (is (= :emitted-parallel-program-retained-validation
+                 (reason #(invocation-link/realize-ready-equation
+                           (assoc state :caller-options options) equation-id options)))))
+        (is (= 1 @checks) "forged reports are refused without whole-program reconstruction")))))
 
 (deftest ready-storage-is-conditional-not-completed-invocation-storage
   (let [compilation (equation-first/compile #'fixture/write-before-shape
@@ -176,12 +217,21 @@
                  {:semantic host-only-program :emitted host-only-program :target :ocl:0}
                  [(double-array 3)] nil)
           calls (atom 0)
-          end (invocation-link/advance-host-source
+          context-vars [#'link-plan/*validated-program-instances*
+                        #'link-plan/*retained-program-validations*
+                        #'link-plan/*caller-options*
+                        #'program-call/*validated-boundary-projections*
+                        #'program-call/*validated-projection-policy*]
+          end (with-bindings (zipmap context-vars (repeat ::outer-proof-context))
+                (invocation-link/advance-host-source
                start nil
                (fn [equation context]
                  (swap! calls inc)
+                 (is (every? nil? (map deref context-vars)))
+                 (is (every? nil? @(future (mapv deref context-vars)))
+                     "host callbacks and their futures inherit no compiler proof context")
                  (is (= {'xs [3]} (:buffer-shapes context)))
-                 (scalar/evaluate-host-equation *ns* equation context)) nil)]
+                 (scalar/evaluate-host-equation *ns* equation context)) nil))]
       (is (= 1 @calls))
       (is (= {'cnt {:type :long :value 3}} (:host-scalars end)))
       (is (zero? (get-in end [:materialization :next-step])))
