@@ -174,19 +174,19 @@
                (every? (fn [{:keys [binding expression]}]
                          (and (not= primary binding)
                               (= 1 (count (filter #(and (= binding (first %))
-                                                         (semantic/equivalent? [binding expression] (vec %)))
+                                                         (semantic/retained-source-equivalent? [binding expression] (vec %)))
                                                    source-pairs)))))
                        witness)
                (some (fn [{binding :binding generated :expression kind :kind}]
                        (and (= symbol binding)
-                            (semantic/equivalent? [symbol expression] [binding generated])
+                            (semantic/retained-source-equivalent? [symbol expression] [binding generated])
                             (case kind
                               :result-allocation
                               (and (some #{binding} (:results equation))
                                    (dialect/program-form? (:algorithm equation))
                                    (some (fn [inner]
                                            (and (some #{binding} (nth inner 2))
-                                                (semantic/equivalent?
+                                                (semantic/retained-source-equivalent?
                                                  [binding generated]
                                                  (equation-allocation-pair
                                                   (:values program) inner binding))))
@@ -295,7 +295,7 @@
                           :initialization (descriptor/allocation-initialization operation))))))
 
 (defn- same-integral-extent? [source dimension values]
-  (or (semantic/equivalent? source dimension)
+  (or (semantic/retained-source-equivalent? source dimension)
       (try
         (let [decline! (fn [& _] (throw (ex-info "not an exact typed extent" {:reason ::extent})))
               project #(index-expression/lower-typed % (set (keys values))

@@ -849,7 +849,7 @@
                 {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
             {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
             (map-indexed vector step-pairs)))
-          _ (when-not (semantic/equivalent? expected-steps (:steps plan))
+          _ (when-not (semantic/retained-source-equivalent? expected-steps (:steps plan))
               (fail! :invocation-source-step-mismatch
                      "invocation steps differ from their canonical source producers"
                      {:expected expected-steps :actual (:steps plan)}))
@@ -866,7 +866,7 @@
                    equation (parallel-program/equation-for-binding program symbol expression)
                    realization (invocation-source/realization-equation program symbol expression)
                    allocation? (and (contains? allocations symbol)
-                                    (semantic/equivalent? expression (get allocations symbol)))]
+                                    (semantic/retained-source-equivalent? expression (get allocations symbol)))]
                (when (and equation realization)
                  (fail! :invocation-source-order-ambiguous
                         "one source binding cannot be two different equation sites"
@@ -884,7 +884,7 @@
                                   (:values plan) public symbol expression)]
                    (when-not (and (true? (get-in equation [:attributes :host-only]))
                                   (= [symbol] (:results equation))
-                                  (semantic/equivalent?
+                                  (semantic/retained-source-equivalent?
                                    canonical (invocation-source/scalar-equation-source equation)))
                      (fail! :invocation-source-order-shared-producer
                             "shared invocation/equation bindings require one identical host computation"
@@ -905,7 +905,7 @@
              (let [matches (filterv
                             #(and (or (= [:body index] (:site %))
                                       (and (= index (dec (count body))) (= [:return] (:site %))))
-                                  (semantic/equivalent? expression (:source %)))
+                                  (semantic/retained-source-equivalent? expression (:source %)))
                             (:equations program))]
                (when (> (count matches) 1)
                  (fail! :invocation-source-order-ambiguous

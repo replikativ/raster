@@ -108,6 +108,12 @@ physical entry facts. Captured programs never use this path to renew their owner
 Declined ordinary C candidates keep their independent fallback; source tags
 select work but cannot grant physical carrier or emission permission.
 These guards stay process-local, outside portable TypedSOAC facts and cache keys.
+Private retained-source correspondence can additionally compare actual Class
+identities, including Classes in owned JVM completion contracts. Its pair-local
+boolean comparison shares the canonical encoder's metadata and floating-bit rules,
+but exposes no bytes or local fingerprint. Portable fingerprints, cache keys and
+artifact seals still reject Classes and runtime handles. Source correspondence
+alone grants no invocation, purity, conversion-elision or persistence permission.
 Pure source qualification retains only the identities it consumes: original
 lookups, canonical Var/intern/namespace identity, and Class/alias/miss decisions.
 That observation survives harmless Var-root/JIT publication; it grants no value,

@@ -184,7 +184,7 @@
   [program-values public-inputs equation]
   (if-let [expression (invocation-source/scalar-equation-expression equation)]
     (let [projected (invocation-source/project-scalar-metadata program-values public-inputs expression)]
-      (if (semantic/equivalent? expression projected)
+      (if (semantic/retained-source-equivalent? expression projected)
         equation
         (let [result (first (:results equation))
               scalar-types (into {} (keep (fn [[id value]]
@@ -738,7 +738,7 @@
                       (:equations parallel-program))]
     (doseq [[symbol expression] (partition 2 (second (:source parallel-program)))
             :when (and (not (and (contains? prefix-bindings symbol)
-                                 (semantic/equivalent?
+                                 (semantic/retained-source-equivalent?
                                   (invocation-source/canonicalize-shape-projection
                                    (:values parallel-program)
                                    public-inputs
@@ -747,7 +747,7 @@
                        (not (program/equation-for-binding parallel-program symbol expression))
                        (not (invocation-source/realization-binding? parallel-program symbol expression))
                        (not (and (contains? allocations symbol)
-                                 (semantic/equivalent? expression (get allocations symbol))))
+                                 (semantic/retained-source-equivalent? expression (get allocations symbol))))
                        ;; A changed claimed binding invalidates its executor even when the new
                        ;; source expression is pure. Only unclaimed host work may be removed.
                        (or (contains? claimed symbol)

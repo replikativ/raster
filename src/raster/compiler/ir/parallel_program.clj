@@ -224,14 +224,14 @@
    ignoring source locations. A backend-local rewrite must not reuse the prior certificate."
   [program sym source]
   (some #(when (and (= [:binding sym] (:site %))
-                   (semantic-fingerprint/equivalent? source (:source %))) %)
+                   (semantic-fingerprint/retained-source-equivalent? source (:source %))) %)
         (:equations program)))
 
 (defn equation-for-source
   "Find an unambiguous body-position equation for an exact source expression."
   [program source]
   (let [matches (filterv #(and (= :body (first (:site %)))
-                              (semantic-fingerprint/equivalent? source (:source %)))
+                              (semantic-fingerprint/retained-source-equivalent? source (:source %)))
                          (:equations program))]
     (when (= 1 (count matches)) (first matches))))
 
