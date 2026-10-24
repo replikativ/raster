@@ -6606,6 +6606,9 @@
         ;; Preparing it invalidates the ORIGINAL observations and restarts the
         ;; whole derivation. An already captured parent is never renewed here.
         _ (when-let [receiver (when-not captured (get-in frontend [:definition :receiver-var]))]
+            ;; Source availability is semantic evidence only. This physical
+            ;; origin consumer must observe its exact selected receiver itself.
+            (method-entry/assert-frontend-selection! frontend resolved)
             (method-entry/prepare-pending-definition-inputs!
              rcore/ensure-current-owned-bytecode! [receiver]))
         context (when frontend (source-ad-context (get-in frontend [:source-entry :source-policy])))

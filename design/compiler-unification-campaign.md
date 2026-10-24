@@ -36,6 +36,53 @@ oracles. Typed Clojure startup optimization is deferred; correctness and a coher
 producer path remain the current priority. These are completion obligations, not
 a claim that PR #1566 or the overall campaign is qualified.
 
+#### Source meaning and executable bindings
+
+The implementation distinguishes the existing immutable `SourceFrontend` from
+`FrontendSourceOwner`, its binding to one implementation. Genuine JIT compilation
+can bind the **same frontend** to a new implementation:
+
+```text
+                  frozen SourceFrontend
+                    /              \
+           pending binding      JIT binding + emitted module
+                    \              /
+               semantic selection guard
+
+The emitted module additionally retains its own strict physical input guard.
+```
+
+Source-only selection keeps the original source/dispatcher observations, lookup
+identities, compiler policies and opaque frontend identity. A changed binding is
+accepted only if the current registered implementation has an authentic binding
+to that identical frontend and satisfies its actual registered interface. This
+is not permission to infer a physical Class or successful conversion from dtype.
+
+Physical Method, return-bridge and occurrence consumers separately retain exact
+receiver/module history. Reacquiring source does not refresh an old physical
+artifact. Exact-candidate source preparation closes the existing walk cache
+before observation; queries themselves do not compile or execute anything.
+These guards stay process-local, outside portable TypedSOAC facts and cache keys.
+The mixed cold-source/warm-emission body reader still requires its planned
+consumer-by-consumer migration; this separation alone does not finish AD or
+transitive import closure.
+
+#### Optional effect analysis is not a source owner
+
+Raster's Beichte contexts disable fallback Var file/line source expansion. A
+fresh analysis cache cannot prove that source text describes a Var's current
+root, and macroexpanding a `defprotocol` can create a second interface Class
+without reloading its owning namespace. The cold protocol-identity regression
+must stay a failure, not become a Class-name equality exception.
+
+Declared effect contracts and direct expression analysis remain available;
+unknown helpers conservatively abstain. Beichte's optional source facility also
+rejects non-function declarations before analysis and disables reader evaluation.
+This does not sandbox arbitrary function macros. Future purity derivation from
+helper bodies must consume the existing owned semantic frontend, not silently
+restore filesystem lookup. Actual protocol/primitive invocations include their
+callee and receiver/operand effects rather than classifying arguments alone.
+
 The CPU frozen-source producer landing preserves the existing optimizer's
 classification of ordinary unmarked arithmetic; it does not claim blanket
 source-exception equivalence for that legacy behavior (for example, an unused

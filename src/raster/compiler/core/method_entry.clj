@@ -775,9 +775,65 @@
                       {:reason :unowned-checked-result-frontend})))
     frontend))
 
-(deftype ^:private FrontendSourceIdentityInput [lineage]
+(defn- typed-frontend-binding
+  "Read an actual selected implementation's source binding, not its code facts."
+  [{:keys [source-var receiver-var entry] :as definition}]
+  (when (and source-var receiver-var)
+    (let [metadata (meta receiver-var)
+          spec (:raster.core/jit-spec metadata)
+          emission (when-not spec (:raster.core/bytecode-emission metadata))
+          owner (if spec (:frontend-source-owner spec) (:frontend-source-owner emission))
+          implementation (:typed-impl entry)
+          interface (get @types/fn-interface-by-name (:typed-iface entry))
+          interface-class (:iface-class interface)]
+      ;; Source ownership is not an excuse for an impossible public binding.
+      ;; This checks the actual registry Class, not parameter Classes from tags.
+      (when (and owner implementation
+                 (= (:typed-iface entry) (:iface-name interface))
+                 (= (mapv types/tag->iface-type (:tags definition)) (:param-tags interface))
+                 (class? interface-class)
+                 (.isInterface ^Class interface-class)
+                 (.isInstance ^Class interface-class implementation))
+        (let [original (frontend-source-input! owner implementation)
+              lineage (:source-entry original)
+              source-ns (.ns ^clojure.lang.Var source-var)
+              envelope? (if spec
+                          (and (= (:source-ns-name spec) (ns-name source-ns))
+                               (identical? source-var (ns-resolve source-ns (:mangled-sym spec)))
+                               (= lineage (capture-source-entry
+                                           source-var (assoc spec :source-ns source-ns
+                                                                  :typed-interface (:typed-iface-name spec)))))
+                          (and (= :jvm-bytecode (:backend emission))
+                               (identical? implementation (:implementation emission))
+                               (identical? lineage (:source-entry emission))))]
+          (when (and envelope?
+                     (source-entry-matches-selection? lineage definition source-var))
+            (assoc original :emission emission)))))))
+
+(defn- assert-semantic-frontend-selection!
+  [lineage {:keys [operation implementation-op argument-count source-var generic-var
+                   receiver-var parameters tags frontend receiver-reference receiver-policy]}]
+  (let [current (selected-definition operation implementation-op argument-count)
+        binding (when current (typed-frontend-binding current))]
+    (when-not (and (var-reference-current? receiver-reference)
+                   (= receiver-policy (select-keys (meta receiver-var)
+                                                   [:no-inline :raster.compiler/host-only]))
+                   (identical? source-var (:source-var current))
+                   (identical? generic-var (:generic-var current))
+                   (identical? receiver-var (:receiver-var current))
+                   (= parameters (:parameters current)) (= tags (:tags current))
+                   (identical? lineage (:source-entry binding))
+                   (identical? frontend (:source-frontend binding)))
+      (throw (ex-info "semantic frontend no longer has its original source selection"
+                      {:reason :stale-semantic-frontend-selection :source source-var})))
+    true))
+
+(deftype ^:private FrontendSourceIdentityInput [lineage selection]
   RetainedProducerInput
-  (assert-producer-current! [_] (assert-source-entry-current! lineage)))
+  (assert-producer-current! [_]
+    (assert-source-entry-current! lineage)
+    (when selection (assert-semantic-frontend-selection! lineage selection))
+    true))
 
 (defn observe-frontend-source-identity!
   "Retain exact source-entry identity after authenticating its opaque frontend.
@@ -790,66 +846,105 @@
       (swap! *emission-inputs*
              (fn [inputs]
                (if (some #(and (instance? FrontendSourceIdentityInput %)
-                               (identical? lineage (.-lineage ^FrontendSourceIdentityInput %)))
+                               (identical? lineage (.-lineage ^FrontendSourceIdentityInput %))
+                               (nil? (.-selection ^FrontendSourceIdentityInput %)))
                          (:producer-inputs inputs))
                  inputs
-                 (retain-producer-inputs inputs [(FrontendSourceIdentityInput. lineage)])))))
+                 (retain-producer-inputs inputs [(FrontendSourceIdentityInput. lineage nil)])))))
     true))
+
+(defn- retain-semantic-frontend-selection!
+  [definition original operation implementation-op argument-count]
+  (let [{:keys [source-var generic-var receiver-var parameters tags]} definition
+        lineage (:source-entry original)
+        receiver-ns (.ns ^clojure.lang.Var receiver-var)
+        selection {:operation operation :implementation-op implementation-op :argument-count argument-count
+                   :source-var source-var :generic-var generic-var :receiver-var receiver-var
+                   :parameters parameters :tags tags :frontend (:source-frontend original)
+                   :receiver-reference {:var receiver-var
+                                        :metadata (select-keys (meta receiver-var) [:ns :name])
+                                        :lookups #{[receiver-ns implementation-op]}}
+                   :receiver-policy (select-keys (meta receiver-var)
+                                                 [:no-inline :raster.compiler/host-only])}
+        input (FrontendSourceIdentityInput. lineage selection)]
+    (assert-producer-current! input)
+    (when-not (some #(and (instance? FrontendSourceIdentityInput %)
+                         (identical? lineage (.-lineage ^FrontendSourceIdentityInput %))
+                         (= selection (.-selection ^FrontendSourceIdentityInput %)))
+                   (:producer-inputs @*emission-inputs*))
+      (adopt-definition-inputs! {:producer-inputs [input]}))))
 
 (defn selected-frontend-source
   "Original typed frontend of an exactly selected specialization.
    Its opaque original owner authenticates source independently of any transformed
-   module's freshness. This permits new source compilation, not invocation of an
+   module's freshness. Semantic selection retains the frozen frontend across a
+   legitimate implementation rebind; it does not retain receiver-root facts.
+   This permits new source compilation, not invocation of an
    old module or observed-bytecode analysis. Optional :emission is an unvalidated
    observation; every emission consumer must check its own historical guard.
    Missing cold/legacy ownership abstains without walking or emitting code."
   [operation implementation-op argument-count source-var expected-dtype]
   (call-with-optional-definition-inputs
    (fn []
-     (let [projection (selected-parameter-carriers operation implementation-op argument-count)
+     (let [initial (when *emission-inputs*
+                     (selected-definition operation implementation-op argument-count))
+           ;; Semantic source selection consumes the source and dispatcher, not
+           ;; the replaceable receiver's root/JIT metadata. Physical queries
+           ;; separately retain that exact receiver before deriving code facts.
+           _ (when initial
+               (observe-definition-input! (:generic-var initial)
+                                          (.ns ^clojure.lang.Var (:generic-var initial)) operation)
+               (observe-definition-input! (:source-var initial)
+                                          (.ns ^clojure.lang.Var (:source-var initial))
+                                          (.sym ^clojure.lang.Var (:source-var initial))))
+           definition (when initial
+                        (assert-definition-inputs-current! @*emission-inputs*)
+                        (selected-definition operation implementation-op argument-count))
            direct-op (symbol (str (:ns (meta source-var))) (str (:name (meta source-var))))
-           direct (when-not projection
+           direct (when-not definition
                     (observed-selected-definition :direct operation direct-op argument-count))
-           spec (some-> projection :definition :receiver-var meta :raster.core/jit-spec)
-           pending? (boolean spec)
-           receiver (get-in projection [:definition :receiver-var])
-           emission (when (and projection (not pending?))
-                      (:raster.core/bytecode-emission (meta receiver)))
-           owner (if projection (if pending? (:frontend-source-owner spec)
-                                   (:frontend-source-owner emission))
+           typed-original (when definition (typed-frontend-binding definition))
+           owner (if definition (:source-owner typed-original)
                      (:raster.core/frontend-source-owner (meta source-var)))
            ;; Authenticate against the actual selected receiver, never an
            ;; implementation identity asserted by an editable emission map.
-           implementation (if projection (get-in projection [:definition :entry :typed-impl])
+           implementation (if definition (get-in definition [:entry :typed-impl])
                               (when direct (var-get source-var)))
-           original (when (and owner implementation)
-                      (frontend-source-input! owner implementation))
-           lineage (if projection (:source-entry original)
+           original (or typed-original (when (and owner implementation)
+                                        (frontend-source-input! owner implementation)))
+           lineage (if definition (:source-entry original)
                        (when (identical? source-var (:source-var direct))
                          (:raster.core/clojure-source-entry (meta source-var))))]
        (when (and lineage
-                  (or (not projection)
-                      (source-entry-matches-selection? lineage (:definition projection) source-var)))
+                  (or (not definition)
+                      (source-entry-matches-selection? lineage definition source-var)))
          (when-let [frontend (original-frontend owner lineage implementation expected-dtype)]
            (observe-definition-input! source-var (:ns (meta source-var)) (:name (meta source-var)))
+           (when definition
+             (retain-semantic-frontend-selection! definition original operation implementation-op argument-count))
            (assert-definition-inputs-current! @*emission-inputs*)
-           (merge {:source-entry lineage :definition (or (:definition projection) direct)
+           (merge {:source-entry lineage :definition (or definition direct)
                    :source-owner owner :implementation implementation
-                   :emission emission} frontend)))))))
+                   :emission (:emission typed-original)} frontend)))))))
 
 (declare original-source-frontend)
 
 (defn assert-frontend-selection!
-  "Authenticate an original frontend's actual registered source/receiver entry.
+  "Authenticate and observe an original frontend's exact physical receiver entry.
    Producer preparation may use this before acquiring an emitted-module guard.
    This grants neither emission freshness nor original invocation completion;
    physical occurrence consumers must still use their owned observation queries."
   [frontend source-var]
   (assert-frontend-source! frontend source-var)
   (let [current (original-source-frontend source-var)
-        selected (:definition current)
+        current-definition (:definition current)
+        physical (when (:receiver-var current-definition)
+                   (selected-parameter-carriers (:operation current-definition)
+                                                (:implementation-op current-definition)
+                                                (count (:parameters current-definition))))
+        selected (if (:receiver-var current-definition) (:definition physical) current-definition)
         claimed (:definition frontend)]
-    (when-not (and current
+    (when-not (and current selected
                    (every? #(identical? (get frontend %) (get current %))
                            [:source-frontend :source-owner :implementation :source-entry])
                    (= (select-keys claimed [:operation :implementation-op :parameters :tags])

@@ -28,6 +28,129 @@
   (entry/call-with-definition-inputs
    #(entry/selected-source-entry-carriers operation implementation 4 source)))
 
+(deftest semantic-source-guards-survive-only-the-same-frontend-rebinding
+  (let [{:keys [source receiver operation]} (fresh-entry)
+        before @body-calls
+        _ (core/prepare-emission-source-walk! source)
+        cold-root (var-get receiver)
+        source-metadata (meta source)
+        capture (fn [physical?]
+                  (entry/call-with-definition-inputs
+                   (fn []
+                     (let [frontend (entry/original-source-frontend source)]
+                       (when physical? (entry/frontend-body-entry-carriers frontend source))
+                       {:frontend frontend :inputs @entry/*emission-inputs*}))))
+        semantic (capture false)
+        physical (capture true)
+        frontend (:frontend semantic)
+        check #(entry/assert-definition-inputs-current! (:inputs %))]
+    (is (some? frontend))
+    (is (not (contains? (get-in semantic [:inputs :definition-proofs]) receiver)))
+    (is (contains? (get-in physical [:inputs :definition-proofs]) receiver))
+    (is (identical? cold-root (var-get receiver)) "queries do not perform JIT")
+    (is (map? (:raster.core/jit-spec (meta receiver))))
+    (core/ensure-bytecode-implementation! receiver)
+    (is (not (identical? cold-root (var-get receiver))))
+    (is (identical? source-metadata (meta source))
+        "the explicit source constructor already published the exact walk cache")
+    (is (true? (check semantic)))
+    (is (thrown? clojure.lang.ExceptionInfo (check physical))
+        "a semantic observation cannot weaken an actual physical observation")
+    (let [current (entry/call-with-definition-inputs #(entry/original-source-frontend source))]
+      (is (identical? (:source-frontend frontend) (:source-frontend current)))
+      (is (identical? (:body frontend) (:body current)))
+      (is (not (identical? (:source-owner frontend) (:source-owner current))))
+      (is (not (identical? (:implementation frontend) (:implementation current)))))
+    (doseq [policy [:no-inline :raster.compiler/host-only]]
+      (let [metadata (meta receiver)]
+        (try
+          (alter-meta! receiver assoc policy true)
+          (is (thrown? clojure.lang.ExceptionInfo (check semantic))
+              "receiver-side semantic policy is not incidental JIT metadata")
+          (finally (reset-meta! receiver metadata)))))
+    (let [metadata (meta receiver)
+          emission (:raster.core/bytecode-emission metadata)]
+      (try
+        ;; The original cold binding cannot authenticate the new implementation.
+        (alter-meta! receiver assoc :raster.core/bytecode-emission
+                     (assoc emission :frontend-source-owner (:source-owner frontend)))
+        (is (thrown? clojure.lang.ExceptionInfo (check semantic)))
+        (finally (reset-meta! receiver metadata))))
+    (with-redefs-fn {receiver (fn [& _] :foreign)}
+      #(is (thrown? clojure.lang.ExceptionInfo (check semantic))
+           "a receiver replacement without its authentic frontend binding is not JIT"))
+    (let [table (:raster.core/dispatch-table (meta (find-var operation)))
+          original @table]
+      (try
+        ;; A table atom keeps its identity across registration changes. The
+        ;; semantic guard must reselect, not rely only on generic Var metadata.
+        (swap! table update 4 #(mapv (fn [method] (assoc method :target-fn (fn [& _] :foreign))) %))
+        (is (thrown? clojure.lang.ExceptionInfo (check semantic)))
+        (finally (reset! table original))))
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [current (entry/original-source-frontend source)]
+         (is (thrown? clojure.lang.ExceptionInfo
+                      (entry/assert-frontend-source!
+                       (update current :body #(with-meta (into [] %) (meta %))) source))))))
+    (let [metadata (meta source)]
+      (try
+        (alter-meta! source update :raster.core/deftm-source-body
+                     #(with-meta (apply list %) (meta %)))
+        (is (thrown? clojure.lang.ExceptionInfo (check semantic)))
+        (finally (reset-meta! source metadata))))
+    (is (true? (check semantic)))
+    (is (= before @body-calls) "source preparation and JIT never invoke numerical code")))
+
+(deftest semantic-source-selection-keeps-its-original-receiver-lookup
+  (let [{:keys [source receiver]} (fresh-entry)
+        _ (core/prepare-emission-source-walk! source)
+        observations (entry/call-with-definition-inputs
+                      #(do (entry/original-source-frontend source) @entry/*emission-inputs*))
+        root (var-get receiver)
+        receiver-ns (.ns ^clojure.lang.Var receiver)
+        name (.sym ^clojure.lang.Var receiver)]
+    (try
+      ;; Keep the old Var/root alive: canonical lookup identity must still fail.
+      (ns-unmap receiver-ns name)
+      (intern receiver-ns name root)
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (entry/assert-definition-inputs-current! observations)))
+      (finally
+        (ns-unmap receiver-ns name)
+        (.refer ^clojure.lang.Namespace receiver-ns name receiver)))))
+
+(deftest semantic-source-selection-rejects-an-impossible-interface-binding
+  (let [{:keys [source receiver operation]} (fresh-entry)
+        _ (core/prepare-emission-source-walk! source)
+        {:keys [frontend observations]}
+        (entry/call-with-definition-inputs
+         #(let [frontend (entry/original-source-frontend source)]
+            {:frontend frontend :observations @entry/*emission-inputs*}))
+        metadata (meta receiver)
+        table (:raster.core/dispatch-table (meta (find-var operation)))
+        methods @table
+        foreign (Object.)
+        ;; The real binding factory accepts non-nil implementations. Even a
+        ;; genuine frontend and internally consistent metadata cannot make an
+        ;; Object satisfy its selected typed invocation interface.
+        foreign-owner (entry/bind-source-frontend (:source-frontend frontend) foreign)]
+    (try
+      (with-redefs-fn {receiver foreign}
+        #(do
+           (alter-meta! receiver assoc-in [:raster.core/jit-spec :frontend-source-owner] foreign-owner)
+           (swap! table update 4 (fn [entries] (mapv (fn [method] (assoc method :typed-impl foreign)) entries)))
+           (is (some? (entry/selected-definition operation
+                                                (symbol (str (ns-name (.ns ^clojure.lang.Var receiver)))
+                                                        (str (.sym ^clojure.lang.Var receiver))) 4))
+               "the setup passes nominal selected-definition correspondence")
+           (is (nil? (entry/call-with-definition-inputs (fn [] (entry/original-source-frontend source)))))
+           (is (thrown? clojure.lang.ExceptionInfo
+                        (entry/assert-definition-inputs-current! observations)))))
+      (finally
+        (reset-meta! receiver metadata)
+        (reset! table methods)))))
+
 (deftest cold-and-warm-entries-have-the-same-formal-facts-without-running-the-body
   (let [{:keys [receiver source] :as selected} (fresh-entry)
         before @body-calls

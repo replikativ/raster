@@ -291,7 +291,10 @@
         ;; This is the candidate selected by try-resolve-deftm, after its
         ;; opacity checks. Earlier observations are not an inline frontier:
         ;; they can include opaque callees whose bodies we never consume.
-        _ (when (var? v) (rcore/prepare-deftm-frontend! v))
+        ;; Close this exact source's immutable walk cache too: later JIT may
+        ;; rebind its frontend, but must not publish a missing source input
+        ;; after the semantic consumer has observed the source Var.
+        _ (when (var? v) (rcore/prepare-emission-source-walk! v))
         retained-frontend (when (:raster.core/deftm (meta v))
                             (method-entry/original-source-frontend v))
         _ (when (and (var? v) (nil? retained-frontend))

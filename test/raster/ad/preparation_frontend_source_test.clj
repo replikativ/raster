@@ -434,12 +434,16 @@
             owner (atom {:static [] :values []})
             candidates (atom [])]
         (binding [entry/*emission-inputs* owner]
-          (entry/original-source-frontend parent-source)
+          ;; This fixture prepares implementations and compares physical
+          ;; snapshots. A semantic frontend query no longer supplies those
+          ;; receiver observations implicitly.
+          (entry/assert-frontend-selection! (entry/original-source-frontend parent-source) parent-source)
           (let [historical @owner]
             (is (= :stale-definition-proof-input
                    (reason #(entry/call-with-independent-definition-inputs
                              (fn []
-                               (entry/original-source-frontend child-source)
+                               (entry/assert-frontend-selection!
+                                (entry/original-source-frontend child-source) child-source)
                                (entry/prepare-pending-definition-inputs!
                                 (fn [receiver]
                                   (swap! candidates conj receiver)
@@ -451,7 +455,10 @@
             (is (entry/assert-definition-inputs-current! historical))
             (is (= :prepared
                    (entry/call-with-independent-definition-inputs
-                    (fn [] (entry/original-source-frontend child-source) :prepared))))
+                    (fn []
+                      (entry/assert-frontend-selection!
+                       (entry/original-source-frontend child-source) child-source)
+                      :prepared))))
             (is (entry/same-var-snapshot? (get-in historical [:definition-proofs parent-receiver])
                                          (get-in @owner [:definition-proofs parent-receiver])))
             (is (contains? (:definition-proofs @owner) child-receiver)))
