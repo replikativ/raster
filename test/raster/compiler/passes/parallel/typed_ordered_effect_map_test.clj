@@ -894,5 +894,8 @@
                    (catch clojure.lang.ExceptionInfo e e))]
     (is (= :unchecked-int-induction-unbounded (:reason (ex-data error))))
     (is (= 'e (:index (ex-data error))))
-    (is (= '(clojure.core/long len) (:bound (ex-data error))))
+    ;; The retained walker now normalizes this identity Long conversion. The
+    ;; diagnostic must still name its bound and retain the complete source.
+    (is (= 'len (:bound (ex-data error))))
+    (is (= source (:source-form (ex-data error))))
     (is (frontend/source-decline? error))))

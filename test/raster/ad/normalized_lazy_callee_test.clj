@@ -14,13 +14,14 @@
         old (fn [& _] (swap! body-calls inc))
         compiled (fn [& _] (swap! body-calls inc))
         v (intern source-ns 'lazy old)
-        pending (spec source-ns)]
+        pending (assoc (spec source-ns) :source-policy {:unchecked-math false})]
     (try
       (alter-meta! v assoc :raster.core/jit-spec pending)
       (with-redefs [core/do-bytecode-upgrade!
                     (fn [& args]
                       (is (= [v 'lazy '[x] '[double] 'double '[x] source-ns nil
-                              :annotations nil :source-body nil] (vec args)))
+                              :annotations nil :source-body nil
+                              :source-policy (:source-policy pending)] (vec args)))
                       (swap! calls inc)
                       (alter-var-root v (constantly compiled)))]
         (core/ensure-bytecode-implementation! v)
