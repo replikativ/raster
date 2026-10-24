@@ -7,12 +7,40 @@
             [raster.ad.normalized-map-sum-runtime-test :as sums]
             [raster.ad.normalized-indexed-runtime-test :as indexed]
             [raster.ad.normalized-scalar-capture-test :as capture]
+            [raster.ad.templates :as templates]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 (defn- plain [value] (if (number? value) value (vec value)))
+
+(deftest normalized-producers-bootstrap-before-epoch-capture-but-queries-do-not
+  (let [initialize effects/init-raster-context!
+        revision templates/registry-revision
+        _ (initialize)
+        source (#'maps/map-program :double {})
+        sum (#'sums/identity-source :double)]
+    (doseq [construct [(fn [] (normalized/linearize-map-element source *ns*))
+                       (fn [] (normalized/linearize-map-program source *ns*))
+                       (fn [] (normalized/linearize-equation-program source *ns*))
+                       (fn [] (normalized/linearize-map-sum-program sum *ns* {:active-input 'xs}))]]
+      (let [events (atom [])]
+        (with-redefs [effects/init-raster-context!
+                      (fn [] (initialize) (swap! events conj :initialized) nil)
+                      templates/registry-revision
+                      (fn [] (swap! events conj :epoch) (revision))]
+          (construct))
+        (is (= :initialized (first @events)))
+        (is (some #{:epoch} @events))))
+    (let [expected (normalized/revisions)
+          guard (normalized/execution-guard *ns* expected [{:parameters [] :body nil}])]
+      (with-redefs [effects/init-raster-context!
+                    (fn [] (throw (AssertionError. "a revision query initialized semantic context")))]
+        (is (= expected (normalized/revisions)))
+        (is (guard))))))
+
 (defn- cases []
   ;; Preparing a later family may register lazy numeric specializations. Build each
   ;; witness immediately before using it; an eager vector would rightly stale earlier

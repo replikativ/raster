@@ -436,10 +436,9 @@
      :seed seed}))
 
 (defn ^:no-doc revisions []
-  ;; Effect analysis cold-loads numerical libraries and their AD/dispatch declarations. Establish
-  ;; that shared semantic context before any construction or execution authority snapshots epochs.
-  ;; The realized delay is cheap on hot calls; later mutations must still fail the existing fences.
-  (effects/init-raster-context!)
+  ;; Observational at both construction and execution fences. Producers must
+  ;; explicitly establish the shared effect/rule context before taking this
+  ;; snapshot; a validator must not load libraries or register new rules.
   {:template-revision (templates/registry-revision)
    :compiler-revision (dispatch/compiler-definition-revision)})
 
@@ -810,6 +809,7 @@
    The interface explicitly supplies :params, retained :tags, :active-inputs and :source-ns.
    This compiler entry never walks source, resolves a deftm Var or re-infers its types."
   [primal interface]
+  (effects/init-raster-context!)
   (build-bundle primal interface (revisions)))
 
 (defn- source-envelope?
@@ -1151,6 +1151,7 @@
    Retained dtypes are not storage-default guesses."
   ([map-program source-ns] (linearize-map-element map-program source-ns {}))
   ([map-program source-ns options]
+   (effects/init-raster-context!)
    (let [{:keys [primal interface]} (project-map-element map-program source-ns nil options)]
      (linearize-program primal interface))))
 
@@ -2939,6 +2940,7 @@
    :active-array retain their existing one-active behavior. Scalar capture activity needs a sum."
   ([source source-ns] (linearize-map-program source source-ns {}))
   ([source source-ns options]
+   (effects/init-raster-context!)
    (let [bundle (build-map-programs source source-ns options)]
      (validate! (assoc bundle :certificate (certificate bundle))))))
 
@@ -2955,6 +2957,7 @@
    new derivative registry, device owner or default-engine migration is involved."
   ([source source-ns] (linearize-equation-program source source-ns {}))
   ([source source-ns options]
+   (effects/init-raster-context!)
    (let [source (soac/validate! source)
          equations (soac/equations source)
          kinds (mapv soac/operation-kind equations)]
@@ -2988,6 +2991,7 @@
    Canonical adaptation separately checks source, execution scope and residual lineage."
   ([source source-ns] (linearize-map-chain-program source source-ns {}))
   ([source source-ns options]
+   (effects/init-raster-context!)
    (when-not (< 1 (count (soac/equations source)))
      (fail! :ad-normalized-map-chain-boundary
             {:equations (count (soac/equations source))}))
@@ -3266,6 +3270,7 @@
    indices. Primal explicitly snapshots indices. Ordered transpose requires a fresh owned
    typed-zero physical gradient binding; the effect equation does not allocate or zero it."
   [source source-ns]
+  (effects/init-raster-context!)
   (let [revision (revisions)
         {:keys [gather-programs]} (gather-node-lifecycle source source-ns revision)
         bundle (merge revision {:source-ns source-ns :gather-programs gather-programs})]
@@ -3616,6 +3621,7 @@
    Transpose consumes an explicit scalar seed. This entry constructs programs, not execution."
   ([source source-ns] (linearize-map-sum-program source source-ns {}))
   ([source source-ns options]
+   (effects/init-raster-context!)
    (let [map-source (sum-source-map source source-ns)
          bundle (build-map-programs map-source source-ns options)
          map-interface (get-in bundle [:map-programs :interface])
@@ -3632,6 +3638,7 @@
   "Build one validated primal/linear/transpose bundle for a resolved scalar deftm Var.
    :wrt is a vector of distinct original parameter indices; excluded slots retain their primals."
   [resolved wrt]
+  (effects/init-raster-context!)
   (let [revision (revisions)
         metadata (meta resolved)
         params (vec (:raster.core/deftm-params metadata))
@@ -3698,6 +3705,7 @@
    no source, operation or numerical capability. Original failures propagate.
    This is the existing sequential staleness contract, not concurrent mutation protection."
   [bundle parameters body compile-runtime]
+  (effects/init-raster-context!)
   (let [source-ns (:source-ns bundle)
         guard! (execution-guard source-ns (select-keys bundle [:template-revision :compiler-revision])
                                 [{:parameters parameters :body body}])

@@ -16,6 +16,7 @@
             [raster.compiler.ir.link-module-plan :as module-plan]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.gpu.link-module :as link-module]))
 
 (defn- fail! [reason message data]
@@ -908,6 +909,7 @@
    No default AD engine, cache, host readback, mutable state, map-sum or indexed-map path is
    activated by this boundary."
   [owner arguments {:keys [target] :as options}]
+   (effects/init-raster-context!)
    (when-not (and (map? options) (set/subset? (set (keys options)) option-keys))
      (fail! :normalized-device-options
             "normalized device preparation accepts only target, schedule, scalar-math and profile"
@@ -935,6 +937,7 @@
    This opt-in boundary does not enable mutable state, indexed maps, arbitrary DAGs, caching,
    host readback, or a default AD engine."
   [owner arguments fixed-seed {:keys [target] :as options}]
+  (effects/init-raster-context!)
   (when-not (and (map? options) (set/subset? (set (keys options)) option-keys))
     (fail! :normalized-device-options
            "normalized device preparation accepts only target, schedule, scalar-math and profile"
@@ -962,6 +965,7 @@
    mutable state, caching, host readback, or default AD activation. Every issued lease must close
    before replaying an overlapping entry or calling `:close!`."
   [owner arguments {:keys [target] :as options}]
+  (effects/init-raster-context!)
   (when-not (and (map? options) (set/subset? (set (keys options)) option-keys))
     (fail! :normalized-device-options
            "normalized device preparation accepts only target, schedule, scalar-math and profile"

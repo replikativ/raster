@@ -9,6 +9,7 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.method-entry :as entry]))
 
 (deftm squared-loss [x :- Double] :- Double (numeric/* x x))
@@ -28,6 +29,21 @@
 
 (defn- result [prepared x]
   (((deref (ns-resolve 'raster.ad.reverse 'compile-prepared-value+grad)) prepared) x))
+
+(deftest source-ad-producers-initialize-context-before-capturing-rule-epochs
+  (let [initialize effects/init-raster-context!
+        revision templates/registry-revision]
+    (initialize)
+    (doseq [construct [(fn [] (reverse/prepare-value+grad #'squared-loss [0]))
+                       (fn [] (reverse/vjp #'squared-loss 2.0))]]
+      (let [events (atom [])]
+        (with-redefs [effects/init-raster-context!
+                      (fn [] (initialize) (swap! events conj :initialized) nil)
+                      templates/registry-revision
+                      (fn [] (swap! events conj :epoch) (revision))]
+          (construct))
+        (is (= :initialized (first @events)))
+        (is (some #{:epoch} @events))))))
 
 (deftest preparation-uses-the-frozen-frontend-not-replaceable-walk-caches
   (is (= 9.0 (squared-loss 3.0)))

@@ -4472,6 +4472,7 @@
    This never renews the supplied emission. A callee promotion invalidates the
    whole enclosing producer; an old captured input still fails its own guard."
   [emission active-indices]
+  (effects/init-raster-context!)
   (method-entry/call-with-definition-inputs
    #(method-entry/call-with-independent-definition-inputs
      (fn []
@@ -4600,6 +4601,7 @@
   one slot per ORIGINAL param (with nil for non-differentiable slots) so
   positional consumers don't shift."
   [resolved]
+  (effects/init-raster-context!)
   (loop []
     (let [registry-revision (tmpl/registry-revision)
           definition-revision (dispatch/compiler-definition-revision)
@@ -5996,9 +5998,11 @@
     ;; Own freshness only: historical definitions and earlier producer inputs
     ;; are adopted flat into the consumer, never recursively reobserved here.
     (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
-    (when-not (= template-revision (tmpl/registry-revision))
-      (throw (ex-info "generated AD rules changed after preparation"
-                      {:reason :ad-prepared-program-stale-rules})))
+    (let [actual (tmpl/registry-revision)]
+      (when-not (= template-revision actual)
+        (throw (ex-info "generated AD rules changed after preparation"
+                        {:reason :ad-prepared-program-stale-rules
+                         :expected template-revision :actual actual}))))
     (when-let [physical (::generated-entry program)]
       ((:guard physical)))
     this))
@@ -7001,6 +7005,8 @@
                   (= generated-source-policy (:source-policy generated-call)))
      (throw (ex-info "generated invocation requires its own retained source policy"
                      {:reason :unclosed-generated-call-policy})))
+   (when (= :generated-product-bindings (:kind generated-call))
+     (effects/init-raster-context!))
    (let [product? (= :generated-product-bindings (:kind generated-call))
          ;; Capture before template derivation, not just before eval: otherwise
          ;; code derived in one epoch could be blessed with the next epoch.
@@ -7637,6 +7643,7 @@
    invalidate an in-progress derivation: discard it and retry the WHOLE owner,
    never certify its old code with fresh observations. Execution does not retry."
   [f-var wrt]
+  (effects/init-raster-context!)
   (let [enclosing? (some? method-entry/*emission-inputs*)
         construct #(method-entry/call-with-definition-inputs
                     (fn [] (prepare-owned-bytecode-value+grad-once f-var wrt)))]
@@ -7666,6 +7673,7 @@
    not discard it. Preparation may compile the original input and the selected
    helper companion, but does not compile the resulting paired outer program."
   [emission original input-index declarations active-ports]
+  (effects/init-raster-context!)
   (let [outline (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-invocation-input-region)
         nested (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-call-context)
         region (outline emission original input-index)
@@ -8360,6 +8368,10 @@
    evaluating a numerical body. Runtime construction and compiler inlining
    consume this same generated program, physical entry and padded slot boundary."
   [f-var wrt]
+  ;; Initialize the existing shared semantic context before this owner can
+  ;; capture epochs or source. A later validator must never bootstrap rules
+  ;; and thereby invalidate an already constructed gradient.
+  (effects/init-raster-context!)
   (method-entry/call-with-definition-inputs
    #(method-entry/call-with-independent-definition-inputs
      (fn []

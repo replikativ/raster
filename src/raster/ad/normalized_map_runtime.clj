@@ -4,6 +4,7 @@
   (:require [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-program-bundle :as canonical]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (defn- fail! [reason data]
@@ -333,12 +334,14 @@
    receive fresh exclusive typed-zero owners. Epoch and executable identities are fenced.
    No default AD migration, implicit seed, device execution or general equation composition."
   [owner]
+  (effects/init-raster-context!)
   (prepare-validated-owner (canonical/validate! owner)))
 
 (defn prepare
   "Compatibility entry for checked derivation evidence. Canonical adaptation owns family
    admission; prepare-owner owns host execution. See prepare-owner for value/lifetime contracts."
   [bundle]
+  (effects/init-raster-context!)
   ;; Adaptation has just performed independent canonical validation. Reuse the private
   ;; consumer, not a skip flag: both public entries retain the post-capture proof/fence.
   (prepare-validated-owner (canonical/adapt bundle)))
