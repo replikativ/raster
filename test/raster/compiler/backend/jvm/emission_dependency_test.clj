@@ -537,14 +537,22 @@
         ;; resolves its live receiver and must not manufacture an unused sibling.
         (let [direct-result (compile! direct)
               invk-result (compile! invk)
+              mixed-result (compile! (list 'clojure.core/+ direct invk))
+              static-count #(count (filter (fn [^java.lang.reflect.Method method]
+                                             (.startsWith (.getName method) "__rstr_deftm_"))
+                                           (.getDeclaredMethods ^Class (get-in % [:artifact :class]))))
               invoke #(let [^java.lang.reflect.Method method (get-in % [:artifact :methods 'run])]
                         (.invoke method nil (object-array [2.0])))]
           (is (some #(identical? leaf %) (:visited direct-result)))
           (is (empty? (:visited invk-result)))
+          (is (= [leaf] (:visited mixed-result)) "mixed uses retain one actual static source consumer")
+          (is (= 1 (static-count direct-result) (static-count mixed-result)))
+          (is (zero? (static-count invk-result)))
           (is (map? (:raster.core/jit-spec (meta receiver))))
           (is (= 3.0 (invoke direct-result)))
           (is (map? (:raster.core/jit-spec (meta receiver))) "static execution does not invoke the leaf receiver")
-          (is (= 3.0 (invoke invk-result)))))
+          (is (= 3.0 (invoke invk-result)))
+          (is (= 6.0 (invoke mixed-result)))))
       (finally (remove-ns (ns-name scope))))))
 
 (deftest emitted-global-aliases-use-the-actual-resolved-var-target

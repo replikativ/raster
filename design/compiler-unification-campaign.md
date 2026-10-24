@@ -2,6 +2,40 @@
 
 ## Reconciled execution plan
 
+### October 24 active producer-consolidation sequence
+
+Keep the original eight objectives below. The current landing order is:
+
+1. Close fresh-process source/AD preparation regressions before further admission.
+   Ordinary late-bound calls may remain recursive; only a derived consumer pins
+   the implementation history it actually used. Direct static calls and `.invk`
+   share dependency discovery, but `.invk` must not manufacture unused static
+   siblings. Changed inputs during construction require discarding the whole
+   attempt. Invoking an old captured artifact must still refuse, not retry it.
+2. Normalize segmented scalar computations at their actual TypedSOAC producer.
+   Factor the existing selected-method FP body recipe from its physical caller
+   argument-completion gate. A semantic typed operand domain is not evidence of
+   a JVM operand Class. Join the actual selected body, source history and return
+   bridge under the existing definition owner; keep cold preparation explicit.
+   Construct the complete recurrence once, then share its ProductReduction view
+   across contraction projection and scheduling. Do not strip casts or weaken
+   the exact-product gate of a schedule that replaces the summand.
+3. Close result-completion and residency obligations separately. In particular,
+   checked Double-to-Float completion cannot silently become unchecked on a GPU,
+   and a resident result has no implicit host readback on which to run the check.
+   Qualify the chosen continuation or explicit numerical contract before routing.
+4. Re-run reusable training and external workload qualification, then resume the
+   retained performance, portability and distributed-planning objectives. Report
+   actual device execution separately from compile-only vendor coverage.
+
+Use one bounded REPL for affected tests and exact-head CI for full qualification.
+Warm preparation is not a substitute for a cold-process lifecycle check. Review
+shared ownership changes before broadening them, consolidate existing test matrices
+where possible, and keep stale-history/alias/effect controls alongside numerical
+oracles. Typed Clojure startup optimization is deferred; correctness and a coherent
+producer path remain the current priority. These are completion obligations, not
+a claim that PR #1566 or the overall campaign is qualified.
+
 The CPU frozen-source producer landing preserves the existing optimizer's
 classification of ordinary unmarked arithmetic; it does not claim blanket
 source-exception equivalence for that legacy behavior (for example, an unused

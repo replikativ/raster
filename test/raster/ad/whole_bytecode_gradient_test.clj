@@ -4,6 +4,7 @@
             [raster.numeric :as n]
             [raster.par :as par]
             [raster.ad.reverse :as reverse]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.source-owner :as source-owner]))
@@ -278,6 +279,59 @@
         (is (instance? Float gradient))
         (is (= (Double/doubleToRawLongBits (widened-object-local x))
                (Double/doubleToRawLongBits value)))))))
+
+(deftest cold-selected-helpers-restart-the-whole-bytecode-preparation-owner
+  (let [once-var (ns-resolve 'raster.ad.reverse 'prepare-owned-bytecode-value+grad-once)
+        once! @once-var]
+    (doseq [tag '[Double Float] nested? [false true]]
+      (let [scope (create-ns (gensym "raster.ad.cold-whole-owner."))
+            attempts (atom 0)]
+        (try
+          (binding [*ns* scope]
+            (refer 'clojure.core)
+            (eval (list 'raster.core/deftm 'leaf ['x ':- tag] ':- tag
+                        '(raster.numeric/* x x)))
+            (eval (list 'raster.core/deftm 'caller ['x ':- tag] ':- 'Double
+                        '(let [contribution (leaf x)] contribution)))
+            (eval '(raster.core/deftm unrelated [x :- Double] :- Double x)))
+          (let [function (ns-resolve scope 'caller)
+                leaf (core/resolve-deftm-var (ns-resolve scope 'leaf))
+                receiver (ns-resolve scope (symbol (str (:name (meta leaf)) "-impl")))
+                original (var-get receiver)
+                unrelated (core/resolve-deftm-var (ns-resolve scope 'unrelated))
+                _ (is (map? (:raster.core/jit-spec (meta receiver))))
+                p (with-redefs-fn
+                    {once-var (fn [& arguments]
+                                (swap! attempts inc)
+                                (apply once! arguments))}
+                    #(if nested?
+                       (entry/call-with-definition-inputs
+                        (fn []
+                          (let [p (prepared function)]
+                            ;; This later consumer belongs to the enclosing
+                            ;; owner, not the derivative already constructed.
+                            (entry/observe-definition-input!
+                             unrelated scope (.sym ^clojure.lang.Var unrelated))
+                            p)))
+                       (prepared function)))
+                invoke (#'reverse/compile-prepared-value+grad p)
+                x (if (= tag 'Float) (float 2.0) 2.0)]
+            (is (<= 2 @attempts) "cold helper publication discards and reconstructs the whole derivation")
+            (is (not (identical? original (var-get receiver))))
+            (is (nil? (:raster.core/jit-spec (meta receiver))))
+            (is (= 4.0 (function x)))
+            (let [[value gradient] (invoke x)]
+              (is (= 4.0 value gradient))
+              (is (instance? Double value))
+              (is (if (= tag 'Float) (instance? Float gradient) (instance? Double gradient))))
+            (when nested?
+              (let [metadata (meta unrelated)]
+                (try
+                  (alter-meta! unrelated assoc ::later-unrelated-change (Object.))
+                  (is (= [4.0 4.0] (invoke x))
+                      "the derivative guard freezes its construction history, not the mutable parent collector")
+                  (finally (reset-meta! unrelated metadata))))))
+          (finally (remove-ns (ns-name scope))))))))
 
 (deftest compound-input-regions-compose-with-the-existing-lexical-producer
   (doseq [v [#'scoped-input-factor #'array-input-factor]]

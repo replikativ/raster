@@ -4307,7 +4307,7 @@
 
 (declare ad-prepare)
 
-(defn- get-paired-helper-program
+(defn- get-paired-helper-program-once
   "Compile an owned bytecode helper's paired forward/pullback program.
 
    The caller must first match this actual emitter snapshot to its selected
@@ -4406,7 +4406,8 @@
                       (gen-reverse-let-program bindings results active-params)))))
               program-guard (capture source-ns expected [{:parameters all-params :body (:form program)}])
               emission-guard (method-entry/prepare-emission-input-guard! emission)
-              guard (fn []
+              observations @proof-inputs
+              source-guard (fn []
                       (emission-guard)
                       (when-not (identical? source-ns (find-ns (ns-name source-ns)))
                         (throw (ex-info "paired helper source namespace changed"
@@ -4416,18 +4417,30 @@
                         (throw (ex-info "paired helper interface registration changed"
                                         {:reason :ad-paired-helper-interface})))
                       (entry-guard)
-                      (method-entry/assert-definition-inputs-current! @proof-inputs)
+                      (method-entry/assert-definition-inputs-current! observations)
                       (program-guard))
-              _ (guard)
-              companion (binding [*ns* source-ns
-                                  method-entry/*compilation-classloader* loader]
-                          (compile-pair (str "raster.compiled.PairedHelper" (gensym))
-                                        params tags 'Object [(:form program)] source-ns interface-class))
+              _ (source-guard)
+              {companion :implementation companion-emission :emission}
+              (binding [*ns* source-ns
+                        method-entry/*compilation-classloader* loader]
+                (rcore/emit-owned-bytecode!
+                 compile-pair "raster.compiled.PairedHelper"
+                 params tags 'Object [(:form program)] source-ns interface-class
+                 'paired-helper observations))
+              ;; The companion is captured as an Object by its parent. Its
+              ;; physical calls therefore belong to THIS producer, not a scan
+              ;; of the outer generated body or of the original primal body.
+              companion-emission
+              ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/prepare-emitted-global-invocations!)
+               companion-emission)
+              companion-guard (method-entry/prepare-emission-input-guard! companion-emission)
+              guard (fn [] (source-guard) (companion-guard))
               _ (when-not (.isInstance interface-class companion)
                   (throw (ex-info "paired helper compiler returned a different input interface"
                                   {:reason :ad-paired-helper-interface})))
               _ (guard)
-              result {:companion companion :program program :guard guard
+              result {:companion companion :companion-emission companion-emission
+                      :program program :guard guard
                       :emission emission :parameters all-params :active-indices active-indices
                       :active-params active-params :interface-class interface-class :method invocation
                       :dependency-snapshots (:dependency-snapshots emission)
@@ -4453,6 +4466,21 @@
                             :definition-revision (:compiler-revision expected)
                             :entries {cache-key result}})))
           result)))))
+
+(defn- get-paired-helper-program
+  "Construct a companion under its own original input history, then adopt it.
+   This never renews the supplied emission. A callee promotion invalidates the
+   whole enclosing producer; an old captured input still fails its own guard."
+  [emission active-indices]
+  (method-entry/call-with-definition-inputs
+   #(method-entry/call-with-independent-definition-inputs
+     (fn []
+       (method-entry/assert-emission-inputs-current! emission)
+       (let [lineage (:source-entry emission)]
+         (method-entry/assert-source-entry-current! lineage)
+         (source-policy/call-with-policy
+          (:source-policy lineage)
+          (fn [] (get-paired-helper-program-once emission active-indices))))))))
 
 (defn- capture-selected-helper-emission
   "AD and generated-program normalization share the selected physical producer."
@@ -7544,7 +7572,10 @@
         selected (capture-selected-helper-emission operation receiver-name (count (:parameters definition)) (first methods))
         emission (:emission selected)
         expected ((requiring-resolve 'raster.ad.normalized-scalar/revisions))
-        proof-inputs (atom {:static [] :values []})
+        ;; The whole preparation, including selected helper realization, shares
+        ;; its existing definition owner. A detached collector would turn a
+        ;; legitimate first-call promotion into an unhandled inner failure.
+        proof-inputs method-entry/*emission-inputs*
         used (atom (util/free-syms-flat (:body emission)))]
     (with-ad-gensym
       (binding [*generated-product-context* {:backend :jvm-bytecode :used-identifiers used}
@@ -7575,10 +7606,14 @@
               execution-guard ((requiring-resolve 'raster.ad.normalized-scalar/execution-guard)
                                (:source-ns emission) expected
                                [{:parameters (into params (map :companion helpers)) :body body}])
-              guard (fn [] ((:guard selected))
+              observations @proof-inputs
+              guard (fn []
+                      ;; Freeze the actual completed attempt's history, not a
+                      ;; mutable enclosing collector that may acquire later work.
+                      (method-entry/assert-definition-inputs-current! observations)
+                      ((:guard selected))
                       (doseq [{:keys [guard helper]} helpers] (guard) ((:guard helper)))
                       (doseq [region (:input-regions ordered)] ((:guard region)))
-                      (method-entry/assert-definition-inputs-current! @proof-inputs)
                       (execution-guard))
               _ (guard)]
           {:params params :tags tags :walked-body walked-body :source-ns (:source-ns emission)
@@ -7599,14 +7634,21 @@
    invalidate an in-progress derivation: discard it and retry the WHOLE owner,
    never certify its old code with fresh observations. Execution does not retry."
   [f-var wrt]
-  (loop [attempt 0]
-    (let [result (try {:value (prepare-owned-bytecode-value+grad-once f-var wrt)}
-                      (catch clojure.lang.ExceptionInfo failure {:failure failure}))]
-      (if-let [failure (:failure result)]
-        (if (and (< attempt 2) (method-entry/retryable-emission-change? failure))
-          (recur (inc attempt))
-          (throw failure))
-        (:value result)))))
+  (let [enclosing? (some? method-entry/*emission-inputs*)
+        construct #(method-entry/call-with-definition-inputs
+                    (fn [] (prepare-owned-bytecode-value+grad-once f-var wrt)))]
+    ;; This compatibility emission retry surrounds the definition owner's
+    ;; three-attempt budget: a standalone mixed-failure case may construct
+    ;; nine times. Nested callers leave both decisions to their enclosing owner.
+    (loop [attempt 0]
+      (let [result (try {:value (construct)}
+                        (catch clojure.lang.ExceptionInfo failure {:failure failure}))]
+        (if-let [failure (:failure result)]
+          (if (and (not enclosing?) (< attempt 2)
+                   (method-entry/retryable-emission-change? failure))
+            (recur (inc attempt))
+            (throw failure))
+          (:value result))))))
 
 (defn ^:no-doc prepare-bytecode-input-pullback
   "Linearize an owned FP input whose operand is an emitted typed call tree.
