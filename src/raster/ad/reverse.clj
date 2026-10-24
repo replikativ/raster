@@ -6465,18 +6465,9 @@
             (throw (ex-info "Generated AD bytecode entry could not be emitted"
                             {:reason :ad-generated-entry-unavailable})))
         _ ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/validate-program-emission!)
-           program emission)
-        pending (filterv #(map? (get-in % [:metadata :raster.core/jit-spec]))
-                         (:dependency-snapshots emission))]
-    ;; Only prepare receivers actually consumed by this completed emitter.
-    ;; Adopt their ORIGINAL observations, not new snapshots after promotion.
-    ;; A changed receiver invalidates this whole preparation transaction;
-    ;; neither the generated program nor its module is restamped in place.
-    (when (seq pending)
-      (method-entry/adopt-definition-inputs!
-       {:definition-proofs (into {} (map (juxt :var identity)) pending)})
-      (method-entry/prepare-pending-definition-inputs!
-       rcore/ensure-current-owned-bytecode! (mapv :var pending)))
+           program emission)]
+    ;; The shared emitter has already prepared its ACTUAL global invocations.
+    ;; Retained source-only observations are not additional physical calls.
     {:implementation implementation :emission emission :input-body walked-body
      :interface-class (:iface-class interface) :source-policy policy
      :guard (method-entry/prepare-emission-input-guard! emission)}))

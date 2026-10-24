@@ -431,6 +431,9 @@
       (if (and failure (< attempt 2) (me/retryable-emission-change? failure))
         (recur (inc attempt))
         (do (when failure (throw failure))
+            (when implementation
+              (binding [me/*emission-inputs* inputs]
+                ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/prepare-emitted-global-invocations!))))
             {:implementation implementation :emission emission})))))
 
 (clojure.core/defn ^:no-doc prepare-implementation-frontend!

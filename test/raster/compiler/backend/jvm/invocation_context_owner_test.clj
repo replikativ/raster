@@ -200,8 +200,26 @@
                         "raster.compiled.ClonedInvocationContext"
                         [{:name 'run :params [argument] :return-tag 'Object
                           :walked-body [body]
-                          :source-ns (the-ns 'raster.compiler.backend.jvm.invocation-context-owner-test)}]))
-                     (vals (:invocation-contexts @inputs))))]
+                          :source-ns (the-ns 'raster.compiler.backend.jvm.invocation-context-owner-test)}])
+                       ;; Ambiguous SOURCE correspondence does not erase the
+                       ;; independently recorded actual physical invocations.
+                       (is (nil? (bytecode/prepare-emitted-global-invocations!)))
+                       (let [original @inputs
+                             physical (filterv (fn [[key record]]
+                                                 (identical? key (::bytecode/physical-invocation record)))
+                                               (:invocation-contexts original))
+                             [key record] (first physical)]
+                         (is (= 2 (count (filter #(= (second call) (:receiver (val %))) physical))))
+                         (doseq [changed [(update original :invocation-contexts dissoc key)
+                                          (update original :invocation-contexts
+                                                  #(assoc (dissoc % key) (Object.) record))]]
+                           (binding [entry/*emission-inputs* (atom changed)]
+                             (is (= :unclosed-emitted-global-invocations
+                                    (try (bytecode/prepare-emitted-global-invocations!) :incorrectly-closed
+                                         (catch clojure.lang.ExceptionInfo failure
+                                           (:reason (ex-data failure))))))))))
+                     (vals (select-keys (:invocation-contexts @inputs)
+                                        [(::bytecode/call-occurrence (meta call))]))))]
     (let [records (compile! (list 'let* ['a call 'b call] 'b))]
       (is (= 1 (count records)))
       (is (= :ambiguous (:status (first records)))))

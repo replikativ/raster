@@ -511,23 +511,29 @@
                                     (swap! attempts conj result))
                                   result))]
                    (reverse/prepare-value+grad function [0]))
-        emission (:raster.core/bytecode-emission (meta receiver))]
+        physical (reverse/prepared-bytecode-entry prepared)
+        emission (:emission physical)]
     (is (= before @preparation-body-calls)
         "materializing an observed dependency must not evaluate the model")
-    (is (not (identical? implementation (var-get receiver))))
-    (is (nil? (:raster.core/jit-spec (meta receiver))))
-    (is (identical? (:implementation emission) (var-get receiver)))
+    (is (identical? implementation (var-get receiver))
+        "an inlined source producer is not an additional physical invocation")
+    (is (map? (:raster.core/jit-spec (meta receiver))))
+    (is (identical? (:implementation emission) (:implementation physical)))
     (is (identical? emission ((entry/prepare-emission-input-guard! emission))))
-    (is (<= 2 (count @attempts)) "promotion retries the whole generated owner")
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (entry/prepare-emission-input-guard! (:emission (first @attempts))))
-        "the rejected module's old observations remain stale")
+    (is (<= 1 (count @attempts)) "the actual numerical producer was emitted")
     (is (identical? (:emission (last @attempts))
                     (:emission (reverse/prepared-bytecode-entry prepared)))
         "only the newly emitted module belongs to the completed preparation")
     (is (= [16.0 8.0] (result prepared 4.0)))
     (is (= (inc before) @preparation-body-calls)
-        "the prepared call executes the original effect exactly once")))
+        "the prepared call executes the original effect exactly once")
+    (let [original (meta source)]
+      (try
+        (alter-meta! source assoc :raster.core/deftm-source-body '[42.0])
+        (is (thrown? clojure.lang.ExceptionInfo (result prepared 4.0))
+            "retained source history still guards the inlined producer")
+        (is (= (inc before) @preparation-body-calls))
+        (finally (reset-meta! source original))))))
 
 (deftest enclosing-owner-detects-a-source-change-during-ad-preparation
   (let [source (core/resolve-deftm-var #'squared-loss)

@@ -17,6 +17,7 @@
             [raster.compiler.core.macroexpand :as mex]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.support.mangled :as mangled]
             [raster.compiler.backend.jvm.split :as split])
   (:import (java.lang.classfile ClassFile ClassFile$ClassHierarchyResolverOption ClassFile$Option)
            (java.lang.classfile.attribute SourceFileAttribute)
@@ -1132,10 +1133,45 @@
      ;; A logical hint does not prove a reference nonnull or an exact payload.
      :ports (select-keys locals (filter visible free))}))
 
+(defn- observe-emitted-global-receiver!
+  "Observe the actual global typed invocation before emitting its arguments.
+   A Method or interface hint alone does not select a deftm implementation."
+  [^java.lang.reflect.Method method receiver v arity ctx]
+  (when me/*emission-inputs*
+    (let [source-ns (or (:source-ns ctx) *ns*)
+          _ (when-not (and (var? v) (bound? v))
+              (throw (ex-info "global typed invocation has no actual receiver"
+                              {:reason :unowned-emitted-global-invocation :receiver receiver})))
+          _ (me/observe-definition-input! v source-ns receiver)
+          canonical-receiver (symbol (str (ns-name (.ns ^clojure.lang.Var v)))
+                                     (str (.sym ^clojure.lang.Var v)))
+          ;; Original operation metadata supplies a lookup candidate only;
+          ;; selected-entry/receiver/Method identity below authenticates it.
+          original-operation (:raster.op/original (meta (::call-expression ctx)))
+          original-var (when (symbol? original-operation) (ns-resolve source-ns original-operation))
+          operation (or (when (var? original-var)
+                          (symbol (str (ns-name (.ns ^clojure.lang.Var original-var)))
+                                  (str (.sym ^clojure.lang.Var original-var))))
+                        (mangled/impl->op canonical-receiver))
+          selection (when (symbol? operation)
+                      (me/selected-parameter-carriers operation canonical-receiver arity))
+          snapshot (get-in @me/*emission-inputs* [:definition-proofs v])
+          definition (:definition selection)
+          pending? (map? (get-in snapshot [:metadata :raster.core/jit-spec]))]
+      (when-not (and (identical? (:value snapshot) (.getRawRoot ^clojure.lang.Var v))
+                     (.isInstance (.getDeclaringClass method) (:value snapshot))
+                     (or (and (nil? selection) (not pending?))
+                         (and (= method (:invocation-method selection))
+                              (identical? v (:receiver-var definition))
+                              (identical? (:value snapshot) (get-in definition [:entry :typed-impl])))))
+        (throw (ex-info "global invocation differs from its selected physical entry"
+                        {:reason :unowned-emitted-global-invocation :receiver receiver})))
+      {:snapshot snapshot :selection selection})))
+
 (defn- retain-invocation-context!
-  [method receiver arguments mode return-carrier completions locals ctx]
-  (when-let [token (::call-occurrence ctx)]
-    (when me/*emission-inputs*
+  [method receiver arguments mode return-carrier completions locals ctx & [global-receiver]]
+  (when (and me/*emission-inputs*
+             (or (::call-occurrence ctx) (= mode :global-typed-indy)))
       (let [input #(physical-operand-input % locals ctx)
             guarded? (= mode :guarded-local-typed-interface)
             record (cond-> {:status (if guarded? :unsupported :known)
@@ -1147,8 +1183,94 @@
                      (and (not guarded?) completions)
                      (assoc :input-completions completions)
                      guarded? (assoc :reason :runtime-selected-input-context))]
-        (retain-call-observation! ctx :invocation-contexts record
-                                  :repeated-emitted-invocation-context)))))
+        (when (::call-occurrence ctx)
+          (retain-call-observation! ctx :invocation-contexts record
+                                    :repeated-emitted-invocation-context))
+        (when (= mode :global-typed-indy)
+          ;; Source cloning denies a unique source query, not knowledge that
+          ;; both physical calls were actually emitted. Keep the original
+          ;; source-indexed view above unchanged, and record EVERY actual
+          ;; global call independently in this same collection. A private key
+          ;; is never installed on source metadata or invocation-catalog.
+          (let [key (Object.)]
+            (swap! me/*emission-inputs*
+                   (fn [inputs]
+                     (let [ordinal (inc (get inputs :invocation-emission-ordinal -1))]
+                       (-> inputs
+                           (assoc :invocation-emission-ordinal ordinal)
+                           (assoc-in [:invocation-contexts key]
+                                     (assoc record ::physical-invocation key
+                                            :emission-ordinal ordinal
+                                            :global-receiver global-receiver)))))))))))
+
+(def ^:private ^:dynamic *preparing-emitted-receivers* #{})
+
+(defn ^:no-doc prepare-emitted-global-invocations!
+  "Complete an actual emitter's known global-call receiver preparations.
+   Only constructor-recorded calls nominate receivers; source-only history is
+   not execution. Preparation changes reject the whole owning attempt through
+   its ORIGINAL observations, never refresh this emitted body or old artifact."
+  []
+  (when-not me/*emission-inputs*
+    (throw (ex-info "emitted invocation preparation requires its compiler owner"
+                    {:reason :missing-definition-preparation-owner})))
+  (let [historical @me/*emission-inputs*
+        _ (me/assert-definition-inputs-current! historical)
+        physical (filterv (fn [[_ record]] (contains? record ::physical-invocation))
+                          (:invocation-contexts historical))
+        calls (mapv val physical)
+        ordinals (mapv :emission-ordinal calls)]
+    (when-not (and (every? (fn [[key record]] (identical? key (::physical-invocation record))) physical)
+                   (= (count calls) (inc (get historical :invocation-emission-ordinal -1)))
+                   (every? #(and (= :known (:status %))
+                                (= :global-typed-indy (:invocation-mode %))
+                                (instance? java.lang.reflect.Method (:method %))
+                                (map? (:global-receiver %))) calls)
+                   (every? #(and (integer? %) (<= 0 %)) ordinals)
+                   (= (set ordinals) (set (range (count calls))))
+                   ;; A legacy source-only global record cannot substitute for
+                   ;; the new emitter's physical accounting.
+                   (or (seq calls)
+                       (not-any? #(= :global-typed-indy (:invocation-mode %))
+                                 (vals (:invocation-contexts historical)))))
+      (throw (ex-info "emitted global invocation readiness is incomplete"
+                      {:reason :unclosed-emitted-global-invocations})))
+    (let [receivers
+          (reduce
+           (fn [result {:keys [method global-receiver]}]
+             (let [{:keys [snapshot selection]} global-receiver
+                   v (:var snapshot)
+                   retained (get-in historical [:definition-proofs v])
+                   pending? (map? (get-in snapshot [:metadata :raster.core/jit-spec]))
+                   definition (:definition selection)]
+               ;; Later actual occurrences may merge additional lookup edges
+               ;; into the SAME first definition observation. Keep this call's
+               ;; original snapshot; do not demand map identity after that merge.
+               (when-not (and (me/same-var-snapshot? snapshot retained)
+                              (every? (:lookups retained) (:lookups snapshot))
+                              (me/var-snapshot-current? snapshot)
+                              (or (not pending?)
+                                  (and (= method (:invocation-method selection))
+                                       (identical? v (:receiver-var definition))
+                                       (identical? (:value snapshot)
+                                                   (get-in definition [:entry :typed-impl])))))
+                 (throw (ex-info "emitted receiver lost its original selected-entry observation"
+                                 {:reason :unowned-emitted-global-invocation :receiver v})))
+               (if (and pending? (not (some #(identical? v %) result)))
+                 (conj result v) result)))
+           [] (sort-by :emission-ordinal calls))]
+      (when (some *preparing-emitted-receivers* receivers)
+        (throw (ex-info "recursive pending receiver preparation cannot publish an owned emission"
+                        {:reason :recursive-emitted-receiver-preparation})))
+      (when (seq receivers)
+        (let [prepare! (requiring-resolve 'raster.core/ensure-current-owned-bytecode!)]
+          (me/prepare-pending-definition-inputs!
+           (fn [receiver]
+             ;; Only the currently preparing ancestor is active. A sibling
+             ;; queued later in the outer batch can legitimately be a child.
+             (binding [*preparing-emitted-receivers* (conj *preparing-emitted-receivers* receiver)]
+               (prepare! receiver)))
+           receivers))))))
 
 (defn ^:no-doc retained-invocation-context
   "Query one ORIGINAL occurrence from a trusted, guarded bytecode emission.
@@ -4555,6 +4677,18 @@
       (let [{cls :interface method :method param-types :parameter-carriers
              ^Class ret-class :interface-result-class ^Class prim-ret-class :primitive-result-class
              is-var? :global?} invocation
+            ;; Resolve the actual global receiver ONCE, before arguments. A
+            ;; namespace alias is a source lookup, not a runtime namespace for
+            ;; the bootstrap. Raw forward declarations keep their old fallback.
+            receiver-var (when is-var?
+                           (try (ns-resolve (or (:source-ns ctx) *ns*) obj)
+                                (catch Exception _ nil)))
+            receiver-target (if (var? receiver-var)
+                              [(str (ns-name (.ns ^clojure.lang.Var receiver-var)))
+                               (str (.sym ^clojure.lang.Var receiver-var))]
+                              [(str (namespace obj)) (str (name obj))])
+            global-receiver (when is-var?
+                              (observe-emitted-global-receiver! method obj receiver-var (count method-args) ctx))
             completions (volatile! nil)]
         (if is-var?
           ;; Var reference (e.g. raster.numeric/_plus__m_double_double-impl)
@@ -4572,9 +4706,7 @@
                              bsm-handle
                              "invoke"
                              call-mt
-                             (into-array ConstantDesc
-                                         [(str (namespace obj))
-                                          (str (name obj))]))]
+                             (into-array ConstantDesc receiver-target))]
               (.invokedynamic code indy-desc)))
           ;; Local symbol with IFn__ tag.
           ;; If the local was checkcast at method entry (:verified in locals),
@@ -4623,7 +4755,7 @@
          (cond is-var? :global-typed-indy
                (:verified (get locals obj)) :local-typed-interface
                :else :guarded-local-typed-interface)
-         (if is-var? (or prim-ret-class ret-class) ret-class) @completions locals ctx)
+         (if is-var? (or prim-ret-class ret-class) ret-class) @completions locals ctx global-receiver)
         ;; Stack type: primitive for invokedynamic with compute_prim, :ref for local path
         (if (and is-var? prim-ret-class)
           (class-type->stack prim-ret-class)
@@ -6981,6 +7113,8 @@
           (recur (inc attempt))
           (do
             (when failure (throw failure))
+            (binding [me/*emission-inputs* emitted-inputs]
+              (prepare-emitted-global-invocations!))
             (alter-meta! deftm-var
                          (fn [metadata]
                            (when (and (contains? preparation :expected-cache)

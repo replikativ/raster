@@ -66,6 +66,13 @@ requires a whole construction retry. Source preparation and executable-callee
 readiness are distinct obligations; neither permits retrying numerical execution
 or accepting an old artifact after its retained definitions change.
 
+Executable preparation uses the emitter's actual global typed calls, not every
+source dependency. Calls are prepared in emission order before publication;
+source-only dependencies need not acquire a JVM implementation. Source-indexed
+call observations remain distinct from private physical-call records: cloning
+can deny source reconstruction without hiding either emitted call. Both use the
+same emission ledger, and private records grant no additional source authority.
+
 ### AOT via `compile-aot`
 
 `compile-aot` inlines an entire call chain into a single JVM method. This

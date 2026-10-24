@@ -352,6 +352,198 @@
         (is (= {:unchecked-math false} (get-in frontend [:source-entry :source-policy]))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest completed-emitter-prepares-only-actual-global-receivers-in-emission-order
+  (let [scope (create-ns (gensym "raster.emitted-receiver-readiness."))
+        events (atom [])
+        order [11 2 10 0 8 4 12 6 1 9 3 7 5 11]
+        names (mapv #(symbol (str "leaf" %)) (range 13))]
+    (try
+      (intern scope 'events events)
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (doseq [[index name] (map-indexed vector names)]
+          (eval (list 'raster.core/deftm name ['x ':- 'Double] ':- 'Double
+                      (list 'do (list 'swap! 'events 'conj index) 'x))))
+        (eval '(raster.core/deftm unused [x :- Double] :- Double x))
+        (eval (list 'raster.core/deftm 'caller ['x ':- 'Double] ':- 'Double
+                    (list 'let* (vec (mapcat (fn [ordinal index]
+                                             [(symbol (str "result" ordinal))
+                                              (list (nth names index) 'x)])
+                                           (range) order)) 'x))))
+      (let [source #(core/resolve-deftm-var (ns-resolve scope %))
+            receiver #(ns-resolve scope (symbol (str (:name (meta %)) "-impl")))
+            caller (source 'caller)
+            unused (receiver (source 'unused))
+            leaves (mapv (comp receiver source) names)
+            expected (mapv #(nth leaves %) (distinct order))
+            prepared (atom [])
+            attempts (atom 0)
+            rejected (atom [])
+            actual-prepare! core/ensure-current-owned-bytecode!
+            actual-ready! bytecode/prepare-emitted-global-invocations!
+            result
+            (with-redefs [core/ensure-current-owned-bytecode!
+                          (fn [v]
+                            (swap! prepared conj v)
+                            (actual-prepare! v))
+                          bytecode/prepare-emitted-global-invocations!
+                          (fn []
+                            (let [original @method-entry/*emission-inputs*]
+                              (try (actual-ready!)
+                                   (catch clojure.lang.ExceptionInfo failure
+                                     (swap! rejected conj original)
+                                     (throw failure)))))]
+              (method-entry/call-with-definition-inputs
+               #(let [_ (swap! attempts inc)
+                      ;; This is real historical source input, deliberately NOT
+                      ;; a physical call in the emitted body.
+                      _ (method-entry/observe-definition-input! unused scope (:name (meta unused)))
+                      frontend (core/prepare-deftm-frontend! caller)
+                      _ (method-entry/assert-frontend-source! frontend caller)
+                      _ (method-entry/observe-frontend-source-identity! frontend)
+                      {:keys [params tags return-tag typed-interface]} (:source-entry frontend)]
+                  (core/emit-owned-bytecode!
+                   bytecode/compile-typed-impl! "raster.compiled.ReceiverReadiness"
+                   params tags return-tag (:body frontend) scope typed-interface
+                   (:name (meta caller)) @method-entry/*emission-inputs*))))
+            emitted (:emission result)
+            guard (method-entry/prepare-emission-input-guard! emitted)
+            records (into [] (keep (fn [[key record]]
+                                     (when (identical? key (::bytecode/physical-invocation record)) record)))
+                          (:invocation-contexts emitted))]
+        (is (= 2 @attempts) "one completed batch restarts the whole owner")
+        (is (= expected @prepared) "hash-map iteration and symbol order are not emission order")
+        (is (seq @rejected))
+        (doseq [original @rejected]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (method-entry/assert-definition-inputs-current! original))
+              "discarded whole-emitter history is not refreshed after promotion"))
+        (is (empty? @events) "preparation executes no numerical body")
+        (is (every? #(nil? (:raster.core/jit-spec (meta %))) leaves))
+        (is (map? (:raster.core/jit-spec (meta unused))))
+        (is (= (count order) (count records)))
+        (is (= (count records) (count (set (map :emission-ordinal records)))))
+        (is (= 3.0 ((:implementation result) 3.0)))
+        (is (= order @events))
+        (is (guard))
+        (let [changed (source (first names))
+              original (meta changed)]
+          (try
+            (alter-meta! changed assoc ::real-source-change (Object.))
+            (is (thrown? clojure.lang.ExceptionInfo (guard)))
+            (finally (reset-meta! changed original))))
+        (is (guard)))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest tokenless-static-emission-records-do-not-become-source-occurrences
+  (let [scope (create-ns (gensym "raster.tokenless-receiver-readiness."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm leaf [x :- Double] :- Double x))
+        (eval '(raster.core/deftm middle [x :- Double] :- Double (leaf x)))
+        ;; The first queued receiver consumes a later queued receiver. This is
+        ;; an acyclic dependency, not recursive preparation of an ancestor.
+        (eval '(raster.core/deftm caller [x :- Double] :- Double
+                 (do (middle x) (leaf x)))))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'caller))
+            source-only (atom nil)
+            result
+            (method-entry/call-with-definition-inputs
+             #(let [frontend (core/prepare-deftm-frontend! source)
+                    {:keys [params tags return-tag source-policy]} (:source-entry frontend)
+                    _ (bytecode/prepare-emission-input-snapshots! (:body frontend) scope params)
+                    artifact (bytecode/compile-specialized-class!
+                              "raster.compiled.TokenlessReadiness"
+                              [{:name 'run :params (mapv (fn [p tag] (vary-meta p assoc :tag tag)) params tags)
+                                :return-tag return-tag :source-policy source-policy
+                                :source-ns scope :walked-body (:body frontend)}])]
+                (reset! source-only @method-entry/*emission-inputs*)
+                (bytecode/prepare-emitted-global-invocations!)
+                artifact))
+            contexts (:invocation-contexts @source-only)
+            records (filter (fn [[_ record]] (= :global-typed-indy (:invocation-mode record))) contexts)]
+        (is (seq records))
+        (is (every? (fn [[key _]] (not (contains? (:invocation-catalog @source-only) key))) records))
+        (is (every? (fn [[_ record]]
+                      (nil? (:raster.compiler.backend.jvm.bytecode/call-occurrence
+                             (meta (:expression record))))) records))
+        (is (= 4.0 (.invoke ^java.lang.reflect.Method (get-in result [:methods 'run])
+                           nil (object-array [4.0])))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest recursive-pending-receiver-preparation-refuses-before-publication
+  (let [scope (create-ns (gensym "raster.recursive-receiver-readiness."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm recursive-value [x :- Double] :- Double
+                 (recursive-value x))))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'recursive-value))
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            original (var-get receiver)
+            failure (try (core/ensure-current-owned-bytecode! receiver) nil
+                         (catch clojure.lang.ExceptionInfo failure failure))]
+        (is (some? failure))
+        (is (some #(= :recursive-emitted-receiver-preparation (:reason (ex-data %)))
+                  (take-while some? (iterate ex-cause failure))))
+        (is (identical? original (var-get receiver))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest emitted-global-aliases-use-the-actual-resolved-var-target
+  (let [source-ns (create-ns (gensym "raster.receiver-alias-source."))
+        replacement-ns (create-ns (gensym "raster.receiver-alias-other."))
+        caller-ns (create-ns (gensym "raster.receiver-alias-caller."))]
+    (try
+      (doseq [scope [source-ns replacement-ns]]
+        (binding [*ns* scope]
+          (refer 'clojure.core)
+          (eval '(raster.core/deftm leaf [x :- Double] :- Double x))
+          (eval '(raster.core/deftm caller [x :- Double] :- Double (leaf x)))))
+      (binding [*ns* caller-ns] (alias 'actual-source (ns-name source-ns)))
+      (let [source (core/resolve-deftm-var (ns-resolve source-ns 'caller))
+            leaf (core/resolve-deftm-var (ns-resolve source-ns 'leaf))
+            receiver (ns-resolve source-ns (symbol (str (:name (meta leaf)) "-impl")))
+            frontend (core/prepare-deftm-frontend! source)
+            receiver-name (symbol (str (ns-name source-ns)) (str (:name (meta receiver))))
+            call (first (filter #(and (seq? %) (= '.invk (first %)) (= receiver-name (second %)))
+                                (tree-seq coll? seq (:body frontend))))
+            alias-name (symbol "actual-source" (name receiver-name))
+            _ (is (seq call))
+            _ (is (identical? receiver (ns-resolve caller-ns alias-name)))
+            _ (is (map? (:raster.core/jit-spec (meta receiver))))
+            alias-call (with-meta (apply list '.invk (with-meta alias-name (meta (second call))) (drop 2 call))
+                         (meta call))
+            params (mapv (fn [p tag] (vary-meta p assoc :tag tag))
+                         (get-in frontend [:source-entry :params]) (get-in frontend [:source-entry :tags]))
+            spec {:name 'run :params params :return-tag (get-in frontend [:source-entry :return-tag])
+                  :source-policy (get-in frontend [:source-entry :source-policy])
+                  :source-ns caller-ns :walked-body [alias-call]}
+            owned (method-entry/call-with-definition-inputs
+                   #(let [artifact (bytecode/compile-specialized-class!
+                                    "raster.compiled.OwnedReceiverAlias" [spec])]
+                      (bytecode/prepare-emitted-global-invocations!)
+                      {:artifact artifact :inputs @method-entry/*emission-inputs*}))
+            raw (binding [method-entry/*emission-inputs* nil]
+                  (bytecode/compile-specialized-class! "raster.compiled.RawReceiverAlias" [spec]))]
+        (doseq [artifact [(:artifact owned) raw]]
+          (is (= 5.0 (.invoke ^java.lang.reflect.Method (get-in artifact [:methods 'run])
+                             nil (object-array [5.0])))))
+        (is (method-entry/assert-definition-inputs-current! (:inputs owned)))
+        (binding [*ns* caller-ns]
+          (ns-unalias caller-ns 'actual-source)
+          (alias 'actual-source (ns-name replacement-ns)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (method-entry/assert-definition-inputs-current! (:inputs owned))))
+        ;; Raw compilation still has its pre-existing global Var/world-age
+        ;; semantics. This repair only canonicalizes the originally resolved
+        ;; alias target; it does not introduce a new raw execution guard.
+        (is (= 5.0 (.invoke ^java.lang.reflect.Method (get-in raw [:methods 'run])
+                           nil (object-array [5.0])))))
+      (finally
+        (doseq [scope [caller-ns replacement-ns source-ns]]
+          (remove-ns (ns-name scope)))))))
+
 (deftest detached-vars-cannot-certify-replaced-emission-inputs
   (let [scope (create-ns (gensym "raster.detached-emission."))
         v (intern scope 'child (fn [] :old))
