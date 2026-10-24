@@ -337,3 +337,195 @@
    (reduce (fn [facts [id expression]]
              (assoc facts id (completed-scalar-fact expression facts source-ns completion-result)))
            lexical-facts pairs)))
+
+(defn- double-storage-leaf? [expression]
+  (or (symbol? expression) (instance? Double expression)))
+
+(defn- double-storage-initializer? [expression]
+  (or (double-storage-leaf? expression)
+      (when-let [{:keys [contract operand]} (completion/canonical-parts expression)]
+        (and (= completion/object-input-contract contract)
+             (double-storage-leaf? operand)))
+      (and (seq? expression)
+           (or (and (= 'clojure.core/double (first expression))
+                    (= 2 (count expression))
+                    (double-storage-leaf? (second expression)))
+               (and (= '.invk (first expression)) (symbol? (second expression))
+                    (every? double-storage-leaf? (nnext expression)))))))
+
+(defn- present-double-payload? [{:keys [carrier presence builtin-class]}]
+  (and (= :present presence)
+       (or (identical? Double/TYPE carrier)
+           (and (contains? #{Object Double} carrier)
+                (identical? Double builtin-class)))))
+
+(defn- double-storage-annotations? [expression]
+  ;; An annotation supplies NO carrier fact. Once the independent physical
+  ;; construction proves Double, reject a contradictory width the downstream
+  ;; scalar emitter could otherwise honor. Object storage annotations are not
+  ;; silently reinterpreted as primitive producer evidence.
+  (every? (fn [tag]
+            (or (nil? tag)
+                (contains? #{Object Double Double/TYPE} tag)
+                (contains? #{Object Double/TYPE}
+                           (get types/tag->java-class (get types/boxed->primitive-tag tag tag)))))
+          ((juxt :tag :raster.type/tag) (meta expression))))
+
+(defn- double-storage-call-entry [expression locals]
+  (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+        (descriptor/call-description expression)]
+    (when (and dispatch? (not lexical-callee)
+               (not (contains? locals implementation-op)))
+      (when-let [definition (method-entry/observed-selected-definition
+                            :typed semantic-op implementation-op (count arguments))]
+        (let [entry (method-entry/selected-source-entry-carriers
+                     semantic-op implementation-op (count arguments) (:source-var definition))]
+          (when (and entry (every? #(identical? Double/TYPE %) (:parameter-carriers entry)))
+            entry))))))
+
+(defn- construct-double-storage-source
+  "Representation-only construction over the actual physical binding plan.
+   Whole-spine closure is also the use check: no Object observation/escape or
+   unknown operation can consume a replaced snapshot. Original calls stay at
+   their original bindings. Original facts are never retagged as primitives."
+  [source parameters entry source-ns]
+  (let [parameter-locals ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/resolved-parameter-locals)
+                          (:invocation-method entry) parameters)
+        context {:source-ns source-ns}
+        used (into (into (set parameters) (take-nth 2 (second source))) (util/free-syms source))
+        ;; The shared physical planner rejects duplicate/rebound binders,
+        ;; including parameter shadowing. No earlier replacement can survive a
+        ;; new definition: source shadowing must first pass normal SSA hygiene.
+        plan (when parameter-locals
+               ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/plan-flat-bindings)
+                (second source) parameter-locals context))
+        leaf-fact (fn [expression facts]
+                    (if (instance? Double expression)
+                      {:carrier Double/TYPE :presence :present :builtin-class Double}
+                      (get facts expression)))]
+    (when plan
+      (loop [rows (:bindings plan)
+             facts (zipmap parameters (repeat {:carrier Double/TYPE :presence :present}))
+             replacements {} bindings [] used used]
+        (if-let [{:keys [binder initializer before raw-type completion]} (first rows)]
+          (let [parts (raster.compiler.core.value-completion/canonical-parts initializer)
+                cast? (and (seq? initializer) (= 'clojure.core/double (first initializer)))
+                call? (and (seq? initializer) (= '.invk (first initializer)))
+                fact
+                (cond
+                  (double-storage-leaf? initializer) (leaf-fact initializer facts)
+                  parts (when-let [operand-fact (leaf-fact (:operand parts) facts)]
+                          (when (and (present-double-payload? operand-fact)
+                                     (intrinsic-source/observe-original! source-ns 'clojure.core/double))
+                            (assoc operand-fact :carrier Object :builtin-class Double)))
+                  cast? (when (and (present-double-payload? (leaf-fact (second initializer) facts))
+                                   (intrinsic-source/observe-original! source-ns 'clojure.core/double))
+                          {:carrier Double/TYPE :presence :present :builtin-class Double})
+                  call?
+                  (let [arguments (vec (nnext initializer))
+                        argument-facts (mapv #(leaf-fact % facts) arguments)
+                        invocation ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/typed-invocation-plan)
+                                    (second initializer) (count arguments) before
+                                    ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/binding-initializer-context)
+                                     context))
+                        payload (when (every? present-double-payload? argument-facts)
+                                  (scalar-body/checked-selected-fp-payload initializer argument-facts))]
+                    (when (and payload (:global? invocation)
+                               (= (:method invocation) (get-in payload [:bridge :invocation-method]))
+                               (= (:parameter-carriers invocation) (:parameter-carriers payload))
+                               (every? #(identical? Double/TYPE %) (:parameter-carriers payload))
+                               (identical? Double/TYPE (:payload-carrier payload))
+                               (identical? Object (:interface-result-class invocation)))
+                      {:carrier Object :presence :present :builtin-class Double})))
+                expected (when fact (if (identical? Double/TYPE (:carrier fact)) :double :ref))
+                checkcast (:checkcast-class completion)]
+            (when (and (present-double-payload? fact) (= expected raw-type) (nil? checkcast)
+                       (double-storage-annotations? binder)
+                       (double-storage-annotations? initializer)
+                       (every? double-storage-annotations?
+                               (cond parts [(:operand parts)]
+                                     cast? [(second initializer)]
+                                     call? (nnext initializer)
+                                     :else [])))
+              (let [new-id (if parts
+                             (loop [candidate (gensym "numeric_snapshot_")]
+                               (if (contains? used candidate)
+                                 (recur (gensym "numeric_snapshot_"))
+                                 (with-meta candidate {:raster.type/tag 'double})))
+                             binder)
+                    new-init (util/subst-syms replacements
+                                             (if parts
+                                               (list 'clojure.core/double (:operand parts))
+                                               initializer))]
+                (recur (next rows) (assoc facts binder fact)
+                       (cond-> replacements parts (assoc binder new-id))
+                       (conj bindings new-id new-init) (conj used new-id)))))
+          (when (and (present-double-payload? (leaf-fact (nth source 2) facts))
+                     (double-storage-annotations? (nth source 2)))
+            (util/remake-from source
+                              (list 'let* bindings (util/subst-syms replacements (nth source 2))))))))))
+
+(defn with-closed-double-storage-source
+  "Consume a bounded primitive/Object/primitive source construction lexically.
+   The caller owns the actual frontend-to-source transformation and final target
+   emission. Source Method Classes, not native ABI/dtypes, seed the physical plan.
+   Only a flat all-Double numerical spine is admitted. Boxed AD entry contracts,
+   identity observations, arbitrary casts/calls and escaping Objects abstain.
+
+   Explicit preparation compiles only observed original receivers, then checks
+   their ORIGINAL observations; any change discards the whole owning attempt.
+   consume! receives the new source and a finalizer. The latter accepts the
+   actual target parameter order, scalar ABI and result ABI, and returns the
+   existing definition guard to run AFTER all public input conversions. Neither
+   construction products nor a proof map escape into IR/options."
+  [frontend source-var source parameters prepare! consume!]
+  (when (and method-entry/*emission-inputs* frontend
+             (seq? source) (= 'let* (first source)) (= 3 (count source))
+             (vector? (second source)) (even? (count (second source)))
+             (vector? parameters) (every? symbol? parameters)
+             (completion/contains-completion? source)
+             (every? double-storage-initializer? (take-nth 2 (rest (second source))))
+             (double-storage-leaf? (nth source 2)))
+    (method-entry/call-with-optional-definition-inputs
+     (fn []
+       (let [selection (method-entry/assert-frontend-selection! frontend source-var)
+             entry (method-entry/frontend-body-entry-carriers frontend source-var)
+             source-ns (get-in frontend [:source-entry :source-ns])
+             locals (into (set parameters) (take-nth 2 (second source)))
+             calls (filter #(and (seq? %) (= '.invk (first %)))
+                           (take-nth 2 (rest (second source))))
+             call-entries (mapv #(double-storage-call-entry % locals) calls)]
+         (when (and entry (= parameters (:parameters entry))
+                    (every? #(identical? Double/TYPE %) (:parameter-carriers entry))
+                    (every? some? call-entries) (:receiver-var selection))
+           (method-entry/prepare-owned-definition-inputs!
+            prepare! (conj (mapv #(get-in % [:definition :receiver-var]) call-entries)
+                           (:receiver-var selection)))
+           (when-let [bridge (method-entry/frontend-boxed-entry-bridge frontend)]
+             ;; The actual compute return may unbox an Object body result.
+             ;; The whole-source fold below proves that very terminal payload
+             ;; is a present builtin Double; no logical return annotation
+             ;; discharges Number.doubleValue or changes an Object fact.
+             (when (and (= :boxed-primitive-static-return (:kind bridge))
+                        (identical? Double/TYPE (:payload-carrier bridge))
+                        (identical? Double/TYPE
+                                    (.getReturnType ^java.lang.reflect.Method (:compute-method bridge)))
+                        (= (:invocation-method entry) (:invocation-method bridge))
+                        (= (:parameter-carriers entry) (:parameter-carriers bridge))
+                        (= :double (get-in bridge [:body-context :return-stack-type]))
+                        (contains? #{:ref :double} (get-in bridge [:body-context :emitted-result-type]))
+                        (= (completion/bytecode-operand-context {})
+                           (get-in bridge [:body-context :result-context])))
+               (when-let [constructed (construct-double-storage-source source parameters entry source-ns)]
+                 (consume!
+                  constructed
+                  (fn [target-parameters target-scalars target-result]
+                    (when-not (and (= parameters target-parameters)
+                                   (= (vec (repeat (count parameters) :double)) target-scalars)
+                                   (= :double target-result))
+                      (throw (ex-info "scalar storage construction has a different target ABI"
+                                      {:reason :scalar-storage-target-mismatch})))
+                    (method-entry/assert-frontend-selection! frontend source-var)
+                    (let [historical @method-entry/*emission-inputs*]
+                      (method-entry/assert-definition-inputs-current! historical)
+                      (fn [] (method-entry/assert-definition-inputs-current! historical))))))))))))))

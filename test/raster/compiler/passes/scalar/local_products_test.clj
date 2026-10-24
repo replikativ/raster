@@ -1,11 +1,13 @@
 (ns raster.compiler.passes.scalar.local-products-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.core :refer [deftm]]
+            [raster.core :as rcore :refer [deftm]]
             [raster.numeric :as n]
             [raster.ad.reverse :as reverse]
             [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]
             [raster.compiler.passes.scalar.local-products :as products]))
 
 (deftm projected-product [x :- Double] :- Double
@@ -36,6 +38,121 @@
           (is (= (projected-product x) (compiled x))))
         (finally (when (instance? java.lang.AutoCloseable compiled)
                    (.close ^java.lang.AutoCloseable compiled)))))))
+
+(deftm native-product-with-unused-input [x :- Double unused :- Double] :- Double
+  (let [scaled (n/* x 2.0)
+        values [x scaled]]
+    (n/+ (nth values 0) (nth values 1))))
+
+(defn- observed-double [events label value]
+  (proxy [Number] []
+    (intValue [] (throw (AssertionError. "unexpected integral conversion")))
+    (longValue [] (throw (AssertionError. "unexpected integral conversion")))
+    (floatValue [] (throw (AssertionError. "unexpected Float conversion")))
+    (doubleValue []
+      (swap! events conj label)
+      (if (instance? Throwable value) (throw value) (double value)))))
+
+(deftest native-object-storage-keeps-entry-conversions-before-the-source-guard
+  (let [compiled (pipeline/compile-aot #'native-product-with-unused-input :target :c :dtype :double)
+        events (atom [])
+        x (observed-double events :x 2.0)
+        unused (observed-double events :unused 17.0)
+        receiver (ns-resolve 'raster.numeric '_star__m_double_double-impl)]
+    (try
+      (is (= 6.0 (compiled x unused)))
+      (is (= [:x :unused] @events))
+      (reset! events [])
+      (is (= :native-call-arity
+             (:reason (ex-data (try (compiled x unused 1.0) nil
+                                   (catch clojure.lang.ExceptionInfo error error))))))
+      (is (empty? @events) "arity refusal precedes every public conversion")
+      ;; This is an actual selected receiver mutation, not fabricated carrier
+      ;; evidence. No replacement numerical helper is ever executed.
+      (with-redefs-fn
+        {receiver (Object.)}
+        (fn []
+          (is (thrown? NullPointerException (compiled nil unused)))
+          (is (thrown? ClassCastException (compiled "not a Number" unused)))
+          (is (empty? @events))
+          (let [error (try (compiled x unused) nil
+                           (catch clojure.lang.ExceptionInfo error error))]
+            (is (= :stale-definition-proof-input (:reason (ex-data error))))
+            (is (= [:x :unused] @events)
+                "both original conversions occur exactly once before freshness denial"))
+          (reset! events [])
+          (let [failure (ex-info "unused conversion failed" {:conversion :unused})
+                actual (try (compiled x (observed-double events :unused failure)) nil
+                            (catch clojure.lang.ExceptionInfo error error))]
+            (is (identical? failure actual))
+            (is (= [:x :unused] @events)))))
+      (reset! events [])
+      ;; The source is current when invocation starts. A guard before the
+      ;; conversions would miss this mutation and incorrectly execute C.
+      (with-redefs-fn
+        {receiver (var-get receiver)}
+        (fn []
+          (let [mutating-x
+                (proxy [Number] []
+                  (intValue [] (throw (AssertionError. "unexpected integral conversion")))
+                  (longValue [] (throw (AssertionError. "unexpected integral conversion")))
+                  (floatValue [] (throw (AssertionError. "unexpected Float conversion")))
+                  (doubleValue []
+                    (swap! events conj :mutating-x)
+                    (alter-var-root receiver (constantly (Object.)))
+                    2.0))
+                error (try (compiled mutating-x unused) nil
+                           (catch clojure.lang.ExceptionInfo error error))]
+            (is (= [:mutating-x :unused] @events)
+                "even a mutation in the first conversion precedes the second conversion")
+            (is (= :stale-definition-proof-input (:reason (ex-data error)))))))
+      (finally (when (instance? java.lang.AutoCloseable compiled)
+                 (.close ^java.lang.AutoCloseable compiled))))))
+
+(deftm native-product-observed-identity [x :- Double] :- Double
+  (let [values [x x]]
+    (if (identical? (nth values 0) (nth values 1)) 1.0 2.0)))
+
+(deftm native-product-checked-integral [x :- Double] :- Double
+  (let [values [(double (long x)) x]]
+    (n/+ (nth values 0) (nth values 1))))
+
+(deftest native-object-storage-does-not-admit-identity-or-checked-integral-work
+  (doseq [source [#'native-product-observed-identity #'native-product-checked-integral]]
+    (is (= :unclosed-c-family-value-completion
+           (try (pipeline/compile-aot source :target :c :dtype :double) :unexpected-admission
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "the bounded transport constructor cannot grant either operation")))
+
+(deftm native-product-double-literal [x :- Double] :- Double
+  (let [precise 1.0000000596046448
+        values [x precise]]
+    (n/+ (nth values 0) (nth values 1))))
+
+(deftest native-object-storage-retains-double-emission-policy
+  (let [compiled (pipeline/compile-aot #'native-product-double-literal :target :c :dtype :double)]
+    (is (= 1.0000000596046448 (compiled 0.0))))
+  (is (= :unclosed-c-family-value-completion
+         (try (pipeline/compile-aot #'native-product-double-literal :target :c :dtype :float)
+              :unexpected-admission
+              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+      "a Double entry/return does not establish the C emitter's literal policy"))
+
+(deftest scalar-storage-construction-uses-the-existing-ssa-shadow-boundary
+  (method-entry/call-with-definition-inputs
+   (fn []
+     (let [source-var (:resolved-var (pipeline/deftm-frontend-facts #'projected-product :double))
+           _ (rcore/prepare-deftm-frontend! source-var)
+           frontend (method-entry/original-source-frontend source-var)
+           entry (method-entry/frontend-body-entry-carriers frontend source-var)
+           parameters (vec (:parameters entry))
+           parameter (first parameters)
+           snapshot (list completion/completion-symbol completion/object-input-contract parameter)
+           source (list 'let* ['p snapshot 'p (list 'clojure.core/double parameter)] 'p)]
+       (is (some? entry) "use the actual entry Method, never invented local carrier facts")
+       (is (nil? (#'normal-return/construct-double-storage-source
+                  source parameters entry (get-in frontend [:source-entry :source-ns])))
+           "the shared physical SSA planner refuses a rebinding before any replacement escapes")))))
 
 (defn- run [expression & arguments]
   (binding [*unchecked-math* false]

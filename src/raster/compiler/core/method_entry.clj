@@ -922,6 +922,16 @@
   (frontend-emission-observation
    frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-primitive-body-return-bridge) %)))
 
+(defn frontend-boxed-entry-bridge
+  "Observe the actual public Object-input plans and wrapper/compute return edge.
+   Unlike the primitive-body query this retains a possible body-return coercion;
+   it does NOT discharge that coercion or establish a numerical payload. The
+   consumer must join its independently constructed source result to the exact
+   recorded context before using a primitive target return."
+  [frontend]
+  (frontend-emission-observation
+   frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-boxed-entry-bridge) %)))
+
 (defn frontend-reference-return-bridge
   "Observe the exact owned implementation's reference→Object pass-through.
    Preserve its whole body context and actual Method-return CHECKCAST. This grants

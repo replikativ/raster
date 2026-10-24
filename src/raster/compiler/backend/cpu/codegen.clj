@@ -195,9 +195,18 @@
    (load-kernel so name n-ptrs scalars :void))
   ([so name n-ptrs scalars return-type]
    (load-kernel so name n-ptrs scalars return-type {}))
+  ([so name n-ptrs scalars return-type options]
+   (load-kernel so name n-ptrs scalars return-type options nil))
   ([so name n-ptrs scalars return-type
     {:keys [call-policy critical-contract pointer-access no-alias? object-distinct-pairs]
-     :or {call-policy :ordinary}}]
+     :or {call-policy :ordinary}} source-guard!]
+   ;; Internal lexical continuation, not an ABI field or a runtime-check waiver.
+   (when (and source-guard!
+              (not (and (fn? source-guard!) (zero? n-ptrs)
+                        (vector? scalars) (every? #{:double} scalars)
+                        (= :double return-type) (= :ordinary call-policy))))
+     (throw (ex-info "Source guard requires the exact scalar Double adapter"
+                     {:reason :native-source-guard-abi})))
    (when-not (or (= :void return-type) (contains? scalar-layout return-type))
      (throw (ex-info "Unsupported native scalar return ABI"
                      {:reason :unsupported-native-return :return-type return-type})))
@@ -251,6 +260,9 @@
                (throw (ex-info "Too many native kernel arguments"
                                {:reason :native-call-arity :expected arity
                                 :actual (+ index (count remaining))})))))
+         ;; All public input conversions, including unused parameters, precede
+         ;; freshness validation. A custom Number conversion runs exactly once.
+         (when source-guard! (source-guard!))
          (if (= call-policy :critical)
            (.invokeWithArguments ^java.lang.invoke.MethodHandle mh arguments)
            (native-call/invoke-ordinary! mh arguments n-ptrs access no-alias?)))))))

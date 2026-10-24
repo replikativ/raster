@@ -28,6 +28,7 @@
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -35,6 +36,8 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.scalar.host-entry-contract :as host-entry]
+            [raster.compiler.passes.scalar.normal-return :as normal-return]
+            [raster.core :as rcore]
             [raster.compiler.passes.scalar.peephole :as peephole]))
 
 (def ^:dynamic *simd-preamble*
@@ -169,18 +172,20 @@
         (check! body (conj scalars ordinal) true))))
   source)
 
-(defn fused-scalar-form
+(defn- fused-scalar-form*
   "Run compile-aot's forward passes with the SCALAR backend (no SIMD lowering)
   to get the inlined, buffer-fused body as plain loops/lets — the dialect the C
   emitter consumes."
-  [f-var dtype & {:keys [simd? no-alias?] :or {simd? false no-alias? true}}]
+  [f-var dtype simd? no-alias? frontend]
   (when-not (boolean? no-alias?)
     (throw (ex-info "Native :no-alias? must be Boolean"
                     {:reason :invalid-native-alias-policy :no-alias? no-alias?})))
-  (let [wb     (pl/get-walked-body f-var dtype)
-        params (pl/get-params f-var dtype)
+  (let [params (if frontend (get-in frontend [:source-entry :params]) (pl/get-params f-var dtype))
+        wb     (if frontend (pl/normalize-source-bindings (:body frontend) params)
+                   (pl/get-walked-body f-var dtype))
         raw    (if (= 1 (count wb)) (first wb) (list* 'do wb))
-        source-ns (or (when (var? f-var) (.ns ^clojure.lang.Var f-var)) *ns*)
+        source-ns (or (get-in frontend [:source-entry :source-ns])
+                      (when (var? f-var) (.ns ^clojure.lang.Var f-var)) *ns*)
         active (pl/clean-params params)
         penv   (pl/build-param-env f-var dtype)
         ;; :simd? false always keeps the JVM Vector-API lowering OFF; :keep-par-forms?
@@ -198,6 +203,11 @@
       {:form (if program (:source program) lowered)
        :parallel-program program
        :params active :param-env penv})))
+
+(defn fused-scalar-form
+  "Run the existing scalar forward pipeline; no source completion is discharged."
+  [f-var dtype & {:keys [simd? no-alias?] :or {simd? false no-alias? true}}]
+  (fused-scalar-form* f-var dtype simd? no-alias? nil))
 
 (defn- strip-index-casts [x]
   (loop [x x]
@@ -833,8 +843,12 @@
 
 (defn- native-call-wrapper
   "Compile immutable argument/result selectors once. Invocation scratch stays local."
-  [native params array-params scalar-params len-order heap-buffers scalar-bindings
-   result-shape result-syms reuse-buffers?]
+  ([native params array-params scalar-params len-order heap-buffers scalar-bindings
+    result-shape result-syms reuse-buffers?]
+   (native-call-wrapper native params array-params scalar-params len-order heap-buffers scalar-bindings
+                        result-shape result-syms reuse-buffers? nil))
+  ([native params array-params scalar-params len-order heap-buffers scalar-bindings
+    result-shape result-syms reuse-buffers? source-guard!]
   (let [param-index (zipmap params (range))
         buffer-index (zipmap (map first heap-buffers) (range))
         array-indices (mapv #(param-index (first %)) array-params)
@@ -855,6 +869,9 @@
       ;; Keep the ordinary native adapter (including ownership/alias admission),
       ;; but do not construct an unused size environment on every density call.
       (fn [& args]
+        (when (and source-guard! (not= (count params) (count args)))
+          (throw (ex-info "Native source argument count does not match its entry"
+                          {:reason :native-call-arity :expected (count params) :actual (count args)})))
         (let [args (vec args)
               arguments (into (mapv #(nth args %) abi-indices)
                               (map #(count (nth args (first %))) length-plan))]
@@ -880,9 +897,9 @@
             native-result
             (let [results (mapv (fn [[kind i]]
                               (case kind :input (nth args i) :buffer (nth bufs i) nil)) result-plan)]
-              (if (= :vector result-shape) results (first results))))))))))
+              (if (= :vector result-shape) results (first results)))))))))))
 
-(defn compile-aot-c
+(defn- compile-aot-c-source
   "Compile a deftm var to a single native C function via the monolithic CPU-C
   backend. Returns a fn of the deftm's args that allocates output buffers, calls
   the native code with ordinary FFM calls, and returns the result buffer.
@@ -896,13 +913,7 @@
 
   With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
   __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
-  [f-var dtype & {:keys [simd? reuse-buffers? no-alias?] :or {simd? false no-alias? true}}]
-  ;; Native code freezes definition-dependent frontend decisions just as JVM
-  ;; AOT does. Own them BEFORE normalization; post-hoc snapshots cannot certify
-  ;; old decisions. The shared owner retries the entire compilation, never the
-  ;; numerical call. Staging/workspace allocation remains invocation-local.
-  (method-entry/call-with-definition-inputs
-   (fn []
+  [f-var dtype reuse-buffers? no-alias? source-result finish-source!]
   (let [return-tag (:return-tag (pl/deftm-frontend-facts f-var dtype))
         return-type (some-> return-tag dtype/dtype-for-scalar-tag)
         return-class (get types/tag->java-class return-tag)
@@ -912,7 +923,7 @@
             (throw (ex-info "Unsupported native scalar return ABI"
                             {:reason :unsupported-native-return :return-tag return-tag})))
         {:keys [form parallel-program params param-env]}
-        (fused-scalar-form f-var dtype :simd? simd? :no-alias? no-alias?)
+        source-result
         form (recover-rectangular-maps form)
         {nform :form length-syms :length-syms} (normalize-for-c form)
         ;; The lowering pipeline uses hygienic gensyms. Canonicalize the final
@@ -967,6 +978,12 @@
               (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers
                          length-syms stripped :return-type (or return-type :void)
                          :written-pointers written :no-alias? no-alias?))
+        source-guard! (when finish-source!
+                        (when (or parallel-program (seq array-params) (seq buffers)
+                                  (seq len-order) (not= :native-scalar result-shape))
+                          (throw (ex-info "Scalar source construction acquired storage or scheduled work"
+                                          {:reason :scalar-storage-target-mismatch})))
+                        (finish-source! (mapv first scalar-params) scalar-ffm return-type))
         so  (cpu/compile-source! src)
         pointer-access (into (mapv (fn [[sym _]] (if (written sym) :read-write :read))
                                    array-params)
@@ -975,13 +992,47 @@
                                 (+ (count array-params) (count heap-buffers))
                                 scalar-ffm (or return-type :void)
                                 {:pointer-access pointer-access :no-alias? (if no-alias? true :same-region)
-                                 :object-distinct-pairs object-pairs})
+                                 :object-distinct-pairs object-pairs}
+                                source-guard!)
         wrapper (native-call-wrapper native params array-params scalar-params len-order
                                      heap-buffers scalar-bindings result-shape result-syms
-                                     reuse-buffers?)]
+                                     reuse-buffers? source-guard!)]
     (with-meta
       wrapper
       {:c-source src :kernel-name kernel-name :native-call-policy :ordinary
        :native-alias-policy (if no-alias? :disjoint :same-region-pointwise)
        :entry-preconditions (:preconditions entry-contract)
-       :native-pointer-access pointer-access})))))
+       :native-pointer-access pointer-access})))
+
+(defn compile-aot-c
+  "Compile through the existing scalar C backend. Exact Double storage
+   constructions retain the original definition guard after public conversions;
+   all other sources keep the ordinary backend's completion refusal boundary."
+  [f-var dtype & {:keys [simd? reuse-buffers? no-alias?] :or {simd? false no-alias? true}}]
+  (method-entry/call-with-definition-inputs
+   (fn []
+     (or
+      (when (and (= :double dtype) (not simd?))
+        (method-entry/call-with-optional-definition-inputs
+         (fn []
+           (let [{:keys [resolved-var return-tag]} (pl/deftm-frontend-facts f-var dtype)
+                 ;; Source freezing is not physical preparation or admission.
+                 frontend (when (= :double (dtype/dtype-for-scalar-tag return-tag))
+                            (rcore/prepare-deftm-frontend! resolved-var)
+                            (method-entry/original-source-frontend resolved-var))
+                 entry (when frontend (method-entry/frontend-body-entry-carriers frontend resolved-var))]
+             (when (and entry (every? #(identical? Double/TYPE %) (:parameter-carriers entry)))
+               (let [source-result (source-policy/call-with-policy
+                                    (get-in frontend [:source-entry :source-policy])
+                                    #(fused-scalar-form* resolved-var dtype simd? no-alias? frontend))]
+                 (when (nil? (:parallel-program source-result))
+                   (normal-return/with-closed-double-storage-source
+                    frontend resolved-var (:form source-result) (:params source-result)
+                    rcore/ensure-current-owned-bytecode!
+                    (fn [source finish!]
+                      (compile-aot-c-source f-var dtype reuse-buffers? no-alias?
+                                            (assoc source-result :form source) finish!))))))))))
+      ;; Refusal adopts no candidate-only evidence and preserves the original
+      ;; TC/walking route. The unchanged C completion barrier still applies.
+      (compile-aot-c-source f-var dtype reuse-buffers? no-alias?
+                            (fused-scalar-form f-var dtype :simd? simd? :no-alias? no-alias?) nil)))))
