@@ -5210,7 +5210,7 @@
   ([body param-env]
    (let [body (-> body retain-source-scan-checkpoint-obligations
                   retain-source-memory-evaluations)
-         body (local-products/lower-local-products body)
+         body (local-products/lower-local-products body {:lexical-inputs (vec (keys param-env))})
          body (inline/inline-transparent-lexical-calls body param-env)
          ;; A source-written reduction must project its initializer and step
         ;; before broad ANF is allowed to move either across the binder.
@@ -6555,7 +6555,8 @@
            source (first walked-body)
            normalized (-> source
                           (local-products/lower-local-products
-                           {:source-ns source-ns :completed-presence? true})
+                           {:source-ns source-ns :completed-presence? true
+                            :lexical-inputs params})
                           inline/flatten-nested-lets)
            [_ bindings outputs] (when (seq? normalized) normalized)
            ids (when (vector? bindings) (vec (take-nth 2 bindings)))

@@ -17,6 +17,7 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.binding-completion :as binding-completion]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.source-entry-lineage-test :as lineage]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.passes.scalar.host-abstract-value :as host-av]
             [raster.compiler.passes.parallel.patterns :as patterns]
@@ -24,6 +25,67 @@
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
+
+(deftest reference-entry-projection-requires-the-actual-unshadowed-formal
+  (let [{:keys [source]} (#'lineage/fresh-entry)
+        parameters '[values count scale reference]
+        scope (:ns (meta source))
+        array-class (.arrayType Double/TYPE)
+        checked (fn [carrier operand]
+                  (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier) operand))
+        baseline-options {:dtype :double :source-ns scope :lexical-inputs parameters
+                          :array-types {'values :double} :scalar-types {'count :long 'scale :double}}
+        normalize (fn [body changes]
+                    (entry/call-with-definition-inputs
+                     #(frontend/normalize-source
+                       body (merge baseline-options
+                                   {:source-var source
+                                    :source-binding-context
+                                    (binding-completion/capture-resolution-context
+                                     #'bytecode/binding-completion-plan)} changes))))
+        binder (with-meta 'array-input {:tag 'doubles :raster.type/tag 'doubles})
+        body (list 'let* [binder (checked array-class 'values)] 'array-input)
+        projected (normalize body {})]
+    (is (= 'values (get (into {} (map vec) (partition 2 (second projected))) 'array-input)))
+    (is (= 'array-input (last projected)) "the existing alias/return path owns the public projection")
+    (let [snapshot (with-meta 'snapshot {:tag 'Object :raster.type/tag 'doubles})
+          object-input #(completion/complete-value completion/object-input-contract %)
+          chained (list 'let* [snapshot (object-input 'values)
+                              binder (checked array-class 'snapshot)] 'array-input)
+          result (normalize chained {})]
+      (is (not-any? completion/boxed-reference-input-parts (take-nth 2 (rest (second result))))
+          "the actual entry Class survives an exact, independently checked Object alias")
+      (doseq [blocked [(list 'let* [(with-meta 'snapshot {:tag 'String :raster.type/tag 'doubles})
+                                    (object-input 'values)
+                                    binder (checked array-class 'snapshot)] 'array-input)
+                       (list 'let* [snapshot (vary-meta (object-input 'values)
+                                                       assoc :raster.effect/preserve-evaluation true)
+                                    binder (checked array-class 'snapshot)] 'array-input)
+                       (list 'let* [binder (checked array-class 'snapshot)
+                                    snapshot (object-input 'values)] 'array-input)]]
+        (is (some completion/boxed-reference-input-parts
+                  (take-nth 2 (rest (second (normalize blocked {})))))
+            "a checked/effectful/future intermediate cannot establish formal provenance")))
+    (doseq [[candidate changes]
+            [[body {:lexical-inputs '[reference count scale values]}]
+             [body {:array-types {'values :float}}]
+             [body {:source-var nil}]
+             [(list 'let* [binder (checked array-class 'reference)] 'array-input)
+              {:array-types {'values :double 'reference :double}}]
+             [(list 'let* [binder (checked (.arrayType Float/TYPE) 'values)] 'array-input) {}]
+             [(list 'let* [(with-meta 'array-input {:tag 'String})
+                          (checked array-class 'values)] 'array-input) {}]
+             [(list 'let* ['values '(clojure.core/float-array 1)
+                          binder (checked array-class 'values)] 'array-input) {}]
+             [(list 'let* [binder (vary-meta (checked array-class 'values)
+                                            assoc :raster.effect/preserve-evaluation true)]
+                    'array-input) {}]]]
+      (let [unchanged (frontend/normalize-source candidate (merge baseline-options changes))
+            result (normalize candidate changes)]
+        (is (= unchanged result)
+            "declarations, incompatible storage, Object formals, shadowing and independent checks cannot grant the projection")))
+    (is (nil? (entry/source-var-body-entry-carriers source))
+        "carrier evidence remains an owned compiler query, not a process-wide hint")))
 
 (deftest dead-object-snapshots-respect-lexical-binding-completion
   (let [scope (the-ns 'raster.compiler.passes.parallel.typed-soac-frontend-test)
@@ -90,6 +152,22 @@
                              'still-reads 'snapshot] 'producer)]
       (is (= source (normalize source))
           "deadness uses the original suffix, not transitive producer DCE"))))
+
+(deftest object-buffer-storage-identity-does-not-erase-evaluation-obligations
+  (let [object-input #(completion/complete-value completion/object-input-contract %)
+        flagged (vary-meta (object-input 'x) assoc :raster.effect/preserve-evaluation true)
+        source (list 'let* ['blocked flagged 'chained (object-input 'blocked)
+                           'allowed (object-input 'x)] '[chained allowed])
+        normalized (frontend/normalize-source
+                    source {:dtype :double :array-types {'x :double} :lexical-inputs '[x]})
+        pairs (into {} (map vec) (partition 2 (second normalized)))]
+    (is (completion/object-input-parts (get pairs 'blocked)))
+    (is (true? (:raster.effect/preserve-evaluation (meta (get pairs 'blocked)))))
+    (is (= 'blocked (:operand (completion/object-input-parts (get pairs 'chained))))
+        "the blocked completion cannot establish an eliminable downstream alias")
+    (is (= 'x (get pairs 'allowed)))
+    (is (= '[chained x] (last normalized))
+        "an independent admitted alias cannot launder the blocked alias at return")))
 
 (deftest object-buffer-aliases-use-the-actual-destination-before-later-uses
   (let [object-input #(completion/complete-value completion/object-input-contract %)

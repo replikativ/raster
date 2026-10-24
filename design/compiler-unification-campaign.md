@@ -2,9 +2,72 @@
 
 ## Reconciled execution plan
 
-### October 24 active producer-consolidation sequence
+### October 24 audited correctness/consolidation closure
 
-Keep the original eight objectives below. The current landing order is:
+Keep all eight original objectives below. This phase is their correctness and
+qualification prerequisite, not a replacement campaign or a claim of arbitrary
+Clojure/AD completeness. The audit at `fe0b2375` groups remaining failures by
+shared producer boundary, rather than treating each test as a separate feature.
+
+| Order | Boundary and owner | Required closure |
+| --- | --- | --- |
+| 1 | Source entry → invocation prefix (`method-entry`, frontend, `invocation-plan`) | Use authenticated actual formal Classes to prove redundant internal reference checks. Public declaration tags alone are not authority. For genuine Object→array inputs, retain the check or establish an explicit entry adapter. |
+| 2 | Complete source result/continuation (`structured-control-route`) | Every surviving operation has an executor or replayable elimination proof, and every public result has an exact projection. Used boxing and checked Float completion are separate from dead Object snapshots. |
+| 3 | AD structural/precision producers (`reverse`, `jvp`, normalized scalar programs) | Close the observed Object-operand transpose, mixed-Float ordered carry and indexed-write/gather cases with original primal ordering and conversions intact. Do not weaken checkpoint denial or add a second operator registry. |
+| 4 | Initialization and physical write coverage (`typed-soac-initialization`, `write-coverage`) | Resolve retained native-provider obligations and failed positive rectangular-coverage cases independently. Preserve constructor capacity, exact address widths and ordered host reads. |
+| 5 | Workload composition and state versions (`normalized-program-bundle`, `Compiled`, `LinkPlan`) | Qualify real forward→VJP→optimizer execution and repeated resident replay, including public training/distributed fixtures and alias/lease/version failures before mutation. |
+| 6 | Compilation cost and final qualification | Measure bounded GSDM phase costs, identify real allocation/bytecode regressions versus obsolete assertions, remove covered duplication, and qualify the complete exact-head workload set. |
+
+The entry investigation has confirmed registered cold typed-entry evidence for
+the LoRA root: its public array formals are actual Float-array Classes and remain
+nullable. `selected-source-entry-carriers` supplies that evidence without JIT.
+The separate opaque-frontend query abstains in the recorded cold probes; a fresh
+walk is not itself an owned frontend. Any projection must retain exact registered
+source/implementation correspondence and the binding's independent completion.
+This does not assert that a DeviceArray is a JVM array or authorize Class-from-dtype.
+
+Reference-entry projection also needs source-ordered physical carrier provenance:
+generated helpers first snapshot operands in Object context and then perform
+their boxed-entry checks. Exact aliases may retain a public formal's actual
+carrier only after independently proving the alias binder's completion. Storage
+aliases and logical array annotations are not that proof. Review additionally
+identified an older, separate omission hazard: generic copy propagation and
+dead-host-binding admission can erase a hinted reference binder without making
+its CHECKCAST explicit. Closing that producer boundary before simplification,
+with checked and unused binding controls, is required before claiming complete
+source-binding semantics; merely retaining a syntactic pair is insufficient.
+
+Local-product analysis now accepts explicit lexical-input membership as empty
+facts at parameter-owning preparation boundaries. This prevents a lexical read
+from acquiring a new evaluation token merely because the pass lacked its scope;
+it proves neither presence nor a physical carrier. Existing preservation markers
+are unchanged. Object-buffer normalization separately refuses to erase flagged
+completions or substitute through their bindings at return. The scoped entry
+qualification removes three of four boxed-array checks in the recorded LoRA
+producer; its remaining preserved target snapshot is still an open continuation
+obligation, not evidence of successful GPU training.
+
+Update the existing capability/compatibility ledger with each failure's owner,
+accepted or deliberately declined form, numerical/effect oracle and removal gate.
+Current node-wise AD composition is bounded but implemented; historical statements
+that all composition/transposition is missing must not override current code.
+Likewise, fixes to entry checks do not establish used scalar boxing, Float narrowing,
+general AD loops, arbitrary DAG composition or complete bounds proofs.
+
+This phase is complete only when the failure census is resolved with evidence;
+independent calculus, mixed-precision, empty-domain and effect-order controls pass;
+cold/warm/redefinition and delayed-pullback histories remain original; actual local
+device training/replay passes with dtype/shape/overlap/release failures before
+mutation; designated workload compilation meets documented budgets; and all seven
+exact-head CI contexts exist and succeed (setup, build, test, emit, OpenCL, CUDA
+compile, HIP compile). Compile-only vendor success is not runtime evidence. No
+new numerical relaxation is implied, and no remaining-commit count is established.
+
+### Producer foundations and invariants retained through closure
+
+The first two bounded foundations below have local qualification. The completion
+and workload requirements in items 3–4 remain open; none of these alone establishes
+completion of the audited phase above:
 
 1. Close fresh-process source/AD preparation regressions before further admission.
    Ordinary late-bound calls may remain recursive; only a derived consumer pins

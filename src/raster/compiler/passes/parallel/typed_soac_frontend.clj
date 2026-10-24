@@ -17,6 +17,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.binding-completion :as binding-completion]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -4009,6 +4010,80 @@
             (meta expression))
       (seq (:flags (effects/descriptor expression)))))
 
+(defn- reference-array-declarations-compatible?
+  [carrier expressions]
+  (let [element-type (some-> carrier dtype/dtype-for-jvm-array-class dtype/canon)]
+    (and element-type
+         (every? (fn [expression]
+                   (let [tag (types/sym-type-tag expression)]
+                     (or (nil? tag) (contains? #{'Object 'java.lang.Object} tag)
+                         (identical? Object tag) (identical? carrier tag)
+                         (= element-type (some-> tag dtype/dtype-for-array-tag dtype/canon)))))
+                 expressions))))
+
+(defn- project-redundant-array-entry-checks
+  "Project redundant array CHECKCASTs using source-ordered reference provenance.
+   Registered Method Classes supply the carrier evidence, never AVs or tags.
+   Exact aliases retain that evidence only after their own binding completion
+   is proved checkless. This is physical carrier evidence, not storage analysis."
+  [source {:keys [source-var lexical-inputs source-ns source-binding-context array-types]}]
+  (or
+   (when (and method-entry/*emission-inputs* (var? source-var)
+              (vector? lexical-inputs) source-binding-context
+              (instance? clojure.lang.Namespace source-ns)
+              (form/binding-form? source) (vector? (second source))
+              (even? (count (second source)))
+              (every? symbol? (take-nth 2 (second source)))
+              (some #(completion/boxed-reference-input-parts (second %))
+                    (partition 2 (second source))))
+     (method-entry/call-with-optional-definition-inputs
+      (fn []
+        (when-let [physical (method-entry/source-var-body-entry-carriers source-var)]
+          (when (and (= lexical-inputs (:parameters physical))
+                     (identical? source-ns (get-in physical [:source-entry :source-ns])))
+            (let [[head bindings & body] source
+                  ;; A source parameter shadowed by any local is not this
+                  ;; optional rule's direct public occurrence, even if another
+                  ;; pass has not seeded its alpha-renaming with public names.
+                  shadowed (set (take-nth 2 bindings))
+                  carriers (into {}
+                                 (keep (fn [[formal carrier]]
+                                         (when (and (class? carrier)
+                                                    (not (.isPrimitive ^Class carrier))
+                                                    (not (contains? shadowed formal)))
+                                           [formal {:formal formal :carrier carrier}])))
+                                 (map vector (:parameters physical) (:parameter-carriers physical)))
+                  {:keys [projected replaced]}
+                  (reduce
+                   (fn [{:keys [carriers] :as state} [id expression]]
+                     (let [checked (completion/boxed-reference-input-parts expression)
+                           object-input (completion/object-input-parts expression)
+                           operand (cond checked (:operand checked)
+                                         object-input (:operand object-input)
+                                         (symbol? expression) expression)
+                           {:keys [formal carrier] :as provenance} (get carriers operand)
+                           array-carrier? (some? (some-> carrier dtype/dtype-for-jvm-array-class))
+                           identity? (and provenance array-carrier?
+                                          (or (nil? checked)
+                                              (identical? carrier (get-in checked [:contract :target-carrier])))
+                                          (= (some-> carrier dtype/dtype-for-jvm-array-class dtype/canon)
+                                             (some-> (get array-types formal) dtype/canon))
+                                          (reference-array-declarations-compatible? carrier [id expression operand])
+                                          (not-any? snapshot-evaluation-required? [id expression operand])
+                                          (binding-completion/reference-binding-without-check?
+                                           id source-ns source-binding-context carrier))
+                           project? (and identity? checked)]
+                       (cond-> (-> state
+                                   (update :projected into [id (if project? operand expression)])
+                                   (update :carriers dissoc id))
+                         identity? (assoc-in [:carriers id] provenance)
+                         project? (update :replaced inc))))
+                   {:carriers carriers :projected [] :replaced 0}
+                   (partition 2 bindings))]
+              (when (pos? replaced)
+                (with-meta (list* head (with-meta projected (meta bindings)) body) (meta source)))))))))
+   source))
+
 (defn- prune-dead-object-snapshots
   "Remove only a checkless Object snapshot of a preceding lexical value.
    Deadness uses the ORIGINAL suffix, never a recursively pruned producer.
@@ -4097,6 +4172,7 @@
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
   (let [source (util/uniquify-rebindings (util/free-syms source) source)
+        source (project-redundant-array-entry-checks source options)
         source (prune-dead-object-snapshots source options)
         ;; A locally bound scalar can reuse a public array's name. Only free array
         ;; parameters may borrow the entry type; local arrays need their own tag.
@@ -4121,7 +4197,8 @@
                      expression (-> (util/subst-syms buffer-aliases expression)
                                     resolve-direct-allocation-alengths)
                      object-alias
-                     (when (and (:host-analysis state) (completion/object-input-parts expression))
+                     (when (and (:host-analysis state) (completion/object-input-parts expression)
+                                (not-any? snapshot-evaluation-required? [symbol expression]))
                        (host-av/binding-buffer-alias-source
                         (update-in (:host-analysis state) [:analysis :available]
                                    #(set/intersection % (:host-buffer-values state)))
@@ -4379,7 +4456,11 @@
              (map-indexed vector pairs))]
         (with-meta (list* head (vec (mapcat identity normalized))
                          (if object-buffer-alias?
-                           (map #(util/subst-syms (get-in host-analysis [:analysis :aliases]) %) body)
+                           (let [blocked (keep (fn [[id expression]]
+                                                 (when (some snapshot-evaluation-required? [id expression]) id))
+                                               normalized)
+                                 aliases (apply dissoc (get-in host-analysis [:analysis :aliases]) blocked)]
+                             (map #(util/subst-syms aliases %) body))
                            body))
           (meta source)))
       source)))

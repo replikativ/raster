@@ -28,6 +28,23 @@
   (entry/call-with-definition-inputs
    #(entry/selected-source-entry-carriers operation implementation 4 source)))
 
+(deftest source-var-carriers-reuse-the-registered-selection-not-declarations
+  (let [{:keys [source receiver] :as fixture} (fresh-entry)
+        before @body-calls
+        expected (projection fixture)
+        observed (entry/call-with-definition-inputs
+                  #(let [physical (entry/source-var-body-entry-carriers source)]
+                     {:physical physical :inputs @entry/*emission-inputs*}))]
+    (is (nil? (entry/source-var-body-entry-carriers source)) "an owner is mandatory")
+    (is (= (:parameter-carriers expected) (get-in observed [:physical :parameter-carriers])))
+    (is (= (:invocation-method expected) (get-in observed [:physical :invocation-method])))
+    (is (= :typed-source-body-entry (get-in observed [:physical :scope])))
+    (is (true? (get-in observed [:physical :pending-source?])))
+    (is (= before @body-calls) "querying formals never runs or JITs the body")
+    (with-redefs-fn {receiver (Object.)}
+      #(is (thrown? clojure.lang.ExceptionInfo
+                    (entry/assert-definition-inputs-current! (:inputs observed)))))))
+
 (deftest semantic-source-guards-survive-only-the-same-frontend-rebinding
   (let [{:keys [source receiver operation]} (fresh-entry)
         before @body-calls

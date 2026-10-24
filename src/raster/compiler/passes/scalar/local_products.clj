@@ -421,21 +421,31 @@
    an escape or expansion limit rolls the entire product rewrite back.
    Prepared producers may opt into completed lexical-result presence with
    :completed-presence? and their :source-ns. The enclosing definition-input
-   owner retains the observations; no dtype, purity or totality is inferred."
+   owner retains the observations; no dtype, purity or totality is inferred.
+   :lexical-inputs supplies only already-bound parameter membership, never
+   presence/type facts or permission to remove an existing evaluation marker."
   ([expression] (lower-local-products expression {}))
-  ([expression {:keys [source-ns completed-presence?]}]
-  (when (and completed-presence? (not (instance? clojure.lang.Namespace source-ns)))
-    (throw (ex-info "Completed presence needs its producer's source namespace"
-                    {:reason :local-product-source-context})))
-  (binding [*conditional-expansion-budget* (atom conditional-expansion-limit)
-            *consumed-evaluation-obligations* (atom #{})
-            *evaluation-dependencies* (atom {})
-            *completed-presence-source-ns* (when completed-presence? source-ns)]
-    (try (lower {} expression true)
-       (catch clojure.lang.ExceptionInfo e
-         (case (:reason (ex-data e))
-           (:local-product-escape :local-product-budget) (try (lower {} expression false)
-                                      (catch clojure.lang.ExceptionInfo e
-                                        (if (= :local-product-decline (:reason (ex-data e))) expression (throw e))))
-           :local-product-decline expression
-           (throw e)))))))
+  ([expression {:keys [source-ns completed-presence? lexical-inputs] :as options}]
+   (when (and (contains? options :lexical-inputs)
+              (not (and (or (sequential? lexical-inputs) (set? lexical-inputs))
+                        (every? symbol? lexical-inputs))))
+     (throw (ex-info "Local products require explicit lexical input names"
+                     {:reason :local-product-lexical-inputs})))
+   (when (and completed-presence? (not (instance? clojure.lang.Namespace source-ns)))
+     (throw (ex-info "Completed presence needs its producer's source namespace"
+                     {:reason :local-product-source-context})))
+   (binding [*conditional-expansion-budget* (atom conditional-expansion-limit)
+             *consumed-evaluation-obligations* (atom #{})
+             *evaluation-dependencies* (atom {})
+             *completed-presence-source-ns* (when completed-presence? source-ns)]
+     (let [scope (zipmap lexical-inputs (repeat {}))]
+       (try
+         (lower scope expression true)
+         (catch clojure.lang.ExceptionInfo e
+           (case (:reason (ex-data e))
+             (:local-product-escape :local-product-budget)
+             (try (lower scope expression false)
+                  (catch clojure.lang.ExceptionInfo e
+                    (if (= :local-product-decline (:reason (ex-data e))) expression (throw e))))
+             :local-product-decline expression
+             (throw e))))))))

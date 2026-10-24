@@ -254,6 +254,17 @@
   (let [parts (canonical-parts expression)]
     (when (= object-input-contract (:contract parts)) parts)))
 
+(defn boxed-reference-input-parts
+  "Recognize a boxed-entry reference CHECKCAST, without discharging it.
+   The actual Class remains in the original contract. No declaration, storage
+   dtype or source spelling establishes the operand's Class or presence."
+  [expression]
+  (when-let [{:keys [contract] :as parts} (canonical-parts expression)]
+    (let [carrier (:target-carrier contract)]
+      (when (and (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
+                 (class? carrier) (not (.isPrimitive ^Class carrier)))
+        parts))))
+
 (defn bytecode-context-form?
   "A canonical region whose reconstruction needs original bytecode authority.
    Shape recognition is a rewrite barrier, not proof of ownership or execution."

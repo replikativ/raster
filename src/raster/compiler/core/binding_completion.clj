@@ -27,6 +27,11 @@
 (defn- class-for-name [name initialize? loader]
   (try (Class/forName name initialize? loader) (catch Exception _ nil)))
 
+(defn- array-hint-class-name [hint]
+  ;; Existing emitter hint translation, shared with initializer-free replay.
+  (get {'objects "[Ljava.lang.Object;" 'doubles "[D" 'floats "[F"
+        'ints "[I" 'longs "[J" 'bytes "[B" 'shorts "[S"} hint))
+
 (defn- completion-plan [hint actual resolved]
   (let [checkcast (when (and resolved (not= resolved Object)) resolved)]
     {:resolved-hint-class resolved
@@ -64,8 +69,7 @@
         resolved
         (when (and hint (= actual :ref) (not (typed-interface? hint)))
           (let [loader (checked-loader context)
-                array-name (get {'objects "[Ljava.lang.Object;" 'doubles "[D" 'floats "[F"
-                                 'ints "[I" 'longs "[J" 'bytes "[B" 'shorts "[S"} hint)]
+                array-name (array-hint-class-name hint)]
             (if array-name
               ;; These primitive/bootstrap arrays follow the same first loader.
               (Class/forName array-name true loader)
@@ -79,13 +83,14 @@
 (defn- object-lookup-decision
   "Bounded initializer-free projection of the same first-loader lookup order."
   [hint source-ns loader]
-  (let [name (str hint)
+  (let [array-name (array-hint-class-name hint)
+        name (or array-name (str hint))
         primary (class-for-name name false loader)]
     (if primary
       {:branch :class-for-name :result primary}
       ;; ns-resolve can initialize dotted-name Classes via RT's own loader.
       ;; Only a direct namespace mapping is admitted by this optional proof.
-      (when (and (nil? (namespace hint)) (not (.contains name ".")))
+      (when (and (nil? array-name) (nil? (namespace hint)) (not (.contains name ".")))
         {:branch :namespace-mapping :result (.getMapping ^clojure.lang.Namespace source-ns hint)}))))
 
 (deftype ^:private BindingClassLookupInput [hint source-ns loader decision]
@@ -97,24 +102,21 @@
                       {:reason :stale-binding-completion-resolution :hint hint})))
     this))
 
-(defn object-binding-without-check?
-  "Optional proof for an otherwise independently justified Object initializer.
-   Caller owns exact Object-input syntax, lexical evaluation/deadness, and the
-   captured resolution context's correspondence to the actual emitter. No AV/dtype can
-   supply a Class. Requires explicit source namespace and active definition
-   ownership; returned permission retains the ORIGINAL lookup decision.
-   Both construction and replay avoid class initialization. Two-arg calls
-   abstain rather than inventing the emitter's defining loader."
-  ([binder source-ns] false)
-  ([binder source-ns resolution-context]
+(defn reference-binding-without-check?
+  "Prove a binding CHECKCAST redundant for an independently established actual
+   reference upper-bound Class. Caller owns formal/source carrier correspondence,
+   exact initializer syntax and its evaluation; no AV/dtype supplies a Class.
+   Requires explicit source namespace, sealed actual-policy context and active
+   definition ownership. Original policy/lookup history is retained on success.
+   Neither optional construction nor replay initializes classes."
+  [binder source-ns resolution-context reference-upper-bound]
    (entry/call-with-optional-definition-inputs
     (fn []
       (let [hint (declared-binding-hint binder)]
         (boolean
          (when (and entry/*emission-inputs* (instance? clojure.lang.Namespace source-ns)
+                    (class? reference-upper-bound) (not (.isPrimitive ^Class reference-upper-bound))
                     (symbol? hint) (pos? (count (name hint))) (not (typed-interface? hint))
-                    (or (= hint 'java.lang.Object)
-                        (and (nil? (namespace hint)) (not (.contains (str hint) "."))))
                     (instance? BindingResolutionContext resolution-context))
            (let [^BindingResolutionContext context resolution-context
                  loader (.-loader context)
@@ -122,10 +124,18 @@
                  _ (entry/assert-definition-inputs-current! inputs)
                  decision (object-lookup-decision hint source-ns loader)
                  plan (completion-plan hint :ref (:result decision))]
-             (when (and (identical? Object (:resolved-hint-class plan))
-                        (nil? (:checkcast-class plan)))
+             (when (and (class? (:resolved-hint-class plan))
+                        (.isAssignableFrom ^Class (:resolved-hint-class plan) reference-upper-bound))
                (entry/adopt-definition-inputs! inputs)
                (entry/adopt-definition-inputs!
                 {:producer-inputs [(BindingClassLookupInput. hint source-ns loader decision)]})
                (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
-               true)))))))))
+               true))))))))
+
+(defn object-binding-without-check?
+  "The Object-only specialization; a generic Object carrier cannot justify
+   narrowing to an array/reference hint. Two-arg calls abstain without loader
+   authority. Caller additionally owns exact syntax and lexical deadness."
+  ([binder source-ns] false)
+  ([binder source-ns resolution-context]
+   (reference-binding-without-check? binder source-ns resolution-context Object)))

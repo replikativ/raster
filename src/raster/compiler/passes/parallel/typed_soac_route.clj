@@ -1733,7 +1733,7 @@
    (attempt form dtype array-types {}))
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
                                    resident-uniform-input-loads?
-                                   scalar-types values lexical-inputs source-ns source-binding-context
+                                   scalar-types values lexical-inputs source-ns source-var source-binding-context
                                    abstract-machine segmented-plans?
                                    preserve-declared-array-storage? host-scalars?]
                             :as options
@@ -1742,7 +1742,7 @@
        (try
          (let [form (frontend/normalize-source
                      form (cond-> {:array-types array-types :scalar-types scalar-types
-                                   :values values :dtype dtype :source-ns source-ns
+                                   :values values :dtype dtype :source-ns source-ns :source-var source-var
                                    :source-binding-context source-binding-context}
                             (contains? options :lexical-inputs)
                             (assoc :lexical-inputs lexical-inputs)))

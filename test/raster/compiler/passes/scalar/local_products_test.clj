@@ -286,6 +286,46 @@
           source (completion/project-to-jvm-source (list 'fn* '[x calls] expression) policy)]
       (apply (eval source) arguments))))
 
+(deftest lexical-input-membership-does-not-invent-evaluation-or-presence
+  (let [object-input #(completion/complete-value completion/object-input-contract %)
+        source (list 'let* ['snapshot (object-input 'x)
+                            'value '(clojure.core/double (clojure.core/aget snapshot 0))]
+                     '(clojure.core/nil? value))
+        lower #(products/lower-local-products % {:lexical-inputs '[x calls]})
+        lowered (lower source)
+        marked? #(true? (:raster.effect/preserve-evaluation (meta %)))
+        initializers #(into {} (map vec) (partition 2 (second %)))]
+    (is (not (marked? (get (initializers lowered) 'snapshot)))
+        "an already-evaluated lexical reference needs no new producer token")
+    (is (marked? (get (initializers lowered) 'value))
+        "the checked read still owns its evaluation obligation")
+    (is (marked? (get (initializers (products/lower-local-products source)) 'snapshot))
+        "a free/global read cannot borrow parameter membership")
+    (is (false? (run lowered (double-array [2.0]) nil)))
+    (doseq [[input exception] [[nil NullPointerException]
+                              [(double-array 0) ArrayIndexOutOfBoundsException]]]
+      (let [thrown-class #(try (run % input nil) nil (catch Throwable e (class e)))]
+        (is (= exception (thrown-class source) (thrown-class lowered)))))
+    (let [nullable (list 'clojure.core/nil? (object-input 'x))
+          result (lower nullable)]
+      (is (= nullable result))
+      (is (true? (run result nil nil)))
+      (is (false? (run result (double-array 0) nil))))
+    (let [flagged (list 'let* ['snapshot (vary-meta (object-input 'x)
+                                                   assoc :raster.effect/preserve-evaluation true)]
+                        'snapshot)]
+      (is (marked? (get (initializers (lower flagged)) 'snapshot))
+          "previously established obligations are never stripped"))
+    (let [shadowed (list 'let* ['x '(do (clojure.core/swap! calls inc)
+                                      (throw (IllegalStateException. "producer")))
+                                'snapshot (object-input 'x)]
+                         '(clojure.core/nil? snapshot))
+          calls (atom 0)]
+      (is (thrown? IllegalStateException (run (lower shadowed) nil calls)))
+      (is (= 1 @calls)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"lexical input names"
+                         (products/lower-local-products source {:lexical-inputs [42]})))))
+
 (deftest scalar-accumulation-lowering-requires-independent-present-carriers
   (let [source '(let* [left (clojure.core/double x)
                        right (clojure.core/double 2.0)]

@@ -140,6 +140,7 @@
             :active-params parameters
             :public-parameters parameters
             :source-ns source-ns
+            :source-var (:resolved-var frontend)
             :return-tag (:return-tag frontend)
             :array-types (:array-types parameter-types)
             :scalar-types (:scalar-types parameter-types)}

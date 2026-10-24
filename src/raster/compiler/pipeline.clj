@@ -534,7 +534,10 @@
               ;; Literal presence and nonescaping local products are physical
               ;; representation facts, shared by JVM/C/GPU. Do not invoke broad
               ;; arithmetic PE or rewalk merely to remove a known presence arm.
-              expanded (local-products/lower-local-products expanded)
+              expanded (local-products/lower-local-products
+                        expanded (cond-> {}
+                                   (contains? opts :active-params)
+                                   (assoc :lexical-inputs (:active-params opts))))
               ;; Step 2: Normalize + Rewalk only if expand introduced NEW
               ;; undevirtualized calls (e.g. from composable AD body inlining).
               ;; Regular expand (compound deftm inlining) produces pre-walked code
@@ -877,7 +880,9 @@
   [source]
   (when (and me/*emission-inputs* (form/binding-form? source)
              (vector? (second source))
-             (some (fn [[_ expression]] (value-completion/object-input-parts expression))
+             (some (fn [[_ expression]]
+                     (or (value-completion/object-input-parts expression)
+                         (value-completion/boxed-reference-input-parts expression)))
                    (partition 2 (second source))))
     (when-let [source-emitter (find-ns 'raster.compiler.backend.jvm.bytecode)]
       (when-let [policy (ns-resolve source-emitter 'binding-completion-plan)]
@@ -926,6 +931,7 @@
                     :scalar-types (:scalar-types opts)
                     :values values
                     :source-ns (:source-ns opts)
+                    :source-var (:source-var opts)
                     :source-binding-context (source-binding-resolution-context source)
                     :abstract-machine abstract-machine}
                      (some? (:public-parameters common))
@@ -1643,6 +1649,7 @@
                              effective-dtype
                              {:preserve-declared-array-storage? preserve-declared-array-storage?})
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
+                          :source-var resolved-var
                           :owned-jvm-calls? (nil? target-device)
                           :active-params active-params :dtype effective-dtype
                           :preserve-declared-array-storage? preserve-declared-array-storage?}
@@ -2188,6 +2195,7 @@
            (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype
            {:preserve-declared-array-storage? preserve-declared-array-storage?}))
         pre-opts (cond-> {:inline? true :simd? false :target-device device-id
+                          :source-var resolved-var
                           :active-params active-params :dtype effective-dtype
                           ;; Resident reduction realization is a TypedSOAC transform. The logical
                           ;; scalar remains rank zero while its explicit representation and SegOp

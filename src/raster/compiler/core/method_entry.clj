@@ -1099,19 +1099,36 @@
   (frontend-emission-observation
    frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-reference-return-bridge) %)))
 
-(defn original-source-frontend
-  "Optional original frontend for an exact already-resolved deftm source Var.
-   Shared mangling only discovers the operation; selected correspondence proves it."
+(defn- source-var-selection-request
   [source-var]
   (when (and *emission-inputs* (var? source-var))
     (let [metadata (meta source-var)
           source-op (symbol (str (:ns metadata)) (str (:name metadata)))
           operation (mangled/impl->op source-op)]
       (when operation
-        (selected-frontend-source operation
-                                  (symbol (namespace source-op) (str (name source-op) "-impl"))
-                                  (count (:raster.core/deftm-params metadata)) source-var
-                                  (dtype/infer-dtype-from-tags (:raster.core/deftm-tags metadata)))))))
+        {:operation operation
+         :implementation-op (symbol (namespace source-op) (str (name source-op) "-impl"))
+         :arity (count (:raster.core/deftm-params metadata))
+         :parameter-dtype (dtype/infer-dtype-from-tags (:raster.core/deftm-tags metadata))}))))
+
+(defn original-source-frontend
+  "Optional original frontend for an exact already-resolved deftm source Var.
+   Shared mangling only discovers the operation; selected correspondence proves it."
+  [source-var]
+  (when-let [{:keys [operation implementation-op arity parameter-dtype]}
+             (source-var-selection-request source-var)]
+    (selected-frontend-source operation implementation-op arity source-var parameter-dtype)))
+
+(defn source-var-body-entry-carriers
+  "Actual registered typed formals for an already-resolved source Var.
+   Mangling and declarations select work only. The existing selected-entry
+   query authenticates the source/receiver/interface and retains its history.
+   No JIT or opaque-frontend construction occurs. Reference facts remain
+   nullable; this supplies no body-import or return-payload permission."
+  [source-var]
+  (when-let [{:keys [operation implementation-op arity]}
+             (source-var-selection-request source-var)]
+    (selected-source-entry-carriers operation implementation-op arity source-var)))
 
 (defn- retained-body-context!
   [{:keys [source-var source-body]} lineage body context]

@@ -82,6 +82,45 @@
                   (reason (fn [] (binding [entry/*emission-inputs* (atom {:static [] :values []})]
                                    (completion/object-binding-without-check? binder source context)))))))))))
 
+(deftest reference-proof-uses-actual-upper-bound-classes-not-logical-array-tags
+  (with-resolution
+    (fn [source _ _ context]
+      (.importClass source 'Object Object)
+      (.importClass source 'Cloneable Cloneable)
+      (let [floats (class (float-array 0))
+            owner (atom {:static [] :values []})]
+        (binding [entry/*emission-inputs* owner]
+          (doseq [hint '[floats Object Cloneable]]
+            (is (completion/reference-binding-without-check?
+                 (with-meta 'snapshot {:tag hint}) source context floats)))
+          (doseq [[hint carrier] [['doubles floats] ['String floats] ['floats Object]
+                                  ['floats Float/TYPE] ['floats :float]]]
+            (is (false? (completion/reference-binding-without-check?
+                         (with-meta 'snapshot {:tag hint}) source context carrier))))
+          (is (false? (completion/object-binding-without-check?
+                       (with-meta 'snapshot {:tag 'floats}) source context))))))))
+
+(deftest reference-proof-preserves-real-class-identity-and-original-lookup-history
+  (with-resolution
+    (fn [source _ loader context]
+      (let [name (str "raster.test." (gensym "ReferenceCarrier"))
+            bytes (class-bytes name "java/lang/Object" nil)
+            other-loader (clojure.lang.DynamicClassLoader. (.getParent ^ClassLoader loader))
+            actual (.defineClass ^clojure.lang.DynamicClassLoader loader name bytes nil)
+            same-name (.defineClass other-loader name bytes nil)
+            hint (gensym "ReferenceAlias")
+            binder (with-meta 'snapshot {:tag hint})
+            owner (atom {:static [] :values []})]
+        (.importClass source hint actual)
+        (is (= (.getName actual) (.getName same-name)))
+        (binding [entry/*emission-inputs* owner]
+          (is (completion/reference-binding-without-check? binder source context actual))
+          (is (false? (completion/reference-binding-without-check? binder source context same-name))))
+        (.unmap source hint)
+        (.importClass source hint same-name)
+        (is (= :stale-binding-completion-resolution
+               (reason #(entry/assert-definition-inputs-current! @owner))))))))
+
 (deftest object-proof-retains-full-first-loader-and-namespace-mapping-decision
   (with-resolution
     (fn [source _ loader context]
@@ -101,14 +140,15 @@
         (is (nil? (reason #(entry/assert-definition-inputs-current! @owner))))
         ;; Defining a previously missing first-loader Class changes precedence,
         ;; even when the namespace still maps the hint to java.lang.Object.
-        (.defineClass ^clojure.lang.DynamicClassLoader loader (str hint)
-                      (class-bytes (str hint) "java/lang/Object" property) nil)
+        (let [defined (.defineClass ^clojure.lang.DynamicClassLoader loader (str hint)
+                                   (class-bytes (str hint) "java/lang/Object" property) nil)]
         (is (= :stale-binding-completion-resolution
                (reason #(entry/assert-definition-inputs-current! @owner))))
         (is (nil? (System/getProperty property)) "guard replay must not run static initializers")
         (binding [entry/*emission-inputs* (atom {:static [] :values []})]
-          (is (false? (completion/object-binding-without-check? binder source context))))
-        (is (nil? (System/getProperty property)) "optional construction must not initialize either")))))
+          (is (false? (completion/object-binding-without-check? binder source context)))
+          (is (completion/reference-binding-without-check? binder source context defined)))
+        (is (nil? (System/getProperty property)) "optional construction must not initialize either"))))))
 
 (deftest object-proof-retains-source-namespace-identity
   (with-resolution
