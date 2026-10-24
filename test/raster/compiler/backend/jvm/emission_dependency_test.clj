@@ -55,6 +55,41 @@
           (finally (reset-meta! dependency original))))
       (finally (remove-ns (ns-name scope))))))
 
+(deftest pipeline-diagnostics-do-not-invalidate-retained-gradients
+  (let [scope (create-ns (gensym "raster.gradient-aot-diagnostics."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm square [x :- Double] :- Double
+                 (raster.numeric/* x x))))
+      (let [generic (ns-resolve scope 'square)
+            selected (core/resolve-deftm-var generic)]
+        (doseq [caller [generic selected]]
+          (let [gradient (reverse/value+grad caller)
+                root (var-get caller)
+                observed (method-entry/emission-definition-snapshot caller)]
+            (is (= [9.0 6.0] (vec (gradient 3.0))))
+            (let [forward (pipeline/compile-aot caller :simd? false)]
+              (is (= 9.0 (forward 3.0)))
+              (is (contains? (meta caller) :raster.compiler.pipeline/compiled-diagnostics))
+              (is (identical? root (var-get caller)))
+              (is (method-entry/var-snapshot-current? observed))
+              (is (= [9.0 6.0] (vec (gradient 3.0)))))
+            (testing "other metadata remains a historical definition input"
+              (let [original (meta caller)]
+                (try
+                  (alter-meta! caller assoc ::changed-definition true)
+                  (is (not (method-entry/var-snapshot-current? observed)))
+                  (is (thrown? clojure.lang.ExceptionInfo (gradient 3.0)))
+                  (finally (reset-meta! caller original)))))
+            (testing "changing actual source is not diagnostic publication"
+              (let [original (meta selected)]
+                (try
+                  (alter-meta! selected assoc :raster.core/deftm-source-body '[42.0])
+                  (is (thrown? clojure.lang.ExceptionInfo (gradient 3.0)))
+                  (finally (reset-meta! selected original))))))))
+      (finally (remove-ns (ns-name scope))))))
+
 (deftest actual-root-and-static-emissions-retain-producer-inputs
   (let [scope (create-ns (gensym "raster.producer-emission."))
         current (atom true)

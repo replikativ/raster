@@ -40,10 +40,11 @@
        (= (:metadata a) (:metadata b))))
 
 (defn emission-definition-snapshot
-  "Observe definition inputs, excluding only this emitter's static cache output.
+  "Observe definition inputs, excluding only static cache and pipeline diagnostic outputs.
    Actually consumed static artifacts are retained separately by the emitter."
   [v]
-  (assoc (update (var-snapshot v) :metadata dissoc :raster.core/deftm-bytecode)
+  (assoc (update (var-snapshot v) :metadata dissoc :raster.core/deftm-bytecode
+                 :raster.compiler.pipeline/compiled-diagnostics)
          :snapshot-kind :emission-definition))
 
 (def ^:dynamic *emission-inputs*
@@ -95,14 +96,15 @@
   "Compare a historical observation directly to the effective live Var value.
    Equivalent to same-var-snapshot? against a fresh observation, without building
    that temporary map. Name/lookup identity remains the caller's responsibility.
-   Definition observations exclude only this emitter's static cache output."
+   Definition observations exclude only static cache and pipeline diagnostic outputs."
   [{:keys [var value metadata snapshot-kind] :as snapshot}]
   (and (var? var)
        (let [is-bound (bound? var)]
          (and (= (:bound? snapshot) is-bound)
               (identical? value (when is-bound (var-get var)))
               (= metadata (if (= :emission-definition snapshot-kind)
-                            (dissoc (meta var) :raster.core/deftm-bytecode)
+                            (dissoc (meta var) :raster.core/deftm-bytecode
+                                    :raster.compiler.pipeline/compiled-diagnostics)
                             (meta var)))))))
 
 (defn var-snapshot-current?

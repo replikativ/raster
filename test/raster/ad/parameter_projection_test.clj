@@ -9,7 +9,7 @@
         e (with-meta 'e {:raster.type/tag 'double})
         f (with-meta 'f {:raster.type/tag 'float})
         sum (list 'raster.ad.reverse/grad-acc d e)
-        expression-tag #'tangent/expr-manifest-tag]
+        expression-tag tangent/scalar-value-tag]
     (is (= 'double (expression-tag sum)))
     (is (= sum (tangent/project-expr 'double sum)))
     (let [project (eval (list 'fn '[d e] (tangent/project-expr 'double sum)))]
