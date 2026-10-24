@@ -2845,6 +2845,23 @@
     (binding [util/*shadowing-locals* #{'float-array}]
       (is (empty? (:allocations (analyze '(float-array n) {} {})))))))
 
+(deftest causal-allocation-typing-does-not-waive-a-declared-binder
+  (let [expression '(clojure.core/double-array n)
+        analyze (fn [binder]
+                  (#'frontend/source-storage-analysis
+                   [[binder expression]] :float {} {'n :long} false {} {} '[n]))]
+    (is (= :double (get-in (analyze 'out) [:allocations 0 :dtype]))
+        "the existing allocation transfer supplies element type, not ambient precision")
+    (is (= '[n] (get-in (analyze 'out) [:values 'out :shape])))
+    (doseq [tag ['String 'not-a-class 'long]
+            :let [binder (with-meta 'out {:tag tag})
+                  result (analyze binder)]]
+      (is (nil? (get-in result [:allocations 0 :dtype]))
+          "source capacity evidence cannot complete or erase a declared binder check")
+      (is (nil? (get-in result [:values 'out])))
+      (is (= expression (get-in result [:descriptions 0 :expr])))
+      (is (= tag (-> result :descriptions first :sym meta :tag))))))
+
 (deftest equivalent-shapes-preserve-producers-but-still-refine-unknowns
   (let [producer (av/tensor {:dtype :float :shape '[n]})
         consumer (av/tensor {:dtype :float :shape '[later-length]})

@@ -1746,11 +1746,12 @@
                                    :source-binding-context source-binding-context}
                             (contains? options :lexical-inputs)
                             (assoc :lexical-inputs lexical-inputs)))
-               frontend-options {:dtype dtype :array-types array-types
-                                 :scalar-types scalar-types :values values
-                                 :host-scalars? host-scalars?
-                                 :segmented-plans? segmented-plans?
-                                 :preserve-declared-array-storage? preserve-declared-array-storage?}
+               frontend-options (cond-> {:dtype dtype :array-types array-types
+                                        :scalar-types scalar-types :values values
+                                        :host-scalars? host-scalars?
+                                        :segmented-plans? segmented-plans?
+                                        :preserve-declared-array-storage? preserve-declared-array-storage?}
+                                  (contains? options :lexical-inputs) (assoc :lexical-inputs lexical-inputs))
                live-projection (validated-live-source-projection form frontend-options)
                {live-form :form :keys [projection typed-input admitted? bindings-removed
                                        terminal-scalars-materialized]}

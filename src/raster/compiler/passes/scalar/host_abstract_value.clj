@@ -193,6 +193,14 @@
                 (par/extract-par-map-info expression)]
             (when-not offset {:out out :bound bound :cast cast :elem-type elem-type})))]
     (cond
+      ;; The opt-in source-capacity view requires an actual preceding buffer
+      ;; exemplar. A retained result dtype cannot replace that dependency. The
+      ;; ordinary relational analysis deliberately retains its historical rules.
+      (and (:capacity-only? state)
+           (or clone-source (:source allocation))
+           (not (buffer-value? (get values (or clone-source (:source allocation))))))
+      state
+
       alength-expression
       (let [state (assoc-in state [:values symbol]
                             (tensor (or cast-dtype
@@ -359,6 +367,96 @@
   (finish-analysis
    (reduce (fn [context [id expression]] (advance-binding context id expression))
            (begin-analysis source options) (partition 2 (second source)))))
+
+(defn analyze-capacities
+  "Analyze source capacities in binding order, retaining definition-time AVs.
+
+   Unlike analyze, seed maps describe only explicit lexical inputs, not results
+   of a later numerical analysis. :reference-aliases optionally supplies certified
+   source-return facts {binding preceding-buffer}; these are analysis-only facts,
+   not host type, purity, ownership, or permission to erase evaluation. The final
+   :values/:equalities remain relational; :definition-values never receives later
+   equality refinements and excludes certified non-buffer or unstable identities.
+   Capacity transfers cannot consume logical-only tensor results; :aliases and
+   :available likewise describe only the source-capacity view."
+  [source {:keys [lexical-inputs reference-aliases] :as options}]
+  (when-not (contains? options :lexical-inputs)
+    (throw (ex-info "source capacity analysis requires explicit lexical inputs"
+                    {:reason :host-abstract-value-lexical-inputs})))
+  (when-not (or (not (contains? options :reference-aliases))
+                (and (map? reference-aliases)
+                     (every? (fn [[id reference]] (and (symbol? id) (symbol? reference)))
+                             reference-aliases)))
+    (throw (ex-info "source capacity reference aliases require symbol identities"
+                    {:reason :host-abstract-value-reference-aliases})))
+  ;; Let the existing initializer validate the source and lexical contract before
+  ;; filtering. No future binder's seed may participate in any transfer rule.
+  (let [validated (begin-analysis source options)
+        inputs (set lexical-inputs)
+        options (reduce (fn [options key]
+                          (if (contains? options key)
+                            (update options key select-keys inputs)
+                            options))
+                        options [:values :array-types :scalar-types])
+        context (begin-analysis source options)
+        pairs (partition 2 (second source))
+        binders (set (map first pairs))
+        reject! (fn [id reference]
+                  (throw (ex-info "source capacity alias requires a preceding eligible buffer"
+                                  {:reason :host-abstract-value-reference-alias
+                                   :binding id :reference reference})))
+        _ (doseq [[id reference] reference-aliases]
+            (when (or (not (contains? binders id))
+                      (contains? (:ineligible validated) id)
+                      (contains? (:ineligible validated) reference))
+              (reject! id reference)))
+        initial-definitions (select-keys (get-in context [:analysis :values])
+                                         (remove (:ineligible context) inputs))
+        capacity-context (-> context
+                             (assoc-in [:analysis :values] initial-definitions)
+                             (assoc-in [:analysis :capacity-only?] true)
+                             (update-in [:analysis :available]
+                                        #(apply disj % (:ineligible context))))
+        result
+        (reduce
+         (fn [{:keys [context logical-context definitions]} [id expression]]
+           (let [reference (get reference-aliases id)
+                 explicit-reference (if-let [parts (completion/object-input-parts expression)]
+                                      (:operand parts) expression)
+                 _ (when (and reference
+                              (or (and (symbol? explicit-reference)
+                                       (not= explicit-reference reference))
+                                  (not= reference
+                                        (binding-buffer-alias-source context id reference))
+                                  (not (buffer-declaration-compatible?
+                                        expression
+                                        (get-in context [:analysis :values reference])))))
+                     (reject! id reference))
+                 ;; An unstable/excluded binder must not publish relational
+                 ;; equalities either (for example n -> a repeated alength id).
+                 next-context (if (contains? (:ineligible context) id)
+                                context
+                                (advance-binding context id (or reference expression)))
+                 eligible? (and (contains? (get-in next-context [:analysis :available]) id)
+                                (not (contains? (:ineligible next-context) id)))
+                 ;; Earlier capacity entries were already checked at definition.
+                 ;; Prune only this binding, not the entire growing value map.
+                 next-context (cond-> next-context
+                                (not eligible?) (update-in [:analysis :values] dissoc id)
+                                (not eligible?) (update-in [:analysis :available] disj id))
+                 value (when eligible?
+                         (when-let [value (get-in next-context [:analysis :values id])]
+                           (update value :shape
+                                   #(canonical-shape
+                                     (get-in next-context [:analysis :equalities]) %))))]
+             {:context next-context
+              :logical-context (advance-binding logical-context id (or reference expression))
+              :definitions (cond-> definitions value (assoc id value))}))
+         {:context capacity-context :logical-context context :definitions initial-definitions} pairs)]
+    (assoc (finish-analysis (:logical-context result))
+           :aliases (get-in result [:context :analysis :aliases])
+           :available (get-in result [:context :analysis :available])
+           :definition-values (:definitions result))))
 
 (defn- zero-index?
   [expression]

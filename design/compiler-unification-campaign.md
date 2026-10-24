@@ -42,10 +42,10 @@ facts at parameter-owning preparation boundaries. This prevents a lexical read
 from acquiring a new evaluation token merely because the pass lacked its scope;
 it proves neither presence nor a physical carrier. Existing preservation markers
 are unchanged. Object-buffer normalization separately refuses to erase flagged
-completions or substitute through their bindings at return. The scoped entry
-qualification removes three of four boxed-array checks in the recorded LoRA
-producer; its remaining preserved target snapshot is still an open continuation
-obligation, not evidence of successful GPU training.
+completions or substitute through their bindings at return. The initial scoped
+entry qualification removed three of four boxed-array checks in the LoRA producer;
+the ordered-identity cohort below subsequently represented the remaining preserved
+conversion. Neither cohort establishes successful GPU training.
 
 The bounded continuation vertical under qualification is an **ordered reference identity**:
 
@@ -85,6 +85,50 @@ missing extent dependency in the prefix. This is not complete training or phase
 qualification; the independent result/precision, write-coverage and legacy
 implicit-binder obligations remain open.
 
+The current shape investigation confirms a distinct capacity/availability issue.
+The LoRA allocation originally has shape `[arg_n]`; a later `alength` of a target
+reference creates the equality `arg_n → rstr_extent_45`, and HostAV finalization
+rewrites that earlier allocation to the later name. The target's numerical
+read-prefix shape was incorrectly used as its full source-array capacity seed.
+
+The opt-in causal host-capacity implementation reuses the existing HostAV
+transfer, rather than introducing another shape/type inference engine:
+
+- Seed public capacities from exact invocation parameter contracts; do not seed
+  local capacities from the complete numerical program value table.
+- Derive local capacities in source order through actual allocation contracts and
+  authenticated reference identities. Reuse certified source `host-return`
+  classification; a tensor-valued effect result is not a host buffer.
+- Keep definition-time capacity AVs for invocation planning while retaining final
+  relational equalities for proof consumers. A global equality representative is
+  not automatically an available allocation recipe.
+- Preserve logical program AVs and checked constructor/count semantics; validate
+  source-allocation correspondence rather than substituting a plausible count.
+
+Reference capacities enter the existing frontend storage-input conversion before
+equation construction: a traversal of `n` elements does not resize a captured
+source buffer. An unannotated allocation may reuse its existing source-derived
+element dtype; this does not discharge an explicit binder check. Capacity
+analysis retains separate incremental logical and eligible-source views using
+the same transfer. Effect-only or unstable logical values cannot supply a clone's
+or exemplar allocation's capacity, including through a retained dtype hint.
+
+The critical independent oracles cover allocation of length `n` and both dead
+and retained later `alength` reads of a larger target. Linking a two-element
+traversal over a six-element input retains output capacity two and input capacity
+six; the retained length scalar is six, and a seven-element demand is rejected
+by the unchanged graph-range guard. The allocation is an ordered source-storage
+action, not necessarily a prefix `BufferAllocation`: its original count and zero
+initialization are prepared before runtime acquisition. No duplicate owner is
+introduced. Final affected qualification passes 248 tests / 1,904 assertions.
+It includes the graph-shape scalar-prefix control: an unknown allocation extent
+is refined only by its causal source-definition snapshot, preserving its checked
+size before allocation while retaining the equation as graph proof. Fresh
+Q8-LoRA compilation now reaches a
+different host-continuation refusal (retained checked integer multiplication);
+that is not successful training. Exact-head CI and the remaining audited
+families are still required before merge.
+
 Update the existing capability/compatibility ledger with each failure's owner,
 accepted or deliberately declined form, numerical/effect oracle and removal gate.
 Current node-wise AD composition is bounded but implemented; historical statements
@@ -100,6 +144,41 @@ mutation; designated workload compilation meets documented budgets; and all seve
 exact-head CI contexts exist and succeed (setup, build, test, emit, OpenCL, CUDA
 compile, HIP compile). Compile-only vendor success is not runtime evidence. No
 new numerical relaxation is implied, and no remaining-commit count is established.
+
+### Coordinated symbolic-superposition research integration (October 24)
+
+The independent `ss/research-experiments` branch contains three local CPU fixes
+based on `0a08a066`; it is not part of the current entry/capacity cohort. Its
+bilinear-model report supplies an external training workload (Float/Double,
+AdamW, SVD polar and Newton--Schulz), not a replacement acceptance gate.
+
+Land reviewed slices rather than the entire research branch:
+
+1. JVM loop-operand normalization (`e8e44a37`): retain the OSR improvement, but
+   preserve all operand reads and their order. A REPL review of the proposed
+   rewrite finds a mutable-Var read moved after a later operand: the original
+   returns `[1 1]`, the rewrite `[9 1]`. Stable lexical reads need proof; do not
+   treat every symbol as an immutable atom. Reuse source scopes/completions and
+   qualify structural bytecode, exception/effect order and cold/hot execution.
+2. Bare AD-application preparation (`1fa0c2c8`): expose the existing owned AD
+   application machinery, with no new rule registry/cache. Qualify repeated
+   calls, helpers, redefinition and delayed pullbacks; test absence of runtime
+   AD preparation independently of BLAS availability.
+3. JVM BLAS leaf (`23407b80`): reuse verified contraction layout facts, but also
+   require numerical admission, accumulator/conversion compatibility, provider
+   availability, checked dimensions/capacities and runtime alias legality before
+   native entry. Distinct symbols are not disjoint storage. Preserve the general
+   generated/fused route and precise portable fallback when this leaf is illegal.
+
+Do not adopt the experimental `critical(true)` GEMM downcall: arbitrary GEMM
+does not satisfy FFM's extremely-short-in-all-cases critical-call contract.
+Improve ordinary downcalls, typed invocation and native-resident storage instead.
+Follow-up training work should expose optimizer state transitions as ordinary
+typed programs/groups, reuse forward residuals for cross-entropy/softmax, close
+Float/Double library gaps, and make provider threading explicit. Keep approximate
+transcendentals opt-in and retain the original numerical policy. Benchmark cold
+load, compile, steady resident execution and concurrency separately; loaded-host
+timings and long-horizon learning endpoints are not interchangeable evidence.
 
 ### Producer foundations and invariants retained through closure
 

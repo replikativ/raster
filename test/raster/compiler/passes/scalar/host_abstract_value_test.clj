@@ -241,3 +241,184 @@
            (host-av/finish-analysis
             (reduce (fn [context [id expression]] (host-av/advance-binding context id expression))
                     (host-av/begin-analysis form options) (partition 2 (second form))))))))
+
+(deftest source-capacities-do-not-equate-an-independent-target-with-an-allocation
+  (let [analysis (host-av/analyze-capacities
+                  '(let* [out (clojure.core/double-array n)
+                          target-length (clojure.core/alength target)] out)
+                  {:array-types {'target :double} :scalar-types {'n :long}
+                   :lexical-inputs '[target n]})]
+    (is (= ['n] (get-in analysis [:definition-values 'out :shape])))
+    (is (= ['n] (get-in analysis [:values 'out :shape])))
+    (is (= '[(extent target)] (get-in analysis [:definition-values 'target :shape])))
+    (is (= ['target-length] (get-in analysis [:values 'target :shape])))
+    (is (not (contains? (:equalities analysis) 'n)))))
+
+(deftest source-capacities-freeze-definitions-before-later-relational-refinement
+  (let [source '(let* [out (clojure.core/double-array n)
+                      size (clojure.core/alength out)
+                      copy (clojure.core/aclone out)] copy)
+        options {:scalar-types {'n :long} :lexical-inputs '[n]}
+        analysis (host-av/analyze-capacities source options)]
+    (is (= ['n] (get-in analysis [:definition-values 'out :shape])))
+    (is (= ['size] (get-in analysis [:values 'out :shape])))
+    (is (= ['size] (get-in analysis [:definition-values 'copy :shape])))
+    (is (= (host-av/analyze source options) (dissoc analysis :definition-values)))
+    (is (not (contains? (host-av/analyze source options) :definition-values)))))
+
+(deftest source-capacities-use-certified-preceding-reference-returns
+  (let [input (av/tensor {:dtype :double :shape ['m] :ownership :external
+                          :attributes {:nullable true :source :public}})
+        source '(let* [out (clojure.core/double-array n)
+                       returned (unknown.library/write! out input)
+                       copied returned] copied)
+        analysis (host-av/analyze-capacities
+                  source {:values {'input input} :scalar-types {'n :long}
+                          :lexical-inputs '[input n]
+                          :reference-aliases {'returned 'out}})]
+    (is (= ['n] (get-in analysis [:definition-values 'returned :shape])))
+    (is (= ['n] (get-in analysis [:definition-values 'copied :shape])))
+    (is (= {'returned 'out 'copied 'returned} (:aliases analysis)))
+    (is (= input (get-in analysis [:definition-values 'input])))
+    (is (= input (get-in analysis [:values 'input])))
+    (is (nil? (:definition-values (host-av/analyze source {:values {'input input}}))))))
+
+(deftest source-capacities-cannot-borrow-future-seeds
+  (let [future (av/tensor {:dtype :double :shape ['wrong]})
+        source '(let* [early later
+                       unknown (unknown.library/result)
+                       later (clojure.core/double-array n)] later)
+        options {:values {'later future 'early future 'unknown future}
+                 :array-types {'unknown :double} :scalar-types {'n :long}
+                 :lexical-inputs '[n]}
+        analysis (host-av/analyze-capacities source options)]
+    (is (nil? (get-in analysis [:definition-values 'early])))
+    (is (nil? (get-in analysis [:definition-values 'unknown])))
+    (is (= ['n] (get-in analysis [:definition-values 'later :shape])))
+    (is (= :host-abstract-value-reference-alias
+           (try (host-av/analyze-capacities
+                 source (assoc options :reference-aliases {'early 'later})) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
+(deftest source-capacities-exclude-logical-non-buffer-results-and-unstable-identities
+  (let [source '(let* [effect (raster.par/stencil! destination [input] 1 :dirichlet double i n
+                                                 (clojure.core/aget input i))]
+                      effect)
+        analysis (host-av/analyze-capacities
+                  source {:array-types {'input :double 'destination :double}
+                          :scalar-types {'n :long}
+                          :lexical-inputs '[input destination n]
+                          :non-buffer-bindings '[effect]})]
+    (is (= ['n] (get-in analysis [:values 'effect :shape]))
+        "the existing transfer still records the logical tensor result")
+    (is (nil? (get-in analysis [:definition-values 'effect]))
+        "a certified effect-only host result is not a source buffer capacity"))
+  (let [analysis (host-av/analyze-capacities
+                  '(let* [input (clojure.core/double-array n)] input)
+                  {:array-types {'input :double} :scalar-types {'n :long}
+                   :lexical-inputs '[input n]})]
+    (is (nil? (get-in analysis [:definition-values 'input]))
+        "an unstable identity exposes neither its input seed nor its later definition")))
+
+(deftest source-capacities-reject-invalid-reference-alias-assertions
+  (let [value (av/tensor {:dtype :double :shape ['n]})
+        options {:values {'input value 'other value} :lexical-inputs '[input other]}
+        reason (fn [source options]
+                 (try (host-av/analyze-capacities source options) nil
+                      (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))]
+    (doseq [aliases [nil [] {'out 42} {42 'input}]]
+      (is (= :host-abstract-value-reference-aliases
+             (reason '(let* [out input] out) (assoc options :reference-aliases aliases)))))
+    (doseq [[source extra]
+            [['(let* [out other] out) {:reference-aliases {'out 'input}}]
+             ['(let* [out (unknown.library/result)] out)
+              {:reference-aliases {'out 'missing}}]
+             ['(let* [out input] out)
+              {:reference-aliases {'missing 'input}}]
+             ['(let* [out input] out)
+              {:reference-aliases {'out 'input} :non-buffer-bindings '[out]}]
+             ['(let* [effect input out (unknown.library/result)] out)
+              {:reference-aliases {'out 'effect} :non-buffer-bindings '[effect]}]
+             ['(let* [out input out input] out) {:reference-aliases {'out 'input}}]]]
+      (is (= :host-abstract-value-reference-alias (reason source (merge options extra)))))
+    (let [out (with-meta 'out {:raster.type/tag 'floats})]
+      (is (= :host-abstract-value-reference-alias
+             (reason (list 'let* [out '(unknown.library/result)] out)
+                     (assoc options :reference-aliases {out 'input})))))
+    (is (= :host-abstract-value-reference-alias
+           (reason (list 'let* ['out (with-meta '(unknown.library/result)
+                                     {:raster.type/tag 'floats})] 'out)
+                   (assoc options :reference-aliases {'out 'input}))))))
+
+(deftest logical-effect-results-cannot-launder-source-capacities
+  (let [clone-id (with-meta 'cloned {:raster.type/tag 'doubles})
+        zeros-id (with-meta 'zeros {:raster.type/tag 'doubles})
+        zeros-expression (with-meta
+                           '(.invk raster.arrays/zeros-like_m_doubles_long-impl effect n)
+                           {:raster.op/original 'raster.arrays/zeros-like})
+        source (list 'let*
+                     ['effect '(raster.par/stencil! destination [input] 1 :dirichlet double i n
+                                                    (clojure.core/aget input i))
+                      clone-id '(clojure.core/aclone effect)
+                      zeros-id zeros-expression
+                      'clone-alias 'cloned 'zeros-alias 'zeros
+                      'size '(clojure.core/alength effect)
+                      'independent '(clojure.core/double-array n)]
+                     'independent)
+        options {:array-types {'input :double 'destination :double}
+                 :scalar-types {'n :long} :lexical-inputs '[input destination n]
+                 :non-buffer-bindings '[effect]}
+        analysis (host-av/analyze-capacities source options)]
+    (doseq [id '[effect cloned zeros clone-alias zeros-alias]]
+      (is (nil? (get-in analysis [:definition-values id])))
+      (is (not (contains? (:aliases analysis) id))))
+    (is (= ['n] (get-in analysis [:definition-values 'independent :shape]))
+        "alength of a logical-only result cannot rename a real source capacity")
+    (is (= [] (get-in analysis [:definition-values 'size :shape]))
+        "the existing scalar result contract may still be retained")
+    (is (= :host-abstract-value-reference-alias
+           (try (host-av/analyze-capacities
+                 source (assoc options :reference-aliases {'clone-alias 'cloned})) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+    (is (= (:values (host-av/analyze source options)) (:values analysis)))
+    (is (= (:equalities (host-av/analyze source options)) (:equalities analysis)))
+    (is (= ['size] (get-in analysis [:values 'cloned :shape])))))
+
+(deftest hinted-exemplar-results-require-preceding-stable-source-buffers
+  (doseq [[bindings inputs]
+          [[['copied (with-meta
+                       '(.invk raster.arrays/zeros-like_m_floats_long-impl future n)
+                       {:raster.op/original 'raster.arrays/zeros-like})
+             'future '(clojure.core/float-array n)] '[n]]
+           [['input '(clojure.core/float-array n)
+             'copied (with-meta
+                       '(.invk raster.arrays/zeros-like_m_floats_long-impl input n)
+                       {:raster.op/original 'raster.arrays/zeros-like})] '[input n]]]]
+    (let [hinted (mapv #(if (= 'copied %) (with-meta 'copied {:raster.type/tag 'floats}) %)
+                       bindings)
+          source (list 'let* (into hinted ['alias 'copied]) 'alias)
+          analysis (host-av/analyze-capacities
+                    source {:array-types {'input :float 'future :float}
+                            :scalar-types {'n :long} :lexical-inputs inputs})]
+      (is (nil? (get-in analysis [:definition-values 'copied])))
+      (is (nil? (get-in analysis [:definition-values 'alias])))
+      (is (not (contains? (:aliases analysis) 'alias))))))
+
+(deftest unstable-scalar-binders-cannot-publish-capacity-equalities
+  (doseq [[bindings inputs]
+          [[['out '(clojure.core/double-array n)
+             'size '(clojure.core/alength out) 'size 0
+             'later '(clojure.core/double-array n)] '[n]]
+           [['out '(clojure.core/double-array n)
+             'size '(clojure.core/alength out)
+             'later '(clojure.core/double-array n)] '[n size]]]]
+    (let [source (list 'let* bindings 'later)
+          options {:scalar-types {'n :long 'size :long} :lexical-inputs inputs}
+          analysis (host-av/analyze-capacities source options)]
+      (is (= ['n] (get-in analysis [:definition-values 'out :shape])))
+      (is (= ['n] (get-in analysis [:definition-values 'later :shape])))
+      (is (nil? (get-in analysis [:definition-values 'size])))
+      (is (= (:values (host-av/analyze source (update options :scalar-types select-keys inputs)))
+             (:values analysis))
+          "both logical views start from the same public-only seeds")
+      (is (= ['size] (get-in analysis [:values 'later :shape]))))))

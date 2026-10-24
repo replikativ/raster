@@ -6131,7 +6131,9 @@
   "Establish allocation-owned extents before a consumer can infer element shapes.
    Allocation capacity is not permission to flatten a declared logical layout. Reuse the same
    allocation contracts for initialization later; no consumer extent may become its own producer."
-  [pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
+   (source-storage-analysis pairs dtype array-types scalar-types segmented-plans? values shape-equalities nil))
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities lexical-inputs]
   (let [descriptions (normalize-extents
                       (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
                       shape-equalities values)
@@ -6140,8 +6142,35 @@
                   (if (and (= :scalar kind) scalar-dtype)
                     (assoc types sym scalar-dtype) types))
                 scalar-types descriptions)
-        allocations (allocation-contracts descriptions array-types source-scalar-types values
-                                          shape-equalities)
+        capacities
+        (when (some? lexical-inputs)
+          (let [buffer-sources (into {}
+                                     (keep (fn [description]
+                                             (when (and (contains? description :result-storage)
+                                                        (description-host-buffer? description))
+                                               [(:sym description)
+                                                (get-in description [:result-storage 0 :destination])])))
+                                     descriptions)
+                effects (into #{} (keep (fn [description]
+                                         (let [storage (:result-storage description)]
+                                           (when (and (seq storage)
+                                                      (every? #(= :effect (:host-return %)) storage))
+                                             (:sym description))))) descriptions)]
+            (host-av/analyze-capacities
+             (list 'let* (vec (mapcat identity pairs)) nil)
+             {:dtype dtype :values values :array-types array-types
+              :scalar-types source-scalar-types :lexical-inputs lexical-inputs
+              :non-buffer-bindings effects
+              :reference-aliases
+              (invocation-source/capacity-reference-aliases pairs lexical-inputs buffer-sources)})))
+        allocations
+        (mapv (fn [allocation]
+                ;; Existing source allocation typing supplies a missing element
+                ;; contract; the constructor's original count remains the recipe.
+                (update allocation :dtype
+                        #(or % (when-not (binding-completion/declared-binding-hint (:destination allocation))
+                                 (get-in capacities [:definition-values (:destination allocation) :dtype])))))
+              (allocation-contracts descriptions array-types source-scalar-types values shape-equalities))
         values (reduce (fn [known {:keys [destination extent dtype]}]
                          (let [prior (get known destination)]
                            (if (and dtype
@@ -6154,9 +6183,24 @@
                                               (tensor-value dtype [extent]))
                                           shape-equalities)
                              known)))
-                       values allocations)]
+                       values allocations)
+        ;; A reference identity is not an elementwise traversal input. Give its
+        ;; source-owned capacity to the EXISTING storage-input conversion before
+        ;; equation construction can infer the consumer's domain as its shape.
+        values
+        (if (nil? capacities)
+          values
+          (reduce (fn [known {:keys [kind sym expr]}]
+                      (if-let [capacity (when (and (= :scalar kind)
+                                                  (or (symbol? expr)
+                                                      (invocation-source/reference-identity-source sym expr)))
+                                         (get-in capacities [:definition-values sym]))]
+                        (if (seq (:shape capacity))
+                          (merge-value known sym capacity shape-equalities)
+                          known)
+                        known)) values descriptions))]
     {:descriptions (preserve-map-storage-inputs descriptions values)
-     :values values :allocations allocations}))
+     :values values :allocations allocations})))
 
 (defn canonicalize-fresh-full-write-maps
   "Project a closed single-write effect region to the existing functional map contract.
@@ -6333,7 +6377,7 @@
        :rewrites (:rewrites rebuilt) :declines (:declines rebuilt)}))))
 
 (defn- form->program*
-  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
+  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans? lexical-inputs
                  preserve-declared-array-storage? host-scalars?]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
@@ -6343,7 +6387,7 @@
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
           {descriptions :descriptions storage-values :values allocations :allocations}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
-                                   values shape-equalities)]
+                                   values shape-equalities lexical-inputs)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)

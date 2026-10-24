@@ -48,6 +48,25 @@
        (or (true? (:raster.effect/preserve-evaluation (meta binder)))
            (true? (:raster.effect/preserve-evaluation (meta expression))))))
 
+(defn capacity-reference-aliases
+  "Combine explicit identities with caller-certified whole-buffer return sources.
+   Private graph destinations are not source-visible host references. The capacity
+   transfer must still check that a preceding source has an actual buffer AV."
+  [pairs lexical-inputs certified-sources]
+  (:aliases
+   (reduce
+    (fn [{:keys [visible] :as state} [id expression]]
+      (let [explicit (reference-identity-source id expression)
+            certified (get certified-sources id)]
+        (when (and explicit certified (not= explicit certified))
+          (throw (ex-info "source identity and certified buffer return disagree"
+                          {:reason :source-capacity-reference-conflict
+                           :binding id :explicit explicit :certified certified})))
+        (let [reference (or explicit (when (contains? visible certified) certified))]
+          (cond-> (update state :visible conj id)
+            reference (assoc-in [:aliases id] reference)))))
+    {:visible (set lexical-inputs) :aliases {}} pairs)))
+
 (defn shape-projection-source
   [expression]
   (loop [expression expression]
