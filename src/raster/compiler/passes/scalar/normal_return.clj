@@ -550,6 +550,24 @@
             (util/remake-from source
                               (list 'let* bindings (util/subst-syms replacements (nth source 2))))))))))
 
+(defn- prepare-storage-frontend!
+  "Prepare only an admitted candidate's authentic selected source receiver.
+   No physical root facts have been acquired at this boundary. Reacquire the
+   current binding of the SAME opaque frontend after preparation; never refresh
+   any historical observations already owned by the enclosing producer."
+  [frontend source-var prepare!]
+  (let [current (method-entry/assert-frontend-semantic-selection! frontend source-var)]
+    (when-let [receiver (get-in current [:definition :receiver-var])]
+      (let [owner method-entry/*emission-inputs*
+            historical @owner]
+        (binding [method-entry/*emission-inputs* nil]
+          (prepare! receiver))
+        (when-not (identical? historical @owner)
+          (throw (ex-info "storage source preparation changed its enclosing compiler owner"
+                          {:reason :unstable-definition-proof-input})))
+        (method-entry/assert-definition-inputs-current! historical)
+        (method-entry/assert-frontend-semantic-selection! frontend source-var)))))
+
 (defn with-closed-double-storage-source
   "Consume a bounded primitive/Object/primitive source construction lexically.
    The caller owns the actual frontend-to-source transformation and final target
@@ -557,8 +575,12 @@
    Only a flat all-Double numerical spine is admitted. Boxed AD entry contracts,
    identity observations, arbitrary casts/calls and escaping Objects abstain.
 
-   Explicit preparation compiles only observed original receivers, then checks
-   their ORIGINAL observations; any change discards the whole owning attempt.
+   Candidate grammar and actual child-call gates precede preparation. Child
+   preparation retains its strict original fences. The exact semantic root is
+   then prepared BEFORE acquiring any physical root facts; its fresh binding
+   must retain the identical opaque source. Any changed prior observation still
+   discards the whole owning attempt. Declined/no-completion ordinary C
+   candidates perform no root JIT.
    consume! receives the new source and a finalizer. The latter accepts the
    actual target parameter order, scalar ABI and result ABI, and returns the
    existing definition guard to run AFTER all public input conversions. Neither
@@ -573,44 +595,49 @@
              (double-storage-leaf? (nth source 2)))
     (method-entry/call-with-optional-definition-inputs
      (fn []
-       (let [selection (method-entry/assert-frontend-selection! frontend source-var)
-             entry (method-entry/frontend-body-entry-carriers frontend source-var)
-             source-ns (get-in frontend [:source-entry :source-ns])
+       (let [semantic (method-entry/assert-frontend-semantic-selection! frontend source-var)
+             source-ns (get-in semantic [:source-entry :source-ns])
              locals (into (set parameters) (take-nth 2 (second source)))
              calls (filter #(and (seq? %) (= '.invk (first %)))
                            (tree-seq coll? seq (vec (take-nth 2 (rest (second source))))))
              call-entries (mapv #(double-storage-call-entry % locals) calls)]
-         (when (and entry (= parameters (:parameters entry))
-                    (every? #(identical? Double/TYPE %) (:parameter-carriers entry))
-                    (every? some? call-entries) (:receiver-var selection))
+         ;; Declaration filters select work only; actual root Method Classes
+         ;; remain mandatory after preparation, including for direct callers.
+         (when (and (= parameters (get-in semantic [:source-entry :params]))
+                    (every? #(= :double (dtype/dtype-for-scalar-tag %))
+                            (get-in semantic [:source-entry :tags]))
+                    (every? some? call-entries))
            (method-entry/prepare-owned-definition-inputs!
-            prepare! (conj (mapv #(get-in % [:definition :receiver-var]) call-entries)
-                           (:receiver-var selection)))
-           (when-let [bridge (method-entry/frontend-boxed-entry-bridge frontend)]
-             ;; The actual compute return may unbox an Object body result.
-             ;; The whole-source fold below proves that very terminal payload
-             ;; is a present builtin Double; no logical return annotation
-             ;; discharges Number.doubleValue or changes an Object fact.
-             (when (and (= :boxed-primitive-static-return (:kind bridge))
-                        (identical? Double/TYPE (:payload-carrier bridge))
-                        (identical? Double/TYPE
-                                    (.getReturnType ^java.lang.reflect.Method (:compute-method bridge)))
-                        (= (:invocation-method entry) (:invocation-method bridge))
-                        (= (:parameter-carriers entry) (:parameter-carriers bridge))
-                        (= :double (get-in bridge [:body-context :return-stack-type]))
-                        (contains? #{:ref :double} (get-in bridge [:body-context :emitted-result-type]))
-                        (= (completion/bytecode-operand-context {})
-                           (get-in bridge [:body-context :result-context])))
-               (when-let [constructed (construct-double-storage-source source parameters entry source-ns)]
-                 (consume!
-                  constructed
-                  (fn [target-parameters target-scalars target-result]
-                    (when-not (and (= parameters target-parameters)
-                                   (= (vec (repeat (count parameters) :double)) target-scalars)
-                                   (= :double target-result))
-                      (throw (ex-info "scalar storage construction has a different target ABI"
-                                      {:reason :scalar-storage-target-mismatch})))
-                    (method-entry/assert-frontend-selection! frontend source-var)
-                    (let [historical @method-entry/*emission-inputs*]
-                      (method-entry/assert-definition-inputs-current! historical)
-                      (fn [] (method-entry/assert-definition-inputs-current! historical))))))))))))))
+            prepare! (mapv #(get-in % [:definition :receiver-var]) call-entries))
+           (when-let [frontend (prepare-storage-frontend! semantic source-var prepare!)]
+             (let [entry (method-entry/frontend-body-entry-carriers frontend source-var)
+                   bridge (when (and entry (= parameters (:parameters entry))
+                                     (every? #(identical? Double/TYPE %) (:parameter-carriers entry)))
+                            (method-entry/frontend-boxed-entry-bridge frontend))]
+               ;; The actual compute return may unbox an Object body result.
+               ;; The whole-source fold below proves that very terminal payload
+               ;; is a present builtin Double; no logical return annotation
+               ;; discharges Number.doubleValue or changes an Object fact.
+               (when (and bridge (= :boxed-primitive-static-return (:kind bridge))
+                          (identical? Double/TYPE (:payload-carrier bridge))
+                          (identical? Double/TYPE
+                                      (.getReturnType ^java.lang.reflect.Method (:compute-method bridge)))
+                          (= (:invocation-method entry) (:invocation-method bridge))
+                          (= (:parameter-carriers entry) (:parameter-carriers bridge))
+                          (= :double (get-in bridge [:body-context :return-stack-type]))
+                          (contains? #{:ref :double} (get-in bridge [:body-context :emitted-result-type]))
+                          (= (completion/bytecode-operand-context {})
+                             (get-in bridge [:body-context :result-context])))
+                 (when-let [constructed (construct-double-storage-source source parameters entry source-ns)]
+                   (consume!
+                    constructed
+                    (fn [target-parameters target-scalars target-result]
+                      (when-not (and (= parameters target-parameters)
+                                     (= (vec (repeat (count parameters) :double)) target-scalars)
+                                     (= :double target-result))
+                        (throw (ex-info "scalar storage construction has a different target ABI"
+                                        {:reason :scalar-storage-target-mismatch})))
+                      (method-entry/assert-frontend-selection! frontend source-var)
+                      (let [historical @method-entry/*emission-inputs*]
+                        (method-entry/assert-definition-inputs-current! historical)
+                        (fn [] (method-entry/assert-definition-inputs-current! historical)))))))))))))))

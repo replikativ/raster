@@ -952,6 +952,22 @@
 
 (declare original-source-frontend)
 
+(defn assert-frontend-semantic-selection!
+  "Authenticate current selection of the same opaque original source frontend.
+   Returns its CURRENT source binding, not physical Method/carrier facts. A
+   legitimate JIT rebind of identical source may change implementation/owner;
+   existing physical observations retain their separate strict guards."
+  [frontend source-var]
+  (assert-frontend-source! frontend source-var)
+  (let [current (original-source-frontend source-var)]
+    (when-not (and current
+                   (identical? (:source-frontend frontend) (:source-frontend current))
+                   (identical? (:source-entry frontend) (:source-entry current)))
+      (throw (ex-info "frontend selection differs from its original semantic producer"
+                      {:reason :retained-frontend-entry-mismatch})))
+    (assert-definition-inputs-current! @*emission-inputs*)
+    current))
+
 (defn assert-frontend-selection!
   "Authenticate and observe an original frontend's exact physical receiver entry.
    Producer preparation may use this before acquiring an emitted-module guard.

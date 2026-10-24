@@ -1025,9 +1025,13 @@
                             ;; observing it. Later physical preparation must
                             ;; not introduce a missing source input mid-proof.
                             (rcore/prepare-emission-source-walk! resolved-var)
-                            (method-entry/original-source-frontend resolved-var))
-                 entry (when frontend (method-entry/frontend-body-entry-carriers frontend resolved-var))]
-             (when (and entry (every? #(identical? Double/TYPE %) (:parameter-carriers entry)))
+                            (method-entry/original-source-frontend resolved-var))]
+             ;; Frozen tags are a negative work filter, NOT root Class facts.
+             ;; This lexical candidate emits nothing. Its admitted storage
+             ;; consumer separately prepares and proves the actual root entry.
+             (when (and frontend
+                        (every? #(= :double (dtype/dtype-for-scalar-tag %))
+                                (get-in frontend [:source-entry :tags])))
                (source-policy/call-with-policy
                 (get-in frontend [:source-entry :source-policy])
                 (fn []
@@ -1041,7 +1045,7 @@
                                         (fn [source finish!]
                                           (compile-aot-c-source f-var dtype reuse-buffers? no-alias?
                                                                 (assoc source-result :form source) finish!))))))]
-                    (or ((requiring-resolve 'raster.ad.reverse/with-double-source-ad-projection)
+                    (or ((requiring-resolve 'raster.ad.reverse/with-double-source-ad-candidate)
                          frontend resolved-var (pl/build-param-env resolved-var dtype) consume!)
                         (consume! nil))))))))))
       ;; Refusal adopts no candidate-only evidence and preserves the original

@@ -89,10 +89,28 @@
                  (.close ^java.lang.AutoCloseable compiled))))))
 
 (deftest native-ad-entry-construction-does-not-borrow-logical-parameter-types
-  (doseq [source [#'native-ad-integral-boundary-gradient #'native-ad-local-argument-gradient]]
-    (is (= :unclosed-c-family-value-completion
-           (:reason (ex-data (try (pipeline/compile-aot source :target :c :dtype :double) nil
-                                 (catch clojure.lang.ExceptionInfo error error))))))))
+  (doseq [source [#'native-ad-unused-double
+                  #'native-ad-integral-boundary-gradient #'native-ad-local-argument-gradient]]
+    (let [resolved (rcore/resolve-deftm-var source)
+          receiver (ns-resolve (.ns ^clojure.lang.Var resolved)
+                               (symbol (str (.sym ^clojure.lang.Var resolved) "-impl")))
+          implementation (var-get receiver)
+          prepare rcore/ensure-current-owned-bytecode!
+          root-preparations (atom 0)]
+      (with-redefs [rcore/ensure-current-owned-bytecode!
+                    (fn [v & checks]
+                      (when (identical? receiver v) (swap! root-preparations inc))
+                      (apply prepare v checks))]
+        (if (identical? source #'native-ad-unused-double)
+          (let [compiled (pipeline/compile-aot source :target :c :dtype :double)]
+            (try (is (= 6.0 (compiled 3.0 11.0)))
+                 (finally (when (instance? java.lang.AutoCloseable compiled)
+                            (.close ^java.lang.AutoCloseable compiled)))))
+          (is (= :unclosed-c-family-value-completion
+                 (:reason (ex-data (try (pipeline/compile-aot source :target :c :dtype :double) nil
+                                       (catch clojure.lang.ExceptionInfo error error))))))))
+      (is (zero? @root-preparations) "ordinary C and declined AD candidates do not prepare the root")
+      (is (identical? implementation (var-get receiver))))))
 
 (deftest native-ad-entry-projection-rejects-changed-actual-constructor-plans
   (let [factory (requiring-resolve
@@ -126,7 +144,7 @@
                           (assoc plan :slots (assoc-in (:slots plan) [0 :contract] contract)
                                       :input-bindings inputs
                                       :bindings (into (:object-bindings plan) inputs))))))}
-                 #(reverse/with-double-source-ad-projection
+                 #(reverse/with-double-source-ad-candidate
                    frontend source-var (pipeline/build-param-env source-var :double)
                    (fn [_] (swap! consumers inc) :unexpected-consumer)))]
            (is (pos? @factory-calls) "interpose the actual prepared entry constructor")

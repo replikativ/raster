@@ -83,6 +83,12 @@ Physical Method, return-bridge and occurrence consumers separately retain exact
 receiver/module history. Reacquiring source does not refresh an old physical
 artifact. Exact-candidate source preparation closes the existing walk cache
 before observation; queries themselves do not compile or execute anything.
+Native AD source rewriting first builds a lexical candidate, not an admitted
+Double entry. The existing closed-storage grammar and child-call checks decide
+whether to prepare its exact semantic root. Only then does the consumer acquire
+a fresh same-source binding and check actual Method Classes and return bridges.
+Declined ordinary C candidates keep their independent fallback; source tags
+select work but cannot grant physical carrier or emission permission.
 These guards stay process-local, outside portable TypedSOAC facts and cache keys.
 Pure source qualification retains only the identities it consumes: original
 lookups, canonical Var/intern/namespace identity, and Class/alias/miss decisions.

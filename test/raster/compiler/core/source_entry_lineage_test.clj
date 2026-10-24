@@ -61,6 +61,11 @@
       (is (identical? (:body frontend) (:body current)))
       (is (not (identical? (:source-owner frontend) (:source-owner current))))
       (is (not (identical? (:implementation frontend) (:implementation current)))))
+    (let [current (entry/call-with-definition-inputs
+                   #(entry/assert-frontend-semantic-selection! frontend source))]
+      (is (identical? (:source-frontend frontend) (:source-frontend current)))
+      (is (not (identical? (:implementation frontend) (:implementation current)))
+          "source-only reacquisition does not refresh the old physical guard"))
     (doseq [policy [:no-inline :raster.compiler/host-only]]
       (let [metadata (meta receiver)]
         (try

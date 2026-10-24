@@ -6331,21 +6331,22 @@
                           {:reason :ad-unclosed-completion-transpose})))))
     program))
 
-(defn with-double-source-ad-projection
-  "Consume direct AD imports of actual public Double parameters before their
-   JVM adapters. The real Object snapshots remain; only constructor-joined
-   Double wrapper inputs become exact core double conversions at the same site.
-   Numerical closure and final target/entry validation belong to consume!."
+(defn with-double-source-ad-candidate
+  "Construct a lexical, non-executable candidate for direct AD imports.
+   Authentic frozen tags only select work; they are not root Class evidence.
+   Actual generated AD entry plans still own every imported wrapper conversion
+   and Object snapshot. The downstream consumer must prove the real root entry
+   before using this candidate; it may neither emit nor publish on tags alone."
   [frontend source-var param-env consume!]
   (when method-entry/*emission-inputs*
     (method-entry/call-with-optional-definition-inputs
      (fn []
-       (method-entry/assert-frontend-selection! frontend source-var)
-       (let [entry (method-entry/frontend-body-entry-carriers frontend source-var)
-             parameters (:parameters entry)
+       (method-entry/assert-frontend-semantic-selection! frontend source-var)
+       (let [parameters (get-in frontend [:source-entry :params])
              source-ns (get-in frontend [:source-entry :source-ns])
              body (:body frontend)]
-         (when (and entry (every? #(identical? Double/TYPE %) (:parameter-carriers entry))
+         (when (and (every? #(= :double (dtype/dtype-for-scalar-tag %))
+                            (get-in frontend [:source-entry :tags]))
                     (= 1 (count body)))
            (let [publics (set parameters)
                  used (volatile! (into publics (filter symbol?) (tree-seq coll? seq body)))
@@ -6435,9 +6436,9 @@
                          (binding [*generated-product-context* {:project-prepared-call project!}]
                            (inline/flatten-nested-lets (inline/inline-ad-applications source param-env)))))]
                  (when (seq @constructions)
-                   (method-entry/assert-frontend-selection! frontend source-var)
-                   ;; The continuation includes the ordinary numerical source
-                   ;; constructor, C emission and its post-marshalling guard.
+                   (method-entry/assert-frontend-semantic-selection! frontend source-var)
+                   ;; Lexical only: the storage consumer must first admit the
+                   ;; candidate and independently prove its actual root entry.
                    (consume! [projected])))
                (catch clojure.lang.ExceptionInfo error
                  (when-not (= :ad-double-source-boundary (:reason (ex-data error)))
