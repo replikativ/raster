@@ -26,7 +26,7 @@
 (deftest labels-are-derived-from-the-pass-specs-not-a-parallel-table
   (testing "every pass in forward-passes prints a stage header — a pass cannot silently vanish
             from the explanation because someone forgot to add it to a label table"
-    (let [s (explain #'raster.linalg.contract/contract-mm)
+    (let [s (explain #'raster.linalg.contract/contract-mm :dtype :double)
           headers (set (map second (re-seq #"--- Stage \d+: ([^\n]+?) ---" s)))
           specs (var-get (resolve 'raster.compiler.pipeline/pass-specs))]
       (doseq [p pl/forward-passes]
@@ -36,7 +36,7 @@
 (deftest the-hardware-line-names-the-target-not-the-host
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "explain-pipeline: target device")
-    (let [s (explain #'raster.linalg.contract/contract-mm :target-device :ze:0)
+    (let [s (explain #'raster.linalg.contract/contract-mm :dtype :double :target-device :ze:0)
           hw (re-find #"Hardware: [^\n]*" s)]
       (is (re-find #"\[:ze:0\]" (str hw)) (str "expected the target in the line, got: " hw))
       (is (not (re-find #"(?i)core\(tm\)|ultra" (str hw))) "must not report the host CPU")
@@ -46,7 +46,7 @@
 (deftest symbolic-contraction-reaches-the-tiled-schedule-and-reports-its-alternative
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "explain-pipeline: symbolic contraction")
-    (let [s (explain #'raster.linalg.contract/contract-mm :target-device :ze:0)
+    (let [s (explain #'raster.linalg.contract/contract-mm :dtype :double :target-device :ze:0)
           stage-section (fn [label]
                           (second (re-find (re-pattern (str "--- Stage \\d+: " label
                                                             " ---([\\s\\S]*?)(?=--- Stage|--- Kernels|\\z)"))

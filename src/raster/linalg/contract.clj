@@ -20,27 +20,27 @@
 
 ;; ── forward + the two backward contractions (all expressed as par/contract) ──────────
 (deftm contract-mm
-  [A :- (Array double), B :- (Array double), m :- Long, k :- Long, n :- Long] :- (Array double)
-  (let [C (ra/alloc-like A (* m n))]
-    (raster.par/contract C [[i m] [j n]] [[l k]]
-      (* (ra/aget A (+ (* i k) l)) (ra/aget B (+ (* l n) j))))
-    C))
+  (All [T] [A :- (Array T), B :- (Array T), m :- Long, k :- Long, n :- Long] :- (Array T)
+    (let [C (ra/alloc-like A (* m n))]
+      (raster.par/contract C [[i m] [j n]] [[l k]]
+        (* (ra/aget A (+ (* i k) l)) (ra/aget B (+ (* l n) j))))
+      C)))
 
 (deftm contract-mm-dA
   "Ā[i,l] = Σ_j C̄[i,j]·B[l,j]  (= C̄·Bᵀ)."
-  [Cbar :- (Array double), B :- (Array double), m :- Long, k :- Long, n :- Long] :- (Array double)
-  (let [dA (ra/alloc-like Cbar (* m k))]
-    (raster.par/contract dA [[i m] [l k]] [[j n]]
-      (* (ra/aget Cbar (+ (* i n) j)) (ra/aget B (+ (* l n) j))))
-    dA))
+  (All [T] [Cbar :- (Array T), B :- (Array T), m :- Long, k :- Long, n :- Long] :- (Array T)
+    (let [dA (ra/alloc-like Cbar (* m k))]
+      (raster.par/contract dA [[i m] [l k]] [[j n]]
+        (* (ra/aget Cbar (+ (* i n) j)) (ra/aget B (+ (* l n) j))))
+      dA)))
 
 (deftm contract-mm-dB
   "B̄[l,j] = Σ_i A[i,l]·C̄[i,j]  (= Aᵀ·C̄)."
-  [A :- (Array double), Cbar :- (Array double), m :- Long, k :- Long, n :- Long] :- (Array double)
-  (let [dB (ra/alloc-like Cbar (* k n))]
-    (raster.par/contract dB [[l k] [j n]] [[i m]]
-      (* (ra/aget A (+ (* i k) l)) (ra/aget Cbar (+ (* i n) j))))
-    dB))
+  (All [T] [A :- (Array T), Cbar :- (Array T), m :- Long, k :- Long, n :- Long] :- (Array T)
+    (let [dB (ra/alloc-like Cbar (* k n))]
+      (raster.par/contract dB [[l k] [j n]] [[i m]]
+        (* (ra/aget A (+ (* i k) l)) (ra/aget Cbar (+ (* i n) j))))
+      dB)))
 
 ;; ── reverse-mode rule: backward = the two gradient contractions ──────────────────────
 (tmpl/merge-into-template! 'raster.linalg.contract/contract-mm

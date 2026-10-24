@@ -162,6 +162,18 @@ changed-source and future-reference controls remain active. Ordered realization,
 materialization and preparation qualification passes 27 tests / 369 assertions.
 Public automatic ordered selection and training port capabilities remain open.
 
+Public Float fixture qualification exposed an additional type-policy mismatch:
+the Double-only `contract-mm` source retained a Double effect-return binder while
+the legacy dtype policy adapted its exemplar allocation and inputs to Float.
+Capacity admission correctly refused that alias. The forward and both pullbacks
+now use the existing `(All [T])` surface, producing genuine Float specializations
+instead of overriding source evidence. Double numerical/finite-difference AD,
+Float/Double forward and pullback storage, CUDA/HIP Float reduction/ABI types,
+compatibility-ledger and explain checks pass 13 tests / 127 assertions. Existing
+Double-oriented compiler tests explicitly request Double. This adds element-
+polymorphic library dispatch; it does not retire the broader legacy dtype-policy
+debt or authorize alias checks to ignore incompatible retained declarations.
+
 Update the existing capability/compatibility ledger with each failure's owner,
 accepted or deliberately declined form, numerical/effect oracle and removal gate.
 Current node-wise AD composition is bounded but implemented; historical statements
