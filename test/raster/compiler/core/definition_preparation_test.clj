@@ -16,13 +16,19 @@
     @entry/*emission-inputs*))
 
 (deftest historical-adoption-retains-first-observations-and-all-lookup-edges
-  (let [historical (-> (observed-inputs #'input-a)
-                       (assoc :source-body-inputs #{[#'input-a :var]}
-                              :unclosed-source-imports #{[:test-unclosed #'input-a]}))
+  (let [current? (atom true)
+        checks (atom 0)
+        producer (reify entry/RetainedProducerInput
+                   (assert-producer-current! [this]
+                     (swap! checks inc)
+                     (when-not @current?
+                       (throw (ex-info "retained producer changed" {:reason :test-stale-producer})))
+                     this))
+        historical (assoc (observed-inputs #'input-a) :producer-inputs [producer])
         sentinel (Object.)
         parent (atom (-> (observed-inputs #'input-b)
-                         (update :values conj sentinel)
-                         (assoc :unclosed-source-imports #{[:parent-unclosed]})))
+                         (update :values conj sentinel)))
+        numerical-before @numeric-calls
         own-ns (:ns (meta #'input-a))
         qualified (symbol (str (ns-name own-ns)) "input-a")]
     (binding [entry/*emission-inputs* parent]
@@ -39,9 +45,17 @@
           (is (= 3 (count (:values @parent))))
           (is (some #(identical? sentinel %) (:values @parent)))
           (is (some #(identical? adopted %) (:values @parent)))
-          (is (= (:source-body-inputs historical) (:source-body-inputs @parent)))
-          (is (= (conj (:unclosed-source-imports historical) [:parent-unclosed])
-                 (:unclosed-source-imports @parent))))))))
+          (is (= 1 (count (:producer-inputs @parent))))
+          (is (identical? producer (first (:producer-inputs @parent))))
+          (reset! checks 0)
+          (is (true? (entry/assert-definition-inputs-current! @parent)))
+          (is (= 1 @checks))
+          (reset! current? false)
+          (is (= :test-stale-producer
+                 (try (entry/assert-definition-inputs-current! @parent) nil
+                      (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+          (is (= numerical-before @numeric-calls)
+              "adoption and freshness checks never invoke the observed numerical definitions"))))))
 
 (deftest historical-adoption-does-not-overwrite-a-competing-owner-update
   (let [historical (observed-inputs #'input-a)
