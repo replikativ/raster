@@ -46,6 +46,11 @@
       (:params program) (:tags program) 'Object (:walked-body program)
       (:source-ns program) (:iface-name interface) 'generated-body-test nil)]
       (generated/validate-program-emission! program (:emission emitted))
+      ;; These controls are independently emitted derived programs, just like
+      ;; the production generated-entry consumer. Close their actual callees
+      ;; before invocation; a promotion must restart the surrounding test owner,
+      ;; not invalidate an already prepared sibling on the first numeric call.
+      (bytecode/prepare-emitted-global-invocations! (:emission emitted))
       (:implementation emitted))))
 
 (defn- invoke [function arguments]
