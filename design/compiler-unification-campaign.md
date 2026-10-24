@@ -129,6 +129,17 @@ different host-continuation refusal (retained checked integer multiplication);
 that is not successful training. Exact-head CI and the remaining audited
 families are still required before merge.
 
+Portable option qualification also exposed a boundary leak: entry admission's
+actual source Var was retained in `EquationFirstCompilation.options`, causing
+the strict artifact fingerprint to reject an otherwise portable compilation.
+The compilation producer now omits `:source-var` and `:source-binding-context`
+alongside its existing request-local `:values` omission. Source namespace symbols,
+resolved schedules and semantic programs remain retained; artifact encoding and
+fingerprinting are unchanged. Artifact/cache/store/dispatch qualification passes
+32 tests / 355 assertions, including real context omission and rejection of
+manually injected Vars, contexts and callbacks. This is not permission to drop
+arbitrary unsupported artifact data or reuse stale source-definition evidence.
+
 Update the existing capability/compatibility ledger with each failure's owner,
 accepted or deliberately declined form, numerical/effect oracle and removal gate.
 Current node-wise AD composition is bounded but implemented; historical statements

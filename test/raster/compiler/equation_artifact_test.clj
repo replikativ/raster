@@ -5,6 +5,8 @@
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-artifact-store :as store]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.core.binding-completion :as binding-completion]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.invocation-plan :as invocation]
@@ -273,11 +275,23 @@
         transport (artifact/encode envelope)
         restored (artifact/open identity (artifact/decode transport))
         arguments [(float-array [1.0 2.0 3.0 4.0]) 4]]
+    (is (not (contains? (:options original) :source-var)))
+    (is (not (contains? (:options original) :source-binding-context)))
+    (is (symbol? (get-in original [:options :source-ns])))
     (is (= original restored))
     (is (= (equation-first/lower original arguments)
            (equation-first/lower restored arguments)))
     (is (= (:payload-fingerprint envelope)
            (:payload-fingerprint (artifact/decode transport))))))
+
+(deftest request-local-entry-context-is-not-exported
+  (let [context (binding-completion/capture-resolution-context #'bytecode/binding-completion-plan)
+        original (equation-first/compile #'artifact-map
+                                          {:target target :dtype :float
+                                           :source-binding-context context})]
+    (is (some? context))
+    (is (not (contains? (:options original) :source-binding-context)))
+    (is (= :equation-first-compilation (:kind (artifact/seal identity original))))))
 
 (defn- compiler-record-round-trip [value]
   (let [options {:profile :archival
@@ -400,9 +414,12 @@
                                         (assoc envelope :schema-version 2))))))))
 
 (deftest unsupported-runtime-values-never-enter-artifacts
-  (is (= :semantic-fingerprint-unsupported
-         (reason-of #(artifact/seal identity
-                                    (assoc @compilation :options {:callback (fn [] nil)}))))))
+  (doseq [options [{:callback (fn [] nil)}
+                   {:source-var #'artifact-map}
+                   {:source-binding-context (Object.)}]]
+    (is (= :semantic-fingerprint-unsupported
+           (reason-of #(artifact/seal identity (assoc @compilation :options options))))
+        "the producer boundary omits local authorities; artifact validation never erases them")))
 
 (deftest atomic-store-round-trips-bounds-and-reports-corruption
   (with-temporary-directory
