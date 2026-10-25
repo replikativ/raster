@@ -83,17 +83,38 @@ report is shared through the existing retained-proof APIs, never borrowed from
 its parent. Nominal carry allocations remain separate from zero-trip effective
 aliases. Runtime constructor correspondence uses the actual physical allocation
 step and separately checks concrete logical volume. Source-only count aliases
-remain outside numerical scalar argument maps. Local device checks pass 3 tests /
-187 assertions, including empty domains, replay, failed-iteration cleanup,
-snapshot tampering and a discrete-Laplacian/RK4-polynomial oracle on OpenCL and
-Level Zero. An affected ownership/preparation gate passes 33 tests / 631
-assertions. The complete routing/root gate reports 74 tests / 1,055 assertions,
-zero failures and the same two legacy eager/manual-call errors. Independent
-review found no concrete checkpoint blocker; clean qualification and branch-wide
-gates remain open. A language-coverage gap is retained: a let-bound terminal copy can expand
+remain outside numerical scalar argument maps. Independent review found no
+concrete checkpoint blocker. Clean detached d146fb5f qualification reports:
+
+| Affected group | Tests | Assertions | Failures / errors |
+| --- | ---: | ---: | ---: |
+| Source, prefix, fusion and materialization | 286 | 1,818 | 0 / 0 |
+| Linking, ordered ownership and loop lowering | 63 | 801 | 0 / 0 |
+| OpenCL/Level Zero public loop and existing root owners | 5 | 591 | 0 / 0 |
+| Complete structured routing namespace | 72 | 651 | 0 / 2 |
+
+Combined: 426 tests / 3,861 assertions, zero failures and the same two legacy
+eager/manual-call errors; runner exits nonzero. Device coverage includes empty
+domains, replay, failed-iteration cleanup, snapshot tampering and an independent
+discrete-Laplacian/RK4-polynomial oracle. This is not full-branch qualification.
+A language-coverage gap is retained: a let-bound terminal copy can expand
 into a scalar store loop before structured recognition; the inline functional
 copy-combinator form used by RK4 admits. This is not a generic-loop completeness
 claim or permission to erase the original host-prefix provenance.
+
+The two legacy tests must be migrated by obligation, not deleted wholesale:
+
+- Keep full MLP/PDE compilation, public ABI and source-allocation tamper checks
+  device-free; discard obsolete clone/cardinality assumptions, not semantics.
+- Move eager prefix-evaluator/future/lower-observer isolation, five-argument request
+  forwarding, certification/memory-witness and zero-initializer controls to the
+  existing eager-compatible `shape-before-first-stage` fixture.
+- Validate full MLP/PDE through deferred public preparation and completed owners.
+  Retain first-layer shape context, captured target constants, completed alias
+  identities and PDE resident rank-zero output remapping.
+- Replace old fixed mock bind counts only after actual ordered owner observations
+  cover release/allocation balance, no descriptor recording and failure withholding
+  suffix/output publication. Keep the full-workload numerical oracles.
 
 For comparison, exact-parent `be180fd6` CI34832 has 15 completed unit summaries:
 6,949 tests / 87,661 assertions, 24 failures / 50 errors across 58 test Vars; the
