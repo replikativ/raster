@@ -7313,8 +7313,7 @@
   (let [record (retained-input-completion-context emission input-body original)
         contract (:contract record)
         input (:operand-input record)
-        result-type (case (:operation contract)
-                      :int :int :long :long (:float :unchecked-float) :float nil)
+        result-type (some-> (completion/source-cast-result-tag contract) name keyword)
         result-carrier (when result-type (primitive-carrier-class result-type))
         operand-policy (:operand-source-policy record)
         [unowned-reason replay-reason]

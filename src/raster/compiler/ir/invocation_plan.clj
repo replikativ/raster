@@ -322,16 +322,15 @@
 
       (source-completion? step)
       (let [{:keys [contract operand]} (completion/canonical-parts (:expression step))
-            expected (case (:operation contract) :int :int :long :long nil)
+            expected (some-> (completion/source-cast-result-tag contract) dtype/dtype-for-scalar-tag)
             symbols (set (keys operands))]
-        (when-not (and (= :source-integral-cast (:source-context contract))
-                       (scalar-value? value) expected (= expected (dtype/canon (:dtype value)))
+        (when-not (and (scalar-value? value) expected (= expected (dtype/canon (:dtype value)))
                        (every? (fn [id]
                                  (let [input (get values id)]
                                    (or (scalar-value? input) (opaque-value? input)))) operand-values)
                        (= (util/free-syms operand) symbols))
           (fail! :invocation-source-completion
-                 "source completion requires a closed integral operation over host values"
+                 "source completion requires a closed source cast over host values"
                  {:step id :value value})))
 
       (scalar-compute? step)
@@ -653,7 +652,7 @@
                             (get environment source) value)
                :source-expression expression))
 
-      (= :source-integral-cast (:source-context (:contract (completion/canonical-parts expression))))
+      (completion/source-cast-result-tag (:contract (completion/canonical-parts expression)))
       (->SourceCompletion id symbol (referenced-operands expression environment) expression value)
 
       (scalar-value? value)

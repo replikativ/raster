@@ -11,6 +11,8 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.params-flatten :as params-flatten]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -231,7 +233,30 @@
    (:shape abstract)))
 
 (defn- checked-computed-scalar [step value]
+  (when (invocation/source-completion? step)
+    (let [contract (:contract (completion/canonical-parts (:expression step)))
+          carrier (get types/primitive-info (completion/source-cast-result-tag contract))]
+      ;; A source completion already performed its actual conversion. A
+      ;; dtype label is not permission to silently convert its result again.
+      (when-not (and (typed-scalar? value) carrier
+                     (identical? carrier (class (:value value))))
+        (fail! :invocation-materialization-source-carrier
+               "source completion executor did not return its declared physical result"
+               {:step (:id step) :expected carrier :actual (some-> (:value value) class)}))))
   (checked-scalar (:id step) (:value step) value))
+
+(defn- source-completion-producers
+  "Follow only explicit invocation value aliases to their source completion.
+   This is a plan-local dataflow projection, not an inferred numeric type."
+  [plan]
+  (reduce (fn [producers step]
+            (cond
+              (invocation/source-completion? step) (assoc producers (:id step) step)
+              (invocation/value-alias? step)
+              (if-let [producer (get producers (:source step))]
+                (assoc producers (:id step) producer) producers)
+              :else producers))
+          {} (:steps plan)))
 
 (defn- validate-buffer! [binding-id buffer expected]
   (when-not (materialized-buffer? buffer)
@@ -283,6 +308,7 @@
         plan (invocation/validate! plan)
         _ (refuse-external-dimensions! plan)
         _ (refuse-external-storage! plan)
+        completion-producers (source-completion-producers plan)
         invocation-ids (set (concat (map :id (:parameters plan)) (map :id (:steps plan))))
         lexical (into {} (map (juxt :symbol :id))
                       (concat (:parameters plan) (:steps plan)))]
@@ -298,9 +324,9 @@
     ;; Retained parameters/steps can feed shape computations without being
     ;; final program inputs. Their declared scalar domains still apply when a
     ;; materialization is validated again at a later boundary.
-    (doseq [{:keys [id value]} (concat (:parameters plan) (:steps plan))
+    (doseq [{:keys [id value] :as slot} (concat (:parameters plan) (:steps plan))
             :when (scalar-value? value)]
-      (checked-scalar id value (get values id)))
+      (checked-computed-scalar (get completion-producers id slot) (get values id)))
     (doseq [{:keys [id value]} (concat (:parameters plan) (:steps plan))
             :when (opaque-value? value)]
       (checked-opaque id value (get values id)))
@@ -332,6 +358,8 @@
       (checked-scalar id (get-in plan [:values id]) scalar))
     (doseq [{:keys [program-value invocation-value]}
             (concat (:bindings plan) (:storage-bindings plan))]
+      (when-let [producer (get completion-producers invocation-value)]
+        (checked-computed-scalar producer (get program-scalars program-value)))
       (when-not (= (get values invocation-value)
                    (or (get program-buffers program-value)
                        (get program-scalars program-value)))
@@ -495,8 +523,7 @@
 
           (invocation/source-completion? step)
           (let [execute (source-completion-executor evaluate-scalar id)]
-            (checked-computed-scalar
-             step (execute step (step-operand-values step values))))
+            (checked-computed-scalar step (execute step (step-operand-values step values))))
 
           (invocation/scalar-compute? step)
           (let [evaluate (if (map? evaluate-scalar) (:scalar evaluate-scalar) evaluate-scalar)]
@@ -541,7 +568,8 @@
     (fail! :invocation-materialization-state-type "expected an InvocationMaterializationState"
            {:actual (type state)}))
   (let [{:keys [plan values lexical next-step]} state
-        plan (invocation/validate! plan)]
+        plan (invocation/validate! plan)
+        completion-producers (source-completion-producers plan)]
     (refuse-external-dimensions! plan)
     (refuse-external-storage! plan)
     (when-not (and (integer? next-step) (<= 0 next-step (count (:steps plan))))
@@ -559,18 +587,18 @@
             parameter-lexical (into {} (map (juxt :symbol :id)) parameters)
             parameter-values (select-keys values (map :id parameters))
             scalar-values (into {} (filter (comp typed-scalar? val)) parameter-values)
-            check-scalar! (fn [id value actual]
+            check-scalar! (fn [{:keys [id] :as slot} actual]
                             (when-not (typed-scalar? actual)
                               (fail! :invocation-materialization-state-scalar
                                      "retained scalar state requires a typed value"
                                      {:value-id id :actual actual}))
-                            (checked-scalar id value actual))]
+                            (checked-computed-scalar (get completion-producers id slot) actual))]
         (doseq [{:keys [id value] :as parameter} parameters]
           (let [actual (get values id)]
             (cond
               (opaque-value? value) (checked-opaque id value actual)
               (scalar-value? value)
-              (check-scalar! id value actual)
+              (check-scalar! parameter actual)
               :else (do
                 (validate-buffer! id actual value)
                 (let [expected (->MaterializedBuffer
@@ -591,12 +619,14 @@
            (let [{:keys [id symbol value]} step
                  actual (get values id)]
              (if (or (invocation/scalar-compute? step) (invocation/source-completion? step))
-               (do (check-scalar! id value actual)
+               (do (check-scalar! step actual)
                    (-> prior
                        (assoc-in [:values id] actual)
                        (assoc-in [:lexical symbol] id)
                        (update :next-step inc)))
-               (let [expected (advance-materialization prior nil)]
+               (let [_ (when-let [producer (get completion-producers id)]
+                         (checked-computed-scalar producer actual))
+                     expected (advance-materialization prior nil)]
                  (when-not (if (opaque-value? value)
                              (identical? actual (get-in expected [:values id]))
                              (= actual (get-in expected [:values id])))

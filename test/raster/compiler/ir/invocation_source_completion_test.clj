@@ -11,35 +11,45 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.parallel-program :as parallel-program]))
 
-(defn- scalar [] (av/tensor {:dtype :int :shape []}))
+(defn- scalar
+  ([] (scalar :int))
+  ([dtype] (av/tensor {:dtype dtype :shape []})))
 (defn- opaque [] (av/make {:kind :opaque :memory-space :host :ownership :borrowed}))
 
 (defn- completion-node []
   (completion/complete-value
    (completion/source-integral-cast-contract :int {:unchecked-math false}) 'value))
 
-(defn- fixture []
-  (let [nodes [(completion-node) (completion-node)]
+(defn- fixture
+  ([] (fixture :int false))
+  ([dtype unchecked?]
+  (let [node (fn []
+               (if (= :float dtype)
+                 (completion/complete-value
+                  (completion/source-floating-cast-contract :float {:unchecked-math unchecked?}) 'value)
+                 (completion-node)))
+        nodes [(node) (node)]
         interface (types/ensure-fn-interface! '[Object])
         emitted (core/emit-owned-bytecode!
                  bytecode/compile-typed-impl! "raster.compiled.OrderedSourceCompletion"
                  '[value] '[Object] 'Object nodes *ns* (:iface-name interface)
                  'ordered-source-completion)
-        regions (mapv #(bytecode/compile-source-integral-completion-region
-                        (:emission emitted) nodes %) nodes)
+        outline (if (= :float dtype) bytecode/compile-source-floating-completion-region
+                    bytecode/compile-source-integral-completion-region)
+        regions (mapv #(outline (:emission emitted) nodes %) nodes)
         bindings (mapv vector '[first-count second-count] nodes)
         plan (invocation/from-prefix
               {:id :ordered-source-counts
                :parameters '[value] :parameter-values {'value (opaque)}
                :bindings bindings
-               :binding-values {'first-count (scalar) 'second-count (scalar)}
-               :program-values {'first-count (scalar) 'second-count (scalar)}
+               :binding-values {'first-count (scalar dtype) 'second-count (scalar dtype)}
+               :program-values {'first-count (scalar dtype) 'second-count (scalar dtype)}
                :program-inputs '[first-count second-count]
                :program-outputs '[second-count]})
         program (parallel-program/make
                  {:dialect :typed-parallel
                   :source (list 'let* (vec (mapcat identity bindings)) 'second-count)
-                  :values {'first-count (scalar) 'second-count (scalar)}
+                  :values {'first-count (scalar dtype) 'second-count (scalar dtype)}
                   :inputs '[first-count second-count] :outputs '[second-count]})
         executors (java.util.IdentityHashMap.)]
     (doseq [[step region] (map vector (:steps plan) regions)]
@@ -51,9 +61,90 @@
                    (when-not region
                      (throw (ex-info "step is not owned by this prepared source program"
                                      {:reason :unowned-test-source-step})))
-                   {:type :int
+                   {:type dtype
                     :value (apply (:invoke region)
-                                  (map #(get-in operands [% :source]) (:parameters region)))}))}}))
+                                  (map #(get-in operands [% :source]) (:parameters region)))}))}})))
+
+(deftest floating-completions-use-the-same-ordered-host-materialization-contract
+  (doseq [unchecked? [false true]]
+    (let [{:keys [plan execute]} (fixture :float unchecked?)
+          calls (atom [])
+          number (proxy [Number] []
+                   (intValue [] (throw (AssertionError. "wrong conversion")))
+                   (longValue [] (throw (AssertionError. "wrong conversion")))
+                   (floatValue [] (swap! calls conj :float) (float 3.5))
+                   (doubleValue [] (swap! calls conj :double) (double 1.0e40)))
+          initial (materialization/begin-materialization plan [number])]
+      (is (every? invocation/source-completion? (:steps plan)))
+      (is (empty? @calls) "preparation does not execute the source Number conversion")
+      (if unchecked?
+        (let [first-state (materialization/materialize-next initial execute)
+              _ (materialization/validate-state! first-state)
+              final (materialization/materialize-next first-state execute)
+              result (materialization/finish-materialization final)]
+          (is (= [:float :float] @calls))
+          (is (= {:type :float :value (float 3.5)}
+                 (get-in result [:program-scalars 'second-count])))
+          (is (instance? Float (get-in result [:program-scalars 'second-count :value]))))
+        (do
+          (is (thrown? IllegalArgumentException (materialization/materialize-next initial execute)))
+          (is (= [:double] @calls))
+          (is (zero? (:next-step initial)))
+          (materialization/validate-state! initial)
+          (is (= [:double] @calls) "validation does not replay the failed conversion"))))))
+
+(deftest source-completion-executor-cannot-relabel-an-unconverted-result
+  (doseq [[dtype value] [[:float (double 3.5)] [:int (long 3)]]]
+    (let [{:keys [plan]} (fixture dtype false)
+          initial (materialization/begin-materialization plan [(double 3.5)])
+          execute {:source-completion (fn [_ _] {:type dtype :value value})}]
+      (is (= :invocation-materialization-source-carrier
+             (try (materialization/materialize-next initial execute) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (zero? (:next-step initial))))))
+
+(deftest completed-source-carriers-are-revalidated-without-reexecution
+  (let [{:keys [plan execute]} (fixture :float false)
+        initial (materialization/begin-materialization plan [(double 0.25)])
+        first-state (materialization/materialize-next initial execute)
+        id (:id (first (:steps plan)))
+        forged-state (assoc-in first-state [:values id :value] (double 0.25))
+        finished (materialization/materialize plan [(double 0.25)] execute)
+        forged-result (assoc-in finished [:values id :value] (double 0.25))
+        forged-projection (assoc-in finished [:program-scalars 'second-count :value] (double 0.25))]
+    (doseq [[validate value] [[materialization/validate-state! forged-state]
+                              [materialization/validate! forged-result]
+                              [materialization/validate! forged-projection]]]
+      (is (= :invocation-materialization-source-carrier
+             (try (validate value) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest source-completion-carrier-follows-explicit-value-aliases
+  (let [{:keys [plan execute]} (fixture :float false)
+        source (:id (last (:steps plan)))
+        id [:source-float-alias]
+        alias (invocation/->ValueAlias id 'aliased [{:symbol 'second-count :value source}]
+                                       source (scalar :float))
+        plan (-> plan
+                 (update :steps conj alias)
+                 (assoc-in [:values id] (scalar :float))
+                 (update :bindings (fn [bindings]
+                                     (mapv #(if (= 'second-count (:program-value %))
+                                              (assoc % :invocation-value id) %) bindings))))
+        initial (materialization/begin-materialization plan [(double 0.25)])
+        final-state (nth (iterate #(materialization/materialize-next % execute) initial) 3)
+        finished (materialization/finish-materialization final-state)]
+    (is (instance? Float (get-in finished [:program-scalars 'second-count :value])))
+    (doseq [[validate value]
+            [[materialization/validate-state!
+              (assoc-in final-state [:values id :value] (double 0.25))]
+             [materialization/validate!
+              (assoc-in finished [:values id :value] (double 0.25))]
+             [materialization/validate!
+              (assoc-in finished [:program-scalars 'second-count :value] (double 0.25))]]]
+      (is (= :invocation-materialization-source-carrier
+             (try (validate value) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
 
 (deftest owned-completions-run-at-the-host-cursor-not-during-validation
   (let [{:keys [plan program execute]} (fixture)

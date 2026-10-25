@@ -15,7 +15,7 @@ rather than adding a route for each workload.
 | Ordered outputs and taps | Deferred public intent to completed physical boundary | Locally qualified: 45 tests / 997 assertions, shared projector, independent intermediate/final device values and replay/lifetime/failure/certificate controls; full branch gates still pending |
 | Aggregate state and composition | Entry slots locally qualified; deferred components remain open | 57 tests / 1,260 assertions qualify shared leaf projection and replay; next require composed AMR/distributed workload without a fabricated preparation-time LinkPlan |
 | RK4 | Full qualification of unified ordered program stages | Local Intel Arc OpenCL/Level Zero recurrence and discrete RK4 oracle pass; affected/fresh/full gates remain pending |
-| Float/Object results | Owned imported completion suffix after numerical reduction | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
+| Float/Object results | Completed numerical result to invocation-value import, then owned source completion and distinct result publication | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
 | Compile cost and full qualification | GSDM timeout and incomplete CI denominator | Phase profiling, complete exact-head shards/corpus/device/compiler gates; separate cold/prepare/replay/device timings |
 
@@ -62,6 +62,52 @@ an unmodified product-normalized numerical core. This is construction and JVM
 execution evidence only. The invocation cursor must still execute that retained
 completion after the numerical result; the CUDA/HIP fixture pair is not yet
 qualified. No buffer alias or new derivative rule substitutes for that work.
+
+#### Remaining bidirectional invocation boundary
+
+The bounded host prerequisite now reuses the existing `SourceCompletion` step
+for Float and integral casts, with one shared source-contract result declaration.
+Completion creation, retained-state validation, explicit alias transport and
+final program-scalar projection all check the actual completed carrier; numeric
+equality cannot substitute a Double for Float or Long for Integer. Ordinary
+public scalar coercion policy is unchanged. Independent review is closed; the
+affected shared-REPL gate passes 232 tests / 3,290 assertions. Ordered GPU source
+completion remains refused until the result-import/executor/publication chain
+below is implemented and qualified.
+
+Independent implementation review identifies an explicit missing dataflow edge,
+not merely an unsupported cast. `InvocationPlan` currently relates host parameters
+and preceding host steps to numerical inputs. A completed numerical reduction is
+not an available host-step operand. Extend this boundary in three coordinated
+parts, retaining the existing source cursor and runtime owner:
+
+1. Represent a numerical-result-to-invocation-value binding. Require the exact
+   preceding producer/result, validated singleton resident realization and
+   independently retained source normal-return payload relation. No plain
+   rank-zero AV, public-parameter surrogate, arbitrary array read or external
+   storage premise can stand in for this edge. Discharge it after synchronous
+   stage completion from the same owner's actual initialized view; validation
+   neither downloads nor repeats it.
+2. Execute the exact outlined source completion through materialization's separate
+   source executor and the existing ordered host-source transition. Preserve
+   Object snapshots as source reference operations, not numerical dtype aliases.
+   Preflight requires the owned executor and causal operand imports before
+   resource acquisition. Keep the ordered executor's current refusal until those
+   capabilities exist. A completed cast must have its actual declared carrier,
+   not merely a numeric payload bearing a Float dtype label.
+3. Publish the completed Float through a distinct, ordinarily allocated/stored
+   resident output with its own validated producer. Do not label the Double
+   reduction's storage as Float or stamp residency onto the host result. Only
+   successful completion permits publication.
+
+Acceptance is the complete public source vertical: preparation has no conversion
+or transfer effects; write/reduction/conversion/later-write ordering is preserved;
+overflow leaves prior effects but suppresses the suffix and output; wrong/future
+producers, uninitialized or wrong views, stale executors and non-source payloads
+refuse. Include empty reductions, changed-input replay, numerical edge cases,
+OpenCL/Level Zero ownership/lifetime checks and the CUDA/HIP compiler fixtures.
+The host-only Float `SourceCompletion` prerequisite does not itself satisfy this
+vertical or change device admission.
 
 `f23aa150` repairs the structured frontend's causal analysis boundary. Prefix
 bindings advance one immutable HostAV context; a fresh, unknown iteration

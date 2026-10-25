@@ -5,6 +5,19 @@
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
 
+(deftest source-cast-result-declaration-does-not-admit-other-contexts-or-forged-contracts
+  (doseq [[operation tag constructor]
+          [[:int 'int completion/source-integral-cast-contract]
+           [:long 'long completion/source-integral-cast-contract]
+           [:float 'float completion/source-floating-cast-contract]
+           [:unchecked-float 'float completion/source-floating-cast-contract]]]
+    (let [contract (constructor operation {:unchecked-math false})]
+      (is (= tag (completion/source-cast-result-tag contract)))
+      (is (nil? (completion/source-cast-result-tag (dissoc contract :source-policy))))
+      (is (nil? (completion/source-cast-result-tag (assoc contract :unchecked-math true))))))
+  (is (nil? (completion/source-cast-result-tag completion/object-input-contract)))
+  (is (nil? (completion/source-cast-result-tag (completion/reference-check-contract Float)))))
+
 (deftest source-floating-completion-names-the-source-overload-not-an-ieee-cast
   (doseq [operation [:float :unchecked-float]
           mode [false true :warn-on-boxed]]

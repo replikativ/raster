@@ -237,6 +237,14 @@
                 (primitive-carrier? (:target-carrier contract))
                 (source-policy? (:source-policy contract))))))
 
+(defn source-cast-result-tag
+  "The declared result of a valid source-cast contract, not an operand type proof.
+   This query grants no evaluation, portability or reordering permission."
+  [contract]
+  (when (and (canonical-contract? contract)
+             (contains? #{:source-integral-cast :source-floating-cast} (:source-context contract)))
+    (case (:operation contract) :int 'int :long 'long (:float :unchecked-float) 'float nil)))
+
 (defn- value-meta [contract expression]
   ;; A new value term cannot inherit the original callee's identity/effects or
   ;; a JVM hint which changes physical compilation. Retain declarations only.
@@ -249,8 +257,8 @@
         ;; No JVM hint, successful conversion, presence or physical input fact
         ;; follows from this declaration. Exact Class identity stays in contract.
         ^Class target (:target-carrier contract)
-        tag (if (contains? #{:source-integral-cast :source-floating-cast} (:source-context contract))
-              (case (:operation contract) :int 'int :long 'long (:float :unchecked-float) 'float)
+        tag (if-let [source-tag (source-cast-result-tag contract)]
+              source-tag
               (when (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
               (if (.isPrimitive target)
                 (let [tag (symbol (.getName target))]
