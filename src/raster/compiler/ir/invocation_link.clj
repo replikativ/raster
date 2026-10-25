@@ -153,6 +153,30 @@
       (contains? roles :output) :write
       :else nil)))
 
+(defn- boundary-buffer-accesses
+  "Project a checked numerical boundary to outer value identities.
+   Loop graph ports use inner binders; compiler-private temporaries are not
+   accesses to an outer buffer. This is access information, not initialization,
+   execution, or complete-overwrite evidence."
+  [{:keys [operation graph]}]
+  (if-not (emitted-loop/emitted-loop? operation)
+    (into {} (map (fn [id] [id (graph-buffer-access graph id)]))
+          (distinct (map :id (concat (:inputs graph) (:outputs graph)))))
+    (let [algorithm (get-in operation [:schedule :algorithm])
+          physical-results (soac/physical-result-map (control/body algorithm))
+          bindings (concat
+                    (map (juxt :outer :parameter) (control/invariants algorithm))
+                    (mapcat (fn [{:keys [initial parameter result output]}]
+                              [[initial parameter] [output (get physical-results result result)]])
+                            (control/carried algorithm)))]
+      (reduce (fn [accesses [outer inner]]
+                (if-let [access (graph-buffer-access graph inner)]
+                  (update accesses outer kabi/merge-access access)
+                  accesses)) {} bindings))))
+
+(defn- boundary-buffer-access [boundary id]
+  (get (or (:buffer-accesses boundary) (boundary-buffer-accesses boundary)) id))
+
 (defn- soac-complete-write?
   [operation id capacity scalars buffers storage]
   (when (and (emitted-equation/emitted-equation? operation)
@@ -227,9 +251,10 @@
                   (let [projection (when (and projections
                                               (not (emitted-loop/emitted-loop? operation)))
                                      (emitted-program/operation-projection projections operation))]
-                    {:operation operation :projection projection
-                     :graph (if projection (:graph (:boundary projection))
-                                (equation-dispatch/boundary-graph operation))}))))
+                    (let [boundary {:operation operation :projection projection
+                                    :graph (if projection (:graph (:boundary projection))
+                                               (equation-dispatch/boundary-graph operation))}]
+                      (assoc boundary :buffer-accesses (boundary-buffer-accesses boundary)))))))
         (:equations parallel-program))))
 
 (defn- write-before-read-inputs
@@ -240,11 +265,11 @@
   (into #{}
         (keep (fn [id]
                 (let [[access operation projection]
-                      (some (fn [{:keys [operation graph projection]}]
-                              (when-let [access (graph-buffer-access graph id)]
+                      (some (fn [{:keys [operation projection] :as boundary}]
+                              (when-let [access (boundary-buffer-access boundary id)]
                                 [access operation projection]))
                             boundaries)]
-                  (when (and (= :write access)
+                  (when (and (= :write access) (not (emitted-loop/emitted-loop? operation))
                              (complete-write? operation id
                                               (reduce *' 1 (:shape (get program-buffers id)))
                                               scalars buffers storage projection)) id))))
@@ -277,9 +302,7 @@
         array-value? #(seq (:shape (get values %)))
         graph-values
         (into #{}
-              (mapcat (fn [{:keys [graph]}]
-                        (concat (map :id (:inputs graph))
-                                (map :id (:outputs graph)))))
+              (mapcat (comp keys :buffer-accesses))
               boundaries)
         host-values
         (into #{}
@@ -390,8 +413,10 @@
    state (:program-buffers materialized)))
 
 (defn- lower-loop-storage
-  [state invocation-id equation scalars]
-  (let [emitted (emitted-loop/validate! (first (:operations equation)))
+  [state invocation-id equation scalars caller-options]
+  (let [operation (first (:operations equation))
+        emitted (if (nil? caller-options) (emitted-loop/validate! operation)
+                    (emitted-loop/validate! operation caller-options))
         algorithm (-> emitted :schedule :algorithm)
         body-storage (soac/physical-result-map (control/body algorithm))]
     (reduce
@@ -422,12 +447,12 @@
      state (control/carried algorithm))))
 
 (defn- lower-equation-storage
-  [state invocation-id equation program-values scalars physical-projections]
+  [state invocation-id equation program-values scalars physical-projections caller-options]
   (cond
     (true? (get-in equation [:attributes :host-only])) state
 
     (emitted-loop/emitted-loop? (first (:operations equation)))
-    (lower-loop-storage state invocation-id equation scalars)
+    (lower-loop-storage state invocation-id equation scalars caller-options)
 
     :else
     (let [operation (first (:operations equation))
@@ -509,15 +534,11 @@
                          (set/subset? (set (keys requested-roles)) public))
             (fail! :invocation-ordered-entry-roles "entry intent must name public buffers with public roles"
                    {:available public :roles requested-roles}))
-        _ (when (some #(emitted-loop/emitted-loop? (first (:operations %)))
-                       (get-in state [:program :equations]))
-            (fail! :invocation-ordered-entry-control
-                   "structured control needs its own complete entry-access projection" {}))
         boundaries (equation-boundaries (:program state) (:projections (checked-ordered-validation state)))
         written (into #{}
                       (filter (fn [id]
                                 (some #(contains? #{:write :read-write}
-                                                  (graph-buffer-access (:graph %) id)) boundaries)))
+                                                  (boundary-buffer-access % id)) boundaries)))
                       public)
         roles (merge (into {} (map (fn [id] [id (if (contains? written id) :state :input)])) public)
                      requested-roles)]
@@ -681,6 +702,7 @@
     (fail! :invocation-link-native-initialization
            "ordered linking requires an explicit native-content provider"
            {:destinations (vec providers)}))
+  (checked-ordered-validation state)
   (let [steps (into {} (map (juxt :id identity)) (get-in state [:materialization :plan :steps]))
         equations (into {} (map (juxt :id identity)) (get-in state [:program :equations]))]
     (doseq [entry (:source-order state)
@@ -695,9 +717,6 @@
                                   (and (:storage entry) (invocation/buffer-allocation? step))))))
         (fail! :invocation-ordered-source-action
                "ordered source entry requires an unimplemented realization action" {:entry entry}))
-      (when (some emitted-loop/emitted-loop? (:operations equation))
-        (fail! :invocation-ordered-source-action
-               "ordered execution does not yet admit structured-loop fragments" {:entry entry}))
       (when (= :result-allocation (:kind action))
         (validate-source-result-allocation! state entry action))))
   state)
@@ -787,7 +806,8 @@
           ;; host callback. The host constructor validates that same result, not a second eval.
           host-step (when equation
                       (program-call/make-host-equation-step
-                       (:program state) (:id equation) buffers scalars
+                       (:program state) (:id equation) buffers
+                       (select-keys scalars (keys (get-in state [:program :values])))
                        (if step
                          (fn [_ _] {(first (:results equation))
                                     (get-in (run-step!) [:values (:id step)])})
@@ -820,6 +840,9 @@
         expression (if auxiliary? (:expression action) (:source-expression claim))
         abstract (get-in state [:program :values destination])
         values (get-in state [:program :values])
+        step (some #(when (= (:invocation-step entry) (:id %)) %)
+                   (get-in state [:materialization :plan :steps]))
+        physical-value (if (invocation/buffer-allocation? step) (:value step) abstract)
         result-projection (when auxiliary? (validate-source-result-allocation! state entry action))
         algorithm (get-in result-projection [:boundary :algorithm])
         inner (when (soac/program-form? algorithm)
@@ -834,13 +857,16 @@
         ;; A certified rank-zero result owns one physical element. Check the synthetic array
         ;; constructor against that footprint without changing the logical scalar/storage view.
         ;; An outer representation attribute alone cannot enter this branch.
-        constructor-contract (cond-> abstract resident-scalar? (assoc :shape [1]))
+        ;; A real source constructor retains its causal physical count. The
+        ;; numerical value may use an equivalent, differently named dimension;
+        ;; concrete volume agreement is checked below, not guessed from names.
+        constructor-contract (cond-> physical-value resident-scalar? (assoc :shape [1]))
         projection (invocation-source/allocation-source expression values)
-        step (some #(when (= (:invocation-step entry) (:id %)) %)
-                   (get-in state [:materialization :plan :steps]))
         initialization (:initialization projection)
         retained-projections (keep :source-projection [step claim action])]
     (when-not (and destination (= :zero initialization)
+                   (av/abstract-value? physical-value) (av/abstract-value? abstract)
+                   (av/storage-contract-compatible? physical-value abstract)
                    (invocation-source/allocation-corresponds?
                     expression constructor-contract initialization values))
       (fail! :invocation-ordered-next-allocation
@@ -945,7 +971,7 @@
           (update :source-cursor inc)))))
 
 (defn ^:no-doc realize-ready-equation
-  "Realize only the next numerical source entry into an ordinary concrete graph LinkPlan.
+  "Realize only the next numerical source entry into a checked program-stage LinkPlan.
    This neither executes nor advances the cursor. Its conditional entry contract must be
    satisfied by the enclosing owner, and produced views become ready only after completion."
   [state equation-id caller-options]
@@ -957,8 +983,7 @@
         program (:program state)
         equation (some #(when (= equation-id (:id %)) %) (:equations program))]
     (when-not (and equation (= equation-id (:equation entry))
-                   (not (true? (get-in equation [:attributes :host-only])))
-                   (not (emitted-loop/emitted-loop? (first (:operations equation)))))
+                   (not (true? (get-in equation [:attributes :host-only]))))
       (fail! :invocation-ordered-next-equation
              "only the next numerical source entry may acquire ready storage"
              {:entry entry :equation equation-id}))
@@ -985,39 +1010,58 @@
           realized (add-materialized-inputs (:realized state) unacquired (:values program)
                                             overwrite required)
           realized (lower-equation-storage realized (get-in materialization [:plan :id]) equation
-                                            (:values program) scalars (:projections (checked-ordered-validation state)))
+                                            (:values program) scalars (:projections (checked-ordered-validation state))
+                                            caller-options)
+          loop? (emitted-loop/emitted-loop? (first (:operations equation)))
+          realized (cond-> realized
+                     loop? (update :loop-output-bindings merge
+                                   (select-keys (:buffers realized) (:results equation))))
           result-views (into {} (keep :result-view) (vals (:storage realized)))
-          {:keys [call buffers]} (program-call/make-equation-call
-                                 program equation-id (:buffers realized) scalars result-views
-                                 (checked-ordered-validation state) caller-options)
-          _ (when (seq (:result-views call))
+          ;; Constructor-only count aliases remain in the source/physical shape
+          ;; environment. They are not extra numerical ABI scalar arguments.
+          call-scalars (select-keys scalars (keys (:values program)))
+          {:keys [call buffers] fragment-validation :retained-validation}
+          (program-call/make-equation-program-call
+           program equation-id {:buffers (:buffers realized) :scalar-values call-scalars
+                                :loop-scratch (:loop-scratch realized) :result-views result-views
+                                :host-steps (:host-steps state)}
+           (checked-ordered-validation state) caller-options)
+          _ (when (some #(seq (:result-views %)) (:steps call))
               (fail! :invocation-ordered-result-views
                      "ready graph stages must retain logical prefix-result contracts before admission"
                      {:equation equation-id :result-views (:result-views call)}))
+          ;; Binding coverage can fail from the now-resolved count (e.g. a changing
+          ;; induction scalar). Discover that before the owner acquires stage storage.
+          _ (when loop?
+              (program-call/preparation-plan-with-retained-program
+               call [:ordered-equation equation-id] fragment-validation caller-options))
           realized (assoc realized :buffers buffers)
           outputs (vec (distinct (vals (:outputs call))))
-          tokens (vec (distinct (concat (vals (:buffers call)) outputs)))
+          tokens (vec (distinct (concat (map second (program-call/buffer-bindings-with-retained-program
+                                                     call fragment-validation caller-options))
+                                       outputs)))
           layout (storage-link-layout realized scalars (:target state) (set outputs) tokens)
           nodes (mapv (fn [node]
                         (if (contains? acquired (get-in node [:view :allocation :id]))
                           ;; Existing roots are conditional inputs to this stage. Retaining
                           ;; their old host initializer would silently overwrite earlier work.
-                          (assoc node :source nil :role (if (some #{(:id node)} outputs) :state :input))
+                          ;; Retain writability for already-acquired invariant/carry storage;
+                          ;; the stage's ordinary effect proof still checks every actual access.
+                          (assoc node :source nil
+                                 :role (let [role (get (:entry-refresh state) (:id node))]
+                                         (if (link/read-only-node-role? role) role :state)))
                           node))
                       (:nodes layout))
           instance-id [:ordered-equation equation-id]
-          instance (link/graph-instance
-                    {:id instance-id :graph (:graph call) :bindings (:buffers call)
-                     :scalar-values (:scalar-values call)})
+          instance (link/program-instance-candidate {:id instance-id :call call})
           request {:id [(get-in materialization [:plan :id]) :stage equation-id]
                    :target (:target state) :nodes nodes :values (:values layout)
                    :instances [instance] :outputs outputs
                    :aliases (into #{} (map set)
                                   (bview/overlapping-id-pairs (map (juxt :id :view) nodes)))}
           {:keys [plan effect-evidence]}
-          (if (nil? caller-options)
-            (link/make-with-effect-evidence request)
-            (link/make-with-effect-evidence request caller-options))
+          (link/make-with-final-projection request (fn [candidate] {:plan candidate})
+                                           fragment-validation caller-options)
           contract (first (link/relative-entry-contracts! plan effect-evidence
                                                          [[instance-id]] caller-options))]
       {:state (assoc state :realized realized
@@ -1076,18 +1120,22 @@
                    (:realized source-state)
                    (reduce #(lower-equation-storage %1 invocation-id %2
                                                     (:values parallel-program) shape-scalars
-                                                    (:projections retained-validation))
+                                                    (:projections retained-validation) caller-options)
                            initial (:equations parallel-program)))
         call-scalars (select-keys shape-scalars (keys (:values parallel-program)))
+        ;; Zero-trip effective outputs alias the initial carry. The whole-call
+        ;; constructor still needs each distinct nominal output allocation to
+        ;; reconstruct that rotation rather than seeing an in-place alias.
+        call-entry-buffers (merge (:buffers realized) (:loop-output-bindings realized))
         ;; Shape-only invocation scalars are part of the physical program contract even when no
         ;; kernel ABI consumes them. Retain them in the call so logical N-D values can be proved
         ;; element-equivalent to flattened result storage at the LinkPlan boundary.
         call (if (nil? caller-options)
-               (program-call/make parallel-program (:buffers realized) call-scalars
+               (program-call/make parallel-program call-entry-buffers call-scalars
                                 (:loop-scratch realized) evaluate-host
                                 (into {} (keep :result-view) (vals (:storage realized)))
                                 retained-validation)
-               (program-call/make parallel-program (:buffers realized) call-scalars
+               (program-call/make parallel-program call-entry-buffers call-scalars
                                   (:loop-scratch realized) evaluate-host
                                   (into {} (keep :result-view) (vals (:storage realized)))
                                   retained-validation caller-options))
@@ -1108,9 +1156,9 @@
         (into #{}
               (filter
                (fn [compiler-value]
-                 (some (fn [{:keys [graph]}]
+                 (some (fn [boundary]
                          (contains? #{:write :read-write}
-                                    (graph-buffer-access graph compiler-value)))
+                                    (boundary-buffer-access boundary compiler-value)))
                        boundaries)))
               (keys (:buffers call)))
         written-tokens
@@ -1265,7 +1313,7 @@
         initial (resident-single-leaf-storage nodes values (:values parallel-program)
                                               buffer-bindings)
         realized (reduce #(lower-equation-storage %1 id %2 (:values parallel-program)
-                                                  scalar-values (:projections retained-validation))
+                                                  scalar-values (:projections retained-validation) caller-options)
                          initial (:equations parallel-program))
         _ (when-not (and (= buffer-bindings (:buffers realized))
                          (empty? (:loop-scratch realized))
@@ -1368,7 +1416,7 @@
                        {:identities new-ids :existing existing-ids}))
             initial (resident-single-leaf-storage nodes values (:values program) buffer-bindings)
             realized (reduce #(lower-equation-storage %1 id %2 (:values program) scalar-values
-                                                      (:projections retained-validation))
+                                                      (:projections retained-validation) caller-options)
                              initial (:equations program))
             new-storage (select-keys (:storage realized) new-ids)
             _ (when-not (and (= (:buffers realized) (merge buffer-bindings tokens))

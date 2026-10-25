@@ -1256,20 +1256,24 @@
   (let [execution-state (:execution-state executable)
         {:keys [execution-id ledger caller-options]} (:ordered @execution-state)
         plan (:stage-plan ready)
+        _ (when-not (and (seq (:instances plan))
+                         (every? link-plan/program-link-instance? (:instances plan)))
+            (throw (ex-info "ordered numerical stages require checked program instances"
+                            {:reason :link-ordered-stage-kind})))
         storage (acquire-ordered-storage! executable (:nodes plan) (:aliases plan))
         initialized (get-in @execution-state [:ordered :initialized])
         _ (ordered-require-initialized! (:nodes plan) initialized
                                        (get-in ready [:entry-contract :requires]))
-        call (:call ready)
         position (get-in ready [:state :source-cursor])
         executor (resident-program-executor plan (:session executable) execution-id
                                             (:node-views storage) false false ledger)
-        instances [{:id [:source position] :kind :graph
-                    :call {:graph (:graph call) :bindings (:buffers call)
-                           :scalar-values (:scalar-values call)}}]
-        prepared (if (nil? caller-options)
-                   (parallel-program/prepare-sequence-with! instances executor)
-                   (parallel-program/prepare-sequence-with! instances executor caller-options))
+        instances (mapv (fn [instance]
+                          {:id (:id instance) :kind :program :call (:call instance)})
+                        (:instances plan))
+        prepared (parallel-program/prepare-sequence-with-retained-programs!
+                  instances executor
+                  (link-plan/retained-program-validations! plan (:effect-evidence ready) caller-options)
+                  caller-options)
         failure (volatile! nil)]
     (swap! execution-state assoc-in [:ordered :prepared position] prepared)
     (try

@@ -14,7 +14,7 @@ rather than adding a route for each workload.
 | Causal allocation extents | Preceding lexical alias to allocation shape | `bf02a900`: 32 tests / 242 assertions; original recipe and failure ordering preserved |
 | Ordered outputs and taps | Deferred public intent to completed physical boundary | Locally qualified: 45 tests / 997 assertions, shared projector, independent intermediate/final device values and replay/lifetime/failure/certificate controls; full branch gates still pending |
 | Aggregate state and composition | Entry slots locally qualified; deferred components remain open | 57 tests / 1,260 assertions qualify shared leaf projection and replay; next require composed AMR/distributed workload without a fabricated preparation-time LinkPlan |
-| RK4 | Source-loop construction, then ordered structured execution | Source/count/carry/body/copy correspondence; zero/one/many iterations and independent PDE oracle |
+| RK4 | Full qualification of unified ordered program stages | Local Intel Arc OpenCL/Level Zero recurrence and discrete RK4 oracle pass; affected/fresh/full gates remain pending |
 | Float/Object results | Owned imported completion suffix after numerical reduction | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
 | Compile cost and full qualification | GSDM timeout and incomplete CI denominator | Phase profiling, complete exact-head shards/corpus/device/compiler gates; separate cold/prepare/replay/device timings |
@@ -52,14 +52,48 @@ remain separate. Fresh qualification passes 286 tests / 1,818 assertions across
 591 assertions, zero failures and two errors: public MLP eager lowering across
 source-order barriers, and public RK4's manual whole-call construction before
 ordered structured execution. Neither gate is skipped or marked successful.
-The local runner's final summary initially attempted numeric addition on the
-keyword-valued summary type; the completed suite summaries, not its exit, supply
-these counts. Source-free scheduler/replay fixtures explicitly supply initialized
-carry and grant no whole-source credit. Public source tests retain the copy,
-allocations, checked count, loop and suffix. Next: independent review and clean
-checkpoint qualification, then ordered loop entry/access, carry rotation,
+Independent review found no remaining concrete producer blocker. A clean detached
+checkout of d2945bbd reproduces both summaries: 354 tests / 2,409 assertions in
+total, zero failures and the same two errors (runner exits nonzero). Source-free
+scheduler/replay fixtures explicitly supply initialized carry and grant no
+whole-source credit. Public source tests retain the copy, allocations, checked
+count, loop and suffix. Next: ordered loop entry/access, carry rotation,
 completion and final projection through the existing owner. PR #1566 remains
-unqualified; pushed head 0460b638 has failing unit, OpenCL and emitter gates.
+unqualified; pushed d2945bbd and predecessor 0460b638 have failing unit, OpenCL and
+emitter gates. Subsequent uncommitted runtime changes are not covered by those runs.
+
+The reviewed ordered-loop continuation uses one independently checked source-free
+program fragment per actual loop cursor position, not one source action per
+iteration. Project inner graph access to outer invariant/carry identities once;
+reuse that projection for entry and final public roles. Reuse `StructuredLoopCall`
+and ordinary program-instance preparation for bounded carry rotation, relative
+entry effects, initialization and cleanup. Only completed synchronous execution
+may advance the cursor or publish produced storage. Zero trips inherit the actual
+initial carry; preceding explicit source allocations still execute. Acceptance
+requires zero/one/odd/even counts, in-place and out-of-place carries, alias/read-only
+and uninitialized-input refusals, iteration failure cleanup, replay/lease controls
+and an independent RK4 oracle. Preserve the current changing-induction-scalar
+refusal; do not freeze iteration zero to make a graph replayable.
+
+The runtime continuation now uses independently checked program fragments for
+both flat equations and loops. This retains semantic whole-write coverage rather
+than reducing a numerical stage to graph pointer permissions. Exact completed
+host-prefix steps are reused without evaluation; each fresh fragment's own static
+report is shared through the existing retained-proof APIs, never borrowed from
+its parent. Nominal carry allocations remain separate from zero-trip effective
+aliases. Runtime constructor correspondence uses the actual physical allocation
+step and separately checks concrete logical volume. Source-only count aliases
+remain outside numerical scalar argument maps. Local device checks pass 3 tests /
+187 assertions, including empty domains, replay, failed-iteration cleanup,
+snapshot tampering and a discrete-Laplacian/RK4-polynomial oracle on OpenCL and
+Level Zero. An affected ownership/preparation gate passes 33 tests / 631
+assertions. The complete routing/root gate reports 74 tests / 1,055 assertions,
+zero failures and the same two legacy eager/manual-call errors. Independent
+review found no concrete checkpoint blocker; clean qualification and branch-wide
+gates remain open. A language-coverage gap is retained: a let-bound terminal copy can expand
+into a scalar store loop before structured recognition; the inline functional
+copy-combinator form used by RK4 admits. This is not a generic-loop completeness
+claim or permission to erase the original host-prefix provenance.
 
 For comparison, exact-parent `be180fd6` CI34832 has 15 completed unit summaries:
 6,949 tests / 87,661 assertions, 24 failures / 50 errors across 58 test Vars; the

@@ -630,16 +630,14 @@
         (is (some #(= (:id equation) (:equation %)) order))
         (is (not-any? fn? (tree-seq coll? seq semantic)))
         (let [initial (invocation-link/begin-ordered-realization
-                       compilation [(double-array 8) (double-array 8) 0.1 1.0 0.01 3] nil)
-              refusal (try (invocation-link/validate-ordered-source-actions! initial) nil
-                           (catch clojure.lang.ExceptionInfo error (ex-data error)))
-              blocked-equation (some #(when (= (get-in refusal [:entry :equation]) (:id %)) %)
-                                     (:equations semantic))]
-          (is (= :invocation-ordered-source-action
-                 (:reason refusal)))
+                       compilation [(double-array 8) (double-array 8) 0.1 1.0 0.01 3] nil)]
+          (is (identical? initial (invocation-link/validate-ordered-source-actions! initial)))
           (is (not-any? invocation/buffer-clone? (:steps plan)))
-          (is (= (:id equation) (:id blocked-equation))
-              "the remaining executor gap is the structured loop, after ordinary prefix copying"))))))
+          (is (empty? (:acquired-storage initial))
+              "source-action coverage grants no native storage or completion")
+          (is (= :emitted-parallel-program-retained-validation
+                 (reason-of #(invocation-link/validate-ordered-source-actions!
+                              (assoc initial :program (assoc (:program initial) :equations [])))))))))))
 
 (deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
   (let [arguments [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]
@@ -2227,6 +2225,104 @@
     (is (some #(and (= temporary-id (:buffer %)) (= :read (:access %))) (:uses consumer)))
     (is (= [(:id producer)] (:dependencies consumer)))
     (is (not-any? #(= 'rstr_loop_value_0 (:buffer %)) (:uses consumer)))))
+
+(deftest loop-boundary-accesses-use-outer-identities-not-inner-port-names
+  (let [step (-> (prepared-mixed-call 1) :call :steps first)
+        algorithm (get-in step [:schedule :algorithm])
+        {:keys [initial parameter output]} (first (control/carried algorithm))
+        boundary {:operation (emitted-loop/make (:schedule step) (:graph step))
+                  :graph (:graph step)}
+        access #(#'invocation-link/boundary-buffer-access boundary %)]
+    (is (= :read (access initial)) "out-of-place repetition preserves the initial buffer")
+    (is (= :write (access output)) "the logical carry result names its physical output port")
+    (is (nil? (access parameter)) "an inner binder is not a public outer input")
+    (is (nil? (access 'scratch))
+        "a lowered compiler-private temporary is not an external scratch write")
+    (is (nil? (access 'n)) "an invariant scalar is not a buffer access")))
+
+(deftest selected-loop-stage-is-a-fresh-numerical-fragment-with-bounded-replay
+  (doseq [trips [0 1 2 5 6]]
+    (let [original (:call (prepared-mixed-call trips))
+          program (:program original)
+          equation (first (:equations program))
+          {:keys [call buffers]}
+          (program-call/make-equation-program-call
+           program (:id equation) {:buffers (:entry-buffers original)
+                                   :scalar-values (:scalar-values original)
+                                   :loop-scratch (:loop-scratch original)} nil nil)
+          events (atom [])
+          prepared (program-runtime/prepare-with!
+                    call
+                    {:bind! (fn [_ _ bindings _]
+                              (swap! events conj [:bind bindings]) bindings)
+                     :run! #(swap! events conj [:run %])
+                     :release! #(swap! events conj [:release %])})]
+      (is (nil? (get-in call [:program :source])))
+      (is (= [equation] (get-in call [:program :equations])))
+      (is (= (first (:steps original)) (first (:steps call))))
+      (is (= buffers (:buffers call)))
+      (is (= (:outputs (first (:steps original))) (:outputs call)))
+      (is (= (:outputs call) (program-runtime/run-prepared! prepared)))
+      (program-runtime/release-prepared! prepared)
+      (is (= trips (count (filter #(= :run (first %)) @events))))
+      (is (= (min trips 3) (count (filter #(= :bind (first %)) @events))))
+      (is (= (min trips 3) (count (filter #(= :release (first %)) @events)))))))
+
+(deftest in-place-loop-access-keeps-readonly-and-initialized-read-obligations
+  (let [original (:loop (loop-decomposition))
+        body (control/body original)
+        facts (-> (soac/facts body)
+                  (assoc :effects #{:memory/write})
+                  (assoc-in [:equations 'advance :effects] #{:memory/write})
+                  (assoc-in [:equations 'advance :aliases] {'u-next 'u-in})
+                  (assoc-in [:equations 'advance :attributes :result-storage]
+                            [{:destination 'u-in :access :read-write :host-return :buffer}]))
+        body (soac/make facts (soac/equations body) (soac/outputs body))
+        algorithm (control/make (assoc (control/facts original) :effects #{:memory/write})
+                                (control/loop-index original) (control/invariants original)
+                                (control/carried original) body (control/outer-values original))
+        options {:dtype :float :target-device :ocl:0}
+        program (:program (program-opencl/emit-program
+                           (route/schedule-program (route/program-envelope {:loop algorithm}) options)
+                           options))
+        operation (get-in program [:equations 0 :operations 0])
+        boundary {:operation operation :graph (:graph operation)}
+        call (program-call/make program {'u :state 'u-final :state}
+                                {'steps {:type :long :value 3} 'n {:type :int :value 64}} {} nil)
+        instance (link/program-instance {:id :in-place-loop :call call})
+        request (fn [role source]
+                  {:id :in-place-plan :target :ocl:0
+                   :nodes [(link/node {:id :state :dtype :float :shape [64] :device :ocl:0
+                                       :role role :source source})]
+                   :values [(link/value {:id :state :abstract (av/tensor {:dtype :float :shape [64]})
+                                         :leaves [{:name :value :node :state}]})]
+                   :instances [instance] :outputs [:state]})]
+    (is (= :read-write (#'invocation-link/boundary-buffer-access boundary 'u)))
+    (is (= :read-write (#'invocation-link/boundary-buffer-access boundary 'u-final)))
+    (is (= :link-write-read-only (reason-of #(link/make (request :input (float-array 64))))))
+    (is (= :link-read-before-write (reason-of #(link/make (request :internal nil)))))
+    (let [{:keys [plan effect-evidence]} (link/make-with-effect-evidence (request :state (float-array 64)))
+          contract (first (link/relative-entry-contracts! plan effect-evidence [[:in-place-loop]]))]
+      (is (= #{:state} (:requires contract)) "a complete overwrite cannot erase the preceding read")
+      (is (= #{:state} (:full-produces contract))))))
+
+(deftest selected-loop-stage-does-not-admit-a-different-equation-or-frozen-induction
+  (let [original (:call (prepared-mixed-call 3 (mixed-source)))
+        program (:program original)
+        [loop-equation suffix] (:equations program)
+        make-stage #(program-call/make-equation-program-call
+                     program % {:buffers (:entry-buffers original)
+                                :scalar-values (:scalar-values original)
+                                :loop-scratch (:loop-scratch original)} nil nil)]
+    (is (= [suffix] (get-in (make-stage (:id suffix)) [:call :program :equations]))
+        "flat and loop equations use the same numerical stage constructor")
+    (is (= :emitted-program-ready-equation (reason-of #(make-stage :absent))))
+    (is (= :parallel-program-dynamic-loop-binding
+           (reason-of #(program-runtime/prepare-with!
+                        (:call (make-stage (:id loop-equation)))
+                        {:bind! (fn [& _] (throw (AssertionError. "changing induction was bound")))
+                         :run! (fn [& _] (throw (AssertionError. "changing induction was run")))
+                         :release! (fn [& _] nil)}))))))
 
 (deftest structured-loop-staging-is-bounded-by-carry-rotation-not-trip-count
   (let [{:keys [call]} (prepared-mixed-call 9)

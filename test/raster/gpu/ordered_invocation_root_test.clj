@@ -261,13 +261,13 @@
                                            (merge {:target target :dtype :float} request))
         x (float-array [-1.0 -0.0 0.25 1.0])
         executable (link/instantiate-ordered-invocation! compilation [x 4] request)
-        prepare parallel-program/prepare-sequence-with!
+        prepare parallel-program/prepare-sequence-with-retained-programs!
         seen (atom [])]
     (try
-      (with-redefs [parallel-program/prepare-sequence-with!
-                    (fn [instances executor actual-request]
+      (with-redefs [parallel-program/prepare-sequence-with-retained-programs!
+                    (fn [instances executor proofs actual-request]
                       (swap! seen conj actual-request)
-                      (prepare instances executor actual-request))]
+                      (prepare instances executor proofs actual-request))]
         (let [output-id (first (keys (link/run! executable)))]
           (is (= (vec (selected-source-math x 4)) (vec (link/download executable output-id)))))
         (is (= [request] @seen) "each stage retains independently supplied caller math intent"))

@@ -321,7 +321,7 @@
       (is (= :invocation-link-native-initialization
              (reason #(invocation-link/validate-ordered-source-actions!
                        (assoc-in initial [:program :attributes :native-initialization-providers] ['external])))))
-      (is (= :invocation-ordered-source-action
+      (is (= :emitted-parallel-program-retained-validation
              (reason #(invocation-link/validate-ordered-source-actions!
                        (assoc-in initial [:program :equations 0 :operations]
                                  [(emitted-loop/map->EmittedStructuredLoop {})])))))

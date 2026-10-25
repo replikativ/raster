@@ -246,7 +246,7 @@
                    compilation [(double-array [7.0]) (double-array 1) Long/MAX_VALUE] nil)
             equation-id (:id (first (:equations (:program state))))
             ready (invocation-link/realize-ready-equation state equation-id nil)]
-        (is (= 1 @checks) "one request validates static IR once, not once per stage")
+        (is (= 2 @checks) "parent and fresh fragment each validate once, not once per consumer")
         (is (identical? (:program state) (get-in state [:retained-validation :program])))
         (is (identical? (:projections state) (get-in state [:retained-validation :projections])))
         (is (= 0 (get-in ready [:state :source-cursor])))
@@ -264,7 +264,7 @@
           (is (= :emitted-parallel-program-retained-validation
                  (reason #(invocation-link/realize-ready-equation
                            (assoc state :caller-options options) equation-id options)))))
-        (is (= 1 @checks) "forged reports are refused without whole-program reconstruction")))))
+        (is (= 2 @checks) "forged reports are refused without whole-program reconstruction")))))
 
 (deftest ready-storage-is-conditional-not-completed-invocation-storage
   (let [compilation (equation-first/compile #'fixture/write-before-shape
