@@ -28,6 +28,31 @@ hoist, duplicate, differentiate or lower a source completion as a native cast.
 Frontend insertion, source construction correspondence and ordered invocation
 integration must close together before completed counts feed native map extents.
 
+Source completion is not generally pure numerical computation: checked int/long
+conversion of an Object may invoke a user Number method with observable effects.
+The shared effects analysis therefore remains conservative. InvocationPlan now
+has an explicit SourceCompletion step, separate from ScalarCompute. Existing
+opaque AbstractValues can retain host references (including nil) by identity,
+without numeric validation, payload equality/hashing or payload diagnostics.
+Opaque values are refused at numerical input/output/storage boundaries.
+Incremental materialization requires a separately supplied source executor and
+validates completed results without replay; eager preparation lacking that
+executor refuses before evaluating a prefix. Executors remain with the actual
+prepared owner, never in the portable plan or a registry.
+
+The host-only vertical is qualified through actual outlined JVM conversions,
+source-order reconstruction and invocation materialization: the combined affected
+invocation/JVM/AD set passes 197 tests / 2,633 assertions. Independent review
+approved after corrections to eager
+preflight and opaque failure diagnostics. Equal-looking source occurrences stay
+distinct; preparation/validation execute none; each invocation replays its own
+actions and a failing conversion stops the suffix. This does not change device
+executor admission: it still refuses the new action before source effects or
+capture. Automatic frontend extraction, once-only physical source entry, native
+integration and GPU host/device coherence remain required. In particular,
+device completion alone does not refresh host references or already captured
+device contents after an arbitrary source action.
+
 The JVM effect-map expansion also no longer narrows a source Long count through
 the generic dotimes Int adapter. It preserves Long observable ordinals, once-only
 count evaluation and one source body, while selecting a private Int counter only

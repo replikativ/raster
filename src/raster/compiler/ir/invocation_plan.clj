@@ -14,6 +14,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.parallel-program :as parallel-program]
@@ -24,6 +25,7 @@
 (defrecord InvocationParameter [id symbol value])
 (defrecord ShapeProjection [id symbol operands source axis value])
 (defrecord ScalarCompute [id symbol operands region value])
+(defrecord SourceCompletion [id symbol operands expression value])
 (defrecord BufferAllocation [id symbol operands initialization value])
 (defrecord BufferClone [id symbol operands source value])
 (defrecord ValueAlias [id symbol operands source value])
@@ -41,6 +43,8 @@
   (record-kind? "raster.compiler.ir.invocation_plan.ShapeProjection" x))
 (defn scalar-compute? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.ScalarCompute" x))
+(defn source-completion? [x]
+  (record-kind? "raster.compiler.ir.invocation_plan.SourceCompletion" x))
 (defn buffer-allocation? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.BufferAllocation" x))
 (defn buffer-clone? [x]
@@ -237,7 +241,7 @@
 
 (defn invocation-step?
   [x]
-  (or (shape-projection? x) (scalar-compute? x)
+  (or (shape-projection? x) (scalar-compute? x) (source-completion? x)
       (buffer-allocation? x) (buffer-clone? x) (value-alias? x)))
 
 (defn- fail!
@@ -255,6 +259,9 @@
 (defn- buffer-value?
   [value]
   (and (= :tensor (:kind value)) (seq (:shape value))))
+
+(defn- opaque-value? [value]
+  (and (= :opaque (:kind value)) (empty? (:shape value))))
 
 (defn- operand-map
   [step]
@@ -312,6 +319,20 @@
           (fail! :invocation-shape-projection
                  "shape projection requires one shaped source and an integer scalar result"
                  {:step id :source (:source step) :axis (:axis step) :value value})))
+
+      (source-completion? step)
+      (let [{:keys [contract operand]} (completion/canonical-parts (:expression step))
+            expected (case (:operation contract) :int :int :long :long nil)
+            symbols (set (keys operands))]
+        (when-not (and (= :source-integral-cast (:source-context contract))
+                       (scalar-value? value) expected (= expected (dtype/canon (:dtype value)))
+                       (every? (fn [id]
+                                 (let [input (get values id)]
+                                   (or (scalar-value? input) (opaque-value? input)))) operand-values)
+                       (= (util/free-syms operand) symbols))
+          (fail! :invocation-source-completion
+                 "source completion requires a closed integral operation over host values"
+                 {:step id :value value})))
 
       (scalar-compute? step)
       (let [{:keys [parameters locals body-results]} (soac/lambda-parts (:region step))
@@ -472,6 +493,12 @@
     (validate-parameter-projection! plan)
     (validate-source-free-shape-projection-marker! plan)
     (validate-external-dimension-marker! plan)
+    (doseq [boundary (concat program-inputs program-outputs
+                             (map :program-value storage-bindings))]
+      (when (= :opaque (get-in values [boundary :kind]))
+        (fail! :invocation-opaque-program-value
+               "opaque host values cannot cross a numerical program boundary"
+               {:value-id boundary})))
     (let [available (binding [util/*shadowing-locals*
                              (into util/*shadowing-locals*
                                    (map :symbol (concat parameters steps)))]
@@ -625,6 +652,9 @@
         (assoc (->ValueAlias id symbol [{:symbol source :value (get environment source)}]
                             (get environment source) value)
                :source-expression expression))
+
+      (= :source-integral-cast (:source-context (:contract (completion/canonical-parts expression))))
+      (->SourceCompletion id symbol (referenced-operands expression environment) expression value)
 
       (scalar-value? value)
       (let [operands (referenced-operands expression environment)]

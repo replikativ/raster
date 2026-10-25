@@ -4,9 +4,10 @@
    The result contains typed scalars and logical buffer initializers for the exact internal
    ParallelProgram inputs plus explicitly resolved caller-owned result storage. Unresolved resident
    storage refuses before argument projection. It allocates no driver
-   objects and does not evaluate Clojure source: scalar regions are delegated as closed TypedSOAC
-   regions to an injected compiler or interpreter. A later lowering realizes MaterializedBuffers
-   as LinkValues/BufferViews."
+   objects. Pure scalar regions are delegated as closed TypedSOAC regions to an injected compiler
+   or interpreter. Observable source completions require a separate owner-supplied executor;
+   opaque host references never cross the numerical program boundary. A later lowering realizes
+   MaterializedBuffers as LinkValues/BufferViews."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.params-flatten :as params-flatten]
@@ -17,12 +18,17 @@
             [raster.compiler.ir.invocation-plan :as invocation]))
 
 (defrecord MaterializedBuffer [id value shape source initialization])
+(defrecord MaterializedOpaque [id value source])
 (defrecord MaterializedInvocation
            [plan values program-buffers program-scalars attributes])
 (defrecord InvocationMaterializationState [plan values lexical next-step])
 
 (defn materialized-buffer? [value]
   (and value (= "raster.compiler.ir.invocation_materialization.MaterializedBuffer"
+                (.getName (class value)))))
+
+(defn materialized-opaque? [value]
+  (and value (= "raster.compiler.ir.invocation_materialization.MaterializedOpaque"
                 (.getName (class value)))))
 
 (defn materialized-invocation? [value]
@@ -56,6 +62,18 @@
 
 (defn- buffer-value? [value]
   (and (= :tensor (:kind value)) (seq (:shape value))))
+
+(defn- opaque-value? [value]
+  (and (= :opaque (:kind value)) (empty? (:shape value))))
+
+(defn- checked-opaque [id expected actual]
+  ;; Neither equality, hashing nor printing of the payload is a validation
+  ;; operation. Its host reference (including nil) remains entirely opaque.
+  (when-not (and (opaque-value? expected) (materialized-opaque? actual)
+                 (some? (:id actual)) (= expected (:value actual)))
+    (fail! :invocation-materialization-opaque
+           "host reference requires its retained opaque value wrapper" {:value-id id}))
+  actual)
 
 (defn- primitive-array-dtype [value]
   (when (and value (.isArray (class value)))
@@ -283,6 +301,9 @@
     (doseq [{:keys [id value]} (concat (:parameters plan) (:steps plan))
             :when (scalar-value? value)]
       (checked-scalar id value (get values id)))
+    (doseq [{:keys [id value]} (concat (:parameters plan) (:steps plan))
+            :when (opaque-value? value)]
+      (checked-opaque id value (get values id)))
     (let [storage-values (set (map :program-value (:storage-bindings plan)))
           materialized-values (set/union (set (:program-inputs plan)) storage-values)]
       (when-not (= materialized-values
@@ -400,15 +421,34 @@
           (reduce
            (fn [values [parameter argument]]
              (let [{:keys [id value]} parameter]
-               (if (buffer-value? value)
+               (cond
+                 (opaque-value? value)
+                 (assoc values id (->MaterializedOpaque id value argument))
+
+                 (buffer-value? value)
                  (assoc values id
                         (->MaterializedBuffer id value
                                               (runtime-buffer-shape parameter value argument
                                                                     initial-lexical scalar-values)
                                               argument :copy))
-                 values)))
+
+                 (scalar-value? value) values
+                 :else (fail! :invocation-materialization-parameter-kind
+                              "public argument has no supported host materialization"
+                              {:value-id id :kind (:kind value)}))))
            scalar-values parameter-pairs)]
       (->InvocationMaterializationState plan parameter-values initial-lexical 0))))
+
+(defn- step-operand-values [step values]
+  (into {} (map (fn [{:keys [symbol value]}] [symbol (get values value)])) (:operands step)))
+
+(defn- source-completion-executor [evaluators step-id]
+  (let [execute (when (map? evaluators) (:source-completion evaluators))]
+    (when-not (ifn? execute)
+      (fail! :invocation-materialization-source-executor
+             "source completion requires a separately supplied owned executor"
+             {:step step-id}))
+    execute))
 
 (defn- advance-materialization
   [{:keys [plan values lexical next-step] :as state} evaluate-scalar]
@@ -426,16 +466,19 @@
              step {:type (get-in step [:value :dtype])
                    :value (nth (:shape source) (:axis step))}))
 
+          (invocation/source-completion? step)
+          (let [execute (source-completion-executor evaluate-scalar id)]
+            (checked-computed-scalar
+             step (execute step (step-operand-values step values))))
+
           (invocation/scalar-compute? step)
-          (do
-            (when-not (ifn? evaluate-scalar)
+          (let [evaluate (if (map? evaluate-scalar) (:scalar evaluate-scalar) evaluate-scalar)]
+            (when-not (ifn? evaluate)
               (fail! :invocation-materialization-scalar-evaluator
                      "scalar invocation regions require a typed evaluator"
                      {:step id :region (:region step)}))
             (checked-computed-scalar
-             step (evaluate-scalar
-                   step (into {} (map (fn [{:keys [symbol value]}]
-                                        [symbol (get values value)])) (:operands step)))))
+             step (evaluate step (step-operand-values step values))))
 
           (invocation/buffer-clone? step)
           (let [source (get values (:source step))]
@@ -497,9 +540,11 @@
                             (checked-scalar id value actual))]
         (doseq [{:keys [id value] :as parameter} parameters]
           (let [actual (get values id)]
-            (if (scalar-value? value)
+            (cond
+              (opaque-value? value) (checked-opaque id value actual)
+              (scalar-value? value)
               (check-scalar! id value actual)
-              (do
+              :else (do
                 (validate-buffer! id actual value)
                 (let [expected (->MaterializedBuffer
                                 id value
@@ -512,23 +557,27 @@
                            {:value-id id :expected expected :actual actual})))))))
         ;; Reuse the same interpreter to check deterministic shape, allocation,
         ;; clone and alias steps in their original lexical environment. Only
-        ;; ScalarCompute results are supplied, never reevaluated during validation.
+        ;; ScalarCompute and SourceCompletion results are supplied, never
+        ;; reevaluated during validation.
         (reduce
          (fn [prior step]
            (let [{:keys [id symbol value]} step
                  actual (get values id)]
-             (if (invocation/scalar-compute? step)
+             (if (or (invocation/scalar-compute? step) (invocation/source-completion? step))
                (do (check-scalar! id value actual)
                    (-> prior
                        (assoc-in [:values id] actual)
                        (assoc-in [:lexical symbol] id)
                        (update :next-step inc)))
                (let [expected (advance-materialization prior nil)]
-                 (when-not (= actual (get-in expected [:values id]))
+                 (when-not (if (opaque-value? value)
+                             (identical? actual (get-in expected [:values id]))
+                             (= actual (get-in expected [:values id])))
                    (fail! :invocation-materialization-state-producer
                           "retained structured value differs from its ordered producer"
-                          {:value-id id :actual actual
-                           :expected (get-in expected [:values id])}))
+                          (cond-> {:value-id id}
+                            (not (opaque-value? value))
+                            (assoc :actual actual :expected (get-in expected [:values id])))))
                  expected))))
          (->InvocationMaterializationState plan parameter-values parameter-lexical 0)
          (take next-step (:steps plan))))
@@ -582,10 +631,16 @@
   "Specialize a typed plan against public arguments without allocating driver resources.
 
    This eager convenience entry uses the same step interpreter as incremental materialization.
-   `evaluate-scalar` receives the retained closed ScalarCompute and typed operand map, and must
-   return one typed scalar. It is neither retained nor called for shapes, allocations or aliases."
+   A function evaluator receives pure ScalarCompute steps. An explicit executor map may provide
+   :scalar and :source-completion functions separately; each returns one typed scalar. Source
+   execution authority belongs to the caller's exact prepared owner, never this semantic plan.
+   Plans requiring a source executor refuse before evaluating any step when it is absent.
+   Executors are not retained or called for shapes, allocations or aliases."
   [plan arguments evaluate-scalar]
-  (let [initial (begin-materialization plan arguments)
+  (let [plan (invocation/validate! plan)
+        _ (when-let [step (first (filter invocation/source-completion? (:steps plan)))]
+            (source-completion-executor evaluate-scalar (:id step)))
+        initial (begin-materialization plan arguments)
         final (reduce (fn [state _] (advance-materialization state evaluate-scalar))
                       initial (get-in initial [:plan :steps]))]
     ;; The eager chain is produced here, not supplied by a caller. Keep its

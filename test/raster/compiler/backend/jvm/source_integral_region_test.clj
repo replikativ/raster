@@ -3,7 +3,8 @@
             [raster.core :as core]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.types :as types]
-            [raster.compiler.core.value-completion :as completion]))
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 (defn- emit [tags node policy]
   (let [interface (types/ensure-fn-interface! tags)
@@ -66,6 +67,35 @@
       (if operand-policy
         (is (= [[:value 0] [0]] (outcome invoke 4294967296)))
         (is (= [[:error ArithmeticException] [0]] (outcome invoke 4294967296)))))))
+
+(deftest object-count-conversion-retains-user-number-effects
+  (doseq [operation [:int :long] policy [false true :warn-on-boxed]]
+    (let [operand '(do (clojure.core/aset effects 0 (clojure.core/inc (clojure.core/aget effects 0))) value)
+          node (completion/complete-value
+                (completion/source-integral-cast-contract operation {:unchecked-math policy}) operand)
+          {:keys [implementation emission input-body]} (emit '[Object longs] node false)
+          region (bytecode/compile-source-integral-completion-region emission input-body node)
+          invoke (fn [value effects]
+                   (apply (:invoke region)
+                          (map {'value value 'effects effects} (:parameters region))))
+          source (binding [*unchecked-math* policy]
+                   (eval (list 'fn ['value (with-meta 'effects {:tag 'longs})]
+                               (list (symbol "clojure.core" (name operation)) operand))))
+          observe (fn [invoke]
+                    (let [events (atom []) effects (long-array 1)
+                          number (proxy [Number] []
+                                   (intValue [] (swap! events conj :int) 7)
+                                   (longValue [] (swap! events conj :long) 7)
+                                   (floatValue [] (swap! events conj :float) (float 7))
+                                   (doubleValue [] (swap! events conj :double) 7.0))]
+                      {:result (invoke number effects) :effects (vec effects)
+                       :number-methods @events}))
+          expected (observe source)]
+      (is (= [1] (:effects expected)))
+      (is (seq (:number-methods expected)))
+      (is (= expected (observe implementation) (observe invoke)))
+      (is (not= :pure (effects/analyze-effect node))
+          "an unqualified Object conversion is not an externally pure numeric operation"))))
 
 (deftest nested-completions-cannot-substitute-for-the-audited-root
   (let [inner (completion/complete-value
