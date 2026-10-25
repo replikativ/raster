@@ -37,6 +37,31 @@
      {:dtype :float :array-types {'x :float 'y :float 'out :float}
       :scalar-types {'n :long}}))))
 
+(deftest explicit-source-return-demand-reuses-the-output-only-audit
+  (let [program (fused '(let* [total (raster.par/reduce sum 0.0 i n
+                                     (+ sum (clojure.core/aget x i)))] total))
+        facts (dialect/facts program)
+        equations (dialect/equations program)
+        root (first (dialect/outputs program))
+        [realized _] (resident/realize program [root])
+        rebuild #(dialect/make % equations (dialect/outputs program))]
+    (is (= [root] (resident/source-return-reduction-demand program [root])))
+    (is (resident/resident-scalar-value? (get-in (dialect/facts realized) [:values root])))
+    (doseq [changed [(assoc-in facts [:attributes :host-read-values] [root])
+                     (assoc-in facts [:values root :ownership] :borrowed)]]
+      (is (empty? (resident/source-return-reduction-demand (rebuild changed) [root]))))
+    (is (= :typed-soac-reduce-result-type
+           (try (resident/source-return-reduction-demand
+                 (rebuild (assoc-in facts [:values root :dtype] :long)) [root]) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (doseq [request [[root root] ['absent]]]
+      (is (= :typed-soac-resident-output-demand
+             (try (resident/realize program request) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (is (empty? (resident/source-return-reduction-demand
+                 (public-reused-reduction-program) ['norm]))
+        "a returned root with a later device capture uses the independent reused-root audit")))
+
 (defn- public-root-proof-context [program]
   (let [facts (dialect/facts program)
         infos (mapv #'resident/operation-info (dialect/equations program))

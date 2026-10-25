@@ -1594,17 +1594,23 @@
                   (assoc-in [:attributes :allocations] allocations))]
     (dialect/make facts equations chunk-outputs)))
 
-(defn- optimize-typed-component
-  [typed-input {:keys [resident-reductions? resident-initialization?
-                       resident-uniform-input-loads? abstract-machine]}]
-  (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input abstract-machine)
-        [typed-result uniform-stats]
+(defn ^:no-doc realize-typed-component
+  "Shared post-fusion component pipeline, including structured-control continuations.
+   An internal public-output demand must come from a checked whole-source return projection,
+   never from a component's conservative live-outs or caller-supplied representation hints."
+  ([typed-input options] (realize-typed-component typed-input options []))
+  ([typed-input {:keys [resident-reductions? resident-initialization?
+                       resident-uniform-input-loads?]} public-outputs]
+  (when (and (seq public-outputs) (not resident-reductions?))
+    (throw (ex-info "explicit public-output representation requires resident realization"
+                    {:reason :typed-soac-resident-output-policy :requested public-outputs})))
+  (let [[typed-result uniform-stats]
         (if resident-uniform-input-loads?
-          (resident/inline-uniform-input-loads typed-result)
-          [typed-result {:resident-uniform-input-loads 0}])
+          (resident/inline-uniform-input-loads typed-input)
+          [typed-input {:resident-uniform-input-loads 0}])
         [typed-result resident-stats]
         (if resident-reductions?
-          (resident/realize typed-result)
+          (resident/realize typed-result public-outputs)
           [typed-result {:resident-reductions 0 :inlined-scalars 0}])
         [typed-result initialization-stats]
         (if resident-initialization?
@@ -1615,8 +1621,16 @@
      :declined (sequential-continuation-decline typed-result)
      :stats (merge-with (fn [left right]
                           (if (and (number? left) (number? right)) (+ left right) right))
-                        typed-stats uniform-stats resident-stats initialization-stats
-                        ownership-stats)}))
+                        uniform-stats resident-stats initialization-stats
+                        ownership-stats)})))
+
+(defn- optimize-typed-component
+  [typed-input {:keys [abstract-machine] :as options}]
+  (let [[fused stats] (fusion/fusion-fixpoint typed-input abstract-machine)]
+    (update (realize-typed-component fused options) :stats
+            #(merge-with (fn [left right]
+                           (if (and (number? left) (number? right)) (+ left right) right))
+                         stats %))))
 
 (defn- realization-program
   [projection typed-components]

@@ -921,6 +921,13 @@
                               (:array-types opts)))
                       (:values opts))
         common {:dtype (:dtype opts)
+                :resident-reductions? (or (true? (:resident-reductions? opts))
+                                           (device/gpu-target? (:target-device opts)))
+                :resident-initialization? (device/gpu-target? (:target-device opts))
+                :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
+                :source-ns (:source-ns opts)
+                :source-var (:source-var opts)
+                :return-tag (:return-tag opts)
                 :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                 :values values
                 :array-types (:array-types opts)

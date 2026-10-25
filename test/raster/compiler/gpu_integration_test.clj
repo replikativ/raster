@@ -112,15 +112,14 @@
         arguments [u0 target alpha inv-dx2 dt nsteps]
         prepared (compiled/lower #'pde/heat-loss-rk4 arguments
                                  {:compiler :equation-first :target device :dtype :double
-                                  ;; u0 is cloned by staging; only target is a public device input.
-                                  :constants '[target]})
-        plan (get-in prepared [:lowering :plan])]
+                                  ;; The numerical prefix copies refreshed u0; target is captured.
+                                  :constants '[target]})]
     (testing "compilation and lowering are inspectable and allocate no driver resources"
       (is (= :equation-first (get-in prepared [:schedule :compiler])))
       (is (= :none (get-in prepared [:schedule :stats :fallback])))
-      (is (link-plan/link-plan? plan))
-      (is (= 0 (get-in plan [:attributes :driver-allocations])))
-      (is (= 1 (count (:outputs plan)))))
+      (is (some? (:ordered-invocation prepared)))
+      (is (nil? (:lowering prepared))
+          "a concrete resident plan cannot precede ordered source completion"))
     (testing "the public LinkPlan executes the same numerical program on an available GPU"
       (if-not @available?
         (skip! (str "gpu-rk4-equation-first-execution on " device))
@@ -130,9 +129,14 @@
                       result (volatile! nil)]
                   (try
                     (vreset! result (:result (executable {})))
-                    (let [actual (double (aget ^doubles
+                    (let [plan (get-in @(:execution-state (:executable executable))
+                                       [:resident-boundary :plan])
+                          actual (double (aget ^doubles
                                           (value/->host @result)
                                                0))]
+                      (is (link-plan/link-plan? plan))
+                      (is (= 0 (get-in plan [:attributes :driver-allocations])))
+                      (is (= 1 (count (:outputs plan))))
                       (is (< (Math/abs (- (double expected) actual)) 1.0e-10)
                           (format "CPU=%.15g GPU=%.15g" (double expected) actual)))
                     (finally

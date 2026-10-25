@@ -252,6 +252,26 @@
          (empty? sites)
          (contains? #{:float :double} (:dtype value)))))
 
+(defn ^:no-doc source-return-reduction-demand
+  "Select output-only reduction candidates from independently proved source-return identities.
+   Reuse the realizer's producer/use audit; public roots with later device captures belong to its
+   existing reused-root path, not the output-only demand path. Selection is not a certificate."
+  [program returned]
+  (let [program (dialect/validate! program)
+        facts (dialect/facts program)
+        infos (mapv operation-info (dialect/equations program))
+        producers (group-by first (mapcat (fn [info]
+                                          (map #(vector % info) (:results info))) infos))
+        outputs (set (dialect/outputs program))
+        returned (set returned)
+        host-reads (set (get-in facts [:attributes :host-read-values]))
+        uses (group-by first (use-sites (dialect/equations program)))]
+    (vec (mapcat (fn [producer]
+                   (filter #(and (contains? returned %)
+                                 (demanded-public-reduction-root?
+                                  facts producers outputs host-reads producer % (get uses % [])))
+                           (:results producer))) infos))))
+
 (defn- result-transform-expression
   [info transform promoted]
   (let [{:keys [parameters body-results]} (dialect/lambda-parts (:lambda transform))
@@ -1671,8 +1691,18 @@
           outer)))))
 
 (defn realize
-  "Realize audited reduction residents and one bounded direct terminal ScalarIR result."
-  [program]
-  (let [[program reduction-stats] (realize-reductions program [])
+  "Realize audited reduction residents and one bounded direct terminal ScalarIR result.
+   Internal `public-outputs` is an explicit representation demand: its producer must first prove
+   the complete source return. Component live-outs alone never grant that demand. The common
+   reduction transaction independently checks every requested producer/use/value boundary."
+  ([program] (realize program []))
+  ([program public-outputs]
+  (let [_ (when-not (and (vector? public-outputs)
+                         (= (count public-outputs) (count (distinct public-outputs)))
+                         (set/subset? (set public-outputs) (set (dialect/outputs program))))
+            (throw (ex-info "source-return demand must name exact distinct component outputs"
+                            {:reason :typed-soac-resident-output-demand
+                             :requested public-outputs :outputs (dialect/outputs program)})))
+        [program reduction-stats] (realize-reductions program public-outputs)
         [program scalar-stats] (realize-terminal-device-scalar program)]
-    [program (merge reduction-stats scalar-stats)]))
+    [program (merge reduction-stats scalar-stats)])))

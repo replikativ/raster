@@ -35,6 +35,8 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.report :as report]
+            [raster.core :refer [deftm]]
+            [raster.par :as par]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.parallel-program :as program-runtime]
@@ -111,6 +113,12 @@
   (let [expression (-> step :region soac/lambda-parts :body-results first)]
     {:type (get-in step [:value :dtype])
      :value (evaluate-test-scalar-expression expression operands)}))
+
+(deftm eager-boundary-fixture
+  [x :- (Array double), out :- (Array double), scale :- Double] :- (Array double)
+  (let [count (alength x)
+        factor (/ 1.0 scale)]
+    (par/map! out i count double (* factor (aget x i)))))
 
 (defn- loop-decomposition
   []
@@ -639,193 +647,61 @@
                  (reason-of #(invocation-link/validate-ordered-source-actions!
                               (assoc initial :program (assoc (:program initial) :equations [])))))))))))
 
-(deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
-  (let [arguments [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]
-        compilation (equation-first/compile
-                     #'pde/heat-loss-rk4 {:dtype :double :target :ze:debug})
+(deftest real-rk4-pde-retains-the-public-abi-and-typed-emission
+  ;; Runtime materialization and remapping are checked on the completed public
+  ;; owner in ordered-structured-loop-test, not fabricated before source work.
+  (let [compilation (equation-first/compile #'pde/heat-loss-rk4 {:dtype :double :target :ze:debug})
         semantic (:semantic compilation)
         scheduled (:scheduled compilation)
-        emitted {:program (:emitted compilation)
-                 :kernels (:kernels compilation)
-                 :stats (get-in compilation [:stats :emission])}
         emitted-program (:emitted compilation)
         invocation-plan (get-in semantic [:attributes :invocation-plan])
-        materialized
-        (materialization/materialize
-         invocation-plan
-         arguments
-         evaluate-test-scalar)
         loop-operation (some #(when (schedule/scheduled-loop? %) %)
                              (mapcat :operations (:equations scheduled)))
         loop-equation (some #(when (control/loop-program? (:algorithm %)) %)
                             (:equations emitted-program))
         trip-count-id (second (control/loop-index (:algorithm loop-equation)))
-        loop-output (-> loop-equation :algorithm control/carried first :output)
-        device-results
-        (set (mapcat :results
-                     (remove #(true? (get-in % [:attributes :host-only]))
-                             (:equations emitted-program))))
-        buffer-ids
-        (into device-results
-              (filter #(seq (:shape (get (:values emitted-program) %)))
-                      (:inputs emitted-program)))
-        buffers (zipmap buffer-ids (map #(keyword (str "rk4-buffer-" (hash %))) buffer-ids))
-        scalar-values
-        (into {}
-              (keep (fn [id]
-                      (when-not (contains? buffer-ids id)
-                        (let [dtype (get-in emitted-program [:values id :dtype])]
-                          [id {:type dtype
-                               :value (case dtype
-                                        :int (if (= id trip-count-id) 2 64)
-                                        :long 2
-                                        :float (float 0.25)
-                                        :double 0.25)}]))))
-              (:inputs emitted-program))
-        host-evaluator
-        (fn [equation {:keys [operands]}]
-          (let [operand-id (first (:operands equation))
-                divisor (double (get-in operands [operand-id :value]))]
-            (into {}
-                  (map (fn [id]
-                         [id {:type (get-in emitted-program [:values id :dtype])
-                              :value (/ 1.0 divisor)}]))
-                  (:results equation))))
-        call (program-call/make emitted-program buffers scalar-values
-                                {loop-output :rk4-carry-scratch} host-evaluator)
-        linked-plan (equation-first/lower compilation arguments)]
+        public-nsteps (:id (first (filter #(= 'nsteps (:symbol %)) (:parameters invocation-plan))))
+        narrowed (first (filter #(some (fn [operand] (= public-nsteps (:value operand))) (:operands %))
+                                (:steps invocation-plan)))]
     (is (equation-first/equation-first-compilation? compilation))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= :typed-parallel (:dialect semantic)))
     (is (invocation/invocation-plan? invocation-plan))
-    (is (= '[u0 target alpha inv-dx2 dt nsteps]
-           (mapv :symbol (:parameters invocation-plan))))
+    (is (= '[u0 target alpha inv-dx2 dt nsteps] (mapv :symbol (:parameters invocation-plan))))
     (is (= (:inputs semantic) (mapv :program-value (:bindings invocation-plan))))
-    (is (= 1 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
-    (is (= 1 (count (filter invocation/buffer-clone? (:steps invocation-plan)))))
-    (is (= 4 (count (filter invocation/buffer-allocation? (:steps invocation-plan)))))
-    (let [aliases (filter invocation/value-alias? (:steps invocation-plan))
-          allocation-ids (set (map :id (filter invocation/buffer-allocation?
-                                               (:steps invocation-plan))))
-          input-id (:id (first (:parameters invocation-plan)))]
-      ;; Evaluate-once call frames add aliases of u0. Keep the original
-      ;; four allocation aliases as an independent coverage requirement.
-      (is (= 4 (count (filter #(allocation-ids (:source %)) aliases))))
-      (is (= 4 (count (filter #(= input-id (:source %)) aliases))))
-      (is (= 8 (count aliases))))
+    (is (not-any? invocation/buffer-clone? (:steps invocation-plan))
+        "the initial copy is an ordinary numerical prefix, not a clone executor")
+    (is (= 4 (count (filter invocation/buffer-allocation? (:steps invocation-plan))))
+        "the four retained RK4 scratch constructor intents remain explicit")
+    (is (= 2 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
     (is (= 3 (count (filter invocation/scalar-compute? (:steps invocation-plan)))))
     (is (every? #(not (contains? % :expression)) (:steps invocation-plan)))
-    (is (= (set (:inputs semantic))
-           (set (concat (keys (:program-buffers materialized))
-                        (keys (:program-scalars materialized))))))
-    (is (= 0 (get-in materialized [:attributes :driver-allocations])))
-    (doseq [alias (filter invocation/value-alias? (:steps invocation-plan))]
-      (is (identical? (get-in materialized [:values (:id alias)])
-                      (get-in materialized [:values (:source alias)]))))
-    (let [public-nsteps (:id (first (filter #(= 'nsteps (:symbol %))
-                                            (:parameters invocation-plan))))
-          narrowed (first (filter #(some (fn [operand]
-                                           (= public-nsteps (:value operand)))
-                                         (:operands %))
-                                  (:steps invocation-plan)))
-          bound-nsteps (some (fn [{:keys [invocation-value]}]
-                               (when (= (:id narrowed) invocation-value)
-                                 invocation-value))
-                             (:bindings invocation-plan))]
-      (is (invocation/scalar-compute? narrowed))
-      (is (not= public-nsteps (:id narrowed)))
-      (is (= public-nsteps (-> narrowed :operands first :value)))
-      (is (= (:id narrowed) bound-nsteps)))
+    (is (invocation/scalar-compute? narrowed))
+    (is (not= public-nsteps (:id narrowed)))
+    (is (= :int (get-in narrowed [:value :dtype])))
+    (is (= :int (get-in emitted-program [:values trip-count-id :dtype])))
+    (is (some #(= (:id narrowed) (:invocation-value %)) (:bindings invocation-plan)))
     (is (= :scheduled-parallel (:dialect scheduled)))
-    (is (= 3 (count (:equations scheduled)))
-        "the generic fixpoint, host inv-n, and reduction with a final scalar epilogue represent the RK4 loss")
     (is (= 8 (count (get-in loop-operation [:graph :nodes])))
-        "the loop body is the ordinary stencil/map schedule, not an RK4 primitive")
-    (is (= :opencl-parallel (get-in emitted [:program :dialect])))
-    (is (= 10 (count (:kernels emitted))))
-    (is (= {:structured-loops-emitted 1
-            :typed-equations-emitted 1
-            :host-scalar-equations 1
-            :emission-routes {:kernel-body 10}
-            :kernel-body-declines {}}
-           (:stats emitted)))
-    (let [[partial final] (take-last 2 (:kernels emitted))
+        "ordinary stencil/map scheduling, not an RK4-specific kernel")
+    (is (= :opencl-parallel (:dialect emitted-program)))
+    (is (= 11 (count (:kernels compilation))))
+    (is (= {:structured-loops-emitted 1 :typed-equations-emitted 2 :host-scalar-equations 3
+            :emission-routes {:kernel-body 11} :kernel-body-declines {}}
+           (get-in compilation [:stats :emission])))
+    (let [[partial final] (take-last 2 (:kernels compilation))
           inv-n? #(and (symbol? %) (.startsWith (name %) "inv-n_"))]
       (is (= [:kernel-body :kernel-body]
              (mapv #(get-in % [:attributes :emission-route]) [partial final])))
       (is (not-any? inv-n? (:arguments partial))
           "the pre-combine phase must not apply or even bind the completed-result transform")
       (is (some inv-n? (:arguments final))
-          "only the final reduction phase consumes the scalar epilogue input"))
-    (is (= ["StructuredLoopCall" "EvaluatedHostEquation" "EmittedEquationCall"]
-           (mapv #(-> % class .getSimpleName) (:steps call)))
-        "the real emitted workload must cross the checked runtime-call boundary")
-    (is (= (set (:outputs emitted-program)) (set (keys (:outputs call)))))
-    (is (link/link-plan? linked-plan))
-    (is (link/program-link-instance? (first (:instances linked-plan))))
-    (is (= 2 (count (filter (comp some? :source val) (:nodes linked-plan)))))
-    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))
-    (is (= 1 (count (:outputs linked-plan))))
-    (let [[compiler-value buffer] (first (:program-buffers materialized))
-          zero-buffer (assoc buffer :source nil :initialization :zero)
-          requires-zero (-> materialized
-                            (assoc-in [:program-buffers compiler-value] zero-buffer)
-                            (assoc-in [:values (:id buffer)] zero-buffer))]
-      (is (= :invocation-link-zero-initializer
-             (reason-of #(invocation-link/lower requires-zero emitted-program
-                                                :ze:debug host-evaluator)))))
-    (let [session (atom {:device-id :ze:debug :closed? false})
-          events (atom [])]
-      (with-redefs [gpu/alloc! (fn [_ specs] (swap! events conj [:allocate (set (keys specs))]))
-                    gpu/buffer-view
-                    (fn [_ key view]
-                      (let [original (first (keep (fn [[_ node]]
-                                                    (when (= (:id view) (get-in node [:view :id]))
-                                                      (:view node)))
-                                                  (:nodes linked-plan)))]
-                        (assert original "mock binding must name a planned physical view")
-                        {:key key :view (bview/view (assoc (:allocation original) :id key) view)}))
-                    gpu/upload-range! (fn [_ view _source spec]
-                                        (swap! events conj [:upload (:key view) spec]))
-                    gpu/bind-kernel-graph! (fn [_ key _graph bindings _scalars _options]
-                                             (swap! events conj [:bind key (set (keys bindings))])
-                                             {:handle key})
-                    gpu/run-kernel-graph! (fn [_ handle]
-                                            (swap! events conj [:run handle]))
-                    gpu/release-kernel-graph! (fn [_ handle]
-                                                (swap! events conj [:release handle]))
-                    gpu/free-buffer! (fn [_ key] (swap! events conj [:free key]))
-                    gpu/record-graph! (fn [& _]
-                                        (throw (AssertionError.
-                                                "program replay must not use descriptor phases")))]
-        (let [executable (gpu-link/instantiate! linked-plan {:session session})]
-          (is (= 4 (count (filter #(= :bind (first %)) @events))))
-          (is (= (set (:outputs linked-plan))
-                 (set (keys (gpu-link/run! executable)))))
-          (is (= 4 (count (filter #(= :run (first %)) @events))))
-          (gpu-link/close! executable)
-          (is (= 4 (count (filter #(= :release (first %)) @events))))
-          (is (= (count (:nodes linked-plan))
-                 (count (filter #(= :free (first %)) @events)))))))
-    (let [sources (program-call/buffer-identities call)
-          mapping (zipmap sources (mapv #(vector :rk4-storage %)
-                                        (range (count sources))))
-          remapped (program-call/map-buffers call mapping)]
-      (is (every? (set (vals mapping)) (vals (:outputs remapped)))
-          "the rank-zero GPU reduction result remains resident storage during remapping"))))
+          "only the final reduction phase consumes the scalar epilogue input"))))
 
-(deftest loop-free-mlp-shares-the-public-equation-first-vertical
-  (let [arguments [(double-array [1.0 0.0 0.0 1.0])
-                   (double-array [0.0 0.0])
-                   (double-array [0.5 0.5])
-                   (double-array [0.25])
-                   (double-array [1.0 -1.0])]
-        compilation (equation-first/compile #'nn/predict-fn {:target :ze:0})
+(deftest mlp-compilation-retains-its-public-typed-abi
+  (let [compilation (equation-first/compile #'nn/predict-fn {:target :ze:0})
         semantic (:semantic compilation)
         invocation-plan (get-in semantic [:attributes :invocation-plan])
-        linked-plan (equation-first/lower compilation arguments)
-        call (get-in linked-plan [:instances 0 :call])
-        staging (program-runtime/staging-plan call :loop-free-mlp)
         first-layer-bias (:id (first (filter #(= 'b1 (:symbol %))
                                             (:parameters invocation-plan))))
         first-layer-rows (:symbol (first (filter #(and (invocation/shape-projection? %)
@@ -833,37 +709,20 @@
                                                    (= 0 (:axis %)))
                                             (:steps invocation-plan))))]
     (is (= :typed-parallel (:dialect semantic)))
-    (let [scope-vars (mapv (fn [[n s]] (ns-resolve n s))
-                           [['raster.compiler.ir.link-plan '*validated-program-instances*]
-                            ['raster.compiler.ir.link-plan '*retained-program-validations*]
-                            ['raster.compiler.ir.link-plan '*caller-options*]
-                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
-                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
-          observed (atom [])
-          observe #(mapv var-get scope-vars)
-          record! (fn [stage] (swap! observed conj [stage (observe)] [stage @(future (observe))]))
-          evaluate-step typed-scalar/evaluate-invocation-step]
-      (with-redefs [typed-scalar/evaluate-invocation-step
-                    (fn [& args] (record! :prefix) (apply evaluate-step args))]
-        (doseq [request [nil {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]]
-          (let [proof (emitted-program/validate-with-physical-results! (:emitted compilation) request)
-                projected (with-bindings (assoc (zipmap scope-vars (repeat (Object.)))
-                                               #'equation-first/*lower-observer* (fn [_] (record! :observer)))
-                            (equation-first/lower compilation arguments (fn [p] {:plan p}) proof request))]
-            (is (= (set (:outputs linked-plan)) (set (get-in projected [:plan :outputs]))))
-            (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request)))))
-      (is (= #{:prefix :observer} (set (map first @observed))))
-      (is (every? #(= (vec (repeat (count scope-vars) nil)) (second %)) @observed)
-          "prefix evaluation and lower observers, including their futures, have no outer proof authority"))
-    (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
-          lower equation-first/lower
-          requests (atom [])]
-      (with-redefs [equation-first/compile (fn [_ options] (is (= request options)) compilation)
-                    equation-first/lower (fn [& args] (swap! requests conj args) (apply lower args))]
-        (is (= (set (:outputs linked-plan))
-               (set (:outputs (equation-first/compile-link-plan #'nn/predict-fn arguments request)))))
-        (is (= [5] (mapv count @requests)))
-        (is (= request (last (first @requests))))))
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
+    (is (= 4 (get-in semantic [:attributes :invocation-scalar-equations])))
+    (is (= 3 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
+    (is (= 2 (count (get-in compilation [:scheduled :equations])))
+        "pure host scalar/shape equations belong to the typed invocation plan")
+    (is (= 0 (get-in compilation [:stats :emission :host-scalar-equations])))
+    (is (some? first-layer-rows))
+    (is (= '[W1 b1 W2 b2 x] (mapv :symbol (:parameters invocation-plan))))))
+
+(deftest mlp-source-allocation-witnesses-are-exact
+  (let [compilation (equation-first/compile #'nn/predict-fn {:target :ze:0})
+        semantic (:semantic compilation)
+        invocation-plan (get-in semantic [:attributes :invocation-plan])]
     (let [witnesses (mapcat #(get-in % [:attributes :realization-bindings]) (:equations semantic))
           allocation (first (filter #(= :result-allocation (:kind %)) witnesses))]
       (is (some? allocation) "functional map realization certifies its generated allocation")
@@ -910,19 +769,45 @@
                                                      {:public-parameters (mapv :symbol (:parameters invocation-plan))
                                                       :array-types {'W1 :double 'b1 :double 'W2 :double
                                                                     'b2 :double 'x :double}})))
-                "a removable replacement cannot bypass a claimed allocation witness")))))
-    (is (= :none (get-in compilation [:stats :fallback])))
-    (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
-    (is (= 4 (get-in semantic [:attributes :invocation-scalar-equations])))
-    (is (= 3 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
-    (is (= 2 (count (get-in compilation [:scheduled :equations])))
-        "pure host scalar/shape equations belong to the typed invocation plan")
-    (is (= 0 (get-in compilation [:stats :emission :host-scalar-equations])))
-    (is (= 2 (count staging)))
-    (is (some? first-layer-rows))
-    (is (every? #(contains? (:scalar-values %) first-layer-rows) staging)
-        "program shape facts remain available when a later kernel has no ABI use for them")
-    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))
+                "a removable replacement cannot bypass a claimed allocation witness")))))))
+
+(deftest eager-public-boundary-isolates-proof-scopes-and-certifies-independent-intent
+  (let [arguments [(double-array [1.0 -1.0]) (double-array 2) 2.0]
+        compilation (equation-first/compile #'eager-boundary-fixture {:target :ze:0 :dtype :double})
+        semantic (:semantic compilation)
+        invocation-plan (get-in semantic [:attributes :invocation-plan])
+        linked-plan (equation-first/lower compilation arguments)]
+    (let [scope-vars (mapv (fn [[n s]] (ns-resolve n s))
+                           [['raster.compiler.ir.link-plan '*validated-program-instances*]
+                            ['raster.compiler.ir.link-plan '*retained-program-validations*]
+                            ['raster.compiler.ir.link-plan '*caller-options*]
+                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
+                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
+          observed (atom [])
+          observe #(mapv var-get scope-vars)
+          record! (fn [stage] (swap! observed conj [stage (observe)] [stage @(future (observe))]))
+          evaluate-step typed-scalar/evaluate-invocation-step]
+      (with-redefs [typed-scalar/evaluate-invocation-step
+                    (fn [& args] (record! :prefix) (apply evaluate-step args))]
+        (doseq [request [nil {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]]
+          (let [proof (emitted-program/validate-with-physical-results! (:emitted compilation) request)
+                projected (with-bindings (assoc (zipmap scope-vars (repeat (Object.)))
+                                               #'equation-first/*lower-observer* (fn [_] (record! :observer)))
+                            (equation-first/lower compilation arguments (fn [p] {:plan p}) proof request))]
+            (is (= (set (:outputs linked-plan)) (set (get-in projected [:plan :outputs]))))
+            (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request)))))
+      (is (= #{:prefix :observer} (set (map first @observed))))
+      (is (every? #(= (vec (repeat (count scope-vars) nil)) (second %)) @observed)
+          "prefix evaluation and lower observers, including their futures, have no outer proof authority"))
+    (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+          lower equation-first/lower
+          requests (atom [])]
+      (with-redefs [equation-first/compile (fn [_ options] (is (= request options)) compilation)
+                    equation-first/lower (fn [& args] (swap! requests conj args) (apply lower args))]
+        (is (= (set (:outputs linked-plan))
+               (set (:outputs (equation-first/compile-link-plan #'eager-boundary-fixture arguments request)))))
+        (is (= [5] (mapv count @requests)))
+        (is (= request (last (first @requests))))))
     (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
           emitted (:emitted compilation)
           materialized (materialization/materialize invocation-plan arguments evaluate-test-scalar)
@@ -952,7 +837,16 @@
                    (invocation-link/lower materialized emitted :ze:0 nil
                                           (fn [plan] {:plan plan}) proof)))
       (is (thrown? clojure.lang.ExceptionInfo
-                   (invocation-link/certify (:plan projected) [] request))))))
+                   (invocation-link/certify (:plan projected) [] request))))
+    (let [materialized (materialization/materialize invocation-plan arguments evaluate-test-scalar)
+          buffer (get-in materialized [:program-buffers 'x])
+          uninitialized (assoc buffer :source nil :initialization :zero)
+          changed (-> materialized
+                      (assoc-in [:program-buffers 'x] uninitialized)
+                      (assoc-in [:values (:id buffer)] uninitialized))]
+      (is (= :invocation-link-zero-initializer
+             (reason-of #(invocation-link/lower changed (:emitted compilation) :ze:0 nil)))
+          "a source-free read cannot invent completed initialization for its input"))))
 
 (deftest allocation-shape-definition-remains-an-ordered-host-equation
   (let [source '(let* [size (clojure.core/* nrows width)

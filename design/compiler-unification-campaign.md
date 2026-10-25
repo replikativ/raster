@@ -108,13 +108,49 @@ The two legacy tests must be migrated by obligation, not deleted wholesale:
   device-free; discard obsolete clone/cardinality assumptions, not semantics.
 - Move eager prefix-evaluator/future/lower-observer isolation, five-argument request
   forwarding, certification/memory-witness and zero-initializer controls to the
-  existing eager-compatible `shape-before-first-stage` fixture.
+  eager-compatible `eager-boundary-fixture` (including a real scalar evaluator).
 - Validate full MLP/PDE through deferred public preparation and completed owners.
   Retain first-layer shape context, captured target constants, completed alias
   identities and PDE resident rank-zero output remapping.
 - Replace old fixed mock bind counts only after actual ordered owner observations
   cover release/allocation balance, no descriptor recording and failure withholding
   suffix/output publication. Keep the full-workload numerical oracles.
+
+The migration exposed a production gap, not just obsolete tests: public
+`Compiled` RK4 refused `:compiled-ordered-output-kind`. The structured suffix
+bypassed the ordinary component's resident/init/ownership pipeline; additionally,
+output-only reductions intentionally need an explicit representation demand.
+The correction shares post-fusion realization and derives that demand only after
+the complete assembled source return is proved. The existing producer/use audit
+selects output-only roots; returned roots reused by maps retain their separate
+existing audit. Rebuilding the source/envelope transports the inner certificate;
+downstream public scalar admission is unchanged. GPU semantic admission now
+forwards the same residency policy and source namespace to structured control.
+The actual public RK4 test passes 18 assertions across OpenCL and Level Zero.
+
+Unchanged prefix results passed to a suffix retain their exact preceding SSA AV
+and shape-dependency closure. Source-capacity correspondence is independently
+checked under the retained frontend equality environment; loop entry values take
+precedence, including dependency overlap. The fixtures cover scalar-only,
+loop-carry plus scalar, independent prefix output plus scalar, reused public
+reduction, source-free and disabled-residency boundaries, missing shape values,
+future/non-result imports and contract mutations. Successful full-PDE execution
+also observes graph retirement, closed session storage and no legacy descriptor
+recording. This is bounded qualification, not full-branch green.
+The shared-REPL affected gate passes 118 tests / 1,434 assertions; the separate
+public RK4 integration passes 18 assertions. Final lexical-identity and explicit
+request-policy controls still require the clean-process checkpoint gate.
+
+Remaining scope: the source-derived output-only demand currently applies to
+structured suffixes; ordinary public output-only reductions still need the same
+verified-return policy wired into their producer. Do not infer residency from
+rank zero or accept arbitrary caller `:resident-outputs` on source compilation.
+Another source-coverage gap remains reproducible: in
+`structured-prefix-composition-test/reduction-return-source`, moving the
+independent `snapshot` pmap after the unused `scratch` constructor (but before
+`count`) declines `:structured-control-host-continuation`, binding `scratch`,
+owner `:allocation`. Moving it before scratch isolates the positive prefix-return
+test; the after-scratch form is unfinished functionality, not a language exclusion.
 
 For comparison, exact-parent `be180fd6` CI34832 has 15 completed unit summaries:
 6,949 tests / 87,661 assertions, 24 failures / 50 errors across 58 test Vars; the

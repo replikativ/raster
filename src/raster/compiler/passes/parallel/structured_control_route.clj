@@ -1384,17 +1384,69 @@
       {:dimension-loop dimension-loop :dimensions dimensions
        :loop (control/rebind-incoming dimension-loop buffers values)})))
 
+(defn- suffix-prefix-values
+  "Transport only unchanged preceding SSA results, retaining their exact numerical contracts.
+   Source capacity equality is checked independently; it never rewrites the producer's shape."
+  [{:keys [outer-values outer-equalities suffix-bindings outer-body]} prefix loop]
+  (let [values (get-in prefix [:envelope :values])
+        lexical-values (into util/*shadowing-locals*
+                             (concat (keys values) (keys (control/outer-values loop))))
+        referenced (binding [util/*shadowing-locals* lexical-values]
+                     (util/free-syms (list* 'let* (vec (mapcat identity suffix-bindings)) outer-body)))
+        loop-values (set (concat (control/outer-operands loop) (control/outer-results loop)))
+        selected (remove loop-values (filter referenced (get-in prefix [:envelope :outputs])))
+        analysis {:values outer-values :equalities outer-equalities}]
+    (doseq [id selected
+            :let [producer (get values id) source (get outer-values id)]]
+      (when-not (and source
+                     (= (dissoc producer :shape) (dissoc source :shape))
+                     (= (count (:shape producer)) (count (:shape source)))
+                     (= (mapv #(host-av/shape-extent analysis %) (:shape producer))
+                        (mapv #(host-av/shape-extent analysis %) (:shape source))))
+        (fail! :structured-control-prefix-suffix-value
+               "suffix entry must preserve one preceding producer and its source storage contract"
+               {:value id :producer producer :source source})))
+    (clojure.core/loop [pending (seq selected) result {}]
+      (if-let [id (first pending)]
+        (if (contains? result id)
+          (recur (next pending) result)
+          (let [producer (get values id)
+                loop-value (get (control/outer-values loop) id)
+                _ (when (and loop-value (not= producer loop-value))
+                    (fail! :structured-control-prefix-suffix-value
+                           "a producer shape dependency cannot replace a loop entry contract"
+                           {:value id :producer producer :loop-value loop-value}))
+                value (or loop-value producer)]
+            (when-not value
+              (fail! :structured-control-prefix-suffix-value
+                     "a preceding producer shape requires a declared dependency" {:value id}))
+            (recur (concat (next pending)
+                           (binding [util/*shadowing-locals* lexical-values]
+                             (doall (mapcat util/free-syms (:shape value)))))
+                   (assoc result id value))))
+        result))))
+
 (defn- suffix-program
   [{:keys [loop suffix-bindings outer-body outer-values]}
-   {:keys [dtype abstract-machine] :as options}]
+   {:keys [dtype abstract-machine] :as options} incoming-values]
   (when (or (seq suffix-bindings) (seq outer-body))
     (let [source (list* 'let* (vec (mapcat identity suffix-bindings)) outer-body)
           ;; Analyze the source's physical carry names first. Fresh loop results belong to the
           ;; enclosing SSA boundary, not this original source environment.
           outputs (control/outer-results loop)
+          references (binding [util/*shadowing-locals*
+                               (into util/*shadowing-locals*
+                                     (concat (keys outer-values) (keys incoming-values)
+                                             (keys (control/outer-values loop))))]
+                       (util/free-syms source))
           values (apply dissoc
-                        (merge (select-keys outer-values (util/free-syms source))
-                               (control/outer-values loop)) outputs)
+                        (merge (select-keys outer-values references)
+                               (control/outer-values loop)
+                               ;; Earlier numerical definitions own their SSA contracts. The
+                               ;; source host-capacity snapshot is not a second numerical producer
+                               ;; and may use another (equivalent) extent spelling.
+                               incoming-values)
+                        outputs)
           typed (typed-frontend/form->program
                  source (assoc options
                                :dtype (or dtype :double)
@@ -1407,13 +1459,14 @@
         (fail! :structured-control-unsupported-suffix
                "post-loop computation is outside the certified TypedSOAC subset"
                {:suffix-bindings suffix-bindings :outer-body outer-body}))
-      (let [fused (-> (first (fusion/fusion-fixpoint typed abstract-machine))
-                      (scope-generated-results :suffix))
+      (let [fused (scope-generated-results
+                   (first (fusion/fusion-fixpoint typed abstract-machine)) :suffix)
             inputs (set (:inputs (soac/facts fused)))
             substitutions (into {} (keep (fn [{:keys [initial output]}]
                                             (when (contains? inputs initial) [initial output])))
                                 (control/carried loop))]
-        (typed-route/analyzed-program-envelope source fused substitutions)))))
+        {:envelope (typed-route/analyzed-program-envelope source fused substitutions)
+         :source source :typed fused :incoming-renames substitutions}))))
 
 (defn- offset-source-facts
   "Rebase outer source provenance; the nested algorithm keeps its own local source frame."
@@ -1479,22 +1532,9 @@
      (assoc (:provenance facts) :pass :structured-control-route)
      (assoc (:attributes facts) :algorithm-dialect :typed-structured-control))))
 
-(defn program-envelope
-  "Wrap one certified frontend decomposition in the shared typed program envelope.
-
-   When a suffix is itself in the TypedSOAC subset, its uses of the physical carried array are
-   alpha-remapped to the loop's fresh logical output and appended as ordinary typed equations."
-  ([decomposition] (program-envelope decomposition {}))
-  ([decomposition options]
-   (frontend/validate-decomposition! decomposition)
-   (let [{:keys [source loop-binding loop-source prefix-bindings parameter-values outer-values]
-          :as decomposition} (normalize-decomposition decomposition options)
-         prefix (when source (prefix-program decomposition options))
-         {:keys [loop dimension-loop dimensions]} (prefix-loop-join decomposition prefix)
-         suffix-envelope (suffix-program (assoc decomposition :loop dimension-loop)
-                                         (if prefix (assoc options :shape-equalities dimensions)
-                                             options))
-         loop-equation (loop-equation loop loop-binding loop-source)
+(defn- assemble-program-envelope
+  [{:keys [source loop-binding loop-source prefix-bindings]} prefix loop suffix-envelope]
+  (let [loop-equation (loop-equation loop loop-binding loop-source)
          prefix-equations (mapv #(update % :id (fn [id] [:prefix id]))
                                (get-in prefix [:envelope :equations]))
          source-offset (inc (count prefix-bindings))
@@ -1520,8 +1560,7 @@
          program-outputs (or (:outputs suffix-envelope) (control/outer-results loop))
          {:keys [inputs outputs]} (program-boundary equations program-outputs)
          effects (reduce set/union #{} (map :effects equations))
-         parallel-program
-         (program/make
+         parallel-program (program/make
           {:dialect :typed-parallel
            :source source
            :values values
@@ -1536,7 +1575,54 @@
                                :mixed-algorithms (boolean suffix-envelope))
            :operation? typed-operation?
            :algorithm? (partial typed-algorithm-boundary?
-                                {:values values :inputs inputs :equations equations})})
+                                {:values values :inputs inputs :equations equations})})]
+    parallel-program))
+
+(defn- realize-source-return-reductions
+  "Demand resident representation only after the complete assembled source return is proved.
+   Rebuild through the same source/envelope constructor; never copy representation certificates
+   onto the outer program. Source-free fragments and prefix live-outs acquire no demand."
+  [decomposition prefix loop suffix-result options]
+  (let [envelope (:envelope suffix-result)
+        initial (assemble-program-envelope decomposition prefix loop envelope)
+        source-owned? (and (:source decomposition) (:resident-reductions? options)
+                           (seq (or (:public-parameters options) (:active-params options))))]
+    (if-not suffix-result
+      initial
+      (let [projected (when source-owned? (validate-source-result! initial options))
+            ;; Projection uses the enclosing SSA names, while this retained source fragment
+            ;; still owns its original incoming names. Results are unchanged by that transport.
+            returned (set (:outputs projected))
+            typed (:typed suffix-result)
+            demand (if source-owned? (resident/source-return-reduction-demand typed returned) [])]
+          (let [optimized (typed-route/realize-typed-component typed options demand)
+                _ (when-let [decline (:declined optimized)]
+                    (fail! :structured-control-unsupported-suffix
+                           "source-return representation has no supported typed realization"
+                           {:decline decline}))
+                rebuilt (typed-route/analyzed-program-envelope
+                         (:source suffix-result) (:program optimized)
+                         (:incoming-renames suffix-result))]
+            (assemble-program-envelope decomposition prefix loop rebuilt))))))
+
+(defn program-envelope
+  "Wrap one certified frontend decomposition in the shared typed program envelope.
+
+   When a suffix is itself in the TypedSOAC subset, its uses of the physical carried array are
+   alpha-remapped to the loop's fresh logical output and appended as ordinary typed equations."
+  ([decomposition] (program-envelope decomposition {}))
+  ([decomposition options]
+   (frontend/validate-decomposition! decomposition)
+   (let [{:keys [source prefix-bindings parameter-values outer-values]
+          :as decomposition} (normalize-decomposition decomposition options)
+         prefix (when source (prefix-program decomposition options))
+         {:keys [loop dimension-loop dimensions]} (prefix-loop-join decomposition prefix)
+         suffix-result (suffix-program
+                        (assoc decomposition :loop dimension-loop)
+                        (if prefix (assoc options :shape-equalities dimensions) options)
+                        (when prefix (suffix-prefix-values decomposition prefix dimension-loop)))
+         parallel-program (realize-source-return-reductions decomposition prefix loop suffix-result options)
+         {:keys [values inputs outputs]} parallel-program
          public-parameters (or (:public-parameters options) (:active-params options))]
      (if (and (seq public-parameters) source)
        (promote-program parallel-program options)
