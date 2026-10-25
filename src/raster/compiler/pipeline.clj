@@ -22,6 +22,7 @@
             [clojure.pprint :as pp]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.scalar.dce :as dce]
@@ -130,7 +131,8 @@
   stamped onto loop* forms — silent double/float divergence inside one compile
   (the GPU emitters' `WARN loop-value-ctype` firings)."
   [body params tags annotations source-ns element-dtype]
-  (let [type-env (inf/build-param-type-env params tags annotations)
+  (let [body (source-declaration/capture-body body)
+        type-env (inf/build-param-type-env params tags annotations)
         ;; Run TC for per-binding type inference
         tc-binding-tags (when annotations
                           (inf/safe-tc-binding-tags '<compile> params annotations body source-ns))
@@ -316,11 +318,11 @@
                    tag (if object-input?
                          (inf/infer-arg-tag tagged-init env)
                          (or (inf/hint-tag sym) (inf/infer-arg-tag tagged-init env)))
-                   tagged-sym (cond-> sym
+                   tagged-sym (source-declaration/retain-hint (cond-> sym
                                 tag (vary-meta assoc :tag (if object-storage? 'Object tag)
                                                :raster.type/tag tag)
                                 (util/void-form? tagged-init)
-                                (vary-meta assoc :raster.effect/effectful true))
+                                (vary-meta assoc :raster.effect/effectful true)))
                    new-env (assoc env sym (if object-storage?
                                            {:tag tag :physical-carrier Object} tag))]
                [new-env (conj acc tagged-sym tagged-init)]))
@@ -386,6 +388,12 @@
   [form opts]
   (region-copy/expand-region-copies form :param-env (:param-env opts)))
 
+(defn- validate-target-array-declarations! [form opts]
+  (when (or (contains? #{:c :wasm} (:target opts))
+            (device/gpu-target? (:target-device opts)))
+    (source-declaration/validate-native-array-declarations! form))
+  form)
+
 (defn- pass-lower
   "Lower compound deftm ops into primitive ops for AD.
   Stops at rrule template boundaries — ops with templates are kept as calls.
@@ -394,6 +402,7 @@
   Tags all binding symbols with inferred types via metadata.
   (=> :walked :lowered)"
   [form opts]
+  (validate-target-array-declarations! form opts)
   (let [;; Normalize multi-body let FIRST — before inlining can drop effects
         normalized (normalize-let-body form)
         result (if (:inline? opts)
@@ -528,6 +537,7 @@
               ;; Local nonescaping value products have the same scalar meaning
               ;; on JVM, C and accelerators. Preserve escaping objects, exact
               ;; factory ownership and ordered argument/conversion obligations.
+              _ (validate-target-array-declarations! expanded opts)
               expanded (soa-lower/lower-local-constructors
                         expanded {:source-ns (:source-ns opts)
                                   :locals (keys (:param-env opts))})
@@ -550,7 +560,8 @@
                          ;; and rounding, including inside nested loops/maps.
                          (let [rw-result (rewalk/pe-rewalk expanded opts)]
                            (if (map? rw-result) (:form rw-result) rw-result))
-                         expanded)]
+                         expanded)
+              _ (validate-target-array-declarations! rewalked opts)]
           (if (fixpoint-equivalent? rewalked current)
             (let [final (-> (ensure-let*-result rewalked)
                             (tag-binding-types (:param-env opts))
@@ -1380,6 +1391,7 @@
                      (inline/resolve-generic-deftm-calls (:param-env opts))
                      (inline/expand-for-backends 3 (:param-env opts))
                      (inline/resolve-generic-deftm-calls (:param-env opts))))
+        _ (source-declaration/validate-native-array-declarations! source)
         typed (semantic-program-attempt source opts
                                         (abstract-machine-for-target target-device
                                                                      (:target-descriptor opts)))
@@ -2596,7 +2608,7 @@
                         (or (when-let [s (:raster.core/deftm-source-ns m)]
                               (try (the-ns s) (catch Exception _ nil)))
                             (when (var? resolved) (.ns ^clojure.lang.Var resolved))))
-        opts (cond-> {:inline? true :simd? false :dtype dtype :active-params active-params}
+        opts (cond-> {:target :wasm :inline? true :simd? false :dtype dtype :active-params active-params}
                param-env (assoc :param-env param-env)
                source-ns (assoc :source-ns source-ns))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (list* 'do walked-body))

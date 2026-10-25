@@ -1421,6 +1421,20 @@ allocation/helper recipes and their lexical dependencies survive shape normaliza
 equivalence remains a separate causal check. This producer closure does not establish ordered
 clone/loop execution, Float payload completion or resident inter-component composition.
 
+Source local declarations and inferred types are separate facts. Original source entry captures
+the presence and value of a binder's declaration before inference; rewalking transports this
+fact rather than reinterpreting an inferred `:tag` as a source declaration. Actual macro
+expansion captures its new binders while preserving exact incoming binder occurrences. Quoted
+data and owned value-completion operands remain opaque. This is scoped metadata, not a global
+name registry or evidence that a source check has executed. More precise primitive-array clone
+inference must not erase an observable reference check. JVM scalar emission retains the source
+declaration; SIMD declines an incompatible direct operand carrier, and C/Wasm/GPU admission refuses
+incompatible or unresolved array declarations rather than manufacturing a physical Class proof.
+Compatible declarations keep the vector schedule. These constraints do not establish arbitrary
+macro/kernel coverage or general reference-type compilation. Expansion capture currently visits
+input and output subtrees, so deeply nested macro compilation needs cost qualification; it is
+not assumed to have negligible allocation or linear aggregate cost.
+
 Auxiliary realization bindings are executable source actions, not scaffolding that can be
 discarded because a later kernel overwrites the result. The internal ordered root now recovers
 their exact source-position/equation witness: a result allocation executes the existing

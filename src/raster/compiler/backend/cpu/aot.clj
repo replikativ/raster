@@ -285,7 +285,7 @@
         ;; :simd? false always keeps the JVM Vector-API lowering OFF; :keep-par-forms?
         ;; (set when simd?=true) instead PRESERVES par/reduce|map forms so the C
         ;; backend can emit __m256 intrinsics via csimd (vs clang auto-vec only).
-        opts  {:inline? true :simd? false :keep-par-forms? simd? :dtype dtype
+        opts  {:target :c :inline? true :simd? false :keep-par-forms? simd? :dtype dtype
                :active-params active :param-env penv :source-ns source-ns
                :preserve-declared-array-storage? true
                :array-types (:array-types parameter-types)

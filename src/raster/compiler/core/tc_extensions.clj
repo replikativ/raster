@@ -16,6 +16,7 @@
             [typed.cljc.checker.utils :as u]
             [typed.cljc.checker.check-below :as below]
             [typed.cljc.checker.check :as cljc-chk]
+            [typed.cljc.checker.check.invoke :as invoke]
             [typed.cljc.checker.check.unanalyzed :refer [defuspecial]]
             [typed.clj.checker.check.unanalyzed :as unan]))
 
@@ -374,6 +375,28 @@
   [t]
   (when (instance? (resolve 'typed.cljc.checker.type_rep.PrimitiveArray) t)
     (:output-type t)))
+
+;; Compatibility rule until the pinned Typed Clojure provides representation-preserving clone
+;; checking. Its generic ReadOnlyArray x -> Array x annotation preserves elements but erases
+;; primitive jtype. Array subtyping deliberately ignores jtype, so element compatibility alone
+;; is not evidence for a physical Object[] result. Keep this rule in ONE place; remove it when
+;; the upstream dependency supplies the equivalent checking rule.
+(defmethod chk/-invoke-special 'clojure.core/aclone
+  [{:keys [args] :as expr} expected opts]
+  (when-let [check-expr (check-expr-from-opts opts)]
+    (when (= 1 (count args))
+      (let [argument (check-expr (first args) nil opts)
+            array-type (r/ret-t (u/expr-type argument))
+            component (when (r/PrimitiveArray? array-type) (:jtype array-type))]
+        (if (and (class? component) (.isPrimitive ^Class component)
+                 (not= Void/TYPE component))
+          (assoc expr :args [argument]
+                 ;; A clone has the same representation, NOT the source's reference identity,
+                 ;; occurrence filters or object path. Construct a fresh TCResult.
+                 u/expr-type (below/maybe-check-below (r/ret array-type) expected opts))
+          ;; Returning nil would re-check this subtree on ordinary fallback; nested reference
+          ;; clones would then multiply work. Reuse the already checked argument instead.
+          (invoke/normal-invoke expr (:fn expr) args expected {:cargs [argument]} opts))))))
 
 (defmethod chk/-invoke-special 'raster.arrays/aget
   [{:keys [args] :as expr} expected opts]

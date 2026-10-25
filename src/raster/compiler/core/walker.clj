@@ -17,6 +17,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
@@ -139,8 +140,9 @@
 
 (defn- retain-binding-storage [ctx symbol initializer logical-tag element-tag]
   (let [object? (object-storage-initializer? initializer (:type-env ctx))
-        symbol (cond-> (stamp-type-meta symbol logical-tag element-tag)
-                 object? (vary-meta assoc :tag 'Object))]
+        symbol (source-declaration/retain-hint
+                (cond-> (stamp-type-meta symbol logical-tag element-tag)
+                  object? (vary-meta assoc :tag 'Object)))]
     [symbol (cond-> (ctx-assoc-type ctx symbol logical-tag)
               object? (update-in [:type-env symbol] assoc :physical-carrier Object)
               element-tag (update-in [:type-env symbol] assoc :element element-tag))]))

@@ -18,6 +18,7 @@
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.passes.scalar.simplify :as simp]
             [raster.core :as rcore]))
 
@@ -189,7 +190,7 @@
                 pe-init (pe-fn init env)]
             (cond
               ;; Constant — propagate into env, skip binding
-              (constant? pe-init)
+              (and (constant? pe-init) (not (source-declaration/reference-declared? sym)))
               (recur (next pairs) new-bindings (assoc env sym pe-init))
 
               ;; Single-use trivial expression — inline.
@@ -198,7 +199,8 @@
               ;; this let* — under sequential shadowing the env substitution
               ;; would make later use sites (including AD pullback closures
               ;; capturing sliced buffers) read the WRONG (latest) rhs value.
-              (and (trivial? pe-init)
+              (and (not (source-declaration/reference-declared? sym))
+                   (trivial? pe-init)
                    (or (not (symbol? pe-init))
                        (not-any? #(= pe-init (first %)) (next pairs)))
                    (let [uses (reduce + 0 (map #(count-uses sym %) body))]

@@ -68,6 +68,12 @@
    'chars   (Class/forName "[C")
    'booleans (Class/forName "[Z")})
 
+(defn builtin-array-hint-class
+  "Interpret a builtin JVM array declaration, not the Class of an expression's value."
+  [hint]
+  (or (get primitive-array-info hint)
+      (when (= 'objects hint) (Class/forName "[Ljava.lang.Object;"))))
+
 (def tag->java-class
   "Map type tags to java.lang.Class for gen-interface descriptors."
   {'double  Double/TYPE, 'long Long/TYPE, 'int Integer/TYPE, 'float Float/TYPE,
@@ -780,7 +786,8 @@
 (def ^:const preserved-type-keys
   "Metadata keys that CSE must preserve during normalization.
   These carry type information that downstream passes need."
-  [:raster.type/tag :raster.type/fn-info :raster.type/element :raster.type/source])
+  [:raster.type/tag :raster.type/fn-info :raster.type/element :raster.type/source
+   :raster.source/binding-declaration])
 
 ;; --- JVM numeric widening (used by dispatch and inference) ---
 

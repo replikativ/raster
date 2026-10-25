@@ -20,6 +20,7 @@
   For dynamic sizes, emit both paths with runtime branch on n."
   (:require [raster.compiler.core.macroexpand :as macroexpand]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.backend.jvm.bytecode :as bc]
@@ -479,11 +480,15 @@
     :array-types/:scalar-types/:values — optional retained compiler facts for that scheduling"
   [form & {:keys [simd? min-elements dtype scalar-types array-types values abstract-machine]
            :or {simd? true min-elements nil}}]
-  (if-not simd?
+  (let [source (if (parallel-program/parallel-program? form) (:source form) form)
+        declaration-refusal (when simd? (source-declaration/array-declaration-violation source :simd))]
+  (if (or (not simd?) declaration-refusal)
     (let [p (when (parallel-program/parallel-program? form)
               (parallel-program/validate! form segop/segop-node?))
           source (if p (parallel-program/source-form p) form)]
-      {:form (par/expand-par-forms source) :stats {:simd? false}})
+      {:form (par/expand-par-forms source)
+       :stats (cond-> {:simd? false}
+                declaration-refusal (assoc :fallback 1 :fallback-reason (:reason declaration-refusal)))})
     (let [supplied-program (when (parallel-program/parallel-program? form)
                              (parallel-program/validate! form segop/segop-node?))
           direct-schedule
@@ -707,4 +712,4 @@
               (vector? form) (mapv transform form)
               :else form))]
       {:form (transform source-form)
-       :stats @stats})))
+       :stats @stats}))))

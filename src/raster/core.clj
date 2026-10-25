@@ -50,6 +50,7 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.specialize :as specialize]
@@ -235,6 +236,9 @@
         [ret-type body] (if (= :- (first ret-args))
                           [(second ret-args) (nnext ret-args)]
                           [(types/meta-type-annotation param-vec) ret-args])
+        ;; Capture local declarations while this is still original source, including deferred
+        ;; walking. Later inference tags must never become retrospective declarations.
+        body (source-declaration/capture-body body)
         ;; Parse typed params
         {:keys [params annotations]} (types/parse-typed-params param-vec)
         tags (types/extract-tags params annotations)
@@ -325,7 +329,8 @@
   not at definition time. This gives TC-quality code in the JIT path."
   [source-body params tags annotations source-ns]
   (binding [*ns* (or source-ns *ns*)]
-  (let [type-env (build-walker-type-env params annotations)
+  (let [source-body (source-declaration/capture-body source-body)
+        type-env (build-walker-type-env params annotations)
         tc-binding-tags (inf/safe-tc-binding-tags '<jit> params annotations source-body source-ns)
         ;; Effective element dtype from the dispatch tags — the SAME rule as
         ;; compile-aot's get-walked-body. Without it the lazy-JIT tier walked a

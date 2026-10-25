@@ -9,6 +9,7 @@
    rely on), so we re-implement it preserving meta."
   (:refer-clojure :exclude [])
   (:require [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.core.util :as util]))
 
 (defn walk-preserving-meta
@@ -82,6 +83,8 @@
                              (not (and (symbol? (first form)) (skip-head? (first form)))))
                       (macroexpand form)
                       form)
+           expanded (if (identical? form expanded) expanded
+                        (source-declaration/capture-expansion form expanded))
            m (meta form)
            result (walk-preserving-meta #(macroexpand-all-preserving % skip-head?)
                                         carry-let-init-type-meta expanded)]

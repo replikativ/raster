@@ -16,6 +16,7 @@
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.passes.scalar.effects :as effects]
@@ -516,11 +517,13 @@
             (doseq [[id init] (partition 2 bindings)]
               (let [fresh (gensym (str (name id) "_"))
                     value (subst-fn @current init)
-                    renamed (if (and (seq? value) (symbol? (first value))
+                    renamed (source-declaration/retain-hint
+                             (if (and (seq? value) (symbol? (first value))
                                      (op/alloc-op? (first value)))
-                              (with-meta fresh {:raster.buffer/hoistable true
-                                                :tag (get alloc-sym->array-tag (first value))})
-                              (if (meta id) (vary-meta fresh merge (meta id)) fresh))]
+                              (vary-meta fresh merge (meta id)
+                                         {:raster.buffer/hoistable true
+                                          :tag (or (get alloc-sym->array-tag (first value)) (:tag (meta id)))})
+                              (if (meta id) (vary-meta fresh merge (meta id)) fresh)))]
                 (swap! pairs conj [renamed value])
                 (swap! current assoc id renamed)))
             (emit-tail! (mapv #(subst-fn @current %) body)))
