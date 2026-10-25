@@ -35,9 +35,15 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-soac-route]
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
             [raster.compiler.passes.scalar.host-entry-contract :as host-entry]
             [raster.compiler.passes.scalar.normal-return :as normal-return]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.core :as rcore]
             [raster.compiler.passes.scalar.peephole :as peephole]))
 
@@ -56,6 +62,8 @@
    rewrite the host projection, but it cannot invent or reconstruct operations."
   nil)
 
+(def ^:dynamic *native-simd?* true)
+
 (def ^:dynamic *length-syms*
   "C ABI length parameters keyed by their source array symbol."
   {})
@@ -66,13 +74,22 @@
 
 (declare alength-call? alength-arg)
 
-(defn- operations-at-site
+(defn- equation-at-site
   [site]
   (when *scheduled-program*
-    (:operations (some #(when (= site (if (= :binding (first (:site %)))
+    (some #(when (= site (if (= :binding (first (:site %)))
                                       (update (:site %) 1 (fn [id] (get *host-value-remap* id id)))
                                       (:site %))) %)
-                       (:equations *scheduled-program*)))))
+          (:equations *scheduled-program*))))
+
+(defn- operations-at-site [site] (:operations (equation-at-site site)))
+
+(defn- legalize-host-lengths [expression]
+  (walk/postwalk
+   (fn [value]
+     (if (alength-call? value)
+       (get *length-syms* (alength-arg value) value)
+       value)) expression))
 
 (defn- bound-segop
   [record-class]
@@ -80,12 +97,81 @@
     ;; Host-source normalization turns alength into explicit ABI scalars after scheduling. Apply
     ;; that same target expression legalization to the retained operation; its algebra, dtype,
     ;; effects, and schedule remain untouched.
-    (walk/postwalk
-     (fn [expression]
-       (if (alength-call? expression)
-         (get *length-syms* (alength-arg expression) expression)
-         expression))
+    (legalize-host-lengths
      (segop/substitute-host-values *host-value-remap* operation))))
+
+(defn- owned-reduction-projection
+  "Consume a complete owned reduction, not the first physical phase as a result.
+   The CPU folds source inputs directly, then evaluates the certified terminal
+   region once. Its private target temporary is not a new semantic binding."
+  [owner]
+  (when (and owner
+             (some #(instance? raster.compiler.ir.segop.SegRed %) (:operations owner))
+             (not (and (dialect/program-form? (:algorithm owner))
+                       (= 1 (count (dialect/equations (:algorithm owner))))
+                       (= 'reduce (dialect/operation-kind
+                                   (first (dialect/equations (:algorithm owner))))))))
+    (throw (ex-info "owned native reduction lacks a supported complete algorithm"
+                    {:reason :unsupported-native-owned-reduction
+                     :equation (:id owner) :missing-rule :owned-algorithm})))
+  (when (and owner (dialect/program-form? (:algorithm owner)))
+    (let [program (:algorithm owner)
+          equations (dialect/equations program)
+          equation (when (= 1 (count equations)) (first equations))]
+      (when (and equation (= 'reduce (dialect/operation-kind equation)))
+        (let [reject! (fn [rule]
+                        (throw (ex-info "unsupported complete native reduction projection"
+                                        {:reason :unsupported-native-owned-reduction
+                                         :equation (:id owner) :missing-rule rule})))
+              {:keys [source raw-dtype result-dtype transform] :as projection}
+              (typed-soac-route/functional-reduction-host-projection program equation)
+              operations (:operations owner)
+              phases (mapv :phase operations)
+              raw (first operations)
+              terminal (last operations)
+              result (first (nth equation 2))
+              operator (:reduction raw)
+              expected-region (scalar-region-lower/from-typed-result-transform transform)
+              actual-region (get-in terminal [:reduction :attributes :result-region])
+              source-info (par/extract-par-reduce-info source)]
+          ;; Completion contracts may carry process-local Class identities.
+          ;; Refuse their unclosed execution context before portable semantic
+          ;; comparison, whose encoder deliberately does not admit Classes.
+          (doseq [expression [source transform actual-region]]
+            (when (completion/contains-completion? expression)
+              (throw (ex-info "Native emission requires discharged value completions"
+                              {:reason :unclosed-c-family-value-completion :expression expression}))))
+          (when-not (and (= (:results owner) [result])
+                         (= (:site owner) [:binding result])
+                         (every? #(instance? raster.compiler.ir.segop.SegRed %) operations)
+                         (contains? #{[:single] [:block-local :cross-block]} phases)
+                         (= #{result} (:outputs terminal))
+                         (or (= [:single] phases)
+                             (and (= (:outputs raw) (:inputs terminal))
+                                  (nil? (get-in raw [:reduction :attributes :result-region])))))
+            (reject! :phase-shape))
+          (when-not (and (reduction/scalar? operator)
+                         (= [raw-dtype] (reduction/dtypes operator))
+                         (= raw-dtype (:dtype raw) (:dtype terminal))
+                         (= (second equation) (get-in operator [:attributes :equation]))
+                         (= (second equation) (get-in terminal [:reduction :attributes :equation]))
+                         (segop/seg-space-1d? (:space raw))
+                         (= (:idx source-info) (:name (segop/seg-space-reduced-dim (:space raw))))
+                         (= (:bound source-info) (:bound (segop/seg-space-reduced-dim (:space raw))))
+                         (= (:init source-info) (:init (segop/scalar-reduce-op raw)))
+                         (= (:acc source-info) (:acc (segop/scalar-reduce-op raw)))
+                         (= (:body source-info)
+                            (dialect/scalar-converts->source (:lambda (segop/scalar-reduce-op raw)))))
+            (reject! :source-fold-correspondence))
+          (when-not (and (semantic/equivalent? expected-region actual-region)
+                         (or transform (= raw-dtype result-dtype)))
+            (reject! :terminal-region-correspondence))
+          (when-not (every? #{:float :double} [raw-dtype result-dtype])
+            (reject! :unqualified-scalar-dtype))
+          (assoc projection
+                 :raw-operation (legalize-host-lengths
+                                 (segop/substitute-host-values *host-value-remap* raw))
+                 :source (legalize-host-lengths (util/subst-syms *host-value-remap* source))))))))
 
 (defn- compatibility-segop
   "Schedule an uncovered nested C host site at the shared middle-end boundary.
@@ -213,6 +299,7 @@
                     (parallel-program/validate! lowered segop/segop-node?))]
       {:form (if program (:source program) lowered)
        :parallel-program program
+       :simd? simd?
        :params active :param-env penv}))))
 
 (defn fused-scalar-form
@@ -540,6 +627,76 @@
 (defn- emit-expr* [e array-syms]
   (ce/emit-expr e nil array-syms "idx"))
 
+(defn- check-owned-reduction-conversions! [owner expressions]
+  (doseq [expression expressions]
+    (when (completion/contains-completion? expression)
+      (throw (ex-info "Native emission requires discharged value completions"
+                      {:reason :unclosed-c-family-value-completion :expression expression})))
+    (let [source (dialect/scalar-converts->source expression)
+          ;; Use the shared unresolved source obligations, including nested
+          ;; integral/reference checks, rather than treating a C cast as a check.
+          checked? (some #{:checked-source-cast :source-reference-cast :unclosed-source-obligations}
+                         (:flags (effects/descriptor source)))
+          checked-float?
+          (some (fn [node]
+                  (and (seq? node)
+                       (= :checked (descriptor/cast-floating-narrowing
+                                    (descriptor/semantic-op node)))
+                       (not= :float (some-> (first (descriptor/call-args node))
+                                           types/sym-type-tag dtype/dtype-for-scalar-tag))
+                       (nil? (constant/source-value node))))
+                (tree-seq coll? seq source))]
+      (when (or checked? checked-float?)
+        (throw (ex-info "native reduction does not implement unresolved checked conversions"
+                        {:reason :unsupported-native-owned-reduction
+                         :equation (:id owner) :missing-rule :checked-reduction-conversion}))))))
+
+(defn- emit-owned-reduction [owner sym array-syms]
+  (when-let [{:keys [source raw-dtype result-dtype transform raw-operation]}
+             (owned-reduction-projection owner)]
+    (let [occupied (into #{} (map ce/c-symbol)
+                         (filter symbol? (tree-seq coll? seq
+                                                  [(:source *scheduled-program*)
+                                                   (vals *host-value-remap*) sym])))
+          raw (with-meta (first (remove #(contains? occupied (ce/c-symbol %))
+                             (map #(symbol (str "rstr_native_raw_" (ce/c-symbol sym) "_" %))
+                                  (range))))
+                {:tag (dtype/scalar-tag-for-dtype raw-dtype)
+                 :raster.type/tag (dtype/scalar-tag-for-dtype raw-dtype)})
+          raw-type (get ctype raw-dtype)
+          result-type (get ctype result-dtype)
+          transformed (-> (typed-soac-route/materialize-functional-result-transform raw transform)
+                          (as-> expression (util/subst-syms *host-value-remap* expression))
+                          legalize-host-lengths)
+          _ (check-owned-reduction-conversions! owner [source transformed])
+          _ (when-not (and raw-type result-type)
+              (throw (ex-info "unsupported native reduction scalar dtype"
+                              {:reason :unsupported-native-owned-reduction
+                               :equation (:id owner) :raw-dtype raw-dtype :result-dtype result-dtype})))
+          vector (when *native-simd?*
+                   (csimd/compile-segred-c raw-operation (csimd/active-isa) array-syms raw))
+          ;; The accumulator's per-iteration carrier belongs to the fold, not
+          ;; the terminal result or ambient C function precision.
+          accumulator (second source)
+          typed-accumulator (with-meta accumulator
+                              (assoc (meta accumulator)
+                                     :tag (dtype/scalar-tag-for-dtype raw-dtype)
+                                     :raster.type/tag (dtype/scalar-tag-for-dtype raw-dtype)))
+          scalar-source (with-meta
+                          (apply list (assoc (vec source) 1 typed-accumulator
+                                             5 (util/subst-syms {accumulator typed-accumulator}
+                                                               (nth source 5))))
+                          (meta source))
+          fold (if vector
+                 (do (when *simd-preamble*
+                       (swap! *simd-preamble* conj (str (:includes vector) (:helpers vector))))
+                     (str raw-type " " (ce/c-symbol raw) ";\n" (:block vector)))
+                 (str raw-type " " (ce/c-symbol raw) " = "
+                      (binding [ce/*scalar-type* raw-type]
+                        (emit-expr* (par/expand-par-reduce scalar-source) array-syms)) ";"))]
+      (str result-type " " (ce/c-symbol sym) ";\n  {\n" fold "\n"
+           (ce/c-symbol sym) " = " (emit-expr* transformed array-syms) ";\n  }"))))
+
 (defn- emit-host-stmt
   "Emit a fused scalar form as host-C statements. Handles the outer let* (scalar
   decls + buffer-writing loops) and the canonical counted map loop as a clean
@@ -603,7 +760,9 @@
               "\n  "
               (for [[sym init] pairs]
                 (binding [*bound-segops* (operations-at-site [:binding sym])]
+                  (let [owned (emit-owned-reduction (equation-at-site [:binding sym]) sym array-syms)]
                   (cond
+                    owned owned
                     (buffer-loop? init)
                     ;; buffer-writing loop / nested compute — emit for side effects.
                     (emit-host-stmt init array-syms ct)
@@ -612,8 +771,9 @@
                     ;; the C backend never reparses it into another semantic operation.
                     (par/par-reduce-form? init)
                     (or (when-let [sr (or (bound-segop raster.compiler.ir.segop.SegRed)
-                                          (compatibility-segop raster.compiler.ir.segop.SegRed
-                                                               sym init ct))]
+                                          (when-not (equation-at-site [:binding sym])
+                                            (compatibility-segop raster.compiler.ir.segop.SegRed
+                                                                 sym init ct)))]
                           (when-let [{:keys [includes helpers block]}
                                      (csimd/compile-segred-c sr (csimd/active-isa) array-syms sym)]
                             (when *simd-preamble*
@@ -625,7 +785,7 @@
                     ;; value binding (scalar or reduction) — declare with its tag type.
                     :else
                     (str (ce/decl-type sym init) " " (ce/c-symbol sym) " = "
-                         (emit-expr* init array-syms) ";")))))
+                         (emit-expr* init array-syms) ";"))))))
              "\n  "
            ;; Numeric return mode applies only to the last outer value. Buffer
            ;; results remain host-wrapper data, never C return statements.
@@ -985,6 +1145,7 @@
         local-set     (set (map first local-buffers))
         heap-buffers  (filterv #(not (local-set (first %))) buffers)
         src (binding [*scheduled-program* parallel-program
+                      *native-simd?* (boolean (:simd? source-result))
                       *host-value-remap* host-value-remap]
               (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers
                          length-syms stripped :return-type (or return-type :void)

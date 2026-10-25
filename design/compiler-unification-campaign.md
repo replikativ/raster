@@ -11,6 +11,22 @@ obligation is relaxed. Independent review found no blocker. The broader affected
 native suites still expose reduction emission and rectangular-loop recovery
 failures, which remain qualification work rather than waived expectations.
 
+The native reduction-result boundary now consumes a complete owned equation,
+not a syntactically bare reduction or its first physical phase. It folds into a
+private target-local accumulator at the raw dtype and applies the shared terminal
+transform once. Source-fold/phase/result correspondence and unresolved conversion
+obligations are checked before emission; unsupported cases cannot acquire a
+compatibility schedule. Typed element reads retain their operand AV dtype in this
+host projection, without creating reference-Class evidence. Independent review
+approved the bounded design and implementation. Qualification: 72 affected tests,
+1,201 assertions pass; the separate rectangular-loop recovery test remains open.
+
+Two generated-callee hygiene repairs keep that qualification honest: typed
+reduction identities and `expand-reduce`'s generated primitive wrappers now name
+the exact core conversion. The latter was the actual residual Float-seed producer.
+User call heads, recursive narrowing policy and strict constant/source proof are
+unchanged. Bare wrapped scalar-return coverage remains separate unfinished work.
+
 Keep all eight original objectives below. This phase is their correctness and
 qualification prerequisite, not a replacement campaign or a claim of arbitrary
 Clojure/AD completeness. The audit at `fe0b2375` groups remaining failures by

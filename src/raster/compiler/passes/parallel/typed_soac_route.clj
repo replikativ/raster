@@ -28,7 +28,8 @@
             [raster.compiler.core.util :as util]))
 
 (defn- scalar-region
-  [equation]
+  ([equation] (scalar-region equation nil))
+  ([equation typed-values]
   (let [{:keys [kind attributes arrays captures destinations lambda element-lambda]}
         (dialect/operation-parts equation)]
     (cond
@@ -50,7 +51,14 @@
             (into (into (zipmap capture-parameters captures)
                         (zipmap destination-parameters destinations))
                   (map (fn [parameter array]
-                         [parameter (list 'clojure.core/aget array (:index attributes))])
+                         (let [read (list 'clojure.core/aget array (:index attributes))
+                               ;; An explicit TypedSOAC element parameter owns
+                               ;; its scalar dtype through the operand AV. Keep
+                               ;; that fact on the generated read result; this
+                               ;; is neither reference-Class inference nor a
+                               ;; consumer/kernel-dtype fallback.
+                               tag (some-> (get typed-values array) :dtype dtype/info :scalar-tag)]
+                           [parameter (cond-> read tag (with-meta {:tag tag :raster.type/tag tag}))]))
                        elements arrays))
             project-expression
             (fn [expression]
@@ -59,7 +67,7 @@
         {:locals (mapv #(update % :init (fn [init]
                                           (project-expression init)))
                        locals)
-         :bodies (mapv project-expression body-results)}))))
+         :bodies (mapv project-expression body-results)})))))
 
 (defn- storage-only-dtype?
   "A dtype with device storage but no JVM scalar: its values move bit-exactly between arrays
@@ -80,7 +88,7 @@
           body)
     body))
 
-(defn- materialize-functional-result-transform
+(defn materialize-functional-result-transform
   "Project a completed functional reduction's typed scalar transform back to host source.
 
    Device schedules execute this region at their terminal store.  JVM scalar/SIMD lowering still
@@ -126,6 +134,30 @@
                         operands)
                    (map (juxt :parameter :value) (:scalars transform))))]
         (util/subst-syms substitutions expression)))))
+
+(defn functional-reduction-host-projection
+  "Project a validated full scalar reduction without substituting its evaluation
+   into the terminal transform. Native consumers can evaluate the raw fold once
+   in a private target temporary and reuse the same authoritative host boundary."
+  [program equation]
+  (let [{:keys [kind attributes]} (dialect/operation-parts equation)
+        results (nth equation 2)
+        values (:values (dialect/facts program))
+        {locals :locals bodies :bodies} (scalar-region equation values)]
+    (when (= 'reduce kind)
+      (when-not (and (= 1 (count results)) (= 1 (count (:accumulators attributes)))
+                     (= 1 (count (:identities attributes))) (= 1 (count (:dtypes attributes)))
+                     (= 1 (count bodies))
+                     (= [] (:shape (get values (first results))))
+                     (not (resident/resident-scalar-value? (get values (first results)))))
+        (throw (ex-info "native host projection requires one nonresident scalar reduction"
+                        {:reason :unsupported-native-owned-reduction :equation (second equation)})))
+      {:source (list 'raster.par/reduce (first (:accumulators attributes))
+                     (first (:identities attributes)) (:index attributes) (:extent attributes)
+                     (materialize-region locals (first bodies)))
+       :raw-dtype (first (:dtypes attributes))
+       :result-dtype (:dtype (get values (first results)))
+       :transform (:result-transform attributes)})))
 
 (defn- segmented-result-extent
   [attributes]
