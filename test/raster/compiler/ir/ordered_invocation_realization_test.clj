@@ -460,3 +460,25 @@
             (is (empty? (get-in prepared [:state :acquired-storage])))))
         (is (= 1 @calls))
         (is (empty? (get-in state [:realized :storage])))))))
+
+(deftest literal-helper-source-allocation-prepares-without-replaying-the-helper
+  (let [compilation (equation-first/compile #'fixture/literal-helper-source-zero-observed
+                                          {:target :ocl:0 :dtype :float})
+        initial (invocation-link/begin-ordered-realization
+                  compilation [(float-array [7.0]) (float-array 1)] nil)
+        position (first (keep-indexed (fn [i entry] (when (= 'out (:storage entry)) i))
+                                     (:source-order initial)))
+        calls (atom [])
+        state (assoc initial :source-cursor position)
+        prepared (invocation-link/prepare-source-allocation
+                   state
+                   (fn [expression scalars]
+                     (swap! calls conj expression)
+                     (scalar/evaluate-array-size (:source-ns compilation)
+                                                 (update-vals scalars :value) expression)) nil)]
+    (is (= 1 position))
+    (is (= 1 (count @calls)) "only the projected constructor extent is evaluated")
+    (is (= 1 (:elements prepared)))
+    (is (= :zero (:initialization prepared)))
+    (is (= position (get-in prepared [:state :source-cursor])))
+    (is (empty? (get-in prepared [:state :acquired-storage])))))

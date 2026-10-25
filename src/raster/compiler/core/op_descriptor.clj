@@ -837,12 +837,29 @@
                :arguments (vec (call-args form))}
         lexical (assoc :lexical-callee lexical)))))
 
+(defn ^:no-doc allocation-literal-argument
+  "Closed numeric source argument evidence, including its actual primitive carrier.
+   This is not general expression evaluation or a dtype-to-Class projection."
+  [expression]
+  (when-not (some (fn [node]
+                   (or (and (number? node) (nil? (types/numeric-literal-carrier node)))
+                       (some (fn [[key value]]
+                               (and value (keyword? key) (= "raster.effect" (namespace key))))
+                             (meta node))))
+                 (tree-seq seq? seq expression))
+    (when-let [constant ((requiring-resolve 'raster.compiler.core.numeric-constant/source-value)
+                        expression)]
+      (when-let [carrier (if (seq? expression)
+                          (dtype/dtype-for-scalar-tag (cast-result-tag (first expression)))
+                          (types/numeric-literal-carrier expression))]
+        (assoc constant :dtype (dtype/canon carrier))))))
+
 (defn direct-allocation-projection
   "Project an exact constructor or a definition-derived direct allocation helper.
 
    Helpers require the selected qualified implementation's actual retained deftm body, not a
-   registered alloc-form or allocator basename. Actual arguments must already be bound values
-   with matching retained storage/scalar types: substituting them cannot discard evaluation of
+   registered alloc-form or allocator basename. Actual arguments must be bound values or closed
+   numeric literals with matching actual storage/scalar types: substitution cannot discard evaluation of
    an unused argument, duplicate a check, or reorder call-argument effects. Returned helper data
    is correspondence material, not a frozen-definition/completion certificate."
   [expression values]
@@ -855,7 +872,8 @@
                      (method-entry/selected-definition operation implementation-op (count arguments))
                      (method-entry/direct-selected-definition operation implementation-op (count arguments)))]
       (when (and (not lexical-callee) (symbol? implementation-op) (namespace implementation-op)
-                 (every? #(and (symbol? %) (contains? values %)) arguments))
+                 (every? #(or (and (symbol? %) (contains? values %))
+                              (allocation-literal-argument %)) arguments))
         ;; Mangling is only a lookup address. The existing registered MethodEntry must prove
         ;; the exact executable receiver and delegated source; no overload is inferred here.
         (when-let [{v :source-var} (select!)]
@@ -875,7 +893,8 @@
                                 (let [array? (types/array-tag? tag)
                                       expected (if array? (dtype/dtype-for-array-tag tag)
                                                    (dtype/dtype-for-scalar-tag tag))
-                                      actual (get values argument)]
+                                      actual (if (symbol? argument) (get values argument)
+                                                 (allocation-literal-argument argument))]
                                   (and expected (= (dtype/canon expected) (:dtype actual))
                                        (= array? (boolean (seq (:shape actual)))))))]
               (when (and definition (= (count parameters) (count arguments) (count parameter-tags))

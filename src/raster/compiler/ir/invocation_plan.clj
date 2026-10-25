@@ -896,8 +896,8 @@
                (when (and allocation?
                           (not (invocation-source/allocation-corresponds?
                                 expression (get-in program [:values symbol])
-                                (descriptor/allocation-initialization
-                                 (descriptor/semantic-op expression)) (:values program))))
+                                (:initialization (invocation-source/allocation-source
+                                                  expression (:values program))) (:values program))))
                  (fail! :invocation-source-allocation
                         "source storage allocation differs from its retained physical contract"
                         {:binding symbol :source expression}))

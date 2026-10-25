@@ -42,6 +42,17 @@ Native scalar ownership retention, a complete scalar map consumer and guarded
 axis factorization remain subsequent work. This does not establish that every
 current source-bound conversion is already preserved.
 
+Selected direct-allocation helpers now accept closed numeric literal arguments
+through checked source-constant evidence and exact parameter-carrier agreement.
+One actual-literal carrier authority is shared with JVM emission; generic
+`literal-tag` remains unchanged, and unsupported numeric classes are rejected
+even beneath casts. Source-order validation and ordered preparation reuse the
+same projected constructor/initialization and retain helper-definition snapshots.
+Qualification: 52 tests / 484 assertions pass, plus 12 device assertions across
+OpenCL and Level Zero for the real Float-local/Double-fold helper case. Independent
+review approved the corrected carrier boundary. Nested `alength` extent closure
+and its ordered buffer-shape evaluation remain separate open work.
+
 Keep all eight original objectives below. This phase is their correctness and
 qualification prerequisite, not a replacement campaign or a claim of arbitrary
 Clojure/AD completeness. The audit at `fe0b2375` groups remaining failures by

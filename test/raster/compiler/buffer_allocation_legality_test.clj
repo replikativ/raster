@@ -33,6 +33,14 @@
                          (with-meta % (assoc (meta %) :raster.type/tag 'long)) %) arguments)]
     (list 'let* ['result (apply list op arguments)] 'result)))
 
+(deftest allocation-literal-evidence-retains-physical-carriers
+  (doseq [[value expected] [[(long 1) :long] [(int 1) :int] [(byte 1) :int]
+                           [(short 1) :int] [(float 1) :float] [(double 1) :double]]]
+    (is (= expected (:dtype (descriptor/allocation-literal-argument value)))))
+  (doseq [value [(bigint 1) (biginteger 1) 1/3 (bigdec 1)]
+          expression [value (list 'clojure.core/long value)]]
+    (is (nil? (descriptor/allocation-literal-argument expression)))))
+
 (deftest direct-allocation-projection-is-derived-from-the-selected-definition
   (with-source
     (fn [source]
@@ -50,6 +58,25 @@
             "projection retains the conversion authored in the actual helper body")
         (is (= implementation (get-in projection [:helper :implementation])))
         (is (= ['x 'cnt] (get-in projection [:helper :arguments])))
+        (doseq [literal [(long 1) '(clojure.core/long 1) '(clojure.core/long (clojure.core/int 1))
+                         (list 'clojure.core/long (int 1))
+                         (list 'clojure.core/long (byte 1))
+                         (list 'clojure.core/long (short 1))]]
+          (let [literal-projection (descriptor/direct-allocation-projection (make-call ['x literal]) values)]
+            (is (= (list 'clojure.core/double-array (list 'clojure.core/long literal))
+                   (:constructor literal-projection)))
+            (is (= ['x literal] (get-in literal-projection [:helper :arguments])))))
+        (doseq [unsupported [(int 1) (byte 1) (short 1) (float 1.0) (double 1.0)
+                             (bigint 1) (biginteger 1)
+                             (list 'clojure.core/long (bigint 1))
+                             (list 'clojure.core/long (biginteger 1))
+                             '(clojure.core/int 1) '(long 1)
+                             '(clojure.core/long (tick 1)) '(clojure.core/+ 0 1)
+                             '(clojure.core/long 1.0E100)
+                             (with-meta '(clojure.core/long 1)
+                               {:raster.effect/preserve-evaluation true})]]
+          (is (nil? (descriptor/direct-allocation-projection (make-call ['x unsupported]) values))
+              "literal admission neither adapts the actual carrier nor executes an open expression"))
         (doseq [selected [(ns-resolve source (symbol (name implementation)))
                           (ns-resolve source (symbol (name op)))]]
           (with-redefs-fn {selected (fn [& _] (double-array 0))}

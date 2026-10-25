@@ -28,6 +28,13 @@
         result (par/map! out i n double (+ (aget out i) 1.0))]
     result))
 
+(deftm literal-helper-source-zero-observed
+  [x :- (Array float), early :- (Array float)] :- (Array float)
+  (let [written (par/map! early i 1 float (+ (aget x i) 1.0))
+        out (arrays/zeros-like x 1)
+        result (par/map! out i 1 float (+ (aget out i) 1.0))]
+    result))
+
 (deftm preserved-scalar-between-writes
   [x :- (Array double), out :- (Array double), n :- Long] :- (Array double)
   (let [written (par/map! out i 1 double (+ (aget x i) 1.0))
@@ -56,6 +63,19 @@
                      (assoc-in plan [:steps step-index :source-projection :helper :implementation]
                                'unrelated/constructor)]]
       (is (= :invocation-source-step-mismatch (reason #(invocation/source-order changed program)))))))
+
+(deftest literal-helper-allocation-retains-source-position-and-definition
+  (let [[program plan] (compilation #'literal-helper-source-zero-observed :float)
+        order (invocation/source-order plan program)
+        allocation (first (filter #(= 'out (:storage %)) order))
+        expression (:source-expression (first (filter #(= 'out (:destination %))
+                                                       (get-in program [:attributes :allocations]))))
+        projection (source/allocation-source expression (:values program))]
+    (is (= 1 (:position allocation)) "literal helper allocation remains after the preceding write")
+    (is (= :zero (:initialization projection)))
+    (is (= :float (:dtype projection)))
+    (is (= 1 (last (get-in projection [:helper :arguments]))))
+    (is (= 'clojure.core/float-array (first (:constructor projection))))))
 
 (deftest source-position-is-not-the-dependency-pruned-prefix-ordinal
   (let [[program plan] (compilation #'write-before-shape :double)

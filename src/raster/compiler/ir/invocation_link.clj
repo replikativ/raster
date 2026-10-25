@@ -829,7 +829,8 @@
           scalars (merge (invocation-shape-scalars materialization)
                          (:program-scalars available) (:host-scalars state))
           _ (doseq [argument (get-in projection [:helper :arguments])]
-              (when-not (or (contains? scalars argument)
+              (when-not (or (descriptor/allocation-literal-argument argument)
+                            (contains? scalars argument)
                             (contains? (:program-buffers available) argument)
                             (contains? (:acquired-storage state)
                                        (get-in state [:realized :buffers argument])))
