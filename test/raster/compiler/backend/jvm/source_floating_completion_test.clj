@@ -44,6 +44,12 @@
                     (catch Throwable error [:error (class error)]))]
     [result (vec effects)]))
 
+(defn- outlined-invocation [{:keys [emission input-body node]}]
+  (let [region (bytecode/compile-source-floating-completion-region emission input-body node)]
+    (fn [value effects]
+      (apply (:invoke region)
+             (map {'value value 'effects effects} (:parameters region))))))
+
 (deftest source-float-completion-preserves-overloads-bits-failures-and-evaluation
   (doseq [operation [:float :unchecked-float]
           frozen [false true :warn-on-boxed]
@@ -55,19 +61,27 @@
                                   (double 1.0e40) (float 0.25) Double/NaN]]]]
     (let [{:keys [original projected implementation emission node input-body]}
           (fixture tag operation frozen (not frozen))
-          observed (bytecode/retained-input-completion-context emission input-body node)]
+          observed (bytecode/retained-input-completion-context emission input-body node)
+          region (bytecode/compile-source-floating-completion-region emission input-body node)
+          outlined (fn [value effects]
+                     (apply (:invoke region)
+                            (map {'value value 'effects effects} (:parameters region))))]
       (is (= :float (:completion-carrier observed)))
       (is (= :ref (:returned-carrier observed)) "Object parent keeps the original boxing context")
       (is (= {:unchecked-math (not frozen)} (:operand-source-policy observed)))
+      (is (identical? Float/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
       (doseq [value values]
         (let [make-value (constantly value)
               expected (outcome original make-value)]
-          (is (= expected (outcome projected make-value) (outcome implementation make-value))
+          (is (= expected (outcome projected make-value) (outcome implementation make-value)
+                          (outcome outlined make-value))
               (str "source cast " operation " input=" tag " value=" value)))))))
 
 (deftest object-input-keeps-custom-number-conversion-and-its-effects
   (doseq [operation [:float :unchecked-float]]
-    (let [{:keys [original projected implementation]} (fixture 'Object operation false true)
+    (let [{:keys [original projected implementation] :as compiled}
+          (fixture 'Object operation false true)
+          outlined (outlined-invocation compiled)
           make-number (fn [^longs effects]
                         (proxy [Number] []
                           (intValue [] (throw (AssertionError. "not an int conversion")))
@@ -77,7 +91,8 @@
           expected (outcome original make-number)]
       (is (= 1 (get-in expected [1 0])) "the operand runs exactly once before conversion")
       (is (pos? (get-in expected [1 1])) "the source Number conversion remains observable")
-      (is (= expected (outcome projected make-number) (outcome implementation make-number))))))
+      (is (= expected (outcome projected make-number) (outcome implementation make-number)
+                      (outcome outlined make-number))))))
 
 (deftest literal-primitive-void-and-diverging-operands-retain-their-source-context
   (doseq [operation [:float :unchecked-float]
@@ -118,7 +133,9 @@
                (outcome (fn [value _] (implementation value)) (constantly value))))))))
 
 (deftest throwing-number-is-not-replaced-by-a-guessed-primitive-input
-  (let [{:keys [original projected implementation]} (fixture 'Object :float false true)
+  (let [{:keys [original projected implementation] :as compiled}
+        (fixture 'Object :float false true)
+        outlined (outlined-invocation compiled)
         make-number (fn [^longs effects]
                       (proxy [Number] []
                         (intValue [] (throw (AssertionError. "wrong conversion")))
@@ -129,4 +146,22 @@
                           (throw (ArithmeticException. "source Number failed")))))
         expected (outcome original make-number)]
     (is (= [[:error ArithmeticException] [1 1]] expected))
-    (is (= expected (outcome projected make-number) (outcome implementation make-number)))))
+    (is (= expected (outcome projected make-number) (outcome implementation make-number)
+                    (outcome outlined make-number)))))
+
+(deftest floating-outlining-refuses-copied-or-mismatched-source-owners
+  (let [{:keys [emission input-body node]} (fixture 'double :float false true)
+        copied-node (with-meta (apply list node) (meta node))
+        copied-body (vec (map identity input-body))
+        reason (fn [emission input-body node]
+                 (try (bytecode/compile-source-floating-completion-region emission input-body node) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (is (= :unowned-source-floating-completion-region (reason emission input-body copied-node)))
+    (is (= :unowned-source-floating-completion-region (reason emission copied-body node)))
+    (is (= :unowned-source-floating-completion-region
+           (reason (dissoc emission :input-origins) input-body node)))
+    (is (= :unowned-source-floating-completion-region
+           (reason (dissoc emission :completion-contexts) input-body node)))
+    (is (= :unowned-source-integral-completion-region
+           (try (bytecode/compile-source-integral-completion-region emission input-body node) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))

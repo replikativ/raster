@@ -25,6 +25,27 @@ execution paths or relax the original campaign's acceptance obligations.
 
 ### Current source-context qualification (October 25)
 
+The source-completion continuation separates three obligations: the source cast's
+semantics, its exact emitted occurrence, and its execution at the original source
+cursor. Canonical Float casts retain checked/unchecked source policy separately
+from operand policy. The shared JVM source-cast outliner now handles int, long
+and Float through the same physical-port, historical-owner and child-emission
+checks. Original-input observers join only exact input occurrences to retained
+reduction/conversion evidence; they do not infer numerical payload types or grant
+accelerator admission. Copied, ambiguous, foreign and stale occurrences refuse.
+Outlined custom `Number` controls compare conversion effects and exceptions with
+the original Clojure call as well as projected and directly emitted execution.
+
+Qualification in a newly started capped REPL passes 143 tests / 2,490 assertions
+across twelve affected JVM, invocation and AD namespaces. This does not close the
+CUDA/HIP mixed-scale gradient fixture: generated preparation must construct and
+retain the canonical Float completion under its actual frozen source policy,
+then preserve the numerical-result-to-Object boundary and run the completion at
+the ordered invocation cursor. Keep the product-normalized numerical producer
+distinct from its JVM adapter; no new AD-specific cast executor or inferred
+Double-to-Float buffer alias is authorized. PR #1566 at `8a51e5fe4` has failing
+unit, OpenCL and emitter checks and must not be merged on these local results.
+
 `f23aa150` repairs the structured frontend's causal analysis boundary. Prefix
 bindings advance one immutable HostAV context; a fresh, unknown iteration
 parameter enters its child scope without manufacturing a constant-zero equality.

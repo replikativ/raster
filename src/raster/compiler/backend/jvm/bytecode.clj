@@ -826,6 +826,14 @@
         (when (= 1 (count matches))
           (second (first matches)))))))
 
+(defn ^:no-doc retained-input-reduction-emission
+  "Follow an exact emitter-input region to its owned reduction observations.
+   The existing reduction observer retains physical evidence and owner guards."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :reduction)]
+    (when-let [observed (retained-reduction-emission emission owned)]
+      (assoc observed :source-input original))))
+
 (defn- retain-binding-context! [ctx binding-count index binder initializer before after]
   (when-let [token (::binding-scope-occurrence ctx)]
     (when-let [inputs me/*emission-inputs*]
@@ -1480,6 +1488,14 @@
    or logical result tag alone cannot establish this evidence."
   [emission original]
   (retained-call-observation emission original :floating-conversion-contexts))
+
+(defn ^:no-doc retained-input-floating-conversion
+  "Follow an exact emitter-input call to its owned floating conversion.
+   This origin join grants no additional operand or semantic admission."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [observed (retained-floating-conversion emission owned)]
+      (assoc observed :source-input original))))
 
 (defn- comparison-form?
   "True if form is a comparison call: (< a b), (>= a b), (== a b), etc."
@@ -7291,24 +7307,30 @@
                :element-type (:element-type record)} guard)
              :input-contract contract :input-completion completed))))
 
-(defn ^:no-doc compile-source-integral-completion-region
-  "Outline an exact observed source int/long completion before parent consumption.
-   Preserve actual physical ports, operand policy and conversion policy separately.
-   This confers no replay/movement permission, structural derivative or native cast
-   authority. The caller must execute the region at its original source cursor."
-  [emission input-body original]
+(defn- compile-source-completion-region
+  "Shared outlined replay for an exact canonical source-cast occurrence."
+  [emission input-body original expected-context]
   (let [record (retained-input-completion-context emission input-body original)
         contract (:contract record)
         input (:operand-input record)
-        result-type (case (:operation contract) :int :int :long :long nil)
-        operand-policy (:operand-source-policy record)]
-    (when-not (and record (= :source-integral-cast (:source-context contract))
+        result-type (case (:operation contract)
+                      :int :int :long :long (:float :unchecked-float) :float nil)
+        result-carrier (when result-type (primitive-carrier-class result-type))
+        operand-policy (:operand-source-policy record)
+        [unowned-reason replay-reason]
+        (case expected-context
+          :source-integral-cast [:unowned-source-integral-completion-region
+                                 :source-integral-completion-replay-mismatch]
+          :source-floating-cast [:unowned-source-floating-completion-region
+                                 :source-floating-completion-replay-mismatch])]
+    (when-not (and record (= expected-context (:source-context contract))
                    (completion/canonical-contract? contract)
+                   result-carrier
                    (= result-type (:completion-carrier record))
                    (contains? #{:ref :long :int :float :double :bool :void} (:input-carrier record))
                    (map? input) (source-policy/valid? operand-policy))
-      (throw (ex-info "Source integral outlining requires an exact completed source occurrence"
-                      {:reason :unowned-source-integral-completion-region})))
+      (throw (ex-info "Source outlining requires an exact completed source occurrence"
+                      {:reason unowned-reason})))
     (let [observations (atom {:static [] :values []})
           child-lineage (atom nil)
           token (Object.)
@@ -7319,7 +7341,7 @@
                     (when-not (and current (identical? (:source record) (:source current))
                                    (identical? input (:operand-input current)))
                       (throw (ex-info "Source completion lost its original emission owner"
-                                      {:reason :unowned-source-integral-completion-region}))))
+                                      {:reason unowned-reason}))))
                   (me/assert-definition-inputs-current! @observations)
                   (when-let [lineage @child-lineage]
                     (me/assert-emission-inputs-current! lineage)))
@@ -7328,8 +7350,8 @@
                                        [replay] (:source-ns emission) (vec (keys (:ports input))))
                          revision (dispatch/compiler-definition-revision)
                          region (compile-owned-input-region
-                                 emission input (case result-type :int Integer/TYPE :long Long/TYPE)
-                                 {:return-tag (case result-type :int 'int :long 'long)
+                                 emission input result-carrier
+                                 {:return-tag (symbol (.getName ^Class result-carrier))
                                   :walked-body [replay] :source-policy operand-policy
                                   :element-type (:element-type record)
                                   ::body-input-context (:operand-context record)} guard)]
@@ -7351,9 +7373,22 @@
                         (select-keys actual [:contract :input-carrier :operand-context
                                             :completion-carrier :operand-source-policy])))
         (throw (ex-info "Outlined source completion differs from its original emission"
-                        {:reason :source-integral-completion-replay-mismatch})))
+                        {:reason replay-reason})))
       (guard)
       (assoc region :completion-contract contract))))
+
+(defn ^:no-doc compile-source-integral-completion-region
+  "Outline an exact observed int/long completion at its source cursor.
+   Retain physical ports, operand policy, conversion policy and both historical owners."
+  [emission input-body original]
+  (compile-source-completion-region emission input-body original :source-integral-cast))
+
+(defn ^:no-doc compile-source-floating-completion-region
+  "Outline one exact canonical Float source completion, not a guessed numeric cast.
+   Operand effects and frozen conversion policy retain their original order. This proves neither
+   replay permission nor accelerator admission; the caller owns the source cursor and transfers."
+  [emission input-body original]
+  (compile-source-completion-region emission input-body original :source-floating-cast))
 
 (defn- compile-raw-int-input-region
   [emission input input-type element-type guard]

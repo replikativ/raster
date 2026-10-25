@@ -4,6 +4,7 @@
             [raster.core :as core :refer [deftm]]
             [raster.numeric :as n]
             [raster.par :as par]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.util :as util]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
@@ -32,6 +33,83 @@
         receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))]
     (core/ensure-bytecode-implementation! receiver)
     (:raster.core/bytecode-emission (meta receiver))))
+
+(defn- reemit-body [template input-body]
+  (:emission
+   (core/emit-owned-bytecode!
+    bytecode/compile-typed-impl! "raster.compiled.InputOwnerObservationTest"
+    (:params template) (:tags template) (:return-tag template) input-body
+    (the-ns 'raster.compiler.backend.jvm.binding-context-owner-test)
+    (:typed-interface template) 'input-owner-observation-test)))
+
+(defn- input-observer-owner-negatives [observe template input-body original emission]
+  (let [copied-node (with-meta (apply list original) (meta original))
+        copied-body (with-meta (mapv identity input-body) (meta input-body))
+        stale (assoc emission :producer-inputs
+                     [(reify entry/RetainedProducerInput
+                        (assert-producer-current! [_]
+                          (throw (ex-info "test owner is stale" {:reason ::stale-owner}))))])]
+    (is (nil? (observe emission input-body copied-node)))
+    (is (nil? (observe emission copied-body original)))
+    (is (nil? (observe emission (:body emission) original)))
+    (is (nil? (observe (dissoc emission :input-origins) input-body original)))
+    (is (nil? (observe (assoc emission :body copied-body) input-body original)))
+    (is (nil? (observe (reemit-body template copied-body) input-body original)))
+    (let [ambiguous-body [(list 'do original original)]
+          ambiguous (reemit-body template ambiguous-body)]
+      (is (nil? (observe ambiguous ambiguous-body original))))
+    (is (= ::stale-owner
+           (try (observe stale input-body original) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest input-reduction-observer-joins-original-input-to-catalog-owner
+  (let [template (emitted #'float-reduced)
+        original (first (vals (:reduction-catalog template)))
+        input-body [original]
+        emission (reemit-body template input-body)
+        owned (first (vals (:reduction-catalog emission)))
+        observed (bytecode/retained-input-reduction-emission emission input-body original)
+        retained (bytecode/retained-reduction-emission emission owned)]
+    (is (some? observed))
+    (is (= retained (dissoc observed :source-input)))
+    (is (identical? original (:source-input observed)))
+    (is (identical? owned (:source observed)))
+    (is (not (identical? original owned)))
+    (is (nil? (bytecode/retained-reduction-emission emission original)))
+    (is (nil? (bytecode/retained-input-reduction-emission emission input-body owned)))
+    (let [token (:raster.compiler.backend.jvm.bytecode/reduction-occurrence (meta owned))]
+      (is (nil? (bytecode/retained-input-reduction-emission
+                 (assoc-in emission [:reduction-expansions token :status] :ambiguous)
+                 input-body original))))
+    (input-observer-owner-negatives bytecode/retained-input-reduction-emission
+                                    template input-body original emission)))
+
+(deftest input-floating-observer-joins-original-input-to-catalog-owner
+  (let [template (emitted #'float-reduced)
+        original '(clojure.core/float cnt)
+        input-body [original]
+        emission (reemit-body template input-body)
+        owned (first (vals (:invocation-catalog emission)))
+        observed (bytecode/retained-input-floating-conversion emission input-body original)
+        retained (bytecode/retained-floating-conversion emission owned)
+        token (:raster.compiler.backend.jvm.bytecode/call-occurrence (meta owned))]
+    (is (some? observed))
+    (is (= retained (dissoc observed :source-input)))
+    (is (identical? original (:source-input observed)))
+    (is (not (identical? original owned)))
+    (is (= :source-cast (:conversion-kind observed)))
+    (is (= 'clojure.core/float (:source-operation observed)))
+    (is (= :long (:input-type observed)))
+    (is (= Float/TYPE (:target-carrier observed)))
+    (is (nil? (bytecode/retained-floating-conversion emission original)))
+    (is (nil? (bytecode/retained-input-floating-conversion emission input-body owned)))
+    (is (nil? (bytecode/retained-input-floating-conversion
+               (dissoc emission :floating-conversion-contexts) input-body original)))
+    (is (nil? (bytecode/retained-input-floating-conversion
+               (assoc-in emission [:floating-conversion-contexts token :status] :ambiguous)
+               input-body original)))
+    (input-observer-owner-negatives bytecode/retained-input-floating-conversion
+                                    template input-body original emission)))
 
 (deftest sequential-binding-facts-come-from-the-actual-owner
   (let [emission (emitted #'array-tail)
