@@ -5,11 +5,15 @@
    No source frontend, numerical invocation or phantom caller module is created."
   (:require [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.callee-identity :as callee]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
-            [raster.compiler.core.value-completion :as completion]))
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.ir.form :as form]))
 
 (defn- decline! [message data]
   (throw (ex-info message (assoc data :reason :generated-body-unsupported))))
@@ -336,7 +340,7 @@
            (not (.isVarArgs ^java.lang.reflect.Method method))
            (identical? Object (.getReturnType ^java.lang.reflect.Method method))))))
 
-(defn normalize-program
+(defn- normalize-helper-program
   "Expand a new program's closed top-level typed-helper binding spine once.
    `method` is its real interface Method, not an inferred signature. `capture!`
    is the existing owned, non-evaluating selected-emission producer. Successful
@@ -390,6 +394,79 @@
    (catch clojure.lang.ExceptionInfo error
      (if (= :generated-body-unsupported (:reason (ex-data error))) nil (throw error)))))
 
+(defn- independent-code-owner? [node]
+  (and (seq? node)
+       (or (= :lambda (:kind (form/form-info node)))
+           (contains? '#{reify* deftype* var} (first node)))))
+
+(defn- canonical-source-casts
+  "Construct source completions before emission, under the actual producer policy.
+   Scope structure comes from the common form algebra. Independent code owners,
+   quoted data and already-owned completions are opaque. This grants no payload,
+   portability, movement or derivative evidence."
+  [{:keys [walked-body params source-ns source-policy] :as program}]
+  (if-not (contains? program :source-policy)
+    {:body walked-body :changed? false}
+    (do
+      (source-policy/unchecked-math source-policy)
+      (let [changed? (volatile! false)]
+       (letfn [(walk [node bound]
+                (cond
+                  (and (seq? node)
+                       (or (contains? '#{quote clojure.core/quote}
+                                      (first node))
+                           (independent-code-owner? node)
+                           (completion/canonical-form? node))) node
+                  (seq? node)
+                  (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info node)]
+                    (let [scope! (fn [{:keys [binders inits body aux] :as scope}]
+                                   (let [[inner inits]
+                                         (if sequential?
+                                           (reduce (fn [[bound result] [binder init]]
+                                                     [(cond-> bound (symbol? binder) (conj binder))
+                                                      (conj result (walk init bound))])
+                                                   [bound []] (map vector binders inits))
+                                           (let [inner (into bound (filter symbol? binders))]
+                                             [inner (mapv #(walk % (if rec? inner bound)) inits)]))]
+                                     (cond-> (assoc scope :inits inits :body (mapv #(walk % inner) body))
+                                       aux (assoc :aux (mapv #(walk % inner) aux)))))]
+                      (rebuild (mapv scope! scopes) (mapv #(walk % bound) outer)))
+                    (let [resolved (callee/fresh-resolved-callee (first node) source-ns bound)
+                          operation (case resolved
+                                      clojure.core/float :float
+                                      clojure.core/unchecked-float :unchecked-float nil)]
+                      (if (and operation (= 2 (count node)))
+                        (do
+                          (intrinsic-source/observe-original! source-ns (first node) resolved)
+                          (vreset! changed? true)
+                          (completion/complete-value
+                           (completion/source-floating-cast-contract operation source-policy)
+                           (walk (second node) bound)))
+                        (util/remake-if-changed node (mapv #(walk % bound) node)))))
+                  (vector? node) (util/remake-if-changed node (mapv #(walk % bound) node))
+                  (record? node) node
+                  (map? node) (util/map-preserving-identity #(walk % bound) node)
+                  :else node))]
+         (let [body (util/remake-if-changed walked-body (mapv #(walk % (set params)) walked-body))]
+           {:body body :changed? @changed?}))))))
+
+(defn normalize-program
+  "Construct the generated JVM adapter from its exact numerical producer.
+   Source casts become canonical completions under explicit producer policy even
+   when helper expansion abstains. Neither construction admits device execution."
+  [program method capture!]
+  (entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and entry/*emission-inputs* (generated-interface-method? program method))
+       (let [{:keys [body changed?]} (canonical-source-casts program)
+             canonical (if changed? (assoc program :walked-body body) program)
+             expanded (normalize-helper-program canonical method capture!)]
+         (cond
+           expanded (assoc expanded ::normalization-input program)
+           changed? (assoc canonical ::normalization-input program
+                           ::entry-method method ::binding-facts {})
+           :else nil))))))
+
 (defn validate-program-emission!
   "Check construction-time local expectations against the sole actual outer
    emission before a generated owner is published. Expectations are not carrier
@@ -401,6 +478,7 @@
       (letfn [(walk [node]
                 (cond
                   (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) nil
+                  (independent-code-owner? node) nil
                   (and (seq? node) (= 'let* (first node)))
                   (do
                     (doseq [[index [id initializer]] (map-indexed vector (partition 2 (second node)))]

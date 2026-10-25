@@ -46,6 +46,23 @@ distinct from its JVM adapter; no new AD-specific cast executor or inferred
 Double-to-Float buffer alias is authorized. PR #1566 at `8a51e5fe4` has failing
 unit, OpenCL and emitter checks and must not be merged on these local results.
 
+Generated AD preparation now constructs canonical Float casts in the original
+generated source before optional helper expansion, using the actual frontend's
+frozen policy and authenticated bootstrap intrinsic lookup. Imported helpers are
+not rewritten under the caller's policy. Canonical-only adapters retain the exact
+numerical core and activate emitted-completion validation even when helper
+expansion abstains. Lexical shadowing, quoted data and nested code owners remain
+separate; evaluated `def` initializers remain in the current owner. Core/adapter,
+emission and frozen-entry checks preserve the policy correspondence.
+
+The combined warm gate passes 192 tests / 2,986 assertions, including generated
+entry lifecycle, a real mixed-scale gradient with an owned Object-to-Float
+completion, checked overflow, nullable branches, replaced-intrinsic refusal and
+an unmodified product-normalized numerical core. This is construction and JVM
+execution evidence only. The invocation cursor must still execute that retained
+completion after the numerical result; the CUDA/HIP fixture pair is not yet
+qualified. No buffer alias or new derivative rule substitutes for that work.
+
 `f23aa150` repairs the structured frontend's causal analysis boundary. Prefix
 bindings advance one immutable HostAV context; a fresh, unknown iteration
 parameter enters its child scope without manufacturing a constant-zero equality.

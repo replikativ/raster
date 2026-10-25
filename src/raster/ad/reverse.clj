@@ -6030,7 +6030,7 @@
     (when (or (contains? program ::producer-core) adapted?)
       (when-not (and (map? core)
                      (every? #(identical? (get core %) (get program %))
-                             [:params :tags :source-ns :result-sym :param-adj-syms])
+                             [:params :tags :source-ns :source-policy :result-sym :param-adj-syms])
                      (identical? (last (first (:walked-body core)))
                                  (last (first (:walked-body program))))
                      (if adapted?
@@ -6055,6 +6055,8 @@
                    (= 'Object (:return-tag emission))
                    (= (symbol (.getName ^Class interface-class)) (:typed-interface emission))
                    (= source-policy (get-in frontend [:source-entry :source-policy]))
+                   (or (not (contains? program :source-policy))
+                       (= source-policy (:source-policy program)))
                    (ifn? guard))
       (throw (ex-info "Generated AD entry differs from its frozen program"
                       {:reason :ad-generated-entry-mismatch})))
@@ -6489,6 +6491,9 @@
 (defn- emit-generated-program-entry! [program frontend]
   (let [{:keys [params tags walked-body source-ns]} program
         policy (get-in frontend [:source-entry :source-policy])
+        _ (when (and (contains? program :source-policy) (not= policy (:source-policy program)))
+            (throw (ex-info "Generated source adaptation and emission have different policies"
+                            {:reason :ad-generated-source-policy-mismatch})))
         interface (types/ensure-fn-interface! tags)
         expected-method (:raster.compiler.backend.jvm.generated-body/entry-method program)
         _ (when (and (contains? program :raster.compiler.backend.jvm.generated-body/entry-method)
@@ -6743,7 +6748,8 @@
         (let [program (cond-> {:walked-body [padded-form]
                        :params all-params :tags tags :source-ns source-ns
                        :result-sym (:result-sym flat) :param-adj-syms (:param-adj-syms flat)}
-                        context (assoc ::entry-constructions @(:entry-constructions context)))
+                        context (assoc ::entry-constructions @(:entry-constructions context))
+                        frontend (assoc :source-policy (get-in frontend [:source-entry :source-policy])))
               canonical (when frontend (normalize-generated-preparation program parameter-plan))
               ;; Optional product normalization can abstain without changing
               ;; the identity of the actual flat numerical producer. Retain

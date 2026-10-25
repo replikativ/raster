@@ -6,12 +6,14 @@
             [raster.compiler.backend.jvm.generated-body :as generated]
             [raster.compiler.core.call-boundary :as boundary]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.scalar.pe :as pe]
             [raster.compiler.passes.scalar.simplify :as simplify]
-            [raster.compiler.fixtures.distributed-training :as training]))
+            [raster.compiler.fixtures.distributed-training :as training]
+            [raster.compiler.fixtures.mixed-storage :as storage]))
 
 (deftm unused-argument-helper [value :- (Array float) unused :- Double] :- (Array float)
   (aset value 0 (float (+ 1.0 (aget value 0))))
@@ -41,10 +43,13 @@
 
 (defn- emit [program]
   (let [interface (types/ensure-fn-interface! (:tags program))]
-    (let [emitted (core/emit-owned-bytecode!
+    (let [emitted (source-policy/call-with-owner
+                   (cond-> {} (:source-policy program)
+                     (assoc :raster.core/source-policy (:source-policy program)))
+                   #(core/emit-owned-bytecode!
       bytecode/compile-typed-impl! "raster.compiled.GeneratedBodyTest"
       (:params program) (:tags program) 'Object (:walked-body program)
-      (:source-ns program) (:iface-name interface) 'generated-body-test nil)]
+      (:source-ns program) (:iface-name interface) 'generated-body-test nil))]
       (generated/validate-program-emission! program (:emission emitted))
       ;; These controls are independently emitted derived programs, just like
       ;; the production generated-entry consumer. Close their actual callees
@@ -55,6 +60,136 @@
 
 (defn- invoke [function arguments]
   (clojure.lang.Reflector/invokeInstanceMethod function "invk" (object-array arguments)))
+
+(deftest source-casts-retain-producer-policy-before-helper-adaptation
+  (doseq [policy [false true :warn-on-boxed]
+          operation ['clojure.core/float 'clojure.core/unchecked-float]]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [outputs '[result]
+             program {:params '[value] :tags '[double] :source-ns *ns*
+                      :source-policy {:unchecked-math policy}
+                      :walked-body [(list 'let* ['result (list operation 'value)] outputs)]}
+             normalized (generated/normalize-program program (interface-method (:tags program)) capture!)
+             term (nth (second (first (:walked-body normalized))) 1)
+             parts (completion/canonical-parts term)
+             original (emit program)
+             compiled (emit normalized)]
+         (is (= :source-floating-cast (get-in parts [:contract :source-context])))
+         (is (= (:source-policy program) (get-in parts [:contract :source-policy])))
+         (is (identical? program (:raster.compiler.backend.jvm.generated-body/normalization-input normalized)))
+         (is (identical? outputs (last (first (:walked-body normalized)))))
+         (doseq [value [0.0 -0.0 1.0e40 Double/NaN]]
+           (let [outcome (fn [f]
+                           (try [:value (Float/floatToRawIntBits (first (invoke f [value])))]
+                                (catch java.lang.reflect.InvocationTargetException error
+                                  [:error (class (.getCause error))])
+                                (catch Throwable error [:error (class error)])))]
+             (is (= (outcome original) (outcome compiled))))))))))
+
+(deftest canonical-only-adapter-survives-helper-abstention-without-claiming-imports
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program {:params '[value] :tags '[double] :source-ns *ns*
+                    :source-policy {:unchecked-math false}
+                    :walked-body ['(let* [result (clojure.core/float value)] [result])]}
+           adapter (with-redefs-fn
+                     {(ns-resolve 'raster.compiler.backend.jvm.generated-body 'normalize-helper-program)
+                      (fn [& _] nil)}
+                     #(generated/normalize-program program (interface-method (:tags program)) capture!))]
+       (is (identical? program (:raster.compiler.backend.jvm.generated-body/normalization-input adapter)))
+       (is (= {} (:raster.compiler.backend.jvm.generated-body/binding-facts adapter)))
+       (is (= [(float 0.25)] (invoke (emit adapter) [0.25])))
+       (is (nil? (generated/normalize-program program nil capture!)))))))
+
+(deftest source-cast-construction-respects-lexical-and-code-owner-boundaries
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [normalize (ns-resolve 'raster.compiler.backend.jvm.generated-body 'canonical-source-casts)
+           existing (completion/complete-value
+                     (completion/source-floating-cast-contract :float {:unchecked-math true})
+                     '(clojure.core/float value))
+           bodies ['(let* [float identity result (float value)] [result])
+                   '(fn* [value] (clojure.core/float value))
+                   '(quote (clojure.core/float value)) existing]
+           program {:params '[value] :tags '[Object] :source-ns *ns*
+                    :source-policy {:unchecked-math false} :walked-body bodies}
+           result (normalize program)]
+       (is (false? (:changed? result)))
+       (is (= bodies (:body result)))
+       (is (identical? existing (last (:body result))))
+       (is (false? (:changed? (normalize (dissoc program :source-policy)))))
+       (is (= :unclosed-source-policy
+              (try (normalize (assoc program :source-policy {})) nil
+                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
+
+(deftest canonical-source-casts-preserve-nullable-branches-and-completion-owner-scope
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program {:params '[value] :tags '[Object] :source-ns *ns*
+                    :source-policy {:unchecked-math false}
+                    :walked-body ['(let* [result (if (nil? value) nil (clojure.core/float value))]
+                                     [result])]}
+           normalized (generated/normalize-program program (interface-method (:tags program)) capture!)
+           compiled (emit normalized)
+           term (completion/complete-value
+                 (completion/source-floating-cast-contract :float {:unchecked-math false}) 'value)
+           nested (list 'fn* '[value] term)
+           owner-check {:walked-body [nested]
+                        :raster.compiler.backend.jvm.generated-body/binding-facts {}}]
+       (is (= [nil] (invoke compiled [nil])))
+       (is (= [(float 0.25)] (invoke compiled [0.25])))
+       (is (identical? owner-check (generated/validate-program-emission! owner-check {})))
+       (doseq [current-owner-expression [term (list 'def 'unexecuted-test-definition term)]]
+         (is (= :generated-body-completion-context
+                (try (generated/validate-program-emission!
+                      (assoc owner-check :walked-body [current-owner-expression]) {}) nil
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))))
+
+(deftest generated-source-adaptation-cannot-change-its-emission-policy
+  (is (= :ad-generated-source-policy-mismatch
+         (try ((ns-resolve 'raster.ad.reverse 'emit-generated-program-entry!)
+               {:source-policy {:unchecked-math true}}
+               {:source-entry {:source-policy {:unchecked-math false}}}) nil
+              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+
+(deftest source-cast-construction-refuses-a-replaced-bootstrap-intrinsic
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [normalize (ns-resolve 'raster.compiler.backend.jvm.generated-body 'canonical-source-casts)
+           program {:params '[value] :source-ns *ns*
+                    :source-policy {:unchecked-math false}
+                    :walked-body ['(clojure.core/float value)]}]
+       (is (= :intrinsic-source-definition-mismatch
+              (with-redefs [clojure.core/float identity]
+                (try (normalize program) nil
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))))
+
+(deftest mixed-gradient-retains-owned-float-completion-and-separate-numerical-core
+  (let [prepared (reverse/prepare-value+grad #'storage/mixed-scale-energy [0])
+        {:keys [emission input-body]} (reverse/prepared-bytecode-entry prepared)
+        core (:raster.ad.reverse/producer-core prepared)
+        source-casts (fn [body]
+                       (filter #(= :source-floating-cast
+                                   (get-in (completion/canonical-parts %) [:contract :source-context]))
+                               (tree-seq coll? seq body)))
+        terms (vec (source-casts input-body))
+        gradient (reverse/value+grad #'storage/mixed-scale-energy :wrt [0])
+        result (gradient (float 2) (double-array [1 2 3]))]
+    (is (= 1 (count terms)))
+    (is (empty? (source-casts (:walked-body core))))
+    (is (identical? core (:raster.compiler.backend.jvm.generated-body/normalization-input prepared)))
+    (is (= (:source-policy core) (:source-policy prepared)))
+    (doseq [term terms]
+      (let [observed (bytecode/retained-input-completion-context emission input-body term)]
+        (is (= :ref (:input-carrier observed)))
+        (is (= :float (:completion-carrier observed)))
+        (is (= (:source-policy prepared) (get-in observed [:contract :source-policy])))))
+    (is (= [28.0 (float 14.0) nil] result))
+    (is (instance? Float (second result)))
+    (is (= IllegalArgumentException
+           (try (gradient (float 2) (double-array [1.0e20])) nil
+                (catch Throwable error (class error)))))))
 
 (defn- helper-program [source]
   (let [operation (symbol (str (ns-name (.ns source))) (str (:name (meta source))))
