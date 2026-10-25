@@ -20,9 +20,164 @@
 (defmacro ^:private when-blas [& body]
   `(if (blas?) (do ~@body) (println "[SKIP] no BLAS provider:" ~(str *ns*))))
 
+(defn- dense-form [elem variant]
+  (let [left (case variant
+               :tn '(clojure.core/+ (clojure.core/* l m) i)
+               '(clojure.core/+ (clojure.core/* i k) l))
+        right (case variant
+                :nt '(clojure.core/+ (clojure.core/* j k) l)
+                '(clojure.core/+ (clojure.core/* l n) j))]
+    (with-meta
+      (list 'raster.par/contract 'C '[[i m] [j n]] '[[l k]]
+            (list 'clojure.core/* (list 'clojure.core/aget 'A left)
+                  (list 'clojure.core/aget 'B right)))
+      {:raster.type/elem-type elem :raster.source/arithmetic (numerics/blas-source-arithmetic elem)})))
+
+(defn- leaf-function [elem plan fallback]
+  (let [array-cast (case elem :double 'clojure.core/doubles :float 'clojure.core/floats)
+        array-tag (case elem :double 'doubles :float 'floats)
+        typed-array #(with-meta % {:tag array-tag})
+        parameters (into (mapv typed-array '[A B C]) '[m k n])]
+    (eval (list 'fn parameters
+                (list 'let* (vec (concat
+                                  (mapcat (fn [id] [(typed-array id) (list array-cast id)]) '[A B C])
+                                  (mapcat (fn [id] [id (list 'clojure.core/long id)]) '[m k n])))
+                      (ps/dense-contract-blas-form plan fallback))))))
+
+(deftest readiness-prepares-the-selected-gemm-before-branch-selection
+  (doseq [[elem handle] [[:double #'blas/dgemm-mh] [:float #'blas/sgemm-mh]]]
+    (let [preparations (atom 0)
+          missing (delay (swap! preparations inc)
+                         (throw (ex-info "missing typed GEMM" {:dtype elem})))
+          other (if (= elem :double) #'blas/sgemm-mh #'blas/dgemm-mh)]
+      (with-redefs-fn {#'blas/gemm-provider (delay true) handle missing other (delay ::prepared)}
+        (fn []
+          (is (false? (blas/gemm-provider-ready? elem)))
+          (is (true? (blas/gemm-provider-ready? (if (= elem :double) :float :double))))
+          (when (= elem :double) (is (false? (blas/gemm-provider-ready?))))
+          (is (= 1 @preparations)))))))
+
+(deftest typed-readiness-is-used-by-compiler-and-runtime
+  (doseq [elem [:double :float]]
+    (let [seen (atom [])
+          array (if (= elem :double) double-array float-array)]
+      (with-redefs [blas/gemm-provider-ready? (fn [actual] (swap! seen conj actual) false)]
+        (is (= :provider-unavailable (:reason (ps/dense-contract-blas-plan (dense-form elem :nn)))))
+        (is (false? (blas/dense-gemm-admissible? elem (array 1) (array 1) (array 1) 1 1 1)))
+        (is (= [elem elem] @seen))))))
+
+(deftest qualified-native-leaves-cover-both-dtypes-orientations-and-empty-domains
+  (doseq [elem [:double :float] variant [:nn :nt :tn]]
+    (if-not (blas/gemm-provider-ready? elem)
+      (println "[SKIP] typed GEMM unavailable:" elem variant)
+      (let [form (dense-form elem variant)
+            plan (ps/dense-contract-blas-plan form)
+            leaf (leaf-function elem plan (walk/macroexpand-all form))
+            array (if (= elem :double) double-array float-array)
+            guard blas/dense-gemm-admissible?]
+        (is (:ok plan) (pr-str plan))
+        (doseq [[m k n] [[2 3 2] [0 3 2] [2 3 0] [2 0 3]]]
+          (let [A (array (range 1 (inc (* m k))))
+                B (array (range 7 (+ 7 (* k n))))
+                C (array (repeat (+ 2 (* m n)) -7.0))
+                selected (atom [])
+                expected (vec
+                          (for [i (range m) j (range n)]
+                            (reduce + 0.0
+                                    (for [l (range k)]
+                                      (* (aget A (if (= variant :tn) (+ (* l m) i) (+ (* i k) l)))
+                                         (aget B (if (= variant :nt) (+ (* j k) l) (+ (* l n) j))))))))]
+            (with-redefs [blas/dense-gemm-admissible?
+                          (fn [& args]
+                            (let [admitted? (apply guard args)]
+                              (swap! selected conj admitted?) admitted?))]
+              (is (identical? C (leaf A B C m k n))))
+            (is (= [true] @selected) "the qualified BLAS branch, not fallback, executed")
+            (is (= expected (subvec (vec C) 0 (* m n))))
+            (is (= [-7.0 -7.0] (subvec (vec C) (* m n))))))))))
+
+(deftest negative-zero-neutral-keeps-its-generated-result
+  (let [base (dense-form :double :nn)
+        form (with-meta (apply list (concat base [:init -0.0])) (meta base))
+        fallback (walk/macroexpand-all form)]
+    (with-redefs [blas/gemm-provider-ready? (constantly true)]
+      (is (= :signed-zero-init (:reason (ps/dense-contract-blas-plan form)))))
+    (let [generated (eval (list 'fn '[A B C m k n] fallback))
+          C (double-array [7.0])]
+      (generated (double-array 0) (double-array 0) C 1 0 1)
+      (is (= (Double/doubleToRawLongBits -0.0)
+             (Double/doubleToRawLongBits (aget C 0)))))))
+
+(deftest selected-gemm-failure-is-not-replayed-through-the-fallback
+  (let [A (double-array [2.0]) B (double-array [3.0]) C (double-array [-1.0])
+        fallback-calls (atom 0)
+        failure (ex-info "GEMM failed after mutation" {:test :native-failure})]
+    (with-redefs [blas/gemm-provider-ready? (constantly true)
+                  blas/dgemm! (fn [_left _right output & _arguments]
+                                (aset ^doubles output 0 9.0)
+                                (throw failure))
+                  ;; A named sentinel keeps eval's fallback closed without
+                  ;; depending on lexical captures or touching any provider.
+                  blas/dgemm-nt! (fn [& _] (swap! fallback-calls inc) C)]
+      (let [plan (ps/dense-contract-blas-plan (dense-form :double :nn))
+            leaf (leaf-function :double plan
+                                '(raster.linalg.blas/dgemm-nt! A B C m k n 1.0 0.0))]
+        (is (:ok plan))
+        (is (identical? failure
+                        (try (leaf A B C 1 1 1) nil (catch Throwable actual actual))))
+        (is (= [9.0] (vec C)))
+        (is (zero? @fallback-calls))))))
+
 ;; A BLAS-spelled product: canonicalized to par/contract with :abstract-blas-product arithmetic.
 (deftm blas-leaf-mm [A :- (Array double) B :- (Array double) m :- Long k :- Long n :- Long] :- (Array double)
   (nn/matmul A B m k n))
+
+;; Exercise the actual typed fallback, rather than a raw macroexpansion whose
+;; arithmetic has not passed through Raster's Float lowering.
+(deftm blas-leaf-mm-into-double
+  [A :- (Array double) B :- (Array double) C :- (Array double)
+   m :- Long k :- Long n :- Long] :- (Array double)
+  (nn/matmul! A B C m k n))
+
+(deftm blas-leaf-mm-into-float
+  [A :- (Array float) B :- (Array float) C :- (Array float)
+   m :- Long k :- Long n :- Long] :- (Array float)
+  (nn/matmul! A B C m k n))
+
+(deftest missing-gemm-handle-retains-the-generated-loop-without-invoking-native
+  (doseq [[elem handle fixture]
+          [[:double #'blas/dgemm-mh #'blas-leaf-mm-into-double]
+           [:float #'blas/sgemm-mh #'blas-leaf-mm-into-float]]]
+    (let [{:keys [stats f]}
+          (binding [ps/*dense-contraction-leaf* :blas]
+            (with-redefs [blas/gemm-provider-ready? (constantly true)]
+              {:stats (:backend-applied-stats (pipeline/show-pipeline fixture :dtype elem))
+               :f (pipeline/compile-aot fixture :dtype elem)}))
+          array (if (= elem :double) double-array float-array)
+          A (array [2]) B (array [3]) C (array [-1])
+          preparations (atom 0)
+          native-calls (atom 0)
+          selected (atom [])
+          guard blas/dense-gemm-admissible?]
+      (is (= 1 (:blas-contractions stats)) "the typed compiler selected the guarded BLAS leaf")
+      (with-redefs-fn
+        {#'blas/gemm-provider (delay true)
+         handle (delay (swap! preparations inc)
+                       (throw (ex-info "GEMM preparation failed" {:dtype elem})))
+         #'blas/invoke-native! (fn [& _]
+                                (swap! native-calls inc)
+                                (throw (ex-info "native invocation must not be reached" {:dtype elem})))
+         #'blas/dense-gemm-admissible?
+         (fn [& args]
+           (let [admitted? (apply guard args)]
+             (swap! selected conj admitted?)
+             admitted?))}
+        (fn []
+          (is (identical? C (f A B C 1 1 1)))
+          (is (= [6.0] (vec C)))
+          (is (= [false] @selected))
+          (is (= 1 @preparations))
+          (is (zero? @native-calls)))))))
 
 ;; The same product written as an ordered contraction: retained typed-SSA arithmetic.
 (deftm ssa-leaf-mm [A :- (Array double) B :- (Array double) m :- Long k :- Long n :- Long] :- (Array double)

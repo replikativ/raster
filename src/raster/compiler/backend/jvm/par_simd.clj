@@ -25,6 +25,7 @@
             [raster.compiler.backend.jvm.bytecode :as bc]
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
@@ -389,7 +390,8 @@
      product of its element dtype (`numerical-contract/blas-source-arithmetic`: implementation-
      defined association and rounding points), i.e. it was canonicalized from a BLAS-spelled
      product. A contraction with retained typed-SSA arithmetic keeps its ordered generated loop;
-   - no result conversion (:out-dtype), :decode, :stages or epilogue, zero init, not batched;
+   - no result conversion (:out-dtype), :decode, :stages or epilogue, positive-zero init,
+     not batched (negative zero remains observable for an empty contraction);
    - :double or :float elements and operand/dimension spellings the run-time guard can test
      without re-evaluating an expression (symbols / integer literals);
    - a loadable BLAS provider at compile time (re-checked at run time).
@@ -410,11 +412,16 @@
                  :nt 'raster.linalg.blas/dgemm-nt!
                  :tn 'raster.linalg.blas/dgemm-tn!
                  nil)
-            ready? #((requiring-resolve 'raster.linalg.blas/gemm-provider-ready?))]
+            neutral (:neutral (cf/scalar-reduction-view facts))
+            neutral-value (:value (constant/value neutral))
+            negative-zero? (and (number? neutral-value) (zero? neutral-value)
+                                (neg? (Double/doubleToRawLongBits (double neutral-value))))
+            ready? #((requiring-resolve 'raster.linalg.blas/gemm-provider-ready?) elem)]
         (cond
           (not (contains? #{:double :float} elem)) {:ok false :reason :element-type :elem elem}
           (not (:ok view)) {:ok false :reason (or (:reason view) :not-dense)}
           (:batched? view) {:ok false :reason :batched}
+          negative-zero? {:ok false :reason :signed-zero-init}
           (some? (:epilogue view)) {:ok false :reason :epilogue}
           (seq (dissoc (:opts facts) :init :combine :algebra))
           {:ok false :reason :contract-options :options (vec (keys (dissoc (:opts facts) :init :combine :algebra)))}

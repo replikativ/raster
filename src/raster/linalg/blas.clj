@@ -1056,11 +1056,16 @@
   (delay (boolean (try (available?) (catch Throwable _ false)))))
 
 (defn gemm-provider-ready?
-  "Cached: is a BLAS GEMM provider loaded and functional in this JVM? Any admission error
-   counts as unavailable, because callers (the compiler's dense-contraction leaf) always hold
-   an exact generated fallback."
-  []
-  @gemm-provider)
+  "Is the provider available and its dtype's actual GEMM call prepared?
+   Reuses the existing provider and native-handle delays. Preparation errors
+   decline before branch selection; an invoked GEMM is never caught/replayed."
+  ([] (gemm-provider-ready? :double))
+  ([elem]
+   (boolean
+    (try
+      (and @gemm-provider
+           (case elem :double @dgemm-mh :float @sgemm-mh nil))
+      (catch Throwable _ false)))))
 
 (defn dense-gemm-admissible?
   "Run-time guard of the compiler's BLAS leaf for C := A·B with logical shapes m×k, k×n
@@ -1074,7 +1079,7 @@
         in-range? (fn [x] (and (integer? x) (<= 0 (long x) Integer/MAX_VALUE)))]
     (boolean
      (and array-class
-          (gemm-provider-ready?)
+          (gemm-provider-ready? elem)
           (instance? array-class A) (instance? array-class B) (instance? array-class C)
           (not (identical? C A)) (not (identical? C B))
           (in-range? m) (in-range? k) (in-range? n)
