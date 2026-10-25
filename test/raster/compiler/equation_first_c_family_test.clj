@@ -1627,13 +1627,19 @@
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile
                        #'nn/dense-backward-dW {:target target :dtype :float})
-          linked (equation-first/lower
-                  compilation [(float-array [1.0 2.0]) (float-array [3.0 4.0 5.0])])]
+          arguments [(float-array [1.0 2.0]) (float-array [3.0 4.0 5.0])]]
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 1 (count (:kernels compilation))))
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
-      (is (= 1 (count (:outputs linked))))
-      (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+      ;; The original argument allocation still executes at its source position;
+      ;; a later shape action cannot be evaluated during eager lowering.
+      (is (= :equation-first-ordered-preparation
+             (try (equation-first/lower compilation arguments) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (let [prepared (compiled/lower #'nn/dense-backward-dW arguments
+                                     {:compiler :equation-first :target target :dtype :float})]
+        (is (some? (:ordered-invocation prepared)))
+        (is (= 1 (count (compiled/ir prepared))))))))
 
 (deftest in-place-convolution-gradients-project-blas-effects-to-contractions
   ;; These helpers return their caller-owned destination.  The BLAS call must remain an explicit

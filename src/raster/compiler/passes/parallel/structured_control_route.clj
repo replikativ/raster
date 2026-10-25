@@ -353,7 +353,12 @@
   "Existing source claims must each remain valid before considering another executor.
    A matching prefix, equation or allocation may not conceal another stale claim."
   [parallel-program]
-  (let [definitions (group-by first (partition 2 (second (:source parallel-program))))
+  (let [allocations (get-in parallel-program [:attributes :allocations])
+        _ (when-not (= (count allocations) (count (set (map :destination allocations))))
+            (fail! :structured-control-host-continuation
+                   "allocation destinations require unique retained source ownership"
+                   {:owner :allocation :destinations (mapv :destination allocations)}))
+        definitions (group-by first (partition 2 (second (:source parallel-program))))
         actual (fn [binding]
                  (let [pairs (get definitions binding)]
                    (when (= 1 (count pairs)) (second (first pairs)))))
@@ -379,6 +384,33 @@
                                source-expression (actual destination)))
               :allocation)))
   parallel-program)
+
+(defn- retain-source-allocation-values
+  "Complete only missing outer source-allocation contracts from their causal definitions.
+   Numerical initialization has already run; these values add no equation, input or output."
+  [program host-values]
+  (reduce
+   (fn [program [allocation-index {:keys [destination source-expression extent dtype initialization]
+                                  :as allocation}]]
+     (if-not (or (contains? allocation :source-expression)
+                 (contains? allocation :source-binding-id))
+       program
+       (let [value (get host-values destination)
+             existing (get-in program [:values destination])]
+         ;; Claim validation is independent of insertion. Re-entering promotion
+         ;; with a completed outer value cannot conceal changed claim metadata.
+         (when-not (and (= :tensor (:kind value)) (= 1 (count (:shape value)))
+                        (or (nil? dtype) (= dtype (:dtype value)))
+                        (or (nil? existing) (= (:dtype existing) (:dtype value)))
+                        (semantic/retained-source-equivalent? extent (first (:shape value)))
+                        (invocation-source/allocation-corresponds?
+                         source-expression value initialization host-values))
+           (fail! :structured-control-source-allocation-value
+                  "source-only allocation requires its exact constructor-owned buffer contract"
+                  {:allocation allocation :value value}))
+         (-> (cond-> program (nil? existing) (assoc-in [:values destination] value))
+             (assoc-in [:attributes :allocations allocation-index :dtype] (:dtype value))))))
+   program (map-indexed vector (get-in program [:attributes :allocations]))))
 
 (defn- invocation-prefix
   [parallel-program public-parameters prefix-values]
@@ -884,6 +916,8 @@
         ;; Invocation capacities instead use each source definition's original
         ;; point-in-time contract; numerical program shapes stay independent.
         host-values (:definition-values host-analysis)
+        parallel-program (retain-source-allocation-values parallel-program host-values)
+        program-values (:values parallel-program)
         ;; An unknown physical extent may still be refined by its source-owned
         ;; definition. Use only the causal snapshot, never final relational
         ;; representatives, and leave every known numerical domain unchanged.

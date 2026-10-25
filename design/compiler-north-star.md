@@ -1421,6 +1421,16 @@ allocation/helper recipes and their lexical dependencies survive shape normaliza
 equivalence remains a separate causal check. This producer closure does not establish ordered
 clone/loop execution, Float payload completion or resident inter-component composition.
 
+An analyzed allocation claim also roots its original source binding during realization, even
+when no surviving numerical equation reads its contents. Allocation arguments and result storage
+are distinct owners, not interchangeable buffers. After numerical initialization, promotion
+retains missing source-only buffer contracts from causal host definition analysis in the outer
+program; inner algorithms and their numerical inputs/outputs are unchanged. Claim validation
+does not disappear on re-entry once an outer value exists. Duplicate owners, contradictory
+dtype/count/initialization and missing constructor contracts refuse. This does not establish
+the safety of earlier scalar DCE's allocation-removability policy, which requires separate
+evaluation/failure-order qualification.
+
 Source local declarations and inferred types are separate facts. Original source entry captures
 the presence and value of a binder's declaration before inference; rewalking transports this
 fact rather than reinterpreting an inferred `:tag` as a source declaration. Actual macro

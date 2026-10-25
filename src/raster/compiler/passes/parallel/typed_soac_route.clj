@@ -1330,6 +1330,17 @@
                          (map :destination
                               (get-in equation-facts [:attributes :result-storage])))))
               (:equations (dialect/facts program)))
+        ;; An analyzed allocation is also an ordered source computation, even if
+        ;; no surviving equation consumes its contents. Its original argument
+        ;; evaluation and constructor failure cannot disappear with a dead fill.
+        ;; These claims were restored/validated against exact source sites above;
+        ;; generated storage without a source claim is not a new host root.
+        source-allocation-destinations
+        (into #{}
+              (comp (filter #(or (contains? % :source-expression)
+                                 (contains? % :source-binding-id)))
+                    (map :destination))
+              (get-in (dialect/facts program) [:attributes :allocations]))
         ;; Bindings the typed program leaves under host control (an opaque effect loop, a
         ;; host call) are retained as written, so everything they read is a root of the host
         ;; dependency closure too: a size scalar only that loop reads must stay bound.
@@ -1351,6 +1362,7 @@
                            pair))
                        original-pairs)
          (set/union physical-destinations
+                    source-allocation-destinations
                     host-controlled-reads
                     (into #{} (mapcat util/free-syms) body)))
         unprojected-constituent-symbols

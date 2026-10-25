@@ -2,6 +2,8 @@
   (:require [raster.compiler.ir.invocation-source :as invocation-source]
             [clojure.test :refer [deftest is]]
             [raster.compiler.passes.parallel.typed-soac-route :as typed]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.scalar.host-abstract-value :as host-av]
             [raster.compiler.passes.parallel.structured-control-route :as structured]
             [raster.compiler.passes.parallel.segop-lower-pass :as lowering]))
 
@@ -161,6 +163,58 @@
       (is (= :structured-control-host-continuation
              (try (promote (replace-binding program 'out changed)) nil
                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest unused-source-allocation-still-executes-its-constructor-check
+  (let [source '(let* [unused (clojure.core/double-array count)
+                       out (clojure.core/double-array 1)
+                       effect (raster.par/map! out i 1 double 7.0)]
+                  out)
+        ;; Qualify realization of already analyzed source ownership. Earlier
+        ;; optional scalar DCE has a separate allocation-removability policy.
+        analyzed (frontend/form->program source {:dtype :double :scalar-types {'count :long}})
+        program (typed/analyzed-program-envelope source analyzed)
+        retained (into {} (map vec (partition 2 (second (:source program)))))
+        run (fn [form count] (eval (list 'let* ['count count] form)))]
+    (is (some? program))
+    (is (= '(clojure.core/double-array count) (get retained 'unused)))
+    (is (= 2 (count (get-in program [:attributes :allocations]))))
+    (doseq [form [source (:source program)]]
+      (is (thrown? NegativeArraySizeException (run form -1)))
+      (is (= [7.0] (vec (run form 2)))))
+    (let [promote #(structured/promote-program
+                    % {:public-parameters '[count] :scalar-types {'count :long}
+                       :array-types {} :dtype :double})
+          promoted (promote program)
+          allocation-index (first (keep-indexed (fn [i allocation]
+                                                  (when (= 'unused (:destination allocation)) i))
+                                                (get-in program [:attributes :allocations])))]
+      (is (nil? (get-in program [:values 'unused])))
+      (is (= :double (get-in promoted [:values 'unused :dtype])))
+      (is (= '[count] (get-in promoted [:values 'unused :shape])))
+      (is (= (:inputs program) (:inputs promoted)))
+      (is (= (:outputs program) (:outputs promoted)))
+      (is (= (mapv :algorithm (:equations program)) (mapv :algorithm (:equations promoted))))
+      (is (= (get-in program [:attributes :allocations allocation-index :source-expression])
+             (get-in promoted [:attributes :allocations allocation-index :source-expression])))
+      (doseq [[field changed] [[:dtype :float] [:extent 2]]]
+        (is (= :structured-control-source-allocation-value
+               (try (promote (assoc-in program [:attributes :allocations allocation-index field] changed))
+                    nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+      (doseq [[field changed] [[:dtype :float] [:extent 2] [:initialization :copy]]]
+        (is (= :structured-control-source-allocation-value
+               (try (promote (assoc-in promoted [:attributes :allocations allocation-index field] changed))
+                    nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+      (let [analyze host-av/analyze-capacities]
+        (is (= :structured-control-source-allocation-value
+               (with-redefs [host-av/analyze-capacities
+                             (fn [& args] (update (apply analyze args) :definition-values dissoc 'unused))]
+                 (try (promote program) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+      (is (= :structured-control-host-continuation
+             (try (promote (update-in program [:attributes :allocations]
+                                      #(conj % (nth % allocation-index))))
+                  nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
 
 (deftest analyzed-binding-transport-requires-exact-unique-original-ownership
   (let [transport (ns-resolve 'raster.compiler.passes.parallel.typed-soac-route
