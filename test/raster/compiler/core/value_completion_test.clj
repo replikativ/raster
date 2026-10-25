@@ -5,6 +5,28 @@
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
 
+(deftest source-floating-completion-names-the-source-overload-not-an-ieee-cast
+  (doseq [operation [:float :unchecked-float]
+          mode [false true :warn-on-boxed]]
+    (let [contract (completion/source-floating-cast-contract operation {:unchecked-math mode})
+          operand (with-meta 'input {:tag 'Object :raster.type/tag 'double :line 7})
+          term (completion/complete-value contract operand)]
+      (is (completion/canonical-contract? contract))
+      (is (identical? operand (:operand (completion/canonical-parts term))))
+      (is (= 'float (:raster.type/tag (meta term))))
+      (is (nil? (:tag (meta term))) "declared output dtype is not a primitive input proof")
+      (is (= (list (case operation :float (if mode 'clojure.lang.RT/uncheckedFloatCast
+                                                 'clojure.lang.RT/floatCast)
+                                  :unchecked-float 'clojure.lang.RT/uncheckedFloatCast) operand)
+             (completion/project-to-jvm-source term)))
+      (doseq [changed [(assoc contract :operation :double)
+                       (assoc contract :target-carrier Float/TYPE)
+                       (dissoc contract :source-policy)]]
+        (is (false? (completion/canonical-contract? changed))))))
+  (is (= :unsupported-value-completion
+         (try (completion/source-floating-cast-contract :double {:unchecked-math false}) nil
+              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+
 (deftest source-integral-cast-contract-is-exact-and-declares-only-its-result
   (doseq [operation [:int :long]
           mode [false true :warn-on-boxed]]

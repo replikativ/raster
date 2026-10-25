@@ -67,6 +67,17 @@
                      :operation operation :source-policy policy})))
   {:source-context :source-integral-cast :operation operation :source-policy policy})
 
+(defn source-floating-cast-contract
+  "Retain an explicit source float/unchecked-float operation and its compilation policy.
+   This names the original RT overload, not an IEEE narrowing permission. Construction grants
+   no source-occurrence ownership, input-domain proof, totality or accelerator admission."
+  [operation policy]
+  (when-not (and (contains? #{:float :unchecked-float} operation) (source-policy? policy))
+    (throw (ex-info "source floating cast requires an explicit operation and retained policy"
+                    {:reason :unsupported-value-completion
+                     :operation operation :source-policy policy})))
+  {:source-context :source-floating-cast :operation operation :source-policy policy})
+
 (def bytecode-operand-context-keys
   "Bytecode result-position facts that affect an input's original evaluation.
    Retained only by a compilation owner, never inferred from scalar tags."
@@ -186,6 +197,10 @@
                 (= :source-integral-cast (:source-context contract))
                 (contains? #{:int :long} (:operation contract))
                 (source-policy? (:source-policy contract)))
+           (and (= #{:source-context :operation :source-policy} (set (keys contract)))
+                (= :source-floating-cast (:source-context contract))
+                (contains? #{:float :unchecked-float} (:operation contract))
+                (source-policy? (:source-policy contract)))
            (and (= #{:source-context :target-carrier :policy} (set (keys contract)))
                 (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
                 (= :preserve-bytecode-boxed-entry (:policy contract))
@@ -234,8 +249,8 @@
         ;; No JVM hint, successful conversion, presence or physical input fact
         ;; follows from this declaration. Exact Class identity stays in contract.
         ^Class target (:target-carrier contract)
-        tag (if (= :source-integral-cast (:source-context contract))
-              (case (:operation contract) :int 'int :long 'long)
+        tag (if (contains? #{:source-integral-cast :source-floating-cast} (:source-context contract))
+              (case (:operation contract) :int 'int :long 'long (:float :unchecked-float) 'float)
               (when (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
               (if (.isPrimitive target)
                 (let [tag (symbol (.getName target))]
@@ -365,7 +380,7 @@
    than replacing it with a guessed core cast. The caller MUST compile the
    returned form under that same retained policy and physical lexical scope;
    this pure projection does not execute or police later compilation.
-   Source integral casts instead name their frozen RT operation explicitly;
+   Source numeric casts instead name their frozen RT operation explicitly;
    their conversion policy does not depend on the consuming compiler binding.
    CHECKCAST contexts additionally require an owner-local map from the actual
    Class to a fresh lexical Class value port. The owner must bind the actual
@@ -398,6 +413,12 @@
                                       :int (if (source-policy/unchecked-math (:source-policy contract))
                                              "uncheckedIntCast" "intCast")
                                       :long "longCast")) operand)
+                      :source-floating-cast
+                      (list (symbol "clojure.lang.RT"
+                                    (case (:operation contract)
+                                      :float (if (source-policy/unchecked-math (:source-policy contract))
+                                               "uncheckedFloatCast" "floatCast")
+                                      :unchecked-float "uncheckedFloatCast")) operand)
                       :jvm-primitive-input (project-primitive-input contract operand compilation-policy))
            (value-meta contract form))
          (throw (ex-info "invalid canonical value completion"

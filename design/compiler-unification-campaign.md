@@ -138,8 +138,20 @@ future/non-result imports and contract mutations. Successful full-PDE execution
 also observes graph retirement, closed session storage and no legacy descriptor
 recording. This is bounded qualification, not full-branch green.
 The shared-REPL affected gate passes 118 tests / 1,434 assertions; the separate
-public RK4 integration passes 18 assertions. Final lexical-identity and explicit
-request-policy controls still require the clean-process checkpoint gate.
+public RK4 integration passes 18 assertions. Clean committed checkpoint
+`02d75e633` excludes the unrelated bytecode-observer work and passes the expanded
+qualification runner, including final lexical-identity/request-policy controls:
+
+| Clean checkpoint group | Tests | Assertions | Failures / errors |
+| --- | ---: | ---: | ---: |
+| Source, fusion, resident realization and materialization | 324 | 2,140 | 0 / 0 |
+| Linking, ordered ownership and loop lowering | 63 | 801 | 0 / 0 |
+| Actual OpenCL/Level Zero ordered and root owners | 5 | 778 | 0 / 0 |
+| Complete structured routing namespace | 74 | 716 | 0 / 0 |
+| Public `Compiled` RK4 on both local backends | 1 | 18 | 0 / 0 |
+
+Combined: 467 tests / 4,453 assertions; clean runner exits zero. This is not the
+whole-repository gate. PR #1566 remains unqualified until its CI families pass.
 
 Remaining scope: the source-derived output-only demand currently applies to
 structured suffixes; ordinary public output-only reductions still need the same
@@ -151,6 +163,38 @@ independent `snapshot` pmap after the unused `scratch` constructor (but before
 `count`) declines `:structured-control-host-continuation`, binding `scratch`,
 owner `:allocation`. Moving it before scratch isolates the positive prefix-return
 test; the after-scratch form is unfinished functionality, not a language exclusion.
+
+The next checked-completion leaf is grounded by CI34860: 170/172 public CUDA/HIP
+fixtures pass, with only `mixed-scale-energy-gradient` refusing on both targets.
+Its source chain is Double reduction → Object snapshot → checked core/float →
+Object snapshot. The selected dot-product's exact sole body root is its observed
+reduction; its existing normal-return fact proves present boxed Double. The
+existing boxed-entry bridge proves the primitive compute return and Object
+wrapper. The stronger primitive-body bridge correctly abstains because the body
+itself emits a reference before return completion. Reuse these distinct facts;
+do not add another payload registry or erase the checked Float operation.
+
+Implementation order: (1) retain the original generated occurrences at
+`project-prepared-value+grad-call` and transport them through existing qualifier,
+alpha-conversion and substitution constructor observers; (2) extend the shared
+completion vocabulary/outlining and ordered cursor execution, preserving overflow
+and withholding suffix effects/output after failure; (3) publish the actual Float
+result through the ordinary resident boundary. The existing
+`compile-source-integral-completion-region` is a pattern, not Float support.
+Conditional normal-return payload is not permission to replace the original call,
+discard custom Number effects or infer success. Keep original/changed-input,
+overflow/NaN/infinity/signed-zero, empty-reduction, stale/copied-owner and
+effect-order differential gates before declaring the emitter pair closed.
+
+The canonical checked-Float vocabulary/JVM consumer now shares the ordinary
+core-cast emitter. Retained policy selects checked versus unchecked RT overloads,
+including `:warn-on-boxed`; operand policy remains separate. Normal-return
+presence and physical planning recognize the result without asserting totality,
+and structural AD explicitly refuses an unowned transpose. The focused warm gate
+passes 70 tests / 944 assertions across core contracts, ordinary/canonical JVM
+casts, existing integral outlining, AD normalization and normal-return analysis.
+This does not admit floating invocation-prefix completion or generated-source
+import yet. In particular, it does not close the CUDA/HIP emitter pair.
 
 For comparison, exact-parent `be180fd6` CI34832 has 15 completed unit summaries:
 6,949 tests / 87,661 assertions, 24 failures / 50 errors across 58 test Vars; the

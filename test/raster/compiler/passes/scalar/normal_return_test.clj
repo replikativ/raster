@@ -4,12 +4,21 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.scalar.local-products :as products]
             [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.pipeline :as pipeline]))
+
+(deftest floating-completion-presence-is-conditional-not-totality-or-input-domain
+  (doseq [operation [:float :unchecked-float]]
+    (let [contract (completion/source-floating-cast-contract operation {:unchecked-math false})]
+      (is (= {:presence :present}
+             (normal/result-fact (completion/complete-value contract 'unknown-input))))
+      (is (= {:presence :no-return}
+             (normal/result-fact (completion/complete-value contract '(throw failure))))))))
 
 (use-fixtures :each
   (fn [test!]

@@ -2909,6 +2909,22 @@
                                               (into-array ClassDesc [descriptor])))))
         result))))
 
+(defn- emit-source-floating-completion
+  "Replay the source float overload after evaluating its operand exactly once.
+   Descriptor adaptation's raw JVM f2d/d2f rules are deliberately not used here."
+  [code head-name input]
+  (if (= :diverge input)
+    :diverge
+    (let [descriptor (case input
+                       :int I-cd :long J-cd :float F-cd :double D-cd :ref obj-cd
+                       :bool (do (emit-box-to-ref code input) obj-cd)
+                       :void (do (.aconst_null code) obj-cd))]
+      (.invokestatic code rt-cd (case head-name
+                                  "float" (if *unchecked-math* "uncheckedFloatCast" "floatCast")
+                                  "unchecked-float" "uncheckedFloatCast")
+                     (MethodTypeDesc/of F-cd (into-array ClassDesc [descriptor])))
+      :float)))
+
 (defn- retain-array-read! [ctx array index index-type result-type locals proof]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
@@ -3324,24 +3340,11 @@
     ("float" "unchecked-float")
     (when (= 1 (count args))
       (let [t (emit-form code (first args) locals ctx)]
-        (if (= :diverge t)
-          :diverge
-          (let [input (case t
-                        :int I-cd :long J-cd :float F-cd :double D-cd
-                        ;; Boolean is not numeric. Preserve the core Object overload's
-                        ;; failure instead of silently converting its JVM int encoding.
-                        :bool (do (emit-box-to-ref code t) obj-cd)
-                        :void (do (.aconst_null code) obj-cd)
-                        :ref obj-cd)]
-            (retain-floating-conversion! ctx (first args) t Float/TYPE locals
-                                         (if (= "float" head-name)
-                                           'clojure.core/float 'clojure.core/unchecked-float))
-            ;; Explicit core casts use RT's source overload, not the raw JVM
-            ;; coercion used to satisfy an already resolved method descriptor.
-            ;; In particular float(Double/MAX_VALUE) must throw, not become +Inf.
-            (.invokestatic code rt-cd (if (= "float" head-name) "floatCast" "uncheckedFloatCast")
-                           (MethodTypeDesc/of F-cd (into-array ClassDesc [input])))
-            (primitive-core-cast-carrier head-name)))))
+        (when-not (= :diverge t)
+          (retain-floating-conversion! ctx (first args) t Float/TYPE locals
+                                       (if (= "float" head-name)
+                                         'clojure.core/float 'clojure.core/unchecked-float)))
+        (emit-source-floating-completion code head-name t)))
     ("int" "long" "unchecked-int") (emit-source-integral-cast code head-name args locals ctx)
     ;; Arithmetic — dispatched to emit-arithmetic helper
     ("+" "-" "*" "/") (retain-primitive-index-route! ctx :primitive-arithmetic
@@ -4475,9 +4478,10 @@
         (= completion/completion-symbol head)
         (when-let [{:keys [contract operand]} (completion/canonical-parts expression)]
           (case (:source-context contract)
-            :source-integral-cast
+            (:source-integral-cast :source-floating-cast)
             (when-let [raw (plan-form-carrier operand locals (dissoc ctx :void-context))]
-              (if (= :diverge raw) raw (case (:operation contract) :int :int :long :long)))
+              (if (= :diverge raw) raw
+                  (case (:operation contract) :int :int :long :long (:float :unchecked-float) :float)))
             :jvm-object-input
             (when (plan-form-carrier operand locals (object-input-context ctx)) :ref)
             :jvm-checkcast
@@ -6147,7 +6151,7 @@
                                                       (object-input-context ctx))}))
             actual)
           :jvm-checkcast (emit-reference-check-completion code parts locals ctx observation)
-          :source-integral-cast
+          (:source-integral-cast :source-floating-cast)
           (let [operand-ctx (dissoc ctx :void-context)
                 input (when observation (physical-operand-input operand locals operand-ctx))
                 operand-policy (when observation (source-policy/capture))
@@ -6156,11 +6160,13 @@
               (vreset! observation {:input-carrier actual
                                     :operand-input input :operand-source-policy operand-policy
                                     :element-type (:element-type ctx)
-                                    :adaptation (if (= :diverge actual) :diverge :source-integral-cast)
+                                    :adaptation (if (= :diverge actual) :diverge (:source-context contract))
                                     :operand-context (completion/bytecode-operand-context operand-ctx)}))
             (source-policy/call-with-policy
              (:source-policy contract)
-             #(emit-source-integral-completion code (name (:operation contract)) actual)))
+             #(if (= :source-integral-cast (:source-context contract))
+                (emit-source-integral-completion code (name (:operation contract)) actual)
+                (emit-source-floating-completion code (name (:operation contract)) actual))))
           :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx observation)
           :jvm-bytecode-boxed-parameter-input
           (emit-boxed-parameter-completion code parts locals ctx observation)
