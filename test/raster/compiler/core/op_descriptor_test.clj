@@ -1,6 +1,7 @@
 (ns raster.compiler.core.op-descriptor-test
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.core.op-descriptor :as descriptor]))
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.numeric-constant :as constant]))
 
 (deftest reduction-identities-retain-exact-qualified-algebra
   (let [original descriptor/get-op-descriptor
@@ -15,7 +16,7 @@
       (doseq [op '[test.reduction/min test.reduction/+]]
         (is (= 42 (descriptor/typed-reduce-identity op :long)))
         (is (= 42.0 (descriptor/typed-reduce-identity op :double)))
-        (is (= '(float 42.0) (descriptor/typed-reduce-identity op :float))))
+        (is (= '(clojure.core/float 42.0) (descriptor/typed-reduce-identity op :float))))
       (is (thrown? clojure.lang.ExceptionInfo
                    (descriptor/typed-reduce-identity 'test.reduction/empty-min :double)))
       (with-redefs [descriptor/get-op-descriptor
@@ -42,6 +43,21 @@
     (is (= 'Double/NEGATIVE_INFINITY (descriptor/typed-reduce-identity op :double)))
     (doseq [dtype [:float :half]]
       (is (= 'Float/NEGATIVE_INFINITY (descriptor/typed-reduce-identity op dtype))))))
+
+(deftest generated-float-reduction-identities-own-the-exact-core-conversion
+  (doseq [[op expected] [['clojure.core/+ 0.0] ['clojure.core/* 1.0]]
+          dtype [:float :half]]
+    (let [identity (descriptor/typed-reduce-identity op dtype)
+          proof (constant/source-value identity)
+          shadowed (eval (list 'let ['float '(fn [_] -9.0)] identity))]
+      (is (= (list 'clojure.core/float expected) identity))
+      (is (instance? Float (:value proof)))
+      (is (= (float expected) (:value proof) shadowed))
+      (is (instance? Float shadowed))))
+  (is (nil? (constant/source-value '(float 0.0)))
+      "a user-supplied bare cast still has no exact core source proof")
+  (is (= -9.0 (eval '(let [float (fn [_] -9.0)] (float 0.0))))
+      "lexical float remains a real callable, not a core-cast whitelist"))
 
 (deftest allocation-initialization-contracts
   (is (= :zero (descriptor/allocation-initialization 'double-array)))

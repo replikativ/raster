@@ -1,6 +1,7 @@
 (ns raster.compiler.core.inference-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.numeric]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.inference :as inf]))
 
 ;; Helper to build a minimal type-env for infer-binding-tag
@@ -10,6 +11,33 @@
    (reduce-kv (fn [m s t] (assoc m s {:tag t})) {} flat-env)))
 
 (defn- opts [] {:use-tc? false :source-ns *ns*})
+
+(deftest reduction-expansion-retains-exact-generated-compute-casts
+  (doseq [[initial expected]
+          [[0.0 '(clojure.core/float 0.0)]
+           ['(clojure.core/float 0.0)
+            '(clojure.core/float (clojure.core/float 0.0))]]]
+    (let [expanded (inf/expand-reduce ['acc initial] '[x]
+                                     '(clojure.core/+ acc x 1.0)
+                                     (type-env {'x 'floats}) {})
+          [_ accumulator seed index _ body] expanded
+          proof (constant/source-value seed)]
+      (is (= 'raster.par/reduce (first expanded)))
+      (is (= 'acc accumulator))
+      (is (= expected seed) "recursive literal narrowing remains unchanged")
+      (is (= (list 'clojure.core/+ 'acc
+                   (list 'clojure.core/float (list 'aget 'x index))
+                   '(clojure.core/float 1.0)) body))
+      (is (instance? Float (:value proof)))
+      (is (= (float 0.0) (:value proof)
+             (eval (list 'let ['float '(fn [_] -9.0)] seed))))))
+  (let [expanded (inf/expand-reduce '[acc 0.0] '[x] '(clojure.core/+ acc x)
+                                   (type-env {'x 'doubles}) {})]
+    (is (= 0.0 (nth expanded 2)))
+    (is (= (list 'clojure.core/+ 'acc (list 'aget 'x (nth expanded 3)))
+           (nth expanded 5))))
+  (is (nil? (constant/source-value '(float 0.0)))
+      "source proof does not admit bare user or lexical casts"))
 
 (deftest closed-kernel-intrinsic-dtypes
   (is (= :half (inf/infer-scalar-intrinsic-dtype 'raster.numeric/+ [:half :half] *ns*)))

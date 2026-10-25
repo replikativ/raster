@@ -1250,7 +1250,10 @@
         (cond
           (nil? id) (throw (ex-info (str "op " op-sym " has no identity") {:op op-sym}))
           (contains? #{:int :long :byte} dtype) id
-          float-width? (list 'float (double id))
+          ;; This is compiler-generated source, not a lexical call supplied by
+          ;; the user. Retain the exact core conversion under shadowing and at
+          ;; later source-totality proof boundaries.
+          float-width? (list 'clojure.core/float (double id))
           :else (double id))))))
 
 ;; --- Analytic cost (:cost facet; hardware-guided fusion profitability) ---
