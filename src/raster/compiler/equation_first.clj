@@ -769,13 +769,21 @@
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))
-  (let [requirement (invocation-link/ordered-preparation-requirement
-                     compilation retained-validation caller-options)]
-    (when (:required? requirement)
-      (fail! :equation-first-ordered-preparation
-             "source actions require ordered preparation before numerical execution"
-             {:function (:function compilation) :barriers (:barriers requirement)})))
-  (let [started (System/nanoTime)
+  (let [;; The order query and final lowering consume the SAME immutable
+        ;; checked boundary. Re-deriving it independently in each phase repeats
+        ;; storage projection without supplying any new invocation evidence.
+        retained-validation (or retained-validation
+                                (if (nil? caller-options)
+                                  (emitted-program/validate-with-physical-results! (:emitted compilation))
+                                  (emitted-program/validate-with-physical-results!
+                                   (:emitted compilation) caller-options)))
+        requirement (invocation-link/ordered-preparation-requirement
+                     compilation retained-validation caller-options)
+        _ (when (:required? requirement)
+            (fail! :equation-first-ordered-preparation
+                   "source actions require ordered preparation before numerical execution"
+                   {:function (:function compilation) :barriers (:barriers requirement)}))
+        started (System/nanoTime)
         source-ns (:source-ns compilation)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
         unsupported-host-evaluation

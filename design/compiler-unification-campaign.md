@@ -2,6 +2,48 @@
 
 ## Reconciled execution plan
 
+### October 25 failure-driven consolidation
+
+The exact unmerged 62ee82a6 CI baseline has 72 distinct failing test Vars across
+unit and OpenCL gates, plus an incomplete timed-out shard. This is separate from
+green main. Passing local subsets do not qualify the branch. Independent Astra
+audit recommends one source-ordered invocation spine; eager LinkPlan lowering is
+a proved specialization, not another interpretation of host execution.
+
+Landing order within the unchanged eight-objective campaign:
+
+1. Close positively identified small regressions with independent controls.
+   Storage projection was repeated by the ordering query and eager lowerer;
+   both now reuse the same exact-program/request-sealed static validation while
+   invocation materialization and final plan checks stay fresh. Seven existing
+   proof/policy tests pass (68 assertions), including the original count-one
+   expectation. The older packed-index overflow oracle still needs an independent
+   checked-Clojure replacement and explicit unchecked wrapping control.
+2. Close missing source producers using public workloads: selected helper
+   correspondence on allocation-only actions (ASR), causal buffer capacity aliases
+   (graph attention/AD), nested allocation lengths (RK4), and complete Float/Object
+   results. Retain exact construction ownership, not fresh metadata or equality
+   masquerading as original evidence.
+3. Complete the common ordered public boundary: share port intent and output
+   selection, then explicit outputs/taps, resident scalars, aggregate state,
+   donation and composition. AMR/distributed consumers need an actual ordered
+   contract, not a fabricated already-completed concrete LinkPlan.
+4. Close typed AD/JVP and native map consumers, then rectangular/SIMD and JVM
+   quality regressions. Investigate timed GSDM phases before changing timeouts.
+5. Requalify all shards, corpus/device gates and actual CUDA/HIP compilers before
+   merging. Retain distributed simulation, halo/data parallelism, durable
+   manifests and multilevel/AMR as campaign acceptance workloads throughout.
+
+The ordinary public ordered MLP already passed two changed-input replays on local
+OpenCL with independent expected results [0.75] and [1.25]; preparation acquired
+no GPU resources. Its eager-lowering refusal is not a failed numerical kernel,
+but that result does not qualify missing composition/port capabilities. Layout
+lookahead may derive dimensions from proved immutable shape producers; it cannot
+claim allocation/initialization success or hoist a potentially failing action.
+Unrestricted JVM object behavior stays outside portable numerical kernels.
+Changing accepted entry classes or allocation-failure timing requires an explicit
+language contract change, never a purity flag or weakened test.
+
 ### October 24 audited correctness/consolidation closure
 
 Source count conversion is a prerequisite for the complete native map consumer,
