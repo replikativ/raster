@@ -70,6 +70,20 @@ Landing order within the unchanged eight-objective campaign:
    selection, then explicit outputs/taps, resident scalars, aggregate state,
    donation and composition. AMR/distributed consumers need an actual ordered
    contract, not a fabricated already-completed concrete LinkPlan.
+   Already-certified resident scalar outputs now pass ordered preparation and
+   replay through the existing DeviceArray/view boundary. Public admission reuses
+   the source-free compiler's scheduled/emitted inner certificate and checks the
+   actual ordered program value, not rank or outer representation hints. Synthetic
+   one-element result allocation is reconciled with logical shape [] only through
+   the checked emitted physical destination, unique inner producer and exact AV
+   agreement; source constructor dtype/count and zeroing stay independently checked.
+   Storage remains rank zero. No generic rank-zero allocation or source
+   resident-outputs option was added. Four affected suites pass 69 tests / 866
+   assertions, including both local device backends, changed/default replay,
+   zero-trip reduction, later numerical consumption, output-wrapper lifetime,
+   constructor count/dtype refusals and failure before scalar allocation/publication.
+   Host-completed numerical scalars and additional public port capabilities remain
+   open; resident output support does not discharge a checked Float conversion.
 4. Close typed AD/JVP and native map consumers, then rectangular/SIMD and JVM
    quality regressions. Investigate timed GSDM phases before changing timeouts.
 5. Requalify all shards, corpus/device gates and actual CUDA/HIP compilers before
@@ -85,6 +99,49 @@ claim allocation/initialization success or hoist a potentially failing action.
 Unrestricted JVM object behavior stays outside portable numerical kernels.
 Changing accepted entry classes or allocation-failure timing requires an explicit
 language contract change, never a purity flag or weakened test.
+
+#### Checked Float result closure: producer and ordered consumer together
+
+After the protected-return repair, the public emitter gate still passes 170 of
+172 fixtures: CUDA and HIP both refuse mixed-scale-energy-gradient's complete
+Float/Object result. Its retained source has a Double reduction, an Object
+completion, a checked Float projection and a final Object completion. The last
+three bindings are not represented by the numerical outputs. This is not license
+to unwrap them by name or infer physical carrier Classes from their dtype tags.
+
+The checked conversion is an existing AD contract, including for generated
+parameter projection: parameter-projection-test requires overflow exceptions.
+A fresh JVM probe returns java.lang.Float 5.0 for observations [1,2], and throws
+IllegalArgumentException for [1e20], whose Double gradient is 1e40. The existing
+five projection tests pass 48 assertions. Replacing this with IEEE GPU narrowing
+would silently remove the exception; changing AD rounding policy is separate work.
+
+The next closed vertical therefore interleaves producer closure with the ordered
+scalar-output capability rather than adding an isolated proof API:
+
+- Reuse normal-return completed-scalar facts plus original reduction, completion
+  and floating-conversion emission observations. Keep Object carrier, presence
+  and exact built-in payload facts separate; check each binding's own completion.
+  The actual owner is GeneratedPreparationOwner/prepared-bytecode-entry, not the
+  outer deftm emission: generated AD is already compiled once during preparation.
+  The import constructor project-flat-prepared-call creates qualified, hygienic
+  and substituted forms, but currently returns only the flat projection to the
+  caller. Retain construction correspondence there, before normalization loses
+  that edge. InputOrigins already supplies original-to-emitted occurrence joins;
+  reuse them rather than matching later source by equality or guessed metadata.
+- Outline the closed numerical completion suffix through existing owned bytecode
+  machinery and SourceCompletion execution, preserving its original source owner,
+  boxing, conversion and policy. No unrestricted suffix interpreter or new cache.
+- Materialize the preceding device scalar only at the corresponding source cursor,
+  after earlier device effects; establish the actual carrier bridge independently
+  of dtype. Publish the Float output only after the owned completion succeeds.
+- Preserve changed-input replay, once-only completion, NaN/signed zero/subnormals
+  and checked overflow. Test earlier writes before failure and no later execution
+  or publication. Missing/copied/stale owners, custom Number/public Object inputs
+  and observable Object identity remain outside this numerical payload projection.
+
+The public CUDA/HIP fixture pair must pass through this completed vertical, not
+through an unchecked cast, a skipped fixture, or a separate AD/backend ABI.
 
 ### October 24 audited correctness/consolidation closure
 

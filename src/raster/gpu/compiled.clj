@@ -1084,8 +1084,13 @@
                          :default (:source buffer) :donate? false})
                       (sort-by #(get parameter-order (:id (val %))) buffers))
         outputs (get-in initial [:program :outputs])
-        _ (when-not (every? #(seq (get-in initial [:program :values % :shape])) outputs)
-            (throw (ex-info "ordered public outputs currently require resident array values"
+        _ (when-not (every? (fn [id]
+                             (let [value (get-in initial [:program :values id])]
+                               (or (seq (:shape value))
+                                   (when-let [resident (equation-first/validated-resident-output
+                                                       compilation id)]
+                                     (semantic-fingerprint/equivalent? resident value))))) outputs)
+            (throw (ex-info "ordered public outputs require arrays or certified resident scalars"
                             {:reason :compiled-ordered-output-kind})))
         out-tree (mapv (fn [index id]
                          {:key (equation-first-output-key id index (count outputs))

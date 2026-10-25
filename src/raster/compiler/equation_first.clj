@@ -513,18 +513,26 @@
              {:resident-outputs resident-outputs :outputs outputs})))
   resident-outputs)
 
+(defn ^:no-doc validated-resident-output
+  "Return an exact public scalar value certified through scheduling and emission.
+   Rank zero, an outer representation attribute or a dtype alone is not evidence of resident
+   storage. The caller still owns compilation freshness, execution and initialized output views."
+  [compilation result]
+  (let [scheduled-value
+        (structured-route/validated-public-resident-output (:scheduled compilation) result)
+        emitted-value (get-in compilation [:emitted :values result])]
+    (when (and scheduled-value
+               (some #{result} (get-in compilation [:emitted :outputs]))
+               (semantic/equivalent? scheduled-value emitted-value))
+      scheduled-value)))
+
 (defn- validate-resident-output-compilation!
   [compilation resident-outputs]
   (doseq [result resident-outputs]
-    (let [scheduled-value
-          (structured-route/validated-public-resident-output (:scheduled compilation) result)
-          emitted-value (get-in compilation [:emitted :values result])]
-      (when-not (and scheduled-value
-                     (some #{result} (get-in compilation [:emitted :outputs]))
-                     (semantic/equivalent? scheduled-value emitted-value))
-        (fail! :equation-first-resident-output-representation
-               "requested resident output did not retain its certified emitted representation"
-               {:result result :target (:target compilation)}))))
+    (when-not (validated-resident-output compilation result)
+      (fail! :equation-first-resident-output-representation
+             "requested resident output did not retain its certified emitted representation"
+             {:result result :target (:target compilation)})))
   compilation)
 
 (defn- scalar-region-local-dtypes

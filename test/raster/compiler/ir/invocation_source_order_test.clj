@@ -41,6 +41,14 @@
         ^long required ^{:raster.effect/preserve-evaluation true} (* (long n) (long n))]
     (par/map! out i 1 double (+ (aget out i) 1.0))))
 
+(deftm write-before-resident-reduction
+  [x :- (Array double), out :- (Array double), n :- Long] :- Double
+  (let [written (par/map! out i 1 double (+ (aget x i) 1.0))
+        ^long required ^{:raster.effect/preserve-evaluation true} (* (long n) (long n))
+        sum (par/reduce total 0.0 i n (+ total (aget x i)))
+        consumed (par/map! out i 1 double (+ sum (aget out i)))]
+    sum))
+
 (defn- compilation [v dtype]
   (let [program (:semantic (equation-first/compile v {:target :ocl:0 :dtype dtype}))]
     [program (get-in program [:attributes :invocation-plan])]))

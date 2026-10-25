@@ -658,7 +658,8 @@
                    (= destination (get-in projection [:physical-results destination])))
       (fail! :invocation-ordered-realization-storage
              "source allocation must be the equation's exact physical result"
-             {:entry entry :destination destination}))))
+             {:entry entry :destination destination}))
+    projection))
 
 (defn ^:no-doc validate-ordered-source-actions!
   "Check structural executor coverage after begin-ordered-realization, before capture or source
@@ -809,16 +810,31 @@
         expression (if auxiliary? (:expression action) (:source-expression claim))
         abstract (get-in state [:program :values destination])
         values (get-in state [:program :values])
+        result-projection (when auxiliary? (validate-source-result-allocation! state entry action))
+        algorithm (get-in result-projection [:boundary :algorithm])
+        inner (when (soac/program-form? algorithm)
+                (filterv #(some #{destination} (nth % 2)) (soac/equations algorithm)))
+        resident-scalar?
+        (and (= 1 (count inner))
+             (= {:kind :resident-scalar-buffer :elements 1} (:representation abstract))
+             (= :device (:memory-space abstract))
+             (= [] (:shape abstract))
+             (semantic/equivalent? abstract (get-in (soac/facts algorithm) [:values destination]))
+             (= [] (soac/dense-functional-result-shape algorithm (first inner) destination)))
+        ;; A certified rank-zero result owns one physical element. Check the synthetic array
+        ;; constructor against that footprint without changing the logical scalar/storage view.
+        ;; An outer representation attribute alone cannot enter this branch.
+        constructor-contract (cond-> abstract resident-scalar? (assoc :shape [1]))
         projection (invocation-source/allocation-source expression values)
         step (some #(when (= (:invocation-step entry) (:id %)) %)
                    (get-in state [:materialization :plan :steps]))
         initialization (:initialization projection)
         retained-projections (keep :source-projection [step claim action])]
     (when-not (and destination (= :zero initialization)
-                   (invocation-source/allocation-corresponds? expression abstract initialization values))
+                   (invocation-source/allocation-corresponds?
+                    expression constructor-contract initialization values))
       (fail! :invocation-ordered-next-allocation
              "the next source entry is not an admitted size-only zero allocation" {:entry entry}))
-    (when auxiliary? (validate-source-result-allocation! state entry action))
     (when (or (and (:helper projection) (empty? retained-projections))
               (some #(not (semantic/equivalent? (select-keys projection [:constructor :helper]) %))
                     retained-projections))
@@ -854,7 +870,7 @@
                {:source-value source-value :constructor-count elements :destination destination}))
       (let [shape (concrete-shape destination abstract scalars
                                   (get-in state [:realized :buffers]) (get-in state [:realized :storage]))]
-        (when-not (= [elements] shape)
+        (when-not (if resident-scalar? (= 1 elements) (= [elements] shape))
           (fail! :invocation-ordered-allocation-shape
                  "retained storage differs from the evaluated source constructor count"
                  {:shape shape :constructor-count elements :destination destination}))
