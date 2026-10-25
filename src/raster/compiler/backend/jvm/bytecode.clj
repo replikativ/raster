@@ -1056,129 +1056,21 @@
     (with-meta (mapv pre-expand-par-forms form) (meta form))
     :else form))
 
-(def ^:private non-call-heads
-  "Special forms whose operands are not evaluated onto the operand stack in order
-  (or which own their own scoping); `lift-loop-operands` recurses into them but never
-  ANF-lifts their operands."
-  '#{if do let* loop* letfn* fn* quote var try catch finally case* set! throw def
-     monitor-enter monitor-exit . clojure.core/quote reify* deftype* import*
-     clojure.core/import*})
-
-(defn- contains-loop?
-  "Does `form` evaluate a `loop*` in its own frame (i.e. not inside a nested fn*)?"
+(defn- same-frame-loop?
+  "Does evaluating this value enter a loop in the current JVM frame?
+   Data and nested method bodies are opaque. This predicate never rewrites source."
   [form]
   (cond
     (seq? form) (let [h (first form)]
-                  (cond (contains? #{'quote 'clojure.core/quote 'fn*} h) false
-                        (= 'loop* h) true
-                        :else (boolean (some contains-loop? form))))
-    (vector? form) (boolean (some contains-loop? form))
-    (map? form) (boolean (some contains-loop? (concat (keys form) (vals form))))
+                  (cond (contains? '#{quote clojure.core/quote fn fn* clojure.core/fn
+                                     reify reify* clojure.core/reify deftype deftype*
+                                     clojure.core/deftype} h) false
+                        (contains? '#{loop loop* clojure.core/loop} h) true
+                        :else (boolean (some same-frame-loop? form))))
+    (vector? form) (boolean (some same-frame-loop? form))
+    (map? form) (boolean (some same-frame-loop? (concat (keys form) (vals form))))
+    (set? form) (boolean (some same-frame-loop? form))
     :else false))
-
-(defn- constant-operand?
-  "A literal whose evaluation reads no state."
-  [form]
-  (or (number? form) (keyword? form) (string? form) (nil? form)
-      (true? form) (false? form) (char? form)))
-
-(defn- order-free-symbol?
-  "Is evaluating symbol operand `sym` independent of when it happens relative to the other
-   operands of the same call? Only two kinds of symbol are proved so:
-   - a lexical local: an unqualified symbol that resolves to nothing in the current namespace
-     can only be a local binding, and JVM/Clojure locals are immutable (the bytecode backend's
-     only `set!` is field mutation through a `(. obj field)` place, itself a compound operand);
-   - a class literal.
-   Everything else — a Var (any Var can be re-rooted, `set!` under a binding, or redefined by a
-   later operand), a qualified static-field read, or a name that fails to resolve — is a read of
-   mutable state and must be captured in its original position. A local that shadows a Var name
-   is conservatively captured too; that is a redundant copy, never a reordering."
-  [sym]
-  (and (symbol? sym)
-       (nil? (namespace sym))
-       (let [resolved (try (resolve sym) (catch Throwable _ ::unresolvable))]
-         (or (nil? resolved) (class? resolved)))))
-
-(defn- order-free-operand? [form]
-  (or (constant-operand? form) (order-free-symbol? form)))
-
-(defn- inline-var-call?
-  "Does `(v args...)` with `n` arguments compile to an inline expansion, i.e. without reading
-   the Var's root at run time?"
-  [v n]
-  (let [{:keys [inline inline-arities]} (meta v)]
-    (boolean (and inline (or (nil? inline-arities) (inline-arities n))))))
-
-(defn- reorderable-call-head?
-  "May the operands of `(h operands...)` be evaluated into locals before the call itself?
-   Clojure evaluates a non-inline Var head (reading its root) BEFORE the operands, and the
-   bytecode backend's source-call path does the same, so moving operands ahead of such a head
-   can let an operand's effect change which function is called. Only heads whose callee is
-   fixed at compile time or is an immutable local are reorderable:
-   `recur`, `new`, method sugar `.m` (its target is an ordinary first operand, see
-   `lift-loop-operands`), an inline Var call, or a local fn."
-  [h n-operands]
-  (cond
-    (contains? #{'recur 'new} h) true
-    (not (symbol? h)) false
-    (and (nil? (namespace h)) (.startsWith (name h) ".") (not= "." (name h))) true
-    :else (let [resolved (try (resolve h) (catch Throwable _ ::unresolvable))]
-            (cond
-              (var? resolved) (inline-var-call? resolved n-operands)
-              (nil? resolved) (nil? (namespace h))
-              :else false))))
-
-(defn lift-loop-operands
-  "A-normalize call operands that contain a `loop*`, preserving evaluation order.
-
-  `(f a (loop* ...))` is emitted as a loop whose header executes with `a` (and, for
-  array stores / instance calls, the receiver) still on the JVM operand stack. HotSpot C2
-  and Graal refuse on-stack replacement at a loop header with a non-empty expression
-  stack, so such a loop — e.g. the inner product of a host-expanded `par/contract` written
-  as `(aset out f (loop* [l 0 acc 0.0] ...))` — never reaches the optimizing tier when the
-  enclosing method is invoked only a few times (it ran ~100x slower than the same loop
-  bound to a local first).
-
-  The rewrite binds operands to fresh locals IN SOURCE ORDER: every operand is captured
-  except constants and order-free symbols (`order-free-symbol?`: lexical locals and class
-  literals). Var reads and static-field reads are captured where they stood, so an effect in
-  a later operand (e.g. a loop that `set!`s or re-roots that Var) cannot leak into an earlier
-  operand. The rewrite is declined — the form is left exactly as written — when the call head
-  is a run-time Var read (`reorderable-call-head?`), or when a method-sugar target is a
-  non-order-free symbol (capturing it would turn a linked `.invk` target into a plain local).
-  Operand metadata (dtype stamps) is carried onto the temporary."
-  [form]
-  (cond
-    (and (seq? form) (contains? #{'quote 'clojure.core/quote} (first form))) form
-    (seq? form)
-    (let [form' (with-meta (apply list (map lift-loop-operands form)) (meta form))
-          h (first form')
-          [keep-n operands] (cond
-                              (not (symbol? h)) [0 nil]
-                              (contains? non-call-heads h) [0 nil]
-                              (= 'new h) [2 (drop 2 form')]
-                              :else [1 (rest form')])
-          method-target (when (and (symbol? h) (nil? (namespace h))
-                                   (.startsWith (name h) ".") (not= "." (name h)))
-                          (first operands))]
-      (if (and (seq operands) (some contains-loop? operands)
-               (reorderable-call-head? h (count operands))
-               (not (and (symbol? method-target) (not (order-free-symbol? method-target)))))
-        (let [pairs (mapv (fn [op]
-                            (if (order-free-operand? op)
-                              [nil op]
-                              (let [m (select-keys (meta op) [:tag :raster.type/tag])
-                                    s (with-meta (gensym "lift_op__") (not-empty m))]
-                                [s op])))
-                          operands)
-              bindings (vec (mapcat (fn [[s op]] (when s [s op])) pairs))
-              call (with-meta (apply list (concat (take keep-n form')
-                                                  (map (fn [[s op]] (or s op)) pairs)))
-                     (meta form'))]
-          (list 'let* bindings call))
-        form'))
-    (vector? form) (with-meta (mapv lift-loop-operands form) (meta form))
-    :else form))
 
 (defn- materialize-form
   "Run the `materialize` pass on a single form: pure par/pmap (value-producing,
@@ -2519,6 +2411,54 @@
       :int    (do (case arr-tag bytes (.baload code) shorts (.saload code) (.iaload code)) :int)
       :ref    (do (.aaload code) :ref)))))
 
+(declare emit-completed-value-spill! reload-completed-value!)
+
+(defn- emit-aset-completed-spills
+  "Spill only this store's completed operands, at their original evaluation
+   positions. The value loop then carries none of aset's operands on its stack;
+   an incoming parent's stack is deliberately not rewritten or claimed empty."
+  [code [arr idx value] locals ctx arr-tag arr-verified?]
+  (let [operand-ctx (dissoc ctx :void-context)
+        array (emit-completed-value-spill!
+               code ctx
+               (fn []
+                 (let [t (emit-form code arr locals operand-ctx)]
+                   (emit-retained-array-checkcast code arr-tag t arr-verified? ctx)
+                   t)))
+        index (when-not (diverge? (:type array))
+                (emit-completed-value-spill!
+                 code ctx
+                 (fn []
+                   (let [t (emit-form code idx locals operand-ctx)]
+                     (if (diverge? t) t
+                       (if (= t :int) t (emit-coerce code t :int)))))))
+        target (case arr-tag doubles :double floats :float longs :long
+                     (ints bytes shorts) :int :ref)
+        completed (when (and index (not (diverge? (:type index))))
+                    (emit-completed-value-spill!
+                     code ctx
+                     (fn []
+                       (if (= target :ref)
+                         (emit-object-value code value locals operand-ctx)
+                         (let [t (emit-form code value locals operand-ctx)]
+                           (if (diverge? t) t
+                             (if (= t target) t (emit-coerce code t target))))))))]
+    (if (some #(diverge? (:type %)) [array index completed])
+      :diverge
+      (do
+        ;; Null, bounds and reference-store checks belong to the existing store,
+        ;; after the value and its element completion, never to an earlier spill.
+        (reload-completed-value! code array)
+        (reload-completed-value! code index)
+        (reload-completed-value! code completed)
+        (case arr-tag
+          doubles (.dastore code) floats (.fastore code) longs (.lastore code)
+          ints (.iastore code) bytes (.bastore code) shorts (.sastore code)
+          (.aastore code))
+        (if (:void-context ctx)
+          :void
+          (do (reload-completed-value! code completed) (:type completed)))))))
+
 (defn- emit-aset-intrinsic
   "Emit bytecode for aset (array write). Handles typed array checkcast,
    void-context optimization (plain store vs temp-local for return value),
@@ -2530,8 +2470,10 @@
         arr-tag (or (:tag (meta arr))
                     (:raster.type/tag (meta arr))
                     (when (symbol? arr) (:hint (get locals arr))))
-        arr-verified? (when (symbol? arr) (:verified (get locals arr)))
-        arr-type (emit-form code arr locals ctx)]
+        arr-verified? (when (symbol? arr) (:verified (get locals arr)))]
+    (if (same-frame-loop? val)
+      (emit-aset-completed-spills code args locals ctx arr-tag arr-verified?)
+      (let [arr-type (emit-form code arr locals ctx)]
     ;; Known storage only; unknown references use runtime dispatch above.
     (emit-retained-array-checkcast code arr-tag arr-type arr-verified? ctx)
     (let [t (emit-form code idx locals ctx)]
@@ -2594,7 +2536,7 @@
                 (do (.aastore code) :void)
                 ;; dup_x2: [arr, idx, val] → [val, arr, idx, val]
                 ;; aastore pops [arr, idx, val], leaving [val] as result
-                (do (.dup_x2 code) (.aastore code) :ref))))))))
+                (do (.dup_x2 code) (.aastore code) :ref))))))))))
 
 (defn- emit-alength-intrinsic
   "Emit bytecode for alength. Uses arraylength when the array type is known,
@@ -3579,6 +3521,31 @@
   (let [s @(:next-slot ctx)]
     (swap! (:next-slot ctx) + (if (two-slot? type) 2 1))
     s))
+
+(defn- emit-completed-value-spill!
+  "Evaluate and complete an operand through its existing emitter callback.
+   Only the actual resulting JVM carrier selects a private local; this creates
+   no source binding, inferred type, Class proof or new completion operation."
+  [code ctx complete!]
+  (let [t (complete!)]
+    (when-not (contains? #{:double :float :long :int :bool :ref :diverge} t)
+      (throw (ex-info "completed operand spill requires an actual JVM value"
+                      {:reason :bytecode-completed-spill-value :type t})))
+    (if (diverge? t)
+      {:type t}
+      (let [slot (alloc-slot! ctx t)]
+        (case t
+          :double (.dstore code slot) :float (.fstore code slot)
+          :long (.lstore code slot) (:int :bool) (.istore code slot)
+          :ref (.astore code slot))
+        {:slot slot :type t}))))
+
+(defn- reload-completed-value! [code {:keys [slot type]}]
+  (case type
+    :double (.dload code slot) :float (.fload code slot)
+    :long (.lload code slot) (:int :bool) (.iload code slot)
+    :ref (.aload code slot))
+  type)
 
 ;; ---------------------------------------------------------------------------
 ;; Extracted emit-form handlers (each compiles to its own JVM class method,
@@ -5833,7 +5800,7 @@
                                                             :source-ns        source-ns}
                                                        ctx (merge ctx body-input-context)
                                                        expanded-body (binding [*ns* source-ns]
-                                                                       (mapv (comp lift-loop-operands pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                                       (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        _ (when-let [token (::body-occurrence (meta walked-body))]
                                                            (when me/*emission-inputs*
                                                              (swap! me/*emission-inputs* update :body-contexts
@@ -5944,7 +5911,7 @@
                                                             :source-ns  source-ns
                                                             :typed-sibling-methods typed-sibling-methods}
                                                        expanded-body (binding [*ns* source-ns]
-                                                                       (mapv (comp lift-loop-operands pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                                       (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        ret-type (emit-body code expanded-body locals ctx)
                                                        target-st (:stack-type return-info)
                                                        ret-cd (:class-desc return-info)]
