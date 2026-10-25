@@ -1433,49 +1433,57 @@
   "Construct and independently validate the ordinary whole-program boundary after source work.
    Cached host results are looked up, not recomputed. Zeroed source allocations remain conditional
    initialized inputs; the runtime must prove their actual completed initialization before export."
-  [state caller-options]
-  (when-not (= caller-options (:caller-options state))
-    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
-  (when-not (and (nil? (:pending state))
-                 (= (:source-cursor state) (count (:source-order state))))
-    (fail! :invocation-ordered-incomplete "source work has not completed" {}))
-  (let [materialized (materialization/finish-materialization (:materialization state))
-        initialized-tokens (into #{}
-                                 (keep (fn [[token storage]]
-                                         (when (= :zero (:initialization storage)) token)))
-                                 (get-in state [:realized :storage]))
-        evaluate-host (fn [equation _]
-                        (let [step (get-in state [:host-steps (:id equation)])]
-                          (when-not (= equation (:equation step))
-                            (fail! :invocation-ordered-host-result
-                                   "completed source work lacks this exact host definition"
-                                   {:equation (:id equation)}))
-                          (:results step)))
-        entry-refresh (:entry-refresh state)
-        captured (into #{} (keep (fn [[token role]] (when (not= :input role) token))) entry-refresh)
-        project (fn [candidate]
-                  {:plan (cond-> (update candidate :nodes
-                                 (fn [nodes]
-                                   (let [nodes (reduce (fn [nodes token]
-                                                        (if (contains? nodes token)
-                                                          (assoc-in nodes [token :source] nil)
-                                                          nodes))
-                                                       nodes captured)]
-                                     (reduce (fn [nodes token]
-                                               (when-not (contains? nodes token)
-                                                 (fail! :invocation-ordered-storage
-                                                        "source allocation is absent from final storage"
-                                                        {:storage token}))
-                                               (assoc-in nodes [token :role] :state))
-                                             nodes initialized-tokens))))
-                           entry-refresh
-                           (project-public-roles
-                            (into {} (keep (fn [[symbol token]]
-                                             (when-let [role (get entry-refresh token)] [symbol role])))
-                                  (get-in candidate [:attributes :public-buffer-bindings]))))})]
-    (link/without-validation-context
-     #(lower-in-context materialized (:program state) (:target state) evaluate-host project nil
-                        caller-options state))))
+  ([state caller-options] (finish-ordered-realization state caller-options nil))
+  ([state caller-options project-boundary]
+   (when-not (= caller-options (:caller-options state))
+     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
+   (when-not (and (nil? (:pending state))
+                  (= (:source-cursor state) (count (:source-order state))))
+     (fail! :invocation-ordered-incomplete "source work has not completed" {}))
+   (let [materialized (materialization/finish-materialization (:materialization state))
+         initialized-tokens (into #{}
+                                  (keep (fn [[token storage]]
+                                          (when (= :zero (:initialization storage)) token)))
+                                  (get-in state [:realized :storage]))
+         evaluate-host (fn [equation _]
+                         (let [step (get-in state [:host-steps (:id equation)])]
+                           (when-not (= equation (:equation step))
+                             (fail! :invocation-ordered-host-result
+                                    "completed source work lacks this exact host definition"
+                                    {:equation (:id equation)}))
+                           (:results step)))
+         entry-refresh (:entry-refresh state)
+         captured (into #{} (keep (fn [[token role]] (when (not= :input role) token))) entry-refresh)
+         project
+         (fn [candidate]
+           (let [candidate
+                 (update candidate :nodes
+                         (fn [nodes]
+                           (let [nodes (reduce (fn [nodes token]
+                                                 (if (contains? nodes token)
+                                                   (assoc-in nodes [token :source] nil)
+                                                   nodes)) nodes captured)]
+                             (reduce (fn [nodes token]
+                                       (when-not (contains? nodes token)
+                                         (fail! :invocation-ordered-storage
+                                                "source allocation is absent from final storage"
+                                                {:storage token}))
+                                       (assoc-in nodes [token :role] :state))
+                                     nodes initialized-tokens))))
+                 candidate
+                 (if entry-refresh
+                   (project-public-roles
+                    candidate
+                    (into {} (keep (fn [[symbol token]]
+                                     (when-let [role (get entry-refresh token)] [symbol role])))
+                          (get-in candidate [:attributes :public-buffer-bindings])))
+                   candidate)]
+             ;; Public selection is another ordinary final projection, not completion evidence.
+             ;; It runs after source/role reconciliation and before the ordinary final proof.
+             (if project-boundary (project-boundary candidate) {:plan candidate})))]
+     (link/without-validation-context
+      #(lower-in-context materialized (:program state) (:target state) evaluate-host project nil
+                         caller-options state)))))
 
 (def ^:private resident-layout-keys
   #{:target :nodes :values :buffer-bindings :scalar-values :public-inputs})

@@ -15,6 +15,7 @@
             [raster.gpu.link :as link]
             [raster.gpu.value :as value]
             [raster.gpu.ordered-invocation-root-test :as root-fixture]
+            [raster.gpu.program-memory-order-test :as dense-fixture]
             [raster.gpu.device-probe :as ocl-probe]
             [raster.dl.gpu-grad-parity :as ze-probe]))
 
@@ -174,12 +175,122 @@
         (is (nil? (:lowering prepared)))
         (is (= :semantic-preparation (get-in prepared [:preparation-report :phase])))
         (is (false? (get-in prepared [:preparation-report :concrete-plan-available?]))))
-      (doseq [options [{:donate '[x]} {:outputs '[first-output]} {:taps '[x]}
-                       {:profile? true} {:session :borrowed}]]
+      (doseq [options [{:outputs '[out first-output out]} {:taps '[x out]}]]
+        (let [prepared (compiled/lower #'fixture/write-before-shape arguments
+                                       (merge {:compiler :equation-first :target :ocl:0 :dtype :double}
+                                              options))]
+          (is (compiled/prepared? prepared))
+          (is (= :after-source (get-in prepared [:preparation-report :output-projection-phase])))
+          (is (every? #(not (contains? % :node)) (:out-tree prepared))
+              "physical outputs and alias deduplication are not claimed before source work")))
+      (doseq [options [{:donate '[x]} {:profile? true} {:session :borrowed}]]
         (is (= :compiled-ordered-capability
                (reason #(compiled/lower #'fixture/write-before-shape arguments
                                          (merge {:compiler :equation-first :target :ocl:0 :dtype :double}
-                                                options)))))))))
+                                                options))))))
+      (is (= :compiled-equation-first-output
+             (reason #(compiled/lower #'fixture/write-before-shape arguments
+                                       {:compiler :equation-first :target :ocl:0 :dtype :double
+                                        :outputs '[missing]}))))
+      (is (= :compiled-ordered-output-kind
+             (reason #(compiled/lower #'fixture/write-before-shape arguments
+                                       {:compiler :equation-first :target :ocl:0 :dtype :double
+                                        :taps '[n]})))))))
+
+(defn- check-ordered-output-selection! [target]
+  (let [prepared (compiled/lower #'fixture/write-before-shape
+                                 [(double-array [7.0]) (double-array 1) 1]
+                                 {:compiler :equation-first :target target :dtype :double
+                                  :outputs '[out first-output out] :taps '[x out first-output]})
+        artifact (compiled/instantiate! prepared)]
+    (try
+      (is (= :compiled-ordered-entry-intent
+             (reason #(compiled/instantiate! prepared {:project-boundary identity}))))
+      (let [first (artifact)
+            check! (fn [outputs x]
+                     (is (= #{:out :first-output :x} (set (keys outputs))))
+                     (is (= [1.0] (vec (value/->host (:out outputs)))))
+                     (is (= [(+ x 1.0)] (vec (value/->host (:first-output outputs)))))
+                     (is (= [x] (vec (value/->host (:x outputs))))))]
+        (check! first 7.0)
+        (let [executable (:executable artifact)
+              boundary (:resident-boundary @(:execution-state executable))
+              plan (:plan boundary)
+              tree (get-in boundary [:projection :out-tree])]
+          (is (= [:out :first-output :x] (mapv :key tree)))
+          (is (= (:outputs plan) (mapv :node tree)))
+          (is (= (count (:outputs plan)) (count (set (:outputs plan)))))
+          (is (= 1 (count (get-in plan [:attributes :semantic-outputs])))
+              "public taps do not become fabricated semantic results")
+          (is (= :invocation-link-output-boundary
+                 (reason #(invocation-link/certify plan (pop (:outputs plan))))))
+          (is (= :link-outputs
+                 (reason #(invocation-link/certify plan (conj (:outputs plan) ::missing-output)))))
+          (is (= (set (:outputs plan)) (set (keys (link/outputs executable))))))
+        (is (= :invocation-materialization-buffer-dtype
+               (reason #(artifact {:x (float-array 1)}))))
+        (is (every? value/live? (vals first)) "failed preflight retains all previous outputs")
+        (check! (artifact {:x (double-array [11.0])}) 11.0)
+        (is (not-any? value/live? (vals first)) "successful replay retires every escaped wrapper")
+        (check! (artifact) 7.0))
+      (finally (compiled/close! artifact))))
+  (let [prepared (compiled/lower #'fixture/write-before-shape
+                                 [(double-array [7.0]) (double-array 1) Long/MAX_VALUE]
+                                 {:compiler :equation-first :target target :dtype :double
+                                  :outputs '[first-output] :taps '[x]})
+        artifact (compiled/instantiate! prepared)]
+    (try
+      (is (instance? ArithmeticException (try (artifact) nil (catch Throwable error error))))
+      (is (nil? @(:live-outputs artifact)))
+      (is (= :link-execution-poisoned
+             (reason #(link/invocation-output-projection (:executable artifact)))))
+      (is (zero? @(:completed-replays (:executable artifact))))
+      (finally (compiled/close! artifact))))
+  (doseq [[source arguments options expected]
+          [[#'root-fixture/ordered-void! [(double-array 1)] {:outputs '[out out] :taps '[out]}
+            {:out [2.0]}]
+           [#'fixture/write-before-resident-reduction
+            [(double-array [7.0]) (double-array 1) 1]
+            {:outputs '[sum] :taps '[out sum]} {:sum [7.0] :out [15.0]}]]]
+    (let [compilation (equation-first/compile source {:target target :dtype :double})
+          prepared (#'compiled/prepare-ordered-equation-first compilation arguments options nil)
+          artifact (compiled/instantiate! prepared)]
+      (try
+        (is (= expected (into {} (map (fn [[key array]] [key (vec (value/->host array))]))
+                                   (artifact))))
+        (finally (compiled/close! artifact)))))
+  (let [w (double-array [1.0 0.25 -0.5 1.0])
+        b (double-array [0.25 -0.125])
+        prepared (compiled/lower #'dense-fixture/four-layers
+                                 [w b (double-array [1.0 -2.0])]
+                                 {:compiler :equation-first :target target :dtype :double
+                                  :constants '[w b] :taps '[middle]})
+        artifact (compiled/instantiate! prepared)
+        ;; Independent two-coordinate oracle, not the compiler's dense implementation.
+        layer (fn [[x y]] [(+ x (* 0.25 y) 0.25) (+ (* -0.5 x) y -0.125)])]
+    (try
+      (is (some? (:ordered-invocation prepared)))
+      (doseq [coordinates [[1.0 -2.0] [2.0 3.0]]]
+        (let [expected (iterate layer coordinates)
+              outputs (artifact {:x (double-array coordinates)})]
+          (is (= #{:result :middle} (set (keys outputs))))
+          (is (= (nth expected 2) (vec (value/->host (:middle outputs)))))
+          (is (= (nth expected 4) (vec (value/->host (:result outputs)))))
+          (let [plan (get-in @(:execution-state (:executable artifact)) [:resident-boundary :plan])
+                middle (get-in plan [:attributes :compiler-buffer-bindings 'middle])]
+            (is (not (contains? (set (vals (get-in plan [:attributes :public-buffer-bindings]))) middle)))
+            (is (contains? (set (:outputs plan)) middle)))))
+      (finally (compiled/close! artifact)))))
+
+(deftest opencl-ordered-explicit-outputs-and-taps
+  (if @ocl-probe/opencl-fp64-available?
+    (check-ordered-output-selection! :ocl:0)
+    (ocl-probe/opencl-skip! "ordered public output selection")))
+
+(deftest level-zero-ordered-explicit-outputs-and-taps
+  (if @ze-probe/gpu-available?
+    (check-ordered-output-selection! :ze:0)
+    (ze-probe/gpu-skip! "ordered public output selection")))
 
 (deftest direct-eager-lowering-refuses-before-a-late-check-can-run
   (let [compilation (equation-first/compile #'fixture/write-before-shape
@@ -267,8 +378,7 @@
   (let [compilation (equation-first/compile #'fixture/write-before-shape {:target :ocl:0 :dtype :double})
         args [(double-array [7.0]) (double-array 1) Long/MAX_VALUE]]
     (with-redefs [gpu/make-session (fn [& _] (throw (Exception. "unexpected driver acquisition")))]
-      (doseq [opts [{:donate '[x]} {:outputs '[first-output]} {:taps '[x]}
-                    {:profile? true} {:session :borrowed}]]
+      (doseq [opts [{:donate '[x]} {:profile? true} {:session :borrowed}]]
         (is (= :compiled-ordered-capability
                (reason #(#'compiled/prepare-ordered-equation-first compilation args opts nil)))))
       (is (= :link-write-read-only

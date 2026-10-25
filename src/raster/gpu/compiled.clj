@@ -59,7 +59,7 @@
            [lowering     ;; certified resident or composition lowering into LinkPlan
             executable  ;; LinkedExecutable: the sole resident runtime representation
             in-tree      ;; ordered [{:key :sym :role :donate? :shape :dtype} …] — the arg spec
-            out-tree     ;; ordered [{:key :sym :shape :dtype :from} …] — the result spec (multi-output)
+            out-tree     ;; result spec; ordered-source artifacts retain candidates until completion
             donated      ;; {in-key → out-key} — the alias plan (JAX input_output_aliases)
             schedule     ;; the S6 Schedule map (reserved; nil until S6 fills it)
             target       ;; device-id + (future) HardwareDescriptor
@@ -78,6 +78,8 @@
   (applyTo [this argseq] (apply invoke-compiled this argseq)))
 
 (defrecord Prepared
+           ;; Ordered-source out-tree entries are immutable selection candidates, not physical
+           ;; output claims. Its completed executable carries the checked, alias-deduplicated tree.
            [lowering in-tree out-tree donated schedule target descriptor args preparation-report
             provenance-seal])
 
@@ -956,6 +958,47 @@
     {:parameter-projection projection :aggregate-leaves aggregate-leaves :roles roles
      :request request :effective-roles effective-roles :field-output-entries field-output-entries}))
 
+(defn- equation-first-output-candidates
+  "Ordered public intent only. Physical aliases are resolved and deduplicated at final projection."
+  [request field-output-entries semantic-outputs]
+  (vec (concat (:donated-entries request) (:output-entries request) field-output-entries
+               (map-indexed
+                (fn [index value]
+                  {:key (equation-first-output-key value index (count semantic-outputs))
+                   :sym value :from :result})
+                semantic-outputs)
+               (:tap-entries request))))
+
+(defn- project-equation-first-outputs
+  "Resolve public intent once against actual storage, before the ordinary final LinkPlan proof.
+   This is shared by eager preparation and source-ordered completion; it grants no completion."
+  [plan candidates field-output-entries]
+  (let [public-bindings (get-in plan [:attributes :public-buffer-bindings])
+        compiler-bindings (get-in plan [:attributes :compiler-buffer-bindings])
+        resolve-entry (fn [{:keys [sym] :as entry}]
+                        (let [node (or (get public-bindings sym) (get compiler-bindings sym)
+                                       (throw (ex-info "equation-first output names no resident value"
+                                                       {:reason :compiled-equation-first-output
+                                                        :value sym})))]
+                          (merge entry (equation-first-value plan node nil))))
+        resolved (mapv resolve-entry candidates)
+        _ (when (seq field-output-entries)
+            (validate-field-output-nodes!
+             (mapv resolve-entry field-output-entries)
+             (mapv resolve-entry (remove (set field-output-entries) candidates))))
+        out-tree (reduce (fn [entries entry]
+                           (if (some #(= (:node %) (:node entry)) entries)
+                             entries
+                             (conj entries entry))) [] resolved)
+        _ (require-unique-output-keys! out-tree)
+        escaped (mapv :node out-tree)
+        missing (set/difference (set (:outputs plan)) (set escaped))]
+    (when (seq missing)
+      (throw (ex-info "escaped invocation outputs must retain the semantic output boundary"
+                      {:reason :invocation-link-output-boundary
+                       :missing missing :outputs escaped})))
+    {:plan (assoc plan :outputs escaped) :projection {:out-tree out-tree}}))
+
 (defn- project-equation-first-boundary
   "Choose physical public nodes and escaped outputs from semantic intent before the final proof."
   [raw-plan compilation args options]
@@ -966,7 +1009,6 @@
          projection :parameter-projection}
         (equation-first-port-intent invocation-plan (set (keys public-bindings))
                                    (:public-buffer-roles attributes) options)
-        compiler-bindings (:compiler-buffer-bindings attributes)
         plan (invocation-link/project-public-roles raw-plan effective-roles)
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
         argument-map (when-not projection (zipmap (map :symbol parameters) args))
@@ -1002,46 +1044,11 @@
                                     (equation-first-value plan node
                                                           (get effective-roles symbol))))))
                        parameters))
-        resolve-node (fn [value]
-                       (or (get public-bindings value)
-                           (get compiler-bindings value)
-                           (throw (ex-info "equation-first output names no resident value"
-                                           {:reason :compiled-equation-first-output
-                                            :value value}))))
-        output-entry (fn [key value from]
-                       (merge {:key key :sym value :from from}
-                              (equation-first-value plan (resolve-node value) nil)))
-        project-entry (fn [{:keys [key sym from]}] (output-entry key sym from))
-        donated-nodes (map project-entry (:donated-entries request))
-        ordinary-explicit-nodes (map project-entry (:output-entries request))
-        field-explicit-nodes (map project-entry field-output-entries)
-        semantic-outputs (vec (:semantic-outputs attributes))
-        semantic-nodes (map-indexed
-                        (fn [index [value _]]
-                          (output-entry
-                           (equation-first-output-key value index (count semantic-outputs))
-                           value :result))
-                        semantic-outputs)
-        tap-nodes (map project-entry (:tap-entries request))
-        _ (validate-field-output-nodes!
-           field-explicit-nodes
-           (concat donated-nodes ordinary-explicit-nodes semantic-nodes tap-nodes))
-        out-tree (reduce (fn [entries entry]
-                           (if (some #(= (:node %) (:node entry)) entries)
-                             entries
-                             (conj entries entry)))
-                         [] (concat donated-nodes ordinary-explicit-nodes field-explicit-nodes
-                                    semantic-nodes tap-nodes))
-        _ (require-unique-output-keys! out-tree)
-        escaped (mapv :node out-tree)
-        missing (set/difference (set (:outputs plan)) (set escaped))
-        _ (when (seq missing)
-            (throw (ex-info "escaped invocation outputs must retain the semantic output boundary"
-                            {:reason :invocation-link-output-boundary
-                             :missing missing :outputs escaped})))]
-    {:plan (assoc plan :outputs escaped)
-     :projection {:in-tree in-tree :out-tree out-tree
-                  :donated (donated-output-keys request)}}))
+        candidates (equation-first-output-candidates
+                    request field-output-entries
+                    (mapv first (:semantic-outputs attributes)))
+        projected (project-equation-first-outputs plan candidates field-output-entries)]
+    (update projected :projection assoc :in-tree in-tree :donated (donated-output-keys request))))
 
 (defn- prepare-ordered-equation-first
   "Retain semantic ports and the same compiled template without inventing a concrete LinkPlan.
@@ -1051,7 +1058,7 @@
   (let [started (System/nanoTime)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
         _ (when (or (get-in invocation-plan [:attributes :parameter-projection])
-                    (some seq ((juxt :donate :outputs :taps) opts))
+                    (seq (:donate opts))
                     (:session opts) (:profile? opts))
             (throw (ex-info "ordered preparation requires flat owned unprofiled semantic ports"
                             {:reason :compiled-ordered-capability})))
@@ -1083,34 +1090,47 @@
                          :shape (:shape buffer) :dtype (get-in buffer [:value :dtype])
                          :default (:source buffer) :donate? false})
                       (sort-by #(get parameter-order (:id (val %))) buffers))
-        outputs (get-in initial [:program :outputs])
+        outputs (vec (get-in initial [:program :outputs]))
+        candidates (equation-first-output-candidates (:request intent) [] outputs)
+        candidate-value (fn [id]
+                          (or (get-in initial [:program :values id])
+                              (get-in buffers [id :value])
+                              (throw (ex-info "equation-first output names no resident value"
+                                              {:reason :compiled-equation-first-output :value id}))))
         _ (when-not (every? (fn [id]
-                             (let [value (get-in initial [:program :values id])]
+                             (let [value (candidate-value id)]
                                (or (seq (:shape value))
                                    (when-let [resident (equation-first/validated-resident-output
                                                        compilation id)]
-                                     (semantic-fingerprint/equivalent? resident value))))) outputs)
+                                     (semantic-fingerprint/equivalent? resident value)))))
+                           (map :sym candidates))
             (throw (ex-info "ordered public outputs require arrays or certified resident scalars"
                             {:reason :compiled-ordered-output-kind})))
-        out-tree (mapv (fn [index id]
-                         {:key (equation-first-output-key id index (count outputs))
-                          :value id :abstract (get-in initial [:program :values id]) :from :result})
-                       (range) outputs)
-        _ (require-unique-output-keys! out-tree)
+        ;; These are candidates, not physical output claims. Alias deduplication and surviving
+        ;; key checks occur once at the final checked boundary, just as on the eager path.
+        out-tree (mapv (fn [{:keys [sym] :as entry}]
+                         (assoc entry :value sym :abstract (candidate-value sym))) candidates)
+        project-boundary (fn [candidate]
+                           (when-not (= outputs (mapv first (get-in candidate [:attributes :semantic-outputs])))
+                             (throw (ex-info "completed semantic outputs differ from prepared intent"
+                                             {:reason :compiled-ordered-output-boundary})))
+                           (project-equation-first-outputs candidate candidates []))
         descriptor {:all-params (mapv :symbol parameters)
                     :array-params (mapv :sym in-tree) :equation-first? true
                     :steps (equation-first-kernel-steps compilation)
                     :execution-phase :ordered-source}
         report {:kind :ordered-equation-first :phase :semantic-preparation
                 :timing-source :host-monotonic :total-ns (- (System/nanoTime) started)
-                :template template-report :concrete-plan-available? false}]
+                :template template-report :concrete-plan-available? false
+                :output-projection-phase :after-source}]
     (seal-artifact
      (cond-> (assoc (->Prepared nil in-tree out-tree {}
                                (assoc (get-in compilation [:options :schedule])
                                       :compiler :equation-first :stats (:stats compilation))
                                (:target compilation)
                                descriptor (vec args) report nil)
-                    :ordered-invocation {:compilation compilation :entry-roles roles})
+                    :ordered-invocation {:compilation compilation :entry-roles roles
+                                         :project-boundary project-boundary})
        caller-options (assoc :math-request caller-options)))))
 
 (defn- lower-equation-first
@@ -1302,11 +1322,13 @@
                         (when-not (sealed-artifact? prepared)
                           (throw (ex-info "ordered instantiation requires the original prepared semantic boundary"
                                           {:reason :compiled-ordered-owner})))
-                        (when (contains? opts :entry-roles)
+                        (when (some #(contains? opts %) [:entry-roles :project-boundary])
                           (throw (ex-info "runtime options cannot replace prepared entry intent"
                                           {:reason :compiled-ordered-entry-intent})))
                         (gpu-link/instantiate-ordered-invocation!
-                         (:compilation ordered) args (assoc opts :entry-roles (:entry-roles ordered))))
+                         (:compilation ordered) args
+                         (assoc opts :entry-roles (:entry-roles ordered)
+                                     :project-boundary (:project-boundary ordered))))
                       (if (and (sealed-artifact? prepared)
                              (if caller-math-options
                                (link-plan/retained-effect-evidence? (:plan lowering) evidence caller-math-options)
@@ -1766,7 +1788,7 @@
                     {:reason :compiled-deferred-evidence})))
   (when-not (map? inputs)
     (throw (ex-info "compiled inputs must be a map" {:reason :compiled-input-map})))
-  (let [{:keys [executable target out-tree]} c
+  (let [{:keys [executable target]} c
         {:keys [input-nodes input-keys]} (invocation-layout-for c)]
     (when-not (set/subset? (set (keys inputs)) input-keys)
       (throw (ex-info "only dynamic input keys may be replaced; constants and state are captured"
@@ -1777,12 +1799,13 @@
       (observation/phase :replay-host
         (gpu-link/run-ordered-with-inputs! executable replacements #(invalidate-live-outputs! c)))
       (observation/phase :output-projection
-        (let [views (gpu-link/invocation-output-views executable)]
-          (when-not (= (set (map :value out-tree)) (set (keys views)))
+        (let [out-tree (:out-tree (gpu-link/invocation-output-projection executable))
+              views (gpu-link/outputs executable)]
+          (when-not (= (set (map :node out-tree)) (set (keys views)))
             (throw (ex-info "completed semantic outputs differ from prepared output intent"
                             {:reason :compiled-ordered-output-boundary})))
-          (let [outputs (into {} (map (fn [{:keys [key value]}]
-                                        (let [resident (get views value)
+          (let [outputs (into {} (map (fn [{:keys [key node]}]
+                                        (let [resident (get views node)
                                               buffer (gpu/buffer (:session executable) (:key resident))]
                                           [key (v/wrap-external-view buffer target (:view resident))]))) out-tree)]
             (reset! (:live-outputs c) (vec (vals outputs)))

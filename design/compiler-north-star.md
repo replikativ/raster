@@ -1360,13 +1360,13 @@ retain the original captured weights and advance a resident counter from one to 
 source-created temporaries are zeroed again. Capture uses the existing Cleanup transaction;
 a later entry-upload failure releases the earlier acquired roots and session without publishing
 an executable. Contradictory read-only intent is rejected before native acquisition. Semantic
-port-intent normalization and concrete public-role projection are shared with the eager path,
-but this does not yet activate deferred public `Compiled`: donation, input replacement,
+port-intent normalization and concrete public-role projection are shared with the eager path.
+Public ordered `Compiled` supports flat host-array input replacement; donation,
 composition and frontier contracts remain separate gates. Host scalar element reads of captured
 device entries remain unsupported; validated shape descriptors are not content snapshots.
 Completion certificates remain unavailable until execution.
 
-The next internal phase retains that same compiled template in the existing sealed `Prepared`
+The public ordered phase retains that same compiled template in the existing sealed `Prepared`
 and `Compiled` types: preparation carries semantic entry/output identities and explicitly no
 concrete lowering certificate. Owned instantiation captures entries, ordinary invocation validates
 all host-array replacements before retiring outputs, and completed output views resolve through
@@ -1376,11 +1376,22 @@ and leased-invocation APIs explicitly decline this deferred phase rather than fa
 Distinct parameter storage cannot silently split a mutable host alias: the shared host-identity
 checker rejects this before capture or replacement commitment, while read-only sharing remains
 legal. Native ranges and device inputs still need their own overlap/ownership contracts.
-Local OpenCL/Level Zero controls qualify this constructor-to-callable slice, not automatic
-frontend selection. Enabling ordinary lowering must separately derive ordering obligations and
-check capability coverage, including existing model, contraction and scientific workloads; an
+Ordinary lowering derives ordering obligations and checks source-action capability coverage
+before selecting this phase. Local OpenCL/Level Zero controls qualify the covered constructor,
+replay and failure-order workloads, not every model, contraction or scientific program; an
 unsupported ordering obligation cannot fall back eagerly. No new compiler cache, record family,
 backend executor or performance claim follows from this phase.
+
+For ordered artifacts, `out-tree` is immutable public selection intent until source execution
+completes, not a physical-output certificate. Explicit outputs, semantic results and taps retain
+their usual precedence. The eager and ordered paths share one final projector: resolve actual
+resident storage, keep the first entry for each physical node, then reject surviving duplicate
+keys. The ordered path runs it after source/role reconciliation and before ordinary final
+LinkPlan validation, retaining the derived tree beside that exact completed plan. It never
+rewrites semantic results to include taps. Every selected node must be acquired and initialized
+before publication. A tap retains the final contents of its physical storage; it is not a
+snapshot of an earlier SSA version that later aliases overwrite. Aggregate ports, donation,
+deferred composition and leased compiled invocation still require their separate contracts.
 
 Auxiliary realization bindings are executable source actions, not scaffolding that can be
 discarded because a later kernel overwrites the result. The internal ordered root now recovers
@@ -1391,7 +1402,7 @@ grants no allocation, initialization or completion credit. Local OpenCL/Level Ze
 cover the existing four-layer dense program, changed-input replays, empty functional results,
 late constructor failures and aliases after fused writes. Distinct logical/physical result
 storage, prefix views and aliases before target acquisition remain explicit capability limits;
-this does not enable automatic frontend selection.
+these controls do not qualify every possible frontend realization.
 Preparation and native-root construction share one structural source-action coverage gate before
 capture or effects. It refuses unsupported steps/realizations, structured-loop fragments and
 missing native-content-provider contracts without evaluating a checked source size. Runtime

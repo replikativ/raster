@@ -1017,6 +1017,21 @@
                       {:reason :link-invocation-output-boundary})))
     (into {} (map (fn [[id token]] [id (boundary-node-view! boundary token)])) outputs)))
 
+(defn ^:no-doc invocation-output-projection
+  "Return public selection derived alongside the completed checked invocation plan, not the
+   preparation's unresolved output candidates. Resident views remain available through outputs."
+  [executable]
+  (let [executable (ensure-live! executable :invocation-output-projection)
+        {:keys [plan projection]} (resident-boundary! executable :invocation-output-projection)
+        entries (:out-tree projection)]
+    (when-not (and (= :typed-invocation (get-in plan [:attributes :source]))
+                   (vector? entries)
+                   (= (:outputs plan) (mapv :node entries))
+                   (= (count entries) (count (set (map :key entries)))))
+      (throw (ex-info "public output projection requires its completed invocation boundary"
+                      {:reason :link-invocation-output-projection})))
+    projection))
+
 (defn- require-owned-output-boundary! [executable]
   (when (some-> executable :execution-state deref :exclusive-mutation?)
     (throw (ex-info "output leases cannot escape an exclusive mutation scope"
@@ -1133,7 +1148,8 @@
    tests before this path is exposed by Compiled; the ordinary eager instantiator is unchanged."
   [compilation arguments opts]
   (when (or (:session opts) (:profile? opts)
-            (seq (set/difference (set (keys opts)) #{:scalar-math :profile? :entry-roles})))
+            (seq (set/difference (set (keys opts)) #{:scalar-math :profile? :entry-roles :project-boundary}))
+            (and (:project-boundary opts) (not (fn? (:project-boundary opts)))))
     (throw (ex-info "ordered invocation activation currently requires an owned unprofiled session"
                     {:reason :link-ordered-options})))
   (let [caller-options (caller-math-options opts)
@@ -1145,6 +1161,7 @@
                                :ordered {:compilation compilation :arguments (vec arguments)
                                          :caller-options caller-options
                                          :entry-roles entry-roles
+                                         :project-boundary (:project-boundary opts)
                                          :entry-refresh (:entry-refresh entry-layout)
                                          :initialized []
                                          :leaseable-output?
@@ -1274,8 +1291,9 @@
 
 (defn- finish-ordered-invocation! [executable state]
   (let [execution-state (:execution-state executable)
-        {:keys [caller-options roots execution-id ledger timings initialized]} (:ordered @execution-state)
-        final (invocation-link/finish-ordered-realization state caller-options)
+        {:keys [caller-options roots execution-id ledger timings initialized project-boundary]}
+        (:ordered @execution-state)
+        final (invocation-link/finish-ordered-realization state caller-options project-boundary)
         plan (:plan final)
         groups (allocation-groups plan)]
     (when-not (set/subset? (set (keys groups)) (:acquired-storage state))
@@ -1291,7 +1309,8 @@
                       {:reason :link-ordered-incomplete-storage})))
     (let [storage (realize-plan-storage! plan (:session executable) execution-id groups {}
                                         ledger timings roots)]
-      (swap! execution-state assoc :resident-boundary {:plan plan :node-views (:node-views storage)}))))
+      (swap! execution-state assoc :resident-boundary {:plan plan :node-views (:node-views storage)
+                                                      :projection (:projection final)}))))
 
 (defn- run-ordered-invocation! [executable]
   (let [execution-state (:execution-state executable)

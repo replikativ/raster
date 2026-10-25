@@ -2,6 +2,27 @@
 
 ## Reconciled execution plan
 
+### Current boundary ledger
+
+The October 25 independent review keeps all eight original campaign objectives.
+The numerical IR is compositional; the source-execution and public ownership
+boundary is not yet uniformly compositional. Consolidate the common boundary
+rather than adding a route for each workload.
+
+| Family | First incomplete boundary | Acceptance evidence required |
+| --- | --- | --- |
+| Causal allocation extents | Preceding lexical alias to allocation shape | `bf02a900`: 32 tests / 242 assertions; original recipe and failure ordering preserved |
+| Ordered outputs and taps | Deferred public intent to completed physical boundary | Locally qualified: 45 tests / 997 assertions, shared projector, independent intermediate/final device values and replay/lifetime/failure/certificate controls; full branch gates still pending |
+| Aggregate state and composition | Public parameter leaves and deferred components | Same source cursor, explicit ownership, no fabricated preparation-time LinkPlan; composed AMR/distributed workload |
+| RK4 | Source-loop construction, then ordered structured execution | Source/count/carry/body/copy correspondence; zero/one/many iterations and independent PDE oracle |
+| Float/Object results | Owned imported completion suffix after numerical reduction | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
+| Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
+| Compile cost and full qualification | GSDM timeout and incomplete CI denominator | Phase profiling, complete exact-head shards/corpus/device/compiler gates; separate cold/prepare/replay/device timings |
+
+This ledger is the current plan. The dated sections below retain implementation
+evidence and historical decisions; they do not independently authorize obsolete
+execution paths or relax the original campaign's acceptance obligations.
+
 ### October 25 failure-driven consolidation
 
 The exact unmerged 62ee82a6 CI baseline has 72 distinct failing test Vars across
@@ -103,6 +124,20 @@ Landing order within the unchanged eight-objective campaign:
    constructor count/dtype refusals and failure before scalar allocation/publication.
    Host-completed numerical scalars and additional public port capabilities remain
    open; resident output support does not discharge a checked Float conversion.
+   Flat explicit outputs and taps now use the same physical-output projector as
+   eager lowering. Ordered Prepared/Compiled output trees retain immutable
+   candidates; only completed source work yields actual storage, alias
+   deduplication and surviving public keys. The owner-local projector runs after
+   source/role reconciliation and before final LinkPlan proof. Its derived tree
+   stays beside that exact checked resident plan; semantic outputs are unchanged.
+   Five affected suites pass 45 tests / 997 assertions, including OpenCL and Level
+   Zero changed/default replay, an independently checked four-layer middle-buffer
+   tap, explicit-only Void outputs, resident scalars, failed preflight retaining
+   old wrappers, successful replay retiring them, source failure publishing
+   nothing, and refusal to drop certified escaped nodes. Independent review
+   found no blocker. This does not enable aggregate ports, donation, deferred
+   composition or leased compiled invocation, and a physical tap is not an
+   earlier-version snapshot of storage subsequently overwritten through an alias.
 4. Close typed AD/JVP and native map consumers, then rectangular/SIMD and JVM
    quality regressions. Investigate timed GSDM phases before changing timeouts.
 5. Requalify all shards, corpus/device gates and actual CUDA/HIP compilers before
