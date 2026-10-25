@@ -1026,10 +1026,9 @@
                                 :loop-scratch (:loop-scratch realized) :result-views result-views
                                 :host-steps (:host-steps state)}
            (checked-ordered-validation state) caller-options)
-          _ (when (some #(seq (:result-views %)) (:steps call))
-              (fail! :invocation-ordered-result-views
-                     "ready graph stages must retain logical prefix-result contracts before admission"
-                     {:equation equation-id :result-views (:result-views call)}))
+          ;; Preserve logical prefix tokens beside their physical destinations. The ordinary
+          ;; LinkPlan proof below authenticates prefix aliasing and derives child-only write
+          ;; coverage; relative entry contracts and runtime completion never credit the tail.
           ;; Binding coverage can fail from the now-resolved count (e.g. a changing
           ;; induction scalar). Discover that before the owner acquires stage storage.
           _ (when loop?

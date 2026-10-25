@@ -1247,7 +1247,13 @@
 
 (defn- realize-source
   [form program]
-  (let [form (retain-analyzed-binding-expressions
+  ;; Root and dependency scans run outside the original walker. Retain its
+  ;; actual lexical names: a local called `alias` or `count` is not a core Var.
+  (binding [util/*shadowing-locals*
+            (into util/*shadowing-locals*
+                  (concat (map first (partition 2 (second form)))
+                          (:inputs (dialect/facts program))))]
+   (let [form (retain-analyzed-binding-expressions
               form (mapv (fn [{:keys [source-binding-id destination source-expression]}]
                            {:id source-binding-id :sym destination :expr source-expression})
                          (filter #(or (contains? % :source-expression)
@@ -1406,7 +1412,7 @@
                (mapcat :pairs (get by-placement id)))))
           (range (count original-pairs))))
         source (with-meta (list* let-head (vec (mapcat identity pairs)) body) (meta form))]
-    {:source source :realized (into {} (map (juxt :equation-id identity)) realized)}))
+    {:source source :realized (into {} (map (juxt :equation-id identity)) realized)})))
 
 (defn- equation-operation?
   [operation]

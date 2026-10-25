@@ -986,11 +986,12 @@
 
 (defn- equation-first-output-candidates
   "Ordered public intent only. Physical aliases are resolved and deduplicated at final projection."
-  [request field-output-entries semantic-outputs]
+  [request field-output-entries semantic-outputs source-labels]
   (vec (concat (:donated-entries request) (:output-entries request) field-output-entries
                (map-indexed
                 (fn [index value]
-                  {:key (equation-first-output-key value index (count semantic-outputs))
+                  {:key (equation-first-output-key (get source-labels value value)
+                                                   index (count semantic-outputs))
                    :sym value :from :result})
                 semantic-outputs)
                (:tap-entries request))))
@@ -1056,7 +1057,8 @@
                        parameters))
         candidates (equation-first-output-candidates
                     request field-output-entries
-                    (mapv first (:semantic-outputs attributes)))
+                    (mapv first (:semantic-outputs attributes))
+                    (get-in compilation [:semantic :attributes :source-output-labels]))
         projected (project-equation-first-outputs plan candidates field-output-entries)]
     (update projected :projection assoc :in-tree in-tree :donated (donated-output-keys request))))
 
@@ -1107,7 +1109,9 @@
                       (sort-by #(get parameter-order (:id (val %))) buffers))
         outputs (vec (get-in initial [:program :outputs]))
         field-outputs (:field-output-entries intent)
-        candidates (equation-first-output-candidates (:request intent) field-outputs outputs)
+        candidates (equation-first-output-candidates
+                    (:request intent) field-outputs outputs
+                    (get-in compilation [:semantic :attributes :source-output-labels]))
         candidate-value (fn [id]
                           (or (get-in initial [:program :values id])
                               (get-in buffers [id :value])

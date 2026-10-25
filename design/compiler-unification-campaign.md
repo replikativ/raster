@@ -14,7 +14,7 @@ rather than adding a route for each workload.
 | Causal allocation extents | Preceding lexical alias to allocation shape | `bf02a900`: 32 tests / 242 assertions; original recipe and failure ordering preserved |
 | Ordered outputs and taps | Deferred public intent to completed physical boundary | Locally qualified: 45 tests / 997 assertions, shared projector, independent intermediate/final device values and replay/lifetime/failure/certificate controls; full branch gates still pending |
 | Aggregate state and composition | Entry slots locally qualified; deferred components remain open | 57 tests / 1,260 assertions qualify shared leaf projection and replay; next require composed AMR/distributed workload without a fabricated preparation-time LinkPlan |
-| Source buffer returns | Public projection can select the traversal view instead of the whole returned destination | Capacity-eight/domain-two direct, alias and tuple returns; preserved tail, full-buffer consumer and uninitialized-tail refusal through shared eager/ordered projection |
+| Source buffer returns | Whole-buffer projection locally corrected; full branch and subsequent helper-consumption gates remain open | Capacity-eight/domain-two direct/alias/tuple returns and local zero allocations pass local device checks; initialized-tail, nominal keys and ordered stages are independently qualified below; helper-consuming-all-eight remains the next integration |
 | RK4 | Full qualification of unified ordered program stages | Local Intel Arc OpenCL/Level Zero recurrence and discrete RK4 oracle pass; affected/fresh/full gates remain pending |
 | Float/Object results | Completed numerical result to invocation-value import, then owned source completion and distinct result publication | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
@@ -96,6 +96,61 @@ artifacts, missing shard 3: 7,036 tests, 87,919 passing assertions, 26 failures 
 a coverage trend. Public-source emission job 34923 emits 170/172 fixtures; the
 two failures are the same mixed-scale gradient's source-result boundary on CUDA
 and HIP, before the vendor compiler gates. PR #1566 remains unqualified.
+
+### Whole-buffer source-return correction (October 25, branch qualification)
+
+The shared complete-source return projector now selects the certified physical
+destination for buffer-returning calls. Numerical traversal AVs and prefix views
+remain separate and unchanged. A returned source reference can be a boundary
+input without becoming a numerical operand or read effect. It requires an actual
+parameter, retained source allocation or canonical reference identity; the normal
+owner, invocation-prefix and source-order checks still bind it. Scalar hoisting
+preserves boundary input/output references even when no equation reads them.
+
+Retained-source liveness now includes actual lexical binders when scanning roots
+and dependencies. This fixes locals named `alias` or `count` being mistaken for
+core Vars and removed while their source return remained. Storage certification
+was not relaxed to compensate for that lexical error.
+
+Nominal public keys remain separate from physical view selection through
+rederived `:source-output-labels`. They influence keys only, not storage, Class,
+initialization or execution. Distinct returned buffers keep their source-facing
+labels and traversal order. One unique physical source output uses `:result`;
+explicit requested keys still take precedence. This deliberately canonicalizes
+the corner case of several writers to the same returned buffer: physical alias
+deduplication now precedes default key selection rather than retaining an
+accidental first key based on the count of intermediate numerical IDs.
+
+The direct affected gate passes 662 tests / 7,067 assertions. The later focused
+public-source gate passes 6 tests / 214 assertions, including supplied and
+runtime-derived capacities on synthetic OpenCL, CUDA and HIP targets. Local
+OpenCL and Level Zero checks compare full buffers, untouched tails, changed-state
+replay and zero-initialized allocations with independent JVM execution.
+
+Ordered stages retain the same checked prefix/base relation instead of a blanket
+result-view refusal. Stage coverage credits only the written child; a partial
+write cannot initialize the backing tail. The focused ordered/device gate passes
+5 tests / 157 assertions, including genuine late allocation barriers, empty and
+nonempty suffixes, replay, and negative-size failure after the early prefix without
+public output publication. A further 2-test / 17-assertion gate checks an explicitly
+empty prefix and the allocation's multiple valid owners: missing all owners or
+conflicting owners still refuses before count evaluation. The extended affected
+gate ran 717 tests / 7,614 assertions with two old single-owner expectations
+subsequently corrected and checked by that focused gate. Fresh-process combined
+qualification remains pending; none of these local gates qualify PR #1566 for merging.
+
+A separate correctness gap was exposed by an initially dead late allocation:
+the original JVM function throws for a negative size, but pre-semantic scalar
+DCE removes the unused constructor and GPU execution does not throw. Existing
+constructor-owner preservation runs too late to recover the dropped expression.
+The next source-obligation correction must distinguish external purity, safe
+omission, repeatability and live identity. Start with exact constructor contracts
+and their deterministic count/type failures in the shared effect/obligation
+machinery before DCE, retaining positive dead-allocation optimization when the
+count and evaluation are proved safe. Unknown helper/overload semantics remain
+unclosed. Separately probe mutable reads across writes in scalar CSE; external
+purity is not a proof that a later read repeats the same value. The ordered tests
+above use a live late buffer and claim neither independent gap is fixed.
 
 ### Current source-context qualification (October 25)
 

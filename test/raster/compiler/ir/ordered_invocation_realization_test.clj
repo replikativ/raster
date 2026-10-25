@@ -35,6 +35,29 @@
         written (par/map! out i cnt double (+ (aget x i) 1.0))]
     written))
 
+(deftm ordered-prefix-buffer-return
+  [out :- (Array double), n :- Long] :- Object
+  (let [written (par/map! out i 2 double (+ 1.0 (double i)))
+        late (double-array n)
+        late-written (par/map! late j n double 0.0)]
+    [written late-written]))
+
+(deftm ordered-prefix-zero-buffer-return
+  [early :- (Array double), n :- Long] :- Object
+  (let [first-write (par/map! early i 2 double (+ 1.0 (double i)))
+        out (double-array 8)
+        written (par/map! out i 2 double (+ 1.0 (double i)))
+        late (double-array n)
+        late-written (par/map! late j n double 0.0)]
+    [written late-written]))
+
+(deftm ordered-dynamic-prefix-return
+  [out :- (Array double), prefix :- Long, n :- Long] :- Object
+  (let [written (par/map! out i prefix double (double i))
+        late (double-array n)
+        late-written (par/map! late j n double 0.0)]
+    [written late-written]))
+
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
@@ -295,14 +318,83 @@
       (is (not-any? :source (vals (get-in borrowed [:stage-plan :nodes]))))
       (is (seq (get-in borrowed [:entry-contract :requires]))))))
 
-(deftest ready-graph-cannot-drop-a-logical-prefix-result-contract
+(deftest ready-graph-retains-a-logical-prefix-without-initializing-its-tail
   (let [compilation (equation-first/compile #'fixture/write-before-shape
                                            {:target :ocl:0 :dtype :double})
         state (invocation-link/begin-ordered-realization
-               compilation [(double-array [7.0]) (double-array 4) Long/MAX_VALUE] nil)]
-    (is (= :invocation-ordered-result-views
-           (reason #(invocation-link/realize-ready-equation
-                     state (:id (first (:equations (:program state)))) nil))))))
+               compilation [(double-array [7.0]) (double-array [10 11 12 13]) Long/MAX_VALUE] nil)
+        equation-id (:id (first (:equations (:program state))))
+        ready (invocation-link/realize-ready-equation state equation-id nil)
+        call (:call ready)
+        [result physical] (first (:result-views (first (:steps call))))
+        prefix (get (:buffers call) result)
+        base (get (:buffers call) physical)
+        plan (:stage-plan ready)
+        fresh (-> plan (assoc-in [:nodes base :source] nil)
+                  (assoc-in [:nodes base :role] :internal))
+        evidence (:effect-evidence (link-plan/validate-with-effect-evidence! fresh))
+        contract (first (link-plan/relative-entry-contracts!
+                         fresh evidence [[(:id (first (:instances fresh)))]]))]
+    (is (= 'first-output physical))
+    (is (not= prefix base))
+    (is (= [1] (get-in plan [:nodes prefix :view :shape])))
+    (is (= [4] (get-in plan [:nodes base :view :shape])))
+    (is (= (get-in plan [:nodes prefix :view :allocation])
+           (get-in plan [:nodes base :view :allocation])))
+    (is (nil? (get-in plan [:nodes prefix :source])))
+    (is (contains? (:full-produces contract) prefix))
+    (is (not (contains? (:full-produces contract) base)))
+    (is (not (contains? (:requires contract) base)))
+    (is (contains? (:writes contract) base))
+    (let [acquired (-> state
+                       (assoc :realized (get-in ready [:state :realized])
+                              :acquired-storage
+                              (into #{} (map #(get-in % [:view :allocation :id]))
+                                    (vals (:nodes plan)))))
+          repeated (invocation-link/realize-ready-equation acquired equation-id nil)]
+      (is (not-any? :source (vals (get-in repeated [:stage-plan :nodes])))
+          "acquired roots cannot re-upload an earlier host initializer")
+      (is (contains? (get-in repeated [:entry-contract :full-produces]) prefix))
+      (is (not (contains? (get-in repeated [:entry-contract :full-produces]) base))))
+    (is (= :link-unproduced-output
+           (reason #(link-plan/validate! (assoc fresh :outputs [base])))))
+    (is (nil? (reason #(link-plan/validate! (assoc plan :outputs [base]))))
+        "an initialized backing tail can be returned, without whole-write credit")
+    (is (= :program-link-result-view
+           (reason #(link-plan/validate! (assoc-in fresh [:nodes prefix :view :byte-offset] 8)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (link-plan/validate!
+                  (assoc-in fresh [:nodes prefix :view :shape] [5]))))
+    (is (= 0 (get-in ready [:state :source-cursor])))
+    (is (empty? (get-in ready [:state :acquired-storage])))
+    (is (= :invocation-ordered-pending
+           (reason #(invocation-link/realize-ready-equation (:state ready) equation-id nil))))
+    (is (= :invocation-ordered-incomplete
+           (reason #(invocation-link/finish-ordered-realization (:state ready) nil))))))
+
+(deftest an-empty-ordered-prefix-does-not-initialize-the-nonempty-backing-buffer
+  (let [compilation (equation-first/compile
+                     #'ordered-dynamic-prefix-return
+                     {:target :ocl:0 :dtype :double
+                      :values {'out (av/tensor {:dtype :double :shape [8]})}})]
+    (doseq [count [0 2]]
+      (let [state (invocation-link/begin-ordered-realization
+                   compilation [(double-array 8) count 1] nil)
+            ready (invocation-link/realize-ready-equation
+                   state (:id (first (:equations (:program state)))) nil)
+            call (:call ready)
+            [result physical] (first (:result-views (first (:steps call))))
+            prefix (get (:buffers call) result) base (get (:buffers call) physical)
+            fresh (-> (:stage-plan ready) (assoc-in [:nodes base :source] nil)
+                      (assoc-in [:nodes base :role] :internal))
+            evidence (:effect-evidence (link-plan/validate-with-effect-evidence! fresh))
+            contract (first (link-plan/relative-entry-contracts!
+                             fresh evidence [[(:id (first (:instances fresh)))]]))]
+        (is (= [count] (get-in fresh [:nodes prefix :view :shape])))
+        (is (= [8] (get-in fresh [:nodes base :view :shape])))
+        (is (not (contains? (:full-produces contract) base)))
+        (is (= :link-unproduced-output
+               (reason #(link-plan/validate! (assoc fresh :outputs [base])))))))))
 
 (deftest initial-shape-definition-does-not-require-acquired-buffer-storage
   (let [compilation (equation-first/compile #'shape-before-first-stage
@@ -478,20 +570,31 @@
         claim (get-in initial [:source-allocations 'W])
         projection (invocation-source/allocation-source
                     (:source-expression claim) (get-in initial [:program :values]))
+        step-index (first (keep-indexed
+                           (fn [i step] (when (= (:invocation-step entry) (:id step)) i))
+                           (get-in initial [:materialization :plan :steps])))
         calls (atom 0)
         evaluate (fn [& _] (swap! calls inc) (throw (AssertionError. "evaluated unowned size")))]
-    (is (nil? (:invocation-step entry)) "the regression has no prefix step to own the helper")
+    (is (some? step-index) "the returned whole buffer now retains its invocation allocation owner")
     (is (some? (get-in claim [:source-projection :helper])))
     (is (fingerprint/equivalent? (select-keys projection [:constructor :helper])
                                 (:source-projection claim)))
     ;; These are ownership preflight checks only, not simulated acquisition of
     ;; earlier storage. They must refuse before asking for any count or resource.
-    (doseq [changed [(update-in initial [:source-allocations 'W] dissoc :source-projection)
-                     (assoc-in initial [:source-allocations 'W :source-projection :constructor]
-                               '(clojure.core/double-array 1))
-                     (assoc-in initial [:source-allocations 'W :source-projection :helper :definition]
-                               {:parameters [] :parameter-tags [] :constructor '(clojure.core/float-array 0)})]]
-      (is (= :invocation-ordered-allocation-definition
+    (doseq [[changed expected]
+            [[(update-in initial [:source-allocations 'W] dissoc :source-projection)
+              :invocation-ordered-allocation-argument]
+             [(assoc-in initial [:source-allocations 'W :source-projection :constructor]
+                        '(clojure.core/double-array 1))
+              :invocation-ordered-allocation-definition]
+             [(assoc-in initial [:source-allocations 'W :source-projection :helper :definition]
+                        {:parameters [] :parameter-tags [] :constructor '(clojure.core/float-array 0)})
+              :invocation-ordered-allocation-definition]
+             [(-> initial
+                  (update-in [:source-allocations 'W] dissoc :source-projection)
+                  (update-in [:materialization :plan :steps step-index] dissoc :source-projection))
+              :invocation-ordered-allocation-definition]]]
+      (is (= expected
              (reason #(invocation-link/prepare-source-allocation
                        (assoc changed :source-cursor position) evaluate nil)))))
     (is (zero? @calls))

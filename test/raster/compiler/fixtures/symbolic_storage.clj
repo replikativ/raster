@@ -25,6 +25,39 @@
   (p/map-void! i full (a/aset boundary i (a/aget x i)))
   (p/map-void! j owned (a/aset out j (a/aget boundary j))))
 
+(deftm return-written-prefix-buffer
+  [out :- (Array float)] :- (Array float)
+  (let [write (p/map! out i 2 float (float i))] write))
+
+(deftm return-written-prefix-alias
+  [out :- (Array float)] :- (Array float)
+  (let [write (p/map! out i 2 float (float i)) alias write] alias))
+
+(deftm return-written-prefix-aliased-destination
+  [out :- (Array float)] :- (Array float)
+  (let [count out destination count
+        write (p/map! destination i 2 float (float i))] write))
+
+(deftm return-written-prefix-tuple
+  [out :- (Array float)] :- Object
+  (let [write (p/map! out i 2 float (float i))] [write out]))
+
+(deftm return-written-prefix-allocation
+  [seed :- (Array float)] :- (Array float)
+  (let [out (float-array 8) write (p/map! out i 2 float (float i))] write))
+
+(deftm return-written-prefix-pair
+  [a :- (Array float), b :- (Array float)] :- Object
+  (let [left (p/map! a i 2 float (float i))
+        right (p/map! b i 2 float (raster.numeric/+ (float 10.0) (float i)))]
+    [right left]))
+
+(deftm return-two-writes-to-one-buffer
+  [out :- (Array float)] :- Object
+  (let [left (p/map! out i 8 float (float i))
+        right (p/map! out i 8 float (raster.numeric/+ (float 10.0) (float i)))]
+    [left right]))
+
 (deftm shifted-map
   [x :- (Array float), n :- Long] :- (Array float)
   (p/pmap i n float (a/aget x (inc i))))

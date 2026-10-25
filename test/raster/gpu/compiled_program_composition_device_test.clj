@@ -4,6 +4,8 @@
             [raster.core :refer [deftm]]
             [raster.math :as math]
             [raster.compiler.core.hardware :as physical-hardware]
+            [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.array-ops :as array-ops]
             [raster.dl.nn :as nn]
@@ -40,6 +42,65 @@
   (if @gp/gpu-available?
     (run-strided-head-unpack-case :ze:0)
     (gp/gpu-skip! "strided head unpack extent reuse")))
+
+(deftest public-whole-buffer-returns-preserve-partial-write-tails-on-device
+  (doseq [[target available? skip!] [[:ocl:0 @opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 @gp/gpu-available? gp/gpu-skip!]]]
+    (if-not available?
+      (skip! "whole-buffer source returns after partial writes")
+      (do
+        (doseq [source [#'symbolic-storage/return-written-prefix-buffer
+                        #'symbolic-storage/return-written-prefix-alias
+                        #'symbolic-storage/return-written-prefix-aliased-destination
+                        #'symbolic-storage/return-written-prefix-tuple]]
+          (let [first-input (float-array (range 10 18))
+                artifact (compiled/compile
+                          source [first-input]
+                          {:compiler :equation-first :target target :dtype :float
+                           :values {'out (av/tensor {:dtype :float :shape [8]})}
+                           :roles {'out :state} :on-non-resident :throw})
+                state-node (:node (first (:in-tree artifact)))]
+            (try
+              (doseq [input [first-input (float-array (range 20 28))]]
+                ;; Captured state is not a dynamic Compiled input. Refresh it
+                ;; explicitly through its owner's checked, synchronous write API.
+                (link/write! (:executable artifact) state-node input)
+                (let [expected-result (source (aclone input))
+                      expected (if (vector? expected-result) (first expected-result) expected-result)
+                      actual (value/->host (first (vals (artifact {}))))]
+                  (is (= 8 (alength ^floats actual)))
+                  (is (= (vec expected) (vec actual))
+                      "changed-input replay preserves the independently evaluated source tail")))
+              (finally (compiled/close! artifact)))))
+        (let [seed (float-array 1)
+              artifact (compiled/compile
+                        #'symbolic-storage/return-written-prefix-allocation [seed]
+                        {:compiler :equation-first :target target :dtype :float
+                         :on-non-resident :throw})]
+          (try
+            (is (= (vec (symbolic-storage/return-written-prefix-allocation seed))
+                   (vec (value/->host (first (vals (artifact {})))))))
+            (finally (compiled/close! artifact))))))))
+
+(deftest public-whole-buffer-pairs-retain-labels-and-distinct-tails-on-device
+  (doseq [[target available? skip!] [[:ocl:0 @opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 @gp/gpu-available? gp/gpu-skip!]]]
+    (if-not available?
+      (skip! "source labels on distinct whole-buffer returns")
+      (let [a (float-array (range 10 18)) b (float-array (range 20 26))
+            expected (symbolic-storage/return-written-prefix-pair (aclone a) (aclone b))
+            artifact (compiled/compile
+                      #'symbolic-storage/return-written-prefix-pair [a b]
+                      {:compiler :equation-first :target target :dtype :float
+                       :values {'a (av/tensor {:dtype :float :shape [8]})
+                                'b (av/tensor {:dtype :float :shape [6]})}
+                       :on-non-resident :throw})]
+        (try
+          (let [outputs (artifact {})]
+            (is (= #{:right :left} (set (keys outputs))))
+            (is (= (vec (first expected)) (vec (value/->host (:right outputs)))))
+            (is (= (vec (second expected)) (vec (value/->host (:left outputs))))))
+          (finally (compiled/close! artifact)))))))
 
 (deftm twice!
   [input :- (Array float) result :- (Array float) n :- Long] :- Void

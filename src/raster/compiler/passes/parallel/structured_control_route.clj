@@ -306,7 +306,11 @@
                 (:equations parallel-program))]
     (if (and (empty? hoisted) (= retained (:equations parallel-program)))
       parallel-program
-      (let [inputs (program/infer-inputs retained)
+      (let [inputs (ordered-distinct
+                    (concat (program/infer-inputs retained)
+                            ;; A returned source reference remains part of the
+                            ;; boundary even when no retained equation reads it.
+                            (filter (set program-outputs) (:inputs parallel-program))))
             shape-equations (count (filter (comp invocation-source/shape-projection-source
                                                  invocation-source/scalar-equation-expression)
                                            hoisted))]
@@ -738,10 +742,20 @@
                                         [(:destination storage)
                                          {:output result :kind kind}])))
                            storage-entries)
+        result-destinations (into {} (map (fn [[result storage]]
+                                             [result (:destination storage)]))
+                                  storage-entries)
+        buffer-output (fn [result]
+                        (let [destination (get result-destinations result)]
+                          {:kind :buffer :outputs [destination]
+                           :output-labels [result]
+                           :source-references #{destination}}))
         symbol-output (fn [symbol]
                         (let [symbol (resolve-alias symbol)]
                           (cond
                             (contains? effect-bindings symbol) {:kind :unit :outputs []}
+                            (contains? buffer-host-bindings symbol)
+                            (buffer-output (get buffer-host-bindings symbol))
                             (contains? outputs symbol)
                             (let [kind (cond
                                          (contains? stored-result-kinds symbol)
@@ -749,12 +763,12 @@
                                          (contains? stored-results symbol) nil
                                          (contains? array-types symbol) :buffer
                                          :else :value)]
-                              (when kind {:kind kind :outputs [symbol]}))
+                              (when kind
+                                (if (contains? stored-result-kinds symbol)
+                                  (buffer-output symbol)
+                                  {:kind kind :outputs [symbol]})))
                             (contains? outputs (:output (get destinations symbol)))
-                            {:kind (:kind (get destinations symbol))
-                             :outputs [(:output (get destinations symbol))]}
-                            (contains? outputs (get buffer-host-bindings symbol))
-                            {:kind :buffer :outputs [(get buffer-host-bindings symbol)]}
+                            (buffer-output (:output (get destinations symbol)))
                             :else nil)))]
     (letfn [(project [expression]
               (cond
@@ -762,11 +776,14 @@
                 (symbol-output expression)
 
                 (vector? expression)
-                (loop [remaining expression projected []]
+                (loop [remaining expression projected [] labels [] references #{}]
                   (if (seq remaining)
                     (when-let [projection (project (first remaining))]
-                      (recur (next remaining) (into projected (:outputs projection))))
-                    {:kind :tuple :outputs projected}))
+                      (recur (next remaining) (into projected (:outputs projection))
+                             (into labels (or (:output-labels projection) (:outputs projection)))
+                             (into references (:source-references projection))))
+                    {:kind :tuple :outputs projected :output-labels labels
+                     :source-references references}))
 
                 (nil? expression) {:kind :unit :outputs []}
 
@@ -826,10 +843,48 @@
     ;; Island outputs include host live-outs and conservative terminal values. Public
     ;; promotion changes only their escape boundary, never the equations/effects that
     ;; compute them. All returned leaves must have a typed producer or storage alias.
-    (assoc parallel-program :outputs
-           (if (= 'void return-tag)
-             []
-             (vec (distinct (:outputs projection)))))))
+    (let [outputs (if (= 'void return-tag) [] (vec (distinct (:outputs projection))))
+          ;; Nominal public keys remain independent of the physical view. These
+          ;; labels grant no storage or execution authority and are rederived.
+          labels (reduce (fn [labels [output label]]
+                           (if (contains? labels output) labels (assoc labels output label)))
+                         {} (map vector (:outputs projection)
+                                 (or (:output-labels projection) (:outputs projection))))
+          labels (into {} (filter (fn [[output label]] (not= output label)))
+                       (select-keys labels outputs))
+          available (into (set (:inputs parallel-program))
+                          (mapcat :results (:equations parallel-program)))
+          references (set/intersection (set outputs) (set (:source-references projection)))
+          boundary-references (set/difference references available)
+          parameters (set (or (:public-parameters options) (:active-params options)))
+          source-pairs (vec (partition 2 (second source)))
+          allocations (get-in parallel-program [:attributes :allocations])]
+      (doseq [reference boundary-references]
+        (let [bindings (filterv #(= reference (first %)) source-pairs)
+              allocation (filterv #(= reference (:destination %)) allocations)
+              value (get-in parallel-program [:values reference])]
+          (when-not
+           (and (= :tensor (:kind value)) (seq (:shape value))
+                (or (and (contains? parameters reference) (empty? bindings))
+                    (and (= 1 (count bindings))
+                         (or (invocation-source/reference-identity-source
+                              reference (second (first bindings)))
+                             (and (= 1 (count allocation))
+                                  (some? (:source-expression (first allocation)))
+                                  (semantic/retained-source-equivalent?
+                                   (:source-expression (first allocation))
+                                   (second (first bindings))))))))
+            (fail! :structured-control-source-reference
+                   "a whole-buffer return requires a source parameter, reference alias or retained allocation"
+                   {:reference reference}))))
+      ;; A boundary reference is not a numerical operand/read. The ordinary
+      ;; invocation constructor must still bind it, and LinkPlan independently
+      ;; checks the untouched portion's initialization before publication.
+      (assoc parallel-program :outputs outputs
+             :inputs (into (:inputs parallel-program)
+                           (filter boundary-references outputs))
+             :attributes (cond-> (dissoc (:attributes parallel-program) :source-output-labels)
+                           (seq labels) (assoc :source-output-labels labels))))))
 
 (defn- validate-host-coverage!
   "Host-controlled bindings may remain in an island's retained source, but a complete

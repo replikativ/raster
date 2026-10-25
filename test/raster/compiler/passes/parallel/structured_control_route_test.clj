@@ -1133,7 +1133,7 @@
         "the logical contraction result is rank zero")
     (is (symbol? host-binding) "the retained source result is the certified host binding")
     (doseq [expression (distinct [host-binding 'out])]
-      (is (= [output] (:outputs (project parallel expression)))
+      (is (= ['out] (:outputs (project parallel expression)))
           "plain result, destination, and certified host-binding returns remain valid")
       (is (= :structured-control-source-result
              (reason-of #(project parallel (retained-core-cast :double expression))))
@@ -1141,7 +1141,7 @@
     (let [bindings (into (vec (second (:source parallel))) ['returned 'out])
           aliased (assoc parallel :source
                          (list (first (:source parallel)) bindings 'returned))]
-      (is (= [output] (:outputs (#'route/validate-source-result! aliased options))))
+      (is (= ['out] (:outputs (#'route/validate-source-result! aliased options))))
       (is (= :structured-control-source-result
              (reason-of #(#'route/validate-source-result!
                           (with-source-return aliased (retained-core-cast :double 'returned))
@@ -1149,7 +1149,7 @@
     (let [bindings (into (vec (second (:source parallel))) [host-binding 'out])
           shadowed (assoc parallel :source
                           (list (first (:source parallel)) bindings host-binding))]
-      (is (= [output] (:outputs (#'route/validate-source-result! shadowed options))))
+      (is (= ['out] (:outputs (#'route/validate-source-result! shadowed options))))
       (is (= :structured-control-source-result
              (reason-of #(#'route/validate-source-result!
                           (with-source-return shadowed (retained-core-cast :double host-binding))
@@ -1163,6 +1163,30 @@
       (is (= :structured-control-source-result
              (reason-of #(project forged 'forged-binding)))
           "a mutable outer host binding cannot manufacture a return projection"))))
+
+(deftest source-buffer-reference-boundaries-require-their-existing-source-owner
+  (let [parallel (rank-zero-contract-program)
+        host-binding (get-in parallel [:equations 0 :attributes :host-binding])
+        source (with-source-return parallel host-binding)
+        options {:source-ns *ns* :public-parameters '[x y out n]
+                 :array-types {'x :double 'y :double 'out :double}}
+        projected (#'route/validate-source-result! source options)
+        without-out (assoc options :public-parameters '[x y n])
+        fake-claim (assoc-in source [:attributes :allocations]
+                             [{:destination 'out :source-expression '(clojure.core/double-array 8)}])
+        shadowed (assoc source :source
+                        (list 'let* (into ['out '(Object.)] (second (:source source))) host-binding))]
+    (is (= ['out] (:outputs projected)))
+    (is (some #{'out} (:inputs projected)))
+    (is (= projected (#'route/validate-source-result! projected options))
+        "re-entry does not duplicate boundary references")
+    (is (= (mapv :operands (:equations source)) (mapv :operands (:equations projected))))
+    (is (= (:effects source) (:effects projected)))
+    (doseq [[candidate request] [[source without-out] [fake-claim without-out] [shadowed options]
+                                [(assoc-in source [:values 'out]
+                                           (av/make {:kind :opaque :dtype :double :shape [8]})) options]]]
+      (is (= :structured-control-source-reference
+             (reason-of #(#'route/validate-source-result! candidate request)))))))
 
 (deftest public-resident-scalar-load-requires-the-inner-reduction-certificate
   (let [source '(let* [left (raster.par/reduce sum (float 0.0) i n
@@ -1294,7 +1318,8 @@
     (is (= {:destination 'out :extent 'n :initialization :zero :dtype :double}
            (select-keys allocation [:destination :extent :initialization :dtype])))
     (is (= ['n] (get-in promoted [:values 'out :shape])))
-    (is (= {:position 0 :binding 'out :storage 'out}
+    (is (= {:position 0 :binding 'out :storage 'out
+            :invocation-step (:id (first (:steps plan)))}
            (first (invocation/source-order plan promoted))))
     (let [materialized (materialize 2)
           linked (invocation-link/lower materialized emitted :ocl:0 nil)
@@ -1345,7 +1370,8 @@
         call (get-in linked [:instances 0 :call])]
     (is (= ['n] (get-in promoted [:values 'out :shape])))
     (is (= 'n (get-in promoted [:attributes :allocations 0 :extent])))
-    (is (= {:position 0 :binding 'out :storage 'out}
+    (is (= {:position 0 :binding 'out :storage 'out
+            :invocation-step (:id (first (:steps plan)))}
            (first (invocation/source-order plan promoted))))
     (is (= {:type :long :value 6} (get-in call [:scalar-values 'size])))
     (is (= {:type :long :value 2} (get-in call [:scalar-values 'n])))
@@ -1419,18 +1445,18 @@
     (doseq [result ['y 'out '[y]]]
       (let [source (list 'let* '[y (raster.par/map! out i n double (clojure.core/aget x i))]
                          result)]
-        (is (= '[y] (:outputs (route/promote-program (attempt source) options))))))
+        (is (= '[out] (:outputs (route/promote-program (attempt source) options))))))
     (doseq [aliased ['y 'out]
             wrap [identity #(completion/complete-value completion/object-input-contract %)]]
       (let [source (list 'let* (into '[y (raster.par/map! out i n double (clojure.core/aget x i))]
                                    ['returned (wrap aliased) 'final-result (wrap 'returned)])
                          'final-result)]
-        (is (= '[y] (:outputs (route/promote-program (attempt source) options)))
+        (is (= '[out] (:outputs (route/promote-program (attempt source) options)))
             "exact lexical aliases preserve logical/physical return identity")))
     (let [complete (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                     z (raster.par/map! x i n double (clojure.core/aget out i))]
                                    [z y]))]
-      (is (= '[z y] (:outputs (route/promote-program complete options)))
+      (is (= '[x out] (:outputs (route/promote-program complete options)))
           "public unique leaves retain source traversal order rather than island sorting"))
     (let [partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                    logged (clojure.core/println y)] y))]
@@ -1444,7 +1470,7 @@
     (let [complete (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))]
                                    y))
           extra-output (assoc complete :outputs (conj (:outputs complete) 'x))]
-      (is (= '[y] (:outputs (route/promote-program extra-output options)))
+      (is (= '[out] (:outputs (route/promote-program extra-output options)))
           "the public projection must not expose an unrelated island live-out")
       (is (= (:equations extra-output) (:equations (route/promote-program extra-output options)))
           "output projection retains internal equations and effects for explicit physical escapes")
@@ -1493,7 +1519,8 @@
     (is (= (:inputs plain) (:inputs completed)))
     (is (not-any? #{'returned} (:inputs completed))
         "a result alias is not a new public device input")
-    (is (= '[z] (:outputs completed)))))
+    (is (= '[x] (:outputs completed))
+        "the source returns the destination, not the second kernel's traversal view")))
 
 (deftest checked-prefix-equations-are-not-pruned-into-the-invocation-prefix
   (let [source '(let* [checked (clojure.core/int n)

@@ -283,6 +283,68 @@
                (try (lower nx nb no full owned) nil
                     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
 
+(deftest public-partial-write-returns-the-whole-source-buffer
+  (doseq [target [ocl-target cuda-target hip-target]
+          declared-storage? [true false]
+          source [#'symbolic-storage/return-written-prefix-buffer
+                  #'symbolic-storage/return-written-prefix-alias
+                  #'symbolic-storage/return-written-prefix-aliased-destination
+                  #'symbolic-storage/return-written-prefix-tuple]]
+    (let [input (float-array [10 11 12 13 14 15 16 17])
+          compilation (equation-first/compile
+                       source (cond-> {:target target :dtype :float}
+                                declared-storage?
+                                (assoc :values {'out (av/tensor {:dtype :float :shape [8]})})))
+          semantic (:semantic compilation)
+          result (first (:results (first (:equations semantic))))
+          plan (equation-first/lower compilation [input])
+          output (first (:outputs plan))]
+      (is (= 1 (count (:outputs plan))) "repeated source references share one physical output")
+      (is (= [8] (get-in plan [:nodes output :view :shape])))
+      (is (identical? input (get-in plan [:nodes output :source])))
+      (is (= [2] (get-in semantic [:values result :shape]))
+          "public source publication does not widen the numerical result")
+      (is (= [] (:operands (first (:equations semantic))))
+          "a returned storage reference is not an added numerical read")
+      (is (= plan (link-plan/validate! plan)))
+      (let [uninitialized (-> plan (assoc-in [:nodes output :source] nil)
+                              (assoc-in [:nodes output :role] :internal))]
+        (is (= :link-unproduced-output
+               (try (link-plan/validate! uninitialized) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "writing two elements cannot initialize the backing tail")))))
+
+(deftest public-whole-buffer-return-labels-remain-source-facing
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [prepared (compiled/lower
+                    #'symbolic-storage/return-written-prefix-pair
+                    [(float-array 8) (float-array 6)]
+                    {:compiler :equation-first :target target :dtype :float
+                     :values {'a (av/tensor {:dtype :float :shape [8]})
+                              'b (av/tensor {:dtype :float :shape [6]})}})]
+      (is (= [:right :left] (mapv :key (:out-tree prepared))))
+      (is (= [[6] [8]] (mapv :shape (:out-tree prepared)))))))
+
+(deftest one-unique-source-buffer-uses-the-single-result-key
+  (doseq [target [ocl-target cuda-target hip-target]
+          explicit? [false true]]
+    (let [prepared (compiled/lower
+                    #'symbolic-storage/return-two-writes-to-one-buffer [(float-array 8)]
+                    (cond-> {:compiler :equation-first :target target :dtype :float}
+                      explicit? (assoc :outputs '[out])))]
+      (is (= [(if explicit? :out :result)] (mapv :key (:out-tree prepared))))
+      (is (= [[8]] (mapv :shape (:out-tree prepared)))))))
+
+(deftest public-partial-write-retains-the-owned-zero-allocation
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'symbolic-storage/return-written-prefix-allocation
+                       {:target target :dtype :float})
+          plan (equation-first/lower compilation [(float-array 1)])
+          output (first (:outputs plan))]
+      (is (= [8] (get-in plan [:nodes output :view :shape])))
+      (is (= plan (link-plan/validate! plan))))))
+
 (deftest indexed-captures-retain-capacity-without-claiming-a-dense-read-proof
   (doseq [target [ocl-target cuda-target hip-target]
           [source arguments capacity]

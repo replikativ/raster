@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.ordered-invocation-realization-test :as allocation-fixture]
@@ -204,3 +205,64 @@
   (if @ze-probe/gpu-available?
     (check-source-position-allocation! :ze:0)
     (ze-probe/gpu-skip! "source-position allocation between resident stages")))
+
+(defn- check-ordered-prefix-returns! [target]
+  (doseq [[source parameter zero-tail?]
+          [[#'allocation-fixture/ordered-prefix-buffer-return 'out false]
+           [#'allocation-fixture/ordered-prefix-zero-buffer-return 'early true]]]
+    (let [compilation (equation-first/compile
+                       source {:target target :dtype :double
+                               :values {parameter (av/tensor {:dtype :double :shape [8]})}})]
+      (is (true? (:required? (invocation-link/ordered-preparation-requirement compilation)))
+          "the retained late allocation forces actual ordered preparation")
+      (doseq [n [-1 0 3]]
+        (let [input (double-array [10 11 12 13 14 15 16 17])
+              expected (into [1.0 2.0] (if zero-tail? (repeat 6 0.0) [12.0 13.0 14.0 15.0 16.0 17.0]))
+              executable (link/instantiate-ordered-invocation! compilation [input n] {})]
+          (try
+            (if (neg? n)
+              (do
+                (is (thrown? NegativeArraySizeException (link/run! executable)))
+                (let [runtime (:ordered @(:execution-state executable))
+                      token (get-in runtime [:current :realized :buffers 'out])
+                      actual (double-array 8)]
+                  (gpu/download-range! (:session executable) (get-in runtime [:node-views token])
+                                       actual {:elements 8})
+                  (is (= expected (vec actual))
+                      "the prefix completed before the late failure, preserving the initialized tail")
+                  (is (false? (boolean (:resident-boundary @(:execution-state executable)))))
+                  (is (zero? @(:completed-replays executable)))
+                  (is (= :link-execution-poisoned (reason #(link/outputs executable))))))
+              (let [outputs (vec (keys (link/run! executable)))
+                    [output late] outputs
+                    plan (get-in @(:execution-state executable) [:resident-boundary :plan])
+                    view (get-in plan [:nodes output :view])]
+                (is (= 2 (count outputs)))
+                (is (= [8] (:shape view)))
+                (is (= expected (vec (link/download executable output))))
+                (is (= [n] (get-in plan [:nodes late :view :shape])))
+                (is (= (vec (repeat n 0.0)) (vec (link/download executable late))))
+                (is (= [10.0 11.0 12.0 13.0 14.0 15.0 16.0 17.0] (vec input))
+                    "resident completion does not invent host copyback")
+                (if zero-tail?
+                  ;; The next replay must execute the source constructor again, not merely
+                  ;; reuse initialized bytes from the preceding partial write.
+                  (gpu/upload-range! (:session executable) (get (link/outputs executable) output)
+                                     (double-array (repeat 8 99.0)) {:elements 8})
+                  ;; A captured state buffer must not re-upload its old host initializer.
+                  (aset input 7 99.0))
+                (link/run! executable)
+                (is (= 2 @(:completed-replays executable)))
+                (is (= expected (vec (link/download executable output))))
+                (is (= (vec (repeat n 0.0)) (vec (link/download executable late))))))
+            (finally (link/close! executable))))))))
+
+(deftest opencl-ordered-prefix-returns-preserve-whole-source-buffers
+  (if @ocl-probe/opencl-available?
+    (check-ordered-prefix-returns! :ocl:0)
+    (ocl-probe/opencl-skip! "ordered prefix views and whole source returns")))
+
+(deftest level-zero-ordered-prefix-returns-preserve-whole-source-buffers
+  (if @ze-probe/gpu-available?
+    (check-ordered-prefix-returns! :ze:0)
+    (ze-probe/gpu-skip! "ordered prefix views and whole source returns")))
