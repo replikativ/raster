@@ -127,14 +127,10 @@
    class or literal identity. Nonprimitive numbers require a reference lowering."
   [value]
   (when (number? value)
-    (cond
-      (instance? Long value) :long
-      (or (instance? Integer value) (instance? Byte value) (instance? Short value)) :int
-      (instance? Float value) :float
-      (instance? Double value) :double
-      :else (throw (ex-info "Numeric literal requires an owned JVM reference lowering"
-                            {:reason :unsupported-jvm-numeric-literal
-                             :literal-class (class value)})))))
+    (or (types/numeric-literal-carrier value)
+        (throw (ex-info "Numeric literal requires an owned JVM reference lowering"
+                        {:reason :unsupported-jvm-numeric-literal
+                         :literal-class (class value)})))))
 
 (defn- emit-numeric-literal [code value]
   (let [carrier (numeric-literal-stack-type value)]

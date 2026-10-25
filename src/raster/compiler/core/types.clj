@@ -28,6 +28,18 @@
    'short   Short
    'char    Character})
 
+(defn numeric-literal-carrier
+  "Physical primitive carrier of a supported retained numeric literal, or nil.
+   Byte/Short use the JVM int stack. This establishes neither reference boxing
+   identity nor permission to narrow a Long or reinterpret a logical dtype."
+  [value]
+  (cond
+    (instance? Long value) :long
+    (or (instance? Integer value) (instance? Byte value) (instance? Short value)) :int
+    (instance? Float value) :float
+    (instance? Double value) :double
+    :else nil))
+
 (defn literal-tag
   "Primitive source-language tag for a literal value, or nil.
 
