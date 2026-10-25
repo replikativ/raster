@@ -14,6 +14,7 @@ rather than adding a route for each workload.
 | Causal allocation extents | Preceding lexical alias to allocation shape | `bf02a900`: 32 tests / 242 assertions; original recipe and failure ordering preserved |
 | Ordered outputs and taps | Deferred public intent to completed physical boundary | Locally qualified: 45 tests / 997 assertions, shared projector, independent intermediate/final device values and replay/lifetime/failure/certificate controls; full branch gates still pending |
 | Aggregate state and composition | Entry slots locally qualified; deferred components remain open | 57 tests / 1,260 assertions qualify shared leaf projection and replay; next require composed AMR/distributed workload without a fabricated preparation-time LinkPlan |
+| Source buffer returns | Public projection can select the traversal view instead of the whole returned destination | Capacity-eight/domain-two direct, alias and tuple returns; preserved tail, full-buffer consumer and uninitialized-tail refusal through shared eager/ordered projection |
 | RK4 | Full qualification of unified ordered program stages | Local Intel Arc OpenCL/Level Zero recurrence and discrete RK4 oracle pass; affected/fresh/full gates remain pending |
 | Float/Object results | Completed numerical result to invocation-value import, then owned source completion and distinct result publication | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
@@ -22,6 +23,27 @@ rather than adding a route for each workload.
 This ledger is the current plan. The dated sections below retain implementation
 evidence and historical decisions; they do not independently authorize obsolete
 execution paths or relax the original campaign's acceptance obligations.
+
+The follow-up independent review orders the next acceptance bundles as follows:
+
+1. Repair whole-buffer source returns through the common checked output/storage
+   projection, preserving numerical prefix and initialization evidence separately.
+2. Consume analyzed helper components in actual caller scope. Select a numerical
+   result, whole destination or effect-only return before rebasing IDs; retain
+   source order and liveness through fusion. Preserve selected calls only with
+   this consumer, not as unused early hooks or receipts across rewrites.
+3. Close result import, owned completion and actual Float output publication
+   together. A transparent numerical chain must retain baseline fusion/no readback;
+   an observable checked conversion must run exactly once at its source cursor.
+4. Close deferred resident composition as a separate vertical, including AMR
+   state/scratch and distributed consumers, without child host staging.
+5. Finish normalized AD/training and remaining workload gates. Compile-cost
+   measurement and exact-head full CI accounting run alongside every bundle.
+
+This consolidates existing analyzed entries, InvocationPlan and runtime ownership;
+it does not add a numerical IR or executor. Source-action reads contribute to
+liveness, but only actual observable execution obligations partition fusion.
+All eight original campaign objectives remain acceptance requirements.
 
 ### Causal source-value projection (October 25)
 
@@ -58,6 +80,22 @@ two items. The existing description/result-storage return relation must connect
 the caller's source buffer to its physical destination/version. Any consumer of
 the untouched suffix still requires initialization evidence. Alpha-renaming alone
 cannot establish this relation or discharge that obligation.
+
+A hardware-free public `equation-first/compile` followed by `lower` confirms a
+remaining discrepancy: returning the source binder of `map!` with an eight-item
+input destination and two-item traversal exposes a two-item result view. This
+must be repaired at the checked source-return/storage projection, not by widening
+the numerical result or its complete-write domain. Public whole-buffer length and
+unchanged-tail checks, a later reduction over all eight items, and refusal of an
+uninitialized tail are required integration gates. The causal analysis tests above
+do not establish those runtime/public-return obligations.
+
+Exact-head CI accounting for `461216b00` (job 34927) has 15 completed timing
+artifacts, missing shard 3: 7,036 tests, 87,919 passing assertions, 26 failures and
+39 errors across 48 failing Vars. This incomplete, reshuffled denominator is not
+a coverage trend. Public-source emission job 34923 emits 170/172 fixtures; the
+two failures are the same mixed-scale gradient's source-result boundary on CUDA
+and HIP, before the vendor compiler gates. PR #1566 remains unqualified.
 
 ### Current source-context qualification (October 25)
 

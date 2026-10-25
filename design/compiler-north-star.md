@@ -828,7 +828,12 @@ same contract: composite parameters have field initializers, composite scratch h
 leaf size closures, and allocation still sees only typed byte ranges. Certified composition now
 unifies and shares whole logical values atomically while retaining both logical and physical
 certificate mappings; public composite outputs must flatten every leaf in field order. The
-remaining value-layer boundary is ranged/subview composition with explicit ownership transfer.
+remaining value-layer boundaries include ranged/subview composition with explicit ownership
+transfer and whole-value deferred composition. Concrete certified composition does not establish
+that ordered Prepared components accept resident replacement ports or compose AMR state/scratch
+without host staging. Source returns also retain their own checked storage relation: returning a
+whole destination after a partial write must not expose only the numerical traversal view, and
+the partial write cannot initialize an otherwise uninitialized tail.
 
 ### 2.5 Workload coverage is broad at the backend edge, not yet through one door
 
