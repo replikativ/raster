@@ -191,6 +191,27 @@ counts across generated storage. The combined affected shared-REPL gate passes
 542 tests / 5,970 assertions. New import deferral and execution remain disabled;
 fresh-process and complete exact-head CI qualification remain separate gates.
 
+Source description and extent normalization now share one sequential fold. The
+raw type/definition transfer still consumes the original expression; the existing
+extent transfer consumes its preceding immutable state. Incoming equality
+premises exclude local binder identities, including later locals. Both production
+storage analysis and coverage use this fold. An independent former-schedule
+oracle compares describe-all-then-normalize with production on allocation/length
+chains, Int/Long equal extents, Double-to-Float storage and host effects. A resumed
+prefix and transfer counts additionally check that earlier states stay causal and
+each binding is normalized once. The affected shared-REPL gate passes 652 tests /
+6,990 assertions. This is not yet the preceding produced-value environment:
+normalized storage-input classification, result-only AV publication, checked
+component rebasing and return-demand discharge remain the consuming vertical.
+
+Preserving a helper must not itself force a result import or host roundtrip.
+The consuming analysis must distinguish transparent numerical return edges from
+observable completion using the authentic return recipe and complete def-use
+chain before fusion/liveness. Neither an Object snapshot nor a Double consumer
+alone decides that distinction. Cold candidates are selected semantically;
+explicit physical preparation belongs to live consuming analysis, before its
+physical observations, not repeated optional queries or dead-call expansion.
+
 The bounded clean-head GSDM diagnostic at `9f5ad9229` terminated at its explicit
 150-second diagnostic limit, without a test result. Its retained phase log, JFR
 and thread sample locate work in host compiler analysis (two lowerings, region

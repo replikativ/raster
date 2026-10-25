@@ -4633,15 +4633,6 @@
           logical-array-dtype (assoc-in [:array-types symbol] logical-array-dtype)
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
 
-(defn- source-descriptions
-  ([pairs default-dtype array-types scalar-types]
-   (source-descriptions pairs default-dtype array-types scalar-types false))
-  ([pairs default-dtype array-types scalar-types segmented-plans?]
-   (:descriptions
-    (reduce (partial advance-source-description default-dtype segmented-plans?)
-            (initial-source-description-state array-types scalar-types)
-            (map-indexed vector pairs)))))
-
 (defn- canonical-extent
   [equalities values extent]
   (loop [extent extent seen #{}]
@@ -4669,10 +4660,11 @@
         (and wrapped? (= next inner)) extent
         :else (recur next (conj seen extent))))))
 
-(defn- normalize-extents
-  [descriptions shape-equalities values]
-  (let [local-ids (set (map :sym descriptions))
-        entry-scalar? (fn [id]
+(defn- extent-normalization-context
+  "Freeze incoming extent premises separately from the sequential transfer.
+   Local binder identities are known up front, but their values are not."
+  [local-ids shape-equalities values]
+  (let [entry-scalar? (fn [id]
                         (let [value (get values id)]
                           (and (symbol? id) (not (contains? local-ids id))
                                (= :tensor (:kind value)) (empty? (:shape value))
@@ -4689,9 +4681,14 @@
                            (let [representative (canonical-extent entry-equalities values id)]
                              (when (entry-scalar? representative) [id representative])))))
               (keys values))]
-   (:descriptions
-   (reduce
-    (fn [{:keys [extents scalar-representatives] :as state} description]
+    {:entry-scalar? entry-scalar? :entry-representatives entry-representatives
+     :shape-equalities shape-equalities :values values}))
+
+(defn- advance-extent-normalization
+  "Normalize exactly one preceding source description. The immutable state can
+   be retained at a call site without reanalyzing a growing source prefix."
+  [{:keys [entry-scalar? entry-representatives shape-equalities values]}
+   {:keys [extents scalar-representatives] :as state} description]
       (case (:kind description)
         :scalar
         (let [expression (:expr description)
@@ -4743,8 +4740,36 @@
             (assoc-in [:extents (:sym description')] source-extent)))
 
         (update state :descriptions conj description)))
-    {:descriptions [] :extents {} :scalar-representatives {}}
-    descriptions))))
+
+(defn- normalize-extents
+  [descriptions shape-equalities values]
+  (let [context (extent-normalization-context (set (map :sym descriptions))
+                                              shape-equalities values)]
+    (:descriptions
+     (reduce (partial advance-extent-normalization context)
+             {:descriptions [] :extents {} :scalar-representatives {}}
+             descriptions))))
+
+(defn- source-descriptions
+  "Parse and normalize each binding in source order. Type/definition transfer
+   still uses the original expression; extent transfer sees only its preceding
+   normalized state. No growing prefix is reparsed or normalized again."
+  [pairs default-dtype array-types scalar-types segmented-plans? shape-equalities values]
+  (let [context (extent-normalization-context (set (map first pairs)) shape-equalities values)]
+    (:descriptions
+     (reduce
+      (fn [state binding]
+        (let [described (advance-source-description default-dtype segmented-plans? state binding)
+              descriptions (:descriptions described)
+              normalized (advance-extent-normalization
+                          context
+                          (assoc (:extent-normalization state) :descriptions (pop descriptions))
+                          (peek descriptions))]
+          (assoc described :descriptions (:descriptions normalized)
+                           :extent-normalization (dissoc normalized :descriptions))))
+      (assoc (initial-source-description-state array-types scalar-types)
+             :extent-normalization {:extents {} :scalar-representatives {}})
+      (map-indexed vector pairs)))))
 
 (defn- generated-scaffolding?
   [description physical-outputs]
@@ -5002,9 +5027,8 @@
     (let [[_ bindings] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          semantic-descriptions (normalize-extents
-                                 (source-descriptions pairs dtype array-types scalar-types)
-                                 shape-equalities values)
+          semantic-descriptions (source-descriptions pairs dtype array-types scalar-types
+                                                    segmented-plans? shape-equalities values)
           descriptions (consumer-descriptions semantic-descriptions segmented-plans?)
           physical-outputs (physical-output-symbols descriptions)
           declined (remove #(admitted-description? physical-outputs %) descriptions)
@@ -6243,9 +6267,8 @@
   ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
    (source-storage-analysis pairs dtype array-types scalar-types segmented-plans? values shape-equalities nil))
   ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities lexical-inputs]
-  (let [descriptions (normalize-extents
-                      (source-descriptions pairs dtype array-types scalar-types segmented-plans?)
-                      shape-equalities values)
+  (let [descriptions (source-descriptions pairs dtype array-types scalar-types segmented-plans?
+                                          shape-equalities values)
         source-scalar-types
         (reduce (fn [types {:keys [kind sym scalar-dtype]}]
                   (if (and (= :scalar kind) scalar-dtype)

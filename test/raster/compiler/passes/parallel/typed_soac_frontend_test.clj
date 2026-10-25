@@ -9,6 +9,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -51,6 +52,75 @@
     (let [shadowed (into [{:kind :scalar :sym 'count :expr 3}] descriptions)]
       (is (= 3 (:extent (nth (normalize shadowed {'count 'length}) 2)))
           "the actual preceding source binding, not its shadowed entry fact, owns the extent"))))
+
+(deftest extent-normalization-retains-a-causal-resumable-prefix
+  (let [descriptions [{:kind :scalar :sym 'alias :expr 'count}
+                      {:kind :map :sym 'mapped :extent 'alias}
+                      {:kind :scalar :sym 'later :expr 9}
+                      {:kind :scalar :sym 'measured :expr '(clojure.core/alength mapped)}
+                      {:kind :map :sym 'result :extent 'measured}]
+        values (zipmap '[count later] (repeat (av/tensor {:dtype :long :shape []})))
+        equalities {'count 'later}
+        context (#'frontend/extent-normalization-context (set (map :sym descriptions))
+                                                         equalities values)
+        initial {:descriptions [] :extents {} :scalar-representatives {}}
+        advance (partial #'frontend/advance-extent-normalization context)
+        prefix (reduce advance initial (take 2 descriptions))
+        complete (reduce advance prefix (drop 2 descriptions))
+        calls (atom 0)
+        transfer @#'frontend/advance-extent-normalization
+        ordinary (with-redefs-fn
+                   {#'frontend/advance-extent-normalization
+                    (fn [& arguments] (swap! calls inc) (apply transfer arguments))}
+                   #(#'frontend/normalize-extents descriptions equalities values))]
+    (is (= 'count (get-in prefix [:descriptions 1 :extent]))
+        "a future local cannot become the representative of an earlier traversal")
+    (is (not (contains? (:scalar-representatives prefix) 'later)))
+    (is (not (contains? (:scalar-representatives prefix) 'measured)))
+    (is (= 'count (get-in complete [:descriptions 3 :expr])))
+    (is (= 'count (get-in complete [:descriptions 4 :extent])))
+    (is (= ordinary (:descriptions complete)))
+    (is (= (count descriptions) @calls)
+        "the ordinary path normalizes each binding once, not every growing prefix")))
+
+(deftest ordered-source-fold-preserves-the-original-two-phase-analysis
+  (let [original-schedule
+        (fn [pairs dtype arrays scalars segmented? equalities values]
+          (#'frontend/normalize-extents
+           (:descriptions
+            (reduce (partial #'frontend/advance-source-description dtype segmented?)
+                    (#'frontend/initial-source-description-state arrays scalars)
+                    (map-indexed vector pairs)))
+           equalities values))]
+    (doseq [[source options]
+            [['(let* [scratch (clojure.core/float-array n)
+                      alias scratch
+                      size (clojure.core/long (clojure.core/alength alias))
+                      fill (raster.par/map! alias i size float (clojure.core/aget x i))
+                      result (raster.par/pmap j size float (clojure.core/aget alias j))]
+                 result)
+              {:dtype :float :array-types {'x :float} :scalar-types {'n :long}}]
+             ['(let* [alias count
+                      result (raster.par/pmap i alias float (clojure.core/aget x i))] result)
+              {:dtype :float :array-types {'x :float}
+               :scalar-types {'count :int 'length :long}
+               :values {'count (av/tensor {:dtype :int :shape []})
+                        'length (av/tensor {:dtype :long :shape []})}
+               :shape-equalities {'count 'length}}]
+             ['(let* [out (clojure.core/float-array n)
+                      fill (raster.par/map! out i n float (clojure.core/aget wide i))] out)
+              {:dtype :double :array-types {'wide :double} :scalar-types {'n :long}
+               :preserve-declared-array-storage? true}]
+             ['(let* [y (raster.par/pmap i n float (clojure.core/aget x i))
+                      observe (clojure.core/println y)
+                      z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))] z)
+              {:dtype :float :array-types {'x :float} :scalar-types {'n :long}}]]]
+      (let [actual (frontend/form->program source options)
+            expected (with-redefs-fn {#'frontend/source-descriptions original-schedule}
+                       #(frontend/form->program source options))]
+        (is (some? actual) (pr-str source))
+        (is (semantic/equivalent? actual expected)
+            "interleaving must preserve types, extents, effects, storage and source metadata")))))
 
 (deftest normalized-fragment-locals-avoid-nontextual-incoming-identities
   (let [incoming '#{rstr_extent_0 rstr_copy_effect_0_0 rstr_copy_index_0_0}
@@ -601,20 +671,28 @@
 
 (deftest numerical-equations-are-projected-once-before-dependency-selection
   (let [calls (atom [])
+        transfers (atom [])
         project #'frontend/operation-equation
         original @project
+        normalize #'frontend/advance-extent-normalization
+        original-normalize @normalize
         source '(let* [y (raster.par/pmap i n float (* (aget x i) 2.0))
                        z (raster.par/pmap j n float (+ (aget y j) 1.0))]
                   z)
         program (with-redefs-fn
                   {project (fn [description]
                              (swap! calls conj (:id description))
-                             (original description))}
+                             (original description))
+                   normalize (fn [context state description]
+                               (swap! transfers conj (:id description))
+                               (original-normalize context state description))}
                   #(frontend/form->program source
                                            {:dtype :float :array-types {'x :float}
                                             :scalar-types {'n :long}}))]
     (is (some? program))
     (is (= [0 1] @calls))
+    (is (= [0 1] @transfers)
+        "production analysis normalizes each binding once in the same source fold")
     (is (= [0 1] (mapv second (dialect/equations program))))
     (is (= '[z] (dialect/outputs program)))))
 
