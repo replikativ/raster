@@ -7,6 +7,7 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.source-import :as source-import]))
 
@@ -142,6 +143,45 @@
     (is (= :terminal-reduction-import-correspondence
            (reason #(source-import/validate-terminal-reduction-import!
                      (assoc first-import :normalized-source (:normalized-source second-import))))))))
+
+(deftest preceding-functional-map-supplies-the-actual-dot-import-arguments
+  (let [original (selected-frontend #'par/dot-product)
+        receiver (get-in original [:definition :implementation-op])
+        arguments '[scaled input]
+        request (assoc (options original) :arguments arguments :source-position 1
+                       :caller-expression (list* '.invk receiver arguments)
+                       :array-types {'scaled :double 'input :double})
+        supplied-scaled (av/tensor {:dtype :double :shape [4]})
+        source (list 'let*
+                     ['scaled '(raster.par/pmap i 4 double
+                                 (* (double coefficient) (clojure.core/aget input i)))
+                      (:result-symbol request) (:caller-expression request)
+                      'scaled '(clojure.core/println scaled)
+                      'later '(raster.par/pmap j 17 double (double j))]
+                     [(:result-symbol request) 'later])
+        analyzed (frontend/form->program-components
+                  source {:dtype :double :array-types {'input :double}
+                          :scalar-types {'coefficient :float}
+                          :values {'input (av/tensor {:dtype :double :shape [4]})
+                                   'coefficient (av/tensor {:dtype :float :shape []})
+                                   'scaled supplied-scaled
+                                   'later (av/tensor {:dtype :double :shape [17]})}
+                          :lexical-inputs '[input coefficient] :segmented-plans? true})
+        before (get-in analyzed [:preceding-values 1])
+        imported (construct (assoc request :values before))]
+    (is (= #{'input 'coefficient} (set (keys (get-in analyzed [:preceding-values 0])))))
+    (is (= :double (get-in before ['scaled :dtype])))
+    (is (= [4] (get-in before ['scaled :shape])))
+    (is (not (identical? supplied-scaled (get before 'scaled)))
+        "a later/refined global entry is not the producer of an earlier logical value")
+    (is (not (contains? before 'later)))
+    (is (not (contains? (get-in analyzed [:preceding-values 2]) 'later)))
+    (is (contains? (get-in analyzed [:preceding-values 2]) 'scaled))
+    (is (not (contains? (get-in analyzed [:preceding-values 3]) 'scaled))
+        "a host-side shadow must invalidate the previous numerical binding's facts")
+    (is (= ['scaled 'input] (mapv :argument (get-in imported [:obligations :inputs]))))
+    (is (every? #(= :unresolved (:status %)) (get-in imported [:obligations :inputs])))
+    (is (= :unresolved (get-in imported [:obligations :placement :status])))))
 
 (deftest import-receipt-retains-only-its-local-construction-history
   (let [request (options (selected-frontend #'par/sum))

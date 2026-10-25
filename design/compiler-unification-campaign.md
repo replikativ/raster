@@ -23,6 +23,42 @@ This ledger is the current plan. The dated sections below retain implementation
 evidence and historical decisions; they do not independently authorize obsolete
 execution paths or relax the original campaign's acceptance obligations.
 
+### Causal source-value projection (October 25)
+
+The existing analyzed-source entries now retain conditional logical value facts
+before each binding. Equation result declarations are projected separately from
+operand access requirements; final program-wide inference keeps its established
+merge policy. A later contraction may conservatively select indexed access for an
+earlier map, but its access requirement cannot establish an earlier buffer capacity
+or value. Storage selection shares one immutable context and one transfer per
+description instead of becoming a second causal producer analysis.
+
+Only actual lexical inputs seed the prefix. Pure-map result types require their
+own analyzed element declaration; destination-backed source returns require a
+compatible preceding tensor contract. A destination map's source return denotes
+the whole buffer, not just the numerical traversal domain. Effect-only calls do
+not publish their mathematical result as a source tensor. Rebinding invalidates
+dependent shape/layout/attribute facts transitively; a known future source binder
+cannot enter through an input contract. The reverse dependency index currently
+covers symbolic source bindings, not arbitrary composite IR identities.
+
+The focused shared-REPL gate passes 188 tests / 1,249 assertions. It includes a
+preceding functional map supplying the actual dot-helper import constructor,
+shadowing, future dimensions, dependency replacement, whole-buffer capacity and
+effect-only returns. The wider affected shared-REPL gate passes 661 tests / 7,058
+assertions across 28 namespaces. These facts prove neither actual JVM Class nor initialized
+storage, completion, layout compatibility or execution permission. The import
+constructor still leaves caller composition, return discharge and runtime
+publication unresolved; this is not a newly enabled public helper vertical.
+
+Composition must not merge this source-value projection into the numerical AV
+table by symbol spelling. For example, the source `write` returned by a two-item
+`map!` can denote an eight-item destination while its numerical result describes
+two items. The existing description/result-storage return relation must connect
+the caller's source buffer to its physical destination/version. Any consumer of
+the untouched suffix still requires initialization evidence. Alpha-renaming alone
+cannot establish this relation or discharge that obligation.
+
 ### Current source-context qualification (October 25)
 
 The source-completion continuation separates three obligations: the source cast's

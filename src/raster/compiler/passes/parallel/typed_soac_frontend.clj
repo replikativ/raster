@@ -5879,12 +5879,49 @@
                   :second {:kind :tensor :dtype declared-dtype :non-scalar? true}})))))
   values)
 
-(defn- ordinary-equation-values
-  [equation default-dtype array-types scalar-types known-values]
-  (let [[_ _ results] equation
-        {:keys [kind attributes arrays captures destinations]} (dialect/operation-parts equation)
-        result-destinations (zipmap results destinations)
-        array-types (merge (into {} (map (juxt :value :dtype))
+(defn- equation-result-values
+  "Project results under the existing program typing policy. Unlike operand
+   inference this consumes no surrounding AV map or storage-access requirements.
+   Map/scatter result types still use the supplied declaration table; a causal
+   consumer must additionally check the source producer's type authority."
+  [equation {:keys [kind attributes destinations]} default-dtype array-types]
+  (let [[_ _ results] equation]
+    (if (= 'contract kind)
+      (let [source (:contraction attributes)]
+        {(first results)
+         (tensor-value (or (:out-dtype source) (:dtype (first (:stages source))))
+                       (mapv second (:free-axes source)))})
+      (let [result-destinations (zipmap results destinations)
+            array-types (merge (into {} (map (juxt :value :dtype))
+                                     (get-in attributes [:result-transform :operands]))
+                               array-types)
+            result-dtypes (case kind
+                            (scalar stencil reduce scan effect-map) (:dtypes attributes)
+                            segmented-reduce [(or (:result-storage-dtype attributes)
+                                                  (first (:dtypes attributes)))]
+                            product-reduce (mapv #((:dtypes attributes) %)
+                                                (:result-components attributes))
+                            segmented-fold-map (:dtypes attributes)
+                            (map scatter) (map #(value-dtype % default-dtype array-types) results))]
+        (into {} (map (fn [id result-dtype]
+                        [id (tensor-value (or result-dtype default-dtype :double)
+                                          (case kind
+                                            (scalar reduce) []
+                                            (segmented-reduce product-reduce)
+                                            (dialect/segmented-reduce-result-shape attributes)
+                                            segmented-fold-map
+                                            (dialect/segmented-fold-map-result-shape attributes)
+                                            scan (dialect/scan-result-shape attributes)
+                                            scatter [(list 'unknown-dimension id)]
+                                            ;; An effect updates existing storage, not
+                                            ;; a dense traversal-sized result buffer.
+                                            effect-map [(list 'extent (get result-destinations id))]
+                                            (dialect/extent-shape (:extent attributes))))])
+                      results result-dtypes))))))
+
+(defn- ordinary-equation-input-values
+  [equation {:keys [kind attributes arrays captures]} default-dtype array-types scalar-types known-values]
+  (let [array-types (merge (into {} (map (juxt :value :dtype))
                                  (get-in attributes [:result-transform :operands]))
                            array-types)
         extent (:extent attributes)
@@ -5903,19 +5940,7 @@
                                         (types/sym-type-tag id)))]
                 (tensor-value declared []))
               (tensor-value :long [])))
-        stable (set (get-in attributes [:attributes :stable-array-captures]))
-        result-dtypes (case kind
-                        scalar (:dtypes attributes)
-                        stencil (:dtypes attributes)
-                        reduce (:dtypes attributes)
-                        segmented-reduce [(or (:result-storage-dtype attributes)
-                                              (first (:dtypes attributes)))]
-                        product-reduce (mapv #((:dtypes attributes) %)
-                                             (:result-components attributes))
-                        segmented-fold-map (:dtypes attributes)
-                        scan (:dtypes attributes)
-                        effect-map (:dtypes attributes)
-                        (map scatter) (map #(value-dtype % default-dtype array-types) results))]
+        stable (set (get-in attributes [:attributes :stable-array-captures]))]
     (merge
      (into {} (map (fn [id] [id (dimension-value id)])) dimension-ids)
      (into {} (map (fn [id] [id (tensor-value (value-dtype id default-dtype array-types)
@@ -5952,46 +5977,30 @@
                                  (tensor-value (or (declared-type scalar-types id)
                                                    (value-dtype id default-dtype array-types))
                                                [])))])
-                     captures)))
-     (into {} (map (fn [id result-dtype]
-                     [id (tensor-value (or result-dtype default-dtype :double)
-                                       (case kind
-                                         (scalar reduce) []
-                                         segmented-reduce
-                                         (dialect/segmented-reduce-result-shape attributes)
-                                         product-reduce
-                                         (dialect/segmented-reduce-result-shape attributes)
-                                         segmented-fold-map
-                                         (dialect/segmented-fold-map-result-shape attributes)
-                                         scan (dialect/scan-result-shape attributes)
-                                         scatter [(list 'unknown-dimension id)]
-                                         ;; An effect updates existing storage, not a dense
-                                         ;; tensor whose length is the iteration count.
-                                         effect-map [(list 'extent (get result-destinations id))]
-                                         (dialect/extent-shape extent)))])
-                   results result-dtypes)))))
+                     captures))))))
 
-(defn- equation-values
+(defn- equation-value-projection
+  "Keep consumer-side input inference separate from this equation's own result
+   declaration. Only :results may be published as newly produced values."
   [equation default-dtype array-types scalar-types known-values]
-  (if (= 'contract (dialect/operation-kind equation))
-    (let [{:keys [attributes arrays captures]} (dialect/operation-parts equation)
-          source (:contraction attributes)
-          bindings (contraction-closure/bindings attributes arrays captures)
-          requirements (group-by :parameter (contraction-closure/storage-requirements attributes))]
-      (merge
-       (into {} (map (fn [[parameter requirements]]
-                       (let [id (get bindings parameter)]
-                         [id (or (get known-values id)
-                                 (tensor-value (value-dtype id default-dtype array-types)
-                                               [(apply max (map :elements requirements))]))])) requirements))
-       (into {} (map (fn [id]
-                       [id (or (get known-values id)
-                               (when-let [declared (declared-type scalar-types id)]
-                                 (tensor-value declared [])))])) captures)
-       {(first (nth equation 2))
-        (tensor-value (or (:out-dtype source) (:dtype (first (:stages source))))
-                      (mapv second (:free-axes source)))}))
-    (ordinary-equation-values equation default-dtype array-types scalar-types known-values)))
+  (let [{:keys [kind attributes arrays captures] :as parts} (dialect/operation-parts equation)
+        results (equation-result-values equation parts default-dtype array-types)]
+    {:results results
+     :inputs
+     (if (= 'contract kind)
+       (let [bindings (contraction-closure/bindings attributes arrays captures)
+             requirements (group-by :parameter (contraction-closure/storage-requirements attributes))]
+         (merge
+          (into {} (map (fn [[parameter requirements]]
+                          (let [id (get bindings parameter)]
+                            [id (or (get known-values id)
+                                    (tensor-value (value-dtype id default-dtype array-types)
+                                                  [(apply max (map :elements requirements))]))])) requirements))
+          (into {} (map (fn [id]
+                          [id (or (get known-values id)
+                                  (when-let [declared (declared-type scalar-types id)]
+                                    (tensor-value declared [])))])) captures)))
+       (ordinary-equation-input-values equation parts default-dtype array-types scalar-types known-values))}))
 
 (defn- contraction-storage-values
   "Aggregate access lower bounds, without replacing a declared buffer's capacity.
@@ -6092,10 +6101,10 @@
 
 (declare form->program* source-storage-analysis)
 
-(defn- preserve-map-storage-inputs
-  "Use indexed captures in maps, reductions and scans when element-shape equality is not established.
-   Retain source-ordered producer storage shapes; a different symbolic traversal extent is not
-   permission to retype that storage. Existing indexed access/range validation remains mandatory."
+(defn- storage-selection-context
+  "Freeze the existing conservative capture-selection premises once. Global
+   requirements select indexed access; they establish no preceding value AV,
+   actual capacity, initialized storage or execution permission."
   [descriptions values]
   (let [ineligible-storage
         (into #{} (keep (fn [[id value]]
@@ -6115,10 +6124,19 @@
                                            (when (and (seq (:shape value))
                                                       (every? integer? (:shape value)))
                                              [id (reduce *' 1 (:shape value))]))) values))]
-    (:descriptions
-     (reduce
-      (fn [{:keys [shapes] :as state}
-           {:keys [kind extent inputs locals bodies body product index results] :as description}]
+    {:ineligible-storage ineligible-storage :capacities capacities}))
+
+(defn- initial-storage-selection-state
+  "Classification shapes only, never a causal value-availability environment."
+  [values]
+  {:descriptions [] :shapes (into {} (map (juxt key (comp :shape val))) values)})
+
+(defn- advance-storage-selection
+  "Classify one description with the existing preceding shape state. This
+   transfer publishes no AbstractValues or source-execution capabilities."
+  [{:keys [ineligible-storage capacities]}
+   {:keys [shapes] :as state}
+   {:keys [kind extent inputs locals bodies body product index results] :as description}]
         (if-not (contains? #{:map :reduce :scan} kind)
           (update state :descriptions conj description)
           (let [expressions (case kind
@@ -6147,8 +6165,17 @@
                 (assoc :shapes (reduce #(assoc %1 %2 (if (= :reduce kind) [] [extent])) shapes results))
                 (update :descriptions conj
                         (assoc description :storage-inputs storage-inputs))))))
-      {:descriptions [] :shapes (into {} (map (juxt key (comp :shape val))) values)}
-      descriptions))))
+
+(defn- preserve-map-storage-inputs
+  "Use indexed captures in maps, reductions and scans when element-shape equality is not established.
+   Retain source-ordered producer storage shapes; a different symbolic traversal extent is not
+   permission to retype that storage. Existing indexed access/range validation remains mandatory."
+  [descriptions values]
+  (let [context (storage-selection-context descriptions values)]
+    (:descriptions
+     (reduce (partial advance-storage-selection context)
+             (initial-storage-selection-state values)
+             descriptions))))
 
 (defn form->program
   "Construct and validate TypedSOAC islands directly from a let form.
@@ -6573,6 +6600,106 @@
                original-source)
        :rewrites (:rewrites rebuilt) :declines (:declines rebuilt)}))))
 
+(defn- causal-producer-results
+  "Do not import a global destination declaration as a causal producer type.
+   Whole-buffer source returns need compatible preceding storage facts; pure
+   maps need their own analyzed element declaration. Other operation results
+   carry their dtype in the typed equation's attributes. No Class is proved."
+  [description results preceding]
+  (cond
+    (seq (:result-storage description))
+    (let [id (first (:results description))
+          produced (get results id)
+          destination (get-in description [:result-storage 0 :destination])
+          prior (get preceding destination)]
+      (if (and (description-host-buffer? description)
+               produced (av/abstract-value? prior) (= :tensor (:kind prior)) (seq (:shape prior))
+               (= (dtype/canon (:dtype produced)) (dtype/canon (:dtype prior))))
+        ;; A source call returns the whole buffer, not the logical traversal
+        ;; result. Preserve its actual preceding capacity/layout contract.
+        {(:sym description) prior}
+        {}))
+
+    (= :map (:kind description))
+    (into {} (filter (fn [[id produced]]
+                       (and (= id (:sym description))
+                            (when-let [own-type (description-logical-array-dtype description)]
+                              (= own-type (dtype/canon (:dtype produced))))))) results)
+
+    :else (select-keys results [(:sym description)])))
+
+(defn- forget-dependent-value-facts
+  "Invalidate a rebound source identity and facts mentioning its old identity.
+   The reverse reference index avoids scanning every complete prefix per binder."
+  [state binding]
+  (let [invalid (loop [pending #{binding} invalid #{}]
+                  (if-let [id (first pending)]
+                    (let [more (set/difference (get-in state [:dependents id] #{}) invalid)]
+                      (recur (into (disj pending id) (disj more id)) (conj invalid id)))
+                    invalid))]
+    (reduce (fn [state id]
+              (let [references (get-in state [:references id])]
+                (-> (reduce (fn [state reference]
+                              (update state :dependents
+                                      (fn [index]
+                                        (let [remaining (disj (get index reference #{}) id)]
+                                          (if (seq remaining)
+                                            (assoc index reference remaining)
+                                            (dissoc index reference))))))
+                            state references)
+                    (update :values dissoc id)
+                    (update :references dissoc id)
+                    (update :dependents dissoc id))))
+            state invalid)))
+
+(defn- retain-produced-value-facts
+  [state results]
+  (reduce-kv (fn [state id value]
+               (let [references (util/free-syms value)]
+                 (-> (reduce (fn [state reference]
+                               (update-in state [:dependents reference] (fnil conj #{}) id))
+                             state references)
+                     (assoc-in [:references id] references)
+                     (assoc-in [:values id] value))))
+             state results))
+
+(defn- source-available-contracts
+  "A known source binder in a contract cannot refer to a future binding.
+   External symbolic dimensions stay symbolic; this proves no runtime value."
+  [contracts source-bindings available]
+  (let [ready (into available (keys contracts))]
+    (into {} (filter (fn [[_ contract]]
+                       (set/subset? (set/intersection source-bindings (util/free-syms contract)) ready)))
+          contracts)))
+
+(defn- preceding-numerical-values
+  "Retain logical value facts before each source entry. Seed only actual lexical
+   inputs and publish only typed equation results, never consumer-inferred input
+   shapes or whole-body allocation facts. This is not execution/Class evidence.
+   Source-only results remain unknown until their own producer is represented."
+  [entries produced-values lexical-inputs input-values]
+  (let [inputs (set lexical-inputs)
+        source-bindings (into inputs (map #(get-in % [:description :sym])) entries)]
+   (reduce (fn [{:keys [values available] :as state} {:keys [kind equation-id description]}]
+            (let [available (conj available (:sym description))
+                  results (when (= :typed-soac kind)
+                            (source-available-contracts
+                             (causal-producer-results description (get produced-values equation-id) values)
+                             source-bindings available))
+                  state (assoc-in state [:boundaries (:id description)] values)
+                  ;; Source-only bindings also invalidate their predecessor and
+                  ;; dependent extents/layout facts, not just their own AV.
+                  state (reduce forget-dependent-value-facts state
+                                (conj (set (keys results)) (:sym description)))]
+              (-> (retain-produced-value-facts state results)
+                  (assoc :available (into available (when (= :typed-soac kind)
+                                                     (keys (get produced-values equation-id))))))))
+          (retain-produced-value-facts {:values {} :boundaries {} :references {} :dependents {}
+                                       :available inputs}
+                                      (source-available-contracts (select-keys input-values inputs)
+                                                                  source-bindings inputs))
+          entries)))
+
 (defn- form->program*
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans? lexical-inputs
                  preserve-declared-array-storage? host-scalars?]
@@ -6743,15 +6870,24 @@
                                      needed)]
                   (if (= expanded needed) (select-keys storage-values needed)
                       (recur expanded))))
-              inferred-values (reduce (fn [contracts equation]
-                                        (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
-                                                   (equation-values equation dtype array-types'
-                                                                    source-scalar-types
-                                                                    contracts)))
-                                      (merge destination-values
-                                             (contraction-storage-values equations dtype array-types' values)
-                                             published-storage-values)
-                                      equations)
+              {inferred-values :values produced-values :produced-values}
+              (reduce (fn [{:keys [values] :as state} equation]
+                        (let [{:keys [inputs results]}
+                              (equation-value-projection equation dtype array-types'
+                                                         source-scalar-types values)]
+                          (-> state
+                              (assoc :values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
+                                                       values (merge inputs results)))
+                              (assoc-in [:produced-values (second equation)] results))))
+                      {:values (merge destination-values
+                                      (contraction-storage-values equations dtype array-types' values)
+                                      published-storage-values)
+                       :produced-values {}}
+                      equations)
+              preceding-values (preceding-numerical-values
+                                entries produced-values
+                                (if (some? lexical-inputs) lexical-inputs (util/free-syms source))
+                                values)
               extent-environments (when (seq swr-descriptions)
                                     (source-extent-environments descriptions equations
                                                                 inferred-values source-scalar-types))
@@ -6853,6 +6989,7 @@
             {:typed-program typed-program
              :segmented-plans? segmented?
              :entries entries
+             :preceding-values (:boundaries preceding-values)
              :outputs outputs
              :values values
              :facts facts

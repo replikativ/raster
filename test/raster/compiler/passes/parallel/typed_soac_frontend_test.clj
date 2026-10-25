@@ -3227,6 +3227,192 @@
       (is (empty? (:storage-inputs (first (preserve [description] {'x value}))))
           "unproved flat indexing cannot reinterpret a logical layout or packed storage"))))
 
+(deftest storage-selection-freezes-context-once-and-transfers-each-real-binding-once
+  (let [source '(let* [a (raster.par/pmap i n float (aget x i))
+                       b (raster.par/pmap j m float (aget x j))] [a b])
+        context @#'frontend/storage-selection-context
+        advance @#'frontend/advance-storage-selection
+        contexts (atom 0)
+        transfers (atom [])
+        program (with-redefs-fn
+                  {#'frontend/storage-selection-context
+                   (fn [& arguments] (swap! contexts inc) (apply context arguments))
+                   #'frontend/advance-storage-selection
+                   (fn [context state description]
+                     (swap! transfers conj (:id description))
+                     (advance context state description))}
+                  #(frontend/form->program source {:dtype :float :array-types {'x :float}
+                                                   :scalar-types {'n :long 'm :long}}))
+        operations (mapv dialect/operation-parts (dialect/equations program))]
+    (is (some? program))
+    (is (= 1 @contexts))
+    (is (= [0 1] @transfers))
+    (is (= ['x] (:arrays (first operations))))
+    (is (= [] (:arrays (second operations))))
+    (is (= ['x] (get-in operations [1 :attributes :attributes :pointwise-storage-inputs])))
+    (is (= '[n] (get-in (dialect/facts program) [:values 'x :shape])))))
+
+(deftest later-contraction-requirements-only-inform-indexed-capture-classification
+  (let [source '(let* [a (raster.par/pmap p 2 float (aget A p))
+                       c (raster.par/contract C [[i 2] [j 5]] [[blk 2] [k 2]]
+                           (* (aget A (+ (* i 4) (* blk 2) k))
+                              (aget B (+ (* j 4) (* blk 2) k)))
+                           :stages [{:axis blk :extent 2 :dtype :float :init 0.0
+                                     :lift (raster.numeric/* inner (aget da _) (aget db _))
+                                     :operands [{:sym da :map {:groups [[[i 2]] [[blk 2]]]} :dtype :float}
+                                                {:sym db :map {:groups [[[j 5]] [[blk 2]]]} :dtype :float}]}
+                                    {:axis k :extent 2 :dtype :int :init 0}])]
+                 [a c])
+        options {:dtype :byte :array-types {'A :byte 'B :byte 'C :float 'da :float 'db :float}}
+        analysis (frontend/source-fragment-analysis source options)
+        ;; Re-run only the classification on actual source-derived descriptions,
+        ;; not a fabricated contraction closure or a second source analyzer.
+        descriptions (mapv #(dissoc % :storage-inputs) (:descriptions analysis))
+        context (#'frontend/storage-selection-context descriptions {})
+        initial (#'frontend/initial-storage-selection-state {})
+        advance (partial #'frontend/advance-storage-selection context)
+        prefix (advance initial (first descriptions))
+        complete (reduce advance prefix (rest descriptions))
+        without-later (#'frontend/preserve-map-storage-inputs [(first descriptions)] {})
+        projection (frontend/form->program-components
+                    source (assoc options :segmented-plans? true
+                                          :lexical-inputs '[A B C da db]))
+        before-contract (get-in projection [:preceding-values 1])]
+    (is (= [:map :contract] (mapv :kind descriptions)))
+    (is (= 8 (get-in context [:capacities 'A])))
+    (is (= #{} (:storage-inputs (first without-later))))
+    (is (= #{'A} (get-in prefix [:descriptions 0 :storage-inputs])))
+    (is (= [2] (get-in prefix [:shapes 'a])))
+    (is (not (contains? (:shapes prefix) 'A))
+        "a later storage requirement does not establish even an inferred pointwise shape")
+    (is (= #{:descriptions :shapes} (set (keys prefix)))
+        "classification state publishes neither AVs nor causal availability")
+    (is (= #{:ineligible-storage :capacities} (set (keys context))))
+    (is (= (#'frontend/preserve-map-storage-inputs descriptions {}) (:descriptions complete)))
+    (is (= 2 (:extent (first (:descriptions complete)))))
+    (is (= 'c (:sym (last (:descriptions complete)))))
+    (is (nil? (:values context)))
+    (is (nil? (:available complete)))
+    (is (some? (:typed-program projection)))
+    (is (= [8] (get-in projection [:values 'A :shape]))
+        "global storage validation still retains the later contraction's access requirement")
+    (is (not= [8] (get-in before-contract ['A :shape]))
+        "a later access requirement is not an earlier input-capacity producer")
+    (is (= :float (get-in before-contract ['a :dtype])))
+    (is (= [2] (get-in before-contract ['a :shape])))
+    (is (not (contains? before-contract 'c)))
+    (is (not (contains? (get-in projection [:preceding-values 0]) 'a)))))
+
+(deftest shadowing-an-extent-invalidates-dependent-prefix-facts
+  (let [source '(let* [a (raster.par/pmap i n float (aget x i))
+                       n (clojure.core/println n)
+                       final (raster.par/pmap j 1 float 0.0)]
+                 final)
+        projection (frontend/form->program-components
+                    source {:dtype :float :array-types {'x :float}
+                            :scalar-types {'n :long} :lexical-inputs '[x n]
+                            :values {'x (av/tensor {:dtype :float :shape ['n]})
+                                     'n (av/tensor {:dtype :long :shape []})}
+                            :segmented-plans? true})
+        before (get-in projection [:preceding-values 1])
+        after (get-in projection [:preceding-values 2])]
+    (is (some? (:typed-program projection)))
+    (is (= '[n] (get-in before ['a :shape])))
+    (is (not (contains? after 'n)))
+    (is (not (contains? after 'a))
+        "the old dimension must not be interpreted through the newly bound n")
+    (is (not (contains? after 'x))
+        "input facts mentioning that old dimension also need independent re-establishment")))
+
+(deftest a-future-dimension-cannot-enter-a-prefix-through-an-input-contract
+  (let [source '(let* [a (raster.par/pmap i (clojure.core/alength input) float (aget input i))
+                       later (clojure.core/println :later)
+                       final (raster.par/pmap j 1 float 0.0)] final)
+        projection (frontend/form->program-components
+                    source {:dtype :float :array-types {'input :float}
+                            :scalar-types {'later :long} :lexical-inputs '[input]
+                            :values {'input (av/tensor {:dtype :float :shape ['later]})}
+                            :segmented-plans? true})]
+    (is (some? (:typed-program projection)))
+    (is (not (contains? (get-in projection [:preceding-values 0]) 'input))
+        "a noncausal metadata premise cannot establish an earlier shape")
+    (is (not (contains? (get-in projection [:preceding-values 1]) 'a))
+        "nor may result projection launder that future extent into a produced AV")))
+
+(deftest prefix-dependency-invalidation-is-transitive-and-forgets-replaced-edges
+  (let [plain (av/tensor {:dtype :float :shape [4]})
+        ;; Extension references are tracked conservatively, not interpreted as
+        ;; storage, layout or execution evidence by this source analysis.
+        values {'A plain 'B (assoc plain :attributes {:view-parent 'A})
+                'C (assoc plain :attributes {:view-parent 'B}) 'D plain}
+        projection (frontend/form->program-components
+                    '(let* [A (clojure.core/println A)
+                            final (raster.par/pmap i 1 float 0.0)] final)
+                    {:dtype :float :array-types (zipmap '[A B C D] (repeat :float))
+                     :values values :lexical-inputs '[A B C D] :segmented-plans? true})
+        after (get-in projection [:preceding-values 1])
+        indexed (#'frontend/retain-produced-value-facts
+                 {:values {} :references {} :dependents {}} values)
+        forgotten (#'frontend/forget-dependent-value-facts indexed 'A)
+        replacement (#'frontend/retain-produced-value-facts forgotten {'B plain})
+        repeated (#'frontend/forget-dependent-value-facts replacement 'A)]
+    (is (some? (:typed-program projection)))
+    (is (= #{'D} (set (keys after))))
+    (is (= #{'D} (set (keys (:values forgotten)))))
+    (is (= {} (:dependents forgotten)))
+    (is (= {'B plain 'D plain} (:values repeated)))
+    (is (= {} (:dependents repeated)))
+    (is (= values (get-in projection [:preceding-values 0]))
+        "earlier persistent snapshots retain their original contracts")))
+
+(deftest destination-result-types-need-preceding-storage-evidence
+  (let [source '(let* [write (raster.par/map! out i 4 float (float i))] write)
+        analysis (frontend/source-fragment-analysis
+                  source {:dtype :float :array-types {'out :float}})
+        description (first (:descriptions analysis))
+        equation (#'frontend/operation-equation description)
+        parts (dialect/operation-parts equation)
+        local (get (#'frontend/equation-result-values equation parts :float {'write :float}) 'write)
+        global (get (#'frontend/equation-result-values equation parts :double {'write :double}) 'write)
+        predecessor {'out (av/tensor {:dtype :float :shape [4]})}]
+    (is (= :map (:kind description)))
+    (is (= :float (:dtype local)))
+    (is (= :double (:dtype global)) "the inherited final typing table is not a causal dtype proof")
+    (is (= {} (#'frontend/causal-producer-results description {'write global} predecessor)))
+    (is (= {} (#'frontend/causal-producer-results description {'write local} {})))
+    (doseq [kind [:opaque :record]]
+      (is (= {} (#'frontend/causal-producer-results
+                 description {'write local}
+                 {'out (av/make {:kind kind :dtype :float :shape [4]})}))))
+    (is (= {'write local}
+           (#'frontend/causal-producer-results description {'write local} predecessor)))))
+
+(deftest source-buffer-returns-retain-capacity-not-the-written-traversal-domain
+  (let [out (av/tensor {:dtype :float :shape [8]})
+        projection (frontend/form->program-components
+                    '(let* [write (raster.par/map! out i 2 float (float i))
+                            final (raster.par/pmap j 1 float 0.0)] write)
+                    {:dtype :float :array-types {'out :float}
+                     :values {'out out} :lexical-inputs '[out] :segmented-plans? true})]
+    (is (some? (:typed-program projection)))
+    (is (= [2] (get-in projection [:values 'write :shape]))
+        "the mathematical result still describes only the traversed domain")
+    (is (= out (get-in projection [:preceding-values 1 'write]))
+        "the source return describes the whole destination, without proving initialization")
+    (is (not (contains? (get-in projection [:preceding-values 0]) 'write)))))
+
+(deftest effect-only-source-returns-do-not-publish-their-mathematical-results-as-arrays
+  (let [projection (frontend/form->program-components
+                    '(let* [effect (raster.par/map-void! i 2 (aset out i (float i)))
+                            final (raster.par/pmap j 1 float 0.0)] effect)
+                    {:dtype :float :array-types {'out :float}
+                     :values {'out (av/tensor {:dtype :float :shape [8]})}
+                     :lexical-inputs '[out] :segmented-plans? true})]
+    (is (some? (:typed-program projection)))
+    (is (not (contains? (get-in projection [:preceding-values 1]) 'effect))
+        "map-void! returns nil, not the tensor written by its numerical equation")
+    (is (= #{'out} (set (keys (get-in projection [:preceding-values 1])))))))
+
 (deftest a-recomputed-array-read-is-not-an-alias-across-a-kernel
   ;; `n1 = (aget counts 0)` recomputed after a kernel that writes `counts` is a fresh value; only
   ;; array-free scalars and array lengths alias across kernels.
