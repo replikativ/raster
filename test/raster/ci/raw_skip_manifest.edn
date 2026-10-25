@@ -24,6 +24,9 @@
   {:count 1 :class :toolchain :reason "Optional Node execution gate"}
   "test/raster/compiler/csimd_test.clj"
   {:count 4 :class :toolchain :reason "Optional clang and AVX2 execution gates"}
+  "test/raster/compiler/jvm_dense_contraction_blas_test.clj"
+  {:count 3 :class :optional-library
+   :reason "Conditional native GEMM execution requires a prepared provider for the selected dtype; readiness, numerical permission, alias/capacity and generated-fallback controls remain unconditional"}
   "test/raster/compiler/passes/parallel/contract_route_device_test.clj"
   {:count 7 :class :device-test :reason "Level Zero device gates predate the shared probe"}
   "test/raster/compiler/passes/parallel/epilogue_operand_fusion_test.clj"
