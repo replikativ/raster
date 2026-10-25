@@ -1335,8 +1335,22 @@
   ([form max-depth] (inline-deftm-calls form max-depth false))
   ([form max-depth safe?] (inline-deftm-calls form max-depth safe? false))
   ([form max-depth safe? skip-ad-rule-check?]
-   (if (not (form/binding-form? form))
+   (cond
+     ;; A body that IS a bare ((value+grad #'f) args…) application (the canonical
+     ;; `(deftm f-vg [...] ((value+grad #'f) ...))` wrapper) has no let* binding for the
+     ;; binding-level AD machinery to fire on. Left as-is it compiled to a runtime
+     ;; `raster.ad.reverse/value+grad` call that re-prepares the AD program on EVERY
+     ;; invocation (silently correct, several× slower than the inlined gradient).
+     ;; Give it a binding and inline normally.
+     (and (seq? form) (not (form/binding-form? form)) (value+grad-call? form))
+     (let [result-sym (with-meta (gensym "vg_result_") (meta form))]
+       (inline-deftm-calls (list 'let* [result-sym form] result-sym)
+                           max-depth safe? skip-ad-rule-check?))
+
+     (not (form/binding-form? form))
      form
+
+     :else
      (let [subst-fn (if safe? subst-syms-safe subst-syms)]
        (loop [current-form form
               depth max-depth]
