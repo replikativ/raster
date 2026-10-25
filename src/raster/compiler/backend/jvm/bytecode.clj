@@ -2854,6 +2854,32 @@
   (.checkcast code ifn-cd)
   (emit-boxed-ifn-call code args locals ctx))
 
+(defn- emit-source-integral-completion
+  "Complete an already evaluated source int/long operand using its actual carrier.
+   This is deliberately separate from raw JVM/descriptor adaptation."
+  [code head-name input]
+  (let [result (case head-name "int" :int "long" :long)]
+    (if (= :diverge input)
+      :diverge
+      (do
+        (cond
+          (= input result) nil
+          (= [input result] [:int :long]) (.i2l code)
+          :else
+          (let [descriptor (case input
+                             :int I-cd :long J-cd :float F-cd :double D-cd :ref obj-cd
+                             :bool (do (emit-box-to-ref code input) obj-cd)
+                             :void (do (.aconst_null code) obj-cd))
+                ;; Clojure's int inline is policy-sensitive; its long inline
+                ;; always selects longCast, even under unchecked arithmetic.
+                method-name (if (and (= "int" head-name) *unchecked-math*)
+                              "uncheckedIntCast"
+                              (str head-name "Cast"))]
+            (.invokestatic code rt-cd method-name
+                           (MethodTypeDesc/of (if (= :int result) I-cd J-cd)
+                                              (into-array ClassDesc [descriptor])))))
+        result))))
+
 (defn- retain-array-read! [ctx array index index-type result-type locals proof]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
@@ -2861,6 +2887,11 @@
                     :array array :array-local (get locals array)
                     :result-type result-type
                     :input (assoc (physical-operand-input index locals ctx) :type index-type)
+                    ;; Observe the policy that actually selects this emitted
+                    ;; conversion, under the original method's binding. Replay
+                    ;; consumes this history, never its caller's current policy.
+                    :index-completion {:kind :source-int
+                                       :source-policy (source-policy/capture)}
                     :primitive-index? (and (contains? #{:int :long} index-type) (empty? (:open proof)))
                     :index-routes (:routes proof)
                     :element-type (:element-type ctx)}]
@@ -2911,7 +2942,7 @@
     (let [proof (atom {:open {} :routes []})
           t (emit-form code idx locals (assoc ctx ::index-proof proof))]
       (retain-array-read! ctx arr idx t (array-read-stack-type arr locals) locals @proof)
-      (when (not= t :int) (emit-coerce code t :int)))
+      (emit-source-integral-completion code "int" t))
     (case (array-read-stack-type arr locals)
       :double (do (.daload code) :double)
       :float  (do (.faload code) :float)
@@ -2938,8 +2969,7 @@
                  code ctx
                  (fn []
                    (let [t (emit-form code idx locals operand-ctx)]
-                     (if (diverge? t) t
-                       (if (= t :int) t (emit-coerce code t :int)))))))
+                     (emit-source-integral-completion code "int" t)))))
         target (case arr-tag doubles :double floats :float longs :long
                      (ints bytes shorts) :int :ref)
         completed (when (and index (not (diverge? (:type index))))
@@ -2985,7 +3015,7 @@
     ;; Known storage only; unknown references use runtime dispatch above.
     (emit-retained-array-checkcast code arr-tag arr-type arr-verified? ctx)
     (let [t (emit-form code idx locals ctx)]
-      (when (not= t :int) (emit-coerce code t :int)))
+      (emit-source-integral-completion code "int" t))
     ;; In void context (non-last statement), emit plain store (1 instr).
     ;; In value context (result used), use temp local to preserve
     ;; the value across the store (Clojure semantics: aset returns val).
@@ -3090,33 +3120,15 @@
     nil))
 
 (defn- emit-source-integral-cast
-  "Checked source conversions, not method/array ABI coercions. Select the
+  "Source conversions, not method/array ABI coercions. Select the
    Clojure runtime overload from the actual emitted operand carrier."
   [code head-name args locals ctx]
   (when (= 1 (count args))
     (let [input (emit-form code (first args) locals ctx)
-          result (primitive-core-cast-carrier head-name)]
+          result (emit-source-integral-completion code head-name input)]
       (if (= :diverge input)
         :diverge
         (do
-          (cond
-            (= input result) nil
-            (= [input result] [:int :long]) (.i2l code)
-            ;; Keep the existing checked primitive Long narrowing, including
-            ;; its ArithmeticException behavior, distinct from unchecked-int.
-            (= [input result] [:long :int])
-            (.invokestatic code math-cd "toIntExact"
-                           (MethodTypeDesc/of I-cd (into-array ClassDesc [J-cd])))
-            :else
-            (let [descriptor (case input
-                               :float F-cd :double D-cd :ref obj-cd
-                               ;; Boolean's int-shaped stack slot is not a number.
-                               :bool (do (emit-box-to-ref code input) obj-cd)
-                               ;; A void operand completes its effects, then yields nil.
-                               :void (do (.aconst_null code) obj-cd))]
-              (.invokestatic code rt-cd (str head-name "Cast")
-                             (MethodTypeDesc/of (if (= :int result) I-cd J-cd)
-                                                (into-array ClassDesc [descriptor])))))
           (when (contains? #{:int :long} input)
             (retain-primitive-index-route! ctx :integer-cast result))
           result)))))
@@ -6744,6 +6756,7 @@
                                     input-port-layout ::input-port-layout
                                     body-input-context ::body-input-context
                                     expected-body-type ::expected-body-type
+                                    body-source-int-completion ::body-source-int-completion
                                     expected-completion-input-type ::expected-completion-input-type
                                     extracted-region ::extracted-region}]
                                   (map vector method-specs fn-specs)]
@@ -6892,7 +6905,10 @@
                                                        _ (when (and expected-body-type (not= expected-body-type ret-type))
                                                            (throw (ex-info "Outlined operand changed its emitted carrier"
                                                                            {:reason :bytecode-input-result-carrier
-                                                                            :expected expected-body-type :actual ret-type})))]
+                                                                            :expected expected-body-type :actual ret-type})))
+                                                       ret-type (if body-source-int-completion
+                                                                  (emit-source-integral-completion code "int" ret-type)
+                                                                  ret-type)]
                               ;; Return according to method signature type
                                                    (when-not (#{:void :diverge} ret-type)
                                                      (case return-stack-type
@@ -7228,21 +7244,31 @@
     ::body-input-context (:context input) ::expected-body-type input-type} guard))
 
 (defn ^:no-doc compile-array-index-region
-  "Outline the actual evaluated index and raw JVM Int completion of a read.
-   No checked source `int` is inserted: the method's Int return uses the same
-   emit-coerce path as the original array load. Activity is the AD caller's
-   responsibility, and the array read remains outside this operand region."
+  "Outline an owned read's actual index and source Int completion.
+   Replay uses the producer's retained policy and physical operand carrier.
+   Activity is the AD caller's responsibility; the read stays outside the region."
   [emission original]
   (let [record (retained-array-read emission original)]
     (when-not record
       (throw (ex-info "Index outlining requires an original owned array read"
                       {:reason :unowned-bytecode-array-index-region})))
     (let [input (:input record)
+          recipe (:index-completion record)
+          policy (:source-policy recipe)
+          _ (when-not (and (= :source-int (:kind recipe))
+                           (source-policy/valid? policy))
+              (throw (ex-info "Index outlining lacks its original source completion policy"
+                              {:reason :unclosed-bytecode-array-index-completion})))
           guard (fn []
                   (when-not (identical? record (retained-array-read emission original))
                     (throw (ex-info "Index region lost its owning array read"
                                     {:reason :unowned-bytecode-array-index-region}))))]
-      (compile-raw-int-input-region emission input (:type input) (:element-type record) guard))))
+      (compile-owned-input-region
+       emission input Integer/TYPE
+       {:return-tag 'int :walked-body [(:operand input)]
+        :source-policy policy :element-type (:element-type record)
+        ::body-input-context (:context input) ::expected-body-type (:type input)
+        ::body-source-int-completion true} guard))))
 
 (defn ^:no-doc compile-array-count-region
   "Outline the actual count input and raw Int completion of an owned newarray.

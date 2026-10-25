@@ -53,15 +53,35 @@ OpenCL and Level Zero for the real Float-local/Double-fold helper case. Independ
 review approved the corrected carrier boundary. Nested `alength` extent closure
 and its ordered buffer-shape evaluation remain separate open work.
 
-The SS loop-OSR integration exposed a separate, verified baseline correctness
-gap: typed JVM array-index completion uses raw stack coercion. For a Long index
-`4294967296`, ordinary Clojure `aset` throws before its value effect; the current
-typed emitter wraps to index zero and executes the effect/store. Evidence:
-`20261024-array-index-completion-baseline.log`. This is not introduced or fixed
-by completed operand spilling. Prioritize one source-owned array-index recipe,
-including checked/unchecked definition policy, ordinary and spilled `aset`,
-`aget`, and outlined index replay. Reuse the source conversion authority; do not
-change generic JVM coercion or infer a source Class from a logical dtype.
+The SS loop-OSR integration exposed a separate baseline correctness gap: a Long
+array index `4294967296` wrapped to zero instead of throwing before the stored
+value's effects. Array indices now share the actual-carrier source integral
+completion with explicit casts; ordinary/spilled `aset` and `aget` use it, and
+outlined AD index replay consumes its original emitted conversion policy rather
+than the consumer's ambient policy. Clojure's `int` is policy-sensitive; `long`
+always uses checked `longCast`. Generic descriptor coercion and allocation-count
+replay are unchanged.
+
+Qualification after independent review: 96 tests / 1,169 assertions pass across
+source differential/index and explicit-cast checks, historical policy replay,
+walker, completed loop spills, source policy, bytecode input completion and the
+merged BLAS/AD-wrapper integration. Evidence:
+`20261025-source-index-reviewed-final.log`; no optional BLAS tests skipped in
+that run. The native AOT integration still has the two separately recorded
+rectangular-loop code-shape failures; they are not waived by this qualification.
+
+The remaining library-accessor boundary is explicit debt, not silently declared
+equivalent to core inline access. `raster.arrays/aset` evaluates value arguments
+before entering its checked index conversion; a core inline `aset` completes its
+index before evaluating the value. A trial routing library accesses through their
+selected deftm bodies preserved this distinction, but exposed the owned AD helper
+normalizer's FP-only input restriction and an unclosed native map expansion.
+The walker change was withdrawn, not the AD checks weakened. Evidence:
+`20261025-landed-ss-source-index-native-integration.log`. Close a shared owned
+selected-array-call projection before retiring that existing primitive shortcut;
+do not replace it with another spelling-based AD rule. General scalar helper
+imports also lack a definition-policy boundary. No source Class is inferred from
+a logical dtype, and no arbitrary-loop completeness is claimed.
 
 Keep all eight original objectives below. This phase is their correctness and
 qualification prerequisite, not a replacement campaign or a claim of arbitrary
