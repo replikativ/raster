@@ -205,6 +205,7 @@
       (let [state (assoc-in state [:values symbol]
                             (tensor (or cast-dtype
                                         (get-in values [symbol :dtype])
+                                        retained-scalar-dtype
                                         (dtype/dtype-for-scalar-tag 'int)) []))]
         (refine-array-extent state alength-array symbol))
 
@@ -350,6 +351,21 @@
                         source (assoc-in [:aliases symbol] source)
                         (and lexical? (or source (not refused-buffer-reference?)))
                         (update :available conj symbol))))))
+
+(defn ^:no-doc enter-scalar-parameter
+  "Enter a fresh, unknown scalar in a child lexical analysis context.
+
+   This retains preceding relational facts, but establishes neither a value
+   equality nor buffer ownership. The caller must alpha-rename the parameter:
+   even an occurrence used only as a symbolic shape may not be shadowed."
+  [{:keys [analysis lexical? ineligible] :as context} id scalar-dtype]
+  (when-not (and (symbol? id)
+                 (not (contains? ineligible id))
+                 (not-any? #{id} (tree-seq coll? seq analysis)))
+    (throw (ex-info "host analysis parameter requires a fresh lexical identity"
+                    {:reason :host-abstract-value-parameter :parameter id})))
+  (cond-> (assoc-in context [:analysis :values id] (tensor scalar-dtype []))
+    lexical? (update-in [:analysis :available] conj id)))
 
 (defn ^:no-doc finish-analysis [{:keys [analysis]}]
   (update analysis :values

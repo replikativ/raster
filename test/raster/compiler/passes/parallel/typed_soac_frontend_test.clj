@@ -26,6 +26,56 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
+(deftest incoming-extent-aliases-do-not-redefine-scalar-carriers-or-local-producers
+  (let [integral #(av/tensor {:dtype % :shape []})
+        values {'count (integral :int) 'length (integral :long)
+                'later (integral :int) 'floating (integral :double)}
+        descriptions [{:kind :scalar :sym 'alias :expr 'count}
+                      {:kind :map :sym 'result :extent 'count}
+                      {:kind :scalar :sym 'measured :expr '(clojure.core/alength result)
+                       :scalar-dtype :int}]
+        normalize #(#'frontend/normalize-extents %1 %2 values)
+        normalized (normalize descriptions {'count 'length})]
+    (is (= 'length (:extent (second normalized))))
+    (is (= 'count (:expr (first normalized)))
+        "a numerical extent equality is not a scalar carrier conversion")
+    (is (= 'count (:expr (nth normalized 2)))
+        "a later alength also keeps its original Int-producing representative")
+    (doseq [equalities [{'count 'later}
+                        {'count 'later 'later 'length}
+                        {'count 'floating}]]
+      (let [descriptions (conj descriptions {:kind :scalar :sym 'later :expr 9})]
+        (is (= 'count (:extent (second (normalize descriptions equalities))))
+            "no path through a local or nonintegral producer justifies an incoming extent")))
+    (is (= 'count (:extent (second (normalize descriptions {'count 'unknown})))))
+    (let [shadowed (into [{:kind :scalar :sym 'count :expr 3}] descriptions)]
+      (is (= 3 (:extent (nth (normalize shadowed {'count 'length}) 2)))
+          "the actual preceding source binding, not its shadowed entry fact, owns the extent"))))
+
+(deftest normalized-fragment-locals-avoid-nontextual-incoming-identities
+  (let [incoming '#{rstr_extent_0 rstr_copy_effect_0_0 rstr_copy_index_0_0}
+        options {:dtype :double :array-types {'input :double}
+                 :scalar-types {'count :long}
+                 :values (merge {'input (av/tensor {:dtype :double :shape ['rstr_extent_0]})}
+                                (zipmap (disj incoming 'rstr_extent_0)
+                                        (repeat (av/tensor {:dtype :long :shape []}))))}
+        sources ['(let* [result (raster.par/pmap index (+ count 1) double
+                                               (clojure.core/aget input index))] result)
+                 '(let* [copy (clojure.core/aclone input)] copy)]]
+    (doseq [source sources
+            :let [normalized (frontend/normalize-source source options)
+                  binders (set (take-nth 2 (second normalized)))]]
+      (is (not= source normalized))
+      (is (not-any? binders incoming)
+          "a fragment cannot shadow an enclosing value used only by retained shape facts"))
+    (let [normalized (frontend/normalize-source (second sources) options)
+          copy-map (some (fn [[_ expression]]
+                           (when (and (seq? expression)
+                                      (= 'raster.par/map! (first expression))) expression))
+                         (partition 2 (second normalized)))]
+      (is (some? copy-map))
+      (is (not (contains? incoming (nth copy-map 2)))))))
+
 (deftest reference-entry-projection-requires-the-actual-unshadowed-formal
   (let [{:keys [source]} (#'lineage/fresh-entry)
         parameters '[values count scale reference]

@@ -751,8 +751,13 @@
 (def ^:dynamic ^:private *region-local-counter* nil)
 (def ^:dynamic ^:private *region-local-source-symbols* #{})
 
-(defn- source-symbols [source]
-  (set (filter symbol? (tree-seq coll? seq source))))
+(defn- source-symbols
+  ([source] (set (filter symbol? (tree-seq coll? seq source))))
+  ([source options]
+   ;; A captured value (including a symbolic shape) need not occur textually in
+   ;; this fragment. Every region producer must avoid its enclosing identity.
+   (into (source-symbols source)
+         (source-symbols (select-keys options [:values :array-types :scalar-types :lexical-inputs])))))
 
 (defn- fresh-region-local-id!
   "Allocate a deterministic SSA name across the entire source-description pass, not once per
@@ -4225,7 +4230,7 @@
             lexical? (and (contains? options :lexical-inputs)
                           (some (fn [[_ expression]]
                                   (some-> expression completion/object-input-parts :operand symbol?)) pairs))
-            occupied-symbols (set (filter symbol? (tree-seq coll? seq source)))
+            occupied-symbols (source-symbols source options)
             {:keys [normalized host-analysis object-buffer-alias?]}
             (reduce
              (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
@@ -4666,7 +4671,25 @@
 
 (defn- normalize-extents
   [descriptions shape-equalities values]
-  (:descriptions
+  (let [local-ids (set (map :sym descriptions))
+        entry-scalar? (fn [id]
+                        (let [value (get values id)]
+                          (and (symbol? id) (not (contains? local-ids id))
+                               (= :tensor (:kind value)) (empty? (:shape value))
+                               (contains? #{:int :long} (:dtype value)))))
+        ;; Only incoming scalar identities may be chosen before visiting source
+        ;; bindings. Whole-body equalities must not make a later local dimension
+        ;; available at an earlier producer (or create allocation/length cycles).
+        entry-equalities (into {} (filter (fn [[left right]]
+                                           (and (entry-scalar? left) (entry-scalar? right))))
+                               shape-equalities)
+        entry-representatives
+        (into {} (keep (fn [id]
+                         (when (entry-scalar? id)
+                           (let [representative (canonical-extent entry-equalities values id)]
+                             (when (entry-scalar? representative) [id representative])))))
+              (keys values))]
+   (:descriptions
    (reduce
     (fn [{:keys [extents scalar-representatives] :as state} description]
       (case (:kind description)
@@ -4703,14 +4726,19 @@
                         (symbol? extent) (get scalar-representatives extent extent)
                         (not= proved-extent extent) proved-extent
                         :else extent)
+              ;; Extent equality does not identify scalar carriers: an incoming
+              ;; Int count and Long length can agree numerically without allowing
+              ;; ordinary scalar alias expressions to change their JVM type.
+              source-extent extent'
+              extent' (get entry-representatives source-extent source-extent)
               description' (assoc description :extent extent')]
           (cond-> (update state :descriptions conj description')
             (contains? #{:map :scatter :effect-map :stencil :scan} (:kind description'))
-            (assoc-in [:extents (:sym description')] extent')))
+            (assoc-in [:extents (:sym description')] source-extent)))
 
         (update state :descriptions conj description)))
     {:descriptions [] :extents {} :scalar-representatives {}}
-    descriptions)))
+    descriptions))))
 
 (defn- generated-scaffolding?
   [description physical-outputs]
@@ -4883,10 +4911,10 @@
    clone semantics, while device compilation exposes the copy as a fusible functional map. The
    source array's retained dtype chooses the store conversion; unknown/object storage remains an
    honest admission decline rather than acquiring a guessed GPU representation."
-  [source array-types]
+  [source array-types reserved]
   (if (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[head bindings & body] source
-          occupied (set (filter symbol? (tree-seq coll? seq source)))
+          occupied reserved
           fresh (fn [prefix]
                   (first (remove occupied
                                  (map #(symbol (str prefix %)) (range)))))]
@@ -4935,7 +4963,7 @@
                   (set (filter #(kind? (types/sym-type-tag %)) binders)))]
      (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
                *region-local-counter* (atom -1)
-               *region-local-source-symbols* (source-symbols source)
+               *region-local-source-symbols* (source-symbols source options)
                *declared-kinds*
                {:arrays (into (set (keys array-types))
                               (tagged #(some? (dtype/dtype-for-array-tag %))))
@@ -4943,7 +4971,7 @@
                                (tagged #(contains? #{:long :int}
                                                    (some-> % dtype/dtype-for-scalar-tag
                                                            dtype/canon))))}]
-       (normalize-source* (copy-allocations->maps source array-types)
+       (normalize-source* (copy-allocations->maps source array-types (source-symbols source options))
                           array-types scalar-types options)))))
 
 (declare coverage-decline*)
@@ -4957,7 +4985,7 @@
   (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
                                                              values)
             *region-local-counter* (atom -1)
-            *region-local-source-symbols* (source-symbols source)]
+            *region-local-source-symbols* (source-symbols source options)]
     (coverage-decline* source options)))
 
 (defn- coverage-decline*
@@ -6077,7 +6105,7 @@
   (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
                                                              values)
             *region-local-counter* (atom -1)
-            *region-local-source-symbols* (source-symbols source)]
+            *region-local-source-symbols* (source-symbols source options)]
     (let [projection (form->program* source options)]
       (when (and projection (not (:segmented-plans? projection)))
         (:typed-program projection)))))
@@ -6091,7 +6119,8 @@
    unchanged so complete-source validation keeps its existing refusal boundary."
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
                   preserve-declared-array-storage?]
-           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
+           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}
+           :as options}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source))
              (= 1 (count (drop 2 source))))
     (let [[head bindings expression] source]
@@ -6100,7 +6129,7 @@
           (binding [util/*shadowing-locals* (source-shadowing-locals
                                             source array-types scalar-types values)
                     *region-local-counter* (atom -1)
-                    *region-local-source-symbols* (source-symbols source)]
+                    *region-local-source-symbols* (source-symbols source options)]
             (let [pairs (vec (mapv vec (partition 2 bindings)))
                   array-types (binder-array-types pairs array-types dtype
                                                   preserve-declared-array-storage?)
@@ -6149,7 +6178,7 @@
     (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
                                                                values)
               *region-local-counter* (atom -1)
-              *region-local-source-symbols* (source-symbols source)]
+              *region-local-source-symbols* (source-symbols source options)]
       (form->program* source options))))
 
 (defn- allocation-contracts
@@ -6257,7 +6286,7 @@
    integral extent identities. No program dtype supplies missing evidence. Allocation stays at
    its source site; the map replaces the effect at its original site, followed by the original
    unused statement's nil value. Unproved regions remain unchanged for consumer admission."
-  [source {:keys [array-types scalar-types] :or {array-types {} scalar-types {}}}]
+  [source {:keys [array-types scalar-types] :or {array-types {} scalar-types {}} :as options}]
   (let [original-source source
         source (util/normalize-let-body source)
         source (if (and (form/binding-form? original-source)
@@ -6281,7 +6310,7 @@
           rebuilt
           (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
                     *region-local-counter* (atom -1)
-                    *region-local-source-symbols* (source-symbols source)
+                    *region-local-source-symbols* (source-symbols source options)
                     *declared-kinds* {:arrays (set (keys array-types))
                                      :scalars (set (keys scalar-types))}]
             (reduce

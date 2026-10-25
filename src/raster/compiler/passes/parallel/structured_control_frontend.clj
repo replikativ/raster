@@ -174,12 +174,13 @@
     (emit-value state expression lexical (meta expression))))
 
 (defn- flatten-loop-body
-  [body reserved]
-  (let [[state result]
-        (lower-sequence {:pairs [] :writes [] :written #{} :aliases {}
-                         :ordinal 0 :reserved reserved}
-                        body {})]
-    (assoc state :result result)))
+  ([body reserved] (flatten-loop-body body reserved {}))
+  ([body reserved lexical]
+   (let [[state result]
+         (lower-sequence {:pairs [] :writes [] :written #{} :aliases {}
+                          :ordinal 0 :reserved reserved}
+                         body lexical)]
+     (assoc state :result result))))
 
 (defn- terminal-copy
   "Find the final state transition modulo an ordinary return of the copied destination.
@@ -265,7 +266,7 @@
           (fail! :structured-loop-source-binding
                  "the selected counted loop requires one unambiguous outer binding"
                  {:binding binder}))
-        (let [[_ [iteration raw-trip-count] & loop-body] form
+        (let [[_ [source-iteration raw-trip-count] & loop-body] form
               trip-count (if (integer? raw-trip-count)
                            (max 0 raw-trip-count)
                            raw-trip-count)
@@ -274,8 +275,21 @@
               prefix-source (list 'let*
                                   (vec (mapcat identity prefix-pairs))
                                   (if (seq prefix-pairs) (ffirst (rseq prefix-pairs)) nil))
-              reserved (source-symbols source)
-              flattened (flatten-loop-body loop-body reserved)
+              parameter-analysis (host-av/analyze '(let* [] nil) options)
+              outer-context
+              (reduce (fn [context [id expression]]
+                        (host-av/advance-binding context id expression))
+                      (host-av/begin-analysis prefix-source options) prefix-pairs)
+              outer-analysis (host-av/finish-analysis outer-context)
+              ;; Keep outer shape identities and the iteration's lexical identity
+              ;; distinct, including when the source deliberately shadows an extent.
+              reserved (into (into (source-symbols source) (:ineligible outer-context))
+                             (source-symbols (:analysis outer-context)))
+              [iteration-state iteration]
+              (allocate-id {:ordinal 0 :reserved reserved}
+                           "rstr_loop_source_index_" (meta source-iteration))
+              flattened (flatten-loop-body loop-body (:reserved iteration-state)
+                                           {source-iteration iteration})
               flattened-pairs (:pairs flattened)
               terminal (terminal-copy flattened-pairs)
               copy-binding (:binding terminal)
@@ -284,16 +298,16 @@
               flattened-source (when (seq flattened-pairs)
                                  (list 'let* (vec (mapcat identity flattened-pairs))
                                        copy-binding))
-              parameter-analysis (host-av/analyze '(let* [] nil) options)
-              outer-analysis (host-av/analyze prefix-source options)
               body-analysis
               (when flattened-source
-                (host-av/analyze
-                 flattened-source
-                 {:dtype dtype
-                  :values (:values outer-analysis)
-                  :array-types array-types
-                  :scalar-types (assoc scalar-types iteration :long)}))
+                ;; Finalized AVs alone discard prefix equalities. Continue the
+                ;; actual ordered context in a child scope instead; its unknown
+                ;; index is not a fictitious constant-zero source binding.
+                (host-av/finish-analysis
+                 (reduce (fn [context [id expression]]
+                           (host-av/advance-binding context id expression))
+                         (host-av/enter-scalar-parameter outer-context iteration :long)
+                         flattened-pairs)))
               copy-certificate (when body-analysis
                                  (host-av/full-array-copy body-analysis copy-expression))
               write-certificates
@@ -319,17 +333,21 @@
             (let [carry-initial (:destination copy-certificate)
                   carry-result (:source copy-certificate)
                   typed-source (list 'let* (vec (mapcat identity body-pairs)) carry-result)
-                  typed-values (:values body-analysis)
-                  typed-program
-                  (typed-frontend/form->program
-                   (typed-frontend/normalize-source typed-source)
+                  ;; The body frontend owns its local result contracts. HostAV's
+                  ;; finalized body values certify copies/writes, but cannot be
+                  ;; seeded as competing producers of those local results.
+                  typed-values (assoc (:values outer-analysis) iteration
+                                      (av/tensor {:dtype :long :shape []}))
+                  body-options
                    {:dtype dtype
-                    :values (assoc typed-values iteration
-                                   (av/tensor {:dtype :long :shape []}))
+                    :values typed-values
                     :array-types (merge (values->array-types typed-values) array-types)
                     :scalar-types (merge (values->scalar-types typed-values) scalar-types
                                          {iteration :long})
-                    :shape-equalities (:equalities body-analysis)})]
+                    :shape-equalities (:equalities outer-analysis)}
+                  typed-program
+                  (typed-frontend/form->program
+                   (typed-frontend/normalize-source typed-source body-options) body-options)]
               (when typed-program
                 (let [typed-program (add-iteration-value typed-program iteration)
                       [fused fusion-stats]

@@ -116,6 +116,42 @@
   [source]
   (into {} (map vec) (partition 2 (second source))))
 
+(deftest lexical-child-analysis-retains-only-preceding-relations
+  (let [source '(let* [n (int (clojure.core/alength input))
+                      storage (clojure.core/double-array n)] storage)
+        parent (reduce (fn [context [id expression]]
+                         (host-av/advance-binding context id expression))
+                       (host-av/begin-analysis source
+                                               {:values {'input initial}
+                                                :lexical-inputs '[input]})
+                       (partition 2 (second source)))
+        child (host-av/enter-scalar-parameter parent 'iteration :long)
+        child (host-av/advance-binding child 'length '(clojure.core/alength storage))
+        parent-analysis (host-av/finish-analysis parent)
+        child-analysis (host-av/finish-analysis child)]
+    (is (= :long (get-in child-analysis [:values 'iteration :dtype])))
+    (is (contains? (:available child-analysis) 'iteration))
+    (is (not (contains? (:values parent-analysis) 'iteration)))
+    (is (not (contains? (:values parent-analysis) 'length))
+        "a child scope cannot introduce future facts into its parent")
+    (is (every? (fn [[expression value]]
+                  (= value (get-in child-analysis [:equalities expression])))
+                (:equalities parent-analysis)))
+    (is (not-any? #{'iteration} (tree-seq coll? seq (:equalities child-analysis)))
+        "a loop index is unknown, not an assertion that it equals zero")
+    (doseq [id '[input storage n]]
+      (is (= :host-abstract-value-parameter
+             (try (host-av/enter-scalar-parameter parent id :long) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (is (= :host-abstract-value-parameter
+           (try (host-av/enter-scalar-parameter
+                 (host-av/begin-analysis '(let* [] nil)
+                                        {:values {'input (av/tensor {:dtype :double
+                                                                    :shape ['shape-only]})}})
+                 'shape-only :long) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "freshness includes symbols used only in retained shapes")))
+
 (deftest host-shape-refinement-proves-a-complete-state-transition
   (let [analysis (host-av/analyze (source 'n) {:values {'u0 initial} :dtype :double})
         copy-expression (get (binding-map (source 'n)) 'copy)]
@@ -127,6 +163,17 @@
         "the syntax extent used by TypedSOAC retains its relational shape proof")
     (is (= {:source 'next :destination 'u :extent 'n :dtype :double}
            (host-av/full-array-copy analysis copy-expression)))))
+
+(deftest source-length-carriers-retain-analyzed-types-and-explicit-conversions
+  (let [length (with-meta 'length {:raster.type/tag 'long})
+        expression '(.invk raster.arrays/alength_m_doubles-impl input)
+        source (list 'let* [length expression 'n (list 'int length)] 'n)
+        analysis (host-av/analyze source {:values {'input initial}})]
+    (is (= :long (get-in analysis [:values 'length :dtype])))
+    (is (= :int (get-in analysis [:values 'n :dtype])))
+    (is (= :int (get-in (host-av/analyze '(let* [n (clojure.core/alength input)] n)
+                                          {:values {'input initial}})
+                                  [:values 'n :dtype])))))
 
 (deftest partial-or-offset-copies-are-not-functionalized
   (let [analysis (host-av/analyze (source 'n) {:values {'u0 initial} :dtype :double})

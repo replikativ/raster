@@ -7,6 +7,7 @@
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
             [raster.compiler.passes.parallel.structured-control-route :as route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]))
 
 (def ^:private initial
@@ -80,6 +81,35 @@
     (is (= :structured-loop-source-binding
            (try (frontend/form->structured-loop source options) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest normalized-prefix-relations-survive-the-loop-analysis-boundary
+  (let [options (assoc options :array-types {'u0 :double})
+        source (typed-frontend/normalize-source (loop-source 'n) options)
+        decomposition (frontend/form->structured-loop source options)
+        copy (:copy-certificate decomposition)
+        source-indices (filter #(and (symbol? %)
+                                      (.startsWith (name %) "rstr_loop_source_index_"))
+                               (tree-seq coll? seq (:flattened-body-source decomposition)))]
+    (is (some? decomposition))
+    (is (= 'u (:destination copy)))
+    (is (= :double (:dtype copy)))
+    (is (= [(:extent copy)] (get-in decomposition [:outer-values 'u :shape])))
+    (is (identical? source (:source decomposition)))
+    (is (seq source-indices))
+    (is (not-any? #(contains? (:outer-values decomposition) %) source-indices))
+    (is (not (contains? (:parameter-values decomposition) 'u)))
+    (is (not (contains? (:outer-values decomposition) 'after)))))
+
+(deftest loop-index-shadowing-cannot-inherit-an-outer-extent-equality
+  (let [source (update-bindings
+                (loop-source 'n)
+                (fn [bindings]
+                  (update bindings 7
+                          #(apply list (first %) '[n steps] (drop 2 %)))))
+        options (assoc options :array-types {'u0 :double})]
+    (doseq [source [source (typed-frontend/normalize-source source options)]]
+      (is (nil? (frontend/form->structured-loop source options))
+          "the copy count now names the varying iteration, not the outer array length"))))
 
 (deftest destination-writing-loop-becomes-a-typed-functional-fixpoint
   (let [{:keys [loop prefix-bindings suffix-bindings copy-certificate
