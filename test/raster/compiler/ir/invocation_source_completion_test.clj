@@ -8,6 +8,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.parallel-program :as parallel-program]))
 
 (defn- scalar [] (av/tensor {:dtype :int :shape []}))
@@ -64,11 +65,19 @@
                  (doubleValue [] (double (swap! calls inc))))
         initial (materialization/begin-materialization plan [number])]
     (is (every? invocation/source-completion? (:steps plan)))
-    (let [order (invocation/source-order plan program)]
+    (let [order (invocation/source-order plan program)
+          emitted (assoc program :dialect :opencl-parallel)
+          validation (emitted-program/validate-with-physical-results! emitted)]
       (is (= (mapv :id (:steps plan)) (vec (keep :invocation-step order))))
-      (is (= :invocation-ordered-source-action
+      (is (= :emitted-parallel-program-retained-validation
              (try (invocation-link/validate-ordered-source-actions!
                    {:program {:attributes {} :equations []}
+                    :materialization initial :source-order order :source-realizations {}})
+                  nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "a forged program cannot reach executor coverage admission")
+      (is (= :invocation-ordered-source-action
+             (try (invocation-link/validate-ordered-source-actions!
+                   {:program emitted :retained-validation validation :projections (:projections validation)
                     :materialization initial :source-order order :source-realizations {}})
                   nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
           "the existing device executor cannot acquire source-action permission implicitly"))
