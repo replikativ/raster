@@ -4541,16 +4541,17 @@
   ;; Earlier local allocations are authoritative array-type facts for later effects. Thread those
   ;; facts in source order instead of falling back to the program-wide arithmetic dtype: a local
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
-  [default-dtype segmented-plans?
+  [default-dtype _segmented-plans?
         {:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
                  before-parallel?] :as state}
          [id [symbol expression]]]
       (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
             description
-            (or (when (or segmented-plans? (not (swr-fuse/marker? expression)))
-                  (binding [*scalar-definitions* scalar-definitions]
-                    (operation-description id symbol expression default-dtype array-types
-                                           local-scalar-types)))
+            ;; Semantic source facts do not depend on whether this consumer admits the plan.
+            ;; The form->program capability gate remains separate below.
+            (or (binding [*scalar-definitions* scalar-definitions]
+                  (operation-description id symbol expression default-dtype array-types
+                                         local-scalar-types))
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
@@ -4731,6 +4732,20 @@
 (defn- swr-description?
   [description]
   (= :segmented-weighted-reduction-plan (:kind description)))
+
+(defn- consumer-descriptions
+  "Keep unsupported protected plans as existing opaque host boundaries around typed islands.
+   Source capacity analysis consumes their checked semantic view independently. This
+   projection grants no plan execution capability and does not parse or recognize source again."
+  [descriptions segmented-plans?]
+  (if segmented-plans?
+    descriptions
+    (mapv (fn [description]
+            (if (swr-description? description)
+              (assoc (select-keys description [:id :sym :expr :source-prefix? :before-parallel?])
+                     :kind :scalar)
+              description))
+          descriptions)))
 
 (defn- semantic-description?
   [description]
@@ -4946,14 +4961,17 @@
     (coverage-decline* source options)))
 
 (defn- coverage-decline*
-  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage?]
+  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage?
+                 segmented-plans?]
            :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          descriptions (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
-                                          shape-equalities values)
+          semantic-descriptions (normalize-extents
+                                 (source-descriptions pairs dtype array-types scalar-types)
+                                 shape-equalities values)
+          descriptions (consumer-descriptions semantic-descriptions segmented-plans?)
           physical-outputs (physical-output-symbols descriptions)
           declined (remove #(admitted-description? physical-outputs %) descriptions)
           parallel? (some #(not= :scalar (:kind %)) descriptions)]
@@ -6087,9 +6105,11 @@
                   array-types (binder-array-types pairs array-types dtype
                                                   preserve-declared-array-storage?)
                   describe (fn [pairs]
-                             (:descriptions
-                              (source-storage-analysis pairs dtype array-types scalar-types
-                                                       segmented-plans? values shape-equalities)))
+                             (consumer-descriptions
+                              (:descriptions
+                               (source-storage-analysis pairs dtype array-types scalar-types
+                                                        segmented-plans? values shape-equalities))
+                              segmented-plans?))
                   descriptions (describe pairs)
                   physical-outputs (physical-output-symbols descriptions)
                   dependencies (set (util/free-syms expression))
@@ -6415,7 +6435,8 @@
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
           {descriptions :descriptions storage-values :values allocations :allocations}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
-                                   values shape-equalities lexical-inputs)]
+                                   values shape-equalities lexical-inputs)
+          descriptions (consumer-descriptions descriptions segmented-plans?)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)

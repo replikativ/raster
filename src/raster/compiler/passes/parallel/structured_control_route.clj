@@ -455,8 +455,8 @@
   "Return complete `{:entries [[result storage] ...] :host-binding ...}` groups from the
    validated algorithm authority.
 
-   TypedSOAC owns storage and host binding in its inner equation facts. Generic SWR validates only
-   outer storage as part of its equation boundary, so it contributes no host-binding assertion.
+   TypedSOAC owns storage and host binding in its inner equation facts. Generic SWR additionally
+   authenticates the retained protected source before contributing a host-binding assertion.
    Structured control currently has no result-storage projection; an outer attribute alone cannot
    manufacture one."
   [parallel-program equation]
@@ -481,9 +481,10 @@
                   (soac/equations algorithm)))
 
           (swr/plan? algorithm)
-          [{:entries (mapv vector (:results equation)
-                           (get-in equation [:attributes :result-storage]))
-            :host-binding nil}]
+          [(or (swr/source-buffer-return parallel-program equation)
+               {:entries (mapv vector (:results equation)
+                               (get-in equation [:attributes :result-storage]))
+                :host-binding nil})]
 
           :else []))
       (catch Exception _ nil))))

@@ -37,6 +37,35 @@ Landing order within the unchanged eight-objective campaign:
    failing causal-score-rounding case passes separately (three assertions).
    Source count checks, argument availability, allocation position and zero
    initialization remain unchanged; projection data is not completion credit.
+   Independent Astra review and retained-source probes identify two protected
+   reduction return gaps: frontend descriptions hide authenticated marker semantics
+   when that route is disabled, and promotion withholds its host-buffer alias
+   because the existing equation boundary does not authenticate the source binder.
+   Keep operation description independent of route capability, while preserving
+   the admission refusal and its coverage diagnostic. Reuse the existing marker
+   validator for one checked source-return projection consumed by both capacity
+   analyses; never trust an outer host-binding attribute alone. Require unique
+   source/equation ownership, retained source/site/result correspondence, complete
+   rebound-plan agreement and the existing physical-storage contract. Retained
+   binding provenance is not necessarily the current raw source-vector ordinal
+   after inserted realization bindings. Negative controls must retain missing or
+   changed proof, duplicate owners, changed source/storage/dtype, future capacity
+   and effect-only return refusals. This proves a causal buffer alias, not resource
+   acquisition, initialization or completion. HostAV needs no operation-name case.
+   This correction now shares the protected-marker validator in the SWR IR (the
+   existing frontend facade and retained metadata key remain unchanged). Source
+   descriptions retain semantic facts; one consumer projection preserves opaque
+   host boundaries around typed islands when protected-plan execution is disabled.
+   Admission, coverage and terminal-scalar analysis use that same consumer view.
+   The retained public graph-attention compile regression includes the later
+   zeros-like allocation and contraction. Four affected suites pass 206 tests /
+   1,485 assertions, including missing/changed proof, ambiguous ownership, changed
+   source/storage/dtype, inserted binding and causal-capacity refusal controls.
+   A fresh bounded REPL also executed the public ordered graph-attention path on
+   local OpenCL with two changed inputs and an independent sequential oracle;
+   maximum absolute error was 5.6e-17. Preparation acquired no device resources,
+   and the executable was closed after both replays. This qualifies that workload,
+   not the remaining ordered public capabilities or the whole feature branch.
 3. Complete the common ordered public boundary: share port intent and output
    selection, then explicit outputs/taps, resident scalars, aggregate state,
    donation and composition. AMR/distributed consumers need an actual ordered

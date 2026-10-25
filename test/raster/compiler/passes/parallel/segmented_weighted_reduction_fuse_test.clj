@@ -16,10 +16,12 @@
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as fuse]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.reference.segmented-weighted-reduction :as reference]
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as array-ops]
+            [raster.dl.attention :as attention]
             [raster.dl.gsdm :as gsdm]
             [raster.gpu.core :as gpu]
             [raster.gpu.test-lifecycle]
@@ -136,6 +138,53 @@
                                   (filter symbol? (swr/runtime-parameter-values plan)))))
            (:operands plan-equation)))
     (is (= '[normalized] (:results plan-equation)))
+    (let [index (.indexOf ^java.util.List (:equations program) plan-equation)
+          project (fn [candidate]
+                    (swr/source-buffer-return candidate (nth (:equations candidate) index)))
+          expected {:entries [['normalized (first (get-in plan-equation
+                                                         [:attributes :result-storage]))]]
+                    :host-binding 'normalized}
+          pairs (mapv vec (partition 2 (second (:source program))))
+          binding-index (first (keep-indexed (fn [i [binding _]]
+                                              (when (= 'normalized binding) i)) pairs))
+          change-source (fn [candidate update-expression]
+                          (update-in candidate [:source]
+                                     (fn [[head bindings & body :as source]]
+                                       (with-meta
+                                         (list* head
+                                                (update bindings (inc (* 2 binding-index))
+                                                        update-expression)
+                                                body)
+                                         (meta source)))))]
+      (is (= expected (project program)))
+      (doseq [candidate [(assoc-in program [:equations index :site] [:binding 'other])
+                         (assoc-in program [:equations index :results] '[other])
+                         (assoc-in program [:equations index :attributes :host-binding] 'other)
+                         (assoc-in program [:equations index :attributes :result-storage 0
+                                            :destination] 'other-storage)
+                         (update program :equations conj plan-equation)
+                         (update program :source
+                                 (fn [[head bindings & body]]
+                                   (list* head (into bindings ['normalized 'other-storage]) body)))
+                         (change-source program #(vary-meta % dissoc swr/protected-marker-plan-key))
+                         (change-source program #(vary-meta % assoc :raster.op/original 'user/other))
+                         (assoc-in program [:equations index :algorithm :normalization :epsilon] 0.125)
+                         (assoc-in program [:equations index :algorithm :accumulator-dtype] :double)]]
+        (is (nil? (project candidate))
+            "outer storage and source spelling cannot manufacture protected return authority"))
+      (let [proofless (change-source program #(vary-meta % dissoc swr/protected-marker-plan-key))
+            expression (nth (second (:source proofless)) (inc (* 2 binding-index)))
+            proofless (-> proofless
+                          (assoc-in [:equations index :source] expression)
+                          (assoc-in [:equations index :algorithm :source-operation :form] expression))]
+        (is (nil? (project proofless))
+            "agreement among replaceable source fields cannot substitute for marker proof"))
+      (let [[head bindings & body :as source] (:source program)
+            inserted (assoc program :source
+                            (with-meta (list* head (into ['inserted-before-realization 1] bindings)
+                                              body) (meta source)))]
+        (is (= expected (project inserted))
+            "inserted realization bindings do not turn historical ordinals into raw positions")))
     (is (identical? program (structured-route/validate-typed-program! program)))
     (is (= [plan] (:operations plan-equation)))
     (let [source (get (into {} (map vec) (partition 2 (second (:source program))))
@@ -226,6 +275,14 @@
     (is (= :typed-soac (get-in descriptor-attempt [:stats :route])))
     (is (some fuse/marker? (tree-seq coll? seq (get-in descriptor-attempt [:program :source])))
         "descriptor compilation keeps the protected binding between its typed SOAC islands")
+    (is (= 1 (count (filter fuse/marker?
+                           (tree-seq coll? seq (get-in descriptor-attempt [:program :source]))))))
+    (is (not-any? #(swr/plan? (:algorithm %))
+                  (get-in descriptor-attempt [:program :equations]))
+        "retaining host source does not grant protected-plan execution capability")
+    (is (nil? (typed-frontend/coverage-decline source {:dtype :float :array-types array-types
+                                                     :scalar-types scalar-types :values values}))
+        "coverage uses the same consumer view as successful typed-island admission")
     (is (soac/program-form? (first algorithms)))
     (is (= plan (second algorithms)))
     (is (soac/program-form? (last algorithms)))
@@ -286,6 +343,19 @@
                                 :operations 0 :attributes :strategy])))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= 1 (count (:kernels compilation))))))
+
+(deftest protected-buffer-return-feeds-a-later-public-allocation-and-contraction
+  ;; Graph attention allocates its final projection using zeros-like of the protected
+  ;; reduction's returned buffer. Both frontend and promotion capacity analyses must retain
+  ;; the earlier physical destination; final logical shape facts cannot stand in for it.
+  (let [compilation (equation-first/compile
+                     #'attention/graph-attention {:target :ze:0 :dtype :double})
+        semantic (:semantic compilation)
+        reductions (filterv #(swr/plan? (:algorithm %)) (:equations semantic))]
+    (is (= 1 (count reductions)))
+    (is (some? (swr/source-buffer-return semantic (first reductions))))
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (is (seq (:kernels compilation)))))
 
 (deftest public-equation-first-selects-only-explicit-subgroup-policy
   (let [compilation (equation-first/compile

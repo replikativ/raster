@@ -8,8 +8,8 @@
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as indexed-rule]))
 
-(def marker-op 'raster.compiler/segmented-weighted-reduction!)
-(def ^:private plan-key ::plan)
+(def marker-op swr/protected-marker-op)
+(def ^:private plan-key swr/protected-marker-plan-key)
 
 (descriptor/register-op-descriptor!
  marker-op
@@ -26,25 +26,12 @@
 
 (defn marker?
   [form]
-  (and (seq? form) (= marker-op (first form))))
+  (swr/protected-marker? form))
 
 (defn marker-plan
   "Recover and validate the schedule-neutral plan after intervening compiler substitutions."
   [marker emitted-dtype]
-  (when-not (and (marker? marker) (= 4 (count marker))
-                 (vector? (nth marker 2)) (vector? (nth marker 3)))
-    (throw (ex-info "segmented weighted-reduction marker has the wrong shape"
-                    {:reason :segmented-reduction-invalid-marker :marker marker})))
-  (let [[_ output inputs runtime-values] marker
-        template (get (meta marker) plan-key)]
-    (when-not (swr/plan? template)
-      (throw (ex-info "segmented weighted-reduction marker lost its proof"
-                      {:reason :segmented-reduction-marker-missing-plan :marker marker})))
-    (when-not (= emitted-dtype (:accumulator-dtype template))
-      (throw (ex-info "segmented weighted-reduction marker dtype differs from its proof"
-                      {:reason :segmented-reduction-marker-dtype-mismatch
-                       :expected (:accumulator-dtype template) :actual emitted-dtype})))
-    (swr/rebind template output inputs runtime-values marker)))
+  (swr/protected-marker-plan marker emitted-dtype))
 
 (defn- array-constructor
   [dtype]
