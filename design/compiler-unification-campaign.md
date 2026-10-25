@@ -151,6 +151,34 @@ identity. Its constructor still owes original owner/body/root/context joins,
 actual Method/wrapper correspondence, and the exact analyzed imported relation.
 Methods, original modules and receipts remain owner-local, not portable facts.
 
+The isolated terminal-reduction constructor now returns an immediately analyzed
+TypedSOAC component plus the original call bindings and unresolved input, return,
+placement, numerical-import and caller-binding obligations. It reuses ordinary
+helper hygiene, qualification and substitution; it does not install pipeline
+deferral or modify ordinary JVM/C expansion. Actual `par/sum` and
+`par/dot-product` tests exercise the retained input/body/root and compute/Object
+return bridge. Copied components, foreign calls, changed return evidence and
+stale source/receiver definitions refuse.
+
+Independent review found that inheriting the entire enclosing proof history
+would make each component receipt recursively validate unrelated predecessors.
+Construction now uses the existing independent child collector and adopts its
+local dependencies only after checking the parent's original history. A counted
+parent producer is never visited by receipt-only validation and is still checked
+exactly once by its enclosing owner; a stale parent refuses construction. The
+reviewed focused gate passes 4 tests / 55 assertions in the shared capped REPL.
+This closes the isolated constructor prerequisite, not execution, deferred
+composition, numerical liveness or the public mixed-gradient acceptance gate.
+
+The bounded clean-head GSDM diagnostic at `9f5ad9229` terminated at its explicit
+150-second diagnostic limit, without a test result. Its retained phase log, JFR
+and thread sample locate work in host compiler analysis (two lowerings, region
+copies and an unfinished fixpoint), not GPU execution. Main-thread execution
+samples include source freshness checks, structural equality, hashing, source
+walking and JVM compilation; this is not evidence that one check dominates or
+that weakening freshness validation is safe. Keep the original convergence test
+and CI timeout unchanged while locating avoidable repeated analysis.
+
 #### Full CI qualification is still open
 
 CircleCI unit job [34881](https://circleci.com/gh/replikativ/raster/34881), exact
