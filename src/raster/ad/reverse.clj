@@ -409,10 +409,10 @@
     entry))
 
 (defn- assert-completion-transpose-domain! [contract]
-  (when (contains? #{:jvm-bytecode-result-context :jvm-bytecode-integral-input
+  (when (contains? #{:source-integral-cast :jvm-bytecode-result-context :jvm-bytecode-integral-input
                     :jvm-bytecode-reference-input}
                    (:source-context contract))
-    (throw (ex-info "Bytecode completion has no owned structural transpose"
+    (throw (ex-info "Completion has no owned structural transpose"
                     {:reason :ad-unclosed-completion-transpose
                      :source-context (:source-context contract)}))))
 

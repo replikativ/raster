@@ -56,6 +56,17 @@
   {:source-context :jvm-primitive-input :target-carrier parameter-class
    :policy :preserve-source-input :source-policy source-policy})
 
+(defn source-integral-cast-contract
+  "Freeze an actual source int/long operation's compilation policy.
+   Construction proves no origin: the caller must own that source operation.
+   This is neither a resolved parameter Class nor a target-neutral numeric cast."
+  [operation policy]
+  (when-not (and (contains? #{:int :long} operation) (source-policy? policy))
+    (throw (ex-info "source integral cast requires an operation and retained policy"
+                    {:reason :unsupported-value-completion
+                     :operation operation :source-policy policy})))
+  {:source-context :source-integral-cast :operation operation :source-policy policy})
+
 (def bytecode-operand-context-keys
   "Bytecode result-position facts that affect an input's original evaluation.
    Retained only by a compilation owner, never inferred from scalar tags."
@@ -171,6 +182,10 @@
 (defn canonical-contract? [contract]
   (and (map? contract)
        (or (= object-input-contract contract)
+           (and (= #{:source-context :operation :source-policy} (set (keys contract)))
+                (= :source-integral-cast (:source-context contract))
+                (contains? #{:int :long} (:operation contract))
+                (source-policy? (:source-policy contract)))
            (and (= #{:source-context :target-carrier :policy} (set (keys contract)))
                 (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
                 (= :preserve-bytecode-boxed-entry (:policy contract))
@@ -219,13 +234,15 @@
         ;; No JVM hint, successful conversion, presence or physical input fact
         ;; follows from this declaration. Exact Class identity stays in contract.
         ^Class target (:target-carrier contract)
-        tag (when (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
+        tag (if (= :source-integral-cast (:source-context contract))
+              (case (:operation contract) :int 'int :long 'long)
+              (when (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
               (if (.isPrimitive target)
                 (let [tag (symbol (.getName target))]
                   (when (and (contains? types/primitive-info tag)
                              (identical? target (types/tag->java-class tag))) tag))
                 (some (fn [[tag carrier]] (when (identical? target carrier) tag))
-                      types/primitive-array-info)))]
+                      types/primitive-array-info))))]
     (cond-> metadata tag (assoc :raster.type/tag tag))))
 
 (defn complete-value
@@ -348,6 +365,8 @@
    than replacing it with a guessed core cast. The caller MUST compile the
    returned form under that same retained policy and physical lexical scope;
    this pure projection does not execute or police later compilation.
+   Source integral casts instead name their frozen RT operation explicitly;
+   their conversion policy does not depend on the consuming compiler binding.
    CHECKCAST contexts additionally require an owner-local map from the actual
    Class to a fresh lexical Class value port. The owner must bind the actual
    Class there and preserve its scope; a Class literal can lose loader identity.
@@ -371,6 +390,14 @@
                       :jvm-object-input (list '. (list 'do Object) (list 'cast operand))
                       :jvm-checkcast (list '. (reference-class-expression contract reference-bindings)
                                           (list 'cast operand))
+                      :source-integral-cast
+                      ;; Freeze the selected runtime operation, not an ambient-policy
+                      ;; core inline. Clojure still selects its actual operand overload.
+                      (list (symbol "clojure.lang.RT"
+                                    (case (:operation contract)
+                                      :int (if (source-policy/unchecked-math (:source-policy contract))
+                                             "uncheckedIntCast" "intCast")
+                                      :long "longCast")) operand)
                       :jvm-primitive-input (project-primitive-input contract operand compilation-policy))
            (value-meta contract form))
          (throw (ex-info "invalid canonical value completion"

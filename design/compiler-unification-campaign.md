@@ -4,6 +4,26 @@
 
 ### October 24 audited correctness/consolidation closure
 
+Source count conversion is a prerequisite for the complete native map consumer,
+not something that can be inferred from an extent's logical dtype. A new explicit
+source-integral completion freezes the actual int/long operation and its source
+policy, without manufacturing parameter-Class or native execution evidence.
+The JVM consumer evaluates the operand in value context under the consuming
+policy, then applies only the conversion under its retained policy. Structural
+AD transposition remains explicitly refused for this new completion domain.
+Frontend count insertion and ordered native entry-prefix execution remain open.
+
+The JVM effect-map expansion also no longer narrows a source Long count through
+the generic dotimes Int adapter. It preserves Long observable ordinals, once-only
+count evaluation and one source body, while selecting a private Int counter only
+for a proven representable count. Differential controls cover negative counts,
+Long/Int boundaries, effects, closures and binder collisions. Qualification:
+151 affected tests / 1,901 assertions pass. A warmed reused-buffer comparison
+of 65,536-element maps gives similar medians (legacy Int 30.5 microseconds,
+adaptive 29.0); changed-input outputs agree bitwise. This is not a global speedup
+claim. Generic dotimes and other map expansion adapters are not covered by this
+bounded correction and remain on the compatibility-debt ledger.
+
 Native entry facts now use the existing shared parameter-type derivation before
 forward lowering, including write-only array parameters. Declared storage remains
 independent of computation precision; no alias assertion or source-completion

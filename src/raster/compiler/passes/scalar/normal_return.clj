@@ -207,7 +207,7 @@
         (:jvm-object-input :jvm-checkcast :jvm-bytecode-reference-input) fact
         ;; Presence is conditional on normal return, not proof that a cast
         ;; succeeds or authority to execute it under another compilation owner.
-        (:jvm-primitive-input :jvm-bytecode-floating-input :jvm-bytecode-integral-input)
+        (:source-integral-cast :jvm-primitive-input :jvm-bytecode-floating-input :jvm-bytecode-integral-input)
         {:presence (if (= :no-return (:presence fact)) :no-return :present)}))
     (form/binding-form? expression)
     (let [{:keys [sequential? scopes]} (form/scope-info expression)

@@ -1487,6 +1487,41 @@
   (and (seq? form) (symbol? (first form))
        (contains? #{"<" "<=" ">" ">=" "==" "not="} (name (first form)))))
 
+(defn- expand-jvm-effect-map
+  "Keep the source Long count/index while specializing the private counter.
+   The body occurs once. A JVM may unswitch the invariant width choice without
+   duplicating source observations in Raster's IR. No counter increment can
+   overflow: it executes only below the corresponding representable bound."
+  [[_ index bound body :as source]]
+  (let [occupied (atom (into #{} (filter symbol?) (tree-seq coll? seq source)))
+        fresh (fn [prefix]
+                (loop []
+                  (let [candidate (gensym prefix)]
+                    (if (contains? @occupied candidate) (recur)
+                      (do (swap! occupied conj candidate) candidate)))))
+        count-id (fresh "map_count__") narrow? (fresh "map_narrow__")
+        int-count (fresh "map_int_count__") int-index (fresh "map_int_index__")
+        long-index (fresh "map_long_index__")]
+    (list 'let* [count-id (list 'clojure.core/long bound)
+                 narrow? (list 'clojure.core/and
+                               (list 'clojure.core/<= 0 count-id)
+                               (list 'clojure.core/<= count-id Integer/MAX_VALUE))
+                 int-count (list 'if narrow? (list 'clojure.core/int count-id)
+                                 '(clojure.core/int 0))]
+          (list 'loop* [int-index '(clojure.core/int 0) long-index '(clojure.core/long 0)]
+                (list 'if
+                      (list 'if narrow? (list 'clojure.core/< int-index int-count)
+                            (list 'clojure.core/< long-index count-id))
+                      (list 'let* [index (list 'clojure.core/long
+                                               (list 'if narrow? int-index long-index))]
+                            body
+                            (list 'recur
+                                  (list 'if narrow? (list 'clojure.core/unchecked-inc-int int-index)
+                                        int-index)
+                                  (list 'if narrow? long-index
+                                        (list 'clojure.core/unchecked-inc long-index))))
+                      nil)))))
+
 (defn- pre-expand-par-forms
   "Pre-process forms for bytecode compilation:
   1. Fuse and/or+comparison patterns into direct (if (cmp) ...) for branch folding
@@ -1527,11 +1562,10 @@
     (par/par-map-form? form)
     (try (par/expand-par-map! form)
          (catch Throwable _ form))
-    ;; map-void! → dotimes (side-effect only, no output array)
+    ;; A Long semantic domain does not authorize narrowing the source count or
+    ;; boxing the ordinal as Integer. Only the private counter is specialized.
     (par/par-map-void-form? form)
-    (let [[_ idx-sym bound-expr body-expr] form]
-      (pre-expand-par-forms
-       (list 'dotimes [idx-sym bound-expr] body-expr)))
+    (pre-expand-par-forms (expand-jvm-effect-map form))
 
     (par/par-reduce-form? form)
     (expand-owned-reduction form)
@@ -3125,7 +3159,7 @@
    Clojure runtime overload from the actual emitted operand carrier."
   [code head-name args locals ctx]
   (when (= 1 (count args))
-    (let [input (emit-form code (first args) locals ctx)
+    (let [input (emit-form code (first args) locals (dissoc ctx :void-context))
           result (emit-source-integral-completion code head-name input)]
       (if (= :diverge input)
         :diverge
@@ -4447,6 +4481,9 @@
         (= completion/completion-symbol head)
         (when-let [{:keys [contract operand]} (completion/canonical-parts expression)]
           (case (:source-context contract)
+            :source-integral-cast
+            (when-let [raw (plan-form-carrier operand locals (dissoc ctx :void-context))]
+              (if (= :diverge raw) raw (case (:operation contract) :int :int :long :long)))
             :jvm-object-input
             (when (plan-form-carrier operand locals (object-input-context ctx)) :ref)
             :jvm-checkcast
@@ -6112,6 +6149,16 @@
                                                       (object-input-context ctx))}))
             actual)
           :jvm-checkcast (emit-reference-check-completion code parts locals ctx observation)
+          :source-integral-cast
+          (let [operand-ctx (dissoc ctx :void-context)
+                actual (emit-form code operand locals operand-ctx)]
+            (when observation
+              (vreset! observation {:input-carrier actual
+                                    :adaptation (if (= :diverge actual) :diverge :source-integral-cast)
+                                    :operand-context (completion/bytecode-operand-context operand-ctx)}))
+            (source-policy/call-with-policy
+             (:source-policy contract)
+             #(emit-source-integral-completion code (name (:operation contract)) actual)))
           :jvm-bytecode-result-context (emit-bytecode-result-completion code parts locals ctx observation)
           :jvm-bytecode-boxed-parameter-input
           (emit-boxed-parameter-completion code parts locals ctx observation)

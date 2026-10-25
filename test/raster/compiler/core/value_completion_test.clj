@@ -5,6 +5,40 @@
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
 
+(deftest source-integral-cast-contract-is-exact-and-declares-only-its-result
+  (doseq [operation [:int :long]
+          mode [false true :warn-on-boxed]]
+    (let [policy {:unchecked-math mode}
+          contract (completion/source-integral-cast-contract operation policy)
+          operand (with-meta 'input {:line 4 :column 2 :file "source.clj"
+                                    :tag 'double :raster.type/tag 'double
+                                    :raster.op/original 'other/call :ownership :fresh})
+          term (completion/complete-value contract operand)
+          projected (completion/project-to-jvm-source term)
+          expected-method (case operation
+                            :int (if mode 'clojure.lang.RT/uncheckedIntCast 'clojure.lang.RT/intCast)
+                            :long 'clojure.lang.RT/longCast)]
+      (is (completion/canonical-contract? contract))
+      (is (= #{:source-context :operation :source-policy} (set (keys contract))))
+      (is (= {:line 4 :column 2 :file "source.clj" :raster.type/tag (symbol (name operation))}
+             (meta term)))
+      (is (identical? operand (:operand (completion/canonical-parts term))))
+      (is (= (list expected-method operand) projected))
+      (is (= (meta term) (meta projected)))
+      (is (completion/contains-completion? term))
+      (is (not (completion/bytecode-context-form? term)))
+      (doseq [invalid [(assoc contract :target-carrier Integer/TYPE)
+                       (assoc contract :operation :float)
+                       (dissoc contract :source-policy)
+                       (assoc contract :source-policy {})]]
+        (is (false? (completion/canonical-contract? invalid))))))
+  (doseq [[operation policy] [[:float {:unchecked-math false}]
+                             ['int {:unchecked-math false}]
+                             [:int nil] [:long {:unchecked-math nil}]]]
+    (is (= :unsupported-value-completion
+           (try (completion/source-integral-cast-contract operation policy) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
 (deftest exact-object-input-syntax-does-not-generalize-other-completions
   (let [operand (with-meta 'input {:raster.type/tag 'doubles})
         term (completed operand)]

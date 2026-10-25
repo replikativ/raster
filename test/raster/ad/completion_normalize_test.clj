@@ -11,9 +11,11 @@
 (def policy {:unchecked-math false})
 
 (deftest result-context-does-not-acquire-an-identity-transpose
-  (let [term (completion/complete-value
-               (completion/bytecode-result-context-contract
-                (completion/bytecode-operand-context {}) :ref) 'input)]
+  (doseq [contract [(completion/bytecode-result-context-contract
+                    (completion/bytecode-operand-context {}) :ref)
+                   (completion/source-integral-cast-contract :int policy)
+                   (completion/source-integral-cast-contract :long policy)]
+          :let [term (completion/complete-value contract 'input)]]
     (doseq [owner [nil {:backend :jvm-bytecode}]]
       (binding [rev/*generated-product-context* owner]
         (is (= :ad-unclosed-completion-transpose
@@ -40,7 +42,9 @@
     (is (= data ((eval (list 'fn '[events] normalized)) events)))
     (is (= [] @events)))
   (doseq [contract [completion/object-input-contract
-                    (completion/primitive-input-contract Float/TYPE policy)]]
+                    (completion/primitive-input-contract Float/TYPE policy)
+                    (completion/source-integral-cast-contract :int policy)
+                    (completion/source-integral-cast-contract :long policy)]]
     (let [expression (completion/complete-value contract '(let* [input x] input))]
       (is (identical? expression (#'rev/hoist-nested-lets expression))))))
 
