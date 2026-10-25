@@ -21,8 +21,14 @@ Long/Int boundaries, effects, closures and binder collisions. Qualification:
 151 affected tests / 1,901 assertions pass. A warmed reused-buffer comparison
 of 65,536-element maps gives similar medians (legacy Int 30.5 microseconds,
 adaptive 29.0); changed-input outputs agree bitwise. This is not a global speedup
-claim. Generic dotimes and other map expansion adapters are not covered by this
-bounded correction and remain on the compatibility-debt ledger.
+claim. A subsequent consolidation removes the same Int adapter from ordinary
+JVM dotimes, reusing this expansion for empty and multiple body forms as well.
+Differential checks preserve nested recurrence and reject source-invalid direct
+recurrence. That check exposed the emitter's silent zip truncation of recurrence
+arguments; an exact loop-carry arity check now refuses both missing and surplus
+values. Current affected qualification: 153 tests / 1,939 assertions pass, with
+obsolete renamed test Vars removed from the reused REPL before counting. Other
+map expansion adapters and native source-count completion remain open debt.
 
 Native entry facts now use the existing shared parameter-type derivation before
 forward lowering, including write-only array parameters. Declared storage remains

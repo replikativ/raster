@@ -1525,11 +1525,9 @@
 (defn- pre-expand-par-forms
   "Pre-process forms for bytecode compilation:
   1. Fuse and/or+comparison patterns into direct (if (cmp) ...) for branch folding
-  2. Replace raster.par/map! and reduce with int-counted loop* expansions
-  3. Replace clojure.core/dotimes with int-counted loop* (dotimes promotes
-     to long, preventing C2 counted loop recognition)
-  The par macros and dotimes use long counters for Clojure eval, but the
-  bytecode compiler needs int counters for IF_ICMPGE."
+  2. Expand parallel maps and owned reductions
+  3. Specialize private counters of Long-counted effect maps and dotimes,
+     preserving source Long counts and observable ordinals."
   [form]
   (cond
     ;; Quoted values are owned data, never executable syntax to rebuild.
@@ -1570,21 +1568,17 @@
     (par/par-reduce-form? form)
     (expand-owned-reduction form)
 
-    ;; Replace (dotimes [i n] body) with int-counted loop*
+    ;; dotimes and map-void! share a Long source iteration domain. Keep one
+    ;; expansion authority instead of narrowing dotimes through an Int adapter.
     (and (seq? form)
          (let [h (first form)]
            (or (= h 'clojure.core/dotimes) (= h 'dotimes)))
          (vector? (second form))
          (= 2 (count (second form))))
-    (let [[_ [i-sym bound-expr] & body] form
-          n-sym (gensym "n__")]
+    (let [[_ [i-sym bound-expr] & body] form]
       (pre-expand-par-forms
-       (list 'let* [n-sym (list 'int bound-expr)]
-             (list 'loop* [i-sym '(int 0)]
-                   (list 'if (list '< i-sym n-sym)
-                         (apply list 'do (concat body
-                                                 [(list 'recur (list 'clojure.core/unchecked-inc-int i-sym))]))
-                         nil)))))
+       (expand-jvm-effect-map
+        (list 'raster.par/map-void! i-sym bound-expr (list* 'do body)))))
     (seq? form)
     (with-meta (apply list (map pre-expand-par-forms form)) (meta form))
     (vector? form)
@@ -5541,6 +5535,10 @@
   "Emit bytecode for (recur args...) — loop back-edge with IINC optimization."
   [code args locals ctx]
   (let [{:keys [loop-label loop-vars]} ctx
+        _ (when-not (= (count args) (count loop-vars))
+            (throw (ex-info "recur argument count does not match its lexical loop"
+                            {:reason :bytecode-recur-arity
+                             :expected (count loop-vars) :actual (count args)})))
         single-iinc?
         (and (= 1 (count args) (count loop-vars))
              (seq? (first args))

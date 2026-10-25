@@ -104,14 +104,20 @@
         (is (thrown? ArithmeticException (run))
             "inner checked conversion fails before the frozen unchecked cast")))))
 
-(deftest effect-map-count-and-ordinal-retain-the-source-long-domain
-  (let [parameters [(with-meta 'events {:tag 'longs})
+(defn- source-effect-loop [kind index bound statements]
+  (if (= :map-void kind)
+    (list 'raster.par/map-void! index bound (list* 'do statements))
+    (list* kind [index bound] statements)))
+
+(deftest effect-loop-count-and-ordinal-retain-the-source-long-domain
+  (doseq [kind [:map-void 'dotimes 'clojure.core/dotimes]]
+   (let [parameters [(with-meta 'events {:tag 'longs})
                     (with-meta 'captured {:tag 'objects})
                     (with-meta 'count {:tag 'long}) 'stop]
-        body '(raster.par/map-void! i count
-                (do (clojure.core/aset events 0 9)
-                    (clojure.core/aset captured 0 i)
-                    (throw stop)))
+        body (source-effect-loop kind 'i 'count
+                                 '((clojure.core/aset events 0 9)
+                                   (clojure.core/aset captured 0 i)
+                                   (throw stop)))
         source (binding [*unchecked-math* false] (eval (list 'fn parameters body)))
         artifact (bytecode/compile-specialized-class!
                   "raster.compiled.LongEffectMapCount"
@@ -130,16 +136,18 @@
     (doseq [count [Long/MIN_VALUE -1 0 1 3 Integer/MAX_VALUE 2147483648 Long/MAX_VALUE]]
       (is (= (observe source count) (observe compiled count)) (str "count=" count)))
     (is (= {:outcome :stopped :events [9] :ordinal 0 :carrier Long}
-           (observe compiled 2147483648)))))
+           (observe compiled 2147483648))))))
 
-(deftest effect-map-completes-the-bound-once-and-returns-nil-after-iteration
-  (let [parameters [(with-meta 'events {:tag 'longs})
+(deftest effect-loop-completes-the-bound-once-and-returns-nil-after-iteration
+  (doseq [kind [:map-void 'dotimes 'clojure.core/dotimes]]
+   (let [parameters [(with-meta 'events {:tag 'longs})
                     (with-meta 'ordinals {:tag 'objects})]
-        body '(raster.par/map-void!
-               i (do (clojure.core/aset events 0 (clojure.core/inc (clojure.core/aget events 0))) 3)
-               (do (clojure.core/aset events (clojure.core/inc i)
-                                     (clojure.core/inc (clojure.core/aget events (clojure.core/inc i))))
-                   (clojure.core/aset ordinals i (fn [] i))))
+        body (source-effect-loop
+              kind 'i
+              '(do (clojure.core/aset events 0 (clojure.core/inc (clojure.core/aget events 0))) 3)
+              '((clojure.core/aset events (clojure.core/inc i)
+                                  (clojure.core/inc (clojure.core/aget events (clojure.core/inc i))))
+                (clojure.core/aset ordinals i (fn [] i))))
         source (binding [*unchecked-math* false] (eval (list 'fn parameters body)))
         artifact (bytecode/compile-specialized-class!
                   "raster.compiled.EffectMapBoundOnce"
@@ -153,7 +161,7 @@
                      :carriers (mapv #(class (%)) ordinals)}))]
     (is (= {:result nil :events [1 1 1 1] :ordinals [0 1 2] :carriers [Long Long Long]}
            (observe compiled)))
-    (is (= (observe source) (observe compiled)))))
+    (is (= (observe source) (observe compiled))))))
 
 (deftest private-counter-specialization-is-fresh-and-keeps-one-source-body
   (let [token (Object.)
@@ -175,6 +183,50 @@
     (is (= 1 (count (filter #(identical? body %) nodes))))
     (is (= 1 (count (filter #(identical? token (:source-observation (meta %))) nodes))))
     (is (some #(and (seq? %) (= 'clojure.core/and (first %))) nodes))))
+
+(deftest effect-loop-preserves-nested-recur-and-empty-body-semantics
+  (doseq [kind [:map-void 'dotimes 'clojure.core/dotimes]
+          statements ['() '((clojure.core/aset out i
+                              (loop* [j (clojure.core/long 0)]
+                                (if (clojure.core/< j 2)
+                                  (recur (clojure.core/inc j)) j))))]]
+    (let [parameters [(with-meta 'out {:tag 'longs})]
+          body (source-effect-loop kind 'i 3 statements)
+          source (eval (list 'fn parameters body))
+          artifact (bytecode/compile-specialized-class!
+                    "raster.compiled.NestedEffectLoopRecurrence"
+                    [{:name 'run :params parameters :return-tag 'Object
+                      :walked-body [body] :source-ns *ns*
+                      :source-policy {:unchecked-math false}}])
+          compiled (fn [& arguments] (invoke-method (get-in artifact [:methods 'run]) arguments))
+          observe (fn [run] (let [out (long-array 3)]
+                             [(run out) (vec out)]))]
+      (is (= (observe source) (observe compiled)))))
+  (doseq [kind [:map-void 'dotimes 'clojure.core/dotimes]]
+    (let [body (source-effect-loop kind 'i 3 '((recur (clojure.core/inc i))))]
+      (is (thrown? Throwable (eval (list 'fn [] body))))
+      (is (thrown? Throwable
+            (bytecode/compile-specialized-class!
+             "raster.compiled.InvalidEffectLoopRecurrence"
+             [{:name 'run :params [] :return-tag 'Object
+               :walked-body [body] :source-ns *ns*
+               :source-policy {:unchecked-math false}}]))))))
+
+(deftest recurrence-arity-cannot-silently-truncate-carried-values
+  (doseq [[body expected actual]
+          [['(loop* [a 0 b 0] (recur (clojure.core/inc a))) 2 1]
+           ['(loop* [a 0] (recur (clojure.core/inc a) a)) 1 2]]]
+    (is (thrown? clojure.lang.Compiler$CompilerException (eval (list 'fn [] body))))
+    (let [failure (try
+                    (bytecode/compile-specialized-class!
+                     "raster.compiled.InvalidLoopCarryArity"
+                     [{:name 'run :params [] :return-tag 'Object
+                       :walked-body [body] :source-ns *ns*
+                       :source-policy {:unchecked-math false}}])
+                    nil
+                    (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+      (is (= {:reason :bytecode-recur-arity :expected expected :actual actual}
+             (select-keys failure [:reason :expected :actual]))))))
 
 (deftest core-index-completion-matches-clojure-before-value-effects
   (doseq [policy [false true :warn-on-boxed]
