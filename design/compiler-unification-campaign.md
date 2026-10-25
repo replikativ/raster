@@ -4,6 +4,13 @@
 
 ### October 24 audited correctness/consolidation closure
 
+Native entry facts now use the existing shared parameter-type derivation before
+forward lowering, including write-only array parameters. Declared storage remains
+independent of computation precision; no alias assertion or source-completion
+obligation is relaxed. Independent review found no blocker. The broader affected
+native suites still expose reduction emission and rectangular-loop recovery
+failures, which remain qualification work rather than waived expectations.
+
 Keep all eight original objectives below. This phase is their correctness and
 qualification prerequisite, not a replacement campaign or a claim of arbitrary
 Clojure/AD completeness. The audit at `fe0b2375` groups remaining failures by

@@ -19,6 +19,7 @@
   (:require [clojure.walk :as walk]
             [raster.compiler.pipeline :as pl]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.intrinsics :as intrinsics]
@@ -190,11 +191,19 @@
                       (when (var? f-var) (.ns ^clojure.lang.Var f-var)) *ns*)
         active (pl/clean-params params)
         penv   (pl/build-param-env f-var dtype)
+        ;; These are source ABI facts, including write-only buffers. Native C
+        ;; preserves each resolved array's storage independently of compute dtype.
+        parameter-types (opencl-pass/derive-param-types
+                         active (mapv #(get penv %) active) dtype
+                         {:preserve-declared-array-storage? true})
         ;; :simd? false always keeps the JVM Vector-API lowering OFF; :keep-par-forms?
         ;; (set when simd?=true) instead PRESERVES par/reduce|map forms so the C
         ;; backend can emit __m256 intrinsics via csimd (vs clang auto-vec only).
         opts  {:inline? true :simd? false :keep-par-forms? simd? :dtype dtype
-               :active-params active :param-env penv :source-ns source-ns}]
+               :active-params active :param-env penv :source-ns source-ns
+               :preserve-declared-array-storage? true
+               :array-types (:array-types parameter-types)
+               :scalar-types (:scalar-types parameter-types)}]
     (let [lowered (if no-alias?
                     (pl/run-passes raw pl/forward-passes opts)
                     (let [source (pl/run-passes raw [:lower] opts)]

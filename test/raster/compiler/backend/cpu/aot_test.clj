@@ -19,6 +19,8 @@
             [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -29,6 +31,56 @@
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]))
+
+(deftest native-forward-passes-receive-declared-source-abi-facts
+  (doseq [[params tags kernel-dtype arrays scalars]
+          [['[x y cnt] '[doubles doubles long] :double
+            '{x :double y :double} '{cnt :long}]
+           ['[x y gain cnt] '[floats floats double long] :double
+            '{x :float y :float} '{gain :double cnt :long}]
+           ['[x y offset cnt] '[ints floats int long] :float
+            '{x :int y :float} '{offset :int cnt :long}]
+           ['[x y offset cnt] '[ints floats long long] :float
+            '{x :int y :float} '{offset :long cnt :long}]]
+          frozen? [false true]]
+    (let [source '(let* [effect (raster.par/map! y i cnt double 1.0)] y)
+          calls (atom [])
+          derivations (atom [])
+          derive opencl-pass/derive-param-types
+          ;; Use a deliberately different order for the frozen source entry:
+          ;; the source's public parameter order, not map iteration, owns the ABI.
+          selected-params (if frozen? (vec (reverse params)) params)
+          frontend (when frozen?
+                     {:source-entry {:params selected-params :source-ns *ns*}
+                      :body [source]})]
+      (with-redefs [pipeline/get-params (fn [_ _] params)
+                    pipeline/get-walked-body (fn [_ _] [source])
+                    pipeline/normalize-source-bindings (fn [body _] body)
+                    pipeline/build-param-env (fn [_ _] (zipmap params tags))
+                    opencl-pass/derive-param-types
+                    (fn [parameters declared-tags dt options]
+                      (swap! derivations conj [parameters declared-tags dt options])
+                      (derive parameters declared-tags dt options))
+                    pipeline/run-passes
+                    (fn [form passes options]
+                      (swap! calls conj {:form form :passes passes :options options})
+                      form)]
+        (let [result (#'aot/fused-scalar-form* ::source-owner kernel-dtype true true frontend)
+              options (:options (first @calls))]
+          (is (= source (:form result)))
+          (is (= selected-params (:params result) (:active-params options)))
+          (is (= [[selected-params (mapv (zipmap params tags) selected-params)
+                   kernel-dtype {:preserve-declared-array-storage? true}]]
+                 @derivations))
+          (is (= arrays (:array-types options)) "write-only y retains its declared storage seed")
+          (is (= scalars (:scalar-types options)))
+          (is (true? (:preserve-declared-array-storage? options)))
+          (is (= kernel-dtype (:dtype options)))
+          (is (true? (:keep-par-forms? options)))
+          (is (false? (:simd? options)))
+          (is (= pipeline/forward-passes (:passes (first @calls))))
+          (is (= 1 (count @calls)))
+          (is (not (contains? options :source-var)) "entry facts do not invent source ownership"))))))
 
 (deftest native-completion-admission-precedes-local-source-simplification
   (let [value (completion/complete-value completion/object-input-contract 'x)]
