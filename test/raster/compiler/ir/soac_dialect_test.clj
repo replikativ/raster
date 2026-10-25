@@ -31,6 +31,73 @@
                  (dialect/lambda-form '[x-element] [body])))]
     '[y])))
 
+(deftest map-ordinal-contract-is-long-independent-of-extent-and-source-casts
+  (doseq [kind '[map effect-map]]
+    (is (= :long (dialect/map-index-dtype kind 'i)))
+    (is (= :long (dialect/map-index-dtype kind (with-meta 'i {:raster.type/tag 'long}))))
+    (doseq [metadata [{:tag 'int} {:raster.type/tag 'int}
+                      {:raster.type/tag 'float} {:tag 'int :raster.type/tag 'long}]]
+      (is (= :typed-soac-map-index-contract
+             (try (dialect/map-index-dtype kind (with-meta 'i metadata))
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+  (is (= :typed-soac-map-index-contract
+         (try (dialect/map-index-dtype 'reduce 'i)
+              nil
+              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+  (let [body '(clojure.core/int i)
+        program (map-program {:values {'x tensor
+                                       'y (av/tensor {:dtype :int :shape '[n]})
+                                       'n (av/tensor {:dtype :int :shape []})}
+                              :body body})
+        equation (first (dialect/equations program))
+        parts (dialect/operation-parts equation)]
+    (is (= :int (get-in (dialect/facts program) [:values 'n :dtype])))
+    (is (= :long (dialect/map-index-dtype (:kind parts) (get-in parts [:attributes :index]))))
+    (is (= body (first (:body-results (dialect/lambda-parts (:lambda parts)))))
+        "an explicit Int narrowing in the body remains an executable conversion")
+    (is (= 'n (get-in parts [:attributes :extent])))))
+
+(deftest map-ordinal-declarations-and-colliding-roles-decline
+  (let [facts (dialect/facts (map-program))
+        make-equation (fn [index captures parameters locals body]
+                        (list '= 'map-0 '[y]
+                              (list 'map {:index index :extent 'n} '[x] captures
+                                    (dialect/lambda-form parameters locals [body]))))
+        reason (fn [equation]
+                 (try (dialect/make facts [equation] '[y])
+                      nil
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= :typed-soac-map-index-contract
+           (reason (make-equation (with-meta 'i {:raster.type/tag 'int}) [] '[element] [] 'element))))
+    (is (= :typed-soac-map-index-collision
+           (reason (make-equation 'i '[i] '[element captured] [] 'captured))))
+    (is (= :typed-soac-map-index-collision
+           (reason (make-equation 'i [] '[i] [] 'i))))
+    (is (= :typed-soac-region-binders
+           (reason (make-equation 'i [] '[element]
+                                  [(dialect/local-value 'i :long 0)] 'element))))
+    (let [result [:effect-map :collision]
+          effects [(list 'effect 'destination :unique 'i true 1.0)]
+          equation (list '= 'map-0 [result]
+                         (list 'effect-map
+                               {:index 'i :extent 'n :dtypes [:float]
+                                :iteration-order :independent}
+                               [] [] '[i]
+                               (dialect/effect-lambda-form '[destination] effects)))
+          storage [{:destination 'i :access :write :host-return :effect}]
+          facts (-> facts
+                    (assoc :values {'n extent 'i tensor result tensor} :inputs '[n i]
+                           :effects #{:memory/write})
+                    (assoc-in [:equations 'map-0]
+                              (assoc (dialect/default-equation-facts)
+                                     :effects #{:memory/write} :aliases {result 'i}
+                                     :attributes {:result-storage storage})))]
+      (is (= :typed-soac-map-index-collision
+             (try (dialect/make facts [equation] [])
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
 (deftest completed-full-reduction-transform-requires-one-result
   (let [left '(clojure.core/+ a element)
         right '(clojure.core/+ b element)
@@ -380,7 +447,7 @@
 
 (deftest scan-mode-has-a-distinct-typed-and-effectful-contract
   (let [out (av/tensor {:dtype :float :shape '[(unknown-dimension out)]})
-        algebra (scan/->AssociativeScan 'acc 0.0 '+ 'element '(float 0.0) :float)
+        algebra (scan/->AssociativeScan 'acc 0.0 '+ 'element '(clojure.core/float 0.0) :float)
         facts (dialect/default-program-facts
                {:values {'n extent 'x tensor 'out out 'result tensor}
                 :inputs '[n out x]

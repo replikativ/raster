@@ -82,6 +82,8 @@
    expression binding. Lambda regions have one typed, ordered local-SSA spine. A local initializer
    may reference parameters, the map index, and earlier locals; results may reference all locals.
    This represents shared scalar work once without smuggling type inference into an emitter.
+   Map and effect-map ordinals are intrinsically signed Long values, independently of the
+   extent's dtype. Source bound conversions remain separate executable scalar obligations.
    Ordered effect maps are the conservative boundary for imperative parallel work: each physical
    destination is explicit, every effect carries either an injectivity proof or a checked
    commutative-reduction contract, and source order is retained within a logical work item. They
@@ -1638,6 +1640,25 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :dialect :typed-soac))))
 
+(defn map-index-dtype
+  "The intrinsic signed Long ordinal of a TypedSOAC map/effect-map.
+
+   This is a lexical iteration value, independent of the extent's dtype and
+   the source operation's bound conversion. It grants neither a new extent
+   conversion nor a JVM Class/physical-carrier proof. Other SOACs and arbitrary
+   SegSpaces do not acquire an index type from this map-scoped contract."
+  [kind index]
+  (when-not (and (contains? '#{map effect-map} kind) (symbol? index))
+    (fail! :typed-soac-map-index-contract
+           "map index typing requires a map/effect-map ordinal"
+           {:kind kind :index index}))
+  (doseq [[key tag] (select-keys (meta index) [:tag :raster.type/tag])]
+    (when (and tag (not= :long (dtype/dtype-for-scalar-tag tag)))
+      (fail! :typed-soac-map-index-contract
+             "map ordinal declaration contradicts its intrinsic Long dtype"
+             {:kind kind :index index :declaration key :tag tag :dtype :long})))
+  :long)
+
 (def ^:private stencil-index-casts
   '#{byte short int long clojure.core/byte clojure.core/short clojure.core/int clojure.core/long})
 
@@ -1732,6 +1753,15 @@
         (lambda-parts (or lambda element-lambda map-lambda))
         component-count (when product? (count (:component-ids attributes)))
         result-count (count results)]
+    (when (contains? '#{map effect-map} kind)
+      (map-index-dtype kind (:index attributes))
+      ;; Map lambda parameters represent elements/captures/destinations; the
+      ;; intrinsic ordinal is not a parameter in this layout. Do not apply this
+      ;; check to reductions/Folds, whose explicit formal roles differ.
+      (when (some #{(:index attributes)} (concat parameters arrays captures destinations))
+        (fail! :typed-soac-map-index-collision
+               "map ordinal cannot shadow an element, capture, or destination"
+               {:equation equation-id :index (:index attributes)})))
     (when-not (distinct-vector? results)
       (fail! :typed-soac-equation-results "SOAC equation results must be distinct"
              {:equation equation-id :results results}))

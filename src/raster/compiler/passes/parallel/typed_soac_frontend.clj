@@ -2245,7 +2245,7 @@
         ordered-results (vec (concat (order-results order)
                                      (mapcat #(order-results (:order %))
                                              (loop-tree loops))))
-        local-types (into (into (into (assoc scalar-types index :long)
+        local-types (into (into (into (assoc scalar-types index (dialect/map-index-dtype 'effect-map index))
                                      (map (juxt :id :dtype)) analysis-locals)
                                 (keep (fn [{:keys [result result-dtype]}]
                                         (when result [result result-dtype]))) stores)

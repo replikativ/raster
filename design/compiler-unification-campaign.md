@@ -31,6 +31,17 @@ the exact core conversion. The latter was the actual residual Float-seed produce
 User call heads, recursive narrowing policy and strict constant/source proof are
 unchanged. Bare wrapped scalar-return coverage remains separate unfinished work.
 
+Owned TypedSOAC map/effect-map ordinals now have one explicit signed-Long
+contract shared by validation, frontend region analysis and SegMap lowering.
+Extent evaluation/conversion is independent: an Int extent still has Long
+ordinals, and explicit body narrowing is retained. Contradictory declarations
+and ambiguous interface roles refuse rather than being retagged. Qualification:
+104 dialect/route tests (1,172 assertions) and two portable lowering tests
+(21 assertions) pass; independent review approved this bounded contract.
+Native scalar ownership retention, a complete scalar map consumer and guarded
+axis factorization remain subsequent work. This does not establish that every
+current source-bound conversion is already preserved.
+
 Keep all eight original objectives below. This phase is their correctness and
 qualification prerequisite, not a replacement campaign or a claim of arbitrary
 Clojure/AD completeness. The audit at `fe0b2375` groups remaining failures by

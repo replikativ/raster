@@ -171,6 +171,53 @@
                   :scheduled-equation-algorithm (:algorithm equation)
                   :scheduled-equation-body program)))))
 
+(deftest map-int-extents-and-empty-domains-retain-long-ordinals
+  (doseq [bound ['n 0 -2]]
+    (let [operation (segop/->SegMap
+                     :map-index-contract (segop/make-seg-space 'i bound)
+                     (segop/->SegLevel :thread :virtual)
+                     '(clojure.core/long i) {:locals [] :result '(clojure.core/long i)}
+                     #{} #{'out} #{} (segop/->KernelGrid 1 32 0) :long 'out nil)
+          lowered (segmap-body/lower
+                   operation {:scalar-types {'n :int} :array-types {'out :long}
+                              :array-shapes {'out [8]}})
+          body (:kernel-body lowered)
+          ordinal (first (filter #(= 'i (:id %)) (:indices body)))
+          store (some #(when (instance? raster.compiler.ir.kernel_body.ScalarStore %) %)
+                      (tree-seq coll? seq (:operations body)))
+          bound-parameter (first (filter #(= '_n_bound (:id %)) (:parameters body)))]
+      (is (= :int (:dtype bound-parameter)))
+      (is (= :long (get-in ordinal [:expression :dtype])))
+      (is (= 'i (:id ordinal) (:value store)))
+      (is (= body (kernel-body/validate! body))
+          "the store references the validated Long IndexCompute, not a new value declaration")
+      (is (= bound (:bound lowered)))
+      (is (= bound (get-in operation [:space :dims 0 :bound]))))))
+
+(deftest map-explicit-int-body-conversion-does-not-narrow-its-ordinal
+  (let [operation (segop/->SegMap
+                   :map-index-body-cast (segop/make-seg-space 'i 'n)
+                   (segop/->SegLevel :thread :virtual)
+                   '(clojure.core/unchecked-int i)
+                   {:locals [] :result '(clojure.core/unchecked-int i)}
+                   #{} #{'out} #{} (segop/->KernelGrid 1 32 0) :int 'out nil)
+        body (:kernel-body (segmap-body/lower
+                            operation {:scalar-types {'n :int} :array-types {'out :int}
+                                       :array-shapes {'out [8]}}))
+        casts (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                            (= :cast (get-in % [:expression :op])))
+                      (tree-seq coll? seq (:operations body)))]
+    (is (some #(and (= :int (get-in % [:result :type]))
+                    (= :wrap (get-in % [:expression :options :overflow]))) casts))
+    (is (= :long (get-in (first (filter #(= 'i (:id %)) (:indices body))) [:expression :dtype])))
+    (is (= :typed-soac-map-index-contract
+           (try (segmap-body/lower
+                 (assoc operation :space
+                        (segop/make-seg-space (with-meta 'i {:raster.type/tag 'int}) 'n))
+                 {:scalar-types {'n :int} :array-types {'out :int}})
+                nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest output-only-storage-scalars-require-exact-independent-graph-storage
   (let [operation (segop/->SegMap
                    1903 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)

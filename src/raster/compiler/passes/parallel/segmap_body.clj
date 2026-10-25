@@ -130,6 +130,7 @@
             (decline! :workgroup-size "map workgroup size must be positive"
                       {:workgroup-size workgroup-size}))
         index (:name (first dimensions))
+        index-dtype (soac-dialect/map-index-dtype 'map index)
         bound (:bound (first dimensions))
         inputs (vec (sort-by name (:inputs segmap)))
         primary-output (:out-sym segmap)
@@ -197,7 +198,7 @@
         declared-scalar-types scalar-types
         scalar-types (into {} (map (juxt identity scalar-dtype)) scalars)
         index-scope (conj (set scalars) index)
-        index-types (assoc scalar-types index :long)
+        index-types (assoc scalar-types index index-dtype)
         lower-index (fn lower-index
                       ([expression] (lower-index expression #{}))
                       ([expression extra-scope]
@@ -217,7 +218,7 @@
                           :id-prefix "map" :decline! decline!}
                    strict-effects? (assoc :require-source-types? true
                                            :conversion-policy scalar-conversion/policy)))
-        base-environment (assoc scalar-types index :long)
+        base-environment (assoc scalar-types index index-dtype)
         _ (when (seq effects)
             (soac-dialect/validate-scheduled-effect-carries!
              effects (concat inputs outputs (keys base-environment) (map :id locals))))
@@ -611,9 +612,9 @@
         scheduled-operations
         (if sequential-effects?
           [(body/->ForLoop
-            (body/value index :long)
-            (body/index-cast 0 :long :exact)
-            (body/index-cast '_n_bound :long :exact)
+            (body/value index index-dtype)
+            (body/index-cast 0 index-dtype :exact)
+            (body/index-cast '_n_bound index-dtype :exact)
             1
             []
             (conj scalar-operations (body/->Yield []))
@@ -714,13 +715,13 @@
                    (body/expression :add
                                     (body/expression :mul group-index workgroup-size)
                                     local-index)
-                   :long :exact))]
+                   index-dtype :exact))]
        :masks (into [(body/->Mask
                       :map-active
                       [(if sequential-effects?
                          (body/predicate :eq launch-index 0)
                          (body/predicate :lt index
-                                         (body/index-cast '_n_bound :long :exact)))])]
+                                         (body/index-cast '_n_bound index-dtype :exact)))])]
                     (:masks effect-state))
        :operations scheduled-operations
        :schedule {:strategy (if sequential-effects?
@@ -804,7 +805,8 @@
   "The existing typed-SSA range proof, consumed before pointer parameters are constructed."
   [index bound scheduled-operations options]
   (when (and (integer? bound) (<= 1 bound Integer/MAX_VALUE))
-    (let [operations (tree-seq coll? seq scheduled-operations)
+    (let [index-dtype (soac-dialect/map-index-dtype 'map index)
+          operations (tree-seq coll? seq scheduled-operations)
           loads (filter #(= "raster.compiler.ir.kernel_body.ScalarLoad"
                                   (some-> % class .getName)) operations)
                 ;; A lexical map local may be retained as typed SSA rather than beta-expanded
@@ -862,10 +864,10 @@
                          (assoc known id {:type type :range derived})
                          known))
                      known))
-                 {index {:type :long :range {:lower 0 :upper (dec bound)}}}
+                 {index {:type index-dtype :range {:lower 0 :upper (dec bound)}}}
                  operations)
                 leaf-types (merge (:scalar-types options)
-                                  {index :long}
+                                  {index index-dtype}
                                   (into {} (map (fn [[id fact]] [id (:type fact)]))
                                         computed-ranges))
                 leaf-ranges (merge {index {:lower 0 :upper (dec bound)}}
