@@ -1,6 +1,9 @@
 (ns raster.compiler.ir.emitted-host-bindings-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :refer [deftm]]
+            [raster.par :as par]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as program-target]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.ir.abstract-value :as av]
@@ -9,8 +12,20 @@
             [raster.compiler.ir.emitted-parallel-program-call :as call]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
-            [raster.dl.attention :as attention]
             [raster.runtime.hardware :as hardware]))
+
+(deftm write-three! [input :- (Array float), out :- (Array float)] :- (Array float)
+  (par/map-void! i 3 (aset out i (aget input i)))
+  out)
+
+(defn- source-target []
+  (let [target :cuda:host-binding-order-test]
+    (hardware/register-target-device!
+     target {:type :cuda :name "Synthetic host-binding order target"
+             :capabilities {:compute-capability [8 0] :warp-size 32
+                            :subgroup-sizes [32] :max-workgroup-size 1024
+                            :shared-local-memory 65536 :total-eus 108}})
+    target))
 
 (defn- host-equation [values id operands result expression & [parameters]]
   (let [algorithm (soac/make
@@ -213,20 +228,87 @@
         (is (= :emitted-program-host-device-dependency
                (reason #(validate fabricated))))))))
 
+(deftest exact-shape-query-after-device-write-is-metadata-not-a-content-read
+  (let [compilation (equation-first/compile #'write-three! {:target (source-target) :dtype :float})
+        lowered (equation-first/lower compilation [(float-array 3) (float-array 3)])
+        original (get-in lowered [:instances 0 :call])
+        p (:program original)
+        values (assoc (:values p) 'length (av/tensor {:dtype :long :shape []}))
+        equation (host-equation values :late-length '[out] 'length '(clojure.core/alength out))
+        ;; The added metadata equation reads the caller-owned output's shape;
+        ;; declare that root explicitly rather than inventing a logical result alias.
+        extended (program/make (assoc p :values values :inputs (vec (distinct (conj (:inputs p) 'out)))
+                                     :outputs '[length]
+                                     :equations (conj (:equations p) equation)))
+        entries (assoc (:entry-buffers original) 'out (get (:buffers original) 'out))
+        calls (atom 0)
+        evaluator (fn [eq context]
+                    (swap! calls inc)
+                    (scalar/evaluate-host-equation *ns* eq (assoc context :buffer-shapes {'out [3]})))
+        selected (call/make-host-equation-step extended :late-length (:buffers original)
+                                                (:scalar-values original) evaluator nil)
+        constructed (call/make extended entries (:scalar-values original) {} evaluator)]
+    (is (= 2 @calls) "selected and whole-call constructors each evaluate once")
+    (is (= {'length {:type :long :value 3}} (:results selected) (:outputs constructed)))
+    (is (= constructed (call/validate! constructed)))
+    (is (= 2 @calls) "validation retains the cached result without evaluating again")
+    (is (= :emitted-program-host-operand-bindings
+           (reason #(call/validate! (assoc-in constructed [:steps 1 :operands 'out] :different-buffer)))))
+    (doseq [expression ['(clojure.core/aget out 0)
+                        '(clojure.core/+ (clojure.core/alength out) 1)
+                        '(clojure.core/unchecked-int (clojure.core/alength out))
+                        '(clojure.core/float (clojure.core/alength out))]]
+      (let [bad (host-equation values :late-length '[out] 'length expression)
+            changed (program/make (assoc extended :equations (conj (:equations p) bad)))
+            before @calls]
+        (is (= :emitted-program-host-device-dependency
+               (reason #(call/make-host-equation-step changed :late-length (:buffers original)
+                                                       (:scalar-values original) evaluator nil))))
+        (is (= before @calls) "content/arithmetic/conversion refusals precede callbacks")))))
+
+(deftest metadata-classification-needs-exact-operand-result-and-current-storage
+  (let [classify (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call 'metadata-only-buffer-source)
+        values {'out (av/tensor {:dtype :float :shape [3]})
+                'other (av/tensor {:dtype :float :shape [3]})
+                'length (av/tensor {:dtype :long :shape []})}
+        shape (host-equation values :shape '[out] 'length '(clojure.core/alength out))]
+    (is (= 'out (classify shape values {'out :current-storage})))
+    (doseq [buffers [{} {'out nil} {'other :current-storage}]]
+      (is (nil? (classify shape values buffers))))
+    (doseq [changed [(assoc-in values ['out :shape] [])
+                     (assoc-in values ['out :shape] [1 3])
+                     (assoc-in values ['length :shape] [1])
+                     (assoc-in values ['length :dtype] :double)]]
+      (is (nil? (classify shape changed {'out :current-storage}))))
+    (let [extra (host-equation values :shape '[out other] 'length '(clojure.core/alength out))
+          content (assoc (host-equation values :shape '[out] 'length '(clojure.core/aget out 0))
+                         :source '(clojure.core/alength out)
+                         :attributes {:host-only true :graph-shape-definition true})]
+      (is (nil? (classify extra values {'out :current-storage 'other :other-storage})))
+      (is (nil? (classify content values {'out :current-storage}))
+          "source spelling and shape flags do not override the actual scalar algorithm"))))
+
 (deftest entry-storage-shape-can-be-read-before-a-later-in-place-write
   ;; This is a hardware-free binding test. Use an explicit source target with checked
   ;; integer arithmetic, not whichever OpenCL device happens to be installed locally.
-  (let [target :cuda:host-binding-order-test
-        _ (hardware/register-target-device!
-           target {:type :cuda :name "Synthetic host-binding order target"
-                   :capabilities {:compute-capability [8 0] :warp-size 32
-                                  :subgroup-sizes [32] :max-workgroup-size 1024
-                                  :shared-local-memory 65536 :total-eus 108}})
-        compiled (equation-first/compile #'attention/softmax-rows!
+  (let [target (source-target)
+        compiled (equation-first/compile #'write-three!
                                         {:target target :dtype :float})
-        linked (equation-first/lower compiled [(float-array 6) 2 3])
-        original (get-in linked [:instances 0 :call])
-        p (:program original)
+        linked (equation-first/lower compiled [(float-array 6) (float-array 6)])
+        numerical (get-in linked [:instances 0 :call])
+        ;; Add the host prefix BEFORE target emission. Reusing an already emitted
+        ;; body would violate its exact enclosing-prefix correspondence.
+        base (:scheduled compiled)
+        values (assoc (:values base) 'length (av/tensor {:dtype :long :shape []}))
+        query (host-equation values :early-length '[out] 'length '(clojure.core/alength out))
+        scheduled (program/make (assoc base :values values
+                                      :inputs (vec (distinct (conj (:inputs base) 'out)))
+                                      :equations (into [query] (:equations base))))
+        p (:program (program-target/emit-program scheduled (assoc (:options compiled) :target-dialect :cuda)))
+        original (call/make p (assoc (:entry-buffers numerical) 'out (get (:buffers numerical) 'out))
+                            (:scalar-values numerical) {}
+                            #(scalar/evaluate-host-equation *ns* %1 (assoc %2 :buffer-shapes {'out [6]}))
+                            (apply merge (keep :result-views (:steps numerical))))
         proof (emitted/validate-with-physical-results! p)
         projected (fn [step]
                     (when (call/emitted-equation-call? step)
@@ -242,6 +324,8 @@
                                          (drop (inc i) (:steps original))))]
                     id)]
     (is (seq witnesses) "this control must read storage before its later physical update")
+    (is (= {:type :long :value 6} (get-in original [:steps 0 :results 'length]))
+        "length is the physical buffer capacity, not the three-element write domain")
     (is (= original (call/validate! original)))
     (is (= original (call/validate-with-retained-program! original proof)))
     (is (map? (call/preparation-plan original :in-place-entry-shape)))))

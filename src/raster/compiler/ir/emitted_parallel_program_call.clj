@@ -1,8 +1,9 @@
 (ns raster.compiler.ir.emitted-parallel-program-call
   "Pure runtime binding for one equation-first emitted parallel program.
 
-   Construction evaluates only effect-free host scalar equations that are independent of device
-   results. Every numerical equation is then bound from its emitted ABI and retained physical
+   Construction evaluates effect-free host scalar equations, never device-produced contents.
+   Exact length queries may depend on a bound resident buffer's stable metadata, not its data.
+   Every numerical equation is then bound from its emitted ABI and retained physical
    result contracts. The resulting call owns no driver handles and never reads retained source."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
@@ -15,6 +16,7 @@
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
@@ -355,9 +357,27 @@
              "device-produced storage cannot be supplied as an evaluated host scalar"
              {:values (set shadowed)}))))
 
-(defn- validate-host-device-dependencies! [equation device-results]
+(defn- metadata-only-buffer-source
+  "Classify an exact shape query, not its value or permission to execute it early.
+   Actual length still comes from the checked runtime buffer view at its source position."
+  [equation values buffers]
+  (let [expression (invocation-source/scalar-equation-source equation)
+        source (when expression (invocation-source/shape-projection-source expression))
+        buffer (get values source)
+        result (when (= 1 (count (:results equation))) (get values (first (:results equation))))]
+    (when (and source (= [source] (:operands equation))
+               (= :tensor (:kind buffer)) (= 1 (count (:shape buffer)))
+               (some? (get buffers source))
+               (= :tensor (:kind result)) (empty? (:shape result))
+               (contains? #{:int :long} (:dtype result))
+               (invocation-source/projection-corresponds? expression result))
+      source)))
+
+(defn- validate-host-device-dependencies! [equation device-results values buffers]
   (let [dependencies (set/intersection device-results (set (:operands equation)))]
-    (when (seq dependencies)
+    (when (and (seq dependencies)
+               (not= dependencies (when-let [source (metadata-only-buffer-source equation values buffers)]
+                                    #{source})))
       (fail! :emitted-program-host-device-dependency
              "a host scalar equation cannot be staged before a device result"
              {:equation (:id equation) :values dependencies}))))
@@ -380,7 +400,7 @@
        (if-not (true? (get-in equation [:attributes :host-only]))
          (update state :device-results into (device-equation-results equation projections))
          (do
-           (validate-host-device-dependencies! equation device-results)
+           (validate-host-device-dependencies! equation device-results values buffers)
            (let [step (evaluate-host-step equation values buffers scalars evaluate-host)
                  results (:results step)]
              (-> state
@@ -431,7 +451,8 @@
             (when-not (= equation (:equation step))
               (fail! :emitted-program-call-step-equation
                      "evaluated host step changed equation identity" {:equation (:id equation)}))
-            (validate-host-device-dependencies! equation @prior-device-results)
+            (validate-host-device-dependencies! equation @prior-device-results
+                                                (:values parallel-program) @current-buffers)
             (let [expected (host-operand-bindings equation (:values parallel-program)
                                                 @current-buffers @current-scalars)]
               (doseq [[id value] expected]
@@ -886,7 +907,8 @@
               {:equation equation-id}))
      (validate-host-device-dependencies!
       equation (into #{} (mapcat #(device-equation-results % projections caller-options))
-                     (take-while #(not= equation-id (:id %)) (:equations program))))
+                     (take-while #(not= equation-id (:id %)) (:equations program)))
+      (:values program) buffers)
      (let [step (evaluate-host-step equation (:values program) buffers scalars evaluate-host)]
        (merge-host-results scalars equation (:results step))
        step))))
@@ -944,8 +966,9 @@
 
    `buffers` may include preallocated intermediate and output storage in addition to inputs.
    `scalar-values` contains typed runtime scalars. `loop-scratch` maps loop output IDs to alternate
-   carry buffers. `evaluate-host` is called only for effect-free scalar equations that do not
-   depend on device results.
+   carry buffers. `evaluate-host` is called only for effect-free scalar equations without
+   device-content dependencies. Exact metadata-only length queries still require current buffer
+   bindings; this constructor grants no permission to execute source work early.
    Optional `result-views` maps logical results to their prefix-producing physical destinations.
    This declares a storage relation, not proof that arbitrary runtime tokens alias: LinkPlan
    validates concrete views, and runtime preparation requires checked view resolution.

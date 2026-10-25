@@ -4,6 +4,7 @@
             [raster.par :as par]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]))
 
 (deftm stored-scalar-continuation
@@ -27,13 +28,20 @@
         operation (first (:operations producer))
         expected-storage (set (vals (emitted-equation/physical-results operation)))
         original scalar/evaluate-host-equation
-        error
+        preparation-error
         (with-redefs [scalar/evaluate-host-equation
                       (fn [& arguments]
                         (swap! calls conj (:id (first arguments)))
                         (apply original arguments))]
           (try (equation-first/lower compilation [(float-array [1.2345679 2.3456789])])
-               (catch clojure.lang.ExceptionInfo e e)))]
+               (catch clojure.lang.ExceptionInfo e e)))
+        error (try (program-call/make-host-equation-step
+                    (:emitted compilation) terminal-id {'input :input-storage 'out :output-storage} {}
+                    (fn [& _] (swap! calls conj terminal-id)
+                      (throw (AssertionError. "read device contents on host"))) nil)
+                   nil (catch clojure.lang.ExceptionInfo e e))]
+    (is (= :equation-first-ordered-preparation (:reason (ex-data preparation-error)))
+        "the public entry refuses to run late allocation work during eager preparation")
     (is (= :emitted-program-host-device-dependency (:reason (ex-data error))))
     (is (some? terminal-id))
     (is (emitted-equation/emitted-equation? operation) "this fixture exercises direct emission")

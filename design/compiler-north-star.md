@@ -1431,6 +1431,14 @@ dtype/count/initialization and missing constructor contracts refuse. This does n
 the safety of earlier scalar DCE's allocation-removability policy, which requires separate
 evaluation/failure-order qualification.
 
+A device write changes contents, not a bound buffer's shape. Host dependency validation admits
+only an exact, scalar-algorithm-derived rank-one length query with a current buffer binding and
+an exact integral result conversion. This classifies a metadata dependency; it neither derives
+the length from a symbolic AV nor permits early source evaluation. The existing ordered
+ShapeProjection action reads the checked materialized shape once; final call validation retains
+its cached result and checks operand correspondence. Content reads and other scalar computations
+remain subject to the ordinary device-dependency prohibition.
+
 Source local declarations and inferred types are separate facts. Original source entry captures
 the presence and value of a binder's declaration before inference; rewalking transports this
 fact rather than reinterpreting an inferred `:tag` as a source declaration. Actual macro
