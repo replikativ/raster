@@ -159,6 +159,169 @@
        :result-dtype (:dtype (get values (first results)))
        :transform (:result-transform attributes)})))
 
+(defn functional-map-host-projection
+  "Project a complete map/effect-map's iteration and host return contract.
+   Allocations, binding placement and scheduling remain the caller's responsibility.
+   :statement includes its typed locals and storage completions exactly once;
+   :locals is informative and MUST NOT be emitted again by a consumer.
+   The input is a validated TypedSOAC program; other operation kinds abstain."
+  [program equation]
+  (let [equation-id (second equation)
+        results (nth equation 2)
+        {:keys [kind attributes]} (dialect/operation-parts equation)
+        values (:values (dialect/facts program))
+        {region-locals :locals bodies :bodies region-index :index}
+        (when (contains? '#{map effect-map} kind) (scalar-region equation))]
+    (case kind
+      map
+      (do
+        (when-not (and (seq results) (= (count results) (count bodies)))
+          (throw (ex-info "the production TypedSOAC route requires one body per map result"
+                          {:reason :typed-soac-production-subset
+                           :equation equation-id :results results})))
+        (let [result (first results)
+              result-dtypes (mapv #(:dtype (get values %)) results)
+              casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
+              projected-source-casts
+              (mapv (fn [body result-dtype]
+                      (when (and (seq? body) (= 2 (count body))
+                                 (descriptor/cast-op? (descriptor/semantic-op body))
+                                 (= result-dtype
+                                    (some-> (descriptor/semantic-op body)
+                                            descriptor/cast-result-tag
+                                            dtype/dtype-for-scalar-tag dtype/canon)))
+                        (descriptor/semantic-op body)))
+                    bodies result-dtypes)
+              casts (mapv #(or %1 %2) projected-source-casts casts)
+              bodies (mapv (fn [body source-cast]
+                             (if source-cast (second body) body))
+                           bodies projected-source-casts)
+              ;; A storage-only dtype (`:half` in `short[]`) has no JVM scalar cast; its map
+              ;; results are stored bit-exactly, so only dtypes with a scalar need one.
+              _ (when (some (fn [[cast dtype]] (and (nil? cast) (not (storage-only-dtype? dtype))))
+                            (map vector casts result-dtypes))
+                  (throw (ex-info "TypedSOAC materialization has no scalar cast for map output"
+                                  {:reason :typed-soac-materialization-dtype
+                                   :results results :dtypes result-dtypes})))
+              cast (first casts)
+              storage (dialect/result-storage (dialect/facts program) equation-id)
+              physical-results (dialect/physical-results (dialect/facts program) equation)
+              host-returns (set (map :host-return storage))
+              multiple-buffer-results? (and (= #{:buffer} host-returns)
+                                            (< 1 (count physical-results)))
+              _ (when (and storage
+                           (not (or (= #{:effect} host-returns)
+                                    (= #{:buffer} host-returns))))
+                  (throw (ex-info "stored map results require one coherent host return contract"
+                                  {:reason :typed-soac-production-subset
+                                   :equation equation-id :storage storage})))
+              secondary-stores
+              (mapv (fn [secondary secondary-cast body]
+                      (list 'clojure.core/aset secondary (:index attributes)
+                            (invocation-source/typed-store-value secondary-cast body)))
+                    (rest physical-results) (rest casts) (rest bodies))
+              body (materialize-region
+                    region-locals
+                    (if (seq secondary-stores)
+                      (list* 'do (concat secondary-stores [(first bodies)]))
+                      (first bodies)))
+              void-statement
+              (when (or (= #{:effect} host-returns) multiple-buffer-results?)
+                (materialize-region
+                 region-locals
+                 (list* 'do
+                        (map (fn [destination result-cast result-body]
+                               (list 'clojure.core/aset destination (:index attributes)
+                                     (invocation-source/typed-store-value result-cast result-body)))
+                             physical-results casts bodies))))
+              value-body (if (= #{:buffer} host-returns)
+                           (materialize-region region-locals (first bodies))
+                           body)
+              target (if (= #{:buffer} host-returns) (first physical-results) result)
+              statement (or void-statement
+                            (list 'clojure.core/aset target (:index attributes)
+                                  (invocation-source/typed-store-value cast value-body)))
+              source (with-meta
+                       (if void-statement
+                         (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+                               void-statement)
+                         (list 'raster.par/map! target (:index attributes) (:extent attributes)
+                               cast value-body))
+                       {:raster.type/elem-type (first result-dtypes)})]
+          {:kind :map :index (:index attributes) :extent (:extent attributes)
+           :locals region-locals :statement statement :source source
+           :physical-destinations physical-results :result-dtypes result-dtypes
+           :storage storage :multiple-buffer-results? multiple-buffer-results?
+           :host-return-contract {:call-result (if void-statement :effect :buffer)
+                                  :storage-returns host-returns}}))
+
+      effect-map
+      (let [storage (dialect/result-storage (dialect/facts program) equation-id)
+            physical-results (dialect/physical-results (dialect/facts program) equation)
+            result-dtypes (mapv #(:dtype (get values %)) results)
+            casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
+            dtype-by-destination (zipmap physical-results result-dtypes)
+            cast-by-destination (zipmap physical-results casts)
+            effects (mapv dialect/scheduled-effect bodies)
+            strict-effects? (dialect/strict-effect-scalar-policy? effects)
+            generated-cast (partial effect-source/storage-cast strict-effects?)
+            materialize-locals (if strict-effects?
+                                 (partial effect-source/typed-locals generated-cast)
+                                 materialize-region)
+            _ (when-not (and (= (count results) (count physical-results)
+                                (count result-dtypes) (count casts))
+                             (every? some? effects)
+                             (every? (fn [[cast dtype]] (or cast (storage-only-dtype? dtype)))
+                                     (map vector casts result-dtypes))
+                             (= #{:effect} (set (map :host-return storage))))
+                (throw (ex-info "the production effect-map route requires typed effect storage"
+                                {:reason :typed-soac-production-subset
+                                 :equation equation-id :results results
+                                 :storage storage :effects effects :dtypes result-dtypes})))
+            loop-statement
+            (fn [{:keys [index lower extent locals carries] :as loop} emit-body]
+              (if (seq carries)
+                (effect-source/counted-loop generated-cast loop emit-body)
+                ;; Preserve the existing source loop's induction policy when no carry is present.
+                (list 'loop* [index lower]
+                      (list 'if (list 'clojure.core/< index extent)
+                            (materialize-locals
+                             locals (emit-body (list 'recur (list 'clojure.core/inc index))))
+                            nil))))
+            statement
+            (fn [{:keys [destination conflict destination-index predicate value]}]
+              (let [cast (get cast-by-destination destination)
+                    result-dtype (get dtype-by-destination destination)
+                    destination (with-meta destination
+                                  {:raster.type/tag
+                                   (dtype/array-tag-for-dtype result-dtype)
+                                   :tag (dtype/array-tag-for-dtype result-dtype)})
+                    typed-value (if cast (list (generated-cast cast) value) value)
+                    store (if (dialect/reducing-scatter-conflict? conflict)
+                            (list 'raster.par/atomic-add!
+                                  destination destination-index typed-value)
+                            (list 'clojure.core/aset destination destination-index
+                                  typed-value))]
+                (if (contains? #{true 1} predicate) store (list 'if predicate store))))
+            continuation (effect-source/ordered-effects
+                          effects nil {:emit-store statement :emit-loop loop-statement
+                                       :emit-region materialize-locals})
+            iteration-statement (materialize-locals region-locals continuation)
+            effect-source
+            (with-meta
+              (list 'raster.par/map-void! region-index (:extent attributes)
+                    iteration-statement)
+              {:raster.type/elem-type (first result-dtypes)})]
+        {:kind :effect-map :index region-index :extent (:extent attributes)
+         :iteration-order (:iteration-order attributes)
+         :locals region-locals :statement iteration-statement :source effect-source
+         :physical-destinations physical-results :result-dtypes result-dtypes
+         :storage storage
+         :host-return-contract {:call-result :effect
+                                :storage-returns (set (map :host-return storage))}})
+
+      nil)))
+
 (defn- segmented-result-extent
   [attributes]
   (let [shape (dialect/segmented-reduce-result-shape attributes)]
@@ -170,7 +333,8 @@
   (let [[_ equation-id results] equation
         {:keys [kind attributes]} (dialect/operation-parts equation)
         values (:values (dialect/facts program))
-        {region-locals :locals bodies :bodies region-index :index} (scalar-region equation)
+        {region-locals :locals bodies :bodies}
+        (when-not (contains? '#{map effect-map} kind) (scalar-region equation))
         placement-facts (get-in (dialect/facts program) [:equations equation-id])
         constituent-ids (or (some-> placement-facts :attributes :fusion/constituents keys set)
                             #{(or (get-in placement-facts [:provenance :source-binding-id])
@@ -213,83 +377,14 @@
            :source source}))
 
       map
-      (do
-        (when-not (and (seq results) (= (count results) (count bodies)))
-          (throw (ex-info "the production TypedSOAC route requires one body per map result"
-                          {:reason :typed-soac-production-subset
-                           :equation equation-id :results results})))
-        (let [result (first results)
-              result-dtypes (mapv #(:dtype (get values %)) results)
-              casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
-              projected-source-casts
-              (mapv (fn [body result-dtype]
-                      (when (and (seq? body) (= 2 (count body))
-                                 (descriptor/cast-op? (descriptor/semantic-op body))
-                                 (= result-dtype
-                                    (some-> (descriptor/semantic-op body)
-                                            descriptor/cast-result-tag
-                                            dtype/dtype-for-scalar-tag dtype/canon)))
-                        (descriptor/semantic-op body)))
-                    bodies result-dtypes)
-              casts (mapv #(or %1 %2) projected-source-casts casts)
-              bodies (mapv (fn [body source-cast]
-                             (if source-cast (second body) body))
-                           bodies projected-source-casts)
-              ;; A storage-only dtype (`:half` in `short[]`) has no JVM scalar cast; its map
-              ;; results are stored bit-exactly, so only dtypes with a scalar need one.
-              _ (when (some (fn [[cast dtype]] (and (nil? cast) (not (storage-only-dtype? dtype))))
-                            (map vector casts result-dtypes))
-                  (throw (ex-info "TypedSOAC materialization has no scalar cast for map output"
-                                  {:reason :typed-soac-materialization-dtype
-                                   :results results :dtypes result-dtypes})))
-              cast (first casts)
-              storage (dialect/result-storage (dialect/facts program) equation-id)
-              physical-results (dialect/physical-results (dialect/facts program) equation)
-              host-binding (or (get-in placement-facts [:attributes :host-binding]) result)
-              host-bindings (or (get-in placement-facts [:attributes :host-bindings])
-                                {result host-binding})
-              host-returns (set (map :host-return storage))
-              multiple-buffer-results? (and (= #{:buffer} host-returns)
-                                            (< 1 (count physical-results)))
-              _ (when (and storage
-                           (not (or (= #{:effect} host-returns)
-                                    (= #{:buffer} host-returns))))
-                  (throw (ex-info "stored map results require one coherent host return contract"
-                                  {:reason :typed-soac-production-subset
-                                   :equation equation-id :storage storage})))
-              secondary-stores
-              (mapv (fn [secondary secondary-cast body]
-                      (list 'clojure.core/aset secondary (:index attributes)
-                            (invocation-source/typed-store-value secondary-cast body)))
-                    (rest physical-results) (rest casts) (rest bodies))
-              body (materialize-region
-                    region-locals
-                    (if (seq secondary-stores)
-                      (list* 'do (concat secondary-stores [(first bodies)]))
-                      (first bodies)))
-              effect (gensym (str "typed_soac_map_" equation-id "__"))
-              source (with-meta
-                       (cond
-                         (or (= #{:effect} host-returns) multiple-buffer-results?)
-                         (list 'raster.par/map-void! (:index attributes) (:extent attributes)
-                               (materialize-region
-                                region-locals
-                                (list* 'do
-                                       (map (fn [destination result-cast result-body]
-                                              (list 'clojure.core/aset destination
-                                                    (:index attributes)
-                                                    (invocation-source/typed-store-value result-cast result-body)))
-                                            physical-results casts bodies))))
-
-                         (= #{:buffer} host-returns)
-                         (list 'raster.par/map! (first physical-results) (:index attributes)
-                               (:extent attributes) cast
-                               (materialize-region region-locals (first bodies)))
-
-                         :else
-                         (list 'raster.par/map! result (:index attributes) (:extent attributes)
-                               cast body))
-                       {:raster.type/elem-type (first result-dtypes)})]
+      (let [{:keys [source storage physical-destinations multiple-buffer-results?]}
+            (functional-map-host-projection program equation)
+            physical-results physical-destinations
+            result (first results)
+            host-binding (or (get-in placement-facts [:attributes :host-binding]) result)
+            host-bindings (or (get-in placement-facts [:attributes :host-bindings])
+                              {result host-binding})
+            effect (gensym (str "typed_soac_map_" equation-id "__"))]
           {:equation-id equation-id
            :placement placement
            :pairs (cond
@@ -314,7 +409,7 @@
                     (conj (mapv #(invocation-source/equation-allocation-pair values equation %) results)
                           [effect source]))
            :site [:binding (if (and storage (not multiple-buffer-results?)) host-binding effect)]
-           :source source}))
+           :source source})
 
       scatter
       (let [storage (dialect/result-storage (dialect/facts program) equation-id)
@@ -368,68 +463,14 @@
          :source effect-source})
 
       effect-map
-      (let [storage (dialect/result-storage (dialect/facts program) equation-id)
-            physical-results (dialect/physical-results (dialect/facts program) equation)
+      (let [{:keys [source]} (functional-map-host-projection program equation)
             host-binding (or (get-in placement-facts [:attributes :host-binding])
-                             (first results))
-            result-dtypes (mapv #(:dtype (get values %)) results)
-            casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
-            dtype-by-destination (zipmap physical-results result-dtypes)
-            cast-by-destination (zipmap physical-results casts)
-            effects (mapv dialect/scheduled-effect bodies)
-            strict-effects? (dialect/strict-effect-scalar-policy? effects)
-            generated-cast (partial effect-source/storage-cast strict-effects?)
-            materialize-locals (if strict-effects?
-                                 (partial effect-source/typed-locals generated-cast)
-                                 materialize-region)
-            _ (when-not (and (= (count results) (count physical-results)
-                                (count result-dtypes) (count casts))
-                             (every? some? effects)
-                             (every? (fn [[cast dtype]] (or cast (storage-only-dtype? dtype)))
-                                     (map vector casts result-dtypes))
-                             (= #{:effect} (set (map :host-return storage))))
-                (throw (ex-info "the production effect-map route requires typed effect storage"
-                                {:reason :typed-soac-production-subset
-                                 :equation equation-id :results results
-                                 :storage storage :effects effects :dtypes result-dtypes})))
-            loop-statement
-            (fn [{:keys [index lower extent locals carries] :as loop} emit-body]
-              (if (seq carries)
-                (effect-source/counted-loop generated-cast loop emit-body)
-                ;; Preserve the existing source loop's induction policy when no carry is present.
-                (list 'loop* [index lower]
-                      (list 'if (list 'clojure.core/< index extent)
-                            (materialize-locals
-                             locals (emit-body (list 'recur (list 'clojure.core/inc index))))
-                            nil))))
-            statement
-            (fn [{:keys [destination conflict destination-index predicate value]}]
-              (let [cast (get cast-by-destination destination)
-                    result-dtype (get dtype-by-destination destination)
-                    destination (with-meta destination
-                                  {:raster.type/tag
-                                   (dtype/array-tag-for-dtype result-dtype)
-                                   :tag (dtype/array-tag-for-dtype result-dtype)})
-                    typed-value (if cast (list (generated-cast cast) value) value)
-                    store (if (dialect/reducing-scatter-conflict? conflict)
-                            (list 'raster.par/atomic-add!
-                                  destination destination-index typed-value)
-                            (list 'clojure.core/aset destination destination-index
-                                  typed-value))]
-                (if (contains? #{true 1} predicate) store (list 'if predicate store))))
-            continuation (effect-source/ordered-effects
-                          effects nil {:emit-store statement :emit-loop loop-statement
-                                       :emit-region materialize-locals})
-            effect-source
-            (with-meta
-              (list 'raster.par/map-void! region-index (:extent attributes)
-                    (materialize-locals region-locals continuation))
-              {:raster.type/elem-type (first result-dtypes)})]
+                             (first results))]
         {:equation-id equation-id
          :placement placement
-         :pairs [[host-binding effect-source]]
+         :pairs [[host-binding source]]
          :site [:binding host-binding]
-         :source effect-source})
+         :source source})
 
       stencil
       (let [host-binding (or (get-in placement-facts [:attributes :host-binding])

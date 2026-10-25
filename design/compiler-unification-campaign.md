@@ -42,6 +42,19 @@ Native scalar ownership retention, a complete scalar map consumer and guarded
 axis factorization remain subsequent work. This does not establish that every
 current source-bound conversion is already preserved.
 
+Complete map/effect-map host projection is now shared with existing realization,
+not reconstructed from a physical phase or reparsed source loop. Its statement
+contains typed locals and storage completions once, preserves effect order, and
+keeps physical interface order separate from execution order. Allocation,
+placement and host buffer aliases remain with realization. The projection also
+distinguishes a nil-returning fused call from its caller-owned buffer aliases.
+Independent review found no blocker; the affected route suite passes 89 tests /
+1,106 assertions (`20261025-owned-map-host-projection-route-suite.log`). This is
+the prerequisite for the native scalar map consumer, not that consumer itself:
+bound conversion, Long loop emission, SIMD admission and guarded rectangular
+scheduling must still be implemented before native scalar ownership is retained
+unconditionally or the old rectangular source parser is retired.
+
 Selected direct-allocation helpers now accept closed numeric literal arguments
 through checked source-constant evidence and exact parameter-carrier agreement.
 One actual-literal carrier authority is shared with JVM emission; generic

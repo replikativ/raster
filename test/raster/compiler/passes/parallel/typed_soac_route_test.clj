@@ -11,6 +11,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -571,6 +572,175 @@
         "the source effect binder remains nil after TypedSOAC materialization")
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
     (is (= [12.0 22.0 32.0 42.0] (mapv double b)))))
+
+(deftest complete-map-host-projection-retains-local-casts-and-effect-return
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        i n
+                        (let* [^float shifted (+ (clojure.core/aget x i) 1.0)
+                               ^float squared (* shifted shifted)]
+                              (clojure.core/aset a i (float shifted))
+                              (clojure.core/aset b i (float squared))))]
+                      effect)
+        program (:program (route/attempt source :float {'x :float 'a :float 'b :float}
+                                         {:scalar-types {'n :long}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        equation (first (dialect/equations algorithm))
+        projected (route/functional-map-host-projection algorithm equation)
+        statement (:statement projected)
+        stores (filter #(and (seq? %) (= 'clojure.core/aset (first %)))
+                       (tree-seq coll? seq statement))
+        execute (eval (list 'fn '[x a b n]
+                            (interpret-resident-source-for-test {:source (:source projected)})))
+        a (float-array 2)
+        b (float-array 2)]
+    (is (= :map (:kind projected)))
+    (is (= 'n (:extent projected)))
+    (is (= '[a b] (:physical-destinations projected)))
+    (is (= [:float :float] (mapv :dtype (:locals projected))))
+    (is (= 'let* (first statement)))
+    (is (= '[clojure.core/float clojure.core/float]
+           (mapv first (take-nth 2 (rest (second statement))))))
+    (is (= '[a b] (mapv second stores)) "stores retain their complete output order")
+    (is (= 1 (count (filter #(and (seq? %) (= 'clojure.core/aget (first %))
+                                  (= 'x (second %)))
+                            (tree-seq coll? seq statement))))
+        "the shared local initializer occurs once in the complete statement")
+    (is (= {:call-result :effect :storage-returns #{:effect}}
+           (:host-return-contract projected)))
+    (is (= (:source owner) (:source projected)) "realization uses the same shared projection")
+    (is (= :float (:raster.type/elem-type (meta (:source projected)))))
+    (is (nil? (execute (float-array [1.0 2.0]) a b 2)))
+    (is (= [2.0 3.0] (vec a)))
+    (is (= [4.0 9.0] (vec b)))))
+
+(deftest complete-map-host-projection-keeps-buffer-return-separate-from-stores
+  (let [source '(let* [result (raster.par/map! out i n float
+                                            (+ (clojure.core/aget x i) 1.0))]
+                      result)
+        program (:program (route/attempt source :float {'x :float 'out :float}
+                                         {:scalar-types {'n :long}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        projected (route/functional-map-host-projection
+                   algorithm (first (dialect/equations algorithm)))
+        execute (eval (list 'fn '[x out n]
+                            (interpret-resident-source-for-test {:source (:source projected)})))
+        out (float-array 2)]
+    (is (= {:call-result :buffer :storage-returns #{:buffer}}
+           (:host-return-contract projected)))
+    (is (= '[out] (:physical-destinations projected)))
+    (is (= 'clojure.core/aset (first (:statement projected))))
+    (is (= (:source owner) (:source projected)))
+    (is (identical? out (execute (float-array [2.0 3.0]) out 2)))
+    (is (= [3.0 4.0] (vec out)))))
+
+(deftest fresh-tuple-map-host-projection-keeps-secondary-stores-before-primary
+  (let [program (:program (route/attempt horizontal-maps :float {'a :float 'b :float}
+                                         {:scalar-types {'n :long}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        projected (route/functional-map-host-projection
+                   algorithm (first (dialect/equations algorithm)))
+        statement (:statement projected)
+        primary (second statement)
+        secondary-stores (filter #(and (seq? %) (= 'clojure.core/aset (first %)))
+                                 (tree-seq coll? seq (nth statement 3)))]
+    (is (= 2 (count (:physical-destinations projected))))
+    (is (= {:call-result :buffer :storage-returns #{}}
+           (:host-return-contract projected)))
+    (is (= (first (:physical-destinations projected)) primary))
+    (is (= (vec (rest (:physical-destinations projected))) (mapv second secondary-stores))
+        "secondary stores execute in the primary value operand before its outer store")
+    (is (= (:source owner) (:source projected)))))
+
+(deftest fused-caller-buffer-map-projection-keeps-effect-call-and-buffer-aliases
+  (let [source '(let* [u (raster.par/map! u-out i n float
+                                          (* (clojure.core/aget a i) 2.0))
+                       v (raster.par/map! v-out j n float
+                                          (+ (clojure.core/aget b j) 1.0))]
+                      [u v])
+        program (:program (route/attempt source :float
+                                         {'a :float 'b :float 'u-out :float 'v-out :float}
+                                         {:scalar-types {'n :int}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        projected (route/functional-map-host-projection
+                   algorithm (first (dialect/equations algorithm)))
+        stores (filter #(and (seq? %) (= 'clojure.core/aset (first %)))
+                       (tree-seq coll? seq (:statement projected)))
+        execute (eval (list 'fn '[a b u-out v-out n]
+                            (interpret-resident-source-for-test {:source (:source projected)})))
+        execute-host (eval (list 'fn '[a b u-out v-out n]
+                                 (interpret-resident-source-for-test program)))
+        a (float-array [1.0 2.0])
+        b (float-array [4.0 5.0])
+        u-out (float-array 2)
+        v-out (float-array 2)]
+    (is (= 1 (count (:equations program))))
+    (is (true? (:multiple-buffer-results? projected)))
+    (is (= {:call-result :effect :storage-returns #{:buffer}}
+           (:host-return-contract projected)))
+    (is (= '[u-out v-out] (:physical-destinations projected)))
+    (is (= '[u-out v-out] (mapv second stores)))
+    (is (= 'raster.par/map-void! (first (:source projected))))
+    (is (= (:source owner) (:source projected)))
+    (is (nil? (execute a b u-out v-out 2)))
+    (let [result (execute-host a b u-out v-out 2)]
+      (is (identical? u-out (first result)))
+      (is (identical? v-out (second result))))
+    (is (= [2.0 4.0] (vec u-out)))
+    (is (= [5.0 6.0] (vec v-out)))))
+
+(deftest complete-effect-map-host-projection-retains-the-ordered-loop-region
+  ;; This accepted carried-effect fixture stores within the loop, so its region
+  ;; cannot be extracted as a pure map with a terminal scalar fold.
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        row rows
+                        (do (aset scales row (float seed))
+                            (let* [^double sum
+                                   (loop* [^long k 0 ^double acc 0.25]
+                                     (if (< k width)
+                                       (let* [^float v (aget x (+ (* row width) k))]
+                                         (aset packed (+ (* row width) k) v)
+                                         (recur (inc k) (+ acc (double v))))
+                                       acc))]
+                              (aset sums row (float sum)))))]
+                      effect)
+        program (:program (route/attempt source :float
+                                         {'x :float 'packed :float 'scales :float 'sums :float}
+                                         {:scalar-types {'rows :long 'width :long 'seed :float}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        projected (route/functional-map-host-projection
+                   algorithm (first (dialect/equations algorithm)))
+        nodes (tree-seq coll? seq (:statement projected))
+        stores (filter #(and (seq? %) (= 'clojure.core/aset (first %))) nodes)
+        execute (eval (list 'fn '[x packed scales sums rows width seed]
+                            (interpret-resident-source-for-test {:source (:source projected)})))
+        packed (float-array 6)
+        scales (float-array 2)
+        sums (float-array 2)]
+    (is (= :effect-map (:kind projected)))
+    (is (= :independent (:iteration-order projected)))
+    (is (= {:call-result :effect :storage-returns #{:effect}}
+           (:host-return-contract projected)))
+    (is (= '[scales sums packed] (:physical-destinations projected))
+        "physical results retain interface order, independently of ordered effects")
+    (is (some #(and (seq? %) (= 'loop* (first %))) nodes))
+    (is (some #(and (seq? %) (= 'clojure.core/double (first %))) nodes)
+        "the retained Double carry is completed as Double, not storage Float")
+    (is (= '[scales packed sums] (mapv second stores))
+        "pre-loop, in-loop and post-loop stores keep source order")
+    (is (= (util/alpha-normalize (:source owner))
+           (util/alpha-normalize (:source projected))))
+    (is (= (:statement projected) (nth (:source projected) 3)))
+    (is (nil? (execute (float-array [1 2 3 4 5 6]) packed scales sums 2 3 (float 2.5))))
+    (is (= [1.0 2.0 3.0 4.0 5.0 6.0] (vec packed)))
+    (is (= [2.5 2.5] (vec scales)))
+    (is (= [6.25 15.25] (vec sums)))))
 
 (deftest shared-tuple-work-stays-single-copy-through-jvm-and-gpu-lowering
   (let [source '(let* [effect
