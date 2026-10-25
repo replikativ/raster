@@ -23,6 +23,33 @@ This ledger is the current plan. The dated sections below retain implementation
 evidence and historical decisions; they do not independently authorize obsolete
 execution paths or relax the original campaign's acceptance obligations.
 
+### Current source-context qualification (October 25)
+
+`f23aa150` repairs the structured frontend's causal analysis boundary. Prefix
+bindings advance one immutable HostAV context; a fresh, unknown iteration
+parameter enters its child scope without manufacturing a constant-zero equality.
+The body frontend derives its own local results from preceding entry facts,
+while HostAV independently certifies complete writes and copies. Proven incoming
+integral length aliases may normalize operation extents, but not scalar carriers
+or aliases through local/future producers. All source-region entry points share
+the same reservation of textual and incoming identities, including shape-only
+symbols. Length analysis retains analyzed scalar types and explicit conversions.
+
+Fresh qualification in a clean worktree passes 244 tests / 1,506 assertions,
+including frontend/fusion/ownership controls and existing source-correspondence
+and suffix-allocation integration tests. A separate warm probe admits the actual
+normalized RK4 source with its complete-copy certificate. This is not ordered
+loop execution or full-branch qualification. The next producer work remains
+ordinary TypedSOAC prefix composition, then execution through the existing
+ordered cursor; do not add a separate clone executor.
+
+For comparison, exact-parent `be180fd6` CI34832 has 15 completed unit summaries:
+6,949 tests / 87,661 assertions, 24 failures / 50 errors across 58 test Vars; the
+GSDM shard times out, so the complete-suite denominator is unknown. Separate
+OpenCL34836 has 177 tests / 1,431 assertions, zero failures / five errors, and
+emitter34833 passes 170 of 172 fixtures. These gates overlap and must not be
+summed as unique tests. All eight campaign objectives remain open.
+
 ### October 25 failure-driven consolidation
 
 The exact unmerged 62ee82a6 CI baseline has 72 distinct failing test Vars across
