@@ -4,6 +4,7 @@
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
@@ -182,6 +183,60 @@
       (let [changed (assoc program :source (list 'let* ['out expression] 'out))]
         (is (= :invocation-source-allocation
                (reason #(invocation/source-order plan changed))) (str expression))))))
+
+(deftest allocation-extents-use-preceding-prefix-aliases-not-future-program-values
+  (let [scalar (av/tensor {:dtype :int :shape []})
+        buffer (av/tensor {:dtype :double :shape '[n]})
+        length (with-meta '(clojure.core/alength buffer_arg) {:raster.type/tag 'int})
+        constructor (list 'clojure.core/double-array (list 'clojure.core/long length))
+        pairs [['n '(clojure.core/alength x)] ['copy '(clojure.core/aclone x)]
+               ['buffer_arg 'copy] ['out constructor]]
+        values {'n scalar 'out buffer}
+        program (parallel-program/make
+                 {:dialect :typed-parallel :values values :inputs '[out] :outputs '[out]
+                  :source (list 'let* (vec (mapcat identity pairs)) 'out)})
+        plan (invocation/from-prefix
+              {:id :causal-allocation-length :parameters '[x]
+               :parameter-values {'x (av/tensor {:dtype :double :shape '[(extent x)]})}
+               :bindings pairs :binding-values {'n scalar 'copy buffer 'buffer_arg buffer 'out buffer}
+               :program-values values :program-inputs '[out] :program-outputs '[out]})
+        original-source (:source program)
+        order (invocation/source-order plan program)
+        data (double-array [1.0 2.0 3.0])
+        materialized (materialization/materialize
+                      plan [data] (fn [& _] (throw (AssertionError. "unexpected scalar execution"))))]
+    (is (= ['n 'copy 'buffer_arg 'out] (into [] (keep :binding) order)))
+    (is (identical? original-source (:source program)) "shape comparison does not rewrite source")
+    (is (nil? (get (:values plan) 'buffer_arg))
+        "the alias is intentionally stored only under its invocation identity")
+    (is (= '(clojure.core/aclone x) (get (into {} pairs) 'copy)))
+    (is (= '(clojure.core/double-array (clojure.core/long (clojure.core/alength buffer_arg)))
+           constructor))
+    (is (= [3] (:shape (get-in materialized [:values (:id (last (:steps plan)))]))))
+    (is (not (source/allocation-corresponds?
+              '(clojure.core/double-array (clojure.core/int n)) buffer :zero
+              {'n (av/tensor {:dtype :long :shape []})}))
+        "metadata-insensitive typed equality does not authorize integral narrowing")
+    (is (not (source/allocation-corresponds?
+              '(clojure.core/double-array (clojure.core/double n)) buffer :zero {'n scalar}))
+        "floating conversions stay outside exact integral size projection")
+    (is (not (source/allocation-corresponds?
+              (list 'clojure.core/double-array
+                    (list 'clojure.core/long (with-meta 'n {:raster.type/tag 'long})))
+              buffer :zero {'n scalar}))
+        "source width disagreement is still checked before typed-tree comparison")
+    (doseq [source ['future_buffer 'unknown_buffer]]
+      (let [changed-length (with-meta (list 'clojure.core/alength source) (meta length))
+            changed-constructor (list 'clojure.core/double-array
+                                      (list 'clojure.core/long changed-length))
+            changed (-> program
+                        (assoc-in [:values 'future_buffer] buffer)
+                        (assoc :source (list 'let* (assoc (vec (second original-source)) 7
+                                                        changed-constructor) 'out)))]
+        (is (= :invocation-source-allocation
+               (reason #(invocation/source-order
+                         (assoc-in plan [:values 'future_buffer] buffer) changed)))
+            "an outer value table cannot supply a missing or later source buffer")))))
 
 (deftest clone-correspondence-preserves-arity-and-operand-evaluation
   (let [values {'xs (av/tensor {:dtype :double :shape '[n]})

@@ -10,6 +10,13 @@ green main. Passing local subsets do not qualify the branch. Independent Astra
 audit recommends one source-ordered invocation spine; eager LinkPlan lowering is
 a proved specialization, not another interpretation of host execution.
 
+At 980a860d, 15 completed unit-shard summaries report 6,936 tests / 66,155
+assertions, with 22 failures and 53 errors. The remaining shard times out in GSDM
+without a summary, so these are not whole-suite totals. A planner reconstruction
+accounts for the apparent 49-test decrease exactly: the repository adds 13 tests,
+while 62 additional tests move into that unsummarized shard. Do not interpret the
+partial totals as coverage loss or as evidence that the branch is qualified.
+
 Landing order within the unchanged eight-objective campaign:
 
 1. Close positively identified small regressions with independent controls.
@@ -37,6 +44,18 @@ Landing order within the unchanged eight-objective campaign:
    failing causal-score-rounding case passes separately (three assertions).
    Source count checks, argument availability, allocation position and zero
    initialization remain unchanged; projection data is not completion credit.
+   Nested allocation-length correspondence now uses only preceding lexical
+   buffer aliases, while retaining the original constructor/helper recipe and
+   source evaluation order. Equality of successful typed integral extent trees
+   ignores source metadata, not integer widths, casts or overflow semantics.
+   Three affected suites pass 32 tests / 242 assertions, including future-fact,
+   narrowing and floating-expression refusals. The allocation-owner unit test
+   separately passes eight assertions on a fixed compile-only target instead of
+   depending on the host's OpenCL trapping-arithmetic support. RK4 gets past this
+   allocation seam but still refuses an uncovered source loop binding: the
+   structured producer currently omits the equation's source expression. Preserve
+   exact source matching when repairing that producer; ordered loop execution
+   remains an additional acceptance gate.
    Independent Astra review and retained-source probes identify two protected
    reduction return gaps: frontend descriptions hide authenticated marker semantics
    when that route is disabled, and promotion withholds its host-buffer alias

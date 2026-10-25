@@ -464,8 +464,11 @@
         (is (empty? (get-in state [:realized :storage])))))))
 
 (deftest allocation-only-actions-retain-helper-definition-before-size-evaluation
+  ;; This is a constructor-ownership test, not an OpenCL trapping-arithmetic test. Use a fixed
+  ;; compile-only dialect which supports the source's checked math; :ocl:0 otherwise changes
+  ;; dialect with the host vendor. Real ASR OpenCL/Level Zero execution has device parity tests.
   (let [compilation (equation-first/compile #'attention/batched-causal-attn-weights
-                                          {:target :ocl:0 :dtype :float
+                                          {:target :cuda:allocation-owner-compile-only :dtype :float
                                            :schedule {:precision :f32-scalar}})
         initial (invocation-link/begin-ordered-realization
                  compilation [(float-array 6) (float-array 6) 1 2 3] nil)

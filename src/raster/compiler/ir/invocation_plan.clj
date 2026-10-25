@@ -873,13 +873,20 @@
           (:steps
            (reduce
             (fn [{:keys [steps environment]} [ordinal [symbol expression]]]
-              (let [canonical (invocation-source/canonicalize-shape-projection
-                               (:values plan) public symbol expression)
-                    actual (get steps-by-symbol symbol)
+              (let [actual (get steps-by-symbol symbol)
+                    lexical-values (into {} (map (fn [[symbol id]]
+                                                   [symbol (get-in plan [:values id])])) environment)
+                    ;; Allocation operands may name earlier prefix aliases whose values are
+                    ;; stored under invocation IDs. Compare their immutable shape relation in
+                    ;; the causal symbol environment, never a future program-wide value table.
+                    ;; Other projections additionally need their current scalar result contract.
+                    canonical (invocation-source/canonicalize-shape-projection
+                               (if (buffer-allocation? actual) lexical-values (:values plan))
+                               public symbol expression)
                     _ (when (and (buffer-allocation? actual)
                                  (not (invocation-source/allocation-corresponds?
                                        canonical (:value actual) (:initialization actual)
-                                       (into {} (map (fn [[symbol id]] [symbol (get-in plan [:values id])])) environment))))
+                                       lexical-values)))
                         (fail! :invocation-source-allocation
                                "source constructor differs from the retained allocation contract"
                                {:binding symbol :source canonical :value (:value actual)}))
@@ -895,9 +902,12 @@
                         (fail! :invocation-source-projection
                                "source length conversions are not the retained exact projection"
                                {:binding symbol :source canonical}))
-                    step (prefix-step (:id plan) ordinal symbol canonical
+                    ;; The extent comparison does not rewrite a constructor/helper recipe.
+                    ;; Retain its actual source definition and original argument construction.
+                    step (prefix-step (:id plan) ordinal symbol
+                                      (if (buffer-allocation? actual) expression canonical)
                                       (:value (get steps-by-symbol symbol)) environment
-                                      (into {} (map (fn [[symbol id]] [symbol (get-in plan [:values id])])) environment))]
+                                      lexical-values)]
                 {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
             {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
             (map-indexed vector step-pairs)))

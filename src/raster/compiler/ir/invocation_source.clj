@@ -345,7 +345,11 @@
         (let [decline! (fn [& _] (throw (ex-info "not an exact typed extent" {:reason ::extent})))
               project #(index-expression/lower-typed % (set (keys values))
                                                     (fn [id] (:dtype (get values id))) :long decline!)]
-          (semantic/equivalent? (project source) (project dimension)))
+          ;; Successful projection has only integral literals, scoped SSA leaves and explicit
+          ;; IndexExpr/IndexCast fields. Source metadata on a leaf is not a different SSA value;
+          ;; widths and overflow remain in the typed tree. This is size equality, not permission
+          ;; to erase source evaluation or compare arbitrary source with metadata-blind equality.
+          (= (project source) (project dimension)))
         (catch clojure.lang.ExceptionInfo error
           (if (= ::extent (:reason (ex-data error))) false (throw error))))))
 
