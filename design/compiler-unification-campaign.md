@@ -97,6 +97,12 @@ merged BLAS/AD-wrapper integration. Evidence:
 `20261025-source-index-reviewed-final.log`; no optional BLAS tests skipped in
 that run. The native AOT integration still has the two separately recorded
 rectangular-loop code-shape failures; they are not waived by this qualification.
+The CI AD index oracle still expected the old accidental implicit truncation.
+It now checks agreement with checked Clojure indexing and retains wrapping as
+an explicitly requested `unchecked-int` case. That primitive shares the actual
+carrier conversion path, never the checked-default permission. Independent
+review approved it; 13 cast/owned-AD tests and 361 assertions pass
+(`20261025-ad-explicit-source-index-qualified.log`).
 
 The remaining library-accessor boundary is explicit debt, not silently declared
 equivalent to core inline access. `raster.arrays/aset` evaluates value arguments

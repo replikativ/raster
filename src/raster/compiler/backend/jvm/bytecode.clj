@@ -2855,10 +2855,10 @@
   (emit-boxed-ifn-call code args locals ctx))
 
 (defn- emit-source-integral-completion
-  "Complete an already evaluated source int/long operand using its actual carrier.
+  "Complete an evaluated source int/unchecked-int/long using its actual carrier.
    This is deliberately separate from raw JVM/descriptor adaptation."
   [code head-name input]
-  (let [result (case head-name "int" :int "long" :long)]
+  (let [result (case head-name ("int" "unchecked-int") :int "long" :long)]
     (if (= :diverge input)
       :diverge
       (do
@@ -2872,7 +2872,8 @@
                              :void (do (.aconst_null code) obj-cd))
                 ;; Clojure's int inline is policy-sensitive; its long inline
                 ;; always selects longCast, even under unchecked arithmetic.
-                method-name (if (and (= "int" head-name) *unchecked-math*)
+                method-name (if (or (= "unchecked-int" head-name)
+                                    (and (= "int" head-name) *unchecked-math*))
                               "uncheckedIntCast"
                               (str head-name "Cast"))]
             (.invokestatic code rt-cd method-name
@@ -3115,7 +3116,7 @@
   (case head-name
     "double" :double
     ("float" "unchecked-float") :float
-    "int" :int
+    ("int" "unchecked-int") :int
     "long" :long
     nil))
 
@@ -3313,7 +3314,7 @@
             (.invokestatic code rt-cd (if (= "float" head-name) "floatCast" "uncheckedFloatCast")
                            (MethodTypeDesc/of F-cd (into-array ClassDesc [input])))
             (primitive-core-cast-carrier head-name)))))
-    ("int" "long") (emit-source-integral-cast code head-name args locals ctx)
+    ("int" "long" "unchecked-int") (emit-source-integral-cast code head-name args locals ctx)
     ;; Arithmetic — dispatched to emit-arithmetic helper
     ("+" "-" "*" "/") (retain-primitive-index-route! ctx :primitive-arithmetic
                                                        (emit-arithmetic code head-name args locals ctx))

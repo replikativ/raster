@@ -47,7 +47,7 @@
 
 (deftest explicit-integral-casts-share-the-source-policy-and-actual-carrier-rule
   (doseq [policy [false true :warn-on-boxed]
-          cast ['clojure.core/int 'clojure.core/long]
+          cast ['clojure.core/int 'clojure.core/long 'clojure.core/unchecked-int]
           [tag inputs] [['long [0 4294967296 Long/MAX_VALUE]]
                         ['double [0.75 4294967296.0 Double/NaN
                                   Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
