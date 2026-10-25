@@ -77,6 +77,14 @@
            "host reference requires its retained opaque value wrapper" {:value-id id}))
   actual)
 
+(defn- checked-opaque-step [{:keys [id value] :as step} actual]
+  (checked-opaque id value actual)
+  (when (and (invocation/program-result-import? step) (not= id (:id actual)))
+    (fail! :invocation-materialization-import-identity
+           "imported source value belongs to a different invocation step"
+           {:step id :actual (:id actual)}))
+  actual)
+
 (defn- primitive-array-dtype [value]
   (when (and value (.isArray (class value)))
     (case (.getName (.getComponentType (class value)))
@@ -327,9 +335,9 @@
     (doseq [{:keys [id value] :as slot} (concat (:parameters plan) (:steps plan))
             :when (scalar-value? value)]
       (checked-computed-scalar (get completion-producers id slot) (get values id)))
-    (doseq [{:keys [id value]} (concat (:parameters plan) (:steps plan))
+    (doseq [{:keys [id value] :as slot} (concat (:parameters plan) (:steps plan))
             :when (opaque-value? value)]
-      (checked-opaque id value (get values id)))
+      (checked-opaque-step slot (get values id)))
     (let [storage-values (set (map :program-value (:storage-bindings plan)))
           materialized-values (set/union (set (:program-inputs plan)) storage-values)]
       (when-not (= materialized-values
@@ -525,6 +533,11 @@
           (let [execute (source-completion-executor evaluate-scalar id)]
             (checked-computed-scalar step (execute step (step-operand-values step values))))
 
+          (invocation/program-result-import? step)
+          (fail! :invocation-materialization-program-result
+                 "numerical result imports require the owning ordered execution boundary"
+                 {:step id :equation (:equation step) :result (:result step)})
+
           (invocation/scalar-compute? step)
           (let [evaluate (if (map? evaluate-scalar) (:scalar evaluate-scalar) evaluate-scalar)]
             (when-not (ifn? evaluate)
@@ -618,12 +631,22 @@
          (fn [prior step]
            (let [{:keys [id symbol value]} step
                  actual (get values id)]
-             (if (or (invocation/scalar-compute? step) (invocation/source-completion? step))
+             (cond
+               (invocation/program-result-import? step)
+               (do
+                 (checked-opaque-step step actual)
+                 (-> prior
+                     (assoc-in [:values id] actual)
+                     (assoc-in [:lexical symbol] id)
+                     (update :next-step inc)))
+
+               (or (invocation/scalar-compute? step) (invocation/source-completion? step))
                (do (check-scalar! step actual)
                    (-> prior
                        (assoc-in [:values id] actual)
                        (assoc-in [:lexical symbol] id)
                        (update :next-step inc)))
+               :else
                (let [_ (when-let [producer (get completion-producers id)]
                          (checked-computed-scalar producer actual))
                      expected (advance-materialization prior nil)]
@@ -663,6 +686,25 @@
     (when (= (:next-step state) (count (get-in state [:plan :steps])))
       (fail! :invocation-materialization-complete "materialization has no remaining step" {}))
     (advance-materialization state evaluate-scalar)))
+
+(defn supply-program-result
+  "Install one opaque source value at the exact next numerical-result import.
+   This pure transition performs no transfer or conversion and proves no device
+   completion. The ordered owner must first discharge the import's producer,
+   payload and initialized-view obligations. Its actual snapshot step—not an
+   equal reconstructed record—identifies where the supplied value belongs."
+  [state step source]
+  (let [{:keys [plan next-step] :as state} (validate-state! state)
+        actual (nth (:steps plan) next-step nil)]
+    (when-not (and (invocation/program-result-import? actual) (identical? step actual))
+      (fail! :invocation-materialization-import-step
+             "a numerical result may only supply its exact next source import"
+             {:next-step next-step}))
+    (validate-state!
+     (-> state
+         (assoc-in [:values (:id step)] (->MaterializedOpaque (:id step) (:value step) source))
+         (assoc-in [:lexical (:symbol step)] (:id step))
+         (update :next-step inc)))))
 
 (defn- available-program-bindings
   [{:keys [plan values]}]
@@ -710,6 +752,10 @@
    Executors are not retained or called for shapes, allocations or aliases."
   [plan arguments evaluate-scalar]
   (let [plan (invocation/validate! plan)
+        _ (when-let [step (first (filter invocation/program-result-import? (:steps plan)))]
+            (fail! :invocation-materialization-program-result
+                   "eager host materialization cannot supply numerical results"
+                   {:step (:id step) :equation (:equation step) :result (:result step)}))
         _ (when-let [step (first (filter invocation/source-completion? (:steps plan)))]
             (source-completion-executor evaluate-scalar (:id step)))
         initial (begin-materialization plan arguments)

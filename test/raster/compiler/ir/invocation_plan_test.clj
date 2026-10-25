@@ -25,6 +25,108 @@
        (catch clojure.lang.ExceptionInfo exception
          (:reason (ex-data exception)))))
 
+(defn- result-import-fixture []
+  (let [snapshot (completion/complete-value completion/object-input-contract 'total)
+        reduction '(numerical/reduce xs)
+        values {'xs (array-value :double 4) 'total (scalar :double)}
+        opaque (av/make {:kind :opaque :memory-space :host :ownership :borrowed})
+        equation (program/map->ProgramEquation
+                  {:id :reduce :site [:binding 'total] :source reduction
+                   :operands '[xs] :results '[total] :operations [{}]
+                   :effects #{} :provenance {} :attributes {}})
+        parallel (program/make {:dialect :typed-parallel
+                                :source (list 'let* ['total reduction 'saved snapshot] 'total)
+                                :values values :inputs '[xs] :outputs '[total] :equations [equation]})
+        options {:id :result-import :parameters '[xs] :parameter-values (select-keys values '[xs])
+                 :bindings [['saved snapshot]] :binding-values {'saved opaque}
+                 :result-imports {'saved {:equation :reduce :result 'total}}
+                 :program-values values :program-inputs '[xs] :program-outputs '[total]}]
+    {:options options :plan (invocation/from-prefix options) :program parallel
+     :snapshot snapshot :equation equation :opaque opaque}))
+
+(deftest program-result-import-is-an-explicit-source-ordered-opaque-demand
+  (let [{:keys [plan program snapshot]} (result-import-fixture)
+        step (first (:steps plan))
+        order (invocation/source-order plan program)]
+    (is (invocation/program-result-import? step))
+    (is (invocation/invocation-step? step))
+    (is (= [] (:operands step)))
+    (is (= {:equation :reduce :result 'total} (select-keys step [:equation :result])))
+    (is (= snapshot (:source-expression step)))
+    (is (= :opaque (get-in step [:value :kind])))
+    (is (= :host (get-in step [:value :memory-space])))
+    (is (nil? (get-in step [:value :dtype])))
+    (is (identical? plan (invocation/validate-against! plan program)))
+    (is (= :reduce (:equation (first order))))
+    (is (= {:equation :reduce :result 'total} (:program-result-import (second order))))
+    (is (= (:id step) (:invocation-step (second order))))))
+
+(deftest result-imports-cannot-guess-or-relabel-a-source-producer
+  (let [{:keys [plan program options equation snapshot opaque]} (result-import-fixture)
+        step (first (:steps plan))
+        check-both (fn [plan program]
+                     (is (some? (reason-of #(invocation/validate-against! plan program))))
+                     (is (some? (reason-of #(invocation/source-order plan program)))))]
+    (doseq [changed [(assoc step :equation :wrong)
+                     (assoc step :result 'xs)
+                     (assoc step :operands [{:symbol 'xs :value (:id (first (:parameters plan)))}])
+                     (assoc step :value (assoc opaque :dtype :double))]]
+      (check-both (assoc plan :steps [changed]) program))
+    (doseq [source [(list 'let* ['saved snapshot 'total (:source equation)] 'total)
+                    (list 'let* ['total '(numerical/other xs) 'saved snapshot] 'total)
+                    (list 'let* ['total (:source equation) 'saved
+                                (completion/complete-value completion/object-input-contract '(aget xs 0))] 'total)
+                    (list 'let* ['total (:source equation) 'saved 'total] 'total)
+                    nil]]
+      (check-both plan (assoc program :source source)))
+    (check-both plan (update program :equations conj (assoc equation :id :duplicate)))
+    (check-both plan (assoc program :equations []))
+    (check-both plan (assoc program :equations [(assoc equation :operations [] :attributes {:host-only true})]))
+    (check-both (assoc-in plan [:values 'total] (scalar :float)) program)
+    (let [source-free (program/make
+                       {:dialect :typed-parallel :source nil :values (:values program)
+                        :inputs '[xs] :outputs '[xs] :equations []
+                        :provenance {:front-end :explicit-typed-algorithm :pass :source-free-typed-invocation}
+                        :attributes {:host-control :typed-invocation}})
+          source-free-plan (assoc plan :program-outputs '[xs]
+                                 :attributes {:source-dialect :typed-soac :algorithm-dialect :typed-soac
+                                              :target-dialect :typed-invocation})]
+      (is (invocation/source-free-program? source-free))
+      (check-both source-free-plan source-free))
+    (is (= :invocation-prefix-unsupported
+           (reason-of #(invocation/from-prefix (dissoc options :result-imports)))))
+    (is (= :invocation-program-result-import
+           (reason-of #(invocation/from-prefix
+                        (assoc options :result-imports {'unknown {:equation :reduce :result 'total}})))))
+    (doseq [declaration [nil false {:equation :reduce} {:equation :reduce :result 'total :extra true}]]
+      (is (= :invocation-program-result-import
+             (reason-of #(invocation/from-prefix (assoc options :result-imports {'saved declaration}))))))
+    (is (= :invocation-program-result-import
+           (reason-of #(invocation/from-prefix
+                        (assoc options :bindings [['saved (completion/complete-value
+                                                          completion/object-input-contract '(aget xs 0))]])))))
+    (is (= :invocation-opaque-program-value
+           (reason-of #(invocation/from-prefix
+                        (assoc options :program-values (assoc (:program-values options) 'saved opaque)
+                               :program-inputs '[xs saved])))))))
+
+(deftest result-import-keeps-its-producer-across-an-intervening-numerical-stage
+  (let [{:keys [plan program snapshot]} (result-import-fixture)
+        reduction (:source (first (:equations program)))
+        other-source '(numerical/other xs)
+        other (program/map->ProgramEquation
+               {:id :other :site [:binding 'other] :source other-source
+                :operands '[xs] :results '[other] :operations [{}]
+                :effects #{} :provenance {} :attributes {}})
+        changed (-> program
+                    (assoc :source (list 'let* ['total reduction 'other other-source 'saved snapshot] 'total))
+                    (assoc-in [:values 'other] (scalar :double))
+                    (update :equations conj other))
+        order (invocation/source-order plan changed)]
+    (is (= [:reduce :other nil nil] (mapv :equation order)))
+    (is (= {:equation :reduce :result 'total} (:program-result-import (nth order 2))))
+    (is (nil? (:program-result-import (nth order 1))))))
+
 (deftest normalized-reference-identities-retain-their-exact-source
   (let [binder (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})
         expression (vary-meta (completion/complete-value completion/object-input-contract 'x)

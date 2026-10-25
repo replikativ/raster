@@ -26,6 +26,7 @@
 (defrecord ShapeProjection [id symbol operands source axis value])
 (defrecord ScalarCompute [id symbol operands region value])
 (defrecord SourceCompletion [id symbol operands expression value])
+(defrecord ProgramResultImport [id symbol operands equation result value])
 (defrecord BufferAllocation [id symbol operands initialization value])
 (defrecord BufferClone [id symbol operands source value])
 (defrecord ValueAlias [id symbol operands source value])
@@ -45,6 +46,8 @@
   (record-kind? "raster.compiler.ir.invocation_plan.ScalarCompute" x))
 (defn source-completion? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.SourceCompletion" x))
+(defn program-result-import? [x]
+  (record-kind? "raster.compiler.ir.invocation_plan.ProgramResultImport" x))
 (defn buffer-allocation? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.BufferAllocation" x))
 (defn buffer-clone? [x]
@@ -242,6 +245,7 @@
 (defn invocation-step?
   [x]
   (or (shape-projection? x) (scalar-compute? x) (source-completion? x)
+      (program-result-import? x)
       (buffer-allocation? x) (buffer-clone? x) (value-alias? x)))
 
 (defn- fail!
@@ -307,6 +311,17 @@
              {:step id :declared value :table (get values id)}))
     (av/validate! value)
     (cond
+      (program-result-import? step)
+      (when-not (and (= [] (:operands step))
+                     (some? (:equation step)) (symbol? (:result step))
+                     (scalar-value? (get values (:result step)))
+                     (= value (av/make {:kind :opaque :memory-space :host :ownership :borrowed}))
+                     (= (:result step)
+                        (:operand (completion/object-input-parts (:source-expression step)))))
+        (fail! :invocation-program-result-import
+               "program result import requires a scalar demand and an exact opaque Object snapshot"
+               {:step id :result (:result step) :value value}))
+
       (shape-projection? step)
       (let [source-value (get values (:source step))]
         (when-not (and (= 1 (count operands))
@@ -607,8 +622,36 @@
                    (conj operands operand)))
                [])))
 
+(defn- result-import-for-source
+  "Reconstruct a demand from source, never from an invocation step's claimed IDs.
+   This establishes no initialized storage, payload Class or transfer capability."
+  [program symbol expression]
+  (let [[head bindings] (:source program)
+        pairs (when (and (contains? '#{let let* clojure.core/let} head)
+                         (vector? bindings) (even? (count bindings)))
+                (mapv vec (partition 2 bindings)))
+        snapshots (filterv #(= symbol (first (second %))) (map-indexed vector pairs))
+        result (:operand (completion/object-input-parts expression))
+        producers (filterv #(some #{result} (:results %)) (:equations program))
+        producer (first producers)
+        sources (filterv #(= result (first (second %))) (map-indexed vector pairs))
+        [position [_ retained]] (first snapshots)
+        [producer-position [_ producer-source]] (first sources)]
+    (when-not (and pairs (= 1 (count snapshots)) (= 1 (count sources))
+                   (semantic/retained-source-equivalent? expression retained)
+                   (symbol? result) (scalar-value? (get-in program [:values result]))
+                   (= 1 (count producers)) (= [result] (:results producer))
+                   (seq (:operations producer))
+                   (not (true? (get-in producer [:attributes :host-only])))
+                   (< producer-position position)
+                   (identical? producer (parallel-program/equation-for-binding program result producer-source)))
+      (fail! :invocation-program-result-import-source
+             "result import requires one exact preceding scalar equation and direct Object snapshot"
+             {:binding symbol :result result :producers (mapv :id producers)}))
+    {:equation (:id producer) :result result}))
+
 (defn- prefix-step
-  [plan-id ordinal symbol expression value environment lexical-values]
+  [plan-id ordinal symbol expression value environment lexical-values result-import]
   (let [id (binding-id plan-id ordinal symbol)
         operation (descriptor/semantic-op expression)
         projection (when (buffer-value? value)
@@ -616,6 +659,15 @@
         initialization (descriptor/allocation-initialization
                         (if projection (descriptor/semantic-op (:constructor projection)) operation))]
     (cond
+      result-import
+      (do
+        (when-not (and (map? result-import)
+                       (= #{:equation :result} (set (keys result-import))))
+          (fail! :invocation-program-result-import
+                 "result imports require explicit equation/result IDs" {:binding symbol}))
+        (assoc (->ProgramResultImport id symbol [] (:equation result-import) (:result result-import) value)
+               :source-expression expression))
+
       (invocation-source/shape-projection-source expression)
       (let [operands (referenced-operands expression environment)
             source-symbol (invocation-source/shape-projection-source expression)]
@@ -671,11 +723,19 @@
    `parameters` is the public function order. `parameter-values` describes those values before any
    lexical shadowing; `binding-values` describes prefix results. `program-values`, logical inputs,
    resolved or unresolved external storage, and outputs are the validated internal program boundary. Stable SSA IDs keep a
-   narrowed binding such as `nsteps = (int nsteps)` distinct from its public long parameter."
+   narrowed binding such as `nsteps = (int nsteps)` distinct from its public long parameter.
+   `result-imports` explicitly names numerical equation/result demands for opaque Object snapshots;
+   only validation against retained program source can authenticate those demands."
   [{:keys [id parameters parameter-values bindings binding-values program-values
-           program-inputs program-storage external-program-storage program-outputs attributes]
+           program-inputs program-storage external-program-storage program-outputs attributes result-imports]
     :or {program-storage [] external-program-storage [] attributes {}}}]
-  (let [parameters (vec parameters)
+  (let [_ (when-not (and (or (nil? result-imports) (map? result-imports))
+                         (every? (set (map first bindings)) (keys result-imports))
+                         (every? #(and (map? %) (= #{:equation :result} (set (keys %))))
+                                 (vals result-imports)))
+            (fail! :invocation-program-result-import
+                   "result import declarations must name actual prefix bindings" {:imports result-imports}))
+        parameters (vec parameters)
         public
         (mapv (fn [ordinal symbol]
                 (let [value (get parameter-values symbol)]
@@ -695,7 +755,8 @@
                              "invocation prefix binding has no retained AbstractValue"
                              {:symbol symbol :expression expression}))
                     (let [lexical-values (into {} (map (fn [[symbol id]] [symbol (get values id)])) environment)
-                          step (prefix-step id ordinal symbol expression value environment lexical-values)]
+                          step (prefix-step id ordinal symbol expression value environment lexical-values
+                                            (get result-imports symbol))]
                       {:steps (conj steps step)
                        :values (assoc values (:id step) value)
                        :environment (assoc environment symbol (:id step))})))
@@ -850,6 +911,14 @@
           (fail! :invocation-source-order-mismatch
                  "retained invocation order differs from its exact source and typed producers"
                  {:expected actual :actual (get-in plan [:attributes :source-order])}))))
+    (doseq [step (:steps plan) :when (program-result-import? step)]
+      (let [expected (result-import-for-source parallel-program (:symbol step) (:source-expression step))]
+        (when-not (and (= expected (select-keys step [:equation :result]))
+                       (= (get-in plan [:values (:result step)])
+                          (get-in parallel-program [:values (:result step)])))
+          (fail! :invocation-program-result-import-source
+                 "result import differs from its retained numerical producer"
+                 {:step (:id step) :expected expected}))))
     plan))
 
 (defn- derive-source-order
@@ -907,7 +976,9 @@
                     step (prefix-step (:id plan) ordinal symbol
                                       (if (buffer-allocation? actual) expression canonical)
                                       (:value (get steps-by-symbol symbol)) environment
-                                      lexical-values)]
+                                      lexical-values
+                                      (when (program-result-import? actual)
+                                        (result-import-for-source program symbol expression)))]
                 {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
             {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
             (map-indexed vector step-pairs)))
@@ -964,6 +1035,8 @@
                         {:binding symbol :position position}))
                (cond-> {:position position :binding symbol}
                  step (assoc :invocation-step (:id step))
+                 (program-result-import? step)
+                 (assoc :program-result-import (select-keys step [:equation :result]))
                  equation (assoc :equation (:id equation))
                  realization (assoc :realization (:id realization))
                  allocation? (assoc :storage symbol))))
@@ -1001,7 +1074,8 @@
    A shared host binding carries both IDs and denotes one computation, not two evaluations.
    This is correspondence data only: it does not authorize hoisting, binding unresolved storage,
    skipping checked evaluation, or treating a graph submission as completion. Source-free and
-   non-flat programs require their separate explicit execution contract."
+   non-flat programs require their separate explicit execution contract. :program-result-import
+   entries retain numerical liveness demands, not permission for an implicit device read."
   [plan program]
   (let [plan (validate-against! plan program)]
     (if (contains? (:attributes plan) :source-order)

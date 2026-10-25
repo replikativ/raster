@@ -109,6 +109,46 @@ OpenCL/Level Zero ownership/lifetime checks and the CUDA/HIP compiler fixtures.
 The host-only Float `SourceCompletion` prerequisite does not itself satisfy this
 vertical or change device admission.
 
+The declaration-level reverse edge is now explicit as `ProgramResultImport`:
+an exact preceding numerical equation/result supplies an opaque source snapshot,
+not an inferred host scalar. Source-order reconstruction independently checks
+the direct canonical Object snapshot and retains its numerical liveness demand.
+Host-only, future, wrong and duplicate producers refuse. Pure materialization
+stops at this step; its separate supply transition installs one opaque wrapper
+without transfer, conversion, payload equality or completion authority. Ordinary
+eager materialization preflights the missing numerical execution before running
+any source step. Existing ordered device admission remains closed. Review and the
+affected shared-REPL gate pass 237 tests / 3,357 assertions. This is demand and
+structural-transition evidence, not a completed numerical import implementation.
+
+The actual mixed-gradient import now independently confirms that the selected
+helper's original frontend body is the retained emitter input. Its exact root
+reduction observation supplies a present built-in Double normal-return payload;
+its separate compute/Object bridge and original contexts still need to be
+retained through ordinary helper inlining. Use the existing input-origin and
+alpha/qualification/substitution construction machinery, not a new expression
+catalog, source-name heuristic or payload-authority metadata field. Discharge
+the caller result binder's actual completion/checkcast before execution admission.
+
+#### Full CI qualification is still open
+
+CircleCI unit job [34881](https://circleci.com/gh/replikativ/raster/34881), exact
+head `50bb8638d`, has fifteen completed outcome artifacts and one timed-out shard
+(node 3, no final artifact). The completed reports aggregate to 7,069 tests,
+87,785 assertions (87,713 pass, 25 fail, 47 error), with 56 distinct failing test
+vars. These are the available completed-process totals, not the complete planned
+suite denominator; the timed-out process and separate OpenCL/emitter lanes are
+not counted as passing or added to those totals.
+
+Portable diagnostics distinguish twenty ordered-preparation errors, ten ordered
+entry-role errors, and four host-reference-alias errors, alongside AD completion,
+ordered JVP, active parallel-region, allocation/source-result and other failures.
+Diagnostics are bounded per var and do not replace assertion counts or prove a
+failure is an obsolete fixture. Qualify/migrate each family against its retained
+semantic oracle; do not fix this ledger by relaxing admission or changing expected
+errors alone. Source-only compile gates, actual device tests and the complete
+exact-head CI check set remain required before merging PR #1566.
+
 `f23aa150` repairs the structured frontend's causal analysis boundary. Prefix
 bindings advance one immutable HostAV context; a fresh, unknown iteration
 parameter enters its child scope without manufacturing a constant-zero equality.
