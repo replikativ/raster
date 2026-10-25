@@ -28,6 +28,12 @@
         result (par/map! out i n double (+ (aget out i) 1.0))]
     result))
 
+(deftm preserved-scalar-between-writes
+  [x :- (Array double), out :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! out i 1 double (+ (aget x i) 1.0))
+        ^long required ^{:raster.effect/preserve-evaluation true} (* (long n) (long n))]
+    (par/map! out i 1 double (+ (aget out i) 1.0))))
+
 (defn- compilation [v dtype]
   (let [program (:semantic (equation-first/compile v {:target :ocl:0 :dtype dtype}))]
     [program (get-in program [:attributes :invocation-plan])]))

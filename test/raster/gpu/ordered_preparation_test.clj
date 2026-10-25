@@ -8,6 +8,7 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
@@ -218,3 +219,53 @@
   (if @ze-probe/gpu-available?
     (check-callable-ordered-preparation! :ze:0)
     (ze-probe/gpu-skip! "callable source-ordered prepared boundary")))
+
+(defn- check-preserved-scalar-between-writes! [target]
+  (doseq [n [2 Long/MAX_VALUE]]
+    (let [prepared (compiled/lower #'fixture/preserved-scalar-between-writes
+                                   [(double-array [7.0]) (double-array 1) n]
+                                   {:compiler :equation-first :target target :dtype :double})
+          c (compiled/instantiate! prepared)
+          calls (atom 0)
+          evaluate scalar/evaluate-host-equation]
+      (try
+        (is (some? (:ordered-invocation prepared)))
+        (with-redefs [scalar/evaluate-host-equation
+                      (fn [source-ns equation context]
+                        (when (contains? (:flags (effects/descriptor (:source equation)))
+                                         :preserve-source-evaluation)
+                          (swap! calls inc))
+                        (evaluate source-ns equation context))]
+          (if (= n 2)
+            (do
+              (let [first (:result (c))]
+                (is (= [9.0] (vec (value/->host first))))
+                (is (= [13.0] (vec (value/->host (:result (c {:x (double-array [11.0])}))))))
+                (is (not (value/live? first))))
+              (is (= 2 @calls) "the retained scalar executes once per replay, not during preparation"))
+            (do
+              (is (thrown? ArithmeticException (c)))
+              (is (= 1 @calls))
+              (is (nil? @(:live-outputs c)))
+              (let [executable (:executable c)
+                    state @(:execution-state executable)
+                    token (get-in state [:ordered :current :realized :buffers 'out])
+                    view (get-in state [:ordered :node-views token])
+                    actual (double-array 1)]
+                (is (some? view))
+                (when view
+                  (gpu/download-range! (:session executable) view actual {:elements 1})
+                  (is (= [8.0] (vec actual)) "overflow preserves the earlier write and prevents the later write")))
+              (is (= :link-execution-poisoned (reason #(c))))
+              (is (= 1 @calls)))))
+        (finally (compiled/close! c))))))
+
+(deftest public-retained-scalar-ordering-on-opencl
+  (if @ocl-probe/opencl-available?
+    (check-preserved-scalar-between-writes! :ocl:0)
+    (ocl-probe/opencl-skip! "retained scalar between public source writes")))
+
+(deftest public-retained-scalar-ordering-on-level-zero
+  (if @ze-probe/gpu-available?
+    (check-preserved-scalar-between-writes! :ze:0)
+    (ze-probe/gpu-skip! "retained scalar between public source writes")))

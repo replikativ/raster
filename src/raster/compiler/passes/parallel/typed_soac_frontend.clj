@@ -3269,6 +3269,28 @@
   (boolean (some #{:checked-source-cast :source-reference-cast}
                  (:flags (effects/descriptor expression)))))
 
+(defn- required-source-scalar?
+  "Retain a source-owned scalar evaluation, not permission to reuse or hoist it.
+   This rule adds no Object-completion, buffer-read, or physical-carrier proof."
+  [binder expression scalar-dtype local-scalar-types array-types]
+  (let [{:keys [effect flags]} (effects/descriptor expression)
+        primitive-declaration? (fn [value]
+                                 (let [tag (:tag (meta value))]
+                                   (or (nil? tag) (contains? types/primitive-info tag))))]
+    (and (= :pure effect)
+         (contains? flags :preserve-source-evaluation)
+         (not (contains? util/*shadowing-locals* (descriptor/semantic-op expression)))
+         (keyword? scalar-dtype) (dtype/known? scalar-dtype)
+         (:scalar-tag (dtype/info scalar-dtype))
+         (every? primitive-declaration? [binder expression])
+         (not-any? completion/canonical-form? (tree-seq coll? seq expression))
+         (empty? (par/collect-aget-arrays expression))
+         (every? (fn [id]
+                   (let [t (get local-scalar-types id)]
+                     (and (not (contains? array-types id))
+                          (keyword? t) (dtype/known? t) (:scalar-tag (dtype/info t)))))
+                 (util/free-syms expression)))))
+
 (defn- parallel-extent
   [expression]
   (cond
@@ -4543,7 +4565,11 @@
                                        (retained-scalar-dtype expression local-scalar-types))
                                    dtype/canon))
             description (cond-> description
-                          scalar-dtype (assoc :scalar-dtype scalar-dtype))
+                          scalar-dtype (assoc :scalar-dtype scalar-dtype)
+                          (and (= :scalar (:kind description))
+                               (required-source-scalar? symbol expression scalar-dtype
+                                                        local-scalar-types array-types))
+                          (assoc :retained-source-scalar? true))
             ;; a pure product/sum of scalars is a definition later index algebra may expand
             ;; normalize-counted-store-loop clamps every launch count after evaluating it once.
             ;; If the unclamped SSA value is already a proved nonnegative monomial, this exact
@@ -4739,6 +4765,7 @@
                  (or (and (ordered-scalar-expression? (:expr description))
                           (or (effects/removable-expr? (:expr description))
                               (:source-prefix? description)))
+                     (:retained-source-scalar? description)
                      (generated-scaffolding? description physical-outputs)))
     :map (let [target-dtype (or (:elem-type description)
                                 (:result-dtype description) :double)]
@@ -5701,7 +5728,8 @@
         (allocation-capacity-scalars descriptions physical-outputs by-symbol)
         ordered-evaluation-roots
         (into #{} (keep (fn [[symbol description]]
-                          (when (requires-ordered-evaluation? (:expr description)) symbol)))
+                          (when (or (requires-ordered-evaluation? (:expr description))
+                                    (:retained-source-scalar? description)) symbol)))
               by-symbol)
         roots (set (concat outputs
                            allocation-capacity-roots

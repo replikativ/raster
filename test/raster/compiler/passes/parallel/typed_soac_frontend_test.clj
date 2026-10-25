@@ -863,6 +863,95 @@
     (is (nil? (frontend/form->program source options))
         "host-only staging cannot move a later throw before an independent device write")))
 
+(defn- preserved-long-scalar [expression]
+  (with-meta expression {:tag 'long :raster.type/tag 'long
+                         :raster.effect/preserve-evaluation true}))
+
+(deftest source-preserved-scalars-remain-at-their-original-numerical-boundaries
+  (let [saved (with-meta 'saved {:tag 'long :raster.type/tag 'long})
+        product (preserved-long-scalar '(clojure.core/* n n))
+        write '(raster.par/map! out i n double 1.0)
+        options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}]
+    (doseq [[bindings result expected]
+            [[[saved product 'written write] 'written '[scalar map]]
+             [['written write saved product] 'written '[map scalar]]
+             [['first-write write saved product 'second-write write]
+              'second-write '[map scalar map]]]]
+      (let [source (list 'let* bindings result)
+            program (frontend/form->program source options)
+            equations (dialect/equations program)
+            equation (first (filter #(= [saved] (nth % 2)) equations))
+            body (some-> equation dialect/operation-parts :lambda dialect/lambda-parts
+                         :body-results first)]
+        (is (= expected (mapv dialect/operation-kind equations)))
+        (is (= [:long] (-> equation dialect/operation-parts :attributes :dtypes)))
+        (is (= 'clojure.core/* (descriptor/semantic-op body)))
+        (is (true? (:raster.effect/preserve-evaluation (meta body))))))))
+
+(deftest preserved-scalar-evaluation-is-not-a-checked-cast-reuse-permission
+  (let [first-id (with-meta 'first-check {:tag 'long :raster.type/tag 'long})
+        second-id (with-meta 'second-check {:tag 'long :raster.type/tag 'long})
+        expression (preserved-long-scalar '(clojure.core/* n n))
+        source (list 'let* [first-id expression
+                            'first-write '(raster.par/map! out i n double 1.0)
+                            second-id expression
+                            'second-write '(raster.par/map! out i n double 2.0)] 'second-write)
+        options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}
+        normalized (frontend/normalize-source source options)
+        equations (some-> normalized (frontend/form->program options) dialect/equations)]
+    (is (= expression (get (into {} (map vec) (partition 2 (second normalized))) first-id)))
+    (is (= expression (get (into {} (map vec) (partition 2 (second normalized))) second-id)))
+    (is (= '[scalar map scalar map] (mapv dialect/operation-kind equations)))
+    (is (= [[first-id] [second-id]]
+           (mapv #(nth % 2) (filter #(= 'scalar (dialect/operation-kind %)) equations))))))
+
+(deftest source-preservation-roots-only-its-existing-scalar-dependency-closure
+  (let [dependency (with-meta 'dependency {:tag 'long :raster.type/tag 'long})
+        saved (with-meta 'saved {:tag 'long :raster.type/tag 'long})
+        expression (preserved-long-scalar '(clojure.core/* dependency n))
+        source (list 'let* [dependency (with-meta '(clojure.core/+ n 1) {:tag 'long :raster.type/tag 'long})
+                            saved expression
+                            'written '(raster.par/map! out i n double 1.0)] 'written)
+        options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}]
+    (is (= '[scalar scalar map]
+           (mapv dialect/operation-kind (dialect/equations (frontend/form->program source options)))))
+    (let [unflagged (vary-meta expression dissoc :raster.effect/preserve-evaluation)
+          ordinary (list 'let* [dependency (with-meta '(clojure.core/+ n 1) {:tag 'long :raster.type/tag 'long})
+                                saved unflagged
+                                'written '(raster.par/map! out i n double 1.0)] 'written)]
+      (is (= '[map] (mapv dialect/operation-kind
+                         (dialect/equations (frontend/form->program ordinary options))))))))
+
+(deftest source-preservation-does-not-admit-effects-data-reads-or-completions
+  (let [binder (with-meta 'saved {:tag 'long :raster.type/tag 'long})
+        eligible? (fn [expression scalar-types array-types]
+                    (#'frontend/required-source-scalar? binder expression :long scalar-types array-types))]
+    (is (eligible? (preserved-long-scalar '(clojure.core/* n n)) {'n :long} {}))
+    (doseq [expression ['(unknown.library/value n) '(println n)
+                        '(clojure.core/* unavailable n) '(clojure.core/aget input 0)]]
+      (is (not (eligible? (preserved-long-scalar expression) {'n :long} {'input :long}))))
+    (binding [util/*shadowing-locals* #{'future}]
+      (is (not (eligible? (preserved-long-scalar '(clojure.core/* future n)) {'n :long} {})))
+      (is (eligible? (preserved-long-scalar '(clojure.core/* future n)) {'n :long 'future :long} {})
+          "a core-named local uses the caller's lexical scope and preceding type facts"))
+    (is (not (eligible? (preserved-long-scalar '(clojure.core/aget input 0))
+                        {'input :long} {}))
+        "data reads do not become eligible through a forged scalar dependency table")
+    (is (not (eligible? (preserved-long-scalar '(clojure.core/* n n))
+                        {'n :long} {'n :long})))
+    (is (not (#'frontend/required-source-scalar?
+              (with-meta 'saved {:tag 'Object :raster.type/tag 'long})
+              (preserved-long-scalar '(clojure.core/* n n)) :long {'n :long} {})))
+    (is (not (eligible? (vary-meta (completion/complete-value completion/object-input-contract 'n)
+                                   assoc :raster.effect/preserve-evaluation true)
+                        {'n :long} {})))
+    (is (not (eligible? (preserved-long-scalar
+                         (list 'clojure.core/long
+                               (completion/complete-value completion/object-input-contract 'n)))
+                        {'n :long} {})))
+    (is (not (#'frontend/required-source-scalar? binder
+              (preserved-long-scalar '(clojure.core/* n n)) nil {'n :long} {})))))
+
 (deftest certified-checked-scalars-after-host-allocation-bound-a-following-typed-island
   (let [source '(let* [out (double-array (long n))
                        checked (clojure.core/int n)

@@ -179,6 +179,21 @@ aggregate ports, resident replacements and other deferred capabilities still
 need their existing ownership contracts extended before training/composition
 acceptance can close; concrete-plan/performance gates are not retired.
 
+Primitive source-preservation retention is now separate from checked-cast reuse.
+The frontend roots an explicitly preserved scalar only from the existing pure
+effect descriptor, retained primitive result declarations and preceding scalar
+dependencies. Canonical Object completions, physical Object declarations, data
+reads and unknown/effectful dependencies do not enter this new rule. Original
+definitions/metadata stay at their source positions; no general prefix root or
+new operation registry is introduced. Duplicate preserved products remain
+distinct, while unflagged removable arithmetic still disappears. Frontend and
+public preparation/replay qualification passes 151 tests / 1,039 assertions,
+including one evaluation per replay and overflow between two real device writes
+on OpenCL/Level Zero. Q8-LoRA now advances to the separate scalar Object-input
+completion boundary (`ObjectInput(rows)` in an invocation scalar region), not
+successful training. Object completion/result and checked Float projection
+remain independent audited obligations.
+
 Public Float fixture qualification exposed an additional type-policy mismatch:
 the Double-only `contract-mm` source retained a Double effect-return binder while
 the legacy dtype policy adapted its exemplar allocation and inputs to Float.
