@@ -477,7 +477,7 @@
                                 step {} identity {:schedule schedule}))]
     (with-redefs-fn
       {#'raster.gpu.core/bind-selected-executable
-       (fn [_ executable & _]
+       (fn [_ _arena-id executable & _]
          (swap! selected conj (kexec/strategy executable))
          (gpu/->BoundExecutableStep [] {} []))}
       (fn []
@@ -967,7 +967,7 @@
               {#'raster.gpu.core/rt-resolve
                (fn [_ function-name]
                  (case function-name
-                   "register-kernel!" (fn [_ _])
+                   "register-kernel!" (fn [_ _ _])
                    "bind-kernel-call" (fn [call & _]
                                         (assoc call ::cleanup/owner (cleanup/owner [])))
                    (throw (ex-info "unexpected runtime resolution"
@@ -1006,7 +1006,7 @@
         resolver
         (fn [_ function-name]
           (case function-name
-            "register-kernel!" (fn [_ _])
+            "register-kernel!" (fn [_ _ _])
             "make-buffer" (fn [elements dtype opts]
                             (lifecycle/native-buffer #(hash-map :elements elements :dtype dtype)
                                                      #(swap! freed conj %) opts))
