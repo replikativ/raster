@@ -1056,6 +1056,22 @@
     (with-meta (mapv pre-expand-par-forms form) (meta form))
     :else form))
 
+(defn- same-frame-loop?
+  "Does evaluating this value enter a loop in the current JVM frame?
+   Data and nested method bodies are opaque. This predicate never rewrites source."
+  [form]
+  (cond
+    (seq? form) (let [h (first form)]
+                  (cond (contains? '#{quote clojure.core/quote fn fn* clojure.core/fn
+                                     reify reify* clojure.core/reify deftype deftype*
+                                     clojure.core/deftype} h) false
+                        (contains? '#{loop loop* clojure.core/loop} h) true
+                        :else (boolean (some same-frame-loop? form))))
+    (vector? form) (boolean (some same-frame-loop? form))
+    (map? form) (boolean (some same-frame-loop? (concat (keys form) (vals form))))
+    (set? form) (boolean (some same-frame-loop? form))
+    :else false))
+
 (defn- materialize-form
   "Run the `materialize` pass on a single form: pure par/pmap (value-producing,
   no output buffer — e.g. from `broadcast`) → alloc + par/map!. Used in the
@@ -2395,6 +2411,54 @@
       :int    (do (case arr-tag bytes (.baload code) shorts (.saload code) (.iaload code)) :int)
       :ref    (do (.aaload code) :ref)))))
 
+(declare emit-completed-value-spill! reload-completed-value!)
+
+(defn- emit-aset-completed-spills
+  "Spill only this store's completed operands, at their original evaluation
+   positions. The value loop then carries none of aset's operands on its stack;
+   an incoming parent's stack is deliberately not rewritten or claimed empty."
+  [code [arr idx value] locals ctx arr-tag arr-verified?]
+  (let [operand-ctx (dissoc ctx :void-context)
+        array (emit-completed-value-spill!
+               code ctx
+               (fn []
+                 (let [t (emit-form code arr locals operand-ctx)]
+                   (emit-retained-array-checkcast code arr-tag t arr-verified? ctx)
+                   t)))
+        index (when-not (diverge? (:type array))
+                (emit-completed-value-spill!
+                 code ctx
+                 (fn []
+                   (let [t (emit-form code idx locals operand-ctx)]
+                     (if (diverge? t) t
+                       (if (= t :int) t (emit-coerce code t :int)))))))
+        target (case arr-tag doubles :double floats :float longs :long
+                     (ints bytes shorts) :int :ref)
+        completed (when (and index (not (diverge? (:type index))))
+                    (emit-completed-value-spill!
+                     code ctx
+                     (fn []
+                       (if (= target :ref)
+                         (emit-object-value code value locals operand-ctx)
+                         (let [t (emit-form code value locals operand-ctx)]
+                           (if (diverge? t) t
+                             (if (= t target) t (emit-coerce code t target))))))))]
+    (if (some #(diverge? (:type %)) [array index completed])
+      :diverge
+      (do
+        ;; Null, bounds and reference-store checks belong to the existing store,
+        ;; after the value and its element completion, never to an earlier spill.
+        (reload-completed-value! code array)
+        (reload-completed-value! code index)
+        (reload-completed-value! code completed)
+        (case arr-tag
+          doubles (.dastore code) floats (.fastore code) longs (.lastore code)
+          ints (.iastore code) bytes (.bastore code) shorts (.sastore code)
+          (.aastore code))
+        (if (:void-context ctx)
+          :void
+          (do (reload-completed-value! code completed) (:type completed)))))))
+
 (defn- emit-aset-intrinsic
   "Emit bytecode for aset (array write). Handles typed array checkcast,
    void-context optimization (plain store vs temp-local for return value),
@@ -2406,8 +2470,10 @@
         arr-tag (or (:tag (meta arr))
                     (:raster.type/tag (meta arr))
                     (when (symbol? arr) (:hint (get locals arr))))
-        arr-verified? (when (symbol? arr) (:verified (get locals arr)))
-        arr-type (emit-form code arr locals ctx)]
+        arr-verified? (when (symbol? arr) (:verified (get locals arr)))]
+    (if (same-frame-loop? val)
+      (emit-aset-completed-spills code args locals ctx arr-tag arr-verified?)
+      (let [arr-type (emit-form code arr locals ctx)]
     ;; Known storage only; unknown references use runtime dispatch above.
     (emit-retained-array-checkcast code arr-tag arr-type arr-verified? ctx)
     (let [t (emit-form code idx locals ctx)]
@@ -2470,7 +2536,7 @@
                 (do (.aastore code) :void)
                 ;; dup_x2: [arr, idx, val] → [val, arr, idx, val]
                 ;; aastore pops [arr, idx, val], leaving [val] as result
-                (do (.dup_x2 code) (.aastore code) :ref))))))))
+                (do (.dup_x2 code) (.aastore code) :ref))))))))))
 
 (defn- emit-alength-intrinsic
   "Emit bytecode for alength. Uses arraylength when the array type is known,
@@ -3455,6 +3521,31 @@
   (let [s @(:next-slot ctx)]
     (swap! (:next-slot ctx) + (if (two-slot? type) 2 1))
     s))
+
+(defn- emit-completed-value-spill!
+  "Evaluate and complete an operand through its existing emitter callback.
+   Only the actual resulting JVM carrier selects a private local; this creates
+   no source binding, inferred type, Class proof or new completion operation."
+  [code ctx complete!]
+  (let [t (complete!)]
+    (when-not (contains? #{:double :float :long :int :bool :ref :diverge} t)
+      (throw (ex-info "completed operand spill requires an actual JVM value"
+                      {:reason :bytecode-completed-spill-value :type t})))
+    (if (diverge? t)
+      {:type t}
+      (let [slot (alloc-slot! ctx t)]
+        (case t
+          :double (.dstore code slot) :float (.fstore code slot)
+          :long (.lstore code slot) (:int :bool) (.istore code slot)
+          :ref (.astore code slot))
+        {:slot slot :type t}))))
+
+(defn- reload-completed-value! [code {:keys [slot type]}]
+  (case type
+    :double (.dload code slot) :float (.fload code slot)
+    :long (.lload code slot) (:int :bool) (.iload code slot)
+    :ref (.aload code slot))
+  type)
 
 ;; ---------------------------------------------------------------------------
 ;; Extracted emit-form handlers (each compiles to its own JVM class method,
