@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.types :as types]
             [raster.compiler.passes.scalar.host-abstract-value :as host-av]))
 
 (def ^:private initial
@@ -9,6 +10,82 @@
 
 (defn- object-input [operand]
   (completion/complete-value completion/object-input-contract operand))
+
+(defn- reference-entry [carrier operand]
+  (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier) operand))
+
+(deftest reference-entry-transports-only-existing-compatible-source-capacity
+  (doseq [[dtype tag] [[:float 'floats] [:double 'doubles]]]
+    (let [input (with-meta 'input {:raster.type/tag tag})
+          boxed (with-meta 'boxed {:raster.type/tag tag :tag 'Object})
+          checked (with-meta 'checked {:raster.type/tag tag :tag tag})
+          value (av/tensor {:dtype dtype :shape ['m] :ownership :external
+                            :attributes {:nullable true :source :public}})
+          entry (reference-entry (get types/primitive-array-info tag) boxed)
+          allocation (with-meta
+                       (list '.invk (symbol "raster.arrays" (str "zeros-like_m_" tag "_long-impl")) checked 'n)
+                       {:raster.op/original 'raster.arrays/zeros-like})
+          source (list 'let* [boxed (object-input input) checked entry
+                             'out allocation 'returned '(unknown.library/write! out)] 'returned)
+          analysis (host-av/analyze-capacities
+                    source {:values {input value} :scalar-types {'n :long}
+                            :lexical-inputs [input 'n] :reference-aliases {'returned 'out}})]
+      (is (= value (get-in analysis [:definition-values boxed])))
+      (is (= value (get-in analysis [:definition-values checked])))
+      (is (= {boxed input checked boxed 'returned 'out} (:aliases analysis)))
+      (doseq [id '[out returned]]
+        (is (= {:dtype dtype :shape ['n]}
+               (select-keys (get-in analysis [:definition-values id]) [:dtype :shape]))))
+      (is (identical? entry (nth (second source) 3)) "analysis retains the actual CHECKCAST expression")
+      (is (= :jvm-bytecode-boxed-parameter-input
+             (get-in (completion/canonical-parts entry) [:contract :source-context])))
+      (is (= {:nullable true :source :public} (get-in analysis [:definition-values checked :attributes])))
+      (is (nil? (get-in analysis [:definition-values checked :builtin-class]))))))
+
+(deftest reference-entry-refuses-guessed-carriers-and-incompatible-declarations
+  (let [double-class (get types/primitive-array-info 'doubles)
+        buffer (av/tensor {:dtype :double :shape ['n]})
+        values {'input buffer}
+        entry (reference-entry double-class 'input)]
+    (is (= 'input (host-av/bound-buffer-alias-source entry values #{'input} nil)))
+    (doseq [expression [(reference-entry (get types/primitive-array-info 'floats) 'input)
+                        (reference-entry Object 'input)
+                        (reference-entry String 'input)
+                        (reference-entry Double/TYPE 'input)
+                        (completion/complete-value (completion/reference-check-contract double-class) 'input)
+                        (object-input '(identity input))
+                        (reference-entry double-class '(identity input))
+                        '(clojure.core/identity input)
+                        (reference-entry double-class (with-meta 'input {:raster.type/tag 'floats}))
+                        (vary-meta entry assoc :raster.type/tag 'floats)
+                        (list completion/completion-symbol
+                              (assoc (completion/bytecode-boxed-parameter-contract double-class) :extra true) 'input)]]
+      (is (nil? (host-av/bound-buffer-alias-source expression values #{'input} nil))))
+    (doseq [[available known] [[#{} values] [#{'input} {}]
+                              [#{'input} {'input (av/tensor {:dtype :double :shape []})}]]]
+      (is (nil? (host-av/bound-buffer-alias-source entry known available nil))))
+    (let [binder (with-meta 'checked {:raster.type/tag 'floats})
+          analysis (host-av/analyze-capacities (list 'let* [binder entry] binder)
+                                               {:values values :lexical-inputs '[input]})]
+      (is (nil? (get-in analysis [:definition-values binder])))
+      (is (not (contains? (:available analysis) binder))))
+    (doseq [options [{:values values :lexical-inputs []}
+                     {:values values :lexical-inputs '[input] :non-buffer-bindings '[input]}]
+            :let [analysis (host-av/analyze-capacities (list 'let* ['checked entry] 'checked) options)]]
+      (is (nil? (get-in analysis [:definition-values 'checked])))
+      (is (nil? (get-in analysis [:aliases 'checked]))))
+    (let [source (list 'let* ['checked entry 'input '(clojure.core/double-array n)] 'checked)
+          analysis (host-av/analyze-capacities source {:values values :scalar-types {'n :long}
+                                                       :lexical-inputs '[n]})]
+      (is (nil? (get-in analysis [:definition-values 'checked]))))
+    (is (= :host-abstract-value-reference-alias
+           (try
+             (host-av/analyze-capacities
+              (list 'let* ['checked (reference-entry (get types/primitive-array-info 'floats) 'input)] 'checked)
+              {:values values :lexical-inputs '[input] :reference-aliases {'checked 'input}})
+             nil
+             (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "a certified alias map cannot bypass the retained entry carrier check")))
 
 (deftest lexical-buffer-aliases-preserve-the-complete-source-value
   (let [value (av/tensor {:dtype :double :shape ['n] :ownership :external

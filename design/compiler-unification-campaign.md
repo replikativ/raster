@@ -130,6 +130,27 @@ alpha/qualification/substitution construction machinery, not a new expression
 catalog, source-name heuristic or payload-authority metadata field. Discharge
 the caller result binder's actual completion/checkcast before execution admission.
 
+The source-import producer must close the analyzed component before unrelated
+rewrites. Generic helper expansion precedes product lowering, rewalk, DCE and
+buffer/loop transforms; an early node-keyed receipt does not survive that whole
+chain. Do not insert bytecode-only return recipes globally into JVM/C source.
+First construct and analyze the isolated helper component under one owner,
+returning its numerical program, exact source/argument bindings and unresolved
+completion obligations together. Only then install one private deferred-import
+consumer in both ordinary pass execution and `schedule-parallel-form`. The
+existing component-runs/mixed-envelope composition must preserve source position
+and add import demands to live-out roots before fusion/DCE. Ordinary JVM/C
+expansion remains unchanged when no consuming capability is installed.
+
+The authenticated bounded return recipe can reuse existing completion operations:
+original result context (`:ref`) → actual compute Method's floating return
+consumer → Object boxing. The middle recipe uses the existing planned bytecode
+input adaptation with expected raw `:ref`; it is not a claim that a parameter
+occurrence existed. Preserve unbox/rebox rather than replacing it by reference
+identity. Its constructor still owes original owner/body/root/context joins,
+actual Method/wrapper correspondence, and the exact analyzed imported relation.
+Methods, original modules and receipts remain owner-local, not portable facts.
+
 #### Full CI qualification is still open
 
 CircleCI unit job [34881](https://circleci.com/gh/replikativ/raster/34881), exact
@@ -148,6 +169,22 @@ failure is an obsolete fixture. Qualify/migrate each family against its retained
 semantic oracle; do not fix this ledger by relaxing admission or changing expected
 errors alone. Source-only compile gates, actual device tests and the complete
 exact-head CI check set remain required before merging PR #1566.
+
+The four historical HostAV alias errors share one confirmed causal defect:
+boxed primitive-array reference entry checks lost the preceding buffer capacity,
+so a later exemplar allocation had no source AV. Conditional reference transport
+now reuses the actual array-Class projection and existing eligible AV while
+retaining the CHECKCAST and all declaration/exclusion checks. Resident post-SoA
+options also retain the actual resolved source Var, allowing the existing
+Method-owned redundant-array-check proof to run; no new Class inference is added.
+The ordinary and diagnostic split paths have header regression controls.
+
+The affected shared-REPL gate passes 273 tests / 3,604 assertions. The four real
+CI fixture probes separately report 4 tests / 8 passing assertions / 2 errors:
+MLP and composable JVM AD now pass; both resident GPU fixtures reach a retained
+Object snapshot of public Long `batch`, refused as `:invocation-scalar-effect`.
+That snapshot still needs the appropriate source-value completion relation; do
+not mark it pure or discard boxing because a numerical Long tag is present.
 
 `f23aa150` repairs the structured frontend's causal analysis boundary. Prefix
 bindings advance one immutable HostAV context; a fresh, unknown iteration

@@ -34,18 +34,27 @@
 
 (defn bound-buffer-alias-source
   "Return a preceding stable-SSA BUFFER source for a bare reference or exact
-   Object-input completion of that reference, otherwise nil. Validated AVs,
+   Object-input/reference-entry completion of that reference, otherwise nil. Validated AVs,
    not dtype-to-Class guesses, establish buffer/storage compatibility. This
-   analysis fact is not portable ownership or permission to erase evaluation."
+   conditional normal-return fact proves no operand Class, presence or successful
+   CHECKCAST, and is not portable ownership or permission to erase evaluation."
   [expression values available expected-value]
-  (let [parts (completion/object-input-parts expression)
-        _ (when parts (completion/object-value-declaration expression))
+  (let [object-parts (completion/object-input-parts expression)
+        entry-parts (completion/boxed-reference-input-parts expression)
+        parts (or object-parts entry-parts)
+        _ (when object-parts (completion/object-value-declaration expression))
+        ;; Read the actual retained array Class, never manufacture one from a
+        ;; logical dtype. Only an independently established buffer AV travels.
+        entry-dtype (when entry-parts
+                      (dtype/dtype-for-jvm-array-class (get-in entry-parts [:contract :target-carrier])))
         source (if parts (:operand parts) expression)
         value (when (and (symbol? source) (contains? available source)) (get values source))]
     (when value
       (av/validate! value)
       (when expected-value (av/validate! expected-value))
       (when (and (buffer-value? value)
+                 (or (nil? entry-parts)
+                     (and entry-dtype (= (dtype/canon entry-dtype) (dtype/canon (:dtype value)))))
                  (buffer-declaration-compatible? source value)
                  (buffer-declaration-compatible? expression value)
                  (or (nil? expected-value)
@@ -350,7 +359,9 @@
   ([context symbol expression] (advance-binding context symbol expression false))
   ([{:keys [analysis dtype lexical? ineligible] :as context} symbol expression non-buffer?]
    (let [ineligible (cond-> ineligible non-buffer? (conj symbol))
-         reference (if-let [parts (completion/object-input-parts expression)] (:operand parts) expression)
+         reference (if-let [parts (or (completion/object-input-parts expression)
+                                     (completion/boxed-reference-input-parts expression))]
+                     (:operand parts) expression)
          refused-buffer-reference?
          (and (symbol? reference)
               (or (buffer-value? (get-in analysis [:values reference]))
@@ -448,13 +459,15 @@
         (reduce
          (fn [{:keys [context logical-context definitions]} [id expression]]
            (let [reference (get reference-aliases id)
-                 explicit-reference (if-let [parts (completion/object-input-parts expression)]
-                                      (:operand parts) expression)
+                 explicit-parts (or (completion/object-input-parts expression)
+                                    (completion/boxed-reference-input-parts expression))
+                 explicit-reference (if explicit-parts (:operand explicit-parts) expression)
                  _ (when (and reference
                               (or (and (symbol? explicit-reference)
                                        (not= explicit-reference reference))
                                   (not= reference
-                                        (binding-buffer-alias-source context id reference))
+                                        (binding-buffer-alias-source context id
+                                                                     (if explicit-parts expression reference)))
                                   (not (buffer-declaration-compatible?
                                         expression
                                         (get-in context [:analysis :values reference])))))

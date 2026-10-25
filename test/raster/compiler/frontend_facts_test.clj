@@ -79,6 +79,34 @@
              (try (pipeline/compile-gpu-program #'mixed-storage :ocl:frontend-test :dtype :double)
                   (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
+(deftest resident-split-pipeline-retains-the-actual-source-producer
+  (doseq [diagnostic? [false true]]
+    (let [facts (pipeline/deftm-frontend-facts #'mixed-storage :double)
+          observed (atom [])
+          sentinel (ex-info "observed resident post-SoA boundary" {})
+          runner (fn [diagnostic?]
+                   (fn [form _ opts & _]
+                     (swap! observed conj opts)
+                     (if (:resident-gpu? opts)
+                       (throw sentinel)
+                       (if diagnostic? {:form form} form))))]
+      (with-redefs-fn
+        {#'hardware/descriptor-for (constantly nil)
+         #'pipeline/get-walked-body (fn [& _] '[(double (raster.arrays/aget input count))])
+         #'pipeline/run-passes (runner false)
+         #'pipeline/run-passes-diagnostic (runner true)}
+        #(is (identical? sentinel
+                         (try (pipeline/compile-gpu-program
+                               #'mixed-storage :ocl:frontend-test :dtype :double
+                               :compiler-report? diagnostic? :preserve-declared-array-storage? true)
+                              (catch clojure.lang.ExceptionInfo error error)))))
+      (is (= 2 (count @observed)))
+      (doseq [opts @observed]
+        (is (identical? (:resolved-var facts) (:source-var opts))
+            "the post-SoA header must retain the actual producer, not only inferred type facts")
+        (is (identical? (:source-ns facts) (:source-ns opts)))
+        (is (= (:parameters facts) (:active-params opts)))))))
+
 (deftest parametric-facts-use-the-resolved-specialization
   (doseq [dtype [:float :double]]
     (let [facts (pipeline/deftm-frontend-facts #'generic-scale dtype)

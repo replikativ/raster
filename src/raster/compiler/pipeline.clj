@@ -2270,6 +2270,7 @@
                          :leaves leaves}]))
               soa-expansion))
         post-opts (cond-> {:inline? true :simd? false :target-device device-id
+                           :source-var resolved-var
                            :resident-gpu? true
                            :preserve-declared-array-storage? preserve-declared-array-storage?
                            :active-params active-params :dtype effective-dtype
