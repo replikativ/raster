@@ -6149,9 +6149,13 @@
           :jvm-checkcast (emit-reference-check-completion code parts locals ctx observation)
           :source-integral-cast
           (let [operand-ctx (dissoc ctx :void-context)
+                input (when observation (physical-operand-input operand locals operand-ctx))
+                operand-policy (when observation (source-policy/capture))
                 actual (emit-form code operand locals operand-ctx)]
             (when observation
               (vreset! observation {:input-carrier actual
+                                    :operand-input input :operand-source-policy operand-policy
+                                    :element-type (:element-type ctx)
                                     :adaptation (if (= :diverge actual) :diverge :source-integral-cast)
                                     :operand-context (completion/bytecode-operand-context operand-ctx)}))
             (source-policy/call-with-policy
@@ -7280,6 +7284,70 @@
                ::expected-completion-input-type (:emitted-type completed)
                :element-type (:element-type record)} guard)
              :input-contract contract :input-completion completed))))
+
+(defn ^:no-doc compile-source-integral-completion-region
+  "Outline an exact observed source int/long completion before parent consumption.
+   Preserve actual physical ports, operand policy and conversion policy separately.
+   This confers no replay/movement permission, structural derivative or native cast
+   authority. The caller must execute the region at its original source cursor."
+  [emission input-body original]
+  (let [record (retained-input-completion-context emission input-body original)
+        contract (:contract record)
+        input (:operand-input record)
+        result-type (case (:operation contract) :int :int :long :long nil)
+        operand-policy (:operand-source-policy record)]
+    (when-not (and record (= :source-integral-cast (:source-context contract))
+                   (completion/canonical-contract? contract)
+                   (= result-type (:completion-carrier record))
+                   (contains? #{:ref :long :int :float :double :bool :void} (:input-carrier record))
+                   (map? input) (source-policy/valid? operand-policy))
+      (throw (ex-info "Source integral outlining requires an exact completed source occurrence"
+                      {:reason :unowned-source-integral-completion-region})))
+    (let [observations (atom {:static [] :values []})
+          child-lineage (atom nil)
+          token (Object.)
+          replay (vary-meta (completion/complete-value contract (:operand input))
+                            assoc ::completion-occurrence token)
+          guard (fn []
+                  (let [current (retained-input-completion-context emission input-body original)]
+                    (when-not (and current (identical? (:source record) (:source current))
+                                   (identical? input (:operand-input current)))
+                      (throw (ex-info "Source completion lost its original emission owner"
+                                      {:reason :unowned-source-integral-completion-region}))))
+                  (me/assert-definition-inputs-current! @observations)
+                  (when-let [lineage @child-lineage]
+                    (me/assert-emission-inputs-current! lineage)))
+          region (binding [me/*emission-inputs* observations]
+                   (let [dependencies (prepare-emission-input-snapshots!
+                                       [replay] (:source-ns emission) (vec (keys (:ports input))))
+                         revision (dispatch/compiler-definition-revision)
+                         region (compile-owned-input-region
+                                 emission input (case result-type :int Integer/TYPE :long Long/TYPE)
+                                 {:return-tag (case result-type :int 'int :long 'long)
+                                  :walked-body [replay] :source-policy operand-policy
+                                  :element-type (:element-type record)
+                                  ::body-input-context (:operand-context record)} guard)]
+                     ;; Freeze the child compiler's own historical observations.
+                     ;; The original owner need not have consumed identical callees.
+                     (reset! child-lineage
+                             {:dependency-snapshots (into dependencies (:values @observations))
+                              :static-inputs (:static @observations)
+                              :producer-inputs (:producer-inputs @observations)
+                              :definition-revision revision
+                              :completed-definition-revision (dispatch/compiler-definition-revision)})
+                     region))
+          actual (get-in @observations [:completion-contexts token])]
+      ;; A fresh root occurrence audits this compilation only. Nested completions
+      ;; cannot satisfy the audit or inherit a mutable expected-carrier flag.
+      (when-not (and (= :known (:status actual))
+                     (= (select-keys record [:contract :input-carrier :operand-context
+                                            :completion-carrier :operand-source-policy])
+                        (select-keys actual [:contract :input-carrier :operand-context
+                                            :completion-carrier :operand-source-policy])))
+        (throw (ex-info "Outlined source completion differs from its original emission"
+                        {:reason :source-integral-completion-replay-mismatch})))
+      (guard)
+      (assoc region :completion-contract contract))))
 
 (defn- compile-raw-int-input-region
   [emission input input-type element-type guard]

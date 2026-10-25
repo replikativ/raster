@@ -13,6 +13,21 @@ policy, then applies only the conversion under its retained policy. Structural
 AD transposition remains explicitly refused for this new completion domain.
 Frontend count insertion and ordered native entry-prefix execution remain open.
 
+Owned source int/long completions can now be outlined through the existing JVM
+physical-input region compiler. The original emission records the operand's
+actual ports, context, policy and element type separately from conversion policy.
+An outlined region replays the observed operand, audits a fresh root occurrence's
+raw and completed carriers, and guards both original ownership and its own full
+historical value/static/producer lineage. Nested completions cannot satisfy that
+root audit; a copied or missing observation supplies no authority. Independent
+review approved the corrected child-history guard. Qualification: 172 affected
+tests / 2,401 assertions pass, including independent Clojure differential checks,
+opposite ambient policies, once-only effects and isolated stale-child rejection.
+This is an execution primitive for the ordered host cursor, not permission to
+hoist, duplicate, differentiate or lower a source completion as a native cast.
+Frontend insertion, source construction correspondence and ordered invocation
+integration must close together before completed counts feed native map extents.
+
 The JVM effect-map expansion also no longer narrows a source Long count through
 the generic dotimes Int adapter. It preserves Long observable ordinals, once-only
 count evaluation and one source body, while selecting a private Int counter only
