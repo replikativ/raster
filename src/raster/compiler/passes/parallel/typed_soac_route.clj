@@ -1495,25 +1495,40 @@
 (declare sequential-continuation-decline)
 
 (defn- entry-operands
-  [equations-by-id {:keys [kind equation-id description]}]
+  [equations-by-id {:keys [kind equation-id description source-reads]}]
   (case kind
     :typed-soac (equation-references (get equations-by-id equation-id))
+    :source-action source-reads
     :segmented-weighted-reduction
     (vec (distinct
           (concat (swr/ordered-input-ids (:plan description))
                   (filter symbol? (swr/runtime-parameter-values (:plan description))))))))
 
 (defn- component-runs
-  "Partition the one analyzed source spine into maximal ordinary SOAC runs and singleton plans."
+  "Retain the existing SOAC/SWR partition while preserving intervening source entries.
+   Source actions do not introduce new partitions or execution authority. Their
+   host-boundary facts still delimit fusion under the existing legality policy."
   [entries]
+  (doseq [entry entries]
+    (when-not (contains? #{:typed-soac :source-action :segmented-weighted-reduction}
+                         (:kind entry))
+      (throw (ex-info "analyzed source entry has no component projection"
+                      {:reason :typed-soac-source-entry :kind (:kind entry)}))))
   (loop [remaining (seq entries) prefix [] components []]
     (if-not (seq remaining)
       components
-      (if (= :typed-soac (:kind (first remaining)))
-        (let [[run suffix] (split-with #(= :typed-soac (:kind %)) remaining)]
+      (case (:kind (first remaining))
+        :source-action
+        (recur (next remaining) (conj prefix (first remaining)) components)
+
+        :typed-soac
+        (let [[run suffix] (split-with #(contains? #{:typed-soac :source-action} (:kind %))
+                                      remaining)]
           (recur suffix (into prefix run)
                  (conj components {:kind :typed-soac :entries (vec run)
                                    :prefix prefix :suffix (vec suffix)})))
+
+        :segmented-weighted-reduction
         (recur (next remaining) (conj prefix (first remaining))
                (conj components {:kind :segmented-weighted-reduction
                                  :entry (first remaining)
@@ -1523,6 +1538,9 @@
 (defn- entry-storage-values
   [facts equations-by-id {:keys [kind equation-id description]}]
   (case kind
+    ;; Lexical reference dependencies do not establish a content access or
+    ;; discharge first-use initialization. The source/allocation cursor owns it.
+    :source-action #{}
     :typed-soac
     (let [equation (get equations-by-id equation-id)
           storage (get-in facts [:equations equation-id :attributes :result-storage])]
@@ -1552,7 +1570,9 @@
   [{:keys [typed-program outputs]} component]
   (let [source-facts (dialect/facts typed-program)
         equations-by-id (into {} (map (juxt second identity)) (dialect/equations typed-program))
-        equations (mapv #(get equations-by-id (:equation-id %)) (:entries component))
+        equations (into [] (comp (filter #(= :typed-soac (:kind %)))
+                                (map #(get equations-by-id (:equation-id %))))
+                        (:entries component))
         equation-ids (set (map second equations))
         definitions (set (mapcat #(nth % 2) equations))
         references (vec (distinct (mapcat equation-references equations)))
@@ -1577,6 +1597,7 @@
               (mapcat (fn [{:keys [kind equation-id description]}]
                         (case kind
                           :typed-soac (nth (get equations-by-id equation-id) 2)
+                          :source-action []
                           :segmented-weighted-reduction [(:sym description)])))
               (:prefix component))
         ;; An allocator extent can be computed in an earlier component and absent from every

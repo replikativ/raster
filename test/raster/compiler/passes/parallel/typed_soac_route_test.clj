@@ -1197,6 +1197,9 @@
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
                       z)
         {:keys [program stats]} (route/attempt source :float {'x :float})
+        analyzed (frontend/form->program-components
+                  source {:dtype :float :array-types {'x :float} :segmented-plans? true})
+        action (some #(when (= 'side (get-in % [:description :sym])) %) (:entries analyzed))
         source-pairs (partition 2 (second (:source program)))
         lowered (segop-lower/segop-lower-pass program {:dtype :float})]
     (is (= :typed-soac (:dialect program)))
@@ -1205,6 +1208,11 @@
     (is (nil? (get-in program [:values 'side]))
         "opaque host values do not pretend to be functional TypedSOAC values")
     (is (= [1] (get-in program [:attributes :host-binding-ids])))
+    (is (= :source-action (:kind action)))
+    (is (:host-boundary? action))
+    (is (= #{'y} (set (:source-reads action))))
+    (is (= [{:source-binding-id 1 :values #{'y}}]
+           (get-in analyzed [:facts :attributes :host-read-sites])))
     (is (= 2 (count (:equations program))))
     (is (= 2 (get-in lowered [:stats :typed-soac-reused]))
         "both sides of the host barrier stay on the shared typed schedule vertical")
@@ -1220,14 +1228,66 @@
                                               (* (clojure.core/aget b j) 2.0))]
                       [left right])
         {:keys [program stats]}
-        (route/attempt source :float {'a :float 'b :float})]
+        (route/attempt source :float {'a :float 'b :float})
+        analyzed (frontend/form->program-components
+                  source {:dtype :float :array-types {'a :float 'b :float}
+                          :segmented-plans? true})
+        action (some #(when (= 'side (get-in % [:description :sym])) %) (:entries analyzed))]
     (is (= 2 (count (:equations program))))
     (is (zero? (:horizontal stats)))
     (is (= [1] (get-in program [:attributes :host-binding-ids])))
+    (is (= [] (:source-reads action)))
+    (is (:host-boundary? action))
     (is (some #{'println} (flatten (:source program))))))
 
 (deftest scalar-only-host-control-does-not-construct-an-empty-typed-program
   (is (nil? (route/attempt '(let* [x 1 y (println x)] y) :float))))
+
+(deftest source-action-reads-retain-shadowed-public-scalar-dependencies
+  (let [source '(let* [y (raster.par/pmap i n float (clojure.core/aget x i))
+                       side (println count y)
+                       z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
+                 z)
+        analyzed (frontend/form->program-components
+                  source {:dtype :float :array-types {'x :float}
+                          :scalar-types {'count :long 'n :long}
+                          :values {'count (av/tensor {:dtype :long :shape []})}
+                          :segmented-plans? true})
+        action (second (:entries analyzed))]
+    (is (= '[y side z] (mapv #(get-in % [:description :sym]) (:entries analyzed))))
+    (is (= :source-action (:kind action)))
+    (is (= #{'count 'y} (set (:source-reads action))))
+    (is (= [{:source-binding-id 1 :values #{'count 'y}}]
+           (get-in analyzed [:facts :attributes :host-read-sites])))
+    (is (not (contains? (:values analyzed) 'side))
+        "an explicit source action still does not acquire a numerical value contract")))
+
+(deftest generated-storage-actions-do-not-partition-fusible-maps
+  (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
+                       scratch (clojure.core/float-array n)
+                       alias scratch
+                       z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))
+                       effect (raster.par/map! alias k n float (clojure.core/aget x k))]
+                 [z alias])
+        [_ bindings body] source
+        baseline (list 'let* (vec (concat (subvec bindings 2 6) (subvec bindings 0 2)
+                                         (subvec bindings 6))) body)
+        options {:dtype :float :array-types {'x :float}
+                 :scalar-types {'n :long} :segmented-plans? true}
+        analyzed (frontend/form->program-components source options)
+        entries (:entries analyzed)
+        routed (route/attempt source :float {'x :float} {:scalar-types {'n :long}})
+        baseline (route/attempt baseline :float {'x :float} {:scalar-types {'n :long}})]
+    (is (= [:typed-soac :source-action :source-action :typed-soac :typed-soac]
+           (mapv :kind entries)))
+    (is (not-any? :host-boundary? entries)
+        "generated allocation and reference aliases retain obligations without new fusion barriers")
+    (is (= 1 (count (#'route/component-runs entries))))
+    (is (= [] (get-in analyzed [:facts :attributes :host-binding-ids])))
+    (is (pos? (get-in baseline [:stats :vertical])))
+    (is (= (get-in baseline [:stats :vertical]) (get-in routed [:stats :vertical])))
+    (is (= (count (get-in baseline [:program :equations]))
+           (count (get-in routed [:program :equations]))))))
 
 (deftest coverage-diagnostics-share-program-host-boundary-admission
   (let [source '(let* [mapped (raster.par/pmap i n float

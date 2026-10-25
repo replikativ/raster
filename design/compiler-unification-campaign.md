@@ -151,7 +151,7 @@ identity. Its constructor still owes original owner/body/root/context joins,
 actual Method/wrapper correspondence, and the exact analyzed imported relation.
 Methods, original modules and receipts remain owner-local, not portable facts.
 
-The isolated terminal-reduction constructor now returns an immediately analyzed
+The owner-local `passes.scalar.source-import` terminal-reduction adapter returns an immediately analyzed
 TypedSOAC component plus the original call bindings and unresolved input, return,
 placement, numerical-import and caller-binding obligations. It reuses ordinary
 helper hygiene, qualification and substitution; it does not install pipeline
@@ -169,6 +169,27 @@ exactly once by its enclosing owner; a stale parent refuses construction. The
 reviewed focused gate passes 4 tests / 55 assertions in the shared capped REPL.
 This closes the isolated constructor prerequisite, not execution, deferred
 composition, numerical liveness or the public mixed-gradient acceptance gate.
+
+The first consolidation retains all analyzed source bindings in the same ordered
+entry projection. Numerical selection promotes existing entries; host observation
+IDs, read sites/read values and host-result liveness derive from their shared
+lexical dependencies. Existing host classification, attribute ordering, ordinary
+routing and numerical/SWR partitions remain unchanged. Generated storage and
+reference aliases do not create additional fusion barriers. The JVM import
+receipt/Method construction moved out of the numerical frontend into the narrow
+source-import adapter without forwarding APIs or a second execution engine.
+
+Independent review caught an invalid storage implication in the initial refactor:
+raw source references cannot count as physical content accesses when choosing
+first-use initialization. Source actions therefore contribute liveness reads but
+no storage-access credit. A real allocation/alias before SWR, first consumed by a
+suffix numerical component, retains its suffix initialization. Restoring the bad
+inference in a bounded mutation probe fails both initialization assertions. Other
+source-driven controls preserve a shadowed `count`, retain an earlier numerical
+producer observed by a later host action, and preserve positive fusion/kernel
+counts across generated storage. The combined affected shared-REPL gate passes
+542 tests / 5,970 assertions. New import deferral and execution remain disabled;
+fresh-process and complete exact-head CI qualification remain separate gates.
 
 The bounded clean-head GSDM diagnostic at `9f5ad9229` terminated at its explicit
 150-second diagnostic limit, without a test result. Its retained phase log, JFR

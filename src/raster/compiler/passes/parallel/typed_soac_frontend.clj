@@ -18,7 +18,6 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.core.binding-completion :as binding-completion]
             [raster.compiler.core.method-entry :as method-entry]
-            [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-source :as invocation-source]
@@ -5676,8 +5675,34 @@
            (update :writers merge writes))))
    {:writers {} :host-uses #{} :operation-uses #{}} descriptions))
 
+(defn- analyzed-source-entries
+  "Retain each analyzed source binding and its lexical reads once. Host boundaries
+   come from the existing admission partition, not a new effect or scheduling rule.
+   Numerical selection subsequently promotes entries without losing their source
+   position. A source action is not permission to execute, remove or hoist it."
+  [descriptions host-descriptions]
+  (let [host-order (zipmap (map :id host-descriptions) (range))]
+    (mapv (fn [{:keys [id expr] :as description}]
+            {:kind (if (swr-description? description)
+                     :segmented-weighted-reduction :source-action)
+             :description description
+             ;; Numerical operation dependencies already come from their typed
+             ;; equation. Do not walk a potentially large map/loop body again.
+             :source-reads (if (or (= :scalar (:kind description))
+                                   (swr-description? description))
+                             (vec (util/free-syms expr)) [])
+             :host-boundary? (contains? host-order id)
+             :host-boundary-order (get host-order id)})
+          descriptions)))
+
+(defn- host-source-entries
+  "Keep the established host-then-protected attribute order independently of
+   source execution order; this refactor does not change artifact interfaces."
+  [entries]
+  (sort-by :host-boundary-order (filter :host-boundary? entries)))
+
 (defn- terminal-results
-  [descriptions body]
+  [descriptions body source-entries]
   (let [physical-outputs (physical-output-symbols descriptions)
         operations (filter semantic-description? descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
@@ -5704,9 +5729,9 @@
         typed-scalars (filter #(and (= :scalar (:kind %))
                                     (supported-description? physical-outputs %))
                               descriptions)
-        host-scalars (filter #(and (= :scalar (:kind %))
-                                   (not (supported-description? physical-outputs %)))
-                             descriptions)
+        host-scalars (filter #(and (:host-boundary? %)
+                                  (= :scalar (get-in % [:description :kind])))
+                            source-entries)
         scalar-definitions
         (set (keep #(when (and (= :scalar (:kind %))
                                (supported-description? physical-outputs %)
@@ -5719,7 +5744,7 @@
                              (concat (mapcat #(concat (:inputs %) (:scalars %)) operations)
                                      (mapcat #(util/free-syms (:expr %)) typed-scalars)))
         host-uses (into (:host-uses physical-uses)
-                        (mapcat #(util/free-syms (:expr %)) host-scalars))
+                        (mapcat :source-reads host-scalars))
         body-uses (set (mapcat util/free-syms body))
         ;; Destination-writing source forms return the destination buffer, while TypedSOAC names
         ;; the fresh logical result produced by that write. Preserve the public return by
@@ -6188,145 +6213,6 @@
               *region-local-source-symbols* (source-symbols source options)]
       (form->program* source options))))
 
-(deftype ^:private TerminalReductionImportReceipt [artifact guard]
-  method-entry/RetainedProducerInput
-  (assert-producer-current! [this]
-    (guard)
-    this))
-
-(defn ^:no-doc validate-terminal-reduction-import!
-  "Check the exact isolated component and its historical owner. The receipt and
-   Methods are process-local; they are never facts in the portable numerical IR."
-  [{:keys [receipt] :as imported}]
-  (when-not (and (instance? TerminalReductionImportReceipt receipt)
-                 (= (set (keys imported))
-                    (conj (set (keys (.-artifact ^TerminalReductionImportReceipt receipt))) :receipt))
-                 (every? (fn [[key original]] (identical? original (get imported key)))
-                         (.-artifact ^TerminalReductionImportReceipt receipt)))
-    (fail! :terminal-reduction-import-correspondence
-           "terminal reduction import differs from its exact analyzed component" {}))
-  (method-entry/assert-producer-current! receipt)
-  imported)
-
-(defn ^:no-doc analyze-terminal-reduction-import
-  "Construct an isolated analyzed terminal-reduction component under its source owner.
-   No pipeline deferral or execution capability is installed. Lexical array arguments
-   are the bounded input grammar. Original input, return bridge and caller binder
-   completions remain explicit unresolved obligations, not portable payload proofs."
-  [{:keys [frontend input-body root caller-expression arguments result-symbol source-position
-           values array-types scalar-types]}]
-  (when-not method-entry/*emission-inputs*
-    (fail! :terminal-reduction-import-owner "terminal import requires its compiler owner" {}))
-  (method-entry/call-with-independent-definition-inputs
-   (fn []
-     (let [source-var (get-in frontend [:source-entry :source-var])
-           _ (method-entry/assert-frontend-source! frontend source-var)
-           selected (method-entry/assert-frontend-selection! frontend source-var)
-           _ (when-not (and (identical? input-body (:body frontend))
-                            (= 1 (count input-body)) (identical? root (first input-body))
-                            (par/par-reduce-form? root))
-               (fail! :terminal-reduction-import-root
-                      "terminal import requires the exact original singleton reduction body" {}))
-           bridge (method-entry/frontend-boxed-entry-bridge frontend)
-           emission (:emission frontend)
-           body-context (when bridge
-                          ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-body-context)
-                           emission input-body))
-           observed (when body-context
-                      ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-reduction-emission)
-                       emission input-body root))
-           ^java.lang.reflect.Method compute (:compute-method bridge)
-           carrier (when compute (.getReturnType compute))
-           result-tag (get {Double/TYPE 'double Float/TYPE 'float} carrier)
-           payload (get types/primitive-info result-tag)
-           context (:result-context body-context)
-           _ (when-not (and bridge body-context observed result-tag
-                            (= :boxed-primitive-static-return (:kind bridge))
-                            (identical? carrier (:payload-carrier bridge))
-                            (= body-context (:body-context bridge))
-                            (= :ref (:emitted-result-type body-context))
-                            (= (keyword (name result-tag)) (:return-stack-type body-context))
-                            (= {:carrier Object :presence :present :builtin-class payload}
-                               (:result-fact observed))
-                            (= :ref (get-in observed [:root-result :result-type]))
-                            (= context (get-in observed [:root-result :context]))
-                            (= 1 (count (get-in observed [:root-result :body])))
-                            (identical? (get-in observed [:loop :expression])
-                                        (first (get-in observed [:root-result :body]))))
-               (fail! :terminal-reduction-import-return
-                      "terminal import has no exact observed FP compute/Object return bridge" {}))
-           parameters (get-in frontend [:source-entry :params])
-           parameter-carriers (:compute-parameter-carriers bridge)
-           call-arguments (vec (util/call-args caller-expression))
-           _ (when-not (and (seq? caller-expression)
-                            (= '.invk (first caller-expression))
-                            (= (:implementation-op selected) (second caller-expression))
-                            (map? values) (map? array-types) (map? scalar-types)
-                            (vector? arguments) (= arguments call-arguments)
-                            (= (count arguments) (count parameters) (count parameter-carriers))
-                            (every? symbol? arguments) (symbol? result-symbol)
-                            (not (contains? values result-symbol))
-                            (integer? source-position) (<= 0 source-position)
-                            (every? (fn [[argument parameter-carrier]]
-                                      (let [expected (dtype/dtype-for-jvm-array-class parameter-carrier)
-                                            value (get values argument)]
-                                        (and (av/abstract-value? value)
-                                             (contains? #{:double :float} expected)
-                                             (= :tensor (:kind value)) (seq (:shape value))
-                                             (= expected (some-> (:dtype value) dtype/canon))
-                                             (= expected (some-> (get array-types argument) dtype/canon)))))
-                                    (map vector arguments parameter-carriers)))
-               (fail! :terminal-reduction-import-arguments
-                      "terminal import requires the selected call over preceding compatible lexical arrays" {}))
-           policy (get-in frontend [:source-entry :source-policy])
-           numerical-result (with-meta (gensym "terminal_numerical_") {:raster.type/tag result-tag})
-           source-env (merge (into {} (map (fn [[id type]] [id (:array-tag (dtype/info type))])) array-types)
-                             (into {} (map (fn [[id type]] [id (symbol (name type))])) scalar-types))
-           expansion (source-policy/call-with-policy
-                      policy
-                      #((requiring-resolve 'raster.compiler.passes.scalar.inline/expand-original-helper-source)
-                        frontend caller-expression arguments numerical-result source-env))
-           source (list 'let* (vec (mapcat identity (:bindings expansion))) numerical-result)
-           options {:dtype (keyword (name result-tag)) :values values :array-types array-types
-                    :scalar-types scalar-types :lexical-inputs (vec (keys values))
-                    :source-ns (get-in frontend [:source-entry :source-ns])
-                    :preserve-declared-array-storage? true :segmented-plans? true}
-           normalized (source-policy/call-with-policy policy #(normalize-source source options))
-           component (source-policy/call-with-policy policy #(form->program-components normalized options))
-           program (:typed-program component)
-           _ (when-not (and program (= [numerical-result] (:outputs component))
-                            (= (keyword (name result-tag)) (get-in component [:values numerical-result :dtype])))
-               (fail! :terminal-reduction-import-analysis
-                      "terminal helper did not produce its checked isolated numerical component" {}))
-           _ (dialect/validate! program)
-           port (with-meta (gensym "terminal_object_") {:tag 'Object :raster.type/tag result-tag})
-           recipe (completion/complete-value
-                   completion/object-input-contract
-                   (completion/complete-value
-                    (completion/planned-bytecode-input-contract carrier context :ref)
-                    (completion/complete-value (completion/bytecode-result-context-contract context :ref) port)))
-           obligations {:inputs (mapv (fn [argument parameter-carrier]
-                                        {:argument argument :parameter-carrier parameter-carrier
-                                         :status :unresolved}) arguments parameter-carriers)
-                        :return {:value-port port :recipe recipe :compute-method compute
-                                 :invocation-method (:invocation-method bridge) :status :unresolved}
-                        :import {:result numerical-result :status :unresolved}
-                        :placement {:source-position source-position :status :unresolved}
-                        :caller-binding {:binder result-symbol :initializer caller-expression :status :unresolved}}
-           artifact {:component component :source source :normalized-source normalized
-                     :argument-bindings (:argument-bindings expansion)
-                     :caller-expression caller-expression :result-symbol result-symbol
-                     :source-position source-position :source-policy policy :obligations obligations}
-           historical @method-entry/*emission-inputs*
-           guard #(do (method-entry/assert-definition-inputs-current! historical)
-                      (method-entry/assert-frontend-source! frontend source-var)
-                      (method-entry/assert-emission-inputs-current! emission))
-           receipt (TerminalReductionImportReceipt. artifact guard)
-           imported (assoc artifact :receipt receipt)]
-       (validate-terminal-reduction-import! imported)
-       (method-entry/adopt-definition-inputs! {:producer-inputs [receipt]})
-       imported))))
-
 (defn- allocation-contracts
   "Allocation leaves the equation spine as host scaffolding, but initialization is semantic.
    Supported constructor arity and positive scalar-kind evidence distinguish a length from a
@@ -6433,16 +6319,17 @@
               (assoc :source-projection (select-keys projection [:constructor :helper])))))
         allocations))
 
-(defn- source-attributes [pairs host-descriptions allocations values]
-  (let [references (vec (distinct (mapcat #(util/free-syms (:expr %)) host-descriptions)))]
+(defn- source-attributes [pairs source-entries allocations values]
+  (let [host-entries (host-source-entries source-entries)
+        references (vec (distinct (mapcat :source-reads host-entries)))]
     {:source-dialect :closed-clojure
      :source-bindings (mapv first pairs)
-     :host-binding-ids (mapv :id host-descriptions)
+     :host-binding-ids (mapv #(get-in % [:description :id]) host-entries)
      :host-read-values (filterv #(contains? values %) references)
-     :host-read-sites (mapv (fn [{:keys [id expr]}]
-                              {:source-binding-id id
+     :host-read-sites (mapv (fn [{:keys [description source-reads]}]
+                              {:source-binding-id (:id description)
                                :values (set (filter #(contains? values %)
-                                                    (util/free-syms expr)))}) host-descriptions)
+                                                    source-reads))}) host-entries)
      :allocations allocations}))
 
 (defn ^:no-doc source-fragment-analysis
@@ -6484,8 +6371,10 @@
           allocations (retain-allocation-projections allocations (:values analysis))]
       (assoc analysis
              :numerical-binding-ids (mapv :id (filter soac-description? descriptions))
-             :attributes (source-attributes pairs (filterv #(= :scalar (:kind %)) descriptions)
-                                            allocations (:values analysis))))))
+             :attributes (source-attributes
+                          pairs (analyzed-source-entries
+                                 descriptions (filterv #(= :scalar (:kind %)) descriptions))
+                          allocations (:values analysis))))))
 
 (defn canonicalize-fresh-full-write-maps
   "Project a closed single-write effect region to the existing functional map contract.
@@ -6694,8 +6583,9 @@
                              (not (supported-description? physical-outputs %)))
                        descriptions)
               host-control-descriptions (into host-descriptions swr-descriptions)
-              host-read-references (vec (distinct (mapcat #(util/free-syms (:expr %))
-                                                        host-control-descriptions)))
+              source-entries (analyzed-source-entries descriptions host-control-descriptions)
+              host-read-references (vec (distinct (mapcat :source-reads
+                                                        (host-source-entries source-entries))))
               ;; Source descriptions retain the same authoritative local scalar contracts used
               ;; during admission.  Thread them into AbstractValue construction as well: a
               ;; checked host boundary consumed as a launch extent must not silently fall back to
@@ -6709,7 +6599,7 @@
               operation-equations (mapv operation-equation operation-descriptions)
               operation-equations-by-id (zipmap (map :id operation-descriptions)
                                                 operation-equations)
-              outputs (terminal-results descriptions body)
+              outputs (terminal-results descriptions body source-entries)
               semantic-scalar-roots
               (into []
                     (comp (mapcat #(swr/runtime-parameter-values (:plan %)))
@@ -6735,7 +6625,8 @@
               graph-shape-scalar-ids
               (set/union allocation-capacity-scalar-ids normalized-extent-scalar-ids)
               {:keys [equations equation-descriptions entries]}
-              (reduce (fn [{:keys [scalar-dtypes] :as state} description]
+              (reduce (fn [{:keys [scalar-dtypes] :as state}
+                           {:keys [description] :as entry}]
                         (cond
                           (= :scalar (:kind description))
                           (if (contains? required-scalars (:sym description))
@@ -6745,28 +6636,26 @@
                               (-> state
                                   (update :equations conj equation)
                                   (update :equation-descriptions conj description)
-                                  (update :entries conj {:kind :typed-soac
-                                                         :equation-id (:id description)})
+                                  (update :entries conj (assoc entry :kind :typed-soac
+                                                              :equation-id (:id description)))
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
-                            state)
+                            (update state :entries conj entry))
                           (soac-description? description)
                           (-> state
                               (update :equations conj (get operation-equations-by-id (:id description)))
                               (update :equation-descriptions conj description)
-                              (update :entries conj {:kind :typed-soac
-                                                     :equation-id (:id description)}))
+                              (update :entries conj (assoc entry :kind :typed-soac
+                                                          :equation-id (:id description))))
 
                           (swr-description? description)
-                          (update state :entries conj
-                                  {:kind :segmented-weighted-reduction
-                                   :description description})
+                          (update state :entries conj entry)
 
                           :else
                           (fail! :unsupported-operation-description
                                  "admitted source description has no equation projection"
                                  {:description description})))
                       {:equations [] :equation-descriptions [] :entries [] :scalar-dtypes {}}
-                      descriptions)
+                      source-entries)
               equation-info (mapv (fn [equation]
                                     {:results (nth equation 2)
                                      :inputs (dialect/operation-inputs equation)
@@ -6927,7 +6816,7 @@
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects
                       :provenance {:front-end :analyzed-source}
-                      :attributes (source-attributes pairs host-control-descriptions allocations values)})]
+                      :attributes (source-attributes pairs entries allocations values)})]
           (let [segmented? (boolean (seq swr-descriptions))
                 ;; For a mixed projection this is an equation catalog used to build maximal
                 ;; ordinary SOAC chunks. Its broad outputs prevent validation from discarding a

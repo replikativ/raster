@@ -8,7 +8,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.scalar.inline :as inline]
-            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]))
+            [raster.compiler.passes.scalar.source-import :as source-import]))
 
 (core/deftm nonterminal-sum [xs :- (Array double)] :- Double
   (do (par/sum xs) 0.0))
@@ -30,7 +30,7 @@
      :array-types {'input :double} :scalar-types {}}))
 
 (defn- construct [options]
-  (entry/call-with-definition-inputs #(frontend/analyze-terminal-reduction-import options)))
+  (entry/call-with-definition-inputs #(source-import/analyze-terminal-reduction-import options)))
 
 (defn- reason [thunk]
   (try (thunk) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
@@ -45,7 +45,7 @@
         outer (completion/canonical-parts recipe)
         consumer (completion/canonical-parts (:operand outer))
         root-context (completion/canonical-parts (:operand consumer))]
-    (is (identical? imported (frontend/validate-terminal-reduction-import! imported)))
+    (is (identical? imported (source-import/validate-terminal-reduction-import! imported)))
     (is (= program (dialect/validate! program)))
     (is (= 1 (count (dialect/equations program))))
     (is (= :double (get-in component [:values (first (:outputs component)) :dtype])))
@@ -72,10 +72,10 @@
                       (satisfies? entry/RetainedProducerInput %))
                   (tree-seq coll? seq program)))
     (is (= :terminal-reduction-import-correspondence
-           (reason #(frontend/validate-terminal-reduction-import!
+           (reason #(source-import/validate-terminal-reduction-import!
                      (update imported :component (fn [component] (into {} component)))))))
     (is (= :terminal-reduction-import-correspondence
-           (reason #(frontend/validate-terminal-reduction-import! (dissoc imported :receipt)))))
+           (reason #(source-import/validate-terminal-reduction-import! (dissoc imported :receipt)))))
     (let [before (inline/expand-for-backends (:caller-expression request))]
       (is (not (completion/contains-completion? before))
           "ordinary expansion receives no constructor hook or return-recipe insertion"))))
@@ -85,7 +85,7 @@
         request (options original)
         copied-root (with-meta (apply list (:root request)) (meta (:root request)))]
     (is (= :terminal-reduction-import-owner
-           (reason #(frontend/analyze-terminal-reduction-import request))))
+           (reason #(source-import/analyze-terminal-reduction-import request))))
     (doseq [changed [(assoc request :input-body (vec (seq (:input-body request))))
                      (assoc request :root copied-root)]]
       (is (= :terminal-reduction-import-root (reason #(construct changed)))))
@@ -116,7 +116,7 @@
           source (get-in original [:source-entry :source-var])
           receiver (get-in original [:definition :receiver-var])]
       (with-redefs-fn {receiver (Object.)}
-        #(is (some? (reason (fn [] (frontend/validate-terminal-reduction-import! imported))))))
+        #(is (some? (reason (fn [] (source-import/validate-terminal-reduction-import! imported))))))
       (with-redefs-fn {source (fn [& _] (throw (AssertionError. "must never execute")))}
         #(is (some? (reason (fn [] (construct request)))))))))
 
@@ -140,7 +140,7 @@
                  (get-in first-import [:obligations :inputs]))))
     (is (= {:source-position 3 :status :unresolved} (get-in first-import [:obligations :placement])))
     (is (= :terminal-reduction-import-correspondence
-           (reason #(frontend/validate-terminal-reduction-import!
+           (reason #(source-import/validate-terminal-reduction-import!
                      (assoc first-import :normalized-source (:normalized-source second-import))))))))
 
 (deftest import-receipt-retains-only-its-local-construction-history
@@ -150,12 +150,12 @@
                     (assert-producer-current! [this] (swap! parent-checks inc) this))
         parent (atom {:static [] :values [] :producer-inputs [unrelated]})
         imported (binding [entry/*emission-inputs* parent]
-                   (frontend/analyze-terminal-reduction-import request))]
+                   (source-import/analyze-terminal-reduction-import request))]
     (is (pos? @parent-checks) "construction still fences the parent's original history")
     (is (some #(identical? unrelated %) (:producer-inputs @parent))
         "independent construction adopts child inputs without discarding parent dependencies")
     (reset! parent-checks 0)
-    (frontend/validate-terminal-reduction-import! imported)
+    (source-import/validate-terminal-reduction-import! imported)
     (is (zero? @parent-checks)
         "receipt validation must not recursively revisit unrelated parent producers")
     (entry/assert-definition-inputs-current! @parent)
@@ -166,5 +166,5 @@
       (is (= ::stale-parent
              (reason #(binding [entry/*emission-inputs* (atom {:static [] :values []
                                                               :producer-inputs [stale]})]
-                        (frontend/analyze-terminal-reduction-import request))))
+                        (source-import/analyze-terminal-reduction-import request))))
           "isolating child history must not bypass the parent's freshness fence"))))

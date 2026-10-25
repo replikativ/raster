@@ -1481,6 +1481,25 @@ Raster trees should retain stable keyed paths and type/shape information. JAX
 donation and sharding contracts are also useful references; Raster's existing
 ownership checks should remain fail-loud.
 
+The analyzed source projection retains one ordered entry per binding, including
+numerical equations, protected semantic components and host-side source actions.
+Host observation sites, barrier IDs and numerical liveness derive from those
+entries under the existing admission policy. An unselected scalar, allocation or
+reference alias does not become an extra kernel boundary merely by being retained
+there; neither does it become removable or movable. Ordinary and protected
+component routes keep their existing numerical partition and fusion legality.
+Lexical reference dependencies keep producers live but establish no storage
+access, initialized contents, physical Class or completed source action. In
+particular, a reference alias cannot discharge a later component's first-use
+allocation initialization.
+
+JVM-specific helper import correspondence belongs to an owner-local source-import
+adapter, not portable TypedSOAC facts. Its analyzed component and unresolved
+argument/return/import obligations are distinct from execution permission. The
+current entry consolidation does not enable deferred imports, result readback,
+checked Float completion or deferred resident composition; those require the
+corresponding source cursor, completion and storage-owner contracts.
+
 ### 3.8 Time, composition and rate scheduling
 
 Algorithm/schedule separation applies to the time axis. The semantic layer states a dynamical

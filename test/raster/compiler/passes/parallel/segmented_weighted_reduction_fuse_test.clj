@@ -456,6 +456,45 @@
       (is (empty? (fills after))
           "the suffix must observe the prefix update, not reset the allocation"))))
 
+(deftest reference-alias-before-a-protected-plan-does-not-initialize-scratch
+  (let [{:keys [form]} (fuse/fuse (chain) :float)
+        [[storage allocation] [result marker]] (mapv vec (partition 2 (second form)))
+        plan (fuse/marker-plan marker :float)
+        source (list 'let* ['scratch '(clojure.core/float-array 1)
+                           'alias 'scratch
+                           'before '(raster.par/pmap i 1 float (clojure.core/aget Q i))
+                           storage allocation result marker
+                           'observe '(clojure.core/println before)
+                           'after '(raster.par/map-void! i 1
+                                     (raster.par/atomic-add! scratch 0 (float 1.0)))]
+                     [result 'scratch 'alias])
+        options {:segmented-plans? true :resident-initialization? true
+                 :scalar-types (zipmap (:runtime-parameters plan) (repeat :long))
+                 :values (into {} (map (fn [{:keys [id dtype elements]}]
+                                        [id (av/tensor {:dtype dtype :shape [elements]})]))
+                               (:operands plan))}
+        arrays (into {} (map (juxt :id :dtype)) (:operands plan))
+        analyzed (typed-frontend/form->program-components
+                  source (assoc options :dtype :float :array-types arrays))
+        alias-entry (some #(when (= 'alias (get-in % [:description :sym])) %)
+                          (:entries analyzed))
+        attempt (typed-route/attempt source :float arrays options)
+        program (:program attempt)
+        [before [_ & after]] (split-with #(not (swr/plan? (:algorithm %)))
+                                        (:equations program))
+        fills #(filter (fn [equation] (= :zero (get-in equation [:attributes :initialization]))) %)]
+    (is (= :source-action (:kind alias-entry)))
+    (is (= #{'scratch} (set (:source-reads alias-entry))))
+    (is (some #(some #{'before} (:results %)) before)
+        "a later source action keeps the preceding numerical producer live")
+    (is (not-any? #(some #{'observe} (:results %)) (:equations program))
+        "the host action does not acquire a numerical equation")
+    (is (some? program) (pr-str (:declined attempt)))
+    (is (empty? (fills before)))
+    (is (= 1 (count (fills after)))
+        "a reference alias is a dependency, not evidence of an earlier content access")
+    (is (= 1 (get-in attempt [:stats :initialization-fills])))))
+
 (deftest protected-source-admission-does-not-infer-missing-or-conflicting-types
   (let [{:keys [form]} (fuse/fuse (chain) :float)
         marker (last (second form))
