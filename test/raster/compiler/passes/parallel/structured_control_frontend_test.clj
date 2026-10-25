@@ -69,6 +69,7 @@
                                              [:loop-binding 'another-loop]
                                              [:prefix-bindings []] [:suffix-bindings []]
                                              [:outer-body []] [:parameter-values {}] [:outer-values {}]
+                                             [:outer-equalities {}]
                                              [:typed-body-source nil] [:flattened-body-source nil]
                                              [:copy-certificate nil] [:write-certificates []]
                                              [:loop changed-loop]]]

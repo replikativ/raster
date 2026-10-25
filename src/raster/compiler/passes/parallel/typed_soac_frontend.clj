@@ -4704,7 +4704,13 @@
                                (get scalar-representatives expression expression)
                                (integer? expression) expression
                                (and (not= proved-extent expression)
-                                    (dialect/extent? proved-extent)) proved-extent
+                                    (dialect/extent? proved-extent)
+                                    ;; A symbolic shape can be an unknown dimension,
+                                    ;; not an executable scalar. Only entry values or
+                                    ;; preceding bindings may replace this source read.
+                                    (or (integer? proved-extent)
+                                        (entry-scalar? proved-extent)
+                                        (contains? scalar-representatives proved-extent))) proved-extent
                                :else (:sym description))]
           (cond-> (-> state
                       (update :descriptions conj
@@ -6279,6 +6285,68 @@
     {:descriptions (preserve-map-storage-inputs descriptions values)
      :values values :allocations allocations})))
 
+(defn- retain-allocation-projections [allocations values]
+  (mapv (fn [{:keys [source-expression] :as allocation}]
+          (let [projection (invocation-source/allocation-source source-expression values)]
+            (cond-> allocation
+              (:helper projection)
+              (assoc :source-projection (select-keys projection [:constructor :helper])))))
+        allocations))
+
+(defn- source-attributes [pairs host-descriptions allocations values]
+  (let [references (vec (distinct (mapcat #(util/free-syms (:expr %)) host-descriptions)))]
+    {:source-dialect :closed-clojure
+     :source-bindings (mapv first pairs)
+     :host-binding-ids (mapv :id host-descriptions)
+     :host-read-values (filterv #(contains? values %) references)
+     :host-read-sites (mapv (fn [{:keys [id expr]}]
+                              {:source-binding-id id
+                               :values (set (filter #(contains? values %)
+                                                    (util/free-syms expr)))}) host-descriptions)
+     :allocations allocations}))
+
+(defn ^:no-doc source-fragment-analysis
+  "Analyze source storage and binding descriptions without admitting an executable program.
+
+   Enclosing structured producers use the same source-description/allocation machinery
+   to split numerical islands from retained host tails. No host expression is executed,
+   and neither the descriptions nor their AbstractValues confer execution authority."
+  [source {:keys [dtype array-types scalar-types values shape-equalities lexical-inputs
+                  preserve-declared-array-storage?]
+           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}
+           :as options}]
+  (when-not (and (form/binding-form? source) (vector? (second source))
+                 (even? (count (second source))))
+    (fail! :source-fragment-binding-form "source fragment requires flat ordered bindings" {}))
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types values)
+            *region-local-counter* (atom -1)
+            *region-local-source-symbols* (source-symbols source options)]
+    (let [pairs (vec (map vec (partition 2 (second source))))
+          arrays (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
+          analysis (source-storage-analysis pairs dtype arrays scalar-types false values
+                                            shape-equalities lexical-inputs)
+          descriptions (consumer-descriptions (:descriptions analysis) false)
+          source-kinds {:arrays (set (keys arrays))
+                        :scalars (into (set (keys scalar-types))
+                                       (keep #(when (:scalar-dtype %) (:sym %))) descriptions)}
+          allocations
+          (mapv (fn [{:keys [destination source-binding-id] :as allocation}]
+                  (let [[binder expression] (get pairs source-binding-id)]
+                    (when-not (= binder destination)
+                      (fail! :source-fragment-allocation
+                             "source allocation must retain its actual binding ordinal"
+                             {:allocation allocation}))
+                    (binding [*declared-kinds* source-kinds]
+                      (assoc allocation :source-expression expression
+                             :extent (canonical-extent shape-equalities (:values analysis)
+                                                       (allocation-length expression))))))
+                (:allocations analysis))
+          allocations (retain-allocation-projections allocations (:values analysis))]
+      (assoc analysis
+             :numerical-binding-ids (mapv :id (filter soac-description? descriptions))
+             :attributes (source-attributes pairs (filterv #(= :scalar (:kind %)) descriptions)
+                                            allocations (:values analysis))))))
+
 (defn canonicalize-fresh-full-write-maps
   "Project a closed single-write effect region to the existing functional map contract.
 
@@ -6711,41 +6779,15 @@
               ;; Protected markers stay in the reconstructed host form until their existing plan
               ;; becomes a scheduled equation. Keeping the source binding is provenance and
               ;; compatibility materialization, not a second execution path after admission.
-              host-binding-ids (mapv :id host-control-descriptions)
-              ;; Program values a host-controlled binding reads are uses of those values: a
-              ;; producer read by the host must stay materialized, whatever fusion does with
-              ;; its typed consumers.
-              host-read-values
-              (->> host-read-references
-                   (filter #(contains? values %))
-                   distinct
-                   vec)
               ;; Capture helper correspondence where all source argument values
               ;; have been established, before fusion or runtime realization.
               ;; A storage-only allocation may have no InvocationPlan step.
-              allocations (mapv (fn [{:keys [source-expression] :as allocation}]
-                                  (let [projection (invocation-source/allocation-source
-                                                    source-expression values)]
-                                    (cond-> allocation
-                                      (:helper projection)
-                                      (assoc :source-projection
-                                             (select-keys projection [:constructor :helper])))))
-                                allocations)
+              allocations (retain-allocation-projections allocations values)
               facts (dialect/default-program-facts
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects
                       :provenance {:front-end :analyzed-source}
-                      :attributes {:source-dialect :closed-clojure
-                                   :source-bindings (mapv first pairs)
-                                   :host-binding-ids host-binding-ids
-                                   :host-read-values host-read-values
-                                   :host-read-sites
-                                   (mapv (fn [{:keys [id expr]}]
-                                           {:source-binding-id id
-                                            :values (set (filter #(contains? values %)
-                                                                 (util/free-syms expr)))})
-                                         host-control-descriptions)
-                                   :allocations allocations}})]
+                      :attributes (source-attributes pairs host-control-descriptions allocations values)})]
           (let [segmented? (boolean (seq swr-descriptions))
                 ;; For a mixed projection this is an equation catalog used to build maximal
                 ;; ordinary SOAC chunks. Its broad outputs prevent validation from discarding a

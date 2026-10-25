@@ -881,7 +881,8 @@
                     ;; the causal symbol environment, never a future program-wide value table.
                     ;; Other projections additionally need their current scalar result contract.
                     canonical (invocation-source/canonicalize-shape-projection
-                               (if (buffer-allocation? actual) lexical-values (:values plan))
+                               (if (buffer-allocation? actual) lexical-values
+                                 (merge (:values plan) lexical-values {symbol (:value actual)}))
                                public symbol expression)
                     _ (when (and (buffer-allocation? actual)
                                  (not (invocation-source/allocation-corresponds?
@@ -927,6 +928,8 @@
              (let [step (get steps-by-symbol symbol)
                    equation (parallel-program/equation-for-binding program symbol expression)
                    realization (invocation-source/realization-equation program symbol expression)
+                   program-value (get-in program [:values symbol])
+                   allocation-value (if (buffer-allocation? step) (:value step) program-value)
                    allocation? (and (contains? allocations symbol)
                                     (semantic/retained-source-equivalent? expression (get allocations symbol)))]
                (when (and equation realization)
@@ -934,10 +937,15 @@
                         "one source binding cannot be two different equation sites"
                         {:binding symbol}))
                (when (and allocation?
-                          (not (invocation-source/allocation-corresponds?
-                                expression (get-in program [:values symbol])
-                                (:initialization (invocation-source/allocation-source
-                                                  expression (:values program))) (:values program))))
+                          (not (and (compatible-value? allocation-value program-value)
+                                    ;; An actual step has already passed constructor
+                                    ;; correspondence in its causal lexical environment.
+                                    ;; The whole value table is not that environment.
+                                    (or (buffer-allocation? step)
+                                        (invocation-source/allocation-corresponds?
+                                         expression allocation-value
+                                         (:initialization (invocation-source/allocation-source
+                                                           expression (:values plan))) (:values plan))))))
                  (fail! :invocation-source-allocation
                         "source storage allocation differs from its retained physical contract"
                         {:binding symbol :source expression}))

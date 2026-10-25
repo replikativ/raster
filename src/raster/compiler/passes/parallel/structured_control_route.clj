@@ -219,11 +219,15 @@
 (defn- required-shape-scalars
   "Return scalar equation results in the transitive definition closure of retained shapes."
   [parallel-program]
-  (let [shape-symbols
+  (let [source-allocation-arguments
+        (mapcat (fn [{:keys [extent source-expression]}]
+                  (concat (util/free-syms extent) (util/free-syms source-expression)))
+                (get-in parallel-program [:attributes :allocations]))
+        shape-symbols
         (into #{}
-              (mapcat (fn [value]
-                        (mapcat util/free-syms (:shape value))))
-              (vals (:values parallel-program)))
+              (concat source-allocation-arguments
+                      (mapcat (fn [value] (mapcat util/free-syms (:shape value)))
+                              (vals (:values parallel-program)))))
         definitions
         (into {}
               (mapcat (fn [equation]
@@ -1284,14 +1288,113 @@
   (into {} (keep (fn [[id value]]
                    (when (shape? (:shape value)) [id (:dtype value)]))) values))
 
+(defn- scope-generated-results [typed scope]
+  (let [renames (into {} (keep (fn [id] (when-not (symbol? id) [id [scope id]])))
+                      (mapcat #(nth % 2) (soac/equations typed)))]
+    (if (seq renames) (soac/remap-values typed renames) typed)))
+
+(defn- prefix-program
+  [{:keys [prefix-bindings parameter-values loop loop-binding loop-source
+           suffix-bindings outer-body]} {:keys [abstract-machine] :as options}]
+  (when (seq prefix-bindings)
+    (let [options (-> options
+                      (assoc :values parameter-values)
+                      (update :array-types #(merge (value-types parameter-values seq) %))
+                      (update :scalar-types #(merge (value-types parameter-values empty?) %)))
+          options (if-let [parameters (or (:public-parameters options) (:active-params options))]
+                    (assoc options :lexical-inputs parameters) options)
+          source (list 'let* (vec (mapcat identity prefix-bindings)) nil)
+          analysis (typed-frontend/source-fragment-analysis source options)]
+      (when-let [last-numerical (last (:numerical-binding-ids analysis))]
+        (let [cutoff (inc last-numerical)
+              head (subvec prefix-bindings 0 cutoff)
+              tail (subvec prefix-bindings cutoff)
+              continuation (list* 'let*
+                                  (vec (mapcat identity
+                                               (concat tail [[loop-binding loop-source]] suffix-bindings)))
+                                  outer-body)
+              needed (into (set (control/outer-operands loop)) (util/free-syms continuation))
+              outputs (filterv needed (mapv first head))
+              source (list 'let* (vec (mapcat identity head)) outputs)
+              typed (typed-frontend/form->program source options)]
+          (when-not typed
+            (fail! :structured-control-unsupported-prefix
+                   "pre-loop numerical work is outside the certified TypedSOAC subset"
+                   {:prefix-bindings head}))
+          (let [fused (-> (first (fusion/fusion-fixpoint typed abstract-machine))
+                          (scope-generated-results :prefix))
+                envelope (typed-route/analyzed-program-envelope source fused)]
+            {:envelope envelope :typed fused :tail tail :cutoff cutoff
+             :source-attributes (:attributes analysis)}))))))
+
+(defn- prefix-storage-results [typed]
+  (let [facts (soac/facts (soac/validate! typed))]
+    (reduce
+     (fn [mapping equation]
+       (reduce (fn [mapping [result {:keys [destination host-return]}]]
+                 (if (and (= :buffer host-return)
+                          (= destination (get-in facts [:equations (second equation) :aliases result])))
+                   (do (when (contains? mapping destination)
+                         (fail! :structured-control-prefix-storage
+                                "a prefix storage join requires one preceding result owner"
+                                {:destination destination}))
+                       (assoc mapping destination result))
+                   mapping))
+               mapping (map vector (nth equation 2) (soac/result-storage facts (second equation)))))
+     {} (soac/equations typed))))
+
+(defn- prefix-loop-join [{:keys [loop outer-values outer-equalities]} prefix]
+  (if-not prefix
+    {:dimension-loop loop :loop loop :dimensions {}}
+    (let [values (get-in prefix [:envelope :values])
+          results (prefix-storage-results (:typed prefix))
+          incoming (set (control/outer-operands loop))
+          available (into (set (get-in prefix [:envelope :inputs]))
+                          (mapcat :results (get-in prefix [:envelope :equations])))
+          buffers (select-keys results incoming)
+          analysis {:values outer-values :equalities outer-equalities}
+          dimensions
+          (reduce-kv
+           (fn [renames physical logical]
+             (let [before (get-in (control/outer-values loop) [physical :shape])
+                   after (:shape (get values logical))]
+               (when-not (= (count before) (count after))
+                 (fail! :structured-control-prefix-shape
+                        "a prefix result must preserve the complete loop input rank"
+                        {:physical physical :logical logical :before before :after after}))
+               (reduce (fn [renames [old new]]
+                         (if (= old new) renames
+                           (do
+                             (when-not (and (contains? incoming old)
+                                            (contains? available new)
+                                            (= [] (:shape (get outer-values old)))
+                                            (contains? #{:int :long} (:dtype (get outer-values old)))
+                                            (= [] (:shape (get values new)))
+                                            (contains? #{:int :long} (:dtype (get values new)))
+                                            (= (host-av/shape-extent analysis old)
+                                               (host-av/shape-extent analysis new))
+                                            (or (not (contains? renames old)) (= new (get renames old))))
+                               (fail! :structured-control-prefix-shape
+                                      "loop dimensions need preceding source equality and one target"
+                                      {:physical physical :old old :new new}))
+                             (assoc renames old new))))
+                       renames (map vector before after))))
+           {} buffers)
+          dimension-loop (control/rebind-incoming loop dimensions values)]
+      {:dimension-loop dimension-loop :dimensions dimensions
+       :loop (control/rebind-incoming dimension-loop buffers values)})))
+
 (defn- suffix-program
-  [{:keys [loop suffix-bindings outer-body]} {:keys [dtype abstract-machine] :as options}]
+  [{:keys [loop suffix-bindings outer-body outer-values]}
+   {:keys [dtype abstract-machine] :as options}]
   (when (or (seq suffix-bindings) (seq outer-body))
     (let [source (list* 'let* (vec (mapcat identity suffix-bindings)) outer-body)
           ;; Analyze the source's physical carry names first. Fresh loop results belong to the
           ;; enclosing SSA boundary, not this original source environment.
           outputs (control/outer-results loop)
-          values (apply dissoc (control/outer-values loop) outputs)
+          values (apply dissoc
+                        (merge (select-keys outer-values (util/free-syms source))
+                               (control/outer-values loop)) outputs)
           typed (typed-frontend/form->program
                  source (assoc options
                                :dtype (or dtype :double)
@@ -1304,7 +1407,8 @@
         (fail! :structured-control-unsupported-suffix
                "post-loop computation is outside the certified TypedSOAC subset"
                {:suffix-bindings suffix-bindings :outer-body outer-body}))
-      (let [fused (first (fusion/fusion-fixpoint typed abstract-machine))
+      (let [fused (-> (first (fusion/fusion-fixpoint typed abstract-machine))
+                      (scope-generated-results :suffix))
             inputs (set (:inputs (soac/facts fused)))
             substitutions (into {} (keep (fn [{:keys [initial output]}]
                                             (when (contains? inputs initial) [initial output])))
@@ -1323,16 +1427,46 @@
                                 [(if (integer? id) (+ id offset) id)
                                  (offset-source-facts facts offset)])) %))))
 
-(defn- suffix-source-attributes [suffix prefix-bindings loop-binding]
-  (let [offset (inc (count prefix-bindings))
-        shift #(cond-> % (integer? (:source-binding-id %)) (update :source-binding-id + offset))
-        attributes (:attributes suffix)]
+(defn- offset-source-attributes [attributes offset]
+  (let [shift #(cond-> % (integer? (:source-binding-id %)) (update :source-binding-id + offset))]
     (cond-> attributes
-      (:source-bindings attributes)
-      (update :source-bindings #(into (conj (mapv first prefix-bindings) loop-binding) %))
       (:host-binding-ids attributes) (update :host-binding-ids #(mapv (partial + offset) %))
       (:host-read-sites attributes) (update :host-read-sites #(mapv shift %))
       (:allocations attributes) (update :allocations #(mapv shift %)))))
+
+(defn- composed-source-attributes [prefix suffix prefix-bindings loop-binding]
+  (let [head (get-in prefix [:envelope :attributes])
+        complete (:source-attributes prefix)
+        cutoff (:cutoff prefix)
+        tail-hosts (filterv #(>= % cutoff) (:host-binding-ids complete))
+        tail-reads (filterv #(>= (:source-binding-id %) cutoff) (:host-read-sites complete))
+        before (if prefix
+                 (assoc (merge head complete)
+                        :host-binding-ids (into (vec (:host-binding-ids head)) tail-hosts)
+                        :host-read-sites (into (vec (:host-read-sites head)) tail-reads))
+                 {})
+        after (offset-source-attributes (:attributes suffix) (inc (count prefix-bindings)))]
+    (-> (merge before after)
+        (assoc :source-bindings (into (conj (mapv first prefix-bindings) loop-binding)
+                                     (get-in suffix [:attributes :source-bindings])))
+        (assoc :host-binding-ids (into (vec (:host-binding-ids before)) (:host-binding-ids after))
+               :host-read-sites (into (vec (:host-read-sites before)) (:host-read-sites after))
+               :host-read-values (vec (distinct (concat (:host-read-values before)
+                                                        (:host-read-values after))))
+               :allocations (into (vec (:allocations before)) (:allocations after))))))
+
+(defn- normalize-decomposition [decomposition options]
+  (if-not (:source decomposition)
+    decomposition
+    (let [options (update options :array-types
+                          #(merge (value-types (:parameter-values decomposition) seq) %))
+          options (if-let [parameters (or (:public-parameters options) (:active-params options))]
+                    (assoc options :lexical-inputs parameters) options)
+          source (typed-frontend/normalize-source (:source decomposition) options)]
+      (if (identical? source (:source decomposition)) decomposition
+        (or (frontend/form->structured-loop source options)
+            (fail! :structured-control-normalized-source
+                   "normalized structured source must retain its verified loop construction" {}))))))
 
 (defn- loop-equation
   [loop loop-binding loop-source]
@@ -1351,11 +1485,18 @@
    When a suffix is itself in the TypedSOAC subset, its uses of the physical carried array are
    alpha-remapped to the loop's fresh logical output and appended as ordinary typed equations."
   ([decomposition] (program-envelope decomposition {}))
-  ([{:keys [loop source loop-binding loop-source prefix-bindings parameter-values outer-values]
-     :as decomposition} options]
+  ([decomposition options]
    (frontend/validate-decomposition! decomposition)
-   (let [loop-equation (loop-equation loop loop-binding loop-source)
-         suffix-envelope (suffix-program decomposition options)
+   (let [{:keys [source loop-binding loop-source prefix-bindings parameter-values outer-values]
+          :as decomposition} (normalize-decomposition decomposition options)
+         prefix (when source (prefix-program decomposition options))
+         {:keys [loop dimension-loop dimensions]} (prefix-loop-join decomposition prefix)
+         suffix-envelope (suffix-program (assoc decomposition :loop dimension-loop)
+                                         (if prefix (assoc options :shape-equalities dimensions)
+                                             options))
+         loop-equation (loop-equation loop loop-binding loop-source)
+         prefix-equations (mapv #(update % :id (fn [id] [:prefix id]))
+                               (get-in prefix [:envelope :equations]))
          source-offset (inc (count prefix-bindings))
          suffix-equations (mapv #(-> (offset-source-facts % source-offset)
                                      (update :id (fn [id] [:suffix id])))
@@ -1363,13 +1504,19 @@
          source (if (and source suffix-envelope)
                   (with-meta (list* (first source)
                                     (vec (mapcat identity
-                                                 (concat prefix-bindings [[loop-binding loop-source]]
+                                                 (concat (if prefix
+                                                           (concat (partition 2 (second (get-in prefix [:envelope :source])))
+                                                                   (:tail prefix))
+                                                           prefix-bindings)
+                                                         [[loop-binding loop-source]]
                                                          (partition 2 (second (:source suffix-envelope))))))
                                     (drop 2 (:source suffix-envelope)))
                              (meta source))
                   source)
-         equations (into [loop-equation] suffix-equations)
-         values (merge-values (control/outer-values loop) (:values suffix-envelope))
+         equations (into (conj prefix-equations loop-equation) suffix-equations)
+         values (merge-values (merge-values (get-in prefix [:envelope :values] {})
+                                            (control/outer-values loop))
+                              (:values suffix-envelope))
          program-outputs (or (:outputs suffix-envelope) (control/outer-results loop))
          {:keys [inputs outputs]} (program-boundary equations program-outputs)
          effects (reduce set/union #{} (map :effects equations))
@@ -1384,7 +1531,7 @@
            :effects effects
            :provenance {:source-dialect :typed-structured-control
                         :pass :structured-control-route}
-           :attributes (assoc (suffix-source-attributes suffix-envelope prefix-bindings loop-binding)
+           :attributes (assoc (composed-source-attributes prefix suffix-envelope prefix-bindings loop-binding)
                                :host-control :typed-structured-control
                                :mixed-algorithms (boolean suffix-envelope))
            :operation? typed-operation?

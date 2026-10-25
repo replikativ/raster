@@ -175,6 +175,18 @@
                                           {:values {'input initial}})
                                   [:values 'n :dtype])))))
 
+(deftest physical-constructor-capacity-retains-its-already-bound-count
+  (let [source '(let* [n (clojure.core/alength input)
+                      later (long (clojure.core/alength input))
+                      storage (clojure.core/double-array n)] storage)
+        analysis (host-av/analyze-capacities
+                  source {:values {'input initial} :lexical-inputs '[input]})]
+    (is (= '[n] (get-in analysis [:definition-values 'storage :shape])))
+    (is (= '[later] (get-in analysis [:values 'storage :shape]))
+        "logical relational refinement remains independent of physical allocation")
+    (is (= :int (get-in analysis [:definition-values 'n :dtype])))
+    (is (= :long (get-in analysis [:definition-values 'later :dtype])))))
+
 (deftest partial-or-offset-copies-are-not-functionalized
   (let [analysis (host-av/analyze (source 'n) {:values {'u0 initial} :dtype :double})
         complete (get (binding-map (source 'n)) 'copy)]

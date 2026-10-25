@@ -39,9 +39,27 @@ Fresh qualification in a clean worktree passes 244 tests / 1,506 assertions,
 including frontend/fusion/ownership controls and existing source-correspondence
 and suffix-allocation integration tests. A separate warm probe admits the actual
 normalized RK4 source with its complete-copy certificate. This is not ordered
-loop execution or full-branch qualification. The next producer work remains
-ordinary TypedSOAC prefix composition, then execution through the existing
-ordered cursor; do not add a separate clone executor.
+loop execution or full-branch qualification.
+
+The unmerged continuation now composes an ordinary TypedSOAC prefix, exact
+retained host tail, structured loop and ordinary suffix before common invocation
+promotion. Primitive clones become ordinary copy maps, not another executor.
+Physical constructor counts remain distinct from normalized numerical domains;
+loop-boundary rebinding requires exact transported contracts and source-derived
+dimension correspondence. Analyzed source ordinals and runtime cursor positions
+remain separate. Fresh qualification passes 286 tests / 1,818 assertions across
+12 affected suites. The complete routing namespace separately reports 68 tests /
+591 assertions, zero failures and two errors: public MLP eager lowering across
+source-order barriers, and public RK4's manual whole-call construction before
+ordered structured execution. Neither gate is skipped or marked successful.
+The local runner's final summary initially attempted numeric addition on the
+keyword-valued summary type; the completed suite summaries, not its exit, supply
+these counts. Source-free scheduler/replay fixtures explicitly supply initialized
+carry and grant no whole-source credit. Public source tests retain the copy,
+allocations, checked count, loop and suffix. Next: independent review and clean
+checkpoint qualification, then ordered loop entry/access, carry rotation,
+completion and final projection through the existing owner. PR #1566 remains
+unqualified; pushed head 0460b638 has failing unit, OpenCL and emitter gates.
 
 For comparison, exact-parent `be180fd6` CI34832 has 15 completed unit summaries:
 6,949 tests / 87,661 assertions, 24 failures / 50 errors across 58 test Vars; the

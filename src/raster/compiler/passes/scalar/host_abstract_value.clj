@@ -126,7 +126,8 @@
   (when value
     (canonical-shape (:equalities analysis) (:shape value))))
 
-(defn- shape-extent
+(defn ^:no-doc shape-extent
+  "Query an existing relational analysis; the returned extent grants no source authority."
   [{:keys [values equalities]} expression]
   (let [expression (descriptor/unwrap-int-cast expression)]
     (if (and (seq? expression)
@@ -155,6 +156,15 @@
     (cond-> state
       (not= normalized extent) (assoc-in [:equalities normalized] extent)
       (not= expression normalized) (assoc-in [:equalities expression] extent))))
+
+(defn- allocation-count-reference [state allocation]
+  (let [count (:extent allocation)
+        value (get-in state [:values count])]
+    (when (and (:capacity-only? state) (:dtype allocation) (nil? (:source allocation))
+               (symbol? count) (contains? (:available state) count)
+               (= :tensor (:kind value)) (= [] (:shape value))
+               (contains? #{:int :long} (:dtype value)))
+      count)))
 
 (defn- infer-value
   [state symbol expression default-dtype bound-buffer-source]
@@ -218,7 +228,8 @@
         state)
 
       allocation
-      (let [extent (or (shape-extent state (:extent allocation))
+      (let [extent (or (allocation-count-reference state allocation)
+                       (shape-extent state (:extent allocation))
                        (:extent allocation))
             allocation-dtype (or (:dtype allocation)
                                  (get-in values [(:source allocation) :dtype])
@@ -460,11 +471,17 @@
                  next-context (cond-> next-context
                                 (not eligible?) (update-in [:analysis :values] dissoc id)
                                 (not eligible?) (update-in [:analysis :available] disj id))
+                 count-reference (allocation-count-reference (:analysis context)
+                                                              (array-allocation expression))
                  value (when eligible?
                          (when-let [value (get-in next-context [:analysis :values id])]
-                           (update value :shape
-                                   #(canonical-shape
-                                     (get-in next-context [:analysis :equalities]) %))))]
+                           ;; Physical capacity names the count actually supplied to
+                           ;; this constructor, not a later/equivalent numerical domain.
+                           (if count-reference
+                             (assoc value :shape [count-reference])
+                             (update value :shape
+                                     #(canonical-shape
+                                       (get-in next-context [:analysis :equalities]) %)))))]
              {:context next-context
               :logical-context (advance-binding logical-context id (or reference expression))
               :definitions (cond-> definitions value (assoc id value))}))

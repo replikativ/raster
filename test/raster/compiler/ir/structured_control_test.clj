@@ -56,6 +56,30 @@
             zero-trip (apply list zero-trip)]
         (is (= zero-trip (control/validate! zero-trip)))))))
 
+(deftest incoming-rebinding-preserves-inner-scope-and-exact-contracts
+  (let [{:keys [program]} (fixture)
+        shape (av/tensor {:dtype :float :shape '[producer-length]})
+        targets {'producer-length extent 'copy shape}
+        rebound (control/rebind-incoming program {'n 'producer-length 'u0 'copy} targets)]
+    (is (identical? (control/body program) (control/body rebound)))
+    (is (= (control/outer-results program) (control/outer-results rebound)))
+    (is (= '[steps producer-length alpha copy] (control/outer-operands rebound)))
+    (is (= '[producer-length] (get-in (control/outer-values rebound) ['u-final :shape])))
+    (is (= program (control/rebind-incoming program {} {})))
+    (doseq [[renames targets expected]
+            [[{'n 'u-final} {'u-final extent} :typed-loop-incoming-renames]
+             [{'u-final 'other} {'other shape} :typed-loop-incoming-renames]
+             [{'n 'same 'u0 'same} {'same extent} :typed-loop-incoming-renames]
+             [{'n 'steps} {'steps extent} :typed-loop-incoming-renames]
+             [{'n 'producer-length} {'producer-length trip-index} :typed-loop-value-mismatch]
+             [{'u0 'copy} {'copy (av/tensor {:dtype :double :shape '[n]})}
+              :typed-loop-value-mismatch]
+             [{'u0 'copy} {'copy (assoc tensor :ownership :borrowed)} :typed-loop-value-mismatch]
+             [{'u0 'copy} {} :typed-loop-unknown-value]]]
+      (is (= expected
+             (try (control/rebind-incoming program renames targets) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
 (deftest structured-loop-boundaries-are-certified
   (let [{:keys [program outer-values]} (fixture)]
     (testing "body inputs are ordered, not inferred from a set"

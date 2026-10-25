@@ -76,6 +76,21 @@
       (is (some? copy-map))
       (is (not (contains? incoming (nth copy-map 2)))))))
 
+(deftest abstract-shape-names-do-not-replace-source-length-computations
+  (let [descriptions [{:kind :scalar :sym 'measured
+                      :expr '(clojure.core/alength input) :scalar-dtype :int}]
+        normalize (fn [values descriptions]
+                    (#'frontend/normalize-extents descriptions {} values))]
+    (is (= '(clojure.core/alength input)
+           (:expr (first (normalize {'input (av/tensor {:dtype :double :shape '[unknown]})}
+                                    descriptions)))))
+    (is (= '(clojure.core/alength input)
+           (:expr (first (normalize {'input (av/tensor {:dtype :double :shape '[later]})
+                                     'later (av/tensor {:dtype :int :shape []})}
+                                    (conj descriptions {:kind :scalar :sym 'later :expr 3}))))))
+    (is (= 3 (:expr (first (normalize {'input (av/tensor {:dtype :double :shape [3]})}
+                                     descriptions)))))))
+
 (deftest reference-entry-projection-requires-the-actual-unshadowed-formal
   (let [{:keys [source]} (#'lineage/fresh-entry)
         parameters '[values count scale reference]

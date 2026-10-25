@@ -416,6 +416,7 @@
                        :prefix-bindings prefix-pairs
                        :parameter-values (:values parameter-analysis)
                        :outer-values (:values outer-analysis)
+                       :outer-equalities (:equalities outer-analysis)
                        :suffix-bindings suffix-pairs
                        :outer-body (vec outer-body)
                        :flattened-body-source flattened-source

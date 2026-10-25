@@ -244,3 +244,38 @@
   (validate!
    (list 'loop-program (assoc loop-facts :values outer-values)
          (vec index) (vec invariant-bindings) (vec carry-bindings) body-program)))
+
+(defn rebind-incoming
+  "Mechanically rebind a loop's incoming boundary, leaving its body and outputs scoped.
+
+   Like SOAC value renaming, this is not an equivalence proof. The enclosing
+   producer must establish the value/storage correspondence. Target AbstractValues
+   must exactly match the transported contracts; aliases, dtype/ownership changes
+   and collisions cannot be justified by numerical shape equality alone."
+  [program renames target-values]
+  (validate! program)
+  (when-not (and (map? renames)
+                 (every? soac/value-id? (concat (keys renames) (vals renames))))
+    (fail! :typed-loop-incoming-renames "incoming rebinding requires a value-ID map"
+           {:renames renames}))
+  (let [incoming (set (outer-operands program))
+        values (outer-values program)
+        changed (into {} (remove (fn [[source target]] (= source target))) renames)]
+    (when-not (and (set/subset? (set (keys renames)) incoming)
+                   (= (count changed) (count (distinct (vals changed))))
+                   (empty? (set/intersection (set (vals changed))
+                                             (apply disj (set (keys values)) (keys changed)))))
+      (fail! :typed-loop-incoming-renames
+             "incoming rebinding requires distinct compatible targets outside retained loop values"
+             {:renames renames :incoming incoming}))
+    (let [transported (into {} (map (fn [[id value]]
+                                     [(get renames id id) (remap-value value renames)])) values)]
+      (doseq [[_ target] changed]
+        (require-compatible! target (require-value! target-values target :incoming-target)
+                             target (get transported target) {} :incoming-target))
+      (make (facts program)
+            [(first (loop-index program)) (get renames (second (loop-index program))
+                                               (second (loop-index program)))]
+            (mapv #(update % :outer (fn [id] (get renames id id))) (invariants program))
+            (mapv #(update % :initial (fn [id] (get renames id id))) (carried program))
+            (body program) transported))))

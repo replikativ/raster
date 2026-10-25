@@ -6,6 +6,10 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.binding-completion :as binding-completion]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
+            [raster.compiler.support.mangled :as mangled]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]
@@ -160,9 +164,77 @@
                           (meta expression))))))]
     (project expression)))
 
+(declare projection-corresponds?)
+
+(defn- selected-length-expression
+  "Derive a length expression from the selected source, never its Object return tag.
+   The actual input interface, original body and lookup history must agree."
+  [expression value values]
+  (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+        (descriptor/call-description expression)]
+    (when (and dispatch? (not lexical-callee) (= 1 (count arguments))
+               (= :tensor (:kind value)) (= [] (:shape value))
+               (contains? #{:int :long} (:dtype value))
+               (descriptor/alength-op? semantic-op)
+               (= semantic-op (mangled/impl->op implementation-op)))
+      (method-entry/call-with-definition-inputs
+       #(method-entry/call-with-optional-definition-inputs
+         (fn []
+           (when-let [definition (method-entry/observed-selected-definition
+                                 :typed semantic-op implementation-op 1)]
+             (let [entry (method-entry/selected-source-entry-carriers
+                          semantic-op implementation-op 1 (:source-var definition))
+                   carrier (first (:parameter-carriers entry))
+                   operand (first arguments)
+                   actual (get values operand)
+                   storage-dtype (dtype/dtype-for-jvm-array-class carrier)
+                   context (when entry (method-entry/selected-typed-entry-body definition))
+                   [body & more] (:body context)
+                   parameters (set (:parameters definition))]
+               (when (and storage-dtype (symbol? operand)
+                          (= storage-dtype (:dtype actual)) (= 1 (count (:shape actual)))
+                          (= {:kind :plain} (:representation actual))
+                          (nil? (:logical-layout actual)) body (empty? more))
+                 (let [policy (delay (some-> (find-ns 'raster.compiler.backend.jvm.bytecode)
+                                            (ns-resolve 'binding-completion-plan)
+                                            binding-completion/capture-resolution-context))
+                       reference-compatible?
+                       (fn [node]
+                         (or (nil? (binding-completion/declared-binding-hint node))
+                             (binding-completion/reference-binding-without-check?
+                              node (:source-ns context) @policy carrier)))
+                       ;; Caller aliases have no source-namespace authority here.
+                       ;; Only bootstrap reference hints can use the body namespace.
+                       caller-hint (binding-completion/declared-binding-hint operand)
+                       caller-hint? (or (nil? caller-hint)
+                                        (dtype/dtype-for-array-tag caller-hint)
+                                        (contains? '#{objects Object java.lang.Object} caller-hint))
+                       projected
+                       (letfn [(project [node]
+                                 (when (and (seq? node) (= 2 (count node)))
+                                   (when-let [operation (method-entry/observed-body-operation
+                                                        context (first node) parameters)]
+                                     (when (or (= 'clojure.core/alength operation)
+                                               (and (= "clojure.core" (namespace operation))
+                                                    (descriptor/cast-op? operation)))
+                                       (intrinsic-source/observe-original!
+                                        (:source-ns context) (first node) operation)
+                                       (if (= 'clojure.core/alength operation)
+                                         (when (and (= (second node) (first (:parameters definition)))
+                                                    (reference-compatible? (second node)))
+                                           ;; Build pure target syntax, not source-owned metadata.
+                                           (list operation (with-meta operand nil)))
+                                         (when-let [inner (project (second node))]
+                                           (list operation inner)))))))]
+                         (when (and caller-hint? (reference-compatible? operand)) (project body)))]
+                   (when (and projected (projection-corresponds? projected value))
+                     projected)))))))))))
+
 (defn canonicalize-shape-projection
   [program-values public-inputs symbol expression]
-  (let [source (shape-projection-source expression)
+  (let [expression (or (selected-length-expression expression (get program-values symbol) program-values)
+                       expression)
+        source (shape-projection-source expression)
         dimension (when (and source (not (contains? public-inputs source)))
                     (certified-shape-dimension program-values source))]
     (if-not dimension

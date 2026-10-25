@@ -9,6 +9,8 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.method-entry :as method-entry]
+            [clojure.walk :as walk]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as auxiliary]
             [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
@@ -209,6 +211,11 @@
     (is (identical? original-source (:source program)) "shape comparison does not rewrite source")
     (is (nil? (get (:values plan) 'buffer_arg))
         "the alias is intentionally stored only under its invocation identity")
+    (is (some #(= 'out (:storage %))
+              (invocation/source-order
+               plan (assoc-in program [:attributes :allocations]
+                              [{:destination 'out :source-expression constructor}])))
+        "an allocation claim reuses the same causal constructor check, not the whole value table")
     (is (= '(clojure.core/aclone x) (get (into {} pairs) 'copy)))
     (is (= '(clojure.core/double-array (clojure.core/long (clojure.core/alength buffer_arg)))
            constructor))
@@ -263,6 +270,49 @@
   (doseq [dtype [:byte :long]]
     (is (not (source/projection-corresponds? '(clojure.core/byte (clojure.core/alength xs))
                                              (av/tensor {:dtype dtype :shape []}))))))
+
+(deftest typed-length-projection-owns-the-definition-not-the-object-return-tag
+  (let [expression (with-meta '(.invk raster.arrays/alength_m_doubles-impl xs)
+                     {:raster.op/original 'raster.arrays/alength})
+        values {'xs (av/tensor {:dtype :double :shape '[unknown]})
+                'foreign (av/tensor {:dtype :double :shape '[unknown]})
+                'length (av/tensor {:dtype :long :shape []})}
+        project #(source/canonicalize-shape-projection values #{'xs 'foreign} 'length expression)
+        expected '(clojure.core/long (clojure.core/alength xs))
+        original method-entry/selected-typed-entry-body
+        changed-body
+        (fn [transform]
+          (with-redefs [method-entry/selected-typed-entry-body
+                        (fn [definition]
+                          (when-let [context (original definition)]
+                            (assoc context :body [(transform (first (:body context))
+                                                              (first (:parameters definition)))])))]
+            (project)))]
+    (is (= Object (:result-carrier
+                  (method-entry/live-selected-parameter-carriers
+                   'raster.arrays/alength 'raster.arrays/alength_m_doubles-impl 1))))
+    (is (= expected (project)))
+    (is (string? (semantic/fingerprint (project))) "no source-owner object leaks into the projection")
+    (is (= expected
+           (changed-body (fn [body parameter]
+                           (walk/postwalk #(if (= parameter %) (with-meta % {:tag 'doubles}) %) body)))))
+    (doseq [transform [(fn [body parameter]
+                        (walk/postwalk #(if (= parameter %) 'foreign %) body))
+                      (fn [body parameter]
+                        (walk/postwalk #(if (= parameter %) (with-meta % {:tag 'objects}) %) body))
+                      (fn [body _] (list 'do '(throw (Exception.)) body))
+                      (fn [body _] (list 'let* '[unused 1] body))]]
+      (is (= expression (changed-body transform))))
+    (with-redefs [method-entry/observed-body-operation (fn [& _] nil)]
+      (is (= expression (project)) "qualified spelling is not historical lookup authority"))
+    (is (= expression
+           (source/canonicalize-shape-projection
+            (assoc values 'xs (av/tensor {:dtype :float :shape '[unknown]}))
+            #{'xs} 'length expression)))
+    ;; The same source must qualify after the helper genuinely JITs, not only
+    ;; while its original source is pending. No numerical helper is invoked by project.
+    (is (= 3 (arrays/alength (double-array 3))))
+    (is (= expected (project)))))
 
 (deftest allocation-claims-and-auxiliary-owners-are-unambiguous
   (let [[program plan] (allocation-boundary)

@@ -214,6 +214,20 @@
   (let [[_ bindings] (mixed-source)]
     (list 'let* (vec (concat (take 8 bindings) suffix-bindings)) result)))
 
+(defn- mixed-algorithm-program
+  "Scheduler/runtime fixture with an externally supplied initialized carry.
+   This is not a whole Clojure source entry: no clone/allocation execution or
+   source-completion credit is claimed. Public source tests use the full constructor."
+  [source options]
+  (let [decomposition (frontend/form->structured-loop source options)]
+    (route/program-envelope
+     {:loop (:loop decomposition) :loop-binding (:loop-binding decomposition)
+      :suffix-bindings (:suffix-bindings decomposition) :outer-body (:outer-body decomposition)
+      :outer-values (:outer-values decomposition)} options)))
+
+(defn- scheduled-mixed-algorithm [source options]
+  (route/schedule-program (mixed-algorithm-program source options) options))
+
 (defn- reason-of
   [thunk]
   (try
@@ -388,8 +402,7 @@
         options {:dtype :double
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        decomposition (frontend/form->structured-loop (mixed-source) options)
-        typed (route/program-envelope decomposition options)
+        typed (mixed-algorithm-program (mixed-source) options)
         scheduled (route/schedule-program typed {:target-device :cpu:0 :dtype :double})
         [loop-equation suffix-equation] (:equations typed)
         [scheduled-loop scheduled-suffix] (:equations scheduled)
@@ -397,7 +410,8 @@
     (is (= 2 (count (:equations typed))))
     (is (= [loop-output 'n] (:operands suffix-equation)))
     (is (= '[after] (:outputs typed)))
-    (is (= '[steps n u] (:inputs typed)))
+    (is (= '[steps n scratch u] (:inputs typed))
+        "the source-free numerical fragment receives its external scratch explicitly")
     (is (= true (get-in typed [:attributes :mixed-algorithms])))
     (is (schedule/scheduled-loop? (first (:operations scheduled-loop))))
     (is (segop/segop-node? (first (:operations scheduled-suffix))))
@@ -416,7 +430,7 @@
     (is (= :structured-control-unsupported-suffix
            (reason-of #(route/program-envelope decomposition options))))))
 
-(deftest suffix-shadowing-is-rejected-instead-of-breaking-program-ssa
+(deftest suffix-shadowing-preserves-the-source-scope-with-distinct-program-ssa
   (let [initial (av/tensor {:dtype :double :shape ['extent]
                             :representation {:kind :plain}})
         options {:dtype :double
@@ -426,9 +440,15 @@
                 '[u (raster.par/pmap k n double
                                      (* 2.0 (clojure.core/aget u k)))]
                 'u)
-        decomposition (frontend/form->structured-loop source options)]
-    (is (= :typed-soac-use-before-definition
-           (reason-of #(route/program-envelope decomposition options))))))
+        options (assoc options :public-parameters '[u0 steps] :array-types {'u0 :double})
+        decomposition (frontend/form->structured-loop source options)
+        typed (route/program-envelope decomposition options)
+        loop (some #(when (control/loop-program? (:algorithm %)) %) (:equations typed))
+        suffix (filter #(= :suffix (first (:id %))) (:equations typed))
+        binders (take-nth 2 (second (:source typed)))]
+    (is (= (count binders) (count (distinct binders))))
+    (is (some (set (:results loop)) (mapcat :operands suffix)))
+    (is (not= (:outputs typed) (:results loop)))))
 
 (deftest algorithm-kind-and-operation-kind-must-remain-paired
   (let [initial (av/tensor {:dtype :double :shape ['extent]
@@ -436,8 +456,7 @@
         options {:dtype :double
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        decomposition (frontend/form->structured-loop (mixed-source) options)
-        typed (route/program-envelope decomposition options)
+        typed (mixed-algorithm-program (mixed-source) options)
         suffix-operation (get-in typed [:equations 1 :operations 0])
         malformed (assoc-in typed [:equations 0 :operations] [suffix-operation])]
     (is (= :parallel-program-algorithm
@@ -447,7 +466,7 @@
 (deftest public-scheduler-selects-the-structured-semantic-program
   (let [initial (av/tensor {:dtype :double :shape ['extent]
                             :representation {:kind :plain}})
-        options {:dtype :double
+        options {:dtype :double :public-parameters '[u0 steps] :array-types {'u0 :double}
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
@@ -459,7 +478,10 @@
     (is (dialects/valid-scheduled-program? (:form scheduled)))
     (is (= :typed-structured-control (get-in scheduled [:stats :source-dialect])))
     (is (= 1 (get-in scheduled [:stats :structured-loops-scheduled])))
-    (is (= 2 (count (:equations (:form scheduled)))))))
+    (is (= 3 (count (remove #(get-in % [:attributes :host-only])
+                           (:equations (:form scheduled)))))
+        "the source copy, loop and suffix all enter the same numerical schedule")
+    (is (some #(= :prefix (first (:id %))) (:equations (:form scheduled))))))
 
 (deftest structured-attempt-exposes-a-coverage-decline
   (let [initial (av/tensor {:dtype :double :shape ['extent]
@@ -492,7 +514,7 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        typed (:program (route/attempt (mixed-source) options))
+        typed (mixed-algorithm-program (mixed-source) options)
         algorithm (get-in typed [:equations 1 :algorithm])
         scheduled (:form (segop-lower/segop-lower-pass
                           (typed-route/program-envelope algorithm) options))
@@ -512,7 +534,7 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        scheduled (scheduled-mixed-algorithm (mixed-source) options)
         opaque-source (assoc scheduled :source ::must-not-be-inspected)
         {:keys [program kernels stats]} (program-opencl/emit-program opaque-source options)
         [loop-equation suffix-equation] (:equations program)]
@@ -542,7 +564,7 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        scheduled (scheduled-mixed-algorithm (mixed-source) options)
         scheduled-loop (get-in scheduled [:equations 0 :operations 0])
         calls (atom [])
         emit-graph segop-opencl/generate-kernel-graph]
@@ -574,12 +596,15 @@
         (let [semantic (route/program-envelope (frontend/form->structured-loop source options) options)
               plan (get-in semantic [:attributes :invocation-plan])
               order (invocation/source-order plan semantic)
+              loop-equation (some #(when (control/loop-program? (:algorithm %)) %) (:equations semantic))
               suffix (filter #(= :suffix (first (:id %))) (:equations semantic))]
-          (is (= '[n u scratch] (mapv :symbol (:steps plan)))
+          (is (some #{'scratch} (map :symbol (:steps plan)))
               "an observable scratch allocation survives numerical functionalization")
+          (is (not-any? invocation/buffer-clone? (:steps plan))
+              "the initial copy is an ordinary prefix equation, not a second runtime executor")
           (is (= (mapv :id (:equations semantic)) (vec (keep :equation order))))
           (is (seq suffix))
-          (is (some (set (:results (first (:equations semantic)))) (mapcat :operands suffix))
+          (is (some (set (:results loop-equation)) (mapcat :operands suffix))
               "the suffix consumes the loop's actual fresh SSA output")
           (is (not-any? fn? (tree-seq coll? seq semantic)))
           (if allocated?
@@ -608,12 +633,13 @@
                        compilation [(double-array 8) (double-array 8) 0.1 1.0 0.01 3] nil)
               refusal (try (invocation-link/validate-ordered-source-actions! initial) nil
                            (catch clojure.lang.ExceptionInfo error (ex-data error)))
-              blocked-step (some #(when (= (get-in refusal [:entry :invocation-step]) (:id %)) %)
-                                 (:steps plan))]
+              blocked-equation (some #(when (= (get-in refusal [:entry :equation]) (:id %)) %)
+                                     (:equations semantic))]
           (is (= :invocation-ordered-source-action
                  (:reason refusal)))
-          (is (invocation/buffer-clone? blocked-step)
-              "the first remaining executor gap is the source clone, not source correspondence"))))))
+          (is (not-any? invocation/buffer-clone? (:steps plan)))
+          (is (= (:id equation) (:id blocked-equation))
+              "the remaining executor gap is the structured loop, after ordinary prefix copying"))))))
 
 (deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
   (let [arguments [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]
@@ -631,8 +657,10 @@
          invocation-plan
          arguments
          evaluate-test-scalar)
-        loop-operation (get-in scheduled [:equations 0 :operations 0])
-        loop-equation (first (:equations emitted-program))
+        loop-operation (some #(when (schedule/scheduled-loop? %) %)
+                             (mapcat :operations (:equations scheduled)))
+        loop-equation (some #(when (control/loop-program? (:algorithm %)) %)
+                            (:equations emitted-program))
         trip-count-id (second (control/loop-index (:algorithm loop-equation)))
         loop-output (-> loop-equation :algorithm control/carried first :output)
         device-results
@@ -1665,7 +1693,7 @@
                   :target-device :ocl:0
                   :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                   :scalar-types {'steps :long}}
-         scheduled (:form (pipeline/schedule-parallel-form source options))
+         scheduled (scheduled-mixed-algorithm source options)
          emitted (:program (program-opencl/emit-program
                             (assoc scheduled :source ::must-not-be-inspected) options))
          loop-equation (first (:equations emitted))
@@ -2190,10 +2218,13 @@
 
 (deftest scheduled-loop-consumers-read-physical-result-storage
   (let [graph (-> (prepared-mixed-call 1) :call :steps first :graph)
-        [producer consumer] (:nodes graph)]
+        [producer consumer] (:nodes graph)
+        temporary-ids (mapv :id (:temporaries graph))
+        temporary-id (first temporary-ids)]
     (is (= '[rstr_loop_carry_4] (mapv :id (:inputs graph))))
-    (is (= '[scratch] (mapv :id (:temporaries graph))))
-    (is (some #(and (= 'scratch (:buffer %)) (= :read (:access %))) (:uses consumer)))
+    (is (= 1 (count temporary-ids)))
+    (is (some #(and (= temporary-id (:buffer %)) (= :write (:access %))) (:uses producer)))
+    (is (some #(and (= temporary-id (:buffer %)) (= :read (:access %))) (:uses consumer)))
     (is (= [(:id producer)] (:dependencies consumer)))
     (is (not-any? #(= 'rstr_loop_value_0 (:buffer %)) (:uses consumer)))))
 
@@ -2395,8 +2426,7 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        scheduled (:form (pipeline/schedule-parallel-form
-                          (mixed-source-without-induction) options))
+        scheduled (scheduled-mixed-algorithm (mixed-source-without-induction) options)
         base (:program (program-opencl/emit-program
                         (assoc scheduled :source ::must-not-be-inspected) options))
         loop-equation (first (:equations base))
