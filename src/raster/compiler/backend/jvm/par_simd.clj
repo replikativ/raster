@@ -23,6 +23,9 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.backend.jvm.bytecode :as bc]
+            [raster.compiler.ir.contraction-facts :as cf]
+            [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
@@ -356,6 +359,99 @@
 ;; Pipeline pass: SIMD optimization
 ;; ================================================================
 
+;; ----------------------------------------------------------------
+;; Dense-contraction leaf: generated host expansion or BLAS
+;; ----------------------------------------------------------------
+
+(def dense-contraction-leaves #{:generated :blas})
+
+(def ^:dynamic *dense-contraction-leaf*
+  "How the JVM backend executes a verified dense matrix product that no generated (SIMD /
+   fused) schedule consumed:
+   - :generated (default) — the host expansion of `raster.par/contract`, i.e. generated code.
+   - :blas — a BLAS GEMM, but only when `dense-contract-blas-plan` admits the contraction and
+     the emitted run-time guard (`raster.linalg.blas/dense-gemm-admissible?`) holds; otherwise
+     the same host expansion.
+   The leaf is consulted only at the correctness boundary, after every generated schedule
+   declined, so it never pre-empts fusion. Initial value from the JVM property
+   `raster.jvm.dense-contraction-leaf`."
+  (let [leaf (keyword (System/getProperty "raster.jvm.dense-contraction-leaf" "generated"))]
+    (if (contains? dense-contraction-leaves leaf) leaf :generated)))
+
+(defn- dimension-operand? [x]
+  (or (symbol? x) (integer? x)))
+
+(defn dense-contract-blas-plan
+  "Compile-time admission of a `par/contract` to the BLAS leaf. Returns
+   {:ok true :op .. :A .. :B .. :out .. :dimensions [m k n] :elem ..} or {:ok false :reason ..}.
+
+   A dense row-major layout alone does not license BLAS. Admission also requires:
+   - numerical permission: the contraction's source arithmetic is exactly the abstract BLAS
+     product of its element dtype (`numerical-contract/blas-source-arithmetic`: implementation-
+     defined association and rounding points), i.e. it was canonicalized from a BLAS-spelled
+     product. A contraction with retained typed-SSA arithmetic keeps its ordered generated loop;
+   - no result conversion (:out-dtype), :decode, :stages or epilogue, positive-zero init,
+     not batched (negative zero remains observable for an empty contraction);
+   - :double or :float elements and operand/dimension spellings the run-time guard can test
+     without re-evaluating an expression (symbols / integer literals);
+   - a loadable BLAS provider at compile time (re-checked at run time).
+   Capacities, Integer-range dimensions and runtime aliasing are checked by the emitted guard."
+  [form]
+  (if-not (and (seq? form) (= 'raster.par/contract (first form)))
+    {:ok false :reason :not-a-contract}
+    (try
+      (let [elem (:raster.type/elem-type (meta form))
+            facts (cf/contraction-facts form :dtype (or elem :double))
+            view (cf/dense-matrix-view facts)
+            out (second form)
+            {:keys [variant bindings dimensions]} view
+            [m n k] dimensions
+            A (:row bindings) B (:col bindings)
+            op (case variant
+                 :nn 'raster.linalg.blas/dgemm!
+                 :nt 'raster.linalg.blas/dgemm-nt!
+                 :tn 'raster.linalg.blas/dgemm-tn!
+                 nil)
+            neutral (:neutral (cf/scalar-reduction-view facts))
+            neutral-value (:value (constant/value neutral))
+            negative-zero? (and (number? neutral-value) (zero? neutral-value)
+                                (neg? (Double/doubleToRawLongBits (double neutral-value))))
+            ready? #((requiring-resolve 'raster.linalg.blas/gemm-provider-ready?) elem)]
+        (cond
+          (not (contains? #{:double :float} elem)) {:ok false :reason :element-type :elem elem}
+          (not (:ok view)) {:ok false :reason (or (:reason view) :not-dense)}
+          (:batched? view) {:ok false :reason :batched}
+          negative-zero? {:ok false :reason :signed-zero-init}
+          (some? (:epilogue view)) {:ok false :reason :epilogue}
+          (seq (dissoc (:opts facts) :init :combine :algebra))
+          {:ok false :reason :contract-options :options (vec (keys (dissoc (:opts facts) :init :combine :algebra)))}
+          (not= (:source-arithmetic facts) (numerics/blas-source-arithmetic elem))
+          {:ok false :reason :numerical-permission :source-arithmetic (:source-arithmetic facts)}
+          (nil? op) {:ok false :reason :layout :variant variant}
+          (not (and (symbol? out) (symbol? A) (symbol? B))) {:ok false :reason :operand-spelling}
+          (or (= A out) (= B out)) {:ok false :reason :static-alias}
+          (not (every? dimension-operand? [m k n])) {:ok false :reason :dimension-spelling}
+          (not (ready?)) {:ok false :reason :provider-unavailable}
+          :else {:ok true :op op :A A :B B :out out :dimensions [m k n] :elem elem}))
+      (catch Throwable t {:ok false :reason :facts :message (.getMessage t)}))))
+
+(defn dense-contract-blas-form
+  "The BLAS leaf for an admitted plan: a run-time guard selecting the GEMM call or `fallback`
+   (the host expansion of the same contract). The guard re-checks the provider, rejects
+   C identical to A or B (distinct names do not prove distinct buffers; JVM arrays are disjoint
+   objects, so identity is exactly overlap), and checks element class, Integer-range
+   dimensions and capacities m·k ≤ |A|, k·n ≤ |B|, m·n ≤ |C|. Any failure runs `fallback`,
+   so out-of-range shapes keep the generated loop's bounds-checked behaviour."
+  [{:keys [op A B out dimensions elem]} fallback]
+  (let [[m k n] dimensions
+        one (if (= elem :float) '(clojure.core/float 1.0) 1.0)
+        zero (if (= elem :float) '(clojure.core/float 0.0) 0.0)]
+    (list 'if (list 'raster.linalg.blas/dense-gemm-admissible? elem A B out m k n)
+          (list op A B out
+                (list 'clojure.core/long m) (list 'clojure.core/long k) (list 'clojure.core/long n)
+                one zero)
+          fallback)))
+
 (defn- effective-min-elements
   "Compute minimum elements for SIMD from hardware registry.
   AVX2 (4 lanes) → 8, AVX-512 (8 lanes) → 16."
@@ -558,12 +654,26 @@
               ;; macroexpand is deliberately wrong here: it rewrites the walker's `.invk` nodes
               ;; into interop forms before the bytecode backend consumes them.
               (par/par-form? form)
-              (do (swap! stats update :fallback inc)
-                  (macroexpand/macroexpand-all-preserving
-                   form
-                   ;; Preserve the walker's devirtualized typed calls. Unlike macroexpand-core,
-                   ;; this intentionally expands raster.par macros at the correctness boundary.
-                   #(and (symbol? %) (.startsWith (name %) "."))))
+              (let [host-expand #(macroexpand/macroexpand-all-preserving
+                                  %
+                                  ;; Preserve the walker's devirtualized typed calls. Unlike
+                                  ;; macroexpand-core, this intentionally expands raster.par
+                                  ;; macros at the correctness boundary.
+                                  (fn [s] (and (symbol? s) (.startsWith (name s) "."))))
+                    plan (when (and (= :blas *dense-contraction-leaf*)
+                                    (= 'raster.par/contract (first form)))
+                           (dense-contract-blas-plan form))]
+                (swap! stats update :fallback inc)
+                (cond
+                  (:ok plan)
+                  (do (swap! stats update :blas-contractions (fnil inc 0))
+                      (dense-contract-blas-form plan (host-expand form)))
+
+                  plan
+                  (do (swap! stats update-in [:blas-declines (:reason plan)] (fnil inc 0))
+                      (host-expand form))
+
+                  :else (host-expand form)))
 
               ;; let/let* — typed fusion has already made every legal fusion decision before
               ;; scheduling. A backend-local source rewrite would invalidate that certificate and
