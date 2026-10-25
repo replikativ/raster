@@ -58,6 +58,10 @@
                                   stride :- Long offset :- Long] :- Double
   (par/reduce acc 0.0 i cnt
     (n/+ acc (n/* x (aget data (+ (* (long i) stride) offset))))))
+(deftm explicitly-wrapping-packed-observation-region
+  [x :- Double data :- (Array double) cnt :- Long stride :- Long offset :- Long] :- Double
+  (par/reduce acc 0.0 i cnt
+    (n/+ acc (n/* x (aget data (clojure.core/unchecked-int (+ (* (long i) stride) offset)))))))
 (def index-events (atom []))
 (deftm effectful-index-region [x :- Double data :- (Array double)] :- Double
   (n/* x (aget data (do (swap! index-events conj :index) 0))))
@@ -107,11 +111,26 @@
         (is (< (Math/abs (- value (* x total))) 1e-12))
         (is (< (Math/abs (- dx total)) 1e-12))
         (is (every? nil? [inactive-data inactive-count inactive-stride inactive-offset]))))
-    (is (= [1.4 2.0 nil nil nil nil] (invoke 0.7 (double-array [2.0]) 1 1 4294967296)))
-    (is (thrown? ArrayIndexOutOfBoundsException (invoke 0.7 (double-array [2.0]) 1 1 Long/MAX_VALUE)))
-    (is (thrown? ArrayIndexOutOfBoundsException (invoke 0.7 (double-array [2.0]) 1 1 -1)))
+    (let [source-read (fn [^doubles data ^long index] (aget data index))
+          exception-class (fn [run] (try (run) nil (catch Throwable error (class error))))]
+      (doseq [offset [4294967296 Long/MAX_VALUE -1]]
+        (let [data (double-array [2.0])
+              expected (exception-class #(source-read data offset))]
+          (is (some? expected))
+          (is (= expected (exception-class #(invoke 0.7 data 1 1 offset)))
+              "owned index replay preserves checked Clojure narrowing before the read"))))
     (is (thrown? NullPointerException (invoke 0.7 nil 1 1 0)))
     (is (= [0.0 0.0 nil nil nil nil] (invoke 0.7 nil 0 1 0)))))
+
+(deftest explicit-wrapping-observation-keeps-its-primal-and-active-scalar-gradient
+  (let [invoke (#'reverse/compile-prepared-value+grad
+                (prepared #'explicitly-wrapping-packed-observation-region))
+        source-read (fn [^doubles data ^long index] (aget data (unchecked-int index)))
+        data (double-array [2.0])
+        total (source-read data 4294967296)]
+    (is (= 2.0 total))
+    (is (= [(* 0.7 total) total nil nil nil nil]
+           (invoke 0.7 data 1 1 4294967296)))))
 
 (deftest inactive-index-ports-do-not-prove-effect-closure
   (let [before @index-events]

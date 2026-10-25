@@ -17,8 +17,11 @@ Landing order within the unchanged eight-objective campaign:
    both now reuse the same exact-program/request-sealed static validation while
    invocation materialization and final plan checks stay fresh. Seven existing
    proof/policy tests pass (68 assertions), including the original count-one
-   expectation. The older packed-index overflow oracle still needs an independent
-   checked-Clojure replacement and explicit unchecked wrapping control.
+   expectation. The older packed-index overflow oracle now compares actual
+   exception classes with independent checked Clojure array reads. A separate
+   explicit unchecked-int fixture retains wrapping and verifies its primal and
+   active scalar gradient. The affected owned-AD/index namespaces pass 42 tests /
+   1,099 assertions; null and empty-loop checks remain intact.
 2. Close missing source producers using public workloads: selected helper
    correspondence on allocation-only actions (ASR), causal buffer capacity aliases
    (graph attention/AD), nested allocation lengths (RK4), and complete Float/Object
