@@ -6670,6 +6670,17 @@
                    (filter #(contains? values %))
                    distinct
                    vec)
+              ;; Capture helper correspondence where all source argument values
+              ;; have been established, before fusion or runtime realization.
+              ;; A storage-only allocation may have no InvocationPlan step.
+              allocations (mapv (fn [{:keys [source-expression] :as allocation}]
+                                  (let [projection (invocation-source/allocation-source
+                                                    source-expression values)]
+                                    (cond-> allocation
+                                      (:helper projection)
+                                      (assoc :source-projection
+                                             (select-keys projection [:constructor :helper])))))
+                                allocations)
               facts (dialect/default-program-facts
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects

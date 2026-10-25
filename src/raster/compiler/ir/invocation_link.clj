@@ -639,7 +639,9 @@
      :materialization (materialization/begin-materialization invocation arguments)
      :realized {:buffers {} :storage {} :loop-scratch {}}
      :acquired-storage #{}
-     :source-allocations (into {} (map (juxt :destination :source-expression))
+     ;; Preserve the producer's complete allocation claim. A storage-only
+     ;; source action has no prefix step from which to recover its helper owner.
+     :source-allocations (into {} (map (juxt :destination identity))
                               (get-in semantic-program [:attributes :allocations]))
      :projections (:projections checked) :retained-validation checked :target (:target compilation)
      :caller-options caller-options}))
@@ -803,23 +805,25 @@
         action (get (:source-realizations state) (:source-cursor state))
         auxiliary? (= :result-allocation (:kind action))
         destination (or (:storage entry) (when auxiliary? (:binding action)))
-        expression (if auxiliary? (:expression action) (get (:source-allocations state) destination))
+        claim (get (:source-allocations state) destination)
+        expression (if auxiliary? (:expression action) (:source-expression claim))
         abstract (get-in state [:program :values destination])
         values (get-in state [:program :values])
         projection (invocation-source/allocation-source expression values)
         step (some #(when (= (:invocation-step entry) (:id %)) %)
                    (get-in state [:materialization :plan :steps]))
-        initialization (:initialization projection)]
+        initialization (:initialization projection)
+        retained-projections (keep :source-projection [step claim action])]
     (when-not (and destination (= :zero initialization)
                    (invocation-source/allocation-corresponds? expression abstract initialization values))
       (fail! :invocation-ordered-next-allocation
              "the next source entry is not an admitted size-only zero allocation" {:entry entry}))
     (when auxiliary? (validate-source-result-allocation! state entry action))
-    (when (and (:helper projection)
-               (not (semantic/equivalent? (select-keys projection [:constructor :helper])
-                                         (:source-projection step))))
+    (when (or (and (:helper projection) (empty? retained-projections))
+              (some #(not (semantic/equivalent? (select-keys projection [:constructor :helper]) %))
+                    retained-projections))
       (fail! :invocation-ordered-allocation-definition
-             "allocation helper differs from this invocation's retained constructor definition"
+             "allocation helper lacks or differs from its retained constructor definition"
              {:entry entry}))
     (when-not (ifn? evaluate-size)
       (fail! :invocation-ordered-size-evaluator

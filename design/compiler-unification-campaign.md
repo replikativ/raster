@@ -24,6 +24,16 @@ Landing order within the unchanged eight-objective campaign:
    (graph attention/AD), nested allocation lengths (RK4), and complete Float/Object
    results. Retain exact construction ownership, not fresh metadata or equality
    masquerading as original evidence.
+   The allocation-only helper omission is corrected: final frontend values now
+   retain the selected constructor/helper projection on the allocation claim;
+   ordered realization preserves the complete claim and checks every available
+   owner projection rather than assuming a prefix step exists. Missing or altered
+   ownership refuses before size evaluation. The affected source-order/allocation
+   suites and attention device namespace pass 47 tests / 533 assertions, with
+   both local OpenCL and Level Zero cases executing without skips. The original
+   failing causal-score-rounding case passes separately (three assertions).
+   Source count checks, argument availability, allocation position and zero
+   initialization remain unchanged; projection data is not completion credit.
 3. Complete the common ordered public boundary: share port intent and output
    selection, then explicit outputs/taps, resident scalars, aggregate state,
    donation and composition. AMR/distributed consumers need an actual ordered

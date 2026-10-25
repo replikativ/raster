@@ -10,6 +10,7 @@
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
@@ -18,6 +19,7 @@
             [raster.compiler.passes.parallel.structured-control-route :as route]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.core :refer [deftm]]
+            [raster.dl.attention :as attention]
             [raster.par :as par]))
 
 (deftm source-sized-output
@@ -460,6 +462,37 @@
             (is (empty? (get-in prepared [:state :acquired-storage])))))
         (is (= 1 @calls))
         (is (empty? (get-in state [:realized :storage])))))))
+
+(deftest allocation-only-actions-retain-helper-definition-before-size-evaluation
+  (let [compilation (equation-first/compile #'attention/batched-causal-attn-weights
+                                          {:target :ocl:0 :dtype :float
+                                           :schedule {:precision :f32-scalar}})
+        initial (invocation-link/begin-ordered-realization
+                 compilation [(float-array 6) (float-array 6) 1 2 3] nil)
+        position (first (keep-indexed (fn [i entry] (when (= 'W (:storage entry)) i))
+                                     (:source-order initial)))
+        entry (nth (:source-order initial) position)
+        claim (get-in initial [:source-allocations 'W])
+        projection (invocation-source/allocation-source
+                    (:source-expression claim) (get-in initial [:program :values]))
+        calls (atom 0)
+        evaluate (fn [& _] (swap! calls inc) (throw (AssertionError. "evaluated unowned size")))]
+    (is (nil? (:invocation-step entry)) "the regression has no prefix step to own the helper")
+    (is (some? (get-in claim [:source-projection :helper])))
+    (is (fingerprint/equivalent? (select-keys projection [:constructor :helper])
+                                (:source-projection claim)))
+    ;; These are ownership preflight checks only, not simulated acquisition of
+    ;; earlier storage. They must refuse before asking for any count or resource.
+    (doseq [changed [(update-in initial [:source-allocations 'W] dissoc :source-projection)
+                     (assoc-in initial [:source-allocations 'W :source-projection :constructor]
+                               '(clojure.core/double-array 1))
+                     (assoc-in initial [:source-allocations 'W :source-projection :helper :definition]
+                               {:parameters [] :parameter-tags [] :constructor '(clojure.core/float-array 0)})]]
+      (is (= :invocation-ordered-allocation-definition
+             (reason #(invocation-link/prepare-source-allocation
+                       (assoc changed :source-cursor position) evaluate nil)))))
+    (is (zero? @calls))
+    (is (empty? (:acquired-storage initial)))))
 
 (deftest literal-helper-source-allocation-prepares-without-replaying-the-helper
   (let [compilation (equation-first/compile #'fixture/literal-helper-source-zero-observed
