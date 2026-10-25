@@ -4,7 +4,9 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
+            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
+            [raster.compiler.passes.parallel.structured-control-route :as route]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]))
 
 (def ^:private initial
@@ -39,6 +41,45 @@
 (defn- update-bindings
   [source f]
   (apply list (first source) (f (second source)) (drop 2 source)))
+
+(deftest source-correspondence-belongs-to-the-whole-frontend-construction
+  (let [source (loop-source 'n)
+        decomposition (frontend/form->structured-loop source options)
+        typed (route/program-envelope decomposition options)
+        equation (program/equation-for-binding typed (:loop-binding decomposition)
+                                               (:loop-source decomposition))
+        original-loop (:loop decomposition)
+        changed-loop (control/make (control/facts original-loop)
+                                   [(first (control/loop-index original-loop)) 0]
+                                   (control/invariants original-loop) (control/carried original-loop)
+                                   (control/body original-loop) (control/outer-values original-loop))
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (identical? decomposition (frontend/validate-decomposition! decomposition)))
+    (is (identical? (nth (second source) 7) (:loop-source decomposition)))
+    (is (= (:loop-source decomposition) (:source equation)))
+    (is (not-any? fn? (tree-seq coll? seq typed)) "construction witnesses never enter pure IR")
+    (doseq [changed (concat
+                    [(into {} decomposition)
+                     (assoc (frontend/form->structured-loop source options)
+                            :provenance-seal (:provenance-seal decomposition))
+                     (dissoc decomposition :source)]
+                    (for [[key replacement] [[:source '(let* [] nil)]
+                                             [:loop-source '(dotimes [i 0] nil)]
+                                             [:loop-binding 'another-loop]
+                                             [:prefix-bindings []] [:suffix-bindings []]
+                                             [:outer-body []] [:parameter-values {}] [:outer-values {}]
+                                             [:typed-body-source nil] [:flattened-body-source nil]
+                                             [:copy-certificate nil] [:write-certificates []]
+                                             [:loop changed-loop]]]
+                      (assoc decomposition key replacement)))]
+      (is (= :structured-control-source-construction
+             (reason #(route/program-envelope changed options)))))))
+
+(deftest selected-loop-binding-must-be-unambiguous
+  (let [source (update-bindings (loop-source 'n) #(into % ['time-loop 0]))]
+    (is (= :structured-loop-source-binding
+           (try (frontend/form->structured-loop source options) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (deftest destination-writing-loop-becomes-a-typed-functional-fixpoint
   (let [{:keys [loop prefix-bindings suffix-bindings copy-certificate

@@ -90,6 +90,27 @@
                (try (check (replace-binding owner 'buffer changed) prefix #{}) nil
                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
 
+(deftest promotion-cannot-replace-stale-auxiliary-ownership-with-a-prefix-allocation
+  (let [program (functional-program)
+        owner (first (:equations program))
+        {:keys [binding expression]} (first (get-in owner [:attributes :realization-bindings]))
+        options {:dtype :double :public-parameters '[x] :array-types {'x :double}}
+        promote #(structured/promote-program % options)
+        replace-witness (fn [program changed]
+                          (update-in program [:equations 0 :attributes :realization-bindings]
+                                     (fn [entries]
+                                       (mapv #(if (= binding (:binding %))
+                                                (assoc % :expression changed) %) entries))))]
+    (is (some? binding))
+    (is (some? (promote program)))
+    (doseq [changed (semantic-variants expression)
+            candidate [(replace-binding program binding changed)
+                       (replace-witness program changed)
+                       (replace-witness (replace-binding program binding changed) changed)]]
+      (is (= :structured-control-host-continuation
+             (try (promote candidate) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
 (deftest singleton-packet-source-admission-preserves-semantic-metadata
   (let [packet (functional-program)
         equation (first (:equations packet))

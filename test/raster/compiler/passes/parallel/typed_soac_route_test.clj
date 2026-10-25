@@ -51,6 +51,34 @@
             [raster.numeric :as numeric]
             [raster.gpu.program-tuning :as program-tuning]))
 
+(deftest analyzed-envelope-transports-only-fresh-read-only-inputs
+  (let [source '(let* [a (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
+                       b (raster.par/pmap j n float (+ (clojure.core/aget a j) 1.0))] b)
+        typed (frontend/form->program source {:dtype :float :array-types {'x :float}
+                                              :scalar-types {'n :long}})
+        fused (first (fusion/fusion-fixpoint typed nil))
+        envelope (route/analyzed-program-envelope source fused {'x 'loop-result})]
+    (is (< (count (dialect/equations fused)) (count (dialect/equations typed))))
+    (is (some #{'loop-result} (:inputs envelope)))
+    (is (not-any? #{'x} (:inputs envelope)))
+    (is (some #{'x} (util/free-syms (:source envelope)))
+        "realized source retains the physical carry, not a synthetic host alias")
+    (doseq [equation (:equations envelope)]
+      (is (= equation (parallel-program/equation-for-binding
+                      envelope (second (:site equation)) (:source equation)))))
+    (doseq [mapping [{'missing 'fresh} {'missing 'missing} {'x 'b}
+                     {'x 'fresh 'n 'fresh} {'x 'n}]]
+      (is (= :typed-soac-incoming-renaming
+             (try (route/analyzed-program-envelope source fused mapping) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (let [write-source '(let* [y (raster.par/map! out i n float (clojure.core/aget x i))] y)
+          write-program (frontend/form->program write-source
+                                               {:dtype :float :array-types {'x :float 'out :float}
+                                                :scalar-types {'n :long}})]
+      (is (= :typed-soac-incoming-renaming
+             (try (route/analyzed-program-envelope write-source write-program {'out 'fresh}) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
 (defn- kernel-body-operations
   [artifact]
   (letfn [(walk [operations]

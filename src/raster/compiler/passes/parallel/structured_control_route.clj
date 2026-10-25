@@ -331,6 +331,55 @@
             required' (set/union required dependencies)]
         (if (= required required') required (recur required'))))))
 
+(defn- exact-source-owner?
+  "Existing source execution ownership, not a purity or completion claim."
+  [parallel-program symbol expression]
+  (or (program/equation-for-binding parallel-program symbol expression)
+      (invocation-source/realization-binding? parallel-program symbol expression)
+      (some (fn [{:keys [destination source-expression]}]
+              (and (= symbol destination)
+                   (semantic/retained-source-equivalent? expression source-expression)))
+            (get-in parallel-program [:attributes :allocations]))))
+
+(defn- invocation-binding-expression
+  "Preserve allocation recipes and their lexical dependencies; normalize only scalar projections.
+   Allocation size equivalence is checked separately in the causal InvocationPlan environment."
+  [values public-inputs symbol expression]
+  (if (invocation-source/allocation-source expression values)
+    expression
+    (invocation-source/canonicalize-shape-projection values public-inputs symbol expression)))
+
+(defn- validate-retained-source-owners!
+  "Existing source claims must each remain valid before considering another executor.
+   A matching prefix, equation or allocation may not conceal another stale claim."
+  [parallel-program]
+  (let [definitions (group-by first (partition 2 (second (:source parallel-program))))
+        actual (fn [binding]
+                 (let [pairs (get definitions binding)]
+                   (when (= 1 (count pairs)) (second (first pairs)))))
+        check! (fn [binding valid? family]
+                 (when-not valid?
+                   (fail! :structured-control-host-continuation
+                          "retained execution ownership differs from its source definition"
+                          {:binding binding :site [:binding binding] :owner family})))]
+    (doseq [equation (:equations parallel-program)]
+      (when (= :binding (first (:site equation)))
+        (let [binding (second (:site equation))]
+          (check! binding (and (some? (actual binding))
+                               (semantic/retained-source-equivalent? (:source equation) (actual binding)))
+                  :equation)))
+      (doseq [{:keys [binding]} (get-in equation [:attributes :realization-bindings])]
+        (check! binding (= (:id equation)
+                           (:id (invocation-source/realization-equation
+                                 parallel-program binding (actual binding))))
+                :realization)))
+    (doseq [{:keys [destination source-expression]} (get-in parallel-program [:attributes :allocations])]
+      (check! destination (and (some? (actual destination))
+                              (semantic/retained-source-equivalent?
+                               source-expression (actual destination)))
+              :allocation)))
+  parallel-program)
+
 (defn- invocation-prefix
   [parallel-program public-parameters prefix-values]
   (let [source (:source parallel-program)]
@@ -341,10 +390,11 @@
     (let [program-values (:values parallel-program)
           prefix-values (merge prefix-values program-values)
           public-inputs (set public-parameters)
+          raw-source-pairs (mapv vec (partition 2 (second source)))
           source-pairs (mapv (fn [[symbol expression]]
-                               [symbol (invocation-source/canonicalize-shape-projection
+                               [symbol (invocation-binding-expression
                                         prefix-values public-inputs symbol expression)])
-                             (partition 2 (second source)))
+                             raw-source-pairs)
           equation-sites (into #{} (keep (fn [equation]
                                            (when (= :binding (first (:site equation)))
                                              (second (:site equation)))))
@@ -370,7 +420,15 @@
           retained-identities (into #{} (keep (fn [[symbol expression]]
                                                (when (invocation-source/preserved-reference-identity?
                                                       symbol expression) symbol))) candidates)
-          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots retained-identities)
+          ;; This is an ordered step catalog, not permission to evaluate a whole prefix early.
+          ;; Retained observable work must execute or refuse, even when functionalization removes
+          ;; its numerical use. Already-owned auxiliary actions retain their existing executor.
+          retained-actions (into #{} (keep (fn [[symbol expression]]
+                                             (when (and (not (exact-source-owner? parallel-program symbol expression))
+                                                        (not (effects/removable-expr? expression)))
+                                               symbol))) raw-source-pairs)
+          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots
+                                           retained-identities retained-actions)
                                 (set public-parameters))
           required (required-prefix-symbols candidates roots)
           bindings (filterv (comp required first) candidates)
@@ -741,7 +799,9 @@
   "Host-controlled bindings may remain in an island's retained source, but a complete
    invocation must either execute them or prove them removable. Exact retained binding
    expressions, not advisory host IDs or coincident source sites, certify coverage."
-  [parallel-program prefix public-inputs]
+  ([parallel-program prefix public-inputs]
+   (validate-host-coverage! parallel-program prefix public-inputs (:values parallel-program)))
+  ([parallel-program prefix public-inputs projection-values]
   (let [prefix-bindings (into {} prefix)
         allocations (into {} (map (juxt :destination :source-expression))
                           (get-in parallel-program [:attributes :allocations]))
@@ -754,15 +814,12 @@
     (doseq [[symbol expression] (partition 2 (second (:source parallel-program)))
             :when (and (not (and (contains? prefix-bindings symbol)
                                  (semantic/retained-source-equivalent?
-                                  (invocation-source/canonicalize-shape-projection
-                                   (:values parallel-program)
+                                  (invocation-binding-expression
+                                   projection-values
                                    public-inputs
                                    symbol expression)
                                   (get prefix-bindings symbol))))
-                       (not (program/equation-for-binding parallel-program symbol expression))
-                       (not (invocation-source/realization-binding? parallel-program symbol expression))
-                       (not (and (contains? allocations symbol)
-                                 (semantic/retained-source-equivalent? expression (get allocations symbol))))
+                       (not (exact-source-owner? parallel-program symbol expression))
                        ;; A changed claimed binding invalidates its executor even when the new
                        ;; source expression is pure. Only unclaimed host work may be removed.
                        (or (contains? claimed symbol)
@@ -771,15 +828,16 @@
              "a retained host computation has no executor in the complete typed invocation"
              {:binding symbol :expression expression :site [:binding symbol]
               :source-meta (meta expression)}))
-    parallel-program))
+    parallel-program)))
 
 (defn promote-program
-  "Attach the public invocation contract to an analyzed loop-free typed ParallelProgram.
+  "Attach the public invocation contract to an analyzed source-bearing typed ParallelProgram.
 
    The numerical equations are unchanged. This pass adds only the public invocation contract:
-   direct parameters map by identity, while the transitive non-equation host prefix becomes typed
-   ShapeProjection/ScalarCompute/allocation steps. Structured loops and loop-free algorithms can
-   therefore share scheduling, emission, ProgramCall, LinkPlan, and runtime lowering."
+   direct parameters map by identity, while non-equation host dependencies and unowned observable
+   source actions become ordered ShapeProjection/ScalarCompute/allocation steps. The step catalog
+   is not permission to evaluate late actions before numerical execution. Structured loops and
+   loop-free algorithms share this same boundary and preserve one authoritative source order."
   [parallel-program {:keys [public-parameters active-params array-types scalar-types]
                      :as options}]
   (when-not (contains? #{:typed-soac :typed-parallel} (:dialect parallel-program))
@@ -794,6 +852,7 @@
            {:destinations (vec providers)}))
   (let [parallel-program (-> parallel-program
                              (validate-source-result! options)
+                             validate-retained-source-owners!
                              (assoc :dialect :typed-parallel)
                              validate-typed-program!)
         public-parameters (vec (or public-parameters active-params))
@@ -849,8 +908,13 @@
         program-values (refine-effect-result-shapes (merge shape-values program-values)
                                                    (:equations parallel-program))
         parallel-program (assoc parallel-program :values program-values)
-        prefix (invocation-prefix parallel-program public-parameters host-values)
-        _ (validate-host-coverage! parallel-program prefix (set public-parameters))
+        projection-values (merge host-values program-values)
+        prefix (invocation-prefix parallel-program public-parameters projection-values)
+        ;; Construction and coverage must project in the identical causal environment. Host-only
+        ;; allocation aliases need not occur in the numerical value table; omitting them here
+        ;; would compare a normalized extent with the original alength expression instead.
+        _ (validate-host-coverage! parallel-program prefix (set public-parameters)
+                                  projection-values)
         [binding-values _]
         (reduce (fn [[resolved available] [symbol expression]]
                      (let [identity-source (invocation-source/reference-identity-source symbol expression)
@@ -1189,30 +1253,58 @@
 (defn- suffix-program
   [{:keys [loop suffix-bindings outer-body]} {:keys [dtype abstract-machine] :as options}]
   (when (or (seq suffix-bindings) (seq outer-body))
-    (let [substitutions (into {} (map (juxt :initial :output) (control/carried loop)))
-          source (util/subst-syms
-                  substitutions
-                  (list* 'let* (vec (mapcat identity suffix-bindings)) outer-body))
-          values (control/outer-values loop)
+    (let [source (list* 'let* (vec (mapcat identity suffix-bindings)) outer-body)
+          ;; Analyze the source's physical carry names first. Fresh loop results belong to the
+          ;; enclosing SSA boundary, not this original source environment.
+          outputs (control/outer-results loop)
+          values (apply dissoc (control/outer-values loop) outputs)
           typed (typed-frontend/form->program
                  source (assoc options
                                :dtype (or dtype :double)
                                :values values
-                               :array-types (merge (:array-types options)
-                                                   (value-types values seq))
-                               :scalar-types (merge (:scalar-types options)
-                                                    (value-types values empty?))))]
+                               :array-types (apply dissoc (merge (:array-types options)
+                                                                (value-types values seq)) outputs)
+                               :scalar-types (apply dissoc (merge (:scalar-types options)
+                                                                 (value-types values empty?)) outputs)))]
       (when-not typed
         (fail! :structured-control-unsupported-suffix
                "post-loop computation is outside the certified TypedSOAC subset"
                {:suffix-bindings suffix-bindings :outer-body outer-body}))
-      (first (fusion/fusion-fixpoint typed abstract-machine)))))
+      (let [fused (first (fusion/fusion-fixpoint typed abstract-machine))
+            inputs (set (:inputs (soac/facts fused)))
+            substitutions (into {} (keep (fn [{:keys [initial output]}]
+                                            (when (contains? inputs initial) [initial output])))
+                                (control/carried loop))]
+        (typed-route/analyzed-program-envelope source fused substitutions)))))
+
+(defn- offset-source-facts
+  "Rebase outer source provenance; the nested algorithm keeps its own local source frame."
+  [facts offset]
+  (cond-> facts
+    (integer? (get-in facts [:provenance :source-binding-id]))
+    (update-in [:provenance :source-binding-id] + offset)
+    (seq (get-in facts [:attributes :fusion/constituents]))
+    (update-in [:attributes :fusion/constituents]
+               #(into {} (map (fn [[id facts]]
+                                [(if (integer? id) (+ id offset) id)
+                                 (offset-source-facts facts offset)])) %))))
+
+(defn- suffix-source-attributes [suffix prefix-bindings loop-binding]
+  (let [offset (inc (count prefix-bindings))
+        shift #(cond-> % (integer? (:source-binding-id %)) (update :source-binding-id + offset))
+        attributes (:attributes suffix)]
+    (cond-> attributes
+      (:source-bindings attributes)
+      (update :source-bindings #(into (conj (mapv first prefix-bindings) loop-binding) %))
+      (:host-binding-ids attributes) (update :host-binding-ids #(mapv (partial + offset) %))
+      (:host-read-sites attributes) (update :host-read-sites #(mapv shift %))
+      (:allocations attributes) (update :allocations #(mapv shift %)))))
 
 (defn- loop-equation
-  [loop loop-binding]
+  [loop loop-binding loop-source]
   (let [facts (control/facts loop)]
     (program/->ProgramEquation
-     [:structured-loop (:id facts)] [:binding loop-binding] nil
+     [:structured-loop (:id facts)] [:binding loop-binding] loop-source
      (ordered-distinct (control/outer-operands loop))
      (control/outer-results loop) loop [loop]
      (:effects facts)
@@ -1225,18 +1317,23 @@
    When a suffix is itself in the TypedSOAC subset, its uses of the physical carried array are
    alpha-remapped to the loop's fresh logical output and appended as ordinary typed equations."
   ([decomposition] (program-envelope decomposition {}))
-  ([{:keys [loop source loop-binding prefix-bindings parameter-values outer-values]
+  ([{:keys [loop source loop-binding loop-source prefix-bindings parameter-values outer-values]
      :as decomposition} options]
-   (when-not (and (map? decomposition) loop)
-     (throw (ex-info "structured-control routing requires a certified frontend decomposition"
-                     {:reason :structured-control-decomposition
-                      :decomposition decomposition})))
-   (let [loop (control/validate! loop)
-         loop-equation (loop-equation loop loop-binding)
-         suffix (suffix-program decomposition options)
-         suffix-envelope (when suffix (typed-route/program-envelope suffix))
-         suffix-equations (mapv #(update % :id (fn [id] [:suffix id]))
+   (frontend/validate-decomposition! decomposition)
+   (let [loop-equation (loop-equation loop loop-binding loop-source)
+         suffix-envelope (suffix-program decomposition options)
+         source-offset (inc (count prefix-bindings))
+         suffix-equations (mapv #(-> (offset-source-facts % source-offset)
+                                     (update :id (fn [id] [:suffix id])))
                                 (:equations suffix-envelope))
+         source (if (and source suffix-envelope)
+                  (with-meta (list* (first source)
+                                    (vec (mapcat identity
+                                                 (concat prefix-bindings [[loop-binding loop-source]]
+                                                         (partition 2 (second (:source suffix-envelope))))))
+                                    (drop 2 (:source suffix-envelope)))
+                             (meta source))
+                  source)
          equations (into [loop-equation] suffix-equations)
          values (merge-values (control/outer-values loop) (:values suffix-envelope))
          program-outputs (or (:outputs suffix-envelope) (control/outer-results loop))
@@ -1253,29 +1350,32 @@
            :effects effects
            :provenance {:source-dialect :typed-structured-control
                         :pass :structured-control-route}
-           :attributes {:host-control :typed-structured-control
-                        :mixed-algorithms (boolean suffix)}
+           :attributes (assoc (suffix-source-attributes suffix-envelope prefix-bindings loop-binding)
+                               :host-control :typed-structured-control
+                               :mixed-algorithms (boolean suffix-envelope))
            :operation? typed-operation?
            :algorithm? (partial typed-algorithm-boundary?
                                 {:values values :inputs inputs :equations equations})})
          public-parameters (or (:public-parameters options) (:active-params options))]
-     (if (seq public-parameters)
-       (let [plan (invocation/from-prefix
-                   {:id [:program-invocation (:id (control/facts loop))]
-                    :parameters public-parameters
-                    :parameter-values parameter-values
-                    :bindings prefix-bindings
-                    :binding-values outer-values
-                    :program-values values
-                    :program-inputs inputs
-                    :program-outputs outputs
-                    :attributes {:source-dialect :closed-clojure
-                                 :target-dialect :typed-invocation}})]
-         (-> parallel-program
-             (assoc-in [:attributes :invocation-plan]
-                       (invocation/validate-against! plan parallel-program))
-             validate-typed-program!))
-       parallel-program))))
+     (if (and (seq public-parameters) source)
+       (promote-program parallel-program options)
+       (if (seq public-parameters)
+         (let [plan (invocation/from-prefix
+                     {:id [:program-invocation (:id (control/facts loop))]
+                      :parameters public-parameters
+                      :parameter-values parameter-values
+                      :bindings prefix-bindings
+                      :binding-values outer-values
+                      :program-values values
+                      :program-inputs inputs
+                      :program-outputs outputs
+                      :attributes {:source-dialect :closed-clojure
+                                   :target-dialect :typed-invocation}})]
+           (-> parallel-program
+               (assoc-in [:attributes :invocation-plan]
+                         (invocation/validate-against! plan parallel-program))
+               validate-typed-program!))
+         parallel-program)))))
 
 (defn attempt
   "Attempt the complete structured-control semantic route.

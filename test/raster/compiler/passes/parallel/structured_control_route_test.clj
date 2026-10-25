@@ -136,7 +136,8 @@
               [{:initial 'u :parameter 'u-in :result 'u-next :output 'u-final}]
               body
               {'steps index 'n extent 'u tensor 'u-final tensor})]
-    {:loop loop :loop-binding 'time-loop :source '(let* [] nil)}))
+    ;; This fixture constructs an algorithm, not a translation of fabricated source.
+    {:loop loop :loop-binding 'time-loop :source nil}))
 
 (deftest structured-control-uses-the-common-program-equation-spine
   (let [typed (route/program-envelope (loop-decomposition))
@@ -144,6 +145,7 @@
         typed-equation (first (:equations typed))
         scheduled-equation (first (:equations scheduled))]
     (is (program/parallel-program? typed))
+    (is (nil? (:source typed-equation)) "source-free algorithms receive no source execution credit")
     (is (= :typed-parallel (:dialect typed)))
     (is (= '[steps n u] (:inputs typed)))
     (is (= '[u-final] (:outputs typed)))
@@ -361,24 +363,24 @@
                (:plan-id (ex-data exception))))))))
 
 (deftest generic-weighted-reduction-retains-the-common-invocation-boundary
-  (let [typed (assoc (swr-parallel-program)
-                     :source '(let* [out-storage (clojure.core/float-array
-                                                 (clojure.core/* n width))]
-                                out-storage))
-        promoted (route/promote-program
-                  (assoc-in typed [:attributes :allocations]
-                            [{:destination 'out-storage
-                              :source-expression (second (second (:source typed)))}])
-                  {:dtype :float :public-parameters '[x n width]
-                         :array-types {'x :float}
-                         :scalar-types {'n :long 'width :int}})
-        plan (get-in promoted [:attributes :invocation-plan])]
+  (let [typed (swr-parallel-program)
+        ;; This synthetic algorithm has no retained source. Test the common static invocation
+        ;; contract directly; attaching an allocator does not supply its numerical source owner.
+        plan (invocation/from-prefix
+              {:id :source-free-weighted-reduction :parameters '[x n width]
+               :parameter-values (select-keys (:values typed) '[x n width])
+               :bindings [] :binding-values {} :program-values (:values typed)
+               :program-inputs (:inputs typed) :program-outputs (:outputs typed)})
+        promoted (assoc-in typed [:attributes :invocation-plan] plan)]
     (is (= (:equations typed) (:equations promoted)))
     (is (= '[x n width] (mapv :symbol (:parameters plan))))
     (is (= '[x n width] (mapv :program-value (:bindings plan))))
     (is (= '[result] (:program-outputs plan)))
     (is (empty? (:steps plan)) "the device-owned output is not allocated in the host prefix")
-    (is (= plan (invocation/validate-against! plan promoted)))))
+    (is (= plan (invocation/validate-against! plan promoted)))
+    (is (= :invocation-source-order-boundary
+           (reason-of #(invocation/source-order plan promoted)))
+        "a source-free static contract is not whole-source completion evidence")))
 
 (deftest loop-output-feeds-an-ordinary-typed-suffix
   (let [initial (av/tensor {:dtype :double :shape ['extent]
@@ -425,7 +427,7 @@
                                      (* 2.0 (clojure.core/aget u k)))]
                 'u)
         decomposition (frontend/form->structured-loop source options)]
-    (is (= :parallel-program-result-redefinition
+    (is (= :typed-soac-use-before-definition
            (reason-of #(route/program-envelope decomposition options))))))
 
 (deftest algorithm-kind-and-operation-kind-must-remain-paired
@@ -555,6 +557,63 @@
       (is (= (control/body (:algorithm scheduled-loop))
              (:scheduled-equation-algorithm iteration-call)))
       (is (= (:body scheduled-loop) (:scheduled-equation-body iteration-call))))))
+
+(deftest structured-suffix-uses-shared-source-realization-and-allocation-ownership
+  (let [options {:dtype :double :public-parameters '[u0 steps]
+                 :values {'u0 (av/tensor {:dtype :double :shape ['extent]
+                                          :representation {:kind :plain}})
+                          'steps (av/tensor {:dtype :long :shape []})}
+                 :array-types {'u0 :double} :scalar-types {'steps :long}}
+        body (with-meta '(clojure.core/aget u k) {:tag 'double :raster.type/tag 'double})
+        allocated (source-with-suffix
+                   ['out '(clojure.core/double-array n)
+                    'after (list 'raster.par/map! 'out 'k 'n 'double body)] 'after)
+        forbidden (fn [& _] (throw (AssertionError. "producer qualification touched a driver")))]
+    (with-redefs [gpu/make-session forbidden gpu/alloc! forbidden]
+      (doseq [[allocated? source] [[false (mixed-source)] [true allocated]]]
+        (let [semantic (route/program-envelope (frontend/form->structured-loop source options) options)
+              plan (get-in semantic [:attributes :invocation-plan])
+              order (invocation/source-order plan semantic)
+              suffix (filter #(= :suffix (first (:id %))) (:equations semantic))]
+          (is (= '[n u scratch] (mapv :symbol (:steps plan)))
+              "an observable scratch allocation survives numerical functionalization")
+          (is (= (mapv :id (:equations semantic)) (vec (keep :equation order))))
+          (is (seq suffix))
+          (is (some (set (:results (first (:equations semantic)))) (mapcat :operands suffix))
+              "the suffix consumes the loop's actual fresh SSA output")
+          (is (not-any? fn? (tree-seq coll? seq semantic)))
+          (if allocated?
+            (do
+              (is (= 1 (count (filter #(= 'out (:storage %)) order))))
+              (is (= '(clojure.core/double-array n)
+                     (:source-expression (first (filter #(= 'out (:destination %))
+                                                       (get-in semantic [:attributes :allocations])))))))
+            (is (not= (count (second source)) (count (second (:source semantic))))
+                "the actual materialized suffix, not the original binding spine, is retained")))))))
+
+(deftest rk4-source-order-finds-the-original-loop-equation
+  (let [forbidden (fn [& _] (throw (AssertionError. "source correspondence touched a driver")))]
+    (with-redefs [gpu/make-session forbidden gpu/alloc! forbidden]
+      (let [compilation (equation-first/compile #'pde/heat-loss-rk4
+                                               {:target :ze:debug :dtype :double})
+            semantic (:semantic compilation)
+            plan (get-in semantic [:attributes :invocation-plan])
+            equation (first (filter #(control/loop-program? (:algorithm %)) (:equations semantic)))
+            order (invocation/source-order plan semantic)]
+        (is (some? (:source equation)))
+        (is (= equation (program/equation-for-binding semantic (second (:site equation)) (:source equation))))
+        (is (some #(= (:id equation) (:equation %)) order))
+        (is (not-any? fn? (tree-seq coll? seq semantic)))
+        (let [initial (invocation-link/begin-ordered-realization
+                       compilation [(double-array 8) (double-array 8) 0.1 1.0 0.01 3] nil)
+              refusal (try (invocation-link/validate-ordered-source-actions! initial) nil
+                           (catch clojure.lang.ExceptionInfo error (ex-data error)))
+              blocked-step (some #(when (= (get-in refusal [:entry :invocation-step]) (:id %)) %)
+                                 (:steps plan))]
+          (is (= :invocation-ordered-source-action
+                 (:reason refusal)))
+          (is (invocation/buffer-clone? blocked-step)
+              "the first remaining executor gap is the source clone, not source correspondence"))))))
 
 (deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
   (let [arguments [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]
@@ -1455,10 +1514,10 @@
           "public unique leaves retain source traversal order rather than island sorting"))
     (let [partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                    logged (clojure.core/println y)] y))]
-      (is (= :structured-control-host-continuation
+      (is (= :structured-control-prefix-value
              (reason-of #(route/promote-program partial options)))
           "return coverage alone cannot justify dropping an intervening host effect")
-      (is (= :structured-control-host-continuation
+      (is (= :structured-control-prefix-value
              (reason-of #(route/promote-program
                           (assoc-in partial [:attributes :host-binding-ids] []) options)))
           "deleting advisory host IDs cannot make an unexecuted effect disappear"))

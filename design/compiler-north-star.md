@@ -1408,6 +1408,19 @@ shared physical-parameter initializer checks scalar values/domains and buffer co
 not evidence for a root Class, numerical payload Class or completed source entry. A physical
 vector is never passed back through the logical argument projector.
 
+Source-bearing structured loops use the same analyzed-source realization and invocation
+promotion as ordinary TypedSOAC. The frontend authenticates the complete decomposition;
+the suffix is realized once, with fresh read-only incoming SSA names derived mechanically
+while the actual source retains its physical carry names. Source positions and allocation
+claims come from that realized construction, not a guessed correspondence between binding
+lists. A construction witness is not numerical completion evidence and does not enter pure IR.
+Existing primary, auxiliary and allocation source claims are checked independently before
+hoisting or fallback executor selection: another possible executor cannot conceal a stale
+claim. Unowned observable work must execute at its source position or be refused. Original
+allocation/helper recipes and their lexical dependencies survive shape normalization; size
+equivalence remains a separate causal check. This producer closure does not establish ordered
+clone/loop execution, Float payload completion or resident inter-component composition.
+
 Auxiliary realization bindings are executable source actions, not scaffolding that can be
 discarded because a later kernel overwrites the result. The internal ordered root now recovers
 their exact source-position/equation witness: a result allocation executes the existing

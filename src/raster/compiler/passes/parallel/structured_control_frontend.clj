@@ -18,7 +18,10 @@
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as typed-fusion]
-            [raster.compiler.passes.scalar.host-abstract-value :as host-av]))
+            [raster.compiler.passes.scalar.host-abstract-value :as host-av]
+            [raster.runtime.artifact-provenance :as provenance]))
+
+(def ^:private decomposition-issuer (provenance/issuer))
 
 (def ^:private dotimes-heads '#{dotimes clojure.core/dotimes})
 
@@ -33,6 +36,23 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason
                                  :pass :structured-control-frontend))))
+
+(defn validate-decomposition!
+  "Check a temporary frontend construction before publishing its pure program equations.
+   Source-free algorithms remain valid, but carry no retained-source execution correspondence.
+   The exact construction witness proves origin only, not initialization or source completion."
+  [decomposition]
+  (when-not (and (map? decomposition) (:loop decomposition))
+    (fail! :structured-control-decomposition
+           "structured-control routing requires a frontend decomposition" {}))
+  (control/validate! (:loop decomposition))
+  (when (or (some? (:source decomposition)) (some? (:loop-source decomposition))
+            (contains? decomposition :provenance-seal))
+    (when-not (and ((:authentic? decomposition-issuer) decomposition)
+                   (some? (:source decomposition)) (some? (:loop-source decomposition)))
+      (fail! :structured-control-source-construction
+             "retained source requires its original complete frontend construction" {})))
+  decomposition)
 
 (defn- destination-write
   [expression]
@@ -241,6 +261,10 @@
           pairs (when (and (vector? bindings) (even? (count bindings)))
                   (vec (map vec (partition 2 bindings))))]
       (when-let [{:keys [ordinal binder form]} (and pairs (one-loop-binding pairs))]
+        (when-not (and (symbol? binder) (= 1 (count (filter #(= binder (first %)) pairs))))
+          (fail! :structured-loop-source-binding
+                 "the selected counted loop requires one unambiguous outer binding"
+                 {:binding binder}))
         (let [[_ [iteration raw-trip-count] & loop-body] form
               trip-count (if (integer? raw-trip-count)
                            (max 0 raw-trip-count)
@@ -366,8 +390,10 @@
                              :result (get renames carry-result carry-result)
                              :output carry-output}]
                            body outer-values)]
-                      {:loop loop
+                      ((:seal decomposition-issuer)
+                       {:loop loop
                        :source source
+                       :loop-source form
                        :loop-binding binder
                        :prefix-bindings prefix-pairs
                        :parameter-values (:values parameter-analysis)
@@ -378,4 +404,4 @@
                        :typed-body-source typed-source
                        :copy-certificate copy-certificate
                        :write-certificates write-certificates
-                       :fusion-stats fusion-stats})))))))))))
+                       :fusion-stats fusion-stats}))))))))))))

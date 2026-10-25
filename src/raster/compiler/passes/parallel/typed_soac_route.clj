@@ -1440,6 +1440,40 @@
                          (= (:operands equation) (:inputs (dialect/facts algorithm)))
                          (= (:results equation) (dialect/outputs algorithm))))})))
 
+(defn ^:no-doc analyzed-program-envelope
+  "Realize one analyzed/fused source program through the production constructor.
+   An enclosing construction may rename read-only incoming SSA values while retaining original
+   source names. This mechanically derives the renamed algorithm, not an equivalence witness
+   for an arbitrary second program. It grants no host read or source-completion authority."
+  ([source typed-program] (analyzed-program-envelope source typed-program {}))
+  ([source typed-program incoming-renames]
+   (let [typed-program (dialect/validate! typed-program)
+         facts (dialect/facts typed-program)
+         _ (when-not (and (map? incoming-renames)
+                          (every? dialect/value-id? (concat (keys incoming-renames) (vals incoming-renames)))
+                          (set/subset? (set (keys incoming-renames)) (set (:inputs facts))))
+             (throw (ex-info "incoming value renaming requires declared input IDs"
+                             {:reason :typed-soac-incoming-renaming})))
+         renames (into {} (remove (fn [[source target]] (= source target))) incoming-renames)
+         definitions (set (mapcat #(nth % 2) (dialect/equations typed-program)))
+         writes (into #{}
+                      (mapcat (fn [equation]
+                                (let [{:keys [destinations]} (dialect/operation-parts equation)
+                                      attrs (get-in facts [:equations (second equation) :attributes])]
+                                  (concat destinations
+                                          (keep identity [(:destination attrs)])
+                                          (map :destination (:result-storage attrs))))))
+                      (dialect/equations typed-program))
+         _ (when-not (and (= (count renames) (count (set (vals renames))))
+                          (empty? (set/intersection (set (keys renames))
+                                                    (set/union definitions writes)))
+                          (not-any? #(contains? (:values facts) %) (vals renames)))
+             (throw (ex-info "source transport permits only fresh read-only incoming SSA renaming"
+                             {:reason :typed-soac-incoming-renaming :mapping renames})))
+         {:keys [source realized]} (realize-source source typed-program)
+         renamed (if (seq renames) (dialect/remap-values typed-program renames) typed-program)]
+     (envelope renamed source realized))))
+
 (defn- equation-references
   [equation]
   (vec (distinct
@@ -1867,8 +1901,8 @@
                                :stats typed-stats}}
                    (if decline
                      {:declined decline}
-                     (let [{:keys [source realized]} (realize-source form typed-result)]
-                       {:program (envelope typed-result source realized)
+                     (let [program (analyzed-program-envelope form typed-result)]
+                       {:program program
                         :stats (merge typed-stats
                                       {:route :typed-soac :typed-validated true
                                        :front-end :analyzed-source
