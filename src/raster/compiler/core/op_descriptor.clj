@@ -859,8 +859,10 @@
 
    Helpers require the selected qualified implementation's actual retained deftm body, not a
    registered alloc-form or allocator basename. Actual arguments must be bound values or closed
-   numeric literals with matching actual storage/scalar types: substitution cannot discard evaluation of
-   an unused argument, duplicate a check, or reorder call-argument effects. Returned helper data
+   numeric literals with matching actual storage/scalar types. A bound Int may widen explicitly
+   to a verified selected typed invk's primitive Long parameter; other entry adaptation is not
+   inferred. Substitution cannot discard evaluation of an unused argument, duplicate a check,
+   or reorder call-argument effects. Returned helper data
    is correspondence material, not a frozen-definition/completion certificate."
   [expression values]
   (if (array-allocation-size expression)
@@ -889,22 +891,42 @@
                                      (distinct (keep #(get selected %) [:source-var :generic-var :receiver-var])))
                   definition (:direct-allocation (detect-auto-buffer-semantics v))
                   {:keys [parameters parameter-tags constructor]} definition
-                  compatible? (fn [argument tag]
+                  signature (delay (when dispatch?
+                                     (method-entry/live-selected-parameter-carriers
+                                      operation implementation-op (count arguments))))
+                  argument-plan (fn [index argument tag]
                                 (let [array? (types/array-tag? tag)
                                       expected (if array? (dtype/dtype-for-array-tag tag)
                                                    (dtype/dtype-for-scalar-tag tag))
                                       actual (if (symbol? argument) (get values argument)
                                                  (allocation-literal-argument argument))]
-                                  (and expected (= (dtype/canon expected) (:dtype actual))
-                                       (= array? (boolean (seq (:shape actual)))))))]
+                                  (when (and expected
+                                             (= array? (boolean (seq (:shape actual)))))
+                                    (cond
+                                      (= (dtype/canon expected) (:dtype actual))
+                                      {:expression argument}
+
+                                      ;; A bound Int may enter an already selected primitive
+                                      ;; Long invk. Preserve its exact widening in the projected
+                                      ;; constructor, without retagging the Int or adapting IFn,
+                                      ;; literal, Object, floating or narrowing entry contexts.
+                                      (and (symbol? argument) (not array?)
+                                           (= :int (:dtype actual)) (= :long (dtype/canon expected))
+                                           (= Long/TYPE (get (:parameter-carriers @signature) index))
+                                           (identical? v (get-in @signature [:definition :source-var]))
+                                           (= [:exact :exact]
+                                              ((requiring-resolve 'raster.compiler.core.scalar-conversion/policy)
+                                               :int :long)))
+                                      {:expression (list 'clojure.core/long argument)}))))
+                  plans (mapv argument-plan (range) arguments parameter-tags)]
               (when (and definition (= (count parameters) (count arguments) (count parameter-tags))
-                         (every? true? (map compatible? arguments parameter-tags))
+                         (every? some? plans)
                          (identical? root (.getRawRoot ^clojure.lang.Var v))
                          (identical? v (:source-var (select!)))
                          (every? method-entry/var-snapshot-current? observations)
                          (identical? metadata (meta v)))
                 (let [substitute (requiring-resolve 'raster.compiler.core.util/subst-syms)
-                      projected (substitute (zipmap parameters arguments) constructor)]
+                      projected (substitute (zipmap parameters (map :expression plans)) constructor)]
                   (when (array-allocation-size projected)
                     {:constructor projected
                      :helper {:operation operation :implementation implementation-op :definition definition

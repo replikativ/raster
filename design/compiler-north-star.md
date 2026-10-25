@@ -1438,6 +1438,13 @@ the length from a symbolic AV nor permits early source evaluation. The existing 
 ShapeProjection action reads the checked materialized shape once; final call validation retains
 its cached result and checks operand correspondence. Content reads and other scalar computations
 remain subject to the ordinary device-dependency prohibition.
+Shape dimensions may use Long storage internally, but the ShapeProjection result retains its
+declared Int/Long carrier after range checking. This does not normalize caller-supplied scalars
+or weaken carrier-sensitive equality. Definition-derived allocation projection may preserve an
+exact bound Int-to-Long typed-call widening as an explicit constructor conversion, authenticated
+against the actual selected JVM interface. Live interface correspondence and historical compiler
+ownership share one signature check but remain distinct contracts; neither creates a result Class
+or permission to adapt arbitrary IFn, Object, floating or narrowing inputs.
 
 Source local declarations and inferred types are separate facts. Original source entry captures
 the presence and value of a binder's declaration before inference; rewalking transports this

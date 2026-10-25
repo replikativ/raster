@@ -482,9 +482,16 @@
               (fail! :invocation-materialization-shape-source
                      "shape projection source is not a materialized buffer"
                      {:step id :source (:source step) :actual source}))
-            (checked-computed-scalar
-             step {:type (get-in step [:value :dtype])
-                   :value (nth (:shape source) (:axis step))}))
+            (let [result (checked-computed-scalar
+                          step {:type (get-in step [:value :dtype])
+                                :value (nth (:shape source) (:axis step))})]
+              ;; Shape dimensions are stored as Longs, but a source alength
+              ;; produces an Int unless its retained result explicitly widens.
+              ;; Check the domain BEFORE converting; this is this operation's
+              ;; result production, not normalization of arbitrary public scalars.
+              (update result :value #(case (dtype/canon (:type result))
+                                       :int (int %)
+                                       :long (long %)))))
 
           (invocation/source-completion? step)
           (let [execute (source-completion-executor evaluate-scalar id)]

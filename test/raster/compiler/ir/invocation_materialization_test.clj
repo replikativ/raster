@@ -44,6 +44,21 @@
       (is (= (Double/doubleToRawLongBits value)
              (Double/doubleToRawLongBits (:value actual)))))))
 
+(deftest shape-projection-produces-its-retained-primitive-carrier
+  (doseq [[dtype expression carrier] [[:int '(clojure.core/alength input) Integer]
+                                      [:long '(clojure.core/long (clojure.core/alength input)) Long]]]
+    (let [plan (invocation/from-prefix
+                {:id [:shape-carrier dtype]
+                 :parameters '[input] :parameter-values {'input (array-value :double '(extent input))}
+                 :bindings [['length expression]] :binding-values {'length (scalar dtype)}
+                 :program-values {'length (scalar dtype)}
+                 :program-inputs '[length] :program-outputs '[length]})
+          result (materialization/materialize
+                  plan [(double-array 3)] (fn [& _] (throw (AssertionError. "shape callback"))))
+          value (get-in result [:program-scalars 'length])]
+      (is (= {:type dtype :value 3} value))
+      (is (= carrier (class (:value value)))))))
+
 (deftest invalid-integral-parameter-refuses-before-the-scalar-evaluator
   (let [plan (invocation/from-prefix
               {:id :checked-integral-entry

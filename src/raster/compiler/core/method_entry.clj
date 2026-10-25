@@ -622,6 +622,39 @@
                              [:generic-var :receiver-var :source-var]))
             definition))))))
 
+(defn live-selected-parameter-carriers
+  "Check the actual interface of a currently selected registered typed invk.
+   This live correspondence query supplies NO historical definition ownership or
+   operand-completion proof. A compiler consumer must retain its own observations;
+   a replay consumer must recheck its retained recipe. Never generates or invokes code."
+  [operation implementation-op argument-count]
+  (when-let [{:keys [entry tags parameters] :as definition}
+             (selected-definition operation implementation-op argument-count)]
+    (let [{:keys [iface-name iface-class param-tags]}
+          (get @types/fn-interface-by-name (:typed-iface entry))
+          expected-tags (mapv types/tag->iface-type tags)
+          expected-carriers (mapv types/tag->java-class expected-tags)]
+      (when (and (= iface-name (:typed-iface entry))
+                 (= expected-tags param-tags)
+                 (class? iface-class) (.isInterface ^Class iface-class)
+                 (.isInstance ^Class iface-class (:typed-impl entry))
+                 (every? class? expected-carriers))
+        (let [methods (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                              (.getDeclaredMethods ^Class iface-class))]
+          (when (= 1 (count methods))
+            (let [^java.lang.reflect.Method method (first methods)
+                  carriers (vec (.getParameterTypes method))]
+              (when (and (= expected-carriers carriers)
+                         (= argument-count (count parameters) (count carriers))
+                         (not (.isVarArgs method))
+                         (not (java.lang.reflect.Modifier/isStatic (.getModifiers method))))
+                (when (let [current (selected-definition operation implementation-op argument-count)]
+                        (every? #(identical? (get definition %) (get current %))
+                                [:entry :generic-var :receiver-var :source-var]))
+                  {:definition definition :invocation-method method
+                   :parameters parameters :parameter-carriers carriers
+                   :result-carrier (.getReturnType method)})))))))))
+
 (defn selected-parameter-carriers
   "Observe the actual JVM interface of an already selected, registered invk.
 
@@ -634,32 +667,13 @@
    No interface is generated, method invoked or registry added."
   [operation implementation-op argument-count]
   (when *emission-inputs*
-    (when-let [{:keys [entry tags parameters] :as definition}
-               (observed-selected-definition :typed operation implementation-op argument-count)]
-      (let [{:keys [iface-name iface-class param-tags]}
-            (get @types/fn-interface-by-name (:typed-iface entry))
-            expected-tags (mapv types/tag->iface-type tags)
-            expected-carriers (mapv types/tag->java-class expected-tags)]
-        (when (and (= iface-name (:typed-iface entry))
-                   (= expected-tags param-tags)
-                   (class? iface-class) (.isInterface ^Class iface-class)
-                   (.isInstance ^Class iface-class (:typed-impl entry))
-                   (every? class? expected-carriers))
-          (let [methods (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
-                                (.getDeclaredMethods ^Class iface-class))]
-            (when (= 1 (count methods))
-              (let [^java.lang.reflect.Method method (first methods)
-                    carriers (vec (.getParameterTypes method))]
-                (when (and (= expected-carriers carriers)
-                           (= argument-count (count parameters) (count carriers))
-                           (not (.isVarArgs method))
-                           (not (java.lang.reflect.Modifier/isStatic (.getModifiers method))))
-                  (assert-definition-inputs-current! @*emission-inputs*)
-                  (when (identical? entry
-                                    (:entry (selected-definition operation implementation-op argument-count)))
-                    {:definition definition :invocation-method method
-                     :parameters parameters :parameter-carriers carriers
-                     :result-carrier (.getReturnType method)}))))))))))
+    (when-let [definition (observed-selected-definition :typed operation implementation-op argument-count)]
+      (let [projection (live-selected-parameter-carriers operation implementation-op argument-count)]
+        (assert-definition-inputs-current! @*emission-inputs*)
+        (when (and projection
+                   (every? #(identical? (get definition %) (get (:definition projection) %))
+                           [:entry :generic-var :receiver-var :source-var]))
+          projection)))))
 
 (defn- usable-emission?
   "Optional analyses may abstain on unavailable historical evidence. Execution

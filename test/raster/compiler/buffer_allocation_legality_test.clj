@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.hoist :as hoist]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.buffer-fuse :as buffer-fuse]))
@@ -98,12 +100,38 @@
       (let [op (operation source "bare-like" "doubles_long")
             implementation (symbol (namespace op) (str (name op) "-impl"))
             call (with-meta (list '.invk implementation 'x 'cnt)
-                   {:raster.op/original (symbol (namespace op) "bare-like")})]
+                   {:raster.op/original (symbol (namespace op) "bare-like")})
+            int-values {'x {:dtype :double :shape ['m]} 'cnt {:dtype :int :shape []}}
+            project #(binding [method-entry/*emission-inputs* nil]
+                       (descriptor/direct-allocation-projection call int-values))]
         (is (= '(clojure.core/double-array cnt)
                (:constructor (descriptor/direct-allocation-projection
                               call {'x {:dtype :double :shape ['m]}
                                     'cnt {:dtype :long :shape []}})))
-            "semantic constructor projection does not invent a physical entry adapter"))
+            "semantic constructor projection does not invent a physical entry adapter")
+        (let [projection (project)
+              signature (method-entry/live-selected-parameter-carriers
+                         (symbol (namespace op) "bare-like") implementation 2)]
+          (is (= Long/TYPE (second (:parameter-carriers signature))))
+          (is (= '(clojure.core/double-array (clojure.core/long cnt)) (:constructor projection)))
+          (is (= '[x cnt] (get-in projection [:helper :arguments])))
+          (is (= :int (get-in int-values ['cnt :dtype]))))
+        (doseq [count [Integer/MIN_VALUE -1 0 1 Integer/MAX_VALUE]]
+          (is (= (long count)
+                 (eval (list 'let* ['cnt count] (second (:constructor (project))))))
+              "check boundary conversions without allocating boundary-sized arrays"))
+        (binding [*ns* source]
+          (is (= 1 (alength (eval (list '.invk implementation '(double-array 0) '(int 1)))))))
+        (is (= '(clojure.core/double-array (clojure.core/long cnt)) (:constructor (project)))
+            "replay rechecks a warmed selected interface without an active definition owner")
+        (is (nil? (descriptor/direct-allocation-projection (list op 'x 'cnt) int-values))
+            "a direct IFn entry does not inherit typed invk adaptation")
+        (let [signature (method-entry/live-selected-parameter-carriers
+                         (symbol (namespace op) "bare-like") implementation 2)
+              iface (get-in signature [:definition :entry :typed-iface])]
+          (with-redefs [types/fn-interface-by-name
+                        (atom (assoc-in @types/fn-interface-by-name [iface :param-tags] '[doubles double]))]
+            (is (nil? (project)) "mismatched live interface evidence cannot authorize widening"))))
       (let [op (symbol (str (ns-name source)) "tick")
             fake {:allocates? true :auto-detected? true
                   :direct-allocation {:parameters '[n] :parameter-tags '[long]
