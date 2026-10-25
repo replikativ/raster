@@ -181,6 +181,17 @@ and CI timeout unchanged while locating avoidable repeated analysis.
 
 #### Full CI qualification is still open
 
+The AMR cycle's static stage/register contract fixture now obtains its retained
+program directly from equation-first compilation, exactly as the production
+lowerer obtains its argument-independent template. The five stage/register
+oracles are unchanged (5 tests / 25 assertions); they no longer require concrete
+runtime composition merely to inspect emitted semantics. Actual AMR lowering,
+private scratch/reset ownership, composition and device execution remain separate
+required gates. No scratch-to-state role change or expected-refusal migration
+is made. Combined import, routing, invocation, capacity, frontend and AMR checks
+pass 138 tests / 1,526 assertions in the shared capped REPL; this does not replace
+fresh-process or full exact-head CI qualification.
+
 CircleCI unit job [34881](https://circleci.com/gh/replikativ/raster/34881), exact
 head `50bb8638d`, has fifteen completed outcome artifacts and one timed-out shard
 (node 3, no final artifact). The completed reports aggregate to 7,069 tests,
