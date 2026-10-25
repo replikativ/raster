@@ -53,6 +53,16 @@ OpenCL and Level Zero for the real Float-local/Double-fold helper case. Independ
 review approved the corrected carrier boundary. Nested `alength` extent closure
 and its ordered buffer-shape evaluation remain separate open work.
 
+The SS loop-OSR integration exposed a separate, verified baseline correctness
+gap: typed JVM array-index completion uses raw stack coercion. For a Long index
+`4294967296`, ordinary Clojure `aset` throws before its value effect; the current
+typed emitter wraps to index zero and executes the effect/store. Evidence:
+`20261024-array-index-completion-baseline.log`. This is not introduced or fixed
+by completed operand spilling. Prioritize one source-owned array-index recipe,
+including checked/unchecked definition policy, ordinary and spilled `aset`,
+`aget`, and outlined index replay. Reuse the source conversion authority; do not
+change generic JVM coercion or infer a source Class from a logical dtype.
+
 Keep all eight original objectives below. This phase is their correctness and
 qualification prerequisite, not a replacement campaign or a claim of arbitrary
 Clojure/AD completeness. The audit at `fe0b2375` groups remaining failures by
