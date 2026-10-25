@@ -29,15 +29,16 @@
 
 (defn- scalar-region
   ([equation] (scalar-region equation nil))
-  ([equation typed-values]
+  ([equation typed-values] (scalar-region equation typed-values []))
+  ([equation typed-values physical-destinations]
   (let [{:keys [kind attributes arrays captures destinations lambda element-lambda]}
         (dialect/operation-parts equation)]
     (cond
       (contains? #{'segmented-fold-map 'contract} kind)
       {:locals [] :bodies []}
 
-      (= 'effect-map kind)
-      (let [{:keys [index region]} (projection/instantiate-effect-region equation)
+      (contains? '#{map effect-map} kind)
+      (let [{:keys [index region]} (projection/instantiate-map-region equation physical-destinations)
             {:keys [locals body-results]}
             (dialect/lambda-parts (list 'lambda [] (projection/scalar-folds->source region)))]
         {:index index :locals locals :bodies body-results})
@@ -171,10 +172,11 @@
         {:keys [kind attributes]} (dialect/operation-parts equation)
         values (:values (dialect/facts program))
         {region-locals :locals bodies :bodies region-index :index}
-        (when (contains? '#{map effect-map} kind) (scalar-region equation))]
+        (when (contains? '#{map effect-map} kind)
+          (scalar-region equation nil (dialect/physical-results program equation)))]
     (case kind
       map
-      (do
+      (let [attributes (assoc attributes :index region-index)]
         (when-not (and (seq results) (= (count results) (count bodies)))
           (throw (ex-info "the production TypedSOAC route requires one body per map result"
                           {:reason :typed-soac-production-subset

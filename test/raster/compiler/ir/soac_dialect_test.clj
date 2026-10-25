@@ -70,8 +70,12 @@
                       (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
     (is (= :typed-soac-map-index-contract
            (reason (make-equation (with-meta 'i {:raster.type/tag 'int}) [] '[element] [] 'element))))
-    (is (= :typed-soac-map-index-collision
-           (reason (make-equation 'i '[i] '[element captured] [] 'captured))))
+    (let [captured-facts (-> facts
+                             (assoc-in [:values 'i] (av/tensor {:dtype :float :shape []}))
+                             (update :inputs conj 'i))
+          equation (make-equation 'i '[i] '[element captured] [] 'captured)]
+      (is (= [equation] (dialect/equations (dialect/make captured-facts [equation] '[y])))
+          "global capture IDs and lambda ordinals occupy distinct namespaces"))
     (is (= :typed-soac-map-index-collision
            (reason (make-equation 'i [] '[i] [] 'i))))
     (is (= :typed-soac-region-binders
@@ -87,16 +91,14 @@
                                (dialect/effect-lambda-form '[destination] effects)))
           storage [{:destination 'i :access :write :host-return :effect}]
           facts (-> facts
-                    (assoc :values {'n extent 'i tensor result tensor} :inputs '[n i]
+                    (assoc :values {'n extent 'i tensor result tensor} :inputs '[n]
                            :effects #{:memory/write})
                     (assoc-in [:equations 'map-0]
                               (assoc (dialect/default-equation-facts)
                                      :effects #{:memory/write} :aliases {result 'i}
                                      :attributes {:result-storage storage})))]
-      (is (= :typed-soac-map-index-collision
-             (try (dialect/make facts [equation] [])
-                  nil
-                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+      (is (= [equation] (dialect/equations (dialect/make facts [equation] [])))
+          "a destination ID is not its lexical lambda parameter"))))
 
 (deftest completed-full-reduction-transform-requires-one-result
   (let [left '(clojure.core/+ a element)

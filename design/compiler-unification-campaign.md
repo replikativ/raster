@@ -35,7 +35,7 @@ Owned TypedSOAC map/effect-map ordinals now have one explicit signed-Long
 contract shared by validation, frontend region analysis and SegMap lowering.
 Extent evaluation/conversion is independent: an Int extent still has Long
 ordinals, and explicit body narrowing is retained. Contradictory declarations
-and ambiguous interface roles refuse rather than being retagged. Qualification:
+and lexical binder collisions refuse rather than being retagged. Qualification:
 104 dialect/route tests (1,172 assertions) and two portable lowering tests
 (21 assertions) pass; independent review approved this bounded contract.
 Native scalar ownership retention, a complete scalar map consumer and guarded
@@ -54,6 +54,21 @@ the prerequisite for the native scalar map consumer, not that consumer itself:
 bound conversion, Long loop emission, SIMD admission and guarded rectangular
 scheduling must still be implemented before native scalar ownership is retained
 unconditionally or the old rectangular source parser is retired.
+
+Global operand/storage IDs and lexical region binders are distinct namespaces.
+The original ordinal guard incorrectly rejected a physical capture named like
+the ordinal; the CI capture-collision fixture exposed it. Map and effect-map
+host/scheduled consumers now share capture-avoiding instantiation, reserving
+physical outputs as well as inputs before introducing an index or local SSA
+binding. Canonical scalar `region` scoping belongs to the common sequential scope
+engine, preserving initializer order, dtypes and metadata. A bare ordinal also
+cannot be broadcast as a uniform SIMD scalar: value uses retain scalar execution
+until a lane-ramp schedule exists; indexed loads remain independently admissible.
+Qualification: 180 affected tests / 2,080 assertions pass, including numerical
+host/scheduled collision controls and KernelBody emission for three dialects.
+Private CUDA/HIP fixture generation produces 75/74 files without hardware
+(`20261025-map-hygiene-full-affected.log`). This proves generation, not vendor
+compilation, device execution or performance. Genuine lexical/type denials remain.
 
 Selected direct-allocation helpers now accept closed numeric literal arguments
 through checked source-constant evidence and exact parameter-carrier agreement.

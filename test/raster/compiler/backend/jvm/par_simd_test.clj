@@ -162,6 +162,11 @@
          '(Math/exp (+ (aget a i) (* 2.0 (aget b i)))) 'i))))
 
 (deftest simd-able-scalars
+  (testing "uniform scalars are broadcasts, but a varying ordinal needs lane-ramp support"
+    (is (not (segop-simd/simd-able? 'i 'i)))
+    (is (not (segop-simd/simd-able? '(clojure.core/float i) 'i :float)))
+    (is (segop-simd/simd-able? 'gain 'i))
+    (is (segop-simd/simd-able? '(clojure.core/aget x i) 'i)))
   (testing "Scalars are SIMD-able"
     (is (segop-simd/simd-able? 42.0 'i))
     (is (segop-simd/simd-able? 'dt 'i))

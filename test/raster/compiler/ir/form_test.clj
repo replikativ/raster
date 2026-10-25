@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.form-test
   (:require [clojure.test :refer [deftest testing is]]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
 
 ;; ================================================================
@@ -354,6 +355,52 @@
   (is (= :else (form/constant-if-branch false)))
   (is (= :else (form/constant-if-branch nil)))
   (is (nil? (form/constant-if-branch 'runtime-predicate))))
+
+(deftest canonical-scalar-region-is-a-sequential-metadata-preserving-scope
+  (let [binder (with-meta 'gain {:raster.type/tag 'float :line 17})
+        declaration (with-meta (list 'let-value binder :float 'gain) {:line 18})
+        locals (with-meta [declaration '(let-value next-value :double (+ gain captured))]
+                 {:line 19})
+        results (with-meta '[(+ next-value captured)] {:line 20})
+        region (with-meta (list 'region locals results) {:line 21})
+        {:keys [scopes outer sequential? rebuild]} (form/scope-info region)
+        rebuilt (rebuild scopes outer)
+        substituted (util/subst-syms {'gain 'outer-gain 'captured 'gain} region)
+        rewritten-locals (second substituted)
+        renamed (second (first rewritten-locals))]
+    (is (= :scalar-region (:kind (form/form-info region))))
+    (is (form/scope-form? region))
+    (is (false? (:liftable? (form/form-info region))))
+    (is (true? sequential?))
+    (is (= [] outer))
+    (is (= '[gain next-value] (:binders (first scopes))))
+    (is (= '[gain (+ gain captured)] (:inits (first scopes))))
+    (is (= #{'gain 'captured} (util/free-syms region))
+        "a local's own initializer reads the outer binding; later locals see the local")
+    (is (= region rebuilt))
+    (is (= (meta region) (meta rebuilt)))
+    (is (= (meta locals) (meta (second rebuilt))))
+    (is (= (meta results) (meta (nth rebuilt 2))))
+    (is (= (meta declaration) (meta (first (second rebuilt)))))
+    (is (not= 'gain renamed) "capture substitution alpha-renames the conflicting SSA binder")
+    (is (= (meta binder) (meta renamed)))
+    (is (= 'outer-gain (nth (first rewritten-locals) 3)))
+    (is (= (list '+ renamed 'gain) (nth (second rewritten-locals) 3)))
+    (is (= '[(+ next-value gain)] (nth substituted 2)))
+    (is (= [:float :double] (mapv #(nth % 2) rewritten-locals)))
+    (is (= #{'outer-gain 'gain} (util/free-syms substituted)))))
+
+(deftest scalar-region-scope-does-not-guess-malformed-ssa-grammar
+  (doseq [expression ['(region [] value)
+                      '(region [(let-value local :float)] [local])
+                      '(region [(other-binding local :float value)] [local])
+                      '(region [(let-value 1 :float value)] [value])
+                      '(region [] [] :extra)]]
+    (is (nil? (form/scope-info expression))))
+  (let [region '(region [] [(clojure.core/+ input other)])]
+    (is (= #{'input 'other} (util/free-syms region)))
+    (is (= '(region [] [(clojure.core/+ replaced other)])
+           (util/subst-syms {'input 'replaced} region)))))
 
 (deftest scope-info-decomposition-test
   (testing "let* — one sequential scope, binders+inits paired"

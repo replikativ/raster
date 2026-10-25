@@ -573,6 +573,72 @@
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
     (is (= [12.0 22.0 32.0 42.0] (mapv double b)))))
 
+(deftest ordinary-map-physical-bindings-do-not-capture-ordinals-or-locals
+  (doseq [[label array capture destination local]
+          [[:capture 'x 'i 'out 'temporary]
+           [:array 'i 'gain 'out 'temporary]
+           [:destination 'x 'gain 'i 'temporary]
+           [:local 'x 'gain 'out 'gain]
+           [:parameter-reservation 'x 'gain 'element 'temporary]]]
+    (testing (name label)
+      (let [tensor (av/tensor {:dtype :float :shape [3] :ownership :owned})
+            storage [{:destination destination :access :write :host-return :buffer}]
+            facts (dialect/default-program-facts
+                   {:values {array tensor capture (av/tensor {:dtype :float :shape []})
+                             destination tensor 'result tensor}
+                    :inputs [array capture]
+                    :effects #{:memory/write}
+                    :equations {'hygienic-map
+                                (assoc (dialect/default-equation-facts)
+                                       :effects #{:memory/write}
+                                       :aliases {'result destination}
+                                       :attributes {:result-storage storage})}})
+            expression (list 'clojure.core/+
+                             (list 'clojure.core/+ local 'captured)
+                             '(clojure.core/float i))
+            equation (list '= 'hygienic-map '[result]
+                           (list 'map {:index 'i :extent 3} [array] [capture]
+                                 (dialect/lambda-form
+                                  '[element captured]
+                                  [(dialect/local-value local :float 'element)]
+                                  [expression])))
+            program (dialect/make facts [equation] '[result])
+            projected (route/functional-map-host-projection program equation)
+            realization (#'route/realize-equation program equation)
+            host-source (list 'let* (vec (mapcat identity (:pairs realization))) 'result)
+            envelope (#'route/envelope program host-source {'hygienic-map realization})
+            scheduled (:form (segop-lower/segop-lower-pass envelope {:dtype :float}))
+            operation (first (get-in scheduled [:equations 0 :operations]))
+            index (:name (first (:dims (:space operation))))
+            arguments [array capture destination]
+            host (eval (list 'fn arguments
+                             (interpret-resident-source-for-test {:source host-source})))
+            jvm (par-simd/simd-pass scheduled :min-elements 1)
+            execute (eval (list 'fn arguments (interpret-resident-source-for-test
+                                              {:source (:form jvm)})))
+            input (float-array [1.0 2.0 3.0])
+            expected [11.5 13.5 15.5]]
+        (is (= :long (dialect/map-index-dtype 'map (:index projected))))
+        (when (contains? #{:capture :array :destination} label)
+          (is (not= 'i (:index projected)))
+          (is (not= 'i index)))
+        (when (= :local label)
+          (is (not= capture (:id (first (:locals projected))))))
+        (doseq [run [host execute]]
+          (let [out (float-array 3)]
+            (is (identical? out (run input (float 10.5) out)))
+            (is (= expected (vec out)))))
+        (is (= 1 (get-in jvm [:stats :segop-reused])))
+        (doseq [target [:opencl-portable :cuda :hip]]
+          (let [artifact (segop-opencl/generate-segmap-kernel-body
+                          operation :target-dialect target
+                          :array-types {array :float destination :float}
+                          :scalar-types {capture :float})
+                parameters (into {} (map (juxt :id identity))
+                                 (get-in artifact [:attributes :kernel-body :parameters]))]
+            (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+            (is (= :float (:dtype (get parameters capture))))))))))
+
 (deftest complete-map-host-projection-retains-local-casts-and-effect-return
   (let [source '(let* [effect
                        (raster.par/map-void!

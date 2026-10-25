@@ -359,7 +359,11 @@
     (not (floating-node-precision-compatible? expr *simd-element-type*))
     false
     (number? expr) true
-    (symbol? expr) true
+    ;; The ordinal varies between SIMD lanes. Treating it as an ordinary
+    ;; scalar would broadcast one value (or reference an unbound source ID).
+    ;; Address uses are admitted by aget-form? below; value uses need a lane
+    ;; ramp representation before this vector schedule can accept them.
+    (symbol? expr) (not= expr idx-sym)
     (some? (aget-form? expr idx-sym)) true
     (soac-dialect/scalar-convert-form? expr)
     (let [{:keys [attributes operand]} (soac-dialect/scalar-convert-parts expr)]

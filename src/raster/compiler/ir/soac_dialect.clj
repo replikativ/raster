@@ -1755,12 +1755,14 @@
         result-count (count results)]
     (when (contains? '#{map effect-map} kind)
       (map-index-dtype kind (:index attributes))
-      ;; Map lambda parameters represent elements/captures/destinations; the
-      ;; intrinsic ordinal is not a parameter in this layout. Do not apply this
-      ;; check to reductions/Folds, whose explicit formal roles differ.
-      (when (some #{(:index attributes)} (concat parameters arrays captures destinations))
+      ;; Lambda parameters and the intrinsic ordinal share a lexical scope.
+      ;; Global operand IDs do not: remapping a physical capture to `i` is
+      ;; legal when its lambda parameter has a distinct name. Instantiation
+      ;; owns the hygienic bridge between those namespaces.
+      ;; Reductions/Folds have different explicit formal roles.
+      (when (some #{(:index attributes)} parameters)
         (fail! :typed-soac-map-index-collision
-               "map ordinal cannot shadow an element, capture, or destination"
+               "map ordinal cannot shadow a lambda parameter"
                {:equation equation-id :index (:index attributes)})))
     (when-not (distinct-vector? results)
       (fail! :typed-soac-equation-results "SOAC equation results must be distinct"

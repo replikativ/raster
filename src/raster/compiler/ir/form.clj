@@ -133,6 +133,9 @@
         (= 'while-fold head)
         {:kind :while-fold :introduces-scope? true :liftable? false :head head}
 
+        (= 'region head)
+        {:kind :scalar-region :introduces-scope? true :liftable? false :head head}
+
         (= 'effect-region head)
         {:kind :effect-region :introduces-scope? true :liftable? false :head head}
 
@@ -402,6 +405,29 @@
                                                      (arity-tail tprefix aux body)))
                                             parsed scopes')]
                           (apply rl form head (concat (when nm [nm]) arities')))))}))
+
+        ;; A standalone canonical scalar region has the same sequential SSA scope
+        ;; as a Fold's local spine. Dtypes and declaration metadata are structure,
+        ;; not executable values; initializers precede their own binder's scope.
+        :scalar-region
+        (let [[_ locals results] form]
+          (when (and (= 3 (count form)) (vector? locals) (vector? results)
+                     (every? #(and (seq? %) (= 4 (count %)) (= 'let-value (first %))
+                                   (symbol? (second %))) locals))
+            {:sequential? true
+             :scopes [{:binders (mapv second locals)
+                       :inits (mapv #(nth % 3) locals)
+                       :body results}]
+             :outer []
+             :rebuild
+             (fn [[{:keys [binders inits body]}] _]
+               (rl form 'region
+                   (with-meta
+                     (mapv (fn [local id init]
+                             (rl local 'let-value id (nth local 2) init))
+                           locals binders inits)
+                     (meta locals))
+                   (with-meta (vec body) (meta results))))}))
 
         ;; (fold attrs (lambda [acc index] (region [(let-value id dtype init) ...] [step])))
         ;; Synthetic nil initializers let the generic sequential-scope machinery model lambda
@@ -712,7 +738,7 @@
 (defn scope-form?
   "True if the form introduces a new scope (dotimes, loop, fn, par)."
   [form]
-  (contains? #{:scope :lambda :par :fold :product-fold :while-fold
+  (contains? #{:scope :lambda :par :fold :product-fold :while-fold :scalar-region
                :effect-region :effect-loop :effect-when :effect-if}
              (:kind (form-info form))))
 
