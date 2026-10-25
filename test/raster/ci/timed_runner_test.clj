@@ -1,5 +1,6 @@
 (ns raster.ci.timed-runner-test
   (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is]]
             [cognitect.test-runner :as runner]
@@ -29,6 +30,30 @@
         (is (= summary (:summary report))
             "a completed failing run is not reported as an aborted run"))
       (finally (io/delete-file file)))))
+
+(deftest compiled-progress-is-bounded-and-cannot-change-the-test-result
+  (let [timings (atom {})
+        output (java.io.StringWriter.)
+        calls (atom 0)
+        run (fn [] (swap! calls inc) (println "BODY") :result)]
+    (is (= :result (binding [*out* output]
+                     (#'timed/measured-var timings 'probe/compiled true run))))
+    (is (= ["CI compiled test :begin probe/compiled" "BODY" "CI compiled test :end probe/compiled"]
+           (str/split-lines (str output))))
+    (is (= "BODY\n" (with-out-str (#'timed/measured-var timings 'probe/plain false run))))
+    (is (= 2 @calls))
+    (is (= #{'probe/compiled 'probe/plain} (set (keys (:vars @timings)))))
+    (let [broken-output (proxy [java.io.Writer] []
+                          (write [buffer offset length] (throw (java.io.IOException. "diagnostic write failed")))
+                          (flush [] (throw (java.io.IOException. "diagnostic flush failed")))
+                          (close []))
+          failure (Exception. "test failure")]
+      (is (= :result (binding [*out* broken-output]
+                       (#'timed/measured-var timings 'probe/compiled true (constantly :result)))))
+      (is (identical? failure
+                      (binding [*out* broken-output]
+                        (try (#'timed/measured-var timings 'probe/compiled true #(throw failure))
+                             nil (catch Exception error error))))))))
 
 (deftest load-errors-still-publish-the-timing-report
   (let [file (java.io.File/createTempFile "raster-timings-error-" ".edn")]

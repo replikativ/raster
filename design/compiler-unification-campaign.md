@@ -37,6 +37,16 @@ without a summary, so these are not whole-suite totals. A planner reconstruction
 accounts for the apparent 49-test decrease exactly: the repository adds 13 tests,
 while 62 additional tests move into that unsummarized shard. Do not interpret the
 partial totals as coverage loss or as evidence that the branch is qualified.
+At c1b62e2f, the subsequent 15 completed summaries report 6,961 tests / 66,169
+assertions, with 25 failures and 51 errors across 60 failing test Vars; GSDM's
+shard still times out without a summary. Some earlier errors now reach assertions
+about preparation-time concrete plans; those expectations need phase-appropriate
+controls, not a fabricated LinkPlan. These partial totals do not qualify the branch.
+The CI timing runner now emits bounded entry/exit markers for existing `:compiled`
+test Vars so a timeout identifies the active compilation test. Markers do not
+change selection, assertions, timeouts or pass/fail status, and are not heartbeats.
+Twelve diagnostic tests pass 57 assertions, including logging failure preserving
+the original test result. GSDM phase profiling/performance remains open.
 
 Landing order within the unchanged eight-objective campaign:
 

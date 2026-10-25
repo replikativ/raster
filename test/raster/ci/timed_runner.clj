@@ -66,6 +66,21 @@
            (swap! timings update-in path (fnil + 0)
                   (- (System/nanoTime) start))))))
 
+(defn- measured-var
+  [timings id compiled? f]
+  (let [progress! (fn [phase]
+                    (when compiled?
+                      (try
+                        ;; One entry/exit marker, never a heartbeat or passing assertion. A
+                        ;; stalled compile still hits the existing no-output timeout, now with
+                        ;; its test Var identified. Print no compiler forms or runtime inputs.
+                        (println "CI compiled test" phase id)
+                        (flush)
+                        (catch Exception _ nil))))]
+    (progress! :begin)
+    (try (measured timings [:vars id] f)
+         (finally (progress! :end)))))
+
 (defn run-timed!
   [options report-file]
   (let [started (System/nanoTime)
@@ -102,8 +117,8 @@
                     (fn [v]
                       (let [{:keys [ns name]} (meta v)]
                         (if (and (:test (meta v)) (contains? selected (ns-name ns)))
-                          (measured timings [:vars (symbol (str (ns-name ns)) (str name))]
-                                    #(test-var* v))
+                          (measured-var timings (symbol (str (ns-name ns)) (str name))
+                                        (boolean (:compiled (meta v))) #(test-var* v))
                           (test-var* v))))]
         (let [summary (runner/test options)]
           ;; A complete run can fail assertions. Do not equate completion with passing,
