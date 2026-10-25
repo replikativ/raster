@@ -21,7 +21,7 @@
   (with-redefs-fn
     {#'inline/expand-for-backends (fn [form & _] (expand form))
      #'soa-lower/lower-local-constructors (fn [form & _] form)
-     #'local-products/lower-local-products identity
+     #'local-products/lower-local-products (fn [form _context] form)
      #'pipeline/tag-binding-types (fn [form & _] form)
      #'pipeline/carry-void-binding-contracts identity
      #'pipeline/record-fixpoint-census! (fn [& _])}
