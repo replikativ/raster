@@ -7,9 +7,10 @@
 Native entry facts now use the existing shared parameter-type derivation before
 forward lowering, including write-only array parameters. Declared storage remains
 independent of computation precision; no alias assertion or source-completion
-obligation is relaxed. Independent review found no blocker. The broader affected
-native suites still expose reduction emission and rectangular-loop recovery
-failures, which remain qualification work rather than waived expectations.
+obligation is relaxed. Independent review found no blocker. The initial broader
+native run exposed reduction emission and rectangular-loop recovery failures.
+The reduction closure below is qualified; rectangular recovery remains open,
+not a waived expectation.
 
 The native reduction-result boundary now consumes a complete owned equation,
 not a syntactically bare reduction or its first physical phase. It folds into a
@@ -19,7 +20,10 @@ obligations are checked before emission; unsupported cases cannot acquire a
 compatibility schedule. Typed element reads retain their operand AV dtype in this
 host projection, without creating reference-Class evidence. Independent review
 approved the bounded design and implementation. Qualification: 72 affected tests,
-1,201 assertions pass; the separate rectangular-loop recovery test remains open.
+1,201 assertions pass. Shared route regression checks add 84 tests and 1,056
+passing assertions. The separate rectangular-loop recovery test still has its
+two code-shape failures (one numerical assertion passes); its expectations remain
+unchanged.
 
 Two generated-callee hygiene repairs keep that qualification honest: typed
 reduction identities and `expand-reduce`'s generated primitive wrappers now name
