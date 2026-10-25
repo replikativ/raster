@@ -625,10 +625,8 @@
               {:barriers []} (invocation/source-order invocation semantic-program))]
          {:required? (boolean (seq (:barriers result))) :barriers (:barriers result)})))))
 
-(defn ^:no-doc begin-ordered-realization
-  "Begin owner-local realization without evaluating invocation steps or acquiring resources.
-   The returned map is runtime construction state, not a portable completion certificate."
-  [compilation arguments caller-options]
+(defn- begin-ordered-realization-with
+  [compilation arguments caller-options begin-materialization]
   (let [{:keys [semantic-program invocation checked program]}
         (checked-compilation-boundary compilation nil caller-options)
         order (invocation/source-order invocation semantic-program)]
@@ -636,7 +634,7 @@
      :source-realizations (into {} (keep (fn [entry]
                                           (when-let [action (invocation-source/realization-action semantic-program entry)]
                                             [(:position entry) action]))) order)
-     :materialization (materialization/begin-materialization invocation arguments)
+     :materialization (begin-materialization invocation arguments)
      :realized {:buffers {} :storage {} :loop-scratch {}}
      :acquired-storage #{}
      ;; Preserve the producer's complete allocation claim. A storage-only
@@ -645,6 +643,19 @@
                               (get-in semantic-program [:attributes :allocations]))
      :projections (:projections checked) :retained-validation checked :target (:target compilation)
      :caller-options caller-options}))
+
+(defn ^:no-doc begin-ordered-realization
+  "Begin from logical arguments without source evaluation or resources. The returned map is
+   runtime construction state, not a portable completion certificate."
+  [compilation arguments caller-options]
+  (begin-ordered-realization-with compilation arguments caller-options materialization/begin-materialization))
+
+(defn ^:no-doc begin-ordered-parameter-realization
+  "Begin replay from an owning entry adapter's retained physical parameter slots.
+   No logical aggregate is reconstructed or reread. This grants no original-entry completion."
+  [compilation parameter-arguments caller-options]
+  (begin-ordered-realization-with compilation parameter-arguments caller-options
+                                  materialization/begin-parameter-materialization))
 
 (defn- validate-source-result-allocation! [state entry action]
   (let [destination (:binding action)
@@ -693,15 +704,13 @@
 
 (defn ^:no-doc ordered-input-arguments
   "Preflight primitive host-array replacements without evaluating source steps or mutating an
-   owner. Only dynamic entry inputs may change, and the prepared storage specialization is fixed.
-   Aggregate and resident-device replacement require their own ownership-aware adapter."
+   owner. Arguments are the owning entry's physical baseline, never logical aggregate roots.
+   Only dynamic buffer inputs may change; scalar slots and storage specialization remain fixed.
+   Whole-root projection belongs to the public adapter; resident-device replacement is separate."
   [state arguments roles replacements]
   (when-not (map? replacements)
     (fail! :invocation-ordered-inputs "ordered input replacement requires a map" {}))
   (let [plan (get-in state [:materialization :plan])
-        _ (when (get-in plan [:attributes :parameter-projection])
-            (fail! :invocation-ordered-input-projection
-                   "aggregate input replacement requires an ownership-aware field adapter" {}))
         available (materialization/prefix-bindings (:materialization state))
         buffers (:program-buffers available)
         input-ids (into #{} (keep (fn [[id role]] (when (= :input role) id))) roles)
@@ -718,7 +727,8 @@
                                 "dynamic input requires an exact public parameter slot" {:value id}))
                        (assoc arguments slot source)))
                    (vec arguments) replacements)
-        checked (materialization/prefix-bindings (materialization/begin-materialization plan arguments))]
+        checked (materialization/prefix-bindings
+                 (materialization/begin-parameter-materialization plan arguments))]
     (validate-ordered-entry-aliases! (:program-buffers checked) roles)
     (doseq [[id buffer] buffers
             :let [actual (get-in checked [:program-buffers id])]]

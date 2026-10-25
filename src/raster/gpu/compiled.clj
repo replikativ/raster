@@ -958,6 +958,32 @@
     {:parameter-projection projection :aggregate-leaves aggregate-leaves :roles roles
      :request request :effective-roles effective-roles :field-output-entries field-output-entries}))
 
+(defn- equation-first-parameter-ports
+  "Shared public leaf/path and captured scalar metadata, independent of concrete storage.
+   The supplied slots have already passed the invocation's logical parameter projection."
+  [invocation-plan projected-arguments]
+  (let [projection (get-in invocation-plan [:attributes :parameter-projection])
+        leaves (:physical-parameters projection)
+        by-symbol (into {} (map (juxt :symbol identity)) leaves)
+        groups (group-by :binding (filter materialization/projection-path leaves))
+        scalars (into {}
+                      (map (fn [[binding entries]]
+                             [binding (into {} (keep (fn [{:keys [symbol tag] :as leaf}]
+                                                       (when-not (types/array-tag? tag)
+                                                         [leaf (get projected-arguments symbol)])))
+                                            entries)])) groups)]
+    (into {}
+          (map (fn [{:keys [symbol]}]
+                 (let [{:keys [binding] :as leaf} (get by-symbol symbol)
+                       path (materialization/projection-path leaf)]
+                   [symbol (cond-> {:key (if path (into [(keyword (name binding))] path)
+                                            (keyword (name symbol)))
+                                    :sym symbol}
+                             path (assoc :aggregate-binding binding :aggregate-leaf leaf
+                                         :aggregate-tree (get-in projection [:trees binding])
+                                         :aggregate-scalars (get scalars binding)))])))
+          (:parameters invocation-plan))))
+
 (defn- equation-first-output-candidates
   "Ordered public intent only. Physical aliases are resolved and deduplicated at final projection."
   [request field-output-entries semantic-outputs]
@@ -1017,32 +1043,16 @@
                                       (materialization/parameter-arguments invocation-plan args)))
         _ (validate-mutable-aggregate-aliases!
            projection public-bindings projected-arguments aggregate-leaves roles)
-        aggregate-scalars (into {}
-                                (map (fn [[binding leaves]]
-                                       [binding (into {}
-                                                      (keep (fn [{:keys [symbol tag] :as leaf}]
-                                                              (when-not (types/array-tag? tag)
-                                                                [leaf (get projected-arguments symbol)])))
-                                                      leaves)]))
-                                aggregate-leaves)
-        leaves-by-symbol (into {} (map (juxt :symbol identity)) (:physical-parameters projection))
+        parameter-ports (equation-first-parameter-ports invocation-plan projected-arguments)
         donate-set (:donate-set request)
         in-tree (vec
                  (keep (fn [{:keys [symbol]}]
                          (when-let [node (get public-bindings symbol)]
-                           (let [{:keys [binding] :as leaf} (get leaves-by-symbol symbol)
-                                 path (materialization/projection-path leaf)]
-                             (merge (cond-> {:key (if path (into [(keyword (name binding))] path)
-                                                      (keyword (name symbol)))
-                                             :sym symbol
-                                             :donate? (contains? donate-set symbol)
-                                             :default (if projection (get-in raw-plan [:nodes node :source])
-                                                          (get argument-map symbol))}
-                                      path (assoc :aggregate-binding binding :aggregate-leaf leaf
-                                                   :aggregate-tree (get-in projection [:trees binding])
-                                                   :aggregate-scalars (get aggregate-scalars binding)))
-                                    (equation-first-value plan node
-                                                          (get effective-roles symbol))))))
+                           (merge (get parameter-ports symbol)
+                                  {:donate? (contains? donate-set symbol)
+                                   :default (if projection (get-in raw-plan [:nodes node :source])
+                                                (get argument-map symbol))}
+                                  (equation-first-value plan node (get effective-roles symbol)))))
                        parameters))
         candidates (equation-first-output-candidates
                     request field-output-entries
@@ -1057,10 +1067,9 @@
   [compilation args opts template-report]
   (let [started (System/nanoTime)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
-        _ (when (or (get-in invocation-plan [:attributes :parameter-projection])
-                    (seq (:donate opts))
+        _ (when (or (seq (:donate opts))
                     (:session opts) (:profile? opts))
-            (throw (ex-info "ordered preparation requires flat owned unprofiled semantic ports"
+            (throw (ex-info "ordered preparation requires owned unprofiled, non-donating semantic ports"
                             {:reason :compiled-ordered-capability})))
         caller-options (when (contains? opts :scalar-math)
                          {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math opts))})
@@ -1069,29 +1078,36 @@
         available (materialization/prefix-bindings (:materialization initial))
         buffers (:program-buffers available)
         parameters (:parameters invocation-plan)
+        parameter-arguments (materialization/initial-parameter-arguments (:materialization initial))
+        projected-arguments (zipmap (map :symbol parameters) parameter-arguments)
+        parameter-ports (equation-first-parameter-ports invocation-plan projected-arguments)
         parameter-order (zipmap (map :id parameters) (range))
         by-id (into {} (map (juxt :id identity)) parameters)
         public-symbols (into {} (map (fn [[id buffer]] [id (:symbol (get by-id (:id buffer)))])) buffers)
         _ (when-not (and (every? symbol? (vals public-symbols))
                          (= (count public-symbols) (count (distinct (vals public-symbols)))))
-            (throw (ex-info "ordered public entries require unambiguous flat parameter ports"
+            (throw (ex-info "ordered public entries require unambiguous physical parameter ports"
                             {:reason :compiled-ordered-parameter-boundary})))
         defaults (invocation-link/ordered-entry-roles initial nil)
         intent (equation-first-port-intent invocation-plan (set (vals public-symbols))
                                            (into {} (map (fn [[id role]] [(get public-symbols id) role])) defaults)
                                            opts)
+        _ (validate-mutable-aggregate-aliases!
+           (:parameter-projection intent) (set (vals public-symbols)) projected-arguments
+           (:aggregate-leaves intent) (:roles intent))
         roles (invocation-link/ordered-entry-roles
                initial (into {} (map (fn [[id symbol]] [id (get-in intent [:effective-roles symbol])]))
                              public-symbols))
         _ (invocation-link/ordered-entry-layout initial roles)
         in-tree (mapv (fn [[id buffer]]
-                        {:key (keyword (name (get public-symbols id)))
-                         :sym (get public-symbols id) :value id :role (get roles id)
-                         :shape (:shape buffer) :dtype (get-in buffer [:value :dtype])
-                         :default (:source buffer) :donate? false})
+                        (merge (get parameter-ports (get public-symbols id))
+                               {:value id :role (get roles id)
+                                :shape (:shape buffer) :dtype (get-in buffer [:value :dtype])
+                                :default (:source buffer) :donate? false}))
                       (sort-by #(get parameter-order (:id (val %))) buffers))
         outputs (vec (get-in initial [:program :outputs]))
-        candidates (equation-first-output-candidates (:request intent) [] outputs)
+        field-outputs (:field-output-entries intent)
+        candidates (equation-first-output-candidates (:request intent) field-outputs outputs)
         candidate-value (fn [id]
                           (or (get-in initial [:program :values id])
                               (get-in buffers [id :value])
@@ -1114,8 +1130,9 @@
                            (when-not (= outputs (mapv first (get-in candidate [:attributes :semantic-outputs])))
                              (throw (ex-info "completed semantic outputs differ from prepared intent"
                                              {:reason :compiled-ordered-output-boundary})))
-                           (project-equation-first-outputs candidate candidates []))
-        descriptor {:all-params (mapv :symbol parameters)
+                           (project-equation-first-outputs candidate candidates field-outputs))
+        descriptor {:all-params (or (get-in invocation-plan [:attributes :parameter-projection :public-parameters])
+                                    (mapv :symbol parameters))
                     :array-params (mapv :sym in-tree) :equation-first? true
                     :steps (equation-first-kernel-steps compilation)
                     :execution-phase :ordered-source}
@@ -1130,6 +1147,7 @@
                                (:target compilation)
                                descriptor (vec args) report nil)
                     :ordered-invocation {:compilation compilation :entry-roles roles
+                                         :parameter-arguments parameter-arguments
                                          :project-boundary project-boundary})
        caller-options (assoc :math-request caller-options)))))
 
@@ -1325,8 +1343,8 @@
                         (when (some #(contains? opts %) [:entry-roles :project-boundary])
                           (throw (ex-info "runtime options cannot replace prepared entry intent"
                                           {:reason :compiled-ordered-entry-intent})))
-                        (gpu-link/instantiate-ordered-invocation!
-                         (:compilation ordered) args
+                        (gpu-link/instantiate-ordered-parameter-invocation!
+                         (:compilation ordered) args (:parameter-arguments ordered)
                          (assoc opts :entry-roles (:entry-roles ordered)
                                      :project-boundary (:project-boundary ordered))))
                       (if (and (sealed-artifact? prepared)
@@ -1732,7 +1750,7 @@
                                                      (:aggregate-tree (first entries)))
                  (doseq [[leaf expected] (:aggregate-scalars (first entries))]
                    (let [actual (materialization/aggregate-leaf (get inputs key) leaf)]
-                     (when-not (= expected actual)
+                     (when-not (semantic-fingerprint/equivalent? expected actual)
                        (throw (ex-info "aggregate scalar fields are captured by the prepared specialization; prepare again to change them"
                                        {:reason :compiled-aggregate-scalar-change :parameter binding
                                         :field (:field leaf) :path (materialization/projection-path leaf)
@@ -1789,7 +1807,9 @@
   (when-not (map? inputs)
     (throw (ex-info "compiled inputs must be a map" {:reason :compiled-input-map})))
   (let [{:keys [executable target]} c
-        {:keys [input-nodes input-keys]} (invocation-layout-for c)]
+        {:keys [input-nodes input-keys aggregate-groups]} (invocation-layout-for c)
+        inputs (observation/phase :aggregate-input-projection
+                 (project-aggregate-inputs aggregate-groups inputs))]
     (when-not (set/subset? (set (keys inputs)) input-keys)
       (throw (ex-info "only dynamic input keys may be replaced; constants and state are captured"
                       {:reason :compiled-ordered-input-role :inputs input-keys :supplied (set (keys inputs))})))

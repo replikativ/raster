@@ -125,6 +125,28 @@
       (is (= '[half-dt nsteps] @calls))
       (is (zero? (:next-step initial)) "an advance does not mutate an earlier state"))))
 
+(deftest physical-entry-slots-retain-sources-and-check-arity-before-pairing
+  (let [plan (fixture-plan)
+        source (double-array 5)
+        arguments [source -0.0 3]
+        initial (materialization/begin-materialization plan arguments)
+        physical (materialization/initial-parameter-arguments initial)]
+    (is (identical? source (first physical)))
+    (is (= Double (class (second physical))))
+    (is (= (Double/doubleToRawLongBits -0.0)
+           (Double/doubleToRawLongBits (second physical))))
+    (is (= initial (materialization/begin-parameter-materialization plan physical)))
+    (doseq [bad [(pop physical) (conj physical 4) []]]
+      (is (= :invocation-materialization-arity
+             (materialization-reason #(materialization/begin-parameter-materialization plan bad)))))
+    (is (= :invocation-materialization-buffer-dtype
+           (materialization-reason
+            #(materialization/begin-parameter-materialization plan (assoc physical 0 (float-array 5))))))
+    (is (= :invocation-materialization-position
+           (materialization-reason
+            #(materialization/initial-parameter-arguments
+              (materialization/materialize-next initial evaluate-scalar)))))))
+
 (defn- staged-invocation-plan []
   (invocation/from-prefix
    {:id :deferred-square

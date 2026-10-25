@@ -1361,7 +1361,7 @@ source-created temporaries are zeroed again. Capture uses the existing Cleanup t
 a later entry-upload failure releases the earlier acquired roots and session without publishing
 an executable. Contradictory read-only intent is rejected before native acquisition. Semantic
 port-intent normalization and concrete public-role projection are shared with the eager path.
-Public ordered `Compiled` supports flat host-array input replacement; donation,
+Public ordered `Compiled` supports declared aggregate buffer-leaf and flat host-array replacement; donation,
 composition and frontier contracts remain separate gates. Host scalar element reads of captured
 device entries remain unsupported; validated shape descriptors are not content snapshots.
 Completion certificates remain unavailable until execution.
@@ -1390,8 +1390,23 @@ keys. The ordered path runs it after source/role reconciliation and before ordin
 LinkPlan validation, retaining the derived tree beside that exact completed plan. It never
 rewrites semantic results to include taps. Every selected node must be acquired and initialized
 before publication. A tap retains the final contents of its physical storage; it is not a
-snapshot of an earlier SSA version that later aliases overwrite. Aggregate ports, donation,
-deferred composition and leased compiled invocation still require their separate contracts.
+snapshot of an earlier SSA version that later aliases overwrite. Donation, whole-aggregate
+outputs/taps, deferred composition and leased compiled invocation remain separate contracts.
+
+Declared aggregate entries share the eager path's public leaf/path metadata and field-output
+selection. Logical arguments are checked and projected once at preparation. The owner retains
+three distinct things: original logical arguments, immutable physical defaults, and current
+replay slots. Instantiation/replay never reconstruct records or reread captured root fields.
+Array sources are borrowed by identity, not snapshotted: their bytes before instantiation are
+observable under the existing copy-in contract; captured resident state/constants subsequently
+persist independently of host mutation. Dynamic buffer leaves refresh on replay.
+Whole-root replacements use the same nominal/tree, root/leaf conflict, scalar specialization
+and role checks as eager invocation. Captured scalars compare by exact semantic encoding,
+including carrier distinctions, signed zeros and NaN payloads. All leaves, storage shapes and
+mutable cross-port aliases are checked before transfers or output-wrapper retirement. The
+shared physical-parameter initializer checks scalar values/domains and buffer contracts; it is
+not evidence for a root Class, numerical payload Class or completed source entry. A physical
+vector is never passed back through the logical argument projector.
 
 Auxiliary realization bindings are executable source actions, not scaffolding that can be
 discarded because a later kernel overwrites the result. The internal ordered root now recovers

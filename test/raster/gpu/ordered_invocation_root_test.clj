@@ -224,14 +224,18 @@
             (is (= 1 @retirements) "a live lease prevents even the retirement callback")
             (finally (.close ^java.io.Closeable lease))))
         (let [held (atom nil)
-              arguments (get-in @(:execution-state executable) [:ordered :arguments])]
+              arguments (get-in @(:execution-state executable) [:ordered :arguments])
+              parameter-arguments (get-in @(:execution-state executable) [:ordered :parameter-arguments])]
           (try
             (is (= :link-output-lease-active
                    (reason #(link/run-ordered-with-inputs!
                              executable {'x (double-array [41.0])}
                              (fn [] (reset! held (link/output-lease! executable)))))))
             (is (identical? arguments (get-in @(:execution-state executable) [:ordered :arguments]))
-                "reentrant lease acquisition cannot commit the preflighted arguments")
+                "logical arguments remain original provenance")
+            (is (identical? parameter-arguments
+                            (get-in @(:execution-state executable) [:ordered :parameter-arguments]))
+                "reentrant lease acquisition cannot commit the preflighted physical slots")
             (finally (when @held (.close ^java.io.Closeable @held))))))
       (is (= [100.0] (vec state)) "resident state does not silently mutate the borrowed host array")
       (is (= [50.0] (vec weights)))

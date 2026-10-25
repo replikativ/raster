@@ -395,20 +395,21 @@
   [plan arguments]
   (project-parameter-arguments (invocation/validate-parameter-projection! plan) arguments))
 
-(defn begin-materialization
-  "Validate public arguments without evaluating any invocation step.
+(defn- checked-parameter-plan [plan]
+  (let [plan (invocation/validate! plan)]
+    (refuse-external-dimensions! plan)
+    (refuse-external-storage! plan)
+    plan))
 
-   The returned immutable state owns no driver resources or evaluator. It is not a completed
-   MaterializedInvocation or permission to bind its unevaluated suffix. Advancing a state chain
-   evaluates one step at a time; callers may place existing device completion boundaries between
-   advances. Reusing an older state explicitly repeats computation, not a successful-check proof.
-   Host arrays remain borrowed sources, not snapshots or newly acquired lifetime leases."
+(defn- initialize-parameters
   [plan arguments]
-  (let [plan (invocation/validate! plan)
-        _ (refuse-external-dimensions! plan)
-        _ (refuse-external-storage! plan)
-        arguments (project-parameter-arguments plan arguments)]
-    (let [parameter-pairs (mapv vector (:parameters plan) arguments)
+  ;; Check before pairing: mapv vector would otherwise silently truncate a missing leaf.
+  (when-not (and (vector? arguments) (= (count (:parameters plan)) (count arguments)))
+    (fail! :invocation-materialization-arity
+           "physical arguments must follow the declared parameter order"
+           {:parameters (mapv :symbol (:parameters plan))
+            :expected (count (:parameters plan)) :actual (count arguments)}))
+  (let [parameter-pairs (mapv vector (:parameters plan) arguments)
           scalar-values
           (into {}
                 (keep (fn [[parameter argument]]
@@ -437,7 +438,26 @@
                               "public argument has no supported host materialization"
                               {:value-id id :kind (:kind value)}))))
            scalar-values parameter-pairs)]
-      (->InvocationMaterializationState plan parameter-values initial-lexical 0))))
+    (->InvocationMaterializationState plan parameter-values initial-lexical 0)))
+
+(defn ^:no-doc begin-parameter-materialization
+  "Initialize declared physical parameters after an owner's logical entry projection.
+   This checks arity, scalar values/domains and buffer contracts, not the original root Class/tree or
+   source completion. It cannot authorize a new public calling convention or scalar replacement."
+  [plan parameter-arguments]
+  (initialize-parameters (checked-parameter-plan plan) parameter-arguments))
+
+(defn begin-materialization
+  "Validate public arguments without evaluating any invocation step.
+
+   The returned immutable state owns no driver resources or evaluator. It is not a completed
+   MaterializedInvocation or permission to bind its unevaluated suffix. Advancing a state chain
+   evaluates one step at a time; callers may place existing device completion boundaries between
+   advances. Reusing an older state explicitly repeats computation, not a successful-check proof.
+   Host arrays remain borrowed sources, not snapshots or newly acquired lifetime leases."
+  [plan arguments]
+  (let [plan (checked-parameter-plan plan)]
+    (initialize-parameters plan (project-parameter-arguments plan arguments))))
 
 (defn- step-operand-values [step values]
   (into {} (map (fn [{:keys [symbol value]}] [symbol (get values value)])) (:operands step)))
@@ -582,6 +602,21 @@
          (->InvocationMaterializationState plan parameter-values parameter-lexical 0)
          (take next-step (:steps plan))))
       state)))
+
+(defn ^:no-doc initial-parameter-arguments
+  "Read already checked entry slots without revisiting the logical argument containers.
+   This borrows their sources; it neither snapshots bytes nor grants source-completion credit."
+  [state]
+  (when-not (= 0 (:next-step state))
+    (fail! :invocation-materialization-position
+           "entry slots must be captured before source materialization advances" {}))
+  (let [state (validate-state! state)]
+    (mapv (fn [{:keys [id]}]
+            (let [value (get-in state [:values id])]
+              (cond (or (materialized-buffer? value) (materialized-opaque? value)) (:source value)
+                    (typed-scalar? value) (:value value)
+                    :else value)))
+          (get-in state [:plan :parameters]))))
 
 (defn materialize-next
   "Evaluate exactly the next invocation step after validating the current prefix.

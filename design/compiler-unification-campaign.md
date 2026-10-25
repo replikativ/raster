@@ -13,7 +13,7 @@ rather than adding a route for each workload.
 | --- | --- | --- |
 | Causal allocation extents | Preceding lexical alias to allocation shape | `bf02a900`: 32 tests / 242 assertions; original recipe and failure ordering preserved |
 | Ordered outputs and taps | Deferred public intent to completed physical boundary | Locally qualified: 45 tests / 997 assertions, shared projector, independent intermediate/final device values and replay/lifetime/failure/certificate controls; full branch gates still pending |
-| Aggregate state and composition | Public parameter leaves and deferred components | Same source cursor, explicit ownership, no fabricated preparation-time LinkPlan; composed AMR/distributed workload |
+| Aggregate state and composition | Entry slots locally qualified; deferred components remain open | 57 tests / 1,260 assertions qualify shared leaf projection and replay; next require composed AMR/distributed workload without a fabricated preparation-time LinkPlan |
 | RK4 | Source-loop construction, then ordered structured execution | Source/count/carry/body/copy correspondence; zero/one/many iterations and independent PDE oracle |
 | Float/Object results | Owned imported completion suffix after numerical reduction | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
@@ -138,6 +138,19 @@ Landing order within the unchanged eight-objective campaign:
    found no blocker. This does not enable aggregate ports, donation, deferred
    composition or leased compiled invocation, and a physical tap is not an
    earlier-version snapshot of storage subsequently overwritten through an alias.
+   Aggregate entry/state projection now shares eager leaf/path/scalar metadata
+   and exact field-output selection. Prepared captures checked physical defaults
+   once; the runtime keeps logical provenance and current replay slots separate.
+   No nominal roots are reconstructed or reread during instantiation/replay.
+   Existing materialization initialization is shared, with physical arity checked
+   before pairing slots and no new Class/source-completion claims. Eight affected
+   suites pass 57 tests / 1,260 assertions, including both local device backends,
+   nominal and nested-tree cases, borrowed bytes before instantiation, resident
+   state/constants, changed/default replay, later invalid leaves, root/leaf
+   conflicts, mutable cross-root aliases, checked failure after an early write,
+   scalar signed-zero/NaN/carrier controls and physical-slot reentrancy. Independent
+   implementation/design reviews found no blocker. Deferred composition, whole
+   aggregate outputs/taps, donation and leased compiled invocation remain open.
 4. Close typed AD/JVP and native map consumers, then rectangular/SIMD and JVM
    quality regressions. Investigate timed GSDM phases before changing timeouts.
 5. Requalify all shards, corpus/device gates and actual CUDA/HIP compilers before

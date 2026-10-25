@@ -12,6 +12,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.link-composition :as link-composition]
@@ -1141,24 +1142,26 @@
   (parallel-program/release-prepared! prepared)
   (swap! execution-state update-in [:ordered :prepared] dissoc position))
 
-(defn ^:no-doc instantiate-ordered-invocation!
+(defn- instantiate-ordered-invocation-with!
   "Internal owned-root vertical for source-ordered invocation execution. No source-created
    storage or suffix graph is acquired here. Captured public entries are initialized at binding; dynamic
-   inputs refresh on replay. Attached sessions and profiling need their own activation
-   tests before this path is exposed by Compiled; the ordinary eager instantiator is unchanged."
-  [compilation arguments opts]
+   inputs refresh on replay. Attached sessions and profiling remain separate capability gates;
+   the ordinary eager instantiator is unchanged."
+  [compilation arguments opts begin-realization]
   (when (or (:session opts) (:profile? opts)
             (seq (set/difference (set (keys opts)) #{:scalar-math :profile? :entry-roles :project-boundary}))
             (and (:project-boundary opts) (not (fn? (:project-boundary opts)))))
     (throw (ex-info "ordered invocation activation currently requires an owned unprofiled session"
                     {:reason :link-ordered-options})))
   (let [caller-options (caller-math-options opts)
-        initial (invocation-link/validate-ordered-source-actions!
-                 (invocation-link/begin-ordered-realization compilation arguments caller-options))
+        initial (invocation-link/validate-ordered-source-actions! (begin-realization caller-options))
+        parameter-defaults (materialization/initial-parameter-arguments (:materialization initial))
         entry-roles (invocation-link/ordered-entry-roles initial (:entry-roles opts))
         entry-layout (invocation-link/ordered-entry-layout initial entry-roles)
         execution-state (atom {:value-epoch 0
                                :ordered {:compilation compilation :arguments (vec arguments)
+                                         :parameter-defaults parameter-defaults
+                                         :parameter-arguments parameter-defaults
                                          :caller-options caller-options
                                          :entry-roles entry-roles
                                          :project-boundary (:project-boundary opts)
@@ -1192,6 +1195,21 @@
         (capture-ordered-entries! executable entry-layout)
         executable)
      nil)))
+
+(defn ^:no-doc instantiate-ordered-invocation!
+  "Capture logical public entries once, then replay from their checked physical baseline."
+  [compilation arguments opts]
+  (instantiate-ordered-invocation-with!
+   compilation arguments opts
+   #(invocation-link/begin-ordered-realization compilation arguments %)))
+
+(defn ^:no-doc instantiate-ordered-parameter-invocation!
+  "Instantiate a prepared owner's physical entry baseline without rereading captured roots.
+   Logical arguments remain distinct provenance/default data, never physical argument slots."
+  [compilation arguments parameter-arguments opts]
+  (instantiate-ordered-invocation-with!
+   compilation arguments opts
+   #(invocation-link/begin-ordered-parameter-realization compilation parameter-arguments %)))
 
 (defn- ordered-require-initialized! [nodes initialized ids]
   (doseq [id ids]
@@ -1314,12 +1332,13 @@
 
 (defn- run-ordered-invocation! [executable]
   (let [execution-state (:execution-state executable)
-        {:keys [compilation arguments caller-options prepared entry-roles entry-refresh initialized]}
+        {:keys [compilation parameter-arguments caller-options prepared entry-roles entry-refresh initialized]}
         (:ordered @execution-state)]
     (when (seq prepared)
       (throw (ex-info "ordered invocation still owns an unfinished prepared stage"
                       {:reason :link-ordered-prepared-stage})))
-    (let [initial (assoc (invocation-link/begin-ordered-realization compilation arguments caller-options)
+    (let [initial (assoc (invocation-link/begin-ordered-parameter-realization
+                         compilation parameter-arguments caller-options)
                          :entry-roles entry-roles :entry-refresh entry-refresh)
           captured (into #{} (keep (fn [[id role]] (when (not= :input role) id))) entry-refresh)
           initialized (vec (distinct (filter #(contains? captured (get-in % [:allocation :id]))
@@ -1358,7 +1377,8 @@
    executable :run-ordered-with-inputs!
    (fn []
      (let [execution-state (:execution-state executable)
-           {:keys [compilation arguments caller-options entry-roles] :as ordered}
+           {:keys [compilation arguments parameter-defaults parameter-arguments caller-options entry-roles]
+            :as ordered}
            (:ordered @execution-state)]
        (when-not ordered
          (throw (ex-info "ordered input handoff requires an ordered owned root"
@@ -1367,16 +1387,19 @@
          (throw (ex-info "ordered handoff callback must be callable"
                          {:reason :link-ordered-input-callback})))
        (let [epoch (:value-epoch @execution-state)
-             initial (invocation-link/begin-ordered-realization compilation arguments caller-options)
-             checked (invocation-link/ordered-input-arguments initial arguments entry-roles replacements)]
+             initial (invocation-link/begin-ordered-parameter-realization
+                      compilation parameter-defaults caller-options)
+             checked (invocation-link/ordered-input-arguments initial parameter-defaults entry-roles replacements)]
          (when before-mutation! (before-mutation!))
          (ensure-live! executable :run-ordered-with-inputs!)
          (ensure-no-output-leases! executable :run-ordered-with-inputs!)
          (when-not (and (= epoch (:value-epoch @execution-state))
-                        (identical? arguments (get-in @execution-state [:ordered :arguments])))
+                        (identical? arguments (get-in @execution-state [:ordered :arguments]))
+                        (identical? parameter-arguments
+                                    (get-in @execution-state [:ordered :parameter-arguments])))
            (throw (ex-info "ordered input preflight was invalidated by reentrant owner activity"
                            {:reason :link-ordered-input-reentrancy})))
-         (swap! execution-state assoc-in [:ordered :arguments] checked)
+         (swap! execution-state assoc-in [:ordered :parameter-arguments] checked)
          (run! executable))))))
 
 (defn- failed-write!
