@@ -1395,8 +1395,9 @@ keys. The ordered path runs it after source/role reconciliation and before ordin
 LinkPlan validation, retaining the derived tree beside that exact completed plan. It never
 rewrites semantic results to include taps. Every selected node must be acquired and initialized
 before publication. A tap retains the final contents of its physical storage; it is not a
-snapshot of an earlier SSA version that later aliases overwrite. Donation, whole-aggregate
-outputs/taps, deferred composition and leased compiled invocation remain separate contracts.
+snapshot of an earlier SSA version that later aliases overwrite. Declared aggregate field
+selection uses the shared leaf adapter below; whole-aggregate reconstruction for outputs/taps,
+donation, deferred composition and leased compiled invocation remain separate contracts.
 
 Declared aggregate entries share the eager path's public leaf/path metadata and field-output
 selection. Logical arguments are checked and projected once at preparation. The owner retains
@@ -1423,8 +1424,10 @@ Existing primary, auxiliary and allocation source claims are checked independent
 hoisting or fallback executor selection: another possible executor cannot conceal a stale
 claim. Unowned observable work must execute at its source position or be refused. Original
 allocation/helper recipes and their lexical dependencies survive shape normalization; size
-equivalence remains a separate causal check. This producer closure does not establish ordered
-clone/loop execution, Float payload completion or resident inter-component composition.
+equivalence remains a separate causal check. This producer closure is not execution evidence:
+admitted numerical loop/copy stages use the unified ordered ProgramLinkInstance path and its
+completion checks. Unsupported source actions, Float payload completion and deferred resident
+inter-component composition retain their separate obligations.
 
 An analyzed allocation claim also roots its original source binding during realization, even
 when no surviving numerical equation reads its contents. Allocation arguments and result storage
@@ -1473,10 +1476,12 @@ reuse that exact physical token. A storage alias binds an already acquired desti
 grants no allocation, initialization or completion credit. Local OpenCL/Level Zero controls
 cover the existing four-layer dense program, changed-input replays, empty functional results,
 late constructor failures and aliases after fused writes. Distinct logical/physical result
-storage, prefix views and aliases before target acquisition remain explicit capability limits;
-these controls do not qualify every possible frontend realization.
+storage and prefix views now use the shared certified source-return projection: a numerical
+prefix write does not widen its initialization proof to the whole returned backing buffer.
+Aliases before target acquisition still require actual readiness; these controls do not qualify
+every possible frontend realization or helper consumption of untouched suffixes.
 Preparation and native-root construction share one structural source-action coverage gate before
-capture or effects. It refuses unsupported steps/realizations, structured-loop fragments and
+capture or effects. It refuses unsupported steps/realizations, unsupported structured fragments and
 missing native-content-provider contracts without evaluating a checked source size. Runtime
 constructor counts, argument availability, alias readiness and logical-view reconciliation still
 require their own ordered checks; structural admission is not a completion or totality proof.

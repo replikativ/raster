@@ -15,7 +15,7 @@ rather than adding a route for each workload.
 | Ordered outputs and taps | Deferred public intent to completed physical boundary | Locally qualified: 45 tests / 997 assertions, shared projector, independent intermediate/final device values and replay/lifetime/failure/certificate controls; full branch gates still pending |
 | Aggregate state and composition | Entry slots locally qualified; deferred components remain open | 57 tests / 1,260 assertions qualify shared leaf projection and replay; next require composed AMR/distributed workload without a fabricated preparation-time LinkPlan |
 | Source buffer returns | Whole-buffer projection locally corrected; full branch and subsequent helper-consumption gates remain open | Capacity-eight/domain-two direct/alias/tuple returns and local zero allocations pass local device checks; initialized-tail, nominal keys and ordered stages are independently qualified below; helper-consuming-all-eight remains the next integration |
-| Source omission and repeatability | Constructor checks can disappear before semantic admission; stale-read CSE locally repaired | Preserve deterministic constructor failures before DCE; public JVM AOT read/write/read oracle and collection/alias controls; keep safe dead-work elimination and measure compile cost |
+| Source omission and repeatability | Constructor preservation and stale-read CSE locally corrected; exact-checkpoint/full qualification and broader partiality remain | Constructor failure ordering and original intrinsic ownership; public JVM AOT read/write/read oracle and collection/alias controls; keep safe dead-work elimination and measure retained dynamic work |
 | RK4 | Full qualification of unified ordered program stages | Local Intel Arc OpenCL/Level Zero recurrence and discrete RK4 oracle pass; affected/fresh/full gates remain pending |
 | Float/Object results | Completed numerical result to invocation-value import, then owned source completion and distinct result publication | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
@@ -48,6 +48,16 @@ This consolidates existing analyzed entries, InvocationPlan and runtime ownershi
 it does not add a numerical IR or executor. Source-action reads contribute to
 liveness, but only actual observable execution obligations partition fusion.
 All eight original campaign objectives remain acceptance requirements.
+
+The second independent review against `2473d88d3` confirms that the isolated
+selected-helper import adapter still has no production consumer, ordered result
+import/completion is not admitted, and deferred composition still requires a
+concrete preparation. These are implementation gaps, not merely missing tests.
+The next substantive unit must consume the source/component relation and close
+transparent versus observable return execution together; do not add another
+unused receipt layer or numerical IR. Existing source-inlined helpers are not
+thereby unsupported: the bounded whole-buffer `map!` then `par/sum` probe below
+already executes correctly. Keep that positive path while extending composition.
 
 ### Causal source-value projection (October 25)
 
@@ -85,14 +95,14 @@ the caller's source buffer to its physical destination/version. Any consumer of
 the untouched suffix still requires initialization evidence. Alpha-renaming alone
 cannot establish this relation or discharge that obligation.
 
-A hardware-free public `equation-first/compile` followed by `lower` confirms a
-remaining discrepancy: returning the source binder of `map!` with an eight-item
-input destination and two-item traversal exposes a two-item result view. This
-must be repaired at the checked source-return/storage projection, not by widening
+Before `7faf6b296`, a hardware-free public `equation-first/compile` followed by
+`lower` confirmed a discrepancy: returning the source binder of `map!` with an eight-item
+input destination and two-item traversal exposed a two-item result view. This
+required repair at the checked source-return/storage projection, not by widening
 the numerical result or its complete-write domain. Public whole-buffer length and
-unchanged-tail checks, a later reduction over all eight items, and refusal of an
-uninitialized tail are required integration gates. The causal analysis tests above
-do not establish those runtime/public-return obligations.
+unchanged-tail checks and refusal of an uninitialized tail are now qualified by
+the whole-buffer correction below. A later helper reduction over all eight items
+remains an integration gate; the causal analysis alone does not establish it.
 
 Exact-head CI accounting for `461216b00` (job 34927) has 15 completed timing
 artifacts, missing shard 3: 7,036 tests, 87,919 passing assertions, 26 failures and
@@ -179,11 +189,12 @@ remains opaque, including for local discovery and source-obligation traversal.
 Unchanged pure epochs still permit repeated-read CSE. Source optimization unit
 and complete JIT/AOT differential gates pass 53 tests / 653 assertions; the
 focused CSE/effect gate passes 28 tests / 178 assertions, and the public AOT
-regression passes four assertions on changed inputs. Fresh-process and branch-wide
-qualification remain separate. Constructor omission is not fixed by this change;
+regression passes four assertions on changed inputs. Independent clean-process
+qualification also passes 53 tests / 653 assertions; branch-wide qualification
+remains separate. Constructor omission is not fixed by this CSE change;
 more precise read/version and totality proofs remain later refinements.
 
-### Source constructor evaluation (October 25, pending branch qualification)
+### Source constructor evaluation (October 25, branch qualification)
 
 An unused dynamic core array constructor after a numerical prefix previously
 disappeared during scalar DCE. A negative count then returned successfully instead
@@ -212,11 +223,27 @@ constant dead local buffers/writes still disappear. Separate required evaluation
 from content liveness only with actual fresh/non-escape authority and partial-write
 semantics, not nominal allocation names.
 
-The warm five-namespace scalar/JIT-AOT gate passes 57 tests / 689 assertions.
+The initial warm five-namespace scalar/JIT-AOT gate passes 57 tests / 689 assertions.
 Public ordered OpenCL and Level Zero tests pass 2 tests / 14 assertions: negative
 counts throw after the earlier resident write, preserve the untouched tail, poison
 publication and do not complete a replay; zero/positive counts return the full
-buffer. Fresh qualification and the wider affected gate are recorded separately.
+buffer. After original-intrinsic/cache-hit hardening, independent clean-process
+qualification passes the 32-namespace source bundle (718 tests / 7,623 assertions)
+and five scalar/JIT-AOT namespaces (59 tests / 700 assertions). The sandbox's two
+device cases explicitly skip and are not counted as device qualification; the
+separate fresh device run requires both actual local backends and passes 2 tests /
+14 assertions on OpenCL and Level Zero. Together these disjoint gates cover 779
+tests / 8,337 assertions at source checkpoint `6cf88aee0`; they are not full-branch
+or performance qualification.
+
+A bounded public-source probe also checks `map!` writing two elements of an
+initialized eight-element buffer followed by `par/sum` of its returned reference.
+The direct JVM and ordered OpenCL paths both produce the independent result 90;
+instrumenting the five `gpu.core` download entry points records no download calls
+during `run!` (final explicit export is outside that measurement). This qualifies
+neither general selected-component import nor broad transfer/fusion performance.
+Add it to the consuming-assembly regression bundle rather than treating ordinary
+source-inlined helpers as universally absent.
 
 Exact-head CI at `2473d88d3`, before this constructor change, remains unqualified:
 job 34947 has 15 completed artifacts and missing shard 3, with 6,978 tests, 86,365
