@@ -23,6 +23,11 @@
                         (float 0.03125001))))
     (double (arrays/aget out 0))))
 
+(deftm completed-float-publication [completed :- Float] :- Float
+  (let [out (float-array 1)]
+    (par/map-void! i 1 (arrays/aset out i completed))
+    (arrays/aget out 0)))
+
 (def ^:private samples
   [(float-array [1.2345679])
    (float-array [-3.1415927])
@@ -43,8 +48,10 @@
 (defn- direct-scalar-matches
   [prepared]
   (vec
-   (for [instance (get-in prepared [:lowering :plan :instances])
-         :let [program (get-in instance [:call :program])]
+   (for [program (if-let [compilation (get-in prepared [:ordered-invocation :compilation])]
+                   [(:emitted compilation)]
+                   (map #(get-in % [:call :program])
+                        (get-in prepared [:lowering :plan :instances])))
          equation (:equations program)
          :let [algorithm (:algorithm equation)]
          :when (dialect/program-form? algorithm)
@@ -85,8 +92,11 @@
         matches (direct-scalar-matches prepared)
         result-entry (some #(when (= :result (:key %)) %) (:out-tree prepared))]
     (is (= :none (get-in prepared [:schedule :stats :fallback])))
-    (is (= 1 (get-in prepared [:schedule :stats :emission :host-scalar-equations]))
-        "the only host scalar is the checked constant allocation extent")
+    (is (= 0 (get-in prepared [:schedule :stats :emission :host-scalar-equations]))
+        "the constant allocation extent is folded; no scalar result runs on the host")
+    (is (not-any? #(true? (get-in % [:attributes :host-only]))
+                  (mapcat #(get-in % [:program :equations]) matches))
+        "the emitted equations independently confirm the absence of host scalar work")
     (is (= 1 (count matches)) "one semantic ScalarIR result has one direct device schedule")
     (when-let [{:keys [program equation inner result operation value]} (first matches)]
       (is (= [] (:shape value)) "the semantic scalar remains logically rank zero")
@@ -102,8 +112,9 @@
       (is (= 1 (get-in operation [:space :dims 0 :bound])))
       (is (= #{result} (:outputs operation)))
       (is (not (true? (get-in equation [:attributes :host-only])))))
-    (is (= :double (:dtype result-entry)))
-    (is (= [] (:shape result-entry)) "the public value preserves logical scalar shape")
+    (is (= :double (:dtype (or (:abstract result-entry) result-entry))))
+    (is (= [] (:shape (or (:abstract result-entry) result-entry)))
+        "the public value preserves logical scalar shape")
     (let [artifact (compiled/instantiate! prepared)
           latest (atom nil)]
       (try
@@ -136,3 +147,32 @@
   (if @ze/gpu-available?
     (check-device! :ze:0)
     (ze/gpu-skip! "direct Double scalar result")))
+
+(defn- check-completed-float! [target]
+  ;; This is an already completed source scalar. It does not claim to qualify
+  ;; the separate source-result import and checked conversion machinery.
+  (let [prepared (compiled/lower #'completed-float-publication [(float -0.0)]
+                                 {:compiler :equation-first :target target :dtype :float})
+        artifact (compiled/instantiate! prepared)
+        previous (atom nil)]
+    (try
+      (dotimes [_ 2]
+        (let [output (:result (artifact))
+              host (value/->host output)]
+          (is (= (class (float-array 0)) (class host)))
+          (is (= [] (:shape output)))
+          (is (= :float (:dtype output)))
+          (is (= [Integer/MIN_VALUE] (mapv #(Float/floatToRawIntBits %) host)))
+          (when @previous (is (not (value/live? @previous))))
+          (reset! previous output)))
+      (compiled/close! artifact)
+      (is (not (value/live? @previous)))
+      (finally (compiled/close! artifact)))))
+
+(deftest completed-float-keeps-its-physical-class-and-signed-zero
+  (if @opencl/opencl-available?
+    (check-completed-float! :ocl:0)
+    (opencl/opencl-skip! "completed Float publication"))
+  (if @ze/gpu-available?
+    (check-completed-float! :ze:0)
+    (ze/gpu-skip! "completed Float publication")))

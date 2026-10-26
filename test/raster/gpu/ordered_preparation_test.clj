@@ -9,6 +9,8 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.core :refer [deftm]]
+            [raster.par :as par]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
@@ -21,6 +23,48 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftm completed-float-terminal [completed :- Float] :- Float
+  (let [out (float-array 1)]
+    (par/map-void! i 1 (aset out i completed))
+    (aget out 0)))
+
+(deftest terminal-residency-requires-the-checked-emitted-schedule
+  (let [compilation (equation-first/compile #'completed-float-terminal
+                                          {:target :ocl:0 :dtype :float})
+        emitted (:emitted compilation)
+        scheduled (:scheduled compilation)
+        output (first (:outputs scheduled))
+        expected (get-in compilation [:semantic :values output])
+        view (emitted-program/retained-typed-program-view emitted scheduled nil)
+        numerical-index (first (keep-indexed
+                                (fn [i eq] (when (seq (:operations eq)) i))
+                                (:equations scheduled)))]
+    (is (some? view))
+    (is (= :typed-soac (:dialect view)))
+    (is (nil? (:source view)))
+    (is (nil? (get-in view [:attributes :invocation-plan])))
+    (is (every? #(instance? raster.compiler.ir.parallel_program.ProgramEquation %)
+                (:equations view)))
+    (is (= expected (equation-first/validated-resident-output compilation output)))
+    ;; These edits leave the separately emitted program valid. Its checked body must
+    ;; nevertheless match the scheduled peer before raw operations can be projected.
+    (doseq [damaged [(assoc-in compilation [:scheduled :equations numerical-index :operations] [])
+                     (assoc-in compilation [:scheduled :equations numerical-index :operations 0 :space :dims 0 :bound] 2)
+                     (assoc-in compilation [:scheduled :values output :dtype] :double)
+                     (assoc-in compilation [:scheduled :attributes :allocations] [])
+                     (assoc-in compilation [:emitted :values output :dtype] :double)
+                     (assoc-in compilation [:emitted :outputs] [])
+                     (update-in compilation [:scheduled :equations]
+                                (fn [equations]
+                                  (mapv #(if (soac/program-form? (:algorithm %))
+                                           (assoc % :operations (soac/equations (:algorithm %))) %)
+                                        equations)))]]
+      (is (nil? (equation-first/validated-resident-output damaged output))))
+    (is (= (:outputs scheduled) (:outputs view)))
+    (is (= (:effects scheduled) (:effects view)))
+    (is (= (get-in scheduled [:attributes :allocations])
+           (get-in view [:attributes :allocations])))))
 
 (deftest ordered-scalar-preparation-requires-the-inner-resident-output-certificate
   (let [compilation (equation-first/compile #'fixture/write-before-resident-reduction

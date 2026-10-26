@@ -1121,7 +1121,7 @@
                              (let [value (candidate-value id)]
                                (or (seq (:shape value))
                                    (when-let [resident (equation-first/validated-resident-output
-                                                       compilation id)]
+                                                       compilation id caller-options)]
                                      (semantic-fingerprint/equivalent? resident value)))))
                            (map :sym candidates))
             (throw (ex-info "ordered public outputs require arrays or certified resident scalars"

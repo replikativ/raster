@@ -240,7 +240,9 @@
    Nested control remains in its enclosing equation's algorithm; this does not flatten loops.
    Every dispatch alternative must preserve the same semantic projection. This is structural
    provenance, not a proof of an application's mathematical interpretation of these equations."
-  [parallel-program caller-options]
+  ([parallel-program caller-options]
+   (numerical-equations-for-request parallel-program caller-options false))
+  ([parallel-program caller-options include-host?]
   (if (nil? caller-options)
     (validate! parallel-program)
     (validate! parallel-program caller-options))
@@ -249,7 +251,8 @@
          (mapcat
           (fn [equation]
             (cond
-              (true? (get-in equation [:attributes :host-only])) []
+              (true? (get-in equation [:attributes :host-only]))
+              (if include-host? [(scheduled-equation-view equation)] [])
               (seq (get-in equation [:attributes :emitted-source-equations]))
               (let [expected (get-in equation [:attributes :emitted-source-equations])
                     projections
@@ -270,13 +273,63 @@
     (when-not (= (count equations) (count (distinct (map :id equations))))
       (throw (ex-info "retained semantic equations require distinct identities"
                       {:reason :emitted-program-semantic-identities})))
-    equations))
+    equations)))
 
 (defn retained-numerical-equations
   "Project retained numerical equations only after independent validation under caller intent."
   ([parallel-program] (numerical-equations-for-request parallel-program nil))
   ([parallel-program caller-options]
    (numerical-equations-for-request parallel-program caller-options)))
+
+(defn- retained-schedule-matches?
+  "Relate a scheduled peer to the actual source schedules of checked emitted alternatives."
+  [emitted scheduled equations caller-options]
+  (program/validate! scheduled)
+  (let [by-id (into {} (map (juxt :id identity)) (:equations scheduled))]
+    (and (contains? #{:segop :scheduled-parallel} (:dialect scheduled))
+         (semantic-fingerprint/equivalent?
+          (select-keys scheduled [:values :inputs :outputs :effects :attributes])
+          (select-keys emitted [:values :inputs :outputs :effects :attributes]))
+         (= (mapv :id (:equations scheduled)) (mapv :id equations))
+         (every?
+          (fn [equation]
+            (if (true? (get-in equation [:attributes :host-only]))
+              (semantic-fingerprint/equivalent? equation (get by-id (:id equation)))
+              (some (fn [candidate]
+                      (every? #(semantic-fingerprint/equivalent? % (get by-id (:id %)))
+                              (candidate-numerical-equations candidate)))
+                    (equation-candidates (first (:operations equation)) caller-options))))
+          (:equations emitted)))))
+
+(defn retained-typed-program-view
+  "Project a flat TypedSOAC analysis view only after checking the actual emitted program.
+   Retained algorithms, checked host prefixes and allocation context remain authoritative;
+   target operations are not accepted by tag or silently discarded before validation.
+   An optional scheduled peer must match actual retained source schedules, not just their tags.
+   This is not an executable, original-entry completion or invocation-plan capability.
+   Mixed algorithm families abstain rather than broadening semantic analyses."
+  ([parallel-program] (retained-typed-program-view parallel-program nil nil))
+  ([parallel-program caller-options]
+   (retained-typed-program-view parallel-program nil caller-options))
+  ([parallel-program scheduled-peer caller-options]
+   (let [equations (numerical-equations-for-request parallel-program caller-options true)]
+     (when (and (every? #(soac/program-form? (:algorithm %)) equations)
+                (or (nil? scheduled-peer)
+                    (retained-schedule-matches? parallel-program scheduled-peer equations caller-options)))
+       (program/make
+        {:dialect :typed-soac :source nil
+         :values (:values parallel-program) :inputs (:inputs parallel-program)
+         :outputs (:outputs parallel-program) :effects (:effects parallel-program)
+         :diagnostics (:diagnostics parallel-program)
+         :provenance (assoc (:provenance parallel-program) :pass :retained-typed-analysis)
+         :attributes (dissoc (:attributes parallel-program) :invocation-plan)
+         :equations (mapv (fn [equation]
+                            (with-meta
+                              (program/map->ProgramEquation
+                               (assoc equation :operations
+                                      (if (true? (get-in equation [:attributes :host-only]))
+                                        [] (soac/equations (:algorithm equation)))))
+                              (meta equation))) equations)})))))
 
 (def ^:private validation-evidence-seal-token (Object.))
 

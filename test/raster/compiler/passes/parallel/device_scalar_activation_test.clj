@@ -247,7 +247,9 @@
       (is (= (last source) (last (get-in routed [:program :source])))))))
 
 (deftest lost-post-optimization-residency-restores-original-return
-  (with-redefs [resident/realize (fn [program]
+  (with-redefs [resident/realize (fn [program public-outputs]
+                                 (is (empty? public-outputs)
+                                     "the injected loss of residency grants no public-output demand")
                                  [program {:resident-reductions 0 :inlined-scalars 0
                                            :resident-terminal-scalars 0}])]
     (let [routed (route-source terminal-source {'input :float})]

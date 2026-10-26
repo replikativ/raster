@@ -513,23 +513,50 @@
              {:resident-outputs resident-outputs :outputs outputs})))
   resident-outputs)
 
+(defn- validated-emitted-terminal-output
+  "Keep semantic residency separate from target validation, without discarding unchecked schedules."
+  [compilation result caller-options]
+  (try
+    (let [scheduled (:scheduled compilation)
+          emitted (:emitted compilation)
+          producer (some #(when (= [result] (:results %)) %) (:equations scheduled))
+          algorithm (:algorithm producer)]
+      (when (and (soac/program-form? algorithm)
+                 (= 'scalar (some-> algorithm soac/equations first soac/operation-kind)))
+        (let [request (when (contains? caller-options :scalar-math)
+                        (select-keys caller-options [:scalar-math]))
+              logical (emitted-program/retained-typed-program-view emitted scheduled request)]
+          (when logical
+            (structured-route/validated-public-resident-output logical result)))))
+    ;; This is an optional output-property query, not permission to execute a
+    ;; malformed artifact. Ordinary preparation independently validates it too.
+    (catch clojure.lang.ExceptionInfo _ nil)))
+
 (defn ^:no-doc validated-resident-output
   "Return an exact public scalar value certified through scheduling and emission.
    Rank zero, an outer representation attribute or a dtype alone is not evidence of resident
    storage. The caller still owns compilation freshness, execution and initialized output views."
-  [compilation result]
-  (let [scheduled-value
-        (structured-route/validated-public-resident-output (:scheduled compilation) result)
+  ([compilation result] (validated-resident-output compilation result nil))
+  ([compilation result caller-options]
+  (let [producer (some #(when (= [result] (:results %)) %)
+                       (get-in compilation [:scheduled :equations]))
+        algorithm (:algorithm producer)
+        terminal? (and (soac/program-form? algorithm)
+                       (= 'scalar (some-> algorithm soac/equations first soac/operation-kind)))
+        scheduled-value
+        (if terminal?
+          (validated-emitted-terminal-output compilation result caller-options)
+          (structured-route/validated-public-resident-output (:scheduled compilation) result))
         emitted-value (get-in compilation [:emitted :values result])]
     (when (and scheduled-value
                (some #{result} (get-in compilation [:emitted :outputs]))
                (semantic/equivalent? scheduled-value emitted-value))
-      scheduled-value)))
+      scheduled-value))))
 
 (defn- validate-resident-output-compilation!
-  [compilation resident-outputs]
+  [compilation resident-outputs caller-options]
   (doseq [result resident-outputs]
-    (when-not (validated-resident-output compilation result)
+    (when-not (validated-resident-output compilation result caller-options)
       (fail! :equation-first-resident-output-representation
              "requested resident output did not retain its certified emitted representation"
              {:result result :target (:target compilation)})))
@@ -672,8 +699,8 @@
        (merge policy
               {:id id :function-id function-id :target target :dtype carrier :source-ns nil
                :options options :compiler-options compiler-options})
-       promoted)
-      resident-outputs))))
+      promoted)
+      resident-outputs options))))
 
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
