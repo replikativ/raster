@@ -186,6 +186,42 @@ overload equivalence; general closure needs actual selected-call/carrier evidenc
 not another family/type heuristic. This pre-existing source-fidelity limitation
 remains in the language-coverage ledger and is not closed by the verifier repair.
 
+### Ordered numerical fragments retain parent allocation context (October 25)
+
+Exact-head unit job 34962 at `59bb10157` is red and incomplete: 15 completed
+artifacts, shard 3 missing, 7,020 tests, 87,361 passing assertions, 30 failures
+and 42 errors across 53 failing Vars. Comparing the 6,646 executed Vars common
+to jobs 34955 and 34962 finds no new failures and both JVM training VerifyErrors
+recovered; 302 old-only and 374 new-only Vars prevent a whole-suite trend claim.
+Shard 3's test action timed out after about 744 seconds. The current emitter
+still refuses the mixed-gradient source-result pair before vendor compilation.
+
+The OpenCL mixed-attention/projection failure has a separate concrete cause.
+`make-equation-program-call` discarded all enclosing program attributes while
+retaining an emitted equation whose independently checked body preserved its
+output allocation. Reconstructing the expected body from that stripped fragment
+correctly failed `:emitted-reduction-outer-slice`. The fragment now transports
+only its already validated parent's allocation context. The existing graph
+projection selects the relevant allocation, and independent fragment validation
+is unchanged. Neither candidate-derived claims nor source/completion authority
+are copied. Missing, duplicated, changed and forged matching allocation claims
+still refuse; unrelated allocations do not enter the narrowed emitted body.
+
+The warm affected gate passes 33 tests / 366 assertions, including both complete
+source/allocation namespaces and existing flat/loop fragment controls. The real
+mixed-attention/projection test additionally passes 24 assertions on both local
+OpenCL and Level Zero, covering reference/cooperative schedules, replay and the
+initialized empty row. Independent fresh qualification and full CI remain
+separate gates. The allocation-witness test now explicitly distinguishes the
+numerical traversal output from the promoted whole-buffer source return; its
+constructor execution and allocation-tampering controls are retained.
+
+The refreshed independent campaign review keeps the existing IR hierarchy and
+all eight objectives. Its next structural unit remains the consumed source/
+component assembler, followed by actual result import/completion/publication and
+then deferred resident composition. This fragment repair closes a demonstrated
+context-loss bug in that existing execution machinery, not those larger gaps.
+
 ### Whole-buffer source-return correction (October 25, branch qualification)
 
 The shared complete-source return projector now selects the certified physical

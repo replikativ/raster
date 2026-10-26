@@ -3,9 +3,11 @@
             [clojure.walk :as walk]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.equation-artifact :as equation-artifact]
+            [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -430,6 +432,68 @@
     (is (= :emitted-reduction-outer-slice
            (reason #(emitted-program/validate!
                      (assoc-in emitted [:attributes :allocations 0 :initialization] :unspecified)))))))
+
+(deftest ordered-plan-fragment-retains-independent-parent-allocation-context
+  (let [compilation (equation-first/compile
+                     #'resident-structured-reduction-probe {:target :ze:0 :dtype :float})
+        emitted (:emitted compilation)
+        equation (last (:equations emitted))
+        results (set (mapcat :results (:equations emitted)))
+        ;; Logical results are derived by the checked binder from physical
+        ;; storage; distinct tokens here deliberately model no driver resources.
+        buffers (into {} (for [[id value] (:values emitted)
+                               :when (and (seq (:shape value))
+                                          (not (contains? results id)))]
+                           [id [:storage id]]))
+        scalars {'n-nodes {:type :long :value 3} 'n-edges {:type :long :value 4}
+                 'emb-dim {:type :long :value 5} 'n-heads {:type :long :value 2}
+                 ;; This is an already completed source binding, not authority
+                 ;; for the numerical fragment to execute the original helper.
+                 'dk {:type :long :value 2}}
+        whole-call (program-call/make
+                    emitted buffers scalars {}
+                    (partial scalar/evaluate-host-equation
+                             (the-ns 'raster.compiler.passes.parallel.segmented-weighted-reduction-fuse-test)))
+        bindings {:buffers (:entry-buffers whole-call)
+                  :scalar-values (:scalar-values whole-call)
+                  :host-steps (into {} (for [step (:steps whole-call)
+                                             :when (program-call/evaluated-host-equation? step)]
+                                         [(get-in step [:equation :id]) step]))}
+        make-stage #(-> (program-call/make-equation-program-call
+                         % (:id equation) bindings nil nil) :call :program)
+        fragment (make-stage emitted)
+        body-allocations #(get-in (last (:equations %))
+                                  [:operations 0 :body :attributes :allocations])
+        allocations (get-in emitted [:attributes :allocations])
+        allocation (first allocations)
+        reason #(try (make-stage %) nil
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
+    (is (= 1 (count allocations)))
+    (is (nil? (:source fragment)))
+    (is (= #{:allocations} (set (keys (:attributes fragment))))
+        "transport allocation context, not source/completion authority")
+    (is (identical? allocations (get-in fragment [:attributes :allocations])))
+    (is (fingerprint/equivalent? allocations (body-allocations fragment)))
+    (is (= :zero (:initialization allocation)))
+    (let [unrelated (assoc allocation :destination 'Q :source-binding-id 900
+                          :source-expression '(clojure.core/float-array 15)
+                          :extent 15 :initialization :unspecified)
+          with-unrelated (assoc-in emitted [:attributes :allocations]
+                                   (conj allocations unrelated))]
+      (is (fingerprint/equivalent? allocations (body-allocations (make-stage with-unrelated))))
+      (is (= 2 (count (get-in (make-stage with-unrelated) [:attributes :allocations])))))
+    ;; The candidate's retained allocation cannot justify itself when the
+    ;; independently validated enclosing contract is missing or has changed.
+    (doseq [[expected changed]
+            [[:emitted-reduction-outer-slice []]
+             [:segmented-plan-output-allocation [allocation allocation]]
+             [:segmented-plan-output-allocation [(assoc allocation :dtype :double)]]
+             [:segmented-plan-output-allocation [(assoc allocation :extent 0)]]
+             [:emitted-reduction-outer-slice [(update allocation :source-binding-id inc)]]
+             [:emitted-reduction-outer-slice [(assoc allocation :initialization :unspecified)]]
+             [:emitted-reduction-outer-slice
+              [(assoc allocation :source-expression '(clojure.core/float-array 99))]]]]
+      (is (= expected (reason (assoc-in emitted [:attributes :allocations] changed)))))))
 
 (deftest mixed-components-initialize-shared-scratch-only-once
   (let [{:keys [form]} (fuse/fuse (chain) :float)

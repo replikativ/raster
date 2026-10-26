@@ -191,8 +191,14 @@
       (is (nil? (get-in program [:values 'unused])))
       (is (= :double (get-in promoted [:values 'unused :dtype])))
       (is (= '[count] (get-in promoted [:values 'unused :shape])))
-      (is (= (:inputs program) (:inputs promoted)))
-      (is (= (:outputs program) (:outputs promoted)))
+      ;; The numerical result names the traversal, whereas the complete source
+      ;; returns its destination. Promotion retains that physical boundary
+      ;; reference without turning it into a numerical read or changing the
+      ;; equation. Equality of the two interfaces would erase this distinction.
+      (is (= [] (:inputs program)))
+      (is (= '[effect] (:outputs program)))
+      (is (= '[out] (:inputs promoted)))
+      (is (= '[out] (:outputs promoted)))
       (is (= (mapv :algorithm (:equations program)) (mapv :algorithm (:equations promoted))))
       (is (= (get-in program [:attributes :allocations allocation-index :source-expression])
              (get-in promoted [:attributes :allocations allocation-index :source-expression])))

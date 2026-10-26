@@ -1005,7 +1005,14 @@
                      :inputs (program/infer-inputs equations) :outputs (:results equation)
                      :equations equations :effects (reduce set/union #{} (map :effects equations)) :source nil
                      :provenance {:source :ordered-numerical-fragment :equation equation-id}
-                     :attributes {}})
+                     ;; The independently checked emitted body retains the
+                     ;; enclosing allocation contract for its physical output.
+                     ;; Reconstructing that body from a fragment must see the
+                     ;; same parent context, not an empty table (nor claims
+                     ;; copied from the candidate being checked). Its existing
+                     ;; graph projection selects only relevant allocations.
+                     ;; Source/completion authority is deliberately not copied.
+                     :attributes (select-keys (:attributes program) [:allocations])})
           validation (if (nil? caller-options)
                        (emitted-program/validate-with-physical-results! fragment)
                        (emitted-program/validate-with-physical-results! fragment caller-options))
