@@ -55,6 +55,19 @@ to refresh resident state from stale host defaults. The run reports 15 passing
 assertions, no failures and one error; the AMR test took 43.8 seconds including
 preparation and the first cycle. It is not qualified restart execution.
 
+The resident-input review also found a shared sequential-transfer hazard in the
+ordinary compiled path: per-input preflight cannot protect a later resident read
+from an earlier input copy or host upload. Batch input preflight now validates
+the complete source/destination range graph before retiring wrappers or mutating
+storage. Duplicate destinations and cross-input read/write overlap refuse;
+exact self-range no-ops remain valid but their reads stay protected from other
+writers. This is a shared runtime rule, not a model-specific workaround or a
+temporary-buffer implementation of swaps. Both affected driver-free runtime
+suites pass: 34 tests / 309 assertions. Independent review found and corrected
+the duplicate-destination hole; final review found no remaining blocker. The
+ordered path still needs to supply prospective entry-range facts and actual
+single-replay transfer receipts to this same rule before AMR restart can pass.
+
 The next address-proof repair must transport exact integral InvocationPlan
 producer relationships into sliced scheduled bodies as executable equality
 constraints. Both read-footprint proofs and runtime graph preconditions must

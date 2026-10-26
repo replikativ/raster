@@ -1856,6 +1856,15 @@
     (swap! (:tainted-inputs executable) disj node-id)
     executable))
 
+(defn- input-source-facts!
+  [executable node-id source]
+  (if (value/device-array? source)
+    (device-write-facts executable node-id source)
+    (let [node (get-in executable [:plan :nodes node-id])]
+      (when-not node (node-view executable node-id))
+      (link-plan/validate-node-source! node source)
+      nil)))
+
 (defn validate-write!
   "Check one input replacement without uploads, copies, registrations or readiness changes.
    Batch callers preflight all sources before the first mutation. Public write! still validates
@@ -1866,11 +1875,54 @@
     (locking (:lifetime-lock executable)
       (ensure-live! executable :validate-write!)
       (ensure-no-output-leases! executable :validate-write!)
-      (if (value/device-array? source)
-        (device-write-facts executable node-id source)
-        (let [node (get-in executable [:plan :nodes node-id])]
-          (when-not node (node-view executable node-id))
-          (link-plan/validate-node-source! node source)))
+      (input-source-facts! executable node-id source)
+      executable)))
+
+(defn- validate-input-range-order!
+  "Reject cross-input read/write hazards before sequential input transfers begin.
+   These are live runtime range facts, not retained initialization or ownership evidence."
+  [facts]
+  (doseq [{reader :node-id :keys [source-buffer source-view]} facts
+          :when source-buffer
+          {writer :node-id :keys [destination-buffer destination-view mutates?]} facts
+          :when (and (not= reader writer) mutates?
+                     (overlapping-buffer-range? source-buffer source-view
+                                                destination-buffer destination-view))]
+    (throw (ex-info "input transfer would overwrite another input's resident source"
+                    {:reason :link-input-transfer-overlap :reader reader :writer writer}))))
+
+(defn ^:no-doc validate-write-batch!
+  "Preflight a complete input handoff, including cross-input resident read/write hazards.
+   No transfer, registration, wrapper retirement or readiness change occurs here. Unsafe swaps
+   require an explicit snapshot/temporary protocol; sequential copies do not implement them."
+  [executable replacements]
+  (let [executable (ensure-live! executable :validate-write-batch!)
+        replacements (vec replacements)]
+    (when-not (= (count replacements) (count (set (map first replacements))))
+      (throw (ex-info "one input handoff cannot assign a destination more than once"
+                      {:reason :link-input-transfer-duplicate
+                       :nodes (mapv first replacements)})))
+    (require-static-entry-mutation! executable :validate-write-batch!)
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable :validate-write-batch!)
+      (ensure-no-output-leases! executable :validate-write-batch!)
+      ;; Check each source contract once, before looking up host destinations for the
+      ;; range graph. These facts remain local to this one preflight under the owner lock.
+      (let [source-facts (mapv (fn [[node-id source]]
+                                (input-source-facts! executable node-id source)) replacements)]
+        (when (some some? source-facts)
+          (validate-input-range-order!
+           (mapv (fn [[node-id _source] facts]
+                   (if facts
+                     (assoc facts :node-id node-id
+                            :mutates? (not (same-buffer-range?
+                                            (:source-buffer facts) (:source-view facts)
+                                            (:destination-buffer facts) (:destination-view facts))))
+                     (let [destination (node-view executable node-id)]
+                       {:node-id node-id :destination-view (:view destination)
+                        :destination-buffer (gpu/buffer (:session executable) (:key destination))
+                        :mutates? true})))
+                 replacements source-facts))))
       executable)))
 
 (defn write!

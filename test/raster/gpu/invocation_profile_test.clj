@@ -126,3 +126,50 @@
           (is (= (case route :exact-view-no-op [] :same-buffer-copy [:copy]
                        :foreign-buffer-copy [:register :copy :detach]) @actions))))
       (is (value/live? source)))))
+
+(deftest input-batch-preflight-rejects-cross-input-read-write-hazards
+  (let [make-view #(bview/view
+                    (bview/allocation {:id % :byte-size 16 :memory-space :device
+                                       :device :ze:0 :ownership :owned})
+                    {:dtype :float :shape [4]})
+        a-view (make-view :a) b-view (make-view :b)
+        a-buffer {:id :a :dtype :float :n-elements 4 :byte-size 16}
+        b-buffer {:id :b :dtype :float :n-elements 4 :byte-size 16}
+        a (value/wrap-external-view a-buffer :ze:0 a-view)
+        b (value/wrap-external-view b-buffer :ze:0 b-view)
+        executable (lifecycle/linked-executable
+                    {:plan {:id :batch-ranges :target :ze:0
+                            :nodes {:a (plan/node {:id :a :view a-view :role :input})
+                                    :b (plan/node {:id :b :view b-view :role :input})}}
+                     :session ::session
+                     :node-views {:a (gpu/->ResidentBufferView ::session :a a-view)
+                                  :b (gpu/->ResidentBufferView ::session :b b-view)}
+                     :output-leases (atom 0) :pending-inputs (atom #{})
+                     :tainted-inputs (atom #{}) :output-ready? (atom true)
+                     :completed-replays (atom 0)})
+        artifact (compiled/map->Compiled
+                  {:executable executable :target :ze:0 :donated {}
+                   :in-tree [{:key :a :node :a :role :input :default (float-array 4)}
+                             {:key :b :node :b :role :input :default (float-array 4)}]
+                   :out-tree [] :live-outputs (atom [a b])})
+        writes (atom 0) replays (atom 0)]
+    (with-redefs [gpu/buffer (fn [_ key] ({:a a-buffer :b b-buffer} key))
+                  link/write! (fn [& _] (swap! writes inc))
+                  link/run! (fn [& _] (swap! replays inc))]
+      (doseq [inputs [{:a b :b a}
+                      ;; A host upload can destroy the later resident read just as a D2D copy can.
+                      {:a (float-array 4) :b a}]]
+        (is (= :link-input-transfer-overlap
+               (try (compiled/invoke-compiled artifact inputs) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+      (is (identical? executable (link/validate-write-batch! executable [[:a a] [:b b]]))
+          "exact self-range no-ops do not invent a mutating destination")
+      (is (= :link-input-transfer-duplicate
+             (try (link/validate-write-batch! executable [[:a (float-array 4)] [:a a]]) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "a repeated destination cannot hide a host-write/resident-read hazard")
+      (is (zero? @writes))
+      (is (zero? @replays))
+      (is (every? value/live? [a b]))
+      (is (true? @(:output-ready? executable)))
+      (is (zero? (:value-epoch @(:execution-state executable)))))))

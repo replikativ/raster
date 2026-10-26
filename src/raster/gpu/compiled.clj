@@ -1801,8 +1801,9 @@
 
 (defn- preflight-inputs!
   [executable input-nodes inputs]
-  (doseq [{:keys [key node default]} input-nodes]
-    (gpu-link/validate-write! executable node (get inputs key default))))
+  (gpu-link/validate-write-batch!
+   executable (mapv (fn [{:keys [key node default]}]
+                      [node (get inputs key default)]) input-nodes)))
 
 (defn- retiring-value-root?
   [previous value]
