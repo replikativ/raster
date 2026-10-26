@@ -148,6 +148,36 @@ review found and corrected the comparator-map exact-key edge case. No freshness
 fence, retry budget or publication/adoption rule was removed. A matched GSDM
 profile remains required before claiming a compile-time improvement.
 
+The repeat at `57c8f5fd7` also reaches the 420-second diagnostic deadline inside
+fused-training fixpoint construction. Its forward control takes 74.2 seconds
+versus the prior 39.3 seconds, including slower unchanged stages, so elapsed
+times do not establish a controlled speed comparison. In its final 120-second
+window, freshness validation remains in 7,519 / 10,920 main-thread samples
+(68.9%, inclusive); the prior recording's final 120 seconds have 7,943 / 9,924
+(80.0%). Both windows still show validation as the principal cost. These are
+different-progress samples, not a throughput improvement claim. Raw retained
+comparisons now distinguish genuine inequality from unsupported objects: both
+observed fused comparisons are supported but unequal; portable comparison still
+rejects Class metadata.
+
+Independent review identifies a smaller structural next step than changing
+optional-proof semantics: own the entire `expand-for-backends` transformation,
+not only its `inline-deftm-calls` substage, through the existing independent-input
+scope. Direct `.invk` expansion otherwise inherits unrelated enclosing history.
+Existing traversal consumes proof-producing lazy work; no blanket realization
+or quote traversal should be added. Parent/local validation and historical
+adoption must remain intact, with scope/dependency/late-mutation controls.
+
+The complete expansion scope is implemented using the existing independent-input
+owner; the direct `inline-deftm-calls` scope remains for its other callers. Three
+new controls exercise direct `.invk` vectors that bypass the first inliner,
+constant unrelated-parent validation counts for two versus sixteen helper calls,
+retained helper/lookup dependencies, late mutation and exception refusal, and
+completed proof traversal without touching quoted lazy data. Independent
+exact-diff review found no blocker. The combined affected source, emission,
+normalized AD lifetime and inlining gate passes 134 tests / 1,138 assertions in
+the reusable REPL. Actual GSDM completion and performance remain unqualified.
+
 One independent convergence-domain defect is corrected: compiler fixpoints now
 use pair-local retained-source equality, allowing exact immutable Class identity,
 instead of requiring portable serialization of Class metadata. Type/operation

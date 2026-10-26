@@ -2003,10 +2003,13 @@
 
 (defn expand-for-backends
   "Post-AD expansion: fully inline template-backed ops for backend optimization.
+   The complete unpublished transformation owns local observations, including the
+   recursive invk stage. Existing fences validate and adopt all actual dependencies.
    param-env seeds the type environment with function parameter types."
   ([form] (expand-for-backends form 3 nil))
   ([form max-depth] (expand-for-backends form max-depth nil))
   ([form max-depth param-env]
-   (-> (inline-deftm-calls form max-depth false true)
-       inline-invk
-       flatten-nested-lets)))
+   (method-entry/call-with-independent-definition-inputs
+    #(-> (inline-deftm-calls form max-depth false true)
+         inline-invk
+         flatten-nested-lets))))

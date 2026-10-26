@@ -104,6 +104,105 @@
     (is (zero? @visits))
     (is (identical? before @parent))))
 
+(deftest backend-expansion-keeps-unrelated-history-out-of-recursive-invk-queries
+  (let [frontend (prepared-sum-source)
+        implementation (get-in frontend [:definition :implementation-op])
+        helper (get-in frontend [:source-entry :source-var])
+        measurements
+        (mapv (fn [n]
+                (let [visits (atom 0)
+                      guard (reify entry/RetainedProducerInput
+                              (assert-producer-current! [this] (swap! visits inc) this))
+                      parent (atom {:static [] :values [] :producer-inputs [guard]})
+                      ;; A top-level vector deliberately bypasses inline-deftm-calls;
+                      ;; these actual helper queries belong to recursive inline-invk.
+                      source (vec (repeat n (list '.invk implementation 'input)))
+                      expanded (binding [entry/*emission-inputs* parent]
+                                 (inline/expand-for-backends source))
+                      checks @visits]
+                  (is (not= source expanded))
+                  (is (= (vec (repeat n 6.0))
+                         (eval (list 'let* ['input '(double-array [1 2 3])] expanded))))
+                  (is (contains? (:definition-proofs @parent) helper))
+                  (is (some #(seq (:lookups %)) (:values @parent)))
+                  (is (some #(identical? guard %) (:producer-inputs @parent)))
+                  (is (entry/assert-definition-inputs-current! @parent))
+                  checks)) [2 16])]
+    (is (= (first measurements) (second measurements)))
+    (is (<= 1 (first measurements) 6))))
+
+(deftest backend-expansion-fences-the-complete-final-stage-before-adoption
+  (let [frontend (prepared-sum-source)
+        helper (get-in frontend [:source-entry :source-var])
+        source [(list '.invk (get-in frontend [:definition :implementation-op]) 'input)]
+        flatten-original inline/flatten-nested-lets
+        root (var-get helper)]
+    (doseq [change [:already-stale :becomes-stale :replaced :used-helper :throws]]
+      (let [current? (atom (not= change :already-stale))
+            reached? (atom false)
+            guard (reify entry/RetainedProducerInput
+                    (assert-producer-current! [this]
+                      (when-not @current?
+                        (throw (ex-info "stale backend expansion parent" {:reason ::stale-backend-parent})))
+                      this))
+            parent (atom {:static [] :values [] :producer-inputs [guard]})
+            before @parent
+            failure (Exception. "final expansion stage failed")]
+        (try
+          (let [observed
+                (binding [entry/*emission-inputs* parent]
+                  (with-redefs [inline/flatten-nested-lets
+                                (fn [& arguments]
+                                  (let [result (apply flatten-original arguments)]
+                                    ;; Its one-argument entry delegates to the two-argument
+                                    ;; arity. Inject once, after the entire final stage.
+                                    (when (= 1 (count arguments))
+                                      (reset! reached? true)
+                                      (case change
+                                        :becomes-stale (reset! current? false)
+                                        :replaced (reset! parent (into {} @parent))
+                                        :used-helper (alter-var-root helper (constantly (fn [_] -99.0)))
+                                        :throws (throw failure)
+                                        nil))
+                                    result))]
+                    (try (inline/expand-for-backends source) nil
+                         (catch Exception error error))))]
+            (if (= change :throws)
+              (is (identical? failure observed))
+              (is (= (case change
+                       :replaced :unstable-definition-proof-input
+                       :used-helper :stale-definition-proof-input
+                       ::stale-backend-parent)
+                     (:reason (ex-data observed)))))
+            (is (= (not= change :already-stale) @reached?))
+            (is (= before @parent))
+            (is (= (not= change :replaced) (identical? before @parent)))
+            (is (empty? (:definition-proofs @parent))))
+          (finally (alter-var-root helper (constantly root))))))))
+
+(deftest backend-expansion-finishes-proof-work-without-realizing-quoted-data
+  (let [frontend (prepared-sum-source)
+        call (list '.invk (get-in frontend [:definition :implementation-op]) 'input)
+        quoted-visits (atom 0)
+        payload (lazy-seq (swap! quoted-visits inc) (list call))
+        quoted (with-meta (list 'quote payload) {:source-marker :opaque-data})
+        owner (atom {:static [] :values []})
+        expanded (binding [entry/*emission-inputs* owner]
+                   (inline/expand-for-backends [quoted call]))
+        plain (binding [entry/*emission-inputs* owner]
+                (inline/expand-for-backends call))
+        unexpected (fn [& _] (throw (AssertionError. "proof work escaped backend expansion")))]
+    (is (identical? quoted (first expanded)))
+    (is (zero? @quoted-visits))
+    (is (= 6.0 (eval (list 'let* ['input '(double-array [1 2 3])] (second expanded)))))
+    (binding [entry/*emission-inputs* nil]
+      (with-redefs [entry/observe-definition-input! unexpected
+                    entry/observe-source-reference! unexpected
+                    entry/observe-source-resolution! unexpected]
+        (is (string? (pr-str plain)))
+        (is (seq (doall (tree-seq coll? seq plain))))))
+    (is (zero? @quoted-visits))))
+
 (deftest complete-inline-expansion-refuses-stale-or-replaced-parent-without-adoption
   (let [frontend (prepared-sum-source)
         source (repeated-sum-source frontend 1)
