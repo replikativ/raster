@@ -5961,20 +5961,22 @@
 
 (defn- scalar-dependency-closure
   [by-symbol roots]
-  (loop [needed (set/intersection (set roots) (set (keys by-symbol)))]
-    (let [dependencies (set (mapcat #(util/free-syms (:expr (get by-symbol %))) needed))
-          needed' (set/union needed (set/intersection dependencies (set (keys by-symbol))))]
-      (if (= needed needed') needed (recur needed')))))
+  (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys by-symbol))]
+    (loop [needed (set/intersection (set roots) (set (keys by-symbol)))]
+      (let [dependencies (set (mapcat #(util/free-syms (:expr (get by-symbol %))) needed))
+            needed' (set/union needed (set/intersection dependencies (set (keys by-symbol))))]
+        (if (= needed needed') needed (recur needed'))))))
 
 (defn- allocation-capacity-scalars
   [descriptions physical-outputs by-symbol]
   ;; An allocation binding is generated storage scaffolding, but the typed scalar algebra which
   ;; computes its capacity is executable proof data.  Keep the transitive scalar definitions and
   ;; mark them below; no generated-name convention is involved.
-  (scalar-dependency-closure
-   by-symbol
-   (mapcat (comp util/free-syms :expr)
-           (filter #(generated-scaffolding? % physical-outputs) descriptions))))
+  (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys by-symbol))]
+    (scalar-dependency-closure
+     by-symbol
+     (mapcat (comp util/free-syms :expr)
+             (filter #(generated-scaffolding? % physical-outputs) descriptions)))))
 
 (defn- selected-scalars
   [descriptions operation-equations outputs semantic-scalar-roots]

@@ -14,6 +14,7 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.index-expression :as index-expression]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -112,10 +113,26 @@
     (second dimension)
     dimension))
 
+(defn dimension-references
+  "Lexical dependencies of a retained shape dimension, not source evaluation.
+   A bare dimension is always a value ID, even when it names a clojure.core Var.
+   The existing value wrapper and whole-buffer extent root name one dependency;
+   recognizing their syntax neither resolves that value nor validates its kind.
+   Compound algebra uses the caller's declared lexical scope for the same distinction."
+  [dimension scope]
+  (let [dimension (dimension-expression dimension)
+        extent-id (when (seq? dimension) (launch/backing-extent-id dimension))]
+    (cond
+      (symbol? dimension) #{dimension}
+      (symbol? extent-id) #{extent-id}
+      :else
+      (binding [util/*shadowing-locals* (into util/*shadowing-locals* scope)]
+        (util/free-syms dimension)))))
+
 (defn- host-computable-dimension?
   [program-values dimension]
   (let [dimension (dimension-expression dimension)
-        references (util/free-syms dimension)]
+        references (dimension-references dimension (keys program-values))]
     (or (integer? dimension)
         (and (symbol? dimension) (scalar-value? (get program-values dimension)))
         (and (seq? dimension)

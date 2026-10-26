@@ -286,10 +286,23 @@
         (if (and (contains? state :available) (buffer-value? value)
                  (not= expression bound-buffer-source))
           state
-          (cond-> (assoc-in state [:values symbol] value)
-            (and (= :tensor (:kind value)) (= [] (:shape value))
-                 (contains? #{:int :long} (dtype/canon (:dtype value))))
-            (assoc-in [:equalities expression] symbol)))
+          (let [value
+                ;; Only an authenticated whole-buffer identity can rename its own opaque
+                ;; backing extent. Copying `(extent source)` unchanged into a new buffer ID
+                ;; leaves graph storage dependent on a reference outside that graph's scope.
+                ;; This is a normal-return shape fact, not permission to erase the source
+                ;; reference completion or replace an explicit capacity by a consumer domain.
+                (if (and (= expression bound-buffer-source)
+                         (= {:kind :plain} (:representation value))
+                         (nil? (:logical-layout value))
+                         (= [(list 'extent expression)] (:shape value)))
+                  (assoc value :shape [(with-meta (list 'extent symbol)
+                                        (meta (first (:shape value))))])
+                  value)]
+            (cond-> (assoc-in state [:values symbol] value)
+              (and (= :tensor (:kind value)) (= [] (:shape value))
+                   (contains? #{:int :long} (dtype/canon (:dtype value))))
+              (assoc-in [:equalities expression] symbol))))
         state)
 
       cast-dtype

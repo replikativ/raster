@@ -173,6 +173,41 @@ The nested array-AD reproduction advances beyond its former Long-entry refusal;
 the next blocker is backing-capacity scope in graph preconditions. Dropping those
 guards or merely filtering them out of the scalar ABI is not a complete fix.
 
+The following entry-root bundle has passed both its combined warm and fresh-JVM
+gates (141 tests / 2,886 assertions, with OpenCL and Level Zero required); landing
+and full CI qualification remain separate. It closes three related boundaries without another IR:
+
+- A proven plain whole-buffer alias rebases only its own unresolved backing
+  identity. Explicit capacities, views, packed representations and unproved
+  reference conversions gain no new authority.
+- Original materialized parameter roots, including those reached only by later
+  exact aliases, determine public ports, access roles, captured layout and input
+  replacement. Physical allocation roots determine replay refresh. Listing a
+  dynamic input grants no upload or initialization credit.
+- Shape dependencies are lexical values, not context-free Clojure Var lookups.
+  A local dimension named `count` must retain its actual producer. Existing shared
+  scalar steps evaluate that producer once at its source position before its
+  allocation; missing/forward/tampered dependencies reject during construction.
+
+Direct and nested matrix gradients execute through the public compiler on both
+local backends against an independent analytic oracle. Controls change weights
+and data, override late target inputs, restore defaults, and preserve explicit
+constant targets. Aggregate replay and checked late-allocation failures also pass
+the warm gate. This is correctness evidence, not a training-throughput benchmark.
+The old `compile-gpu-program` descriptor consumer separately exposes canonical
+source-completion terms to raw `eval`; migrate or retire it through the public
+ordered path rather than renaming the IR marker or guessing a cast.
+
+Cold source readiness is explicit orchestration: freeze/publish the original
+source walk before target observations, but emit an original JVM receiver only
+for an actual source-action consumer. Those consumers share the existing recursive
+emitted-receiver preparation mechanism. Its successful descendant history is
+adopted only after the caller's original historical fence and exact live module
+identity checks succeed. Retry limits and stale-definition checks are unchanged.
+Separate lifecycle controls pass two tests / 22 assertions, including a cold
+dependency diamond, no source-body execution, and rejection of genuine source,
+receiver-policy, implementation and leaf-history changes.
+
 The dated sections below are historical evidence, not current landing order. In
 particular, claims that all source-completion execution is unimplemented predate
 `b3d7756af`. Existing source-inlined helpers are not generally unsupported: the

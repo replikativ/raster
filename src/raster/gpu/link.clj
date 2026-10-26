@@ -1340,7 +1340,7 @@
     ;; Only dynamic inputs refresh. Captured entries retain their resident value even when the
     ;; borrowed host source changes. Within one invocation acquired nodes have no initializer.
     (doseq [[id node] by-id
-            :when (and (:source node) (= :input (get entry-refresh id))
+            :when (and (:source node) (= :input (get entry-refresh (get-in node [:view :allocation :id])))
                        (contains? roots (get-in node [:view :allocation :id])))]
       (invalidate-ordered-result-reads! execution-state [(:view node)])
       (gpu/upload-range! (:session executable) (get-in storage [:node-views id]) (:source node)
@@ -1353,7 +1353,7 @@
                  (update-in [:ordered :initialized] into
                             (keep #(when (and (:source %)
                                               (or (not (contains? roots (get-in % [:view :allocation :id])))
-                                                  (= :input (get entry-refresh (:id %)))))
+                                                  (= :input (get entry-refresh (get-in % [:view :allocation :id])))))
                                      (:view %)) (vals by-id))))))
     storage))
 

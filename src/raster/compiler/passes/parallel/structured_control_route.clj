@@ -219,14 +219,18 @@
 (defn- required-shape-scalars
   "Return scalar equation results in the transitive definition closure of retained shapes."
   [parallel-program]
-  (let [source-allocation-arguments
+  (let [scope (set (keys (:values parallel-program)))
+        source-allocation-arguments
         (mapcat (fn [{:keys [extent source-expression]}]
-                  (concat (util/free-syms extent) (util/free-syms source-expression)))
+                  (concat (invocation-source/dimension-references extent scope)
+                          (binding [util/*shadowing-locals* (into util/*shadowing-locals* scope)]
+                            (util/free-syms source-expression))))
                 (get-in parallel-program [:attributes :allocations]))
         shape-symbols
         (into #{}
               (concat source-allocation-arguments
-                      (mapcat (fn [value] (mapcat util/free-syms (:shape value)))
+                      (mapcat (fn [value]
+                                (mapcat #(invocation-source/dimension-references % scope) (:shape value)))
                               (vals (:values parallel-program)))))
         definitions
         (into {}
@@ -333,7 +337,9 @@
                                           (if-let [source (invocation-source/reference-identity-source
                                                            symbol expression)]
                                             [source]
-                                            (util/free-syms expression)))))
+                                            (binding [util/*shadowing-locals*
+                                                      (into util/*shadowing-locals* available)]
+                                              (util/free-syms expression))))))
                               set
                               (set/intersection available))
             required' (set/union required dependencies)]
@@ -454,7 +460,9 @@
                               source-pairs)
           shape-roots
           (into #{}
-                (comp (mapcat (comp #(mapcat util/free-syms %) :shape val))
+                (comp (mapcat (comp #(mapcat (fn [dimension]
+                                              (invocation-source/dimension-references
+                                               dimension (keys prefix-values))) %) :shape val))
                       (filter #(scalar-value? (get prefix-values %))))
                 program-values)
           retained-identities (into #{} (keep (fn [[symbol expression]]
@@ -992,7 +1000,9 @@
         ;; public invocation boundary. Declare their retained host facts in the program value
         ;; table so emitted calls can certify N-D logical shapes against flattened storage without
         ;; inventing an untyped shape environment in the linker.
-        shape-symbols (into #{} (mapcat (comp #(mapcat util/free-syms %) :shape val))
+        shape-symbols (into #{} (mapcat (comp #(mapcat (fn [dimension]
+                                                       (invocation-source/dimension-references
+                                                        dimension (keys host-values))) %) :shape val))
                             program-values)
         shape-values (into {} (filter (fn [[symbol value]]
                                         (and (contains? shape-symbols symbol)

@@ -77,6 +77,10 @@
         spans (fn [program plan entries]
                 (#'invocation-link/ordered-equation-spans semantic program plan entries))]
     (is (= {2 {:equation :fused :end 4}} (spans emitted {:steps []} order)))
+    (is (= {2 {:equation :fused :end 4}}
+           (#'invocation-link/ordered-equation-spans
+            (assoc-in semantic [:equations 0 :attributes] {}) emitted {:steps []} order))
+        "host execution classification comes from checked emission, even before semantic scheduling marks it")
     (doseq [action [{:invocation-step :step} {:storage :buffer} {:realization :allocation}
                     {:program-result-import {:equation :producer :result :value}}
                     {:equation :host}]]

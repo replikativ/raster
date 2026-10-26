@@ -913,17 +913,13 @@
                         (do (me/assert-frontend-source! prepared source-var)
                             (me/assert-frontend-selection! prepared source-var)
                             prepared)
-                        (do
-                          ;; Source queries consume physical evidence, never
-                          ;; prepare it. Do that explicitly in orchestration
-                          ;; before the first current-source witness, including
-                          ;; reduction requests preceding the public footer.
-                          (rcore/prepare-emission-source-walk! source-var)
-                          (let [prepared (me/prepare-frontend-source!
-                                          (me/original-source-frontend source-var) source-var
-                                          rcore/ensure-current-owned-bytecode!)]
-                            (vreset! original prepared)
-                            prepared)))))
+                        ;; Source queries consume physical evidence, never
+                        ;; prepare it. Do that explicitly in orchestration
+                        ;; before the first current-source witness, including
+                        ;; reduction requests preceding the public footer.
+                        (let [prepared (rcore/prepare-owned-source-frontend! source-var)]
+                          (vreset! original prepared)
+                          prepared))))
         owner! (fn [source]
                  (or (.get owners source)
                      (let [_ (original!)

@@ -835,6 +835,41 @@
                                 {:reason :unclosed-bytecode-additional-inputs :var impl-var})))
               fresh)))))))))
 
+(clojure.core/defn ^:no-doc prepare-owned-source-frontend!
+  "Prepare an explicitly demanded original physical source consumer.
+   Close its actual emitted descendants under their existing independent owner,
+   then fence the caller's ORIGINAL history before adopting successful readiness
+   inputs. This emits no target code and never invokes the numerical source.
+   Source-only consumers should prepare the frozen frontend/walk instead."
+  [source-var]
+  (when-not me/*emission-inputs*
+    (throw (ex-info "original source preparation requires a compiler owner"
+                    {:reason :missing-definition-preparation-owner})))
+  (prepare-deftm-frontend! source-var)
+  (prepare-emission-source-walk! source-var)
+  (let [receipt (volatile! nil)
+        frontend (me/prepare-frontend-source!
+                  (me/original-source-frontend source-var) source-var
+                  (fn [receiver]
+                    (vreset! receipt
+                             ((requiring-resolve
+                               'raster.compiler.backend.jvm.bytecode/prepare-emitted-receiver!)
+                              receiver ensure-current-owned-bytecode!))))]
+    (when frontend
+      (let [receiver (get-in frontend [:definition :receiver-var])
+            emission (:emission @receipt)]
+        (when-not (and (var? receiver) emission
+                       (identical? emission (:emission frontend))
+                       (identical? emission (::bytecode-emission (meta receiver)))
+                       (identical? (:implementation emission) (var-get receiver))
+                       (identical? (:implementation emission) (:implementation frontend)))
+          (throw (ex-info "prepared original source lost its actual receiver emission"
+                          {:reason :unowned-original-source-preparation :source source-var})))
+        ;; The semantic preparation fence above must succeed first. A rejected
+        ;; enclosing attempt cannot refresh itself using this new local history.
+        (me/adopt-definition-inputs! (:inputs @receipt))
+        frontend))))
+
 ;; ================================================================
 ;; Walked body registry — avoids quoting large walked bodies into
 ;; macro expansions, which would hit Clojure's 64KB method limit when

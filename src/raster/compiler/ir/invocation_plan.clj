@@ -349,7 +349,8 @@
                        (every? (fn [id]
                                  (let [input (get values id)]
                                    (or (scalar-value? input) (opaque-value? input)))) operand-values)
-                       (= (util/free-syms operand) symbols))
+                       (= (binding [util/*shadowing-locals* (into util/*shadowing-locals* symbols)]
+                            (util/free-syms operand)) symbols))
           (fail! :invocation-source-completion
                  "source completion requires its declared scalar or opaque result over host values"
                  {:step id :value value})))
@@ -358,7 +359,9 @@
       (let [{:keys [parameters locals body-results]} (soac/lambda-parts (:region step))
             parameter-set (set parameters)
             free-symbols (when (= 1 (count body-results))
-                           (util/free-syms (first body-results)))]
+                           (binding [util/*shadowing-locals*
+                                     (into util/*shadowing-locals* parameter-set)]
+                             (util/free-syms (first body-results))))]
         (when-not (scalar-value? value)
           (fail! :invocation-scalar-value "scalar computation must produce a rank-zero value"
                  {:step id :value value}))
@@ -385,7 +388,8 @@
                  {:step id :region (:region step)})))
 
       (buffer-allocation? step)
-      (let [shape-symbols (into #{} (mapcat util/free-syms) (:shape value))]
+      (let [shape-symbols (into #{} (mapcat #(invocation-source/dimension-references
+                                            % (concat (keys values) (keys operands)))) (:shape value))]
         (when-not (and (buffer-value? value)
                        (contains? #{:zero :unspecified} (:initialization step))
                        (= shape-symbols (set (map :symbol (:operands step)))))
@@ -621,7 +625,14 @@
 (defn- allocation-operands
   [value environment]
   (->> (:shape value)
-       (mapcat #(referenced-operands % environment))
+       (mapcat #(sort-by str (invocation-source/dimension-references % (keys environment))))
+       (map (fn [symbol]
+              (if-let [id (get environment symbol)]
+                {:symbol symbol :value id}
+                (fail! :invocation-prefix-free-value
+                       "allocation dimension requires an earlier lexical value"
+                       {:symbol symbol :shape (:shape value)
+                        :available (set (keys environment))}))))
        (reduce (fn [operands operand]
                  (if (some #(= (:symbol %) (:symbol operand)) operands)
                    operands

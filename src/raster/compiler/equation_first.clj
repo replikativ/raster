@@ -447,10 +447,7 @@
             ;; Preparation may promote helpers and stale earlier observations.
             ;; The enclosing definition-input transaction retries the complete
             ;; compilation; never refresh an old witness around new source.
-            _ (rcore/prepare-emission-source-walk! source-var)
-            original (method-entry/prepare-frontend-source!
-                      (method-entry/original-source-frontend source-var) source-var
-                      rcore/ensure-current-owned-bytecode!)
+            original (rcore/prepare-owned-source-frontend! source-var)
             witness (source-import/prepare-contextual-source-witness
                      (:source program)
                      (assoc compiler-options :lexical-inputs (:public-parameters compiler-options)))
@@ -807,6 +804,11 @@
              (fail! :equation-first-host-only
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
+         ;; Settle original source-only publication before target observations.
+         ;; Actual JVM receiver preparation remains demand-driven at the owned
+         ;; source-action boundary; freezing/walking here executes no source.
+         _ (rcore/prepare-deftm-frontend! resolved-var)
+         _ (rcore/prepare-emission-source-walk! resolved-var)
          function-id (function-symbol resolved-var)
          policy (compilation-policy function-id target options captured-target)
          {:keys [target-descriptor reference-schedule]} policy
