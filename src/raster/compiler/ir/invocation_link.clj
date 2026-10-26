@@ -582,8 +582,13 @@
                   :entry-refresh refresh)))
 
 (defn- checked-compilation-boundary
-  "Check the existing exact semantic/emitted boundary without materializing source work."
-  [compilation retained-validation caller-options]
+  "Check semantic/emitted correspondence without materializing source work.
+   A compound emission may compare through its checked expanded analysis view.
+   Ordered execution additionally checks its contiguous source-position spans.
+   Never execute the analysis view."
+  ([compilation retained-validation caller-options]
+   (checked-compilation-boundary compilation retained-validation caller-options false))
+  ([compilation retained-validation caller-options allow-expanded-spine?]
   (let [semantic-program (:semantic compilation)
         invocation (get-in semantic-program [:attributes :invocation-plan])
         invocation (invocation/validate-against! invocation semantic-program)
@@ -596,14 +601,25 @@
         program (:program checked)
         boundary #(mapv (fn [equation]
                           (select-keys equation [:id :operands :results :algorithm]))
-                        (:equations %))]
-    (when-not (and (semantic/equivalent? (boundary semantic-program) (boundary program))
+                        (:equations %))
+        same-boundary? (fn [candidate]
+                         (and candidate
+                              (semantic/equivalent? (boundary semantic-program) (boundary candidate))
+                              (semantic/equivalent? (:values semantic-program)
+                                                   (select-keys (:values candidate)
+                                                                (keys (:values semantic-program))))))
+        correspondence (or (same-boundary? program)
+                           (when (and allow-expanded-spine? (:scheduled compilation))
+                             (same-boundary?
+                              (emitted-program/retained-typed-program-view
+                               program (:scheduled compilation) caller-options))))]
+    (when-not (and correspondence
                    (semantic/equivalent? (:values semantic-program)
                                          (select-keys (:values program)
                                                       (keys (:values semantic-program)))))
       (fail! :invocation-ordered-program
              "ordered realization requires the exact retained semantic and emitted boundary" {}))
-    {:semantic-program semantic-program :invocation invocation :checked checked :program program}))
+    {:semantic-program semantic-program :invocation invocation :checked checked :program program})))
 
 (defn ^:no-doc ordered-preparation-requirement
   "Report source-order barriers to eager preparation, without evaluating any source operand.
@@ -613,11 +629,11 @@
   ([compilation] (ordered-preparation-requirement compilation nil nil))
   ([compilation retained-validation caller-options]
    (let [{:keys [semantic-program invocation program]}
-         (checked-compilation-boundary compilation retained-validation caller-options)]
+         (checked-compilation-boundary compilation retained-validation caller-options true)]
      (if (invocation/source-free-program? semantic-program)
        {:required? false :barriers []}
        (let [host-ids (into #{} (comp (filter #(true? (get-in % [:attributes :host-only])))
-                                      (map :id)) (:equations program))
+                                      (map :id)) (:equations semantic-program))
              result
              (reduce
               (fn [{:keys [numerical-position host-position allocation-position] :as state} entry]
@@ -647,12 +663,62 @@
               {:barriers []} (invocation/source-order invocation semantic-program))]
          {:required? (boolean (seq (:barriers result))) :barriers (:barriers result)})))))
 
+(defn- checked-equation-source-span
+  [semantic-program program invocation order equation start]
+  (let [source-equations (into {} (map (juxt :id identity)) (:equations semantic-program))
+        constituents (seq (get-in equation [:attributes :emitted-source-equations]))
+        ids (vec (or constituents [(:id equation)]))
+        end (when (and (integer? start) (<= 0 start)) (+ start (count ids)))
+        entries (when (and end (<= end (count order))) (subvec order start end))
+        imported (into #{} (comp (filter invocation/program-result-import?) (map :equation)) (:steps invocation))]
+    (when-not (and (some #(identical? equation %) (:equations program))
+                   entries (= ids (mapv :equation entries))
+                   (every? (fn [entry]
+                             (let [source (get source-equations (:equation entry))]
+                               (and source (not (true? (get-in source [:attributes :host-only])))
+                                    (not-any? #(some? (get entry %))
+                                              [:invocation-step :storage :realization :program-result-import])))) entries)
+                   (or (nil? constituents) (empty? (set/intersection imported (set ids)))))
+      (fail! :invocation-ordered-compound-span
+             "an emitted stage must cover exact consecutive numerical source entries without actions or constituent imports"
+             {:equation (:id equation) :source-equations ids}))
+    {:equation (:id equation) :end end}))
+
+(defn- ordered-equation-spans
+  "Map original numerical source positions to actual emitted stages. Compound stages
+   consume only contiguous numerical entries, never intervening observable source work.
+   This relation grants no execution credit; its exclusive end is used only after completion."
+  [semantic-program program invocation order]
+  (let [source-equations (into {} (map (juxt :id identity)) (:equations semantic-program))
+        numerical? #(and (:equation %)
+                         (not (true? (get-in source-equations [(:equation %) :attributes :host-only]))))
+        positions (into {} (keep-indexed (fn [i entry] (when (numerical? entry) [(:equation entry) i]))) order)
+        numerical (filterv #(not (true? (get-in % [:attributes :host-only]))) (:equations program))]
+    (loop [remaining numerical covered #{} spans {}]
+      (if-let [equation (first remaining)]
+        (let [ids (vec (or (seq (get-in equation [:attributes :emitted-source-equations])) [(:id equation)]))
+              start (get positions (first ids))
+              span (checked-equation-source-span semantic-program program invocation order equation start)]
+          (when-not (empty? (set/intersection covered (set ids)))
+            (fail! :invocation-ordered-compound-span
+                   "an emitted stage must cover exact consecutive numerical source entries without actions or constituent imports"
+                   {:equation (:id equation) :source-equations ids}))
+          (recur (next remaining) (into covered ids)
+                 (assoc spans start span)))
+        (do
+          (when-not (= covered (set (keys positions)))
+            (fail! :invocation-ordered-compound-coverage
+                   "emitted stages must cover every original numerical source entry exactly once" {}))
+          spans)))))
+
 (defn- begin-ordered-realization-with
   [compilation arguments caller-options begin-materialization]
   (let [{:keys [semantic-program invocation checked program]}
-        (checked-compilation-boundary compilation nil caller-options)
-        order (invocation/source-order invocation semantic-program)]
-    {:program program :source-order order :source-cursor 0
+        (checked-compilation-boundary compilation nil caller-options true)
+        order (invocation/source-order invocation semantic-program)
+        spans (ordered-equation-spans semantic-program program invocation order)]
+    {:program program :source-program semantic-program :source-order order :source-cursor 0
+     :equation-spans spans
      :source-realizations (into {} (keep (fn [entry]
                                           (when-let [action (invocation-source/realization-action semantic-program entry)]
                                             [(:position entry) action]))) order)
@@ -695,18 +761,20 @@
     projection))
 
 (defn- ordered-source-completion?
-  "The planned backend implements bounded lexical Float/reference completions.
+  "The planned backend implements bounded lexical numeric-entry/reference completions.
    Exact operand/source ownership is checked by its owner-local adapter, not this predicate."
   [step]
-  (let [result (completion/invocation-result-description
-                (:contract (completion/canonical-parts (:expression step))))]
+  (let [contract (:contract (completion/canonical-parts (:expression step)))
+        result (completion/invocation-result-description contract)]
     (and (invocation/source-completion? step)
-         (or (= {:kind :opaque} result) (= {:kind :scalar :tag 'float} result))
+         (not= :source-integral-cast (:source-context contract))
+         (or (= {:kind :opaque} result)
+             (and (= :scalar (:kind result)) (contains? '#{float double long int} (:tag result))))
          (= 1 (count (:operands step))))))
 
 (defn- checked-import-source-order [state materialized]
   (let [plan (:plan materialized)
-        program (:program state)
+        program (or (:source-program state) (:program state))
         expected (invocation/source-order plan program)]
     (when-not (and (identical? plan (get-in program [:attributes :invocation-plan]))
                    (semantic/equivalent? expected (:source-order state)))
@@ -1056,8 +1124,17 @@
     (fail! :invocation-ordered-pending "the preceding numerical stage has not completed" {}))
   (let [entry (nth (:source-order state) (:source-cursor state) nil)
         program (:program state)
-        equation (some #(when (= equation-id (:id %)) %) (:equations program))]
-    (when-not (and equation (= equation-id (:equation entry))
+        equation (some #(when (= equation-id (:id %)) %) (:equations program))
+        _ (when-not (and equation
+                         (= equation-id (get-in state [:equation-spans (:source-cursor state) :equation])))
+            (fail! :invocation-ordered-next-equation
+                   "only the next numerical source entry may acquire ready storage"
+                   {:entry entry :equation equation-id}))
+        span (checked-equation-source-span
+              (:source-program state) program (get-in state [:materialization :plan])
+              (:source-order state) equation (:source-cursor state))]
+    (when-not (and equation (= span (get (:equation-spans state) (:source-cursor state)))
+                   (:equation entry)
                    (not (true? (get-in equation [:attributes :host-only]))))
       (fail! :invocation-ordered-next-equation
              "only the next numerical source entry may acquire ready storage"
@@ -1139,10 +1216,30 @@
           contract (first (link/relative-entry-contracts! plan effect-evidence
                                                          [[instance-id]] caller-options))]
       {:state (assoc state :realized realized
-                           :pending {:equation equation-id :source-cursor (:source-cursor state)})
+                           :pending {:equation equation-id :source-cursor (:source-cursor state)
+                                     :source-end (:end span)})
        :call call :stage-plan plan :effect-evidence effect-evidence :entry-contract contract
        :new-storage (select-keys (:storage realized)
                                  (remove #(contains? acquired %) tokens))})))
+
+(defn ^:no-doc ordered-stage-source-end
+  "Derive a stage's completion cursor from its owner's original source entries.
+   Routing caches and pending maps alone grant no permission to skip source actions."
+  [source-state ready-state]
+  (checked-ordered-validation source-state)
+  (let [pending (:pending ready-state)
+        start (:source-cursor source-state)
+        program (:program source-state)
+        equation (some #(when (= (:equation pending) (:id %)) %) (:equations program))
+        span (checked-equation-source-span
+              (:source-program source-state) program (get-in source-state [:materialization :plan])
+              (:source-order source-state) equation start)]
+    (when-not (and (= start (:source-cursor ready-state) (:source-cursor pending))
+                   (= (:end span) (:source-end pending))
+                   (= span (get (:equation-spans source-state) start)))
+      (fail! :invocation-ordered-stage-source-span
+             "stage completion requires its exact owner's current source span" {}))
+    (:end span)))
 
 (defn- lower-in-context
   "Lower one specialized invocation and matching emitted program into a validated LinkPlan.

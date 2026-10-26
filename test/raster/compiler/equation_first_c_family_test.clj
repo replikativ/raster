@@ -2187,6 +2187,38 @@
                   (:kernels compilation)))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
+(deftest compound-emission-projects-only-the-checked-logical-interface
+  (let [compilation (equation-first/compile
+                     #'c-family-broadcast-product-map!
+                     {:target cuda-target :dtype :int
+                      :values {'input (av/tensor {:dtype :int :shape [64]})
+                               'weights (av/tensor {:dtype :int :shape [64]})
+                               'output (av/tensor {:dtype :int :shape [1]})}})
+        {:keys [scheduled emitted]} compilation
+        logical (emitted-program/retained-typed-program-view emitted scheduled nil)
+        initial (invocation-link/begin-ordered-realization
+                 compilation [(int-array 64) (int-array 64) (int-array 1) 1] nil)
+        refuses? (fn [candidate peer]
+                   (try (nil? (emitted-program/retained-typed-program-view candidate peer nil))
+                        (catch clojure.lang.ExceptionInfo _ true)))]
+    (is (some? logical))
+    (is (= (:inputs scheduled) (:inputs logical)))
+    (is (not= (:inputs scheduled) (:inputs emitted)))
+    (is (= (mapv :id (:equations scheduled)) (mapv :id (:equations logical))))
+    (is (= (:semantic compilation) (:source-program initial)))
+    (is (= 1 (count (:equation-spans initial))))
+    (let [[start {:keys [equation end]}] (first (:equation-spans initial))]
+      (is (= 2 (- end start)))
+      (is (= equation (get-in emitted [:equations 1 :id])))
+      (is (= [2 3] (mapv :equation (subvec (:source-order initial) start end)))))
+    (is (nil? (emitted-program/retained-typed-program-view emitted nil nil))
+        "physical inputs alone cannot reconstruct the logical intermediates")
+    (is (refuses? (assoc emitted :inputs (:inputs scheduled)) scheduled)
+        "even a valid extra input must obey the checked emission constructor policy")
+    (is (refuses? emitted (update scheduled :inputs conj 'invented-input)))
+    (is (refuses? emitted (update scheduled :equations #(vec (reverse %)))))
+    (is (refuses? emitted (assoc-in scheduled [:equations 1 :operations] [])))))
+
 (deftest product-reduction-composes-with-an-ordered-epilogue
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile

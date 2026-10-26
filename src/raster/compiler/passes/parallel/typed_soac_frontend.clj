@@ -27,11 +27,13 @@
             [raster.compiler.passes.parallel.staged-contraction-admission :as staged-admission]
             [raster.compiler.passes.parallel.staged-scalar-body :as scalar-stage-body]
             [raster.compiler.ir.index-algebra :as index-algebra]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
@@ -4250,6 +4252,74 @@
              :source-description-state
              (cond-> description-state alias-dtype (assoc-in [:array-types id] alias-dtype))))))
 
+(defn- name-strict-extent-subexpressions
+  "Expose successful strict long subcomputations at their ORIGINAL evaluation site.
+
+   The typed index vocabulary proves only the closed strict grammar and retained widths, not
+   totality. Left-to-right postorder preserves which arithmetic can fail first. Exact later
+   repeats over immutable SSA operands may reuse these completed values; no new check moves
+   across a numerical operation. Rejected trees are left wholly untouched, including branches,
+   reads, narrowing and arithmetic without its own long result contract."
+  [state expression occupied-symbols ordinal]
+  (let [scalar-types (:local-scalar-types state)
+        calls (filter seq? (tree-seq coll? seq expression))
+        admitted?
+        (and (seq calls)
+             (every? #(and (= :long (retained-scalar-dtype % scalar-types))
+                           ;; Direct frontend callers may supply an unqualified local/Var.
+                           ;; Only retained qualified operation identities enter this rewrite.
+                           (symbol? (descriptor/semantic-op %))
+                           (some? (some-> (descriptor/semantic-op %) namespace))
+                           (not (contains? util/*shadowing-locals* (descriptor/semantic-op %))))
+                     calls)
+             (immutable-scalar-operands? expression scalar-types)
+             (ordered-scalar-expression? expression)
+             (try
+               (index-expression/lower-typed
+                expression (set (keys scalar-types)) scalar-types :long
+                (fn [rule message data]
+                  (throw (ex-info message (assoc data ::strict-extent-decline rule)))))
+               true
+               (catch clojure.lang.ExceptionInfo error
+                 (if (::strict-extent-decline (ex-data error)) false (throw error)))))]
+    (if-not admitted?
+      [state expression]
+      (letfn [(key-for [form]
+                {:expression form
+                 :operand-dtypes (select-keys scalar-types (util/free-syms form))})
+              (existing [state key]
+                (some (fn [[prior id]]
+                        (when (semantic/retained-source-equivalent? prior key) id))
+                      (:strict-extent-bindings state)))
+              (visit [state form root?]
+                (if-not (seq? form)
+                  [state form]
+                  (let [key (key-for form)]
+                    (if-let [id (existing state key)]
+                      [state id]
+                      (let [[state arguments]
+                            (reduce (fn [[state arguments] argument]
+                                      (let [[state argument] (visit state argument false)]
+                                        [state (conj arguments argument)]))
+                                    [state []] (descriptor/call-args form))
+                            ;; Keep the actual source dispatch and every policy/type annotation.
+                            prefix (take (- (count form) (count arguments)) form)
+                            rewritten (with-meta (apply list (concat prefix arguments)) (meta form))]
+                        (if root?
+                          [state rewritten]
+                          (let [used (into occupied-symbols (map first) (:normalized state))
+                                base (str "rstr_extent_part_" ordinal "_")
+                                id (with-meta
+                                     (first (remove used (map #(symbol (str base %)) (range))))
+                                     {:tag 'long :raster.type/tag 'long
+                                      :raster.compiler/normalized-extent true})]
+                            [(-> state
+                                 (update :normalized conj [id rewritten])
+                                 (update :strict-extent-bindings (fnil conj []) [key id])
+                                 (assoc-in [:local-scalar-types id] :long))
+                             id])))))))]
+        (visit state expression true)))))
+
 (defn- normalize-source*
   [source array-types scalar-types options]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
@@ -4453,6 +4523,10 @@
                                               (resolve-length #{})
                                               (->> (util/subst-syms scalar-aliases))
                                               (normalize-scalar-casts local-scalar-types))
+                     [state canonical-extent]
+                     (name-strict-extent-subexpressions state canonical-extent
+                                                       occupied-symbols ordinal)
+                     local-scalar-types (:local-scalar-types state)
                      ;; The source binding already evaluated this immutable expression. Reuse
                      ;; its exact SSA value rather than minting a second extent/check identity.
                      canonical-extent (get (:pure-scalar-ids state) canonical-extent

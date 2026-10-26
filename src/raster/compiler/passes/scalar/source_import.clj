@@ -196,27 +196,34 @@
         operands (:operands step)
         input (first operands)
         input-value (get-in plan [:values (:value input)])
-        float-value? #(and (= :tensor (:kind %)) (= :float (:dtype %)) (= [] (:shape %)))
+        scalar-value? #(and (= :tensor (:kind %)) (contains? #{:float :double :long :int} (:dtype %))
+                            (= [] (:shape %)))
         opaque-value? #(and (= :opaque (:kind %)) (= [] (:shape %)))
-        input-kind (cond (float-value? input-value) :scalar (opaque-value? input-value) :opaque)
+        input-kind (cond (scalar-value? input-value) :scalar (opaque-value? input-value) :opaque)
+        input-dtype (when (= :scalar input-kind) (:dtype input-value))
         result-kind (:kind result-description)
+        result-dtype (some-> (:tag result-description) dtype/dtype-for-scalar-tag)
         entries (filterv #(= (:id step) (:invocation-step %)) order)]
     (when-not (and (= 1 (count sites)) (= 1 (count entries))
                    (= position (:position (first entries)))
                    (identical? binder (:symbol step))
                    (identical? expression (:expression step))
                    (completion/canonical-contract? contract)
-                   (or (= {:kind :scalar :tag 'float} result-description)
+                   ;; Checked integral SOURCE casts retain their existing separate
+                   ;; path. This extension consumes canonical numeric ENTRY plans.
+                   (not= :source-integral-cast (:source-context contract))
+                   (or (and (= :scalar result-kind) (contains? #{:float :double :long :int} result-dtype))
                        (= {:kind :opaque} result-description))
                    (symbol? operand) (= 1 (count operands))
                    (identical? operand (:symbol input))
                    input-kind
                    (if (= :opaque result-kind) (opaque-value? (:value step))
-                       (float-value? (:value step))))
+                       (and (scalar-value? (:value step)) (= result-dtype (get-in step [:value :dtype])))))
       (fail! :source-completion-step-source
-             "completion requires its exact retained bounded binding over one lexical Float or opaque value" {}))
+             "completion requires its exact bounded numeric-entry/source-Float binding over one lexical value" {}))
     {:source-position position :binder binder :expression expression
-     :operand operand :operand-id (:value input) :input-kind input-kind :result-kind result-kind}))
+     :operand operand :operand-id (:value input) :input-kind input-kind :result-kind result-kind
+     :input-dtype input-dtype :result-dtype result-dtype}))
 
 (declare validate-contextual-source-witness! current-source-binding!)
 
@@ -238,7 +245,7 @@
    occurrence of this planned recipe. No JIT, result transfer, cursor advancement or
    runtime admission occurs. The caller must validate the complete returned adapter
    against its current program/plan/step before using `[:region :invoke]`. An optional
-   current-source witness authenticates actual Float/Object ports and result carriers;
+   current-source witness authenticates actual bounded numeric/Object ports and result carriers;
    without it, only the original deliberate Object-to-source-Float ABI is supported."
   [{:keys [frontend source-program plan step witness]}]
   (when-not method-entry/*emission-inputs*
@@ -278,13 +285,13 @@
                               (= (:contract (completion/canonical-parts (:expression binding))) (:contract observed))
                               (= port (get (:locals-before observed) (:operand binding)))
                               (if (= :scalar (:input-kind binding))
-                                (= :float (:type port))
+                                (= (:input-dtype binding) (:type port))
                                 (and (= :ref (:type port))
-                                     (contains? #{Object Float} (:reference-class port))))
+                                     (contains? #{Object Float Double Long Integer} (:reference-class port))))
                               (if (= :opaque (:result-kind binding))
                                 (and (= :ref (get-in current [:after :type]))
                                      (identical? Object (get-in current [:after :reference-class])))
-                                (= :float (get-in current [:after :type]))))
+                                (= (:result-dtype binding) (get-in current [:after :type]))))
                  (fail! :source-completion-step-carrier
                         "completion source value or binding differs from its actual physical port/result" {}))
                (when-not (and (= :opaque (:input-kind binding)) (= :scalar (:result-kind binding))
@@ -309,7 +316,11 @@
                       'raster.compiler.backend.jvm.bytecode/compile-planned-source-floating-completion-region)
                      emission (:expression binding) policy owner-check))
            artifact (cond-> (merge binding {:frontend frontend :source-program source-program
-                                           :plan plan :step step :source-policy policy :region region})
+                                           :plan plan :step step :source-policy policy :region region
+                                           :input-class (when (= :scalar (:input-kind binding))
+                                                          (get types/primitive-info (symbol (name (:type port)))))
+                                           :result-class (when (= :scalar (:result-kind binding))
+                                                           (get types/primitive-info (symbol (name (:result-dtype binding)))))})
                       witness (assoc :witness witness :input-port port :observed observed))
            adapter (retain-owned-import! artifact frontend (:guard region))]
        (validate-source-completion-step! adapter source-program plan step)))))

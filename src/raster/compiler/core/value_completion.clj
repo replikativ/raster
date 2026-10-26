@@ -255,10 +255,11 @@
     (cond
       (= object-input-contract contract) {:kind :opaque}
       (source-cast-result-tag contract) {:kind :scalar :tag (source-cast-result-tag contract)}
-      (and (contains? #{:jvm-bytecode-boxed-parameter-input :jvm-bytecode-floating-input
+      (and (contains? #{:jvm-bytecode-boxed-parameter-input :jvm-bytecode-floating-input :jvm-bytecode-integral-input
                         :jvm-primitive-input} (:source-context contract))
-           (identical? Float/TYPE (:target-carrier contract)))
-      {:kind :scalar :tag 'float})))
+           (some #(identical? (types/tag->java-class %) (:target-carrier contract)) '[float double long int]))
+      {:kind :scalar :tag (some #(when (identical? (types/tag->java-class %) (:target-carrier contract)) %)
+                               '[float double long int])})))
 
 (defn- value-meta [contract expression]
   ;; A new value term cannot inherit the original callee's identity/effects or

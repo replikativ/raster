@@ -116,7 +116,8 @@
         emitted (binding [*unchecked-math* false]
                   (core/emit-owned-bytecode!
                    bytecode/compile-typed-impl! "raster.compiled.PlannedCompletionSource"
-                   '[input] [tag] (if (= contract completion/object-input-contract) 'Object 'float)
+                   '[input] [tag] (if (= contract completion/object-input-contract) 'Object
+                                    (:tag (completion/invocation-result-description contract)))
                    body *ns* (:iface-name interface) 'planned-completion-source))
         observed (bytecode/retained-input-completion-context (:emission emitted) body expression)]
     {:emission (:emission emitted) :expression expression :observed observed
@@ -150,6 +151,26 @@
           (is (identical? opaque ((:invoke region) opaque)))
           (is (nil? ((:invoke region) nil))))))))
 
+(deftest planned-numeric-entries-preserve-each-actual-primitive-result-abi
+  (doseq [[tag carrier value] [['float Float/TYPE (float -0.25)]
+                               ['double Double/TYPE (double -0.25)]
+                               ['long Long/TYPE (long 9007199254740993)]
+                               ['int Integer/TYPE (int -17)]]
+          input-tag [tag 'Object]
+          :let [contract (completion/bytecode-boxed-parameter-contract carrier)
+                {:keys [emission expression observed port policy]}
+                (actual-planned-completion input-tag contract)
+                region (bytecode/compile-planned-completion-region
+                        emission expression port observed policy (fn []))
+                method ^java.lang.reflect.Method (:method region)]]
+    (is (identical? carrier (.getReturnType method)))
+    (is (= [(if (= input-tag 'Object) Object carrier)] (vec (.getParameterTypes method))))
+    (is (= value ((:invoke region) value)))
+    (is (= (class value) (class ((:invoke region) value))))
+    (when (= input-tag 'Object)
+      (is (thrown? NullPointerException ((:invoke region) nil)))
+      (is (thrown? ClassCastException ((:invoke region) "not a number"))))))
+
 (deftest planned-primitive-float-entry-retains-number-effects-and-current-owner
   (let [{:keys [emission expression observed port policy]}
         (actual-planned-completion 'Object (completion/bytecode-boxed-parameter-contract Float/TYPE))
@@ -173,11 +194,11 @@
     (is (= 1 @calls))
     (doseq [[bad-expression bad-port bad-observed]
             [[expression (assoc port :type :double) observed]
-             [expression (assoc port :reference-class Double) observed]
+             [expression (assoc port :reference-class String) observed]
              [expression port (assoc observed :completion-carrier :ref)]
              [(completion/complete-value (:contract observed) '(do input input)) port observed]
-             [(completion/complete-value (completion/bytecode-boxed-parameter-contract Double/TYPE) 'input)
-              port (assoc observed :contract (completion/bytecode-boxed-parameter-contract Double/TYPE))]]]
+             [(completion/complete-value (completion/bytecode-boxed-parameter-contract Boolean/TYPE) 'input)
+              port (assoc observed :contract (completion/bytecode-boxed-parameter-contract Boolean/TYPE))]]]
       (is (= :planned-completion-form
              (try (bytecode/compile-planned-completion-region
                    emission bad-expression bad-port bad-observed policy (fn [])) nil

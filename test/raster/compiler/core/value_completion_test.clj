@@ -29,10 +29,18 @@
     (is (nil? (completion/invocation-result-description (assoc contract :unowned true)))))
   (doseq [contract [(completion/reference-check-contract Float)
                     (completion/bytecode-boxed-parameter-contract (.arrayType Float/TYPE))
-                    (completion/bytecode-boxed-parameter-contract Double/TYPE)
+                    (completion/bytecode-boxed-parameter-contract Boolean/TYPE)
+                    (completion/bytecode-boxed-parameter-contract Character/TYPE)
                     (completion/bytecode-result-context-contract
                      (completion/bytecode-operand-context {}) :ref)]]
     (is (nil? (completion/invocation-result-description contract))))
+  (doseq [[carrier tag] [[Float/TYPE 'float] [Double/TYPE 'double]
+                         [Long/TYPE 'long] [Integer/TYPE 'int]]
+          contract [(completion/bytecode-boxed-parameter-contract carrier)
+                    (completion/bytecode-input-contract carrier
+                                                        (completion/bytecode-operand-context {}))]]
+    (is (= {:kind :scalar :tag tag} (completion/invocation-result-description contract)))
+    (is (nil? (completion/invocation-result-description (assoc contract :unowned true)))))
   (is (= {:kind :scalar :tag 'long}
          (completion/invocation-result-description
           (completion/source-integral-cast-contract :long {:unchecked-math false})))))

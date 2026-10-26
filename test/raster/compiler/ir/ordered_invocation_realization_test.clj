@@ -67,6 +67,35 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(deftest compound-source-spans-cannot-skip-observable-work-or-imports
+  (let [semantic {:equations [{:id :host :attributes {:host-only true}}
+                              {:id :producer} {:id :consumer}]}
+        emitted {:equations [{:id :host :attributes {:host-only true}}
+                             {:id :fused :attributes {:emitted-source-equations [:producer :consumer]}}]}
+        order [{:position 0 :storage :scratch} {:position 1 :equation :host}
+               {:position 2 :equation :producer} {:position 3 :equation :consumer}]
+        spans (fn [program plan entries]
+                (#'invocation-link/ordered-equation-spans semantic program plan entries))]
+    (is (= {2 {:equation :fused :end 4}} (spans emitted {:steps []} order)))
+    (doseq [action [{:invocation-step :step} {:storage :buffer} {:realization :allocation}
+                    {:program-result-import {:equation :producer :result :value}}
+                    {:equation :host}]]
+      (is (= :invocation-ordered-compound-span
+             (reason #(spans emitted {:steps []}
+                             (vec (concat (take 3 order) [action] (drop 3 order))))))))
+    (doseq [ids [[:consumer :producer] [:producer :missing] [:producer :producer]]]
+      (is (= :invocation-ordered-compound-span
+             (reason #(spans (assoc-in emitted [:equations 1 :attributes :emitted-source-equations] ids)
+                             {:steps []} order)))))
+    (is (= :invocation-ordered-compound-coverage
+           (reason #(spans (assoc emitted :equations []) {:steps []} order))))
+    (doseq [id [:producer :consumer]]
+      (is (= :invocation-ordered-compound-span
+             (reason #(spans emitted
+                             {:steps [(invocation/map->ProgramResultImport {:equation id})]}
+                             order)))
+          "a constituent result import requires its own exact producer correspondence"))))
+
 (defn- ordered-result-import-fixture []
   (let [snapshot (completion/complete-value completion/object-input-contract 'total)
         cast (completion/complete-value
@@ -372,6 +401,15 @@
                compilation [(double-array [7.0]) (double-array 1) Long/MAX_VALUE] nil)
         equation-id (:id (first (:equations (:program state))))
         ready (invocation-link/realize-ready-equation state equation-id nil)]
+    (is (= (inc (:source-cursor state))
+           (invocation-link/ordered-stage-source-end state (:state ready))))
+    (is (= :invocation-ordered-stage-source-span
+           (reason #(invocation-link/ordered-stage-source-end
+                     state (update-in (:state ready) [:pending :source-end] inc)))))
+    (is (= :invocation-ordered-next-equation
+           (reason #(invocation-link/realize-ready-equation
+                     (update-in state [:equation-spans (:source-cursor state) :end] inc)
+                     equation-id nil))))
     (is (= 1 (count (get-in ready [:stage-plan :instances]))))
     (is (= 0 (get-in ready [:state :source-cursor])))
     (is (= equation-id (get-in ready [:state :pending :equation])))

@@ -7465,26 +7465,31 @@
         kind (:source-context contract)
         object? (= completion/object-input-contract contract)
         source? (= :source-floating-cast kind)
-        floating? (and (= :jvm-bytecode-floating-input kind)
-                       (identical? Float/TYPE (:target-carrier contract)))
+        entry? (and (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                                :jvm-bytecode-boxed-parameter-input} kind)
+                    (= :scalar (:kind (completion/invocation-result-description contract))))
+        retained-context? (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input} kind)
         boxed? (and (= :jvm-bytecode-boxed-parameter-input kind)
-                    (identical? Float/TYPE (:target-carrier contract)))
+                    entry?)
         raw (:type operand-port)
         completed (:completion-carrier observed)
-        carrier (case completed :float Float/TYPE :ref Object nil)
+        declared (if object? :ref (some-> (completion/invocation-result-description contract) :tag name keyword))
+        carrier (if (= :ref completed) Object (primitive-carrier-class completed))
         context (:operand-context observed)]
     (when-not (and (completion/canonical-contract? contract) (symbol? operand)
-                   (or object? floating? boxed?
+                   (or object? entry?
                        (and source? (= 'float (completion/source-cast-result-tag contract))))
-                   (contains? #{:float :ref} raw)
-                   (or (= :float raw)
-                       (contains? #{Object Float} (:reference-class operand-port)))
-                   (or (= :float raw) (boolean? (:verified operand-port)))
+                   (contains? #{:float :double :long :int :ref} raw)
+                   (or (nil? (:locals-before observed))
+                       (= operand-port (get (:locals-before observed) operand)))
+                   (or (not= :ref raw)
+                       (contains? #{Object Float Double Long Integer} (:reference-class operand-port)))
+                   (or (not= :ref raw) (boolean? (:verified operand-port)))
                    (= contract (:contract observed))
                    (= (if (or object? boxed?) :ref raw) (:input-carrier observed))
-                   (= (if object? :ref :float) completed)
+                   (= declared completed)
                    (completion/bytecode-operand-context? context)
-                   (or (not floating?) (= context (:operand-context contract)))
+                   (or (not retained-context?) (= context (:operand-context contract)))
                    (source-policy/valid? operand-policy)
                    (or (not source?) (= operand-policy (:operand-source-policy observed)))
                    (ifn? owner-guard))
@@ -7501,7 +7506,7 @@
                        (contains? observed :adaptation) (conj :adaptation))
           region (compile-planned-recipe-region
                   owner-emission input carrier recipe
-                  {:return-tag (if object? 'Object 'float) :source-policy operand-policy
+                  {:return-tag (if object? 'Object (symbol (name completed))) :source-policy operand-policy
                    ::body-input-context context}
                   owner-guard
                   (fn [observations]

@@ -281,19 +281,29 @@
   ([parallel-program caller-options]
    (numerical-equations-for-request parallel-program caller-options)))
 
+(defn emission-inputs
+  "Physical inputs of an emitted equation spine. Compound regions eliminate internal
+   intermediates; unchanged spines retain the scheduled entry interface. This constructor
+   policy is shared by emission and checked logical projection, not an arbitrary subset rule."
+  [scheduled emitted-equations]
+  (if (some #(seq (get-in % [:attributes :emitted-source-equations])) emitted-equations)
+    (program/infer-inputs emitted-equations)
+    (:inputs scheduled)))
+
 (defn- retained-schedule-matches?
   "Relate a scheduled peer to checked emitted alternatives. Attached invocation-plan
    correspondence is exact identity, not ownership proof or portable numerical data."
   [emitted scheduled equations caller-options]
   (program/validate! scheduled)
   (let [by-id (into {} (map (juxt :id identity)) (:equations scheduled))
-        numerical-boundary #(update (select-keys % [:values :inputs :outputs :effects :attributes])
+        numerical-boundary #(update (select-keys % [:values :outputs :effects :attributes])
                                     :attributes dissoc :invocation-plan)]
     (and (contains? #{:segop :scheduled-parallel} (:dialect scheduled))
          (= (contains? (:attributes scheduled) :invocation-plan)
             (contains? (:attributes emitted) :invocation-plan))
          (identical? (get-in scheduled [:attributes :invocation-plan])
                      (get-in emitted [:attributes :invocation-plan]))
+         (= (:inputs emitted) (emission-inputs scheduled (:equations emitted)))
          (semantic-fingerprint/equivalent?
           (numerical-boundary scheduled) (numerical-boundary emitted))
          (= (mapv :id (:equations scheduled)) (mapv :id equations))
@@ -320,11 +330,17 @@
   ([parallel-program scheduled-peer caller-options]
    (let [equations (numerical-equations-for-request parallel-program caller-options true)]
      (when (and (every? #(soac/program-form? (:algorithm %)) equations)
+                ;; Without a checked peer, a physical compound interface may have lost
+                ;; logical intermediates. Abstain rather than invent external inputs.
+                (or scheduled-peer
+                    (set/subset? (set (program/infer-inputs equations))
+                                 (set (:inputs parallel-program))))
                 (or (nil? scheduled-peer)
                     (retained-schedule-matches? parallel-program scheduled-peer equations caller-options)))
        (program/make
         {:dialect :typed-soac :source nil
-         :values (:values parallel-program) :inputs (:inputs parallel-program)
+         :values (:values parallel-program)
+         :inputs (:inputs (or scheduled-peer parallel-program))
          :outputs (:outputs parallel-program) :effects (:effects parallel-program)
          :diagnostics (:diagnostics parallel-program)
          :provenance (assoc (:provenance parallel-program) :pass :retained-typed-analysis)

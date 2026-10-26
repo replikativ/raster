@@ -134,14 +134,44 @@ input storage does not prove a producer completed in this replay. Keep those fac
 separate. Runtime import must check cursor, producer completion, physical view,
 initialization, owner and epoch across the transfer and owned return adaptation.
 
-At pushed `b3d7756af`, unit job 34993 has 15 completed shards and one incomplete
-shard: 6,975 tests, 28 failures and 41 errors across 51 failing Vars in completed
-shards. The incomplete shard's 436 observed Vars are excluded. Compared with job
-34986, 6,606 common completed Vars have no newly failing or recovered Vars; the
-noncommon and incomplete sets are not a coverage trend. Setup/build pass; unit,
-OpenCL CPU and public-source emission fail. PR #1566 remains unqualified.
+At pushed `2414b5745`, unit job 35001 has 15 completed shards and one incomplete
+shard: 7,046 tests, 25 failures and 39 errors across 47 failing Vars in completed
+shards. The incomplete shard's 326 observed Vars are excluded; noncommon and
+incomplete sets are not a coverage trend. Setup, build, public-source emission,
+CUDA compilation and HIP compilation pass. Unit and OpenCL CPU gates fail.
+PR #1566 remains unqualified and must not merge on the local slice results.
+The CPU-OpenCL job 35000 has all four completed shard artifacts: 648 tests,
+7,996 passing assertions, six failed assertions and 31 errors across 35 failing
+Vars. These overlap unit failures but also exercise additional resident composition
+and distributed/training paths; they are not merely unavailable-device skips.
 The incomplete shard timed out after ten minutes without output while running
 `gsdm-fused-train-step-converges`; it did not produce a final suite summary.
+
+The next local repairs distinguish physical fusion from original source order.
+A compound kernel may eliminate an intermediate physical input without deleting
+its logical source allocation or claiming that its producer has run. Checked
+logical projection must use the scheduled source interface, not invent inputs
+from a physical kernel signature. Contiguous numerical constituents now have a
+bounded source-span execution prototype, with JVM agreement, replay, earlier
+allocation failure and stage failure checks on both local backends (30 assertions).
+Q6 originally placed an observable extent calculation between its constituents.
+Independent review identified a dominating identical strict Long subcomputation
+inside the earlier allocation extent. Bounded source normalization now names that
+subcomputation at its original evaluation position and reuses its successful
+value; Q6 retains one fused kernel without a runtime interval relaxation. Untyped,
+narrowing, conditional, mutable-read and shadowed/unqualified-call trees decline
+this optional normalization. Cached stage endpoints are claims checked against
+actual constituents, never completion authority. The combined warm gate passes
+95 tests / 1,904 assertions, with both local devices required; the same fresh-JVM
+gate also passes. Full CI qualification remains separate. These changes are not
+yet landed.
+
+Numeric source-entry completion transport is being generalized over the existing
+Float, Double, Long and Integer contracts using actual retained JVM ports and
+Methods. It does not infer JVM classes from tensor dtypes or introduce AD rules.
+The nested array-AD reproduction advances beyond its former Long-entry refusal;
+the next blocker is backing-capacity scope in graph preconditions. Dropping those
+guards or merely filtering them out of the scalar ABI is not a complete fix.
 
 The dated sections below are historical evidence, not current landing order. In
 particular, claims that all source-completion execution is unimplemented predate

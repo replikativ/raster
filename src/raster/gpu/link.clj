@@ -1369,6 +1369,7 @@
 (defn- run-ordered-stage! [executable ready]
   (let [execution-state (:execution-state executable)
         source-state (get-in @execution-state [:ordered :current])
+        source-end (invocation-link/ordered-stage-source-end source-state (:state ready))
         epoch (:value-epoch @execution-state)
         replay (get-in @execution-state [:ordered :import-replay])
         {:keys [execution-id ledger caller-options]} (:ordered @execution-state)
@@ -1410,8 +1411,8 @@
     (swap! execution-state update-in [:ordered :initialized] into
            (map #(get-in plan [:nodes % :view]) (get-in ready [:entry-contract :full-produces])))
     (-> (:state ready)
+        (assoc :source-cursor source-end)
         (dissoc :pending)
-        (update :source-cursor inc)
         (update :acquired-storage into (keys (allocation-groups plan))))))
 
 (defn- run-ordered-allocation! [executable state]
@@ -1456,7 +1457,7 @@
                                                       :projection (:projection final)}))))
 
 (defn- execute-ordered-source-completion
-  "Execute one authenticated Float/reference recipe at the current source cursor.
+  "Execute one authenticated bounded numeric-entry/reference recipe at its source cursor.
    Materialization still owns result-Class validation and advancing the prefix."
   [executable source-state step operands]
   (let [execution-state (:execution-state executable)
@@ -1481,8 +1482,9 @@
       (when-not (and (= 1 (count (:operands step))) (= 1 (count operands))
                      (case (:input-kind adapter)
                        :opaque (materialization/materialized-opaque? operand)
-                       :scalar (and (map? operand) (= :float (:type operand))
-                                    (identical? Float (class (:value operand))))
+                       :scalar (and (map? operand) (= (:input-dtype adapter) (:type operand))
+                                    (:input-class adapter)
+                                    (identical? (:input-class adapter) (class (:value operand))))
                        false)
                      ;; ValueAlias intentionally retains the original opaque wrapper.
                      ;; Check the exact current slot, not a newly fabricated alias ID.
@@ -1495,7 +1497,11 @@
         (assert-current!)
         (case (:result-kind adapter)
           :opaque result
-          :scalar {:type :float :value result}
+          :scalar (if (and (:result-class adapter) (:result-dtype adapter)
+                           (identical? (:result-class adapter) (class result)))
+                    {:type (:result-dtype adapter) :value result}
+                    (throw (ex-info "source completion returned a different physical numeric result"
+                                    {:reason :link-ordered-source-completion-result})))
           (throw (ex-info "source completion adapter has no supported result representation"
                           {:reason :link-ordered-source-completion-result})))))))
 
@@ -1596,7 +1602,8 @@
       (loop [state initial]
         (swap! execution-state assoc-in [:ordered :current] state)
         (if-let [entry (nth (:source-order state) (:source-cursor state) nil)]
-          (let [equation (when-let [id (:equation entry)]
+          (let [stage (get (:equation-spans state) (:source-cursor state))
+                equation (when-let [id (or (:equation stage) (:equation entry))]
                            (some #(when (= id (:id %)) %) (get-in state [:program :equations])))
                 next-state
                 (cond
