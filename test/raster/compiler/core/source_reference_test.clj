@@ -107,6 +107,31 @@
             (is (= :stale-source-resolution
                    (reason #(entry/assert-definition-inputs-current! observed))))))))))
 
+(deftest reference-guard-resolves-the-original-var-lookup-once-without-consuming-its-definition
+  (with-scopes
+    (fn [target caller replacement]
+      (let [v (intern target 'value (Object.))
+            metadata (meta v)]
+        (binding [*ns* caller] (alias 'chosen (ns-name target)))
+        (let [observed (collect-reference (decision caller 'chosen/value))
+              input (first (:producer-inputs observed))
+              resolves (atom 0)
+              resolve-original ns-resolve]
+          (try
+            ;; Qualification owns immutable Var ns/name, not this unconsumed
+            ;; root or editable metadata. Canonical reintern checks remain live.
+            (alter-var-root v (constantly (Object.)))
+            (alter-meta! v assoc :ns replacement :name 'unrelated)
+            (with-redefs [clojure.core/ns-resolve
+                          (fn [source & arguments]
+                            ;; Core's two-argument entry may delegate to its
+                            ;; three-argument arity; count original lookup sites.
+                            (when (= 1 (count arguments)) (swap! resolves inc))
+                            (apply resolve-original source arguments))]
+              (is (entry/assert-producer-current! input)))
+            (is (= 1 @resolves))
+            (finally (reset-meta! v metadata))))))))
+
 (deftest class-miss-and-namespace-decisions-retain-exact-identity
   (doseq [kind [:class :miss :alias :namespace]]
     (with-scopes

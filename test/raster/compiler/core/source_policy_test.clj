@@ -23,7 +23,9 @@
       (is (policy/valid? retained))
       (is (= mode (binding [*unchecked-math* (not mode)]
                     (policy/call-with-policy retained #(identity *unchecked-math*)))))))
-  (doseq [missing [nil {} {:unchecked-math nil} {:unchecked-math false :extra true}]]
+  (doseq [missing [nil {} {:other false} {:unchecked-math nil}
+                  {:unchecked-math :foreign} {:unchecked-math false :extra true}
+                  (sorted-map-by (constantly 0) :other false)]]
     (is (false? (policy/valid? missing)))
     (is (thrown? clojure.lang.ExceptionInfo (policy/call-with-policy missing (constantly nil))))))
 

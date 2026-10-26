@@ -123,6 +123,31 @@ compiler program. Historical bounded probes reached repeated frontend/inlining
 work in the five-iteration fixpoint before bytecode emission. Current-head
 phase/call measurements remain necessary before attributing the full delay.
 
+The bounded October 26 cold probe at `700161ef6` now establishes a current
+compile-cost priority. Its forward control completes in 39.3 seconds; fused
+training does not complete within the 420-second diagnostic budget. In the final
+300-second JFR window, definition-currentness validation occurs in 19,361 of
+24,726 main-thread execution samples (78.3%, inclusive and overlapping with its
+callers). Allocation weights indicate temporary bookkeeping churn, not retained
+heap growth; GC pauses account for about 5.1 seconds. These are sampled costs,
+not an end-to-end speedup or proof that validation can be removed.
+
+The first bounded optimization preserves every freshness/publication fence:
+check canonical Var identity and original lookup directly, resolve each original
+lookup once, test source-entry correspondence without constructing discarded
+lineage, and retain an unchanged collector when no lookup edge was added. A
+fresh JVM must qualify the changed private producer type. Only after a matched
+profile should broader compile-local reuse be considered. JAX's separate trace,
+lowering and executable caches are a useful reference, but its capture-on-trace
+global semantics do not satisfy Raster's live REPL redefinition contract.
+
+The first bookkeeping slice passes fresh-JVM qualification: 97 tests / 846
+assertions across source policy/reference/lineage, definition proof/preparation,
+emission dependencies and normalized AD proof lifetimes. Independent exact-diff
+review found and corrected the comparator-map exact-key edge case. No freshness
+fence, retry budget or publication/adoption rule was removed. A matched GSDM
+profile remains required before claiming a compile-time improvement.
+
 One independent convergence-domain defect is corrected: compiler fixpoints now
 use pair-local retained-source equality, allowing exact immutable Class identity,
 instead of requiring portable serialization of Class metadata. Type/operation

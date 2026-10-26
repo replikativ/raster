@@ -75,6 +75,18 @@
               (update inputs :producer-inputs (fnil conj []) producer)))
           inputs producers))
 
+(defn- canonical-var-intern-current?
+  [v source-ns source-name]
+  (and (var? v) (instance? clojure.lang.Namespace source-ns) (symbol? source-name)
+       (identical? source-ns (find-ns (ns-name source-ns)))
+       (identical? v (.findInternedVar ^clojure.lang.Namespace source-ns source-name))))
+
+(defn- original-var-lookup-current?
+  [v lookup-ns lookup-symbol]
+  (and (instance? clojure.lang.Namespace lookup-ns) (symbol? lookup-symbol)
+       (identical? lookup-ns (find-ns (ns-name lookup-ns)))
+       (identical? v (ns-resolve lookup-ns lookup-symbol))))
+
 (defn- var-reference-current?
   "Match historical Var identity and original lookup sites.
    A detached Var can retain its old root after ns-unmap/reintern or namespace
@@ -82,15 +94,9 @@
   [{:keys [var metadata lookups]}]
   (let [source-ns (:ns metadata)
         source-name (:name metadata)]
-    (and (var? var) (instance? clojure.lang.Namespace source-ns)
-         (symbol? source-name)
-         (identical? source-ns (find-ns (ns-name source-ns)))
-         (identical? var (.findInternedVar ^clojure.lang.Namespace source-ns source-name))
+    (and (canonical-var-intern-current? var source-ns source-name)
          (every? (fn [[lookup-ns lookup-symbol]]
-                   (and (instance? clojure.lang.Namespace lookup-ns)
-                        (symbol? lookup-symbol)
-                        (identical? lookup-ns (find-ns (ns-name lookup-ns)))
-                        (identical? var (ns-resolve lookup-ns lookup-symbol)))) lookups))))
+                   (original-var-lookup-current? var lookup-ns lookup-symbol)) lookups))))
 
 (defn var-value-current?
   "Compare a historical observation directly to the effective live Var value.
@@ -119,14 +125,16 @@
       (when-not (same-var-snapshot? prior snapshot)
         (throw (ex-info "definition changed while deriving a compiler proof"
                         {:reason :unstable-definition-proof-input :source v})))
-      (let [updated (update prior :lookups into (:lookups snapshot))]
-        (-> inputs
-            (assoc-in [:definition-proofs v] updated)
-            ;; Emission artifacts serialize :values, not the request-local
-            ;; proof index. Preserve unrelated entries and every lookup edge.
-            (update :values
-                    (fn [values]
-                      (mapv #(if (identical? prior %) updated %) values))))))
+      (if (every? #(contains? (:lookups prior) %) (:lookups snapshot))
+        inputs
+        (let [updated (update prior :lookups into (:lookups snapshot))]
+          (-> inputs
+              (assoc-in [:definition-proofs v] updated)
+              ;; Emission artifacts serialize :values, not the request-local
+              ;; proof index. Preserve unrelated entries and every lookup edge.
+              (update :values
+                      (fn [values]
+                        (mapv #(if (identical? prior %) updated %) values)))))))
     (-> inputs
         (assoc-in [:definition-proofs v] snapshot)
         (update :values (fnil conj []) snapshot))))
@@ -147,21 +155,20 @@
   (assert-producer-current! [_]
     (when-not (and (identical? source-ns (find-ns (ns-name source-ns)))
                    (or (not (var? result))
-                       (var-reference-current?
-                        {:var result
-                         ;; Qualification reads these immutable Var fields,
-                         ;; not the editable :ns/:name metadata or its root.
-                         :metadata {:ns (.ns ^clojure.lang.Var result)
-                                    :name (.sym ^clojure.lang.Var result)}
-                         :lookups #{[source-ns lookup-symbol]}}))
+                       ;; Qualification reads immutable Var fields, not editable
+                       ;; metadata or an unconsumed root. No snapshot is needed.
+                       (canonical-var-intern-current?
+                        result (.ns ^clojure.lang.Var result) (.sym ^clojure.lang.Var result)))
                    (or (not (instance? clojure.lang.Namespace result))
                        (identical? result (find-ns (ns-name result))))
-                   (identical? result
-                               (case kind
-                                 :symbol-resolution (try (ns-resolve source-ns lookup-symbol)
-                                                         (catch Exception _ nil))
-                                 :alias-resolution (get (ns-aliases source-ns) lookup-symbol)
-                                 :namespace-resolution (find-ns lookup-symbol))))
+                   (case kind
+                     :symbol-resolution
+                     (if (var? result)
+                       (original-var-lookup-current? result source-ns lookup-symbol)
+                       (identical? result (try (ns-resolve source-ns lookup-symbol)
+                                               (catch Exception _ nil))))
+                     :alias-resolution (identical? result (get (ns-aliases source-ns) lookup-symbol))
+                     :namespace-resolution (identical? result (find-ns lookup-symbol))))
       (throw (ex-info "source qualification lookup changed"
                       {:reason :stale-source-resolution :kind kind :symbol lookup-symbol})))
     true))
@@ -572,6 +579,23 @@
 
 (declare direct-selected-definition)
 
+(defn- source-entry-corresponds?
+  "Compare original definition fields without constructing a new lineage or refreshing history."
+  [metadata {:keys [params tags annotations source-body source-ns typed-interface return-tag
+                    clojure-body] :as source}]
+  (and (:raster.core/deftm metadata)
+       (source-policy/valid? (:source-policy source))
+       (= (:source-policy source) (:raster.core/source-policy metadata))
+       (identical? source-ns (:ns metadata))
+       (= (ns-name source-ns) (:raster.core/deftm-source-ns metadata))
+       (= params (:raster.core/deftm-params metadata))
+       (= tags (:raster.core/deftm-tags metadata))
+       (= annotations (:raster.core/deftm-annotations metadata))
+       (= return-tag (or (:raster.core/return-tag metadata) 'Object))
+       (some? source-body)
+       (identical? source-body (:raster.core/deftm-source-body metadata))
+       (or (some? typed-interface) (vector? clojure-body))))
+
 (defn capture-source-entry
   "Capture ORIGINAL inputs at the actual compiler producer, before publication.
    This owner-private lineage is not a portable certificate or a type registry.
@@ -583,18 +607,7 @@
   (when (and (var? source-var) (bound? source-var)
              (instance? clojure.lang.Namespace source-ns))
     (let [{:keys [value metadata]} (var-snapshot source-var)]
-      (when (and (:raster.core/deftm metadata)
-                 (source-policy/valid? (:source-policy source))
-                 (= (:source-policy source) (:raster.core/source-policy metadata))
-                 (identical? source-ns (:ns metadata))
-                 (= (ns-name source-ns) (:raster.core/deftm-source-ns metadata))
-                 (= params (:raster.core/deftm-params metadata))
-                 (= tags (:raster.core/deftm-tags metadata))
-                 (= annotations (:raster.core/deftm-annotations metadata))
-                 (= return-tag (or (:raster.core/return-tag metadata) 'Object))
-                 (some? source-body)
-                 (identical? source-body (:raster.core/deftm-source-body metadata))
-                 (or (some? typed-interface) (vector? clojure-body)))
+      (when (source-entry-corresponds? metadata source)
         (cond-> {:source-var source-var :source-root value :source-name (:name metadata)
                  :params params :tags tags :annotations annotations :source-body source-body
                  :source-policy (:source-policy source)
@@ -616,10 +629,9 @@
        (and (var? source-var) (bound? source-var)
             (instance? clojure.lang.Namespace source-ns)
             (symbol? source-name) (nil? (namespace source-name))
-            (identical? source-ns (find-ns (ns-name source-ns)))
-            (identical? source-var (.findInternedVar ^clojure.lang.Namespace source-ns source-name))
+            (canonical-var-intern-current? source-var source-ns source-name)
             (identical? source-root (var-get source-var))
-            (some? (capture-source-entry source-var lineage)))))))
+            (source-entry-corresponds? (meta source-var) lineage))))))
 
 (defn assert-source-entry-current!
   "Fence publication of an actual captured source entry; sequential, not ABA-safe."

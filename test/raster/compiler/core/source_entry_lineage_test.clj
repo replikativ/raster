@@ -376,6 +376,9 @@
     (let [lineage (get-in (meta receiver) [:raster.core/bytecode-emission :source-entry])
           original (meta source)]
       (is (some? lineage))
+      (with-redefs [entry/capture-source-entry
+                    (fn [& _] (throw (AssertionError. "currentness must not recapture lineage")))]
+        (is (true? (entry/source-entry-current? lineage))))
       (try
         (alter-meta! source assoc :raster.core/deftm-walked-body '[different-derived-form])
         (is (entry/source-entry-current? lineage))

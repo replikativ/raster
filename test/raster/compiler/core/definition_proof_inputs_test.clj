@@ -136,6 +136,48 @@
         (is (identical? original (get-in @inputs [:definition-proofs v :value])))
         (finally (alter-var-root v (constantly original)))))))
 
+(deftest repeated-definition-observation-preserves-the-exact-collector-until-a-new-lookup
+  (let [scope (create-ns (gensym "raster.proof-noop."))
+        caller (create-ns (gensym "raster.proof-noop-caller."))
+        v (intern scope 'input (Object.))
+        _ (.setDynamic ^clojure.lang.Var v)
+        owner (atom {:static [] :values []})]
+    (try
+      (binding [*ns* caller] (alias 'chosen (ns-name scope)))
+      (binding [entry/*emission-inputs* owner]
+        (entry/observe-definition-input! v scope 'input)
+        (let [first-observation @owner]
+          (entry/observe-definition-input! v scope 'input)
+          (is (identical? first-observation @owner))
+          (let [metadata (meta v)]
+            (try
+              (alter-meta! v assoc ::changed true)
+              (is (= :unstable-definition-proof-input
+                     (reason #(entry/observe-definition-input! v scope 'input))))
+              (is (identical? first-observation @owner))
+              (finally (reset-meta! v metadata))))
+          (with-redefs-fn {v (Object.)}
+            #(is (= :unstable-definition-proof-input
+                    (reason (fn [] (entry/observe-definition-input! v scope 'input))))))
+          (with-bindings {v (Object.)}
+            (is (= :unstable-definition-proof-input
+                   (reason #(entry/observe-definition-input! v scope 'input)))))
+          (is (identical? first-observation @owner))
+          (entry/observe-definition-input! v caller 'chosen/input)
+          (is (not (identical? first-observation @owner)))
+          (is (= 1 (count (:values @owner))))
+          (is (= #{[scope 'input] [caller 'chosen/input]}
+                 (get-in @owner [:definition-proofs v :lookups])))
+          (is (identical? (first (:values @owner)) (get-in @owner [:definition-proofs v])))
+          (let [with-alias @owner]
+            (entry/observe-definition-input! v caller 'chosen/input)
+            (is (identical? with-alias @owner)))
+          (is (entry/assert-definition-inputs-current! @owner))
+          (ns-unalias caller 'chosen)
+          (is (= :stale-definition-proof-input
+                 (reason #(entry/assert-definition-inputs-current! @owner))))))
+      (finally (remove-ns (ns-name caller)) (remove-ns (ns-name scope))))))
+
 (deftest emission-handoff-preserves-every-consulted-lookup-site
   (let [scope (create-ns (gensym "raster.proof-lookup."))
         inputs (atom {:static [] :values []})]

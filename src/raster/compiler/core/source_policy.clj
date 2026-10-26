@@ -3,7 +3,10 @@
    Recording this context does not attest how an existing bytecode method was emitted.")
 
 (defn valid? [policy]
-  (and (map? policy) (= #{:unchecked-math} (set (keys policy)))
+  (and (map? policy) (= 1 (count policy)) (contains? policy :unchecked-math)
+       ;; Comparator-backed maps may report a different stored key as matching.
+       ;; Require the actual entry key without constructing a key set.
+       (= :unchecked-math (key (find policy :unchecked-math)))
        (contains? #{false true :warn-on-boxed} (:unchecked-math policy))))
 
 (defn capture
