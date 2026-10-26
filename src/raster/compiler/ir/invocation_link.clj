@@ -875,7 +875,7 @@
     projection))
 
 (defn- ordered-source-completion?
-  "The planned backend implements bounded lexical numeric-entry/reference completions.
+  "The planned backend implements bounded lexical completions and numeric Object literals.
    Exact operand/source ownership is checked by its owner-local adapter, not this predicate."
   [step]
   (let [contract (:contract (completion/canonical-parts (:expression step)))
@@ -884,7 +884,9 @@
          (not= :source-integral-cast (:source-context contract))
          (or (= {:kind :opaque} result)
              (and (= :scalar (:kind result)) (contains? '#{float double long int} (:tag result))))
-         (= 1 (count (:operands step))))))
+         (or (= 1 (count (:operands step)))
+             (and (empty? (:operands step))
+                  (completion/numeric-object-literal-carrier (:expression step)))))))
 
 (defn- checked-import-source-order [state materialized]
   (let [plan (:plan materialized)

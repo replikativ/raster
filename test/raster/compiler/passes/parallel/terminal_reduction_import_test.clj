@@ -766,6 +766,58 @@
     {:frontend original :source-program semantic :plan plan :witness witness
      :steps (filterv invocation/source-completion? (:steps plan))}))
 
+(defn- witnessed-literal-completion-source [value]
+  (let [original (selected-frontend #'public-float-entry)
+        boxed (vary-meta (completion/complete-value completion/object-input-contract value)
+                         assoc :raster.effect/preserve-evaluation true)
+        unboxed (completion/complete-value (completion/bytecode-boxed-parameter-contract Float/TYPE) 'boxed)
+        source (list 'let* ['boxed boxed 'unboxed unboxed
+                           'out '(clojure.core/float-array 1)
+                           'written '(raster.par/map-void! i 1 (clojure.core/aset out i unboxed))] 'out)
+        options {:dtype :float :values {'value (av/tensor {:dtype :float :shape []})}
+                 :public-parameters '[value] :lexical-inputs '[value] :active-params '[value]
+                 :array-types {} :scalar-types {'value :float}
+                 :source-var (get-in original [:source-entry :source-var])
+                 :source-ns (get-in original [:source-entry :source-ns])
+                 :source-policy (get-in original [:source-entry :source-policy])}
+        numerical (:program (typed-route/attempt source :float {} options))
+        semantic (structured/promote-program numerical options)
+        plan (get-in semantic [:attributes :invocation-plan])
+        step (first (filter invocation/source-completion? (:steps plan)))
+        witness (entry/call-with-definition-inputs
+                 #(source-import/prepare-contextual-source-witness (:source semantic) options))]
+    {:frontend original :source-program semantic :plan plan :step step :witness witness}))
+
+(deftest witnessed-numeric-literal-completion-keeps-zero-ports-and-actual-object-carrier
+  (doseq [value [(float -0.0) (double -0.0) (int 17) (long 9007199254740993)
+                (byte -7) (short 257)]]
+    (let [{:keys [source-program plan step witness] :as request} (witnessed-literal-completion-source value)
+          adapter (completion-adapter request)
+          method ^java.lang.reflect.Method (get-in adapter [:region :method])
+          invoke (get-in adapter [:region :invoke])]
+      (is (= :literal (:input-kind adapter)))
+      (is (empty? (:operands step)))
+      (is (nil? (:input-port adapter)))
+      (is (empty? (.getParameterTypes method)))
+      (is (identical? Object (.getReturnType method)))
+      (is (= (class value) (class (invoke))))
+      (is (identical? value (invoke)) "Object literal identity belongs to its source owner")
+      (is (identical? adapter (source-import/validate-source-completion-step! adapter source-program plan step)))
+      (doseq [fake [(dissoc adapter :receipt)
+                    (assoc-in adapter [:region :invoke] (constantly value))
+                    (assoc adapter :input-port {:type :ref :reference-class Object})]]
+        (is (= :source-completion-step-correspondence
+               (reason #(source-import/validate-source-completion-step! fake source-program plan step)))))
+      (is (some? (reason #(completion-adapter (dissoc request :witness)))))
+      (is (some? (reason #(completion-adapter
+                          (assoc request :witness (assoc witness :scope (with-meta (:scope witness) {:copied true})))))))
+      (let [observe bytecode/retained-input-binding-context]
+        (is (= :source-completion-step-carrier
+               (with-redefs [bytecode/retained-input-binding-context
+                             (fn [& args] (assoc (apply observe args) :after
+                                                {:type :ref :reference-class Double :verified true}))]
+                 (reason #(completion-adapter request)))))))))
+
 (deftest witnessed-completion-adapters-use-current-float-object-ports-and-results
   (let [original (selected-frontend #'public-float-entry)
         {:keys [source-program plan witness steps] :as request} (witnessed-completion-source original false)

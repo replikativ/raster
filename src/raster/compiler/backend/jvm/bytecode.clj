@@ -7456,7 +7456,7 @@
     region))
 
 (defn ^:no-doc compile-planned-completion-region
-  "Compile a NEW bounded lexical completion under its construction owner.
+  "Compile a NEW bounded lexical or zero-port numeric Object completion under its owner.
    The trusted caller authenticates the actual operand port and observed carrier/
    context against current source. This compiler audits NEW code only; it claims
    no original occurrence, payload, transfer or runtime permission."
@@ -7464,6 +7464,7 @@
   (let [{:keys [contract operand]} (completion/canonical-parts expression)
         kind (:source-context contract)
         object? (= completion/object-input-contract contract)
+        literal-carrier (completion/numeric-object-literal-carrier expression)
         source? (= :source-floating-cast kind)
         entry? (and (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input
                                 :jvm-bytecode-boxed-parameter-input} kind)
@@ -7471,16 +7472,17 @@
         retained-context? (contains? #{:jvm-bytecode-floating-input :jvm-bytecode-integral-input} kind)
         boxed? (and (= :jvm-bytecode-boxed-parameter-input kind)
                     entry?)
-        raw (:type operand-port)
+        raw (or literal-carrier (:type operand-port))
         completed (:completion-carrier observed)
         declared (if object? :ref (some-> (completion/invocation-result-description contract) :tag name keyword))
         carrier (if (= :ref completed) Object (primitive-carrier-class completed))
         context (:operand-context observed)]
-    (when-not (and (completion/canonical-contract? contract) (symbol? operand)
+    (when-not (and (completion/canonical-contract? contract)
+                   (if literal-carrier (nil? operand-port) (symbol? operand))
                    (or object? entry?
                        (and source? (= 'float (completion/source-cast-result-tag contract))))
                    (contains? #{:float :double :long :int :ref} raw)
-                   (or (nil? (:locals-before observed))
+                   (or literal-carrier (nil? (:locals-before observed))
                        (= operand-port (get (:locals-before observed) operand)))
                    (or (not= :ref raw)
                        (contains? #{Object Float Double Long Integer} (:reference-class operand-port)))
@@ -7497,9 +7499,11 @@
                       {:reason :planned-completion-form})))
     (let [token (Object.)
           recipe (vary-meta expression assoc ::completion-occurrence token)
-          ;; This closed grammar has exactly one lexical operand and a canonical
-          ;; conversion. Unlike arbitrary source, it cannot contain sibling calls.
-          input {:ports {operand (assoc operand-port :slot 0)}
+          ;; The original literal remains in the new recipe. Object-context emission owns
+          ;; that exact literal reference in its existing identity pool; each invocation
+          ;; follows that source recipe, without a new runtime cache or lexical input.
+          ;; Neither bounded case can contain sibling calls or arbitrary closed expressions.
+          input {:ports (if literal-carrier {} {operand (assoc operand-port :slot 0)})
                  :unretained-sibling-calls? false}
           audit-keys (cond-> [:contract :input-carrier :completion-carrier :operand-context]
                        source? (conj :operand-source-policy)

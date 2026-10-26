@@ -310,6 +310,14 @@
   (let [parts (canonical-parts expression)]
     (when (= object-input-contract (:contract parts)) parts)))
 
+(defn numeric-object-literal-carrier
+  "Physical carrier of a direct primitive numeric literal in canonical Object input context.
+   No cast, closed expression, logical hint or arbitrary Number conversion is evaluated. This
+   recognizes a bounded source recipe, not execution or permission to replace its owned reference."
+  [expression]
+  (when-let [parts (object-input-parts expression)]
+    (types/numeric-literal-carrier (:operand parts))))
+
 (defn reference-input-parts
   "Recognize an explicit entry/Method reference CHECKCAST, without discharging it.
    The actual Class remains in the original contract. No declaration, storage

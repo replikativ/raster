@@ -48,6 +48,43 @@
        (catch clojure.lang.ExceptionInfo exception
          (:reason (ex-data exception)))))
 
+(deftest numeric-object-literals-remain-zero-operand-ordered-source-completions
+  (let [opaque (av/make {:kind :opaque :memory-space :host :ownership :borrowed})
+        options (fn [expression]
+                  {:id :literal-boxing :parameters [] :parameter-values {}
+                   :bindings [['boxed expression] ['saved 'boxed]]
+                   :binding-values {'boxed opaque 'saved opaque}
+                   :program-values {} :program-inputs [] :program-outputs []})]
+    (doseq [value [(float -0.0) (double -0.0) (int 17) (long 9007199254740993)]]
+      (let [expression (completion/complete-value completion/object-input-contract value)
+            plan (invocation/from-prefix (options expression))
+            step (first (:steps plan))
+            calls (atom 0)
+            initial (materialization/begin-materialization plan [])
+            advanced (materialization/materialize-next
+                      initial {:source-completion
+                               (fn [actual operands]
+                                 (is (identical? step actual))
+                                 (is (empty? operands))
+                                 (swap! calls inc)
+                                 value)})
+            aliased (materialization/materialize-next
+                     advanced (fn [& _] (throw (AssertionError. "saved box reevaluated"))))]
+        (is (invocation/source-completion? step))
+        (is (empty? (:operands step)))
+        (is (identical? expression (:expression step)))
+        (is (= :opaque (get-in step [:value :kind])))
+        (is (zero? (:next-step initial)))
+        (is (= 1 @calls))
+        (is (identical? value (get-in advanced [:values (:id step) :source])))
+        (is (identical? (get-in advanced [:values (:id step)])
+                        (get-in aliased [:values (:id (second (:steps plan)))])))))
+    (doseq [expression ['(+ 0.0 1.0) '(do 0.0) '(clojure.core/float 0.0)
+                        '(clojure.core/aget buffer 0) 1N 1M 1/2 "not numeric"]]
+      (let [node (completion/complete-value completion/object-input-contract expression)]
+        (is (nil? (completion/numeric-object-literal-carrier node)))
+        (is (some? (reason-of #(invocation/from-prefix (options node)))))))))
+
 (defn- result-import-fixture []
   (let [snapshot (completion/complete-value completion/object-input-contract 'total)
         reduction '(numerical/reduce xs)

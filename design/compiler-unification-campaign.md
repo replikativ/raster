@@ -34,8 +34,10 @@ reconstruction and cross-equality cycles before landing; final review found no
 remaining blockers. Exact parameter leaves, same-body ABI closure, width checks,
 runtime equality checks and original-plan rederivation remain separate checks.
 SWR, unsupported producer algebra and unavailable dependencies gain no proof.
-The wider clean-process C-family gate is still running at this checkpoint; these
-warm counts are not a claim that the branch or full campaign is green.
+The wider capped clean-process gate also passes: 135 tests / 1,972 assertions,
+covering the complete current scheduled-graph, map-read and C-family suites.
+This is still affected-suite qualification, not a claim that the branch or
+full campaign is green.
 
 A warm single-target GQA compile measured 5,978 ms, with 33 InvocationPlan
 correspondence checks totaling 52 ms. This is one diagnostic measurement under
@@ -44,6 +46,35 @@ persistent proof caching. The long-lived REPL was retired after selective
 function reload changed a sealing-factory closure class without refreshing its
 class constant; clean-process qualification must distinguish that development
 lifecycle issue from a production validation failure.
+
+The bounded literal-completion continuation uses the existing physical numeric
+literal carrier authority, not evaluation of closed expressions. Canonical Object
+completions may have zero operands only for these direct literals. The source
+adapter, outlined bytecode, executor coverage and owned runtime all agree on that
+grammar. Original literal references (including Byte/Short) retain the JVM
+emitter's artifact-owned identity pool; fresh boxes are not a source guarantee.
+One-port source completions and saved-alias identity remain unchanged.
+
+A new capped process ran the affected completion suites plus public RMSNorm:
+66 tests / 1,445 passing assertions, zero failures and two errors in the two
+public RMSNorm tests. The completion-only suites passed. One error exposed a
+remaining one-operand executor-coverage gate, now corrected and covered by the
+existing runtime test (1 test / 15 assertions). The public driver-free lowering
+and independent analytic gradient/replay/lifetime checks then pass warm on both
+local backends (2 tests / 32 assertions). These warm results do not qualify the
+cold first-call lifecycle.
+
+An isolated fresh-process probe confirms that lifecycle failure: the loss
+receiver promotes once, stays identical on subsequent observations, then the
+gradient receiver promotes once after the outer source owner already observed
+its pending implementation. Its historical fence correctly refuses the old
+observation; earlier discovery work exhausted the generic retry budget before
+that late prerequisite. Do not increase retries, warm arbitrary functions,
+restamp old receipts or weaken the fence. The next bundle must discover exact
+physical-source demand before target scheduling/emission, close the required
+original source/actual descendants under independent readiness ownership, and
+start a fresh semantic/target owner. Source-only programs must not gain JVM
+preparation. Deferred composition and all original campaign obligations remain.
 
 The October 25 independent review keeps all eight original campaign objectives.
 The numerical IR is compositional; the source-execution and public ownership

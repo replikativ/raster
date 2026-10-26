@@ -12,6 +12,7 @@
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.passes.parallel.structured-control-route :as structured]
@@ -61,6 +62,49 @@
                (reason #(link/instantiate-ordered-invocation!
                          (dissoc compilation :program-result-import-adapters) [] {})))))
       (is (zero? @sessions)))))
+
+(deftest zero-port-literal-completion-executes-only-under-its-current-owned-boundary
+  (let [{:keys [source-program plan step] :as request}
+        (#'completion-fixture/witnessed-literal-completion-source (double -0.0))
+        adapter (#'completion-fixture/completion-adapter request)
+        source-state {:materialization (materialization/begin-materialization plan [(float 1.0)])}
+        state (atom {:value-epoch 0
+                     :ordered {:current source-state
+                               :compilation {:semantic source-program
+                                             :source-completion-adapters {(:id step) adapter}}}})
+        owner (cleanup/owner [])
+        ;; No device/session is needed for a host Object completion. Use a real empty cleanup
+        ;; owner so current-owner checks remain active, rather than mocking liveness/admission.
+        executable (assoc (link/map->LinkedExecutable {:closed? (atom false) :execution-state state})
+                          ::cleanup/owner owner)
+        invoke #(#'link/execute-ordered-source-completion executable source-state step %)]
+    (try
+      (is (#'invocation-link/ordered-source-completion? step)
+          "structural executor coverage includes the actual zero-port literal adapter")
+      (doseq [operand ['(do 0.0) '(+ 0.0 1.0) '(aget buffer 0) 1M]]
+        (is (not (#'invocation-link/ordered-source-completion?
+                  (assoc step :expression
+                         (completion/complete-value completion/object-input-contract operand))))
+            "zero free variables do not grant general host-expression execution"))
+      (let [left (invoke {}) right (invoke {})]
+        (is (instance? Double left))
+        (is (= (Double/doubleToRawLongBits (double -0.0)) (Double/doubleToRawLongBits left)))
+        (is (identical? (:operand (completion/canonical-parts (:expression step))) left)
+            "the executor follows the compiler-owned original Object literal reference")
+        (is (identical? left right) "the source literal pool preserves identity across invocations")
+        (is (identical? source-state (get-in @state [:ordered :current])))
+        (is (zero? (get-in source-state [:materialization :next-step]))
+            "the executor alone does not advance its owning source cursor"))
+      (is (= :link-ordered-source-completion-input (reason #(invoke {'fake (Object.)}))))
+      (let [calls (atom 0)
+            fake (assoc-in adapter [:region :invoke] #(do (swap! calls inc) (double 7.0)))]
+        (swap! state assoc-in [:ordered :compilation :source-completion-adapters (:id step)] fake)
+        (is (= :source-completion-step-correspondence (reason #(invoke {}))))
+        (is (zero? @calls)))
+      (swap! state assoc-in [:ordered :compilation :source-completion-adapters (:id step)] adapter)
+      (swap! state assoc-in [:ordered :current] (with-meta source-state {:copied true}))
+      (is (= :link-ordered-source-completion-epoch (reason #(invoke {}))))
+      (finally (cleanup/release! owner)))))
 
 (deftest overlapping-writes-retire-only-uncaptured-resident-result-readiness
   (let [allocation (view/allocation {:id :storage :byte-size 16 :device :ocl:0

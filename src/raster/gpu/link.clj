@@ -1477,9 +1477,13 @@
                               {:reason :link-ordered-source-completion-epoch}))))
           (validate! adapter (:semantic compilation) plan step))]
     (assert-current!)
-    (let [{:keys [symbol value]} (first (:operands step))
+    (let [literal? (= :literal (:input-kind adapter))
+          {:keys [symbol value]} (first (:operands step))
           operand (get operands symbol)]
-      (when-not (and (= 1 (count (:operands step))) (= 1 (count operands))
+      (when-not (if literal?
+                  (and (empty? (:operands step)) (empty? operands)
+                       (completion/numeric-object-literal-carrier (:expression step)))
+                  (and (= 1 (count (:operands step))) (= 1 (count operands))
                      (case (:input-kind adapter)
                        :opaque (materialization/materialized-opaque? operand)
                        :scalar (and (map? operand) (= (:input-dtype adapter) (:type operand))
@@ -1488,12 +1492,14 @@
                        false)
                      ;; ValueAlias intentionally retains the original opaque wrapper.
                      ;; Check the exact current slot, not a newly fabricated alias ID.
-                     (identical? operand
-                                 (get-in source-state [:materialization :values value])))
+                       (identical? operand
+                                   (get-in source-state [:materialization :values value]))))
         (throw (ex-info "planned source completion requires its exact current physical operand"
                         {:reason :link-ordered-source-completion-input})))
-      (let [input (case (:input-kind adapter) :opaque (:source operand) :scalar (:value operand))
-            result ((get-in adapter [:region :invoke]) input)]
+      (let [result (if literal?
+                     ((get-in adapter [:region :invoke]))
+                     (let [input (case (:input-kind adapter) :opaque (:source operand) :scalar (:value operand))]
+                       ((get-in adapter [:region :invoke]) input)))]
         (assert-current!)
         (case (:result-kind adapter)
           :opaque result

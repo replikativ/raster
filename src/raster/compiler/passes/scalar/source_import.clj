@@ -196,11 +196,14 @@
         operands (:operands step)
         input (first operands)
         input-value (get-in plan [:values (:value input)])
+        literal-carrier (completion/numeric-object-literal-carrier expression)
         scalar-value? #(and (= :tensor (:kind %)) (contains? #{:float :double :long :int} (:dtype %))
                             (= [] (:shape %)))
         opaque-value? #(and (= :opaque (:kind %)) (= [] (:shape %)))
-        input-kind (cond (scalar-value? input-value) :scalar (opaque-value? input-value) :opaque)
-        input-dtype (when (= :scalar input-kind) (:dtype input-value))
+        input-kind (cond literal-carrier :literal
+                         (scalar-value? input-value) :scalar (opaque-value? input-value) :opaque)
+        input-dtype (if literal-carrier literal-carrier
+                        (when (= :scalar input-kind) (:dtype input-value)))
         result-kind (:kind result-description)
         result-dtype (some-> (:tag result-description) dtype/dtype-for-scalar-tag)
         entries (filterv #(= (:id step) (:invocation-step %)) order)]
@@ -214,13 +217,14 @@
                    (not= :source-integral-cast (:source-context contract))
                    (or (and (= :scalar result-kind) (contains? #{:float :double :long :int} result-dtype))
                        (= {:kind :opaque} result-description))
-                   (symbol? operand) (= 1 (count operands))
-                   (identical? operand (:symbol input))
+                   (or (and literal-carrier (empty? operands))
+                       (and (symbol? operand) (= 1 (count operands))
+                            (identical? operand (:symbol input))))
                    input-kind
                    (if (= :opaque result-kind) (opaque-value? (:value step))
                        (and (scalar-value? (:value step)) (= result-dtype (get-in step [:value :dtype])))))
       (fail! :source-completion-step-source
-             "completion requires its exact bounded numeric-entry/source-Float binding over one lexical value" {}))
+             "completion requires its exact bounded lexical binding or numeric Object literal" {}))
     {:source-position position :binder binder :expression expression
      :operand operand :operand-id (:value input) :input-kind input-kind :result-kind result-kind
      :input-dtype input-dtype :result-dtype result-dtype}))
@@ -278,16 +282,23 @@
                       ((requiring-resolve
                         'raster.compiler.backend.jvm.bytecode/retained-input-completion-context)
                        (:emission witness) (:input-body witness) (:expression binding)))
-           port (when current (get (:before current) (:operand binding)))
+           literal? (= :literal (:input-kind binding))
+           port (when (and current (not literal?)) (get (:before current) (:operand binding)))
            _ (if witness
                (when-not (and observed
                               (identical? (:expression binding) (:source-input observed))
                               (= (:contract (completion/canonical-parts (:expression binding))) (:contract observed))
-                              (= port (get (:locals-before observed) (:operand binding)))
-                              (if (= :scalar (:input-kind binding))
-                                (= (:input-dtype binding) (:type port))
-                                (and (= :ref (:type port))
-                                     (contains? #{Object Float Double Long Integer} (:reference-class port))))
+                              (if literal?
+                                (and (nil? port)
+                                     (= (:input-dtype binding)
+                                        (completion/numeric-object-literal-carrier (:expression binding)))
+                                     (= :ref (:input-carrier observed) (:completion-carrier observed)))
+                                (and (= port (get (:locals-before observed) (:operand binding)))
+                                     (if (= :scalar (:input-kind binding))
+                                       (= (:input-dtype binding) (:type port))
+                                       (and (= :ref (:type port))
+                                            (contains? #{Object Float Double Long Integer}
+                                                       (:reference-class port))))))
                               (if (= :opaque (:result-kind binding))
                                 (and (= :ref (get-in current [:after :type]))
                                      (identical? Object (get-in current [:after :reference-class])))

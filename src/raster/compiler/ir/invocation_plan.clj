@@ -345,7 +345,9 @@
                          :opaque (= value (av/make {:kind :opaque :memory-space :host :ownership :borrowed}))
                          :scalar (and (scalar-value? value) expected
                                       (= expected (dtype/canon (:dtype value)))))
-                       (or (completion/source-cast-result-tag contract) (symbol? operand))
+                       (or (completion/source-cast-result-tag contract) (symbol? operand)
+                           (and (empty? operand-values)
+                                (completion/numeric-object-literal-carrier (:expression step))))
                        (every? (fn [id]
                                  (let [input (get values id)]
                                    (or (scalar-value? input) (opaque-value? input)))) operand-values)

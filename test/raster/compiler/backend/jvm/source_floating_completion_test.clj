@@ -208,6 +208,54 @@
                  emission expression port (assoc observed :adaptation :identity) policy (fn [])) nil
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
 
+(defn- actual-literal-completion [value]
+  (let [expression (completion/complete-value completion/object-input-contract value)
+        body [expression]
+        interface (types/ensure-fn-interface! [])
+        emitted (binding [*unchecked-math* false]
+                  (core/emit-owned-bytecode!
+                   bytecode/compile-typed-impl! "raster.compiled.PlannedLiteralCompletion"
+                   [] [] 'Object body *ns* (:iface-name interface) 'planned-literal-completion-source))]
+    {:emission (:emission emitted) :expression expression :original (:implementation emitted)
+     :observed (bytecode/retained-input-completion-context (:emission emitted) body expression)
+     :policy {:unchecked-math false}}))
+
+(deftest planned-literal-completion-emits-zero-ports-with-original-numeric-width
+  (doseq [value [(float -0.0) (double -0.0) (int -17) (long 9007199254740993)
+                (byte -7) (short 257)]]
+    (let [{:keys [emission expression observed policy original]} (actual-literal-completion value)
+          stale? (atom false)
+          guard #(when @stale? (throw (ex-info "literal owner retired" {:reason :literal-owner-retired})))
+          region (bytecode/compile-planned-completion-region emission expression nil observed policy guard)
+          method ^java.lang.reflect.Method (:method region)]
+      (is (empty? (.getParameterTypes method)))
+      (is (empty? (:physical-ports region)))
+      (is (identical? Object (.getReturnType method)))
+      (is (identical? value (original)) "the original owned emission retains the source literal")
+      (dotimes [_ 2]
+        (let [result ((:invoke region))]
+          (is (identical? (original) result)
+              "the planned recipe uses the same owned literal reference as the original emission")
+          (is (= (class value) (class result)))
+          (cond
+            (instance? Float value)
+            (is (= (Float/floatToRawIntBits value) (Float/floatToRawIntBits result)))
+            (instance? Double value)
+            (is (= (Double/doubleToRawLongBits value) (Double/doubleToRawLongBits result)))
+            :else (is (= value result)))))
+      (doseq [[node port observation]
+              [[expression {:type :double} observed]
+               [expression nil (assoc observed :input-carrier :double)]
+               [expression nil (assoc observed :completion-carrier :double)]
+               [(completion/complete-value completion/object-input-contract '(do 0.0)) nil observed]]]
+        (is (= :planned-completion-form
+               (try (bytecode/compile-planned-completion-region emission node port observation policy (fn []))
+                    nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+      (reset! stale? true)
+      (is (= :literal-owner-retired
+             (try ((:invoke region)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
 (deftest planned-result-snapshots-retain-primitive-payload-and-exact-return-recipe
   (let [{:keys [emission]} (fixture 'Object :float false false 'value)
         context (completion/bytecode-operand-context {:object-result? true})
