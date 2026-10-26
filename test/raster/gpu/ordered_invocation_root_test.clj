@@ -6,10 +6,12 @@
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as ze-probe]
             [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.device-probe :as ocl-probe]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.program-memory-order-test :as dense-fixture]
+            [raster.gpu.value :as value]
             [raster.math :as math]
             [raster.par :as par]))
 
@@ -316,6 +318,171 @@
       (is (true? (:closed? @@session)))
       (is (empty? (:buffers @@session)) "captured entry roots are released by the same owner")
       (is (nil? @escaped) "no executable or completed output boundary escapes failed capture"))))
+
+(defn- check-resident-input-handoff! [target]
+  (let [compilation (equation-first/compile #'source-zero-observed {:target target :dtype :double})
+        host (double-array [Double/NaN])
+        executable (link/instantiate-ordered-invocation! compilation [host (double-array 1) 3] {})
+        initial-initialized (get-in @(:execution-state executable) [:ordered :initialized])
+        resident (value/->device (double-array [19.0]) target)
+        wrong-dtype (value/->device (float-array [19.0]) target)
+        wrong-shape (value/->device (double-array [1.0 2.0]) target)
+        dead (value/->device (double-array [19.0]) target)
+        copies (atom 0) uploads (atom 0) retirements (atom 0)
+        copy! gpu/copy-range! upload! gpu/upload-range!]
+    (value/free! dead)
+    (try
+      (with-redefs [gpu/copy-range! (fn [& args] (swap! copies inc) (apply copy! args))
+                    gpu/upload-range! (fn [session destination source options]
+                                        (when (identical? host source) (swap! uploads inc))
+                                        (upload! session destination source options))]
+        (doseq [[source expected] [[wrong-dtype :link-device-input-contract]
+                                   [wrong-shape :link-device-input-contract]
+                                   [dead :link-device-input-lifetime]
+                                   [(assoc resident :device :foreign:0) :link-device-input-target]]]
+          (is (= expected (reason #(link/run-ordered-with-inputs!
+                                   executable {'x source} (fn [] (swap! retirements inc)))))))
+        (is (zero? @retirements))
+        (is (zero? @copies))
+        (is (zero? @(:completed-replays executable)))
+        (is (= initial-initialized (get-in @(:execution-state executable) [:ordered :initialized])))
+        (link/run-ordered-with-inputs! executable {'x resident} #(swap! retirements inc))
+        (let [state @(:execution-state executable)
+              token (get-in state [:ordered :current :realized :buffers 'x])
+              early (get-in state [:ordered :current :realized :buffers 'early])
+              output (first (keys (link/outputs executable)))
+              epoch (:value-epoch state)]
+          (is (= [20.0] (vec (link/download executable early))))
+          (is (= [1.0 1.0 1.0] (vec (link/download executable output))))
+          (is (= 1 @copies) "one resident copy covers the entire multistage replay")
+          (is (zero? @uploads) "poisoned host defaults never overwrite resident input")
+          (is (contains? (get-in state [:ordered :current :acquired-storage]) token))
+          (is (nil? (get-in state [:ordered :pending-input-handoff])))
+          (is (= :link-ordered-input-handoff-required (reason #(link/run! executable))))
+          (is (= epoch (:value-epoch @(:execution-state executable))))
+          (is (= 1 @(:completed-replays executable)))
+          (is (true? @(:output-ready? executable)))
+          (link/run-ordered-with-inputs! executable {'x (double-array [27.0])} nil)
+          (is (= [28.0] (vec (link/download executable early))))
+          (is (= 1 @copies) "a new explicit host handoff uses ordinary host refresh")
+          (link/run! executable)
+          (is (= [28.0] (vec (link/download executable early))))
+          (is (= 3 @(:completed-replays executable)))
+          (is (= 1 @copies) "plain replay after a host handoff cannot reuse a resident receipt")))
+      (finally
+        (doseq [source [resident wrong-dtype wrong-shape]] (value/free! source))
+        (link/close! executable))))
+  (let [compilation (equation-first/compile #'source-zero-observed {:target target :dtype :double})
+        executable (link/instantiate-ordered-invocation!
+                    compilation [(double-array [0.0]) (double-array 1) 3] {})
+        resident (value/->device (double-array [19.0]) target)
+        failure (ex-info "injected resident input copy failure" {:reason :test-resident-copy})]
+    (try
+      (with-redefs [gpu/copy-range! (fn [& _] (throw failure))]
+        (is (identical? failure
+                        (try (link/run-ordered-with-inputs! executable {'x resident} nil)
+                             nil (catch Throwable error error)))))
+      (is (zero? @(:completed-replays executable)))
+      (is (false? @(:output-ready? executable)))
+      (is (= 1 (count (get-in @(:execution-state executable) [:ordered :initialized])))
+          "source-free input allocation and failed copy do not initialize the new root")
+      (is (nil? (get-in @(:execution-state executable) [:ordered :pending-input-handoff])))
+      (is (= :link-execution-poisoned (reason #(link/run! executable))))
+      (finally (value/free! resident) (link/close! executable)))))
+
+(defn- check-resident-input-batch-preflight! [target]
+  (let [compilation (equation-first/compile #'captured-entry-replay {:target target :dtype :double})
+        executable (link/instantiate-ordered-invocation!
+                    compilation [(double-array [3.0]) (double-array [4.0]) (double-array 1) (double-array 1)] {})
+        foreign (value/->device (double-array [10.0]) target)
+        bad (value/->device (float-array [20.0]) target)
+        borrowed (atom [])
+        copies (atom 0) retirements (atom 0) copy! gpu/copy-range!]
+    (try
+      (link/run! executable)
+      (let [current (get-in @(:execution-state executable) [:ordered :current])
+            resident-input
+            (fn [id]
+              (let [token (get-in current [:realized :buffers id])
+                    resident (get-in @(:execution-state executable) [:ordered :node-views token])
+                    wrapper (value/wrap-external-view
+                             (gpu/buffer (:session executable) (:key resident)) target (:view resident))]
+                (swap! borrowed conj wrapper) wrapper))
+            x (resident-input 'x) weights (resident-input 'weights)
+            before @(:execution-state executable)]
+        (with-redefs [gpu/copy-range! (fn [& args] (swap! copies inc) (apply copy! args))]
+          (doseq [[replacements expected]
+                  [[{'x foreign 'weights bad} :link-device-input-contract]
+                   [{'x weights 'weights x} :link-input-transfer-overlap]
+                   [{'x weights 'weights (double-array [99.0])} :link-input-transfer-overlap]]]
+            (is (= expected
+                   (reason #(link/run-ordered-with-inputs!
+                             executable replacements (fn [] (swap! retirements inc)))))))
+          (is (zero? @copies))
+          (is (zero? @retirements))
+          (is (= (:value-epoch before) (:value-epoch @(:execution-state executable))))
+          (is (= 1 @(:completed-replays executable)))
+          (link/run-ordered-with-inputs! executable {'x x 'weights weights} nil)
+          (is (zero? @copies) "exact resident input views use no-op refresh, not host defaults")
+          (is (= [7.0] (vec (link/download executable (first (keys (link/outputs executable)))))))
+          (let [epoch (:value-epoch @(:execution-state executable))]
+            (is (= :link-ordered-input-reentrancy
+                   (reason #(link/run-ordered-with-inputs!
+                             executable {'x foreign 'weights weights}
+                             (fn [] (#'link/begin-mutation! executable))))))
+            (is (= (inc epoch) (:value-epoch @(:execution-state executable))))
+            (is (zero? @copies))
+            (is (= 2 @(:completed-replays executable)))
+            (is (nil? (get-in @(:execution-state executable) [:ordered :pending-input-handoff])))
+            (is (= :link-execution-poisoned (reason #(link/run! executable)))))))
+      (finally
+        (doseq [source (concat @borrowed [foreign bad])] (value/free! source))
+        (link/close! executable)))))
+
+(defn- check-compiled-resident-output-feedback! [target]
+  (let [prepared (compiled/lower #'source-zero-observed
+                                 [(double-array [7.0]) (double-array 1) 1]
+                                 {:target target :dtype :double :compiler :equation-first})
+        artifact (compiled/instantiate! prepared)
+        executable (:executable artifact)
+        foreign (value/->device (double-array [9.0]) target)
+        early-value (fn []
+                      (let [id (get-in @(:execution-state executable)
+                                       [:ordered :current :realized :buffers 'early])]
+                        (vec (link/download executable id))))]
+    (try
+      (let [first-output (first (vals (artifact {})))
+            alias (value/alias-of first-output)
+            next-output (first (vals (artifact {:x alias})))]
+        (is (= [2.0] (early-value)) "feedback reads the previous device output, not host x=7")
+        (is (false? (value/live? first-output)))
+        (is (false? (value/live? alias)))
+        (is (true? (value/live? next-output)))
+        (is (= :link-device-input-lifetime (reason #(artifact {:x first-output}))))
+        (is (true? (value/live? next-output)) "invalid old feedback does not retire current outputs")
+        (let [forged (assoc (value/alias-of next-output)
+                            :buffer (:buffer foreign) :view (:view foreign))]
+          (try
+            (is (= :compiled-ordered-input-owner (reason #(artifact {:x forged}))))
+            (is (true? (value/live? foreign)))
+            (is (true? (value/live? next-output)))
+            (finally (value/free! forged))))
+        (artifact {})
+        (is (= [8.0] (early-value)) "omitted input makes a NEW host-default handoff")
+        (value/free! alias))
+      (finally (value/free! foreign) (compiled/close! artifact)))))
+
+(deftest opencl-ordered-resident-inputs-use-one-checked-device-handoff
+  (if @ocl-probe/opencl-available?
+    (do (check-resident-input-handoff! :ocl:0) (check-resident-input-batch-preflight! :ocl:0)
+        (check-compiled-resident-output-feedback! :ocl:0))
+    (ocl-probe/opencl-skip! "ordered resident input handoff")))
+
+(deftest level-zero-ordered-resident-inputs-use-one-checked-device-handoff
+  (if @ze-probe/gpu-available?
+    (do (check-resident-input-handoff! :ze:0) (check-resident-input-batch-preflight! :ze:0)
+        (check-compiled-resident-output-feedback! :ze:0))
+    (ze-probe/gpu-skip! "ordered resident input handoff")))
 
 (deftest opencl-owned-root-obeys-source-order-and-replay
   (if @ocl-probe/opencl-available?

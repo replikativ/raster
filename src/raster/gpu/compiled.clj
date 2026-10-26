@@ -1811,6 +1811,24 @@
        (or (some #(identical? % value) previous)
            (when-let [base (:base value)] (retiring-value-root? previous base)))))
 
+(defn- borrow-retiring-read
+  "Borrow only an actual live subrange of this Compiled owner's current output tree."
+  [previous source]
+  (when-not (v/live? source)
+    (throw (ex-info "cannot hand off a retired output value" {:reason :link-device-input-lifetime})))
+  (loop [current source]
+    (when-not (v/live? current)
+      (throw (ex-info "output alias lost its live owner" {:reason :link-device-input-lifetime})))
+    (if (some #(identical? current %) previous)
+      (v/wrap-external-view (:buffer source) (:device source) (:view source))
+      (let [base (:base current)]
+        (when-not (and base (identical? (:buffer current) (:buffer base))
+                       (= (:device current) (:device base))
+                       (bview/covered-contiguous? (:view current) [(:view base)]))
+          (throw (ex-info "output alias does not retain its actual owner range"
+                          {:reason :compiled-ordered-input-owner})))
+        (recur base)))))
+
 (defn- write-invocation-inputs!
   "Retire public output aliases before mutation, but retain private borrowed reads when a caller
    feeds a previous output back as an input. The executable lifetime lock and completed preflight
@@ -1853,8 +1871,16 @@
       (throw (ex-info "only dynamic input keys may be replaced; constants and state are captured"
                       {:reason :compiled-ordered-input-role :inputs input-keys :supplied (set (keys inputs))})))
     ;; Resolve EVERY omitted input from Prepared's original default, not the last replacement.
-    (let [replacements (into {} (map (fn [{:keys [key value default]}]
-                                       [value (get inputs key default)])) input-nodes)]
+    (let [borrowed (atom [])
+          previous (when-let [outputs (:live-outputs c)] @outputs)
+          failure (volatile! nil)]
+     (try
+      (let [replacements (into {} (map (fn [{:keys [key value default]}]
+                                         (let [source (get inputs key default)]
+                                           [value (if (retiring-value-root? previous source)
+                                                    (let [read (borrow-retiring-read previous source)]
+                                                      (swap! borrowed conj read) read)
+                                                    source)]))) input-nodes)]
       (observation/phase :replay-host
         (gpu-link/run-ordered-with-inputs! executable replacements #(invalidate-live-outputs! c)))
       (observation/phase :output-projection
@@ -1868,7 +1894,17 @@
                                               buffer (gpu/buffer (:session executable) (:key resident))]
                                           [key (v/wrap-external-view buffer target (:view resident))]))) out-tree)]
             (reset! (:live-outputs c) (vec (vals outputs)))
-            outputs))))))
+            outputs))))
+      (catch Throwable error (vreset! failure error) (throw error))
+      (finally
+        (let [cleanup-error (volatile! nil)]
+          (doseq [read @borrowed]
+            (try (v/free! read)
+                 (catch Throwable error
+                   (if-let [primary (or @failure @cleanup-error)]
+                     (when-not (identical? primary error) (.addSuppressed ^Throwable primary error))
+                     (vreset! cleanup-error error)))))
+          (when (and (nil? @failure) @cleanup-error) (throw @cleanup-error))))))))
 
 (defn- invoke-compiled-unleased*
   "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.

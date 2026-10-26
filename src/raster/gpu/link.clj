@@ -28,10 +28,12 @@
             [raster.gpu.measurement :as measurement]
             [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.resident-value :as resident-value]
+            [raster.gpu.runtime-backend :as runtime-backend]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.value :as value]))
 
-(declare close! run! run-ordered-invocation! capture-ordered-entries!)
+(declare close! run! run-ordered-invocation! capture-ordered-entries!
+         prepare-ordered-input-handoff apply-ordered-resident-inputs!)
 
 (defrecord LinkedExecutable
            [plan session owns-session? graph-key phases prepared-program allocation-keys node-views
@@ -1111,6 +1113,15 @@
     (locking (:lifetime-lock executable)
       (ensure-live! executable :run!)
       (ensure-no-output-leases! executable :run!)
+      (let [{:keys [resident-input-handoff-required? pending-input-handoff]}
+            (:ordered @(:execution-state executable))]
+        (when (or (and resident-input-handoff-required? (nil? pending-input-handoff))
+                  (and pending-input-handoff
+                       (or @(:consumed? pending-input-handoff)
+                           (not= (:epoch pending-input-handoff)
+                                 (:value-epoch @(:execution-state executable))))))
+          (throw (ex-info "ordered resident inputs require a fresh complete input handoff"
+                          {:reason :link-ordered-input-handoff-required}))))
       (when (seq @(:pending-inputs executable))
         (throw (ex-info "linked executable has owned inputs or state that have not been initialized"
                         {:reason :link-pending-inputs :plan (get-in executable [:plan :id])
@@ -1622,20 +1633,31 @@
 
 (defn- run-ordered-invocation! [executable]
   (let [execution-state (:execution-state executable)
-        {:keys [compilation parameter-arguments caller-options prepared entry-roles entry-refresh initialized]}
+        {:keys [compilation parameter-arguments caller-options prepared entry-roles entry-refresh initialized
+                pending-input-handoff]}
         (:ordered @execution-state)]
     (when (seq prepared)
       (throw (ex-info "ordered invocation still owns an unfinished prepared stage"
                       {:reason :link-ordered-prepared-stage})))
-    (let [initial (assoc (invocation-link/begin-ordered-parameter-realization
-                         compilation parameter-arguments caller-options)
+    (when pending-input-handoff
+      (when (or @(:consumed? pending-input-handoff)
+                (not (identical? pending-input-handoff
+                                 (get-in @execution-state [:ordered :pending-input-handoff]))))
+        (throw (ex-info "ordered input handoff is no longer owned by this replay"
+                        {:reason :link-ordered-input-handoff-owner})))
+      (vreset! (:consumed? pending-input-handoff) true))
+    (let [initial (assoc (or (:initial pending-input-handoff)
+                            (invocation-link/begin-ordered-parameter-realization
+                             compilation parameter-arguments caller-options))
                          :entry-roles entry-roles :entry-refresh entry-refresh)
           captured (into #{} (keep (fn [[id role]] (when (not= :input role) id))) entry-refresh)
           initialized (vec (distinct (filter #(contains? captured (get-in % [:allocation :id]))
                                              initialized)))]
       (swap! execution-state update :ordered assoc :current initial :initialized initialized
              :import-replay (Object.) :completed-results {})
-      (loop [state initial]
+      (loop [state (if pending-input-handoff
+                     (apply-ordered-resident-inputs! executable pending-input-handoff initial)
+                     initial)]
         (swap! execution-state assoc-in [:ordered :current] state)
         (if-let [entry (nth (:source-order state) (:source-cursor state) nil)]
           (let [stage (get (:equation-spans state) (:source-cursor state))
@@ -1664,7 +1686,7 @@
           (finish-ordered-invocation! executable state))))))
 
 (defn ^:no-doc run-ordered-with-inputs!
-  "Internal host-array handoff under the existing execution guard. Complete preflight precedes
+  "Internal host/resident handoff under the existing execution guard. Complete preflight precedes
    wrapper retirement or argument mutation; the source executor performs uploads in order.
    before-mutation! is an owner-local output-wrapper retirement callback, not proof authority."
   [executable replacements before-mutation!]
@@ -1672,7 +1694,7 @@
    executable :run-ordered-with-inputs!
    (fn []
      (let [execution-state (:execution-state executable)
-           {:keys [compilation arguments parameter-defaults parameter-arguments caller-options entry-roles]
+           {:keys [arguments parameter-arguments]
             :as ordered}
            (:ordered @execution-state)]
        (when-not ordered
@@ -1681,21 +1703,55 @@
        (when-not (or (nil? before-mutation!) (ifn? before-mutation!))
          (throw (ex-info "ordered handoff callback must be callable"
                          {:reason :link-ordered-input-callback})))
+       (when (:pending-input-handoff ordered)
+         (throw (ex-info "ordered input owner already has a pending handoff"
+                         {:reason :link-ordered-input-handoff-owner})))
        (let [epoch (:value-epoch @execution-state)
-             initial (invocation-link/begin-ordered-parameter-realization
-                      compilation parameter-defaults caller-options)
-             checked (invocation-link/ordered-input-arguments initial parameter-defaults entry-roles replacements)]
-         (when before-mutation! (before-mutation!))
-         (ensure-live! executable :run-ordered-with-inputs!)
-         (ensure-no-output-leases! executable :run-ordered-with-inputs!)
-         (when-not (and (= epoch (:value-epoch @execution-state))
-                        (identical? arguments (get-in @execution-state [:ordered :arguments]))
-                        (identical? parameter-arguments
-                                    (get-in @execution-state [:ordered :parameter-arguments])))
-           (throw (ex-info "ordered input preflight was invalidated by reentrant owner activity"
-                           {:reason :link-ordered-input-reentrancy})))
-         (swap! execution-state assoc-in [:ordered :parameter-arguments] checked)
-         (run! executable))))))
+             packet (prepare-ordered-input-handoff executable replacements)
+             crossed? (volatile! false)]
+         (try
+           (when before-mutation!
+             (vreset! crossed? true)
+             (before-mutation!))
+           (ensure-live! executable :run-ordered-with-inputs!)
+           (ensure-no-output-leases! executable :run-ordered-with-inputs!)
+           (when-not (and (= epoch (:value-epoch @execution-state))
+                          (identical? arguments (get-in @execution-state [:ordered :arguments]))
+                          (identical? parameter-arguments
+                                      (get-in @execution-state [:ordered :parameter-arguments]))
+                          (identical? (:roots ordered) (get-in @execution-state [:ordered :roots]))
+                          (nil? (get-in @execution-state [:ordered :pending-input-handoff])))
+             (throw (ex-info "ordered input preflight was invalidated by reentrant owner activity"
+                             {:reason :link-ordered-input-reentrancy})))
+           ;; Fresh actual source/range checks after callback. Descriptor equality alone
+           ;; never establishes that a foreign native source is still live.
+           (let [current (prepare-ordered-input-handoff executable replacements)]
+             (when-not (and (= (count (:range-facts packet)) (count (:range-facts current)))
+                            (every? true?
+                                    (map (fn [before after]
+                                           (and (= (dissoc before :source-buffer :destination-buffer)
+                                                   (dissoc after :source-buffer :destination-buffer))
+                                                (identical? (:source-buffer before) (:source-buffer after))
+                                                (identical? (:destination-buffer before) (:destination-buffer after))))
+                                         (:range-facts packet) (:range-facts current))))
+               (throw (ex-info "ordered input ranges changed during output retirement"
+                               {:reason :link-ordered-input-reentrancy}))))
+           (swap! execution-state update :ordered
+                  #(cond-> (assoc % :pending-input-handoff packet)
+                     (:parameter-arguments packet) (assoc :parameter-arguments (:parameter-arguments packet))))
+           (vreset! crossed? true)
+           (let [result (run! executable)]
+             (when (empty? (:resident-inputs packet))
+               (swap! execution-state assoc-in [:ordered :resident-input-handoff-required?] false))
+             result)
+           (catch Throwable error
+             (if @crossed? (poison-execution! executable error) (throw error)))
+           (finally
+             (swap! execution-state
+                    (fn [state]
+                      (if (identical? packet (get-in state [:ordered :pending-input-handoff]))
+                        (update state :ordered dissoc :pending-input-handoff)
+                        state))))))))))
 
 (defn- failed-write!
   "A failed backend transfer can have changed any byte in its destination. Keep every overlapping
@@ -1755,36 +1811,61 @@
        (< (:byte-offset left-view) (bview/byte-end right-view))
        (< (:byte-offset right-view) (bview/byte-end left-view))))
 
+(defn- device-destination-facts
+  [node-id destination-view {:keys [source-view] :as source-facts}]
+  (let [destination-view (bview/validate-view! destination-view)]
+    (when-not (= [(:dtype destination-view) (:shape destination-view)]
+                 [(:dtype source-view) (:shape source-view)])
+      (throw (ex-info "DeviceArray dtype/shape differs from LinkNode"
+                      {:reason :link-device-input-contract :node node-id
+                       :source {:dtype (:dtype source-view) :shape (:shape source-view)}
+                       :destination {:dtype (:dtype destination-view)
+                                     :shape (:shape destination-view)}})))
+    (when-not (and (bview/contiguous? source-view) (bview/contiguous? destination-view))
+      (throw (ex-info "linked DeviceArray writes require contiguous views"
+                      {:reason :link-device-input-layout :node node-id})))
+    (assoc source-facts :elements (reduce * 1 (:shape destination-view)))))
+
+(defn- device-source-facts
+  "Validate the actual source before any destination lookup; optionally check a prospective view."
+  ([target node-id destination-view source]
+   (device-destination-facts node-id destination-view (device-source-facts target node-id source)))
+  ([target node-id source]
+  (let [_ (when-not (value/live? source)
+            (throw (ex-info "cannot write from a consumed or freed DeviceArray"
+                            {:reason :link-device-input-lifetime :node node-id})))
+        _ (when-not (= (:device source) target)
+            (throw (ex-info "DeviceArray target differs from linked executable target"
+                            {:reason :link-device-input-target :node node-id
+                             :source (:device source)
+                             :target target})))
+        source-view (bview/validate-view! (:view source))
+        source-buffer (:buffer source)
+        _ (when-let [owner (cleanup/lifetime-owner source-buffer)] (cleanup/assert-live! owner))
+        source-bytes (or (:byte-size source-buffer)
+                         (when (:n-elements source-buffer)
+                           (*' (:n-elements source-buffer) (dtype/bytes-of (:dtype source-buffer)))))
+        _ (when-not (and (= (dtype/canon (:dtype source)) (:dtype source-view)
+                            (dtype/canon (:dtype source-buffer)))
+                         (= (:shape source) (:shape source-view))
+                         (or (nil? (get-in source-view [:allocation :device]))
+                             (= target (get-in source-view [:allocation :device])))
+                         (integer? source-bytes) (<= (bview/byte-end source-view) source-bytes))
+            (throw (ex-info "DeviceArray disagrees with its actual backing storage"
+                            {:reason :link-device-input-contract :node node-id})))]
+    {:source source :source-view source-view :source-buffer source-buffer})))
+
 (defn- device-write-facts
   [executable node-id source]
   (let [node (get-in executable [:plan :nodes node-id])
         _ (when-not node (node-view executable node-id))
-        _ (when-not (value/live? source)
-            (throw (ex-info "cannot write from a consumed or freed DeviceArray"
-                            {:reason :link-device-input-lifetime :node node-id})))
-        _ (when-not (= (:device source) (get-in executable [:plan :target]))
-            (throw (ex-info "DeviceArray target differs from linked executable target"
-                            {:reason :link-device-input-target :node node-id
-                             :source (:device source)
-                             :target (get-in executable [:plan :target])})))
-        source-view (bview/validate-view! (:view source))
+        source-facts (device-source-facts (get-in executable [:plan :target]) node-id source)
         destination (node-view executable node-id)
         destination-view (:view destination)
-        _ (when-not (= [(:dtype destination-view) (:shape destination-view)]
-                       [(:dtype source-view) (:shape source-view)])
-            (throw (ex-info "DeviceArray dtype/shape differs from LinkNode"
-                            {:reason :link-device-input-contract :node node-id
-                             :source {:dtype (:dtype source-view) :shape (:shape source-view)}
-                             :destination {:dtype (:dtype destination-view)
-                                           :shape (:shape destination-view)}})))
-        _ (when-not (and (bview/contiguous? source-view)
-                         (bview/contiguous? destination-view))
-            (throw (ex-info "linked DeviceArray writes require contiguous views"
-                            {:reason :link-device-input-layout :node node-id})))
         session (:session executable)
         destination-buffer (gpu/buffer session (:key destination))
-        source-buffer (:buffer source)
-        elements (reduce * 1 (:shape destination-view))]
+        {:keys [source-view source-buffer] :as source-facts}
+        (device-destination-facts node-id destination-view source-facts)]
     ;; A self-write is not a repair. Nor may a disjoint copy read another tainted view of this
     ;; allocation. Check before mutation so preflight preserves the old output boundary.
     (when (some #(let [resident (node-view executable %)
@@ -1799,15 +1880,14 @@
                (overlapping-buffer-range? source-buffer source-view destination-buffer destination-view))
       (throw (ex-info "linked DeviceArray write has partially overlapping source/destination"
                       {:reason :link-device-input-overlap :node node-id})))
-    {:session session :destination destination :destination-view destination-view
-     :source-view source-view :source-buffer source-buffer :destination-buffer destination-buffer
-     :elements elements}))
+    (assoc source-facts :session session :destination destination :destination-view destination-view
+                       :destination-buffer destination-buffer)))
 
-(defn- write-device-array!
-  [executable node-id facts]
+(defn- copy-device-array!
+  "Perform the already-preflighted synchronous transfer; grant no initialization credit."
+  [facts]
   (let [{:keys [session destination destination-view source-view source-buffer destination-buffer elements]}
         facts]
-    (begin-mutation! executable)
     (cond
       (same-buffer-range? source-buffer source-view destination-buffer destination-view)
       (observation/refresh-route :exact-view-no-op (:byte-length destination-view))
@@ -1851,10 +1931,15 @@
                    (if-let [error @primary]
                      (when-not (identical? error cleanup-error)
                        (.addSuppressed ^Throwable error cleanup-error))
-                     (throw cleanup-error)))))))))
+                     (throw cleanup-error)))))))))))
+
+(defn- write-device-array!
+  [executable node-id facts]
+  (begin-mutation! executable)
+  (copy-device-array! facts)
     (swap! (:pending-inputs executable) disj node-id)
     (swap! (:tainted-inputs executable) disj node-id)
-    executable))
+    executable)
 
 (defn- input-source-facts!
   [executable node-id source]
@@ -1890,6 +1975,122 @@
                                                 destination-buffer destination-view))]
     (throw (ex-info "input transfer would overwrite another input's resident source"
                     {:reason :link-input-transfer-overlap :reader reader :writer writer}))))
+
+(defn- ordered-input-destination
+  "Inspect this owner's prospective input root; missing roots have no resident alias hazard."
+  [executable token view]
+  (let [ordered (:ordered @(:execution-state executable))
+        root (get-in ordered [:roots token])]
+    (when root
+      (when-not (and (= (allocation-key (:execution-id ordered) token) (:key root))
+                     (= (into {} (:allocation root)) (into {} (:allocation view)))
+                     (contains? (set @(:ledger ordered)) (:key root)))
+        (throw (ex-info "ordered input root differs from its prospective allocation"
+                        {:reason :link-existing-root-contract :allocation token}))))
+    {:node-id token :destination-view view
+     :destination-buffer (when root (gpu/buffer (:session executable) (:key root)))}))
+
+(defn- require-ordered-source-ready!
+  [executable {:keys [source-buffer source-view]}]
+  (let [{:keys [roots initialized compilation]} (:ordered @(:execution-state executable))
+        backend (runtime-backend/runtime-namespace (:target compilation))
+        native-buffer? (requiring-resolve (symbol (str backend) "device-buffer?"))
+        assert-native-live! (requiring-resolve (symbol (str backend) "assert-buffer-live!"))]
+    (when-not (native-buffer? source-buffer)
+      (throw (ex-info "ordered resident input requires an actual target backend buffer"
+                      {:reason :link-device-input-contract})))
+    (assert-native-live! source-buffer)
+    (doseq [[token root] roots
+            :when (identical? source-buffer (gpu/buffer (:session executable) (:key root)))
+            :let [view (bview/view (:allocation root)
+                                  (select-keys source-view [:id :dtype :shape :strides :byte-offset]))]]
+      ;; A self-copy/no-op is not initialization. Readiness comes only from earlier
+      ;; actual uploads/producers, never the old completed plan's input role labels.
+      (when-not (bview/covered-contiguous? view initialized)
+        (throw (ex-info "ordered resident input reads uninitialized owner storage"
+                        {:reason :link-ordered-input-uninitialized-source :storage token}))))))
+
+(defn- prepare-ordered-input-handoff
+  "Preflight only: no resources, copies, source callbacks or initialization credit."
+  [executable replacements]
+  (when-not (map? replacements)
+    (throw (ex-info "ordered input replacement requires a map" {:reason :invocation-ordered-inputs})))
+  (let [{:keys [compilation parameter-defaults caller-options entry-roles]}
+        (:ordered @(:execution-state executable))
+        initial (invocation-link/begin-ordered-parameter-realization compilation parameter-defaults caller-options)
+        resident-values (into #{} (keep (fn [[id source]] (when (value/device-array? source) id))) replacements)
+        host-replacements (apply dissoc replacements resident-values)
+        {:keys [state resident-inputs resident-realized]}
+        (invocation-link/ordered-input-initial-state initial parameter-defaults entry-roles
+                                                    host-replacements resident-values)
+        buffers (invocation-link/ordered-entry-buffers state)
+        resident-facts
+        (into {}
+              (map (fn [[token {:keys [values node] :as descriptor}]]
+                     (let [sources (mapv replacements values)
+                           facts (mapv #(device-source-facts (:target compilation) token (:view node) %) sources)
+                           _ (doseq [fact facts] (require-ordered-source-ready! executable fact))
+                           first-fact (first facts)
+                           destination (ordered-input-destination executable token (:view node))]
+                       (when-not (every? #(same-buffer-range? (:source-buffer first-fact) (:source-view first-fact)
+                                                             (:source-buffer %) (:source-view %)) facts)
+                         (throw (ex-info "aliased input values require one exact resident source range"
+                                         {:reason :link-ordered-input-alias-source :storage token})))
+                       (when (and (:destination-buffer destination)
+                                  (not (same-buffer-range? (:source-buffer first-fact) (:source-view first-fact)
+                                                           (:destination-buffer destination) (:destination-view destination)))
+                                  (overlapping-buffer-range? (:source-buffer first-fact) (:source-view first-fact)
+                                                             (:destination-buffer destination) (:destination-view destination)))
+                         (throw (ex-info "ordered resident input partially overlaps its destination"
+                                         {:reason :link-device-input-overlap :node token})))
+                       [token {:descriptor descriptor :source (:source first-fact)
+                               :facts (assoc (merge first-fact destination) :mutates?
+                                             (not (same-buffer-range? (:source-buffer first-fact) (:source-view first-fact)
+                                                                      (:destination-buffer destination) (:destination-view destination))))}])) )
+              resident-inputs)
+        host-destinations
+        (into {}
+              (keep (fn [[id buffer]]
+                      (when (and (= :input (get entry-roles id)) (not (contains? resident-values id)))
+                        (let [token (:id buffer)
+                              root (get-in @(:execution-state executable) [:ordered :roots token])]
+                          (when root
+                            [token (assoc (ordered-input-destination
+                                           executable token (bview/view (:allocation root)
+                                                                         {:id token :dtype (get-in buffer [:value :dtype])
+                                                                          :shape (:shape buffer)}))
+                                          :mutates? true)]))))) buffers)
+        range-facts (into (vec (vals host-destinations)) (map :facts) (vals resident-facts))]
+    (validate-input-range-order! range-facts)
+    {:initial state :resident-inputs resident-facts :resident-realized resident-realized
+     :range-facts range-facts :epoch (:value-epoch @(:execution-state executable))
+     :parameter-arguments (when (empty? resident-values)
+                            (materialization/initial-parameter-arguments (:materialization state)))
+     :consumed? (volatile! false)}))
+
+(defn- apply-ordered-resident-inputs!
+  "Refresh each source-free root once; only completed copies/noops credit this replay."
+  [executable packet initial]
+  (when (seq (:resident-inputs packet))
+    (swap! (:execution-state executable) assoc-in [:ordered :resident-input-handoff-required?] true))
+  (reduce-kv
+   (fn [state token {:keys [descriptor source]}]
+     (let [node (:node descriptor)
+           storage (acquire-ordered-storage! executable {token node} #{})
+           destination (get-in storage [:node-views token])
+           facts (assoc (device-source-facts (get-in @(:execution-state executable) [:ordered :compilation :target])
+                                             token (:view node) source)
+                        :session (:session executable) :destination destination
+                        :destination-view (:view destination)
+                        :destination-buffer (gpu/buffer (:session executable) (:key destination)))]
+       (copy-device-array! facts)
+       (swap! (:execution-state executable) update-in [:ordered :initialized] conj (:view node))
+       (-> state
+           (update :acquired-storage conj token)
+           (update-in [:realized :buffers] merge
+                      (select-keys (get-in packet [:resident-realized :buffers]) (:values descriptor)))
+           (assoc-in [:realized :storage token] (get-in packet [:resident-realized :storage token])))))
+   initial (:resident-inputs packet)))
 
 (defn ^:no-doc validate-write-batch!
   "Preflight a complete input handoff, including cross-input resident read/write hazards.

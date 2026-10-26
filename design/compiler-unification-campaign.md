@@ -93,6 +93,28 @@ refresh succeeds. Acquired tokens must have their matching realized storage
 binding; the runtime must not reconstruct this private schema independently.
 The expanded pure gate passes 22 tests / 200 assertions.
 
+The ordered runtime handoff is now implemented. Actual backend buffers stay in
+an owner-local, single-use packet, separate from numerical descriptors. All
+source/target/layout/range checks precede wrapper retirement; callback/epoch and
+source checks run again before installing the packet. Only successful synchronous
+copy or a proved-ready exact no-op installs canonical realized storage and credits
+initialization/acquisition. Pending state is cleared by exact identity; failed
+mutations poison the owner. Plain replay after a resident handoff refuses before
+mutation unless a fresh handoff is provided; a successful explicit all-host
+handoff restores ordinary host replay. Same-owner output aliases use private
+retirement borrows, never foreign-lifetime laundering.
+
+The combined affected runtime gate passes 50 tests / 1,065 assertions, including
+both local GPU backends and ordinary write/profile compatibility. The focused
+root suite separately passes 4 tests / 512 assertions. An early compatibility
+run caught a source-target error being delayed behind destination lookup; shared
+source/destination fact construction now preserves the prior fail-fast boundary.
+The actual AMR second resident invocation now completes; the next failure is its
+old Prepared output-node lookup, not host-only input materialization. End-to-end
+restart remains unqualified: leasing, byte evidence, semantic producer identity
+and capture/restore consumers must use the checked completed boundary, not an
+invented pre-source physical plan or plan-only replay.
+
 The next address-proof repair must transport exact integral InvocationPlan
 producer relationships into sliced scheduled bodies as executable equality
 constraints. Both read-footprint proofs and runtime graph preconditions must
