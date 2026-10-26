@@ -116,6 +116,32 @@
   (filterv #(not (true? (get-in % [:attributes :host-only])))
            (get-in candidate [:body :equations])))
 
+(defn equation-fragment
+  "Construct an exact equation view without execution, retaining revalidatable parent provenance.
+   No source, InvocationPlan, completion authority or validation seal is transferred."
+  [parallel-program equation-id]
+  (program/validate! parallel-program)
+  (when (contains? (:attributes parallel-program) ::equation-origin)
+    (throw (ex-info "nested emitted equation origins are not supported"
+                    {:reason :emitted-parallel-program-fragment-origin})))
+  (let [equation (some #(when (= equation-id (:id %)) %) (:equations parallel-program))]
+    (when-not (and equation (not (true? (get-in equation [:attributes :host-only]))))
+      (throw (ex-info "an emitted fragment requires an existing numerical equation"
+                      {:reason :emitted-parallel-program-fragment-equation
+                       :equation equation-id})))
+    (let [prefix (if (emitted-loop/emitted-loop? (first (:operations equation))) []
+                    (filterv #(true? (get-in % [:attributes :host-only]))
+                             (take-while #(not= equation-id (:id %))
+                                         (:equations parallel-program))))
+          equations (conj prefix equation)]
+      (program/make
+       {:dialect (:dialect parallel-program) :values (:values parallel-program)
+        :inputs (program/infer-inputs equations) :outputs (:results equation)
+        :equations equations :effects (reduce set/union #{} (map :effects equations))
+        :source nil :provenance {:source :ordered-numerical-fragment :equation equation-id}
+        :attributes (assoc (select-keys (:attributes parallel-program) [:allocations])
+                           ::equation-origin {:program parallel-program :equation-id equation-id})}))))
+
 (defn- canonical-candidate-source-region!
   "Recover one exact scheduled source region from already validated emitted alternatives."
   [equation candidates]
@@ -130,7 +156,13 @@
                    (scheduled-equation-view (first %)))))]
     (when-not (and (seq regions)
                    (every? exact-region? regions)
-                   (every? #(semantic-fingerprint/equivalent? canonical %) (next regions)))
+                   ;; Each candidate already validates its own target schedule. Distinct
+                   ;; reference/subgroup operations must retain the same semantic source,
+                   ;; not the same independently certified physical schedule.
+                   (every? #(semantic-fingerprint/equivalent?
+                             (mapv scheduled-equation-view canonical)
+                             (mapv scheduled-equation-view %))
+                           (next regions)))
       (throw (ex-info "emitted alternatives differ from their retained scheduled source region"
                       {:reason :emitted-parallel-program-source-region
                        :outer-equation (:id equation)
@@ -181,9 +213,18 @@
    substituting a different (though locally valid) prefix: its host equations, terminal numerical
    equation, inferred inputs, outputs, and effects must be the exact slice of this program."
   [parallel-program candidates-for]
-  (let [{source-program :program source-regions :regions}
-        (when (get-in parallel-program [:attributes :invocation-plan])
-          (expanded-source-program! parallel-program candidates-for))]
+  (let [;; validate-program! has independently checked this exact parent/view relation.
+        ;; The origin is ordinary provenance, never a stored guard or validation capability.
+        source-context (or (get-in parallel-program [:attributes ::equation-origin :program])
+                           parallel-program)
+        {source-program :program source-regions :regions}
+        (when (some (fn [equation]
+                      (some (fn [candidate]
+                              (equation-graph/invocation-scalar-proof-demand?
+                               source-context (candidate-numerical-equations candidate)))
+                            (candidates-for (first (:operations equation)))))
+                    (:equations parallel-program))
+          (expanded-source-program! source-context candidates-for))]
   (loop [host-prefix [] remaining (:equations parallel-program)]
     (when-let [equation (first remaining)]
       (if (true? (get-in equation [:attributes :host-only]))
@@ -257,7 +298,20 @@
                      :dialect (:dialect parallel-program)
                      :supported (set (keys dialect-targets))
                      :ir :emitted-parallel-program})))
-  (let [candidate-cache (java.util.IdentityHashMap.)
+  (let [origin (get-in parallel-program [:attributes ::equation-origin])
+        _ (when (contains? (:attributes parallel-program) ::equation-origin)
+            (when-not (and (map? origin) (= #{:program :equation-id} (set (keys origin))))
+              (throw (ex-info "emitted equation origin requires an exact parent and equation"
+                              {:reason :emitted-parallel-program-fragment-origin})))
+            ;; Revalidate under CURRENT caller intent. A copied seal or embedded guard vector
+            ;; is never authority, and equation-fragment rejects nested origins before recursion.
+            (let [expected (equation-fragment (:program origin) (:equation-id origin))]
+              (validate-program! (:program origin) #(equation-candidates % caller-options)
+                                 caller-options)
+              (when-not (= expected parallel-program)
+                (throw (ex-info "emitted fragment differs from its exact parent equation view"
+                                {:reason :emitted-parallel-program-fragment-origin})))))
+        candidate-cache (java.util.IdentityHashMap.)
         candidates-for (fn [operation]
                          ;; A validation invocation checks an immutable operation repeatedly:
                          ;; semantic boundary, enclosing host prefix, and target membership.

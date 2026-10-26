@@ -999,20 +999,9 @@
                 (fail! :emitted-program-ready-host-prefix
                        "a numerical fragment requires its exact completed host prefix"
                        {:equation equation-id :host-equation (:id host)})))
-          equations (conj host-prefix equation)
-          fragment (program/make
-                    {:dialect (:dialect program) :values (:values program)
-                     :inputs (program/infer-inputs equations) :outputs (:results equation)
-                     :equations equations :effects (reduce set/union #{} (map :effects equations)) :source nil
-                     :provenance {:source :ordered-numerical-fragment :equation equation-id}
-                     ;; The independently checked emitted body retains the
-                     ;; enclosing allocation contract for its physical output.
-                     ;; Reconstructing that body from a fragment must see the
-                     ;; same parent context, not an empty table (nor claims
-                     ;; copied from the candidate being checked). Its existing
-                     ;; graph projection selects only relevant allocations.
-                     ;; Source/completion authority is deliberately not copied.
-                     :attributes (select-keys (:attributes program) [:allocations])})
+          ;; Keep only an exact, independently revalidatable view relation. The fragment
+          ;; still has no source/InvocationPlan/completion authority of its own.
+          fragment (emitted-program/equation-fragment program equation-id)
           validation (if (nil? caller-options)
                        (emitted-program/validate-with-physical-results! fragment)
                        (emitted-program/validate-with-physical-results! fragment caller-options))

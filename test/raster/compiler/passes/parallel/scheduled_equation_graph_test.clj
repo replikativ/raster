@@ -511,6 +511,42 @@
                               conj {:expression 'rows :op := :value (:expression condition)})))
         "no equality RHS may depend on any equality-defined LHS")))
 
+(deftest emitted-equation-fragments-revalidate-their-exact-parent-origin
+  (let [parent (emitted-invocation-scalar-program)
+        equation (first (remove #(true? (get-in % [:attributes :host-only]))
+                                (:equations parent)))
+        fragment (emitted-program/equation-fragment parent (:id equation))
+        origin-key :raster.compiler.ir.emitted-parallel-program/equation-origin
+        numerical-index (dec (count (:equations fragment)))
+        guard-path [:equations numerical-index :operations 0 :body
+                    :attributes :invocation-scalar-preconditions]]
+    (is (seq (get-in fragment guard-path)))
+    (is (= fragment (emitted-program/validate! fragment)))
+    (is (= fragment (:program (emitted-program/validate-with-physical-results! fragment))))
+    (is (nil? (:source fragment)))
+    (is (not (contains? (:attributes fragment) :invocation-plan)))
+    (is (= #{origin-key} (set (remove #{:allocations} (keys (:attributes fragment))))))
+    (doseq [changed [(assoc-in fragment [:attributes origin-key :equation-id] :foreign)
+                     (assoc-in fragment [:attributes origin-key :program] nil)
+                     (assoc fragment :source '(invented-source))
+                     (assoc fragment :outputs [])
+                     (assoc-in fragment guard-path [])
+                     (update fragment :attributes dissoc origin-key)]]
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! changed))))
+    (is (= :emitted-parallel-program-fragment-origin
+           (reason-of #(emitted-program/equation-fragment fragment (:id equation)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-program/validate! fragment {:scalar-math {:overrides {[:tanh :float] :foreign}}})))
+    ;; Parent provenance is independently checked data, not a seal that can bless a
+    ;; changed body merely by rebuilding an otherwise exact fragment around it.
+    (let [parent-index (first (keep-indexed #(when (= (:id equation) (:id %2)) %1)
+                                           (:equations parent)))
+          changed-parent (assoc-in parent
+                                   [:equations parent-index :operations 0 :body :attributes
+                                    :invocation-scalar-preconditions] [])
+          changed-fragment (emitted-program/equation-fragment changed-parent (:id equation))]
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! changed-fragment))))))
+
 (deftest emitted-program-rederives-invocation-scalar-constraints-from-the-source-plan
   (let [emitted (emitted-invocation-scalar-program)
         equation-index (first (keep-indexed (fn [index equation]

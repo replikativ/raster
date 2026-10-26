@@ -62,12 +62,20 @@
                                            {:strategy :dispatch-reassociated}}})
         compiled (equation-first/compile #'indexed-fixture/resident-indexed-attention-probe options)
         program (:emitted compiled)
-        operation (-> program :equations last :operations first)]
+        equation (last (:equations program))
+        operation (first (:operations equation))
+        fragment (emitted-program/equation-fragment program (:id equation))]
     (is (= (:scalar-math request) (get-in compiled [:options :scalar-math])))
     (is (= 2 (count (:kernels compiled))))
     (is (equation-dispatch/emitted-equation-dispatch? operation))
     (is (identical? operation (equation-dispatch/validate! operation request)))
-    (is (identical? program (emitted-program/validate! program request)))))
+    (is (identical? program (emitted-program/validate! program request)))
+    (is (identical? fragment (emitted-program/validate! fragment request)))
+    (is (identical? fragment
+                    (:program (emitted-program/validate-with-physical-results! fragment request))))
+    (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! program)))
+    (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! fragment))
+        "exact parent provenance does not import its retained non-default math consent")))
 
 (deftest linked-preparation-reuses-only-exact-static-program-proof
   (register-target!)

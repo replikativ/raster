@@ -276,14 +276,12 @@
                (empty? locals) (= 1 (count body-results)))
       (first body-results))))
 
-(defn invocation-scalar-preconditions
-  "Derive ordered equality guards for integral numerical inputs computed by the exact invocation.
+(defn- invocation-scalar-precondition-candidates
+  "Project possible constraints without granting correspondence to the enclosing program.
 
-   The returned KernelPreconditions are a narrow projection of validated ScalarCompute steps,
-   never a second evaluator or a name-based alias table. A result is retained only when its exact
-   program binding names one step, every operand can be represented by one scalar in this
-   numerical boundary, and typed IndexExpression lowering preserves its width and checked
-   arithmetic. Unsupported or ambiguous steps contribute no proof."
+   Demand and the checked projection share this exact eligibility logic. In particular, a body
+   attribute cannot suppress demand by deleting its guards. These candidates are not proof until
+   the complete retained InvocationPlan has been checked against its source program."
   [parallel-program equations]
   (let [equations (vec equations)]
     ;; SegmentedWeightedReduction plans have a separate schedule-neutral graph constructor which
@@ -292,11 +290,10 @@
     ;; false executable contract.
     (if-not (every? (comp soac/program-form? :algorithm) equations)
       []
-      (let [_ (contiguous-equation-region! parallel-program equations)
-            plan (get-in parallel-program [:attributes :invocation-plan])]
+      (let [plan (get-in parallel-program [:attributes :invocation-plan])]
         (if-not plan
           []
-          (let [plan (invocation/validate-against! plan parallel-program)
+          (let [plan (invocation/validate! plan)
             values (:values parallel-program)
             numerical-inputs (program/infer-inputs equations)
             scalar-inputs
@@ -358,6 +355,29 @@
                                        (not (contains? references result)))
                               {:expression result :op := :value projection}))))
                   (:steps plan))))))))
+
+(defn invocation-scalar-proof-demand?
+  "Whether the retained invocation can constrain this actual numerical input boundary.
+   This is only demand for a subsequent full source proof, never a validation receipt."
+  [parallel-program equations]
+  (boolean (seq (invocation-scalar-precondition-candidates parallel-program equations))))
+
+(defn invocation-scalar-preconditions
+  "Derive integral equality guards only after proving the complete invocation/source boundary.
+
+   Guard-free, shape-only and external-premise plans add no scalar authority and need not match
+   an unrelated extended emitted boundary merely because its attributes retain an old plan.
+   Unsupported or ambiguous scalar computations contribute no proof."
+  [parallel-program equations]
+  (let [equations (vec equations)
+        candidates (invocation-scalar-precondition-candidates parallel-program equations)]
+    (if (seq candidates)
+      (do
+        (contiguous-equation-region! parallel-program equations)
+        (invocation/validate-against! (get-in parallel-program [:attributes :invocation-plan])
+                                      parallel-program)
+        candidates)
+      [])))
 
 (defn body-invocation-scalar-preconditions
   "Validate and return the invocation-derived equality guards retained by one scheduled body."

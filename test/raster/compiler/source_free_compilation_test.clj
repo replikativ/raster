@@ -905,7 +905,10 @@
              (interface-fn
               {:values {'resident (av/tensor {:dtype :double :shape []})}
                :equations [] :outputs []}
-              [{:graph {:inputs [{:id 'resident}] :outputs [] :scalars []}}]
+              [{:graph {:inputs [{:id 'resident}] :outputs [] :scalars []}
+                ;; Production equation-boundaries supplies the actual access projection;
+                ;; a graph port alone is not proof that this value remains materialized.
+                :buffer-accesses {'resident :read}}]
               (java.util.IdentityHashMap.)))))))
 
 (deftest resident-binding-closes-over-program-wide-shape-scalars

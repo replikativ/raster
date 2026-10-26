@@ -4,15 +4,56 @@
 
 ### Current boundary ledger
 
-Latest exact-head CI accounting, `7a9bc9ef8` (October 26): setup, build,
+Latest exact-head CI accounting, `48ed47b17` (October 26): setup, build,
 emitted-source fixtures, CUDA compilation and HIP compilation pass. Unit job
-35045 and CPU-OpenCL job 35046 fail; this branch is not merge-ready. Unit has
-15 completed shards: 7,193 tests, 90,910 passing assertions, 20 failures and
-28 errors across 38 failing Vars. Shard 3 remains incomplete with 239 observed
+35070 and CPU-OpenCL job 35074 fail; this branch is not merge-ready. Unit has
+15 completed shards: 7,117 tests, 90,772 passing assertions, 21 failures and
+41 errors across 50 failing Vars. Shard 3 remains incomplete with 316 observed
 Vars, so these are not full-suite totals. CPU-OpenCL has all four completed
-shards: 656 tests, 8,358 passing assertions, 7 failures and 29 errors across
-34 failing Vars. The current artifacts supersede the older checkpoint counts
-below without waiving any remaining failure.
+shards: 674 tests, 8,476 passing assertions, 9 failures and 30 errors across
+37 failing Vars. The current artifacts supersede the older checkpoint counts
+below without waiving any remaining failure. Coverage counts vary with shard
+completion and are not evidence that tests were removed.
+
+The in-progress correction distinguishes an attached InvocationPlan from actual
+scalar-proof demand: strict source correspondence is necessary when a leaf uses
+producer relationships, not merely because a plan exists. Independently callable
+kernel artifacts must also retain every scalar equality and capacity assumption
+used by their address proof. Graph-only preconditions are insufficient. Inline
+quotient/remainder coordinates are normalized to deterministic lexical locals
+for proof construction only; executed coordinates and source locals stay intact.
+Negative direct-artifact calls, unsupported coordinates, collision hygiene and
+read-free controls qualify this boundary separately from graph execution.
+
+That leaf boundary is now implemented in `203990ab0`. The focused warm gate
+passes 19 tests / 240 assertions, including standalone KernelCalls with changed
+extent/capacity, duplicate scalar ABI slots, proof-only normalization, guard
+tampering, and GQA OpenCL/CUDA/HIP source emission. The preceding eight-namespace
+gate completed 267 tests / 3,531 assertions with three failures and no errors:
+two newly complete read-span proofs retained `max(4,3)` instead of the dominant
+capacity, and one hand-built rank-zero interface fixture omitted the production
+access projection. Shared structural span dominance and the exact fixture access
+correct these causes; the corresponding focused assertions pass. Counts overlap
+and must not be summed or reported as a green full-suite run.
+
+An AMR restart exposed a separate ordered-fragment seam: stripping the parent
+InvocationPlan also stripped the origin of a legitimate retained body guard.
+The correction retains an exact parent/equation view as non-executable provenance,
+not a copied seal or guard certificate. Independent validation must validate the
+parent under current math intent and reconstruct the exact fragment. Fragment
+source remains nil and gains no active InvocationPlan or completion authority.
+Nested origins initially refuse. Parent/guard/origin tampering and valid changed
+math-policy checks qualify this independently; actual AMR execution is still a
+required gate, not inferred from pure validation. Review also flags repeated
+whole-parent validation across fragments as a compile-cost measurement target.
+The three-test follow-up passes its math-policy and rank-zero interface checks,
+but AMR restart still errors on the second cycle: ordered parameter materialization
+receives a resident DeviceArray where its host-input path requires a primitive
+array. The previous host-prefix guard failure no longer occurs. This is a runtime
+entry-contract gap, not permission to add backend objects to the numerical IR or
+to refresh resident state from stale host defaults. The run reports 15 passing
+assertions, no failures and one error; the AMR test took 43.8 seconds including
+preparation and the first cycle. It is not qualified restart execution.
 
 The next address-proof repair must transport exact integral InvocationPlan
 producer relationships into sliced scheduled bodies as executable equality
