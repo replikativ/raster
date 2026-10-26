@@ -2883,6 +2883,19 @@
 
 (declare emit-boxed-ifn-call tag->jvm-info)
 
+(defn- verified-array-reference?
+  "A verified local reference proves only its actual retained Class. Object,
+   Number or a different primitive array cannot waive this use site's array
+   cast merely because some earlier reference check succeeded."
+  [array tag locals ctx]
+  (when (symbol? array)
+    (let [local (get locals array)
+          actual (:reference-class local)
+          expected (:class (tag->jvm-info tag (:source-ns ctx)))]
+      (boolean (and (= :ref (:type local)) (:verified local)
+                    (class? actual) (class? expected) (.isArray ^Class expected)
+                    (.isAssignableFrom ^Class expected ^Class actual))))))
+
 (defn- emit-retained-array-checkcast
   [code tag stack-type verified? ctx]
   (when (and (= stack-type :ref) (not verified?))
@@ -2993,9 +3006,9 @@
         arr-tag (or (:tag (meta arr))
                     (:raster.type/tag (meta arr))
                     (when (symbol? arr) (:hint (get locals arr))))
-        ;; Skip checkcast when the local's type is verified by the
-        ;; JVM method descriptor (typed param, not Object)
-        arr-verified? (when (symbol? arr) (:verified (get locals arr)))
+        ;; The actual local Class, not a broad verified flag or use-site hint,
+        ;; must establish this precise array type before omitting its check.
+        arr-verified? (verified-array-reference? arr arr-tag locals ctx)
         arr-type (emit-form code arr locals ctx)]
     ;; Checkcast array to correct type when on stack as Object ref.
     ;; Skip when the type is already verified by the method descriptor.
@@ -3069,7 +3082,7 @@
         arr-tag (or (:tag (meta arr))
                     (:raster.type/tag (meta arr))
                     (when (symbol? arr) (:hint (get locals arr))))
-        arr-verified? (when (symbol? arr) (:verified (get locals arr)))]
+        arr-verified? (verified-array-reference? arr arr-tag locals ctx)]
     (if (same-frame-loop? val)
       (emit-aset-completed-spills code args locals ctx arr-tag arr-verified?)
       (let [arr-type (emit-form code arr locals ctx)]

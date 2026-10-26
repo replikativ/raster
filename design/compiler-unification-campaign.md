@@ -19,6 +19,7 @@ rather than adding a route for each workload.
 | RK4 | Full qualification of unified ordered program stages | Local Intel Arc OpenCL/Level Zero recurrence and discrete RK4 oracle pass; affected/fresh/full gates remain pending |
 | Float/Object results | Completed numerical result to invocation-value import, then owned source completion and distinct result publication | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
+| Generic core array overloads | Array family/hints do not retain selected `RT/aset` overload | Object-valued loop stores with observable operands; distinguish typed CHECKCAST contracts from arbitrary Clojure overload fidelity |
 | Compile cost and full qualification | GSDM timeout and incomplete CI denominator | Phase profiling, complete exact-head shards/corpus/device/compiler gates; separate cold/prepare/replay/device timings |
 
 This ledger is the current plan. The dated sections below retain implementation
@@ -147,7 +148,43 @@ obligations close. Existing inlined helpers retain their established route.
 
 The warm affected bundle passes 724 tests / 7,647 assertions; the two additional
 nested rollback/stale-publication controls pass 2 tests / 7 assertions. Independent
-fresh and device qualification remain required before this checkpoint is pushed.
+clean qualification at `7e94ba374` passes 726 tests / 7,654 assertions and four
+additional public device tests / 54 assertions with both OpenCL and Level Zero
+required. Total: 730 tests / 7,708 assertions; this is an affected gate, not full CI.
+
+### Physical array Class at JVM use sites (October 25)
+
+Normalized comparison of unit jobs 34947 and 34955 finds two new failures among
+6,688 common executed Vars, with 290 only in the former run and 260 only in the
+latter. Missing shard 3 still prevents complete accounting. The new failures are
+Float/Double compiled training steps: preserving constructor evaluations keeps
+more local work live and exposes a JVM helper reading Object parameters using
+`faload`/`daload`. A broadly verified Object reference was incorrectly treated as
+proof of the use site's primitive-array Class. The independent raw-method
+reproducer fails JVM verification on both reads and writes.
+
+The shared read/store guard now elides CHECKCAST only when the retained physical
+reference Class is assignable to the required array Class. It does not infer a
+Class from hints or change the global meaning of `:verified`. Unknown/Object,
+Number and mismatched primitive arrays retain the check; matching arrays and
+covariant reference arrays retain the fast path. Store spills use the same guard.
+The initial complete JVM bytecode namespace passes 32 tests / 116 assertions,
+including both original training failures. Ten additional assertions check the
+explicit typed-array CHECKCAST boundary, operand ordering, loop-valued stores
+and null behavior. Independent clean qualification across nine JVM bytecode,
+array-index, binding/entry ownership, hoisted-wrapper, literal and return-payload
+namespaces passes 117 tests / 2,079 assertions at the array-Class checkpoint.
+Full-branch and performance qualification remain separate.
+
+Do not generalize that ordering oracle to arbitrary hinted Clojure `aset`:
+with an Object parameter, a loop-valued store and wrongly typed Float[] storage,
+ordinary Clojure selects generic `RT/aset(Object,int,Object)`, evaluates index and
+value, then throws IllegalArgumentException. Raster's typed Double[] operation
+CHECKCASTs before those operands and throws ClassCastException. Valid Double[]
+and null controls agree. Family identity and logical storage hints do not prove
+overload equivalence; general closure needs actual selected-call/carrier evidence,
+not another family/type heuristic. This pre-existing source-fidelity limitation
+remains in the language-coverage ledger and is not closed by the verifier repair.
 
 ### Whole-buffer source-return correction (October 25, branch qualification)
 

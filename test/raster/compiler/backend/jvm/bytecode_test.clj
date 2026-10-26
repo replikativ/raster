@@ -7,6 +7,7 @@
             [raster.ad.reverse]
             [raster.arrays :as arr]
             [raster.numeric :as rn]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.mem-merge :as mm]))
 
@@ -130,6 +131,87 @@
 
 (deftest array-ops-test
   (is (== 10.0 (compile-and-run #'bc-array-sum :args [(double-array [1.0 2.0 3.0 4.0])]))))
+
+(deftest typed-array-uses-of-object-parameters-check-the-required-class
+  (doseq [parameter-tag ['Object 'java.lang.Object Object]
+          [array-tag result-tag make-array]
+          [['doubles 'double double-array] ['floats 'float float-array]]]
+    (let [parameter (with-meta 'input {:tag parameter-tag})
+          operand (with-meta 'input {:tag array-tag})
+          specs [{:name 'read :params [parameter] :return-tag result-tag
+                  :walked-body [(list 'clojure.core/aget operand 0)] :source-ns *ns*}
+                 {:name 'write :params [parameter] :return-tag result-tag
+                  :walked-body [(list 'clojure.core/aset operand 0 3.5)] :source-ns *ns*}]
+          artifact (bytecode/compile-specialized-class! "raster.test.ObjectArrayUses" specs)
+          read-method (get-in artifact [:methods 'read])
+          write-method (get-in artifact [:methods 'write])
+          input (make-array [2.0])
+          invoke (fn [^java.lang.reflect.Method method value]
+                   (.invoke method nil (object-array [value])))]
+      (is (= [Object] (vec (.getParameterTypes ^java.lang.reflect.Method read-method))))
+      (is (== 2.0 (invoke read-method input)))
+      (is (== 3.5 (invoke write-method input)))
+      (is (== 3.5 (aget input 0)))
+      (doseq [method [read-method write-method]]
+        (is (= ClassCastException
+               (try (invoke method (object-array [2.0])) nil
+                    (catch java.lang.reflect.InvocationTargetException exception
+                      (class (.getCause exception)))))
+            "Object verification does not prove the primitive-array class")))))
+
+(deftest array-cast-elision-requires-a-compatible-physical-reference-class
+  (let [verified? @#'bytecode/verified-array-reference?
+        actual-double (class (double-array 0))
+        actual-float (class (float-array 0))
+        local (fn [cls] {'input {:type :ref :verified true :reference-class cls}})]
+    (is (verified? 'input 'doubles (local actual-double) {:source-ns *ns*}))
+    (doseq [cls [nil Object Number actual-float]]
+      (is (not (verified? 'input 'doubles (local cls) {:source-ns *ns*}))))
+    (is (not (verified? 'input 'doubles
+                        {'input {:type :ref :verified false :reference-class actual-double}}
+                        {:source-ns *ns*})))
+    (is (verified? 'input 'objects (local (class (make-array String 0))) {:source-ns *ns*})
+        "a verified covariant reference array remains compatible")))
+
+(deftest array-class-checks-preserve-source-operand-and-loop-spill-order
+  ;; This oracle explicitly requests a typed-array CHECKCAST. A raw hinted
+  ;; Clojure aset with an Object-valued loop may instead select RT's generic
+  ;; Object overload; that separate overload-fidelity debt is not proved here.
+  (let [params [(with-meta 'input {:tag 'java.lang.Object}) (with-meta 'events {:tag 'longs})]
+        operand (with-meta 'input {:tag 'doubles})
+        index '(do (clojure.core/aset events 0 (clojure.core/inc (clojure.core/aget events 0))) 0)
+        value '(loop* [i 0 sum 0.0]
+                 (if (clojure.core/< i 1)
+                   (do (clojure.core/aset events 1 (clojure.core/inc (clojure.core/aget events 1)))
+                       (recur (clojure.core/inc i) (clojure.core/+ sum 3.5)))
+                   sum))
+        bodies {'read (list 'clojure.core/aget operand index)
+                'write (list 'clojure.core/aset operand index value)}
+        artifact (bytecode/compile-specialized-class!
+                  "raster.test.ArrayClassSourceOrder"
+                  (mapv (fn [[name body]] {:name name :params params :return-tag 'double
+                                          :walked-body [body] :source-ns *ns*}) bodies))
+        observe (fn [f input]
+                  (let [events (long-array 2)
+                        outcome (try {:value (f input events)}
+                                     (catch java.lang.reflect.InvocationTargetException exception
+                                       {:error (class (.getCause exception))})
+                                     (catch Exception exception {:error (class exception)}))]
+                    (assoc outcome :events (vec events) :array (when input (vec input)))))]
+    (doseq [[name body] bodies]
+      (let [source (eval (list 'fn params
+                              (list 'let* ['input (list '.cast (class (double-array 0)) 'input)] body)))
+            method (get-in artifact [:methods name])
+            compiled (fn [input events]
+                       (.invoke ^java.lang.reflect.Method method nil (object-array [input events])))]
+        (doseq [input-factory [#(double-array 1) #(float-array 1) (constantly nil)]]
+          (is (= (observe source (input-factory)) (observe compiled (input-factory)))))
+        (is (= {:error ClassCastException :events [0 0] :array [0.0]}
+               (observe compiled (float-array 1)))
+            "wrong primitive storage fails before index or loop-valued store evaluation")
+        (is (= {:error NullPointerException :events (if (= name 'write) [1 1] [1 0]) :array nil}
+               (observe compiled nil))
+            "null remains a load/store check after completed source operands")))))
 
 ;; ================================================================
 ;; throw
